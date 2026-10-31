@@ -3409,7 +3409,7 @@ fn installer_upgrade_transactions_preserve_recovery_state_atomically() {
         linux.find("preflight_linux_release_set \"$root\"").unwrap()
             < linux.find("install_linux_release \"$root\"").unwrap()
     );
-    assert!(linux.contains("bloom.linux-upgrade-transaction.2"));
+    assert!(linux.contains("bloom.linux-upgrade-transaction.3"));
     assert!(linux.contains(
         "snapshot_linux_upgrade_units \"$install_root\" \"$upgrade_transaction_scratch\""
     ));
@@ -3765,7 +3765,9 @@ fn make_linux_candidate_payload(
 /// exits without the EXIT-trap rollback, simulating an interrupted process.
 /// `rollback` performs the same writes and then runs the in-process rollback
 /// the EXIT trap would. `recover` runs `recover_interrupted_linux_upgrade` on
-/// the preserved transaction. The start stub fingerprints the units it
+/// the preserved transaction. `retry` recovers and then runs the install's
+/// upgrade steps for the same candidate. `check` runs the pre-activation
+/// state-record check and logs whether the upgrade is forward-only. The start stub fingerprints the units it
 /// observes, so a startup attempt over mixed state is detectable in the log.
 fn write_linux_upgrade_harness(directory: &Path) -> PathBuf {
     let script = directory.join("linux-upgrade-harness.sh");
@@ -3815,18 +3817,74 @@ write_candidate_units() {
       "$unit_root/bloom-broker-control@.socket"
   fi
 }
+# Installs the candidate's state declaration as install_linux_release would.
+# var/lib/bloom/candidate-broker-state can hold "current downgrade_floor
+# migration_floor" for the candidate's Broker.
+stage_candidate_release() {
+  local release="$root/usr/libexec/bloom/releases/$new_digest"
+  local raised="$root/var/lib/bloom/candidate-broker-state" state=""
+  [[ ! -f "$raised" ]] || state="$(<"$raised")"
+  mkdir -p "$release"
+  awk -v state="$state" '
+    BEGIN { split(state, value, " ") }
+    /^\[/ { broker = ($0 == "[state.broker]") }
+    broker && state != "" && $1 == "current" { $0 = "current = " value[1] }
+    broker && state != "" && $1 == "downgrade_floor" { $0 = "downgrade_floor = " value[2] }
+    broker && state != "" && $1 == "migration_floor" { $0 = "migration_floor = " value[3] }
+    { print }
+  ' "$(dirname "$installer")/compatibility-v1.toml" > "$release/compatibility-v1.toml"
+}
+# Only forward-only recovery selects the candidate; other tests install the
+# candidate digest from their own payloads afterwards.
+begin_upgrade() {
+  stage_candidate_release
+  begin_linux_upgrade "$root" "$old_digest" "$new_digest"
+  [[ -e "$upgrade_transaction/forward-only" ]] ||
+    command rm -rf -- "$root/usr/libexec/bloom/releases/$new_digest"
+}
 case "$mode" in
   interrupt)
-    begin_linux_upgrade "$root" "$old_digest" "$new_digest"
+    begin_upgrade
     write_candidate_units
     ;;
   rollback)
-    begin_linux_upgrade "$root" "$old_digest" "$new_digest"
+    begin_upgrade
     write_candidate_units
     rollback_linux_upgrade
     ;;
+  finish-killed)
+    # The upgrade succeeds, then the process dies while deleting the
+    # transaction, after removing its forward-only marker.
+    rm() {
+      if [[ "${*: -1}" == *upgrade-transaction* ]]; then
+        command rm -f -- "${*: -1}/forward-only"
+        kill -9 $$
+      fi
+      command rm "$@"
+    }
+    begin_upgrade
+    write_candidate_units
+    finish_linux_upgrade
+    ;;
   recover)
     recover_interrupted_linux_upgrade "$root"
+    ;;
+  check)
+    stage_candidate_release
+    check_linux_candidate_state "$root" "$old_digest" "$new_digest"
+    if linux_upgrade_is_forward_only "$root" "$old_digest" "$new_digest"; then
+      echo "forward-only" >> "$log"
+    fi
+    ;;
+  retry)
+    # The install dispatch after recovery, requesting the kept candidate.
+    recover_interrupted_linux_upgrade "$root"
+    if linux_release_upgrade_required "$new_digest" "$new_digest"; then
+      begin_linux_upgrade "$root" "$new_digest" "$new_digest"
+      stop_linux_release_set "$root"
+      start_linux_release_set "$root" || { rollback_linux_upgrade; exit 1; }
+      finish_linux_upgrade
+    fi
     ;;
 esac
 "##,
@@ -4022,6 +4080,214 @@ fn linux_upgrade_failure_restores_the_previous_unit_contract_before_restart() {
         }
         assert!(!root.join("var/lib/bloom/upgrade-transaction").exists());
     }
+}
+
+/// Sets the harness candidate's Broker `current downgrade_floor migration_floor`.
+fn set_linux_candidate_broker_state(root: &Path, state: &str) {
+    fs::create_dir_all(root.join("var/lib/bloom")).unwrap();
+    fs::write(root.join("var/lib/bloom/candidate-broker-state"), state).unwrap();
+}
+
+/// Makes the harness candidate write Broker state 3 that state-2 readers
+/// cannot open.
+fn raise_linux_candidate_broker_state(root: &Path) {
+    set_linux_candidate_broker_state(root, "3 3 1");
+}
+
+/// The candidate's declared state decides, before anything changes, whether
+/// the upgrade may proceed and whether it can roll back, as on macOS.
+#[test]
+fn linux_candidate_state_record_gates_the_upgrade() {
+    let harness_directory = tempfile::tempdir().unwrap();
+    let harness = write_linux_upgrade_harness(harness_directory.path());
+    let installer = release_script("install-linux.sh");
+    // Installed Broker state is 2. (candidate state, refusal, forward-only)
+    let cases = [
+        ("2 2 1", None, false),
+        ("3 2 1", None, false),
+        ("3 3 1", None, true),
+        (
+            "1 1 1",
+            Some("broker state-schema downgrade rejected"),
+            false,
+        ),
+        ("4 4 3", Some("below the candidate migration floor"), false),
+        ("3 1 2", Some("malformed broker state"), false),
+    ];
+    for (state, refusal, forward_only) in cases {
+        let directory = tempfile::tempdir().unwrap();
+        let (root, old_digest, new_digest, _staged) =
+            stage_forward_only_linux_upgrade(directory.path(), &harness, "interrupt", |root| {
+                set_linux_candidate_broker_state(root, state)
+            });
+        // The staged interrupt is irrelevant here; only the records matter.
+        fs::remove_dir_all(root.join("var/lib/bloom/upgrade-transaction")).unwrap();
+        let log = directory.path().join("check.log");
+        let checked = run_linux_upgrade_harness(
+            &harness,
+            &installer,
+            &root,
+            "check",
+            &log,
+            &["all", &old_digest, &new_digest],
+        );
+        let stderr = String::from_utf8_lossy(&checked.stderr);
+        match refusal {
+            Some(message) => {
+                assert!(!checked.status.success(), "{state}");
+                assert!(stderr.contains(message), "{state}: {stderr}");
+            }
+            None => {
+                assert!(checked.status.success(), "{state}: {stderr}");
+                let log = fs::read_to_string(&log).unwrap_or_default();
+                assert_eq!(log.contains("forward-only"), forward_only, "{state}");
+            }
+        }
+    }
+}
+
+/// Upgrades that the candidate's declared state versions make forward-only.
+fn stage_forward_only_linux_upgrade(
+    directory: &Path,
+    harness: &Path,
+    mode: &str,
+    prepare: impl FnOnce(&Path),
+) -> (PathBuf, String, String, std::process::Output) {
+    let (root, _layout, old_digest, new_digest, staged) =
+        stage_linux_upgrade_root(directory, harness, mode, "all", prepare);
+    (root, old_digest, new_digest, staged)
+}
+
+/// A candidate that declares a newer Broker state, or that upgrades a
+/// release with no state record, migrates state on its first start. When it
+/// then fails, neither the in-process rollback nor recovery may put the
+/// previous release back over that state.
+#[test]
+fn linux_forward_only_upgrade_failure_keeps_the_candidate() {
+    let harness_directory = tempfile::tempdir().unwrap();
+    let harness = write_linux_upgrade_harness(harness_directory.path());
+    let installer = release_script("install-linux.sh");
+    fn drop_installed_record(root: &Path) {
+        let old_digest = hex::encode(Sha256::digest(b"test payload\n"));
+        fs::remove_file(root.join(format!(
+            "usr/libexec/bloom/releases/{old_digest}/compatibility-v1.toml"
+        )))
+        .unwrap();
+    }
+    let cases = [
+        (
+            "newer broker state",
+            raise_linux_candidate_broker_state as fn(&Path),
+        ),
+        ("no installed state record", drop_installed_record),
+    ];
+    for (case, prepare) in cases {
+        let directory = tempfile::tempdir().unwrap();
+        let (root, old_digest, new_digest, failed) =
+            stage_forward_only_linux_upgrade(directory.path(), &harness, "rollback", prepare);
+        let stderr = String::from_utf8_lossy(&failed.stderr);
+        assert!(!failed.status.success(), "{case}: {stderr}");
+        assert!(
+            stderr.contains("state migration is forward-only"),
+            "{case}: {stderr}"
+        );
+        let log = fs::read_to_string(directory.path().join("rollback-all.log")).unwrap();
+        assert!(!log.contains("start"), "{case}: {log}");
+        let transaction = root.join("var/lib/bloom/upgrade-transaction");
+        assert!(transaction.join("forward-only").is_file(), "{case}");
+
+        let recover_log = directory.path().join("recover.log");
+        let recovered = run_linux_upgrade_harness(
+            &harness,
+            &installer,
+            &root,
+            "recover",
+            &recover_log,
+            &[&old_digest, &new_digest],
+        );
+        let stderr = String::from_utf8_lossy(&recovered.stderr);
+        assert!(recovered.status.success(), "{case}: {stderr}");
+        assert!(stderr.contains("forward-only"), "{case}: {stderr}");
+        assert_eq!(
+            fs::read_link(root.join("usr/libexec/bloom/current")).unwrap(),
+            PathBuf::from(format!("releases/{new_digest}")),
+            "{case}"
+        );
+        let log = fs::read_to_string(&recover_log).unwrap();
+        assert!(
+            log.contains(&format!("rewrite {new_digest} active")),
+            "{case}: {log}"
+        );
+        assert!(!log.contains("start"), "{case}: {log}");
+        // Recovery alone has not health-checked the candidate.
+        assert!(transaction.join("forward-only").is_file(), "{case}");
+
+        // Retrying the same candidate still runs the health-gated start; a
+        // failed start keeps the candidate and the transaction.
+        fs::write(root.join("var/lib/bloom/start-fails"), "").unwrap();
+        let retry_log = directory.path().join("retry.log");
+        let retried = run_linux_upgrade_harness(
+            &harness,
+            &installer,
+            &root,
+            "retry",
+            &retry_log,
+            &["all", &old_digest, &new_digest],
+        );
+        assert!(!retried.status.success(), "{case}");
+        let log = fs::read_to_string(&retry_log).unwrap();
+        assert!(log.contains("start refused"), "{case}: {log}");
+        assert!(transaction.join("forward-only").is_file(), "{case}");
+
+        fs::remove_file(root.join("var/lib/bloom/start-fails")).unwrap();
+        let retried = run_linux_upgrade_harness(
+            &harness,
+            &installer,
+            &root,
+            "retry",
+            &retry_log,
+            &["all", &old_digest, &new_digest],
+        );
+        let stderr = String::from_utf8_lossy(&retried.stderr);
+        assert!(retried.status.success(), "{case}: {stderr}");
+        let log = fs::read_to_string(&retry_log).unwrap();
+        assert!(
+            log.contains(&format!("start current=releases/{new_digest}")),
+            "{case}: {log}"
+        );
+        assert!(!transaction.exists(), "{case}");
+    }
+}
+
+/// A process killed while deleting a forward-only transaction must not leave
+/// one that recovery would roll back over migrated state.
+#[test]
+fn linux_upgrade_interrupted_cleanup_never_rolls_back_a_forward_only_upgrade() {
+    let harness_directory = tempfile::tempdir().unwrap();
+    let harness = write_linux_upgrade_harness(harness_directory.path());
+    let directory = tempfile::tempdir().unwrap();
+    let (root, old_digest, new_digest, killed) =
+        stage_forward_only_linux_upgrade(directory.path(), &harness, "finish-killed", |root| {
+            raise_linux_candidate_broker_state(root)
+        });
+    assert!(!killed.status.success());
+    let recovered = run_linux_upgrade_harness(
+        &harness,
+        &release_script("install-linux.sh"),
+        &root,
+        "recover",
+        &directory.path().join("recover.log"),
+        &[&old_digest, &new_digest],
+    );
+    let stderr = String::from_utf8_lossy(&recovered.stderr);
+    assert!(recovered.status.success(), "{stderr}");
+    assert!(!stderr.contains("restoring"), "{stderr}");
+    let leftovers: Vec<_> = fs::read_dir(root.join("var/lib/bloom"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().starts_with("upgrade-transaction"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
 }
 
 #[test]
@@ -4791,7 +5057,7 @@ fn linux_upgrade_recovery_shares_templates_and_rejects_foreign_transactions() {
         stage_interrupted_linux_root(future_root.path(), &harness, "all");
     fs::write(
         root.join("var/lib/bloom/upgrade-transaction/schema"),
-        "bloom.linux-upgrade-transaction.3\n",
+        "bloom.linux-upgrade-transaction.4\n",
     )
     .unwrap();
     let future = run_linux_installer(

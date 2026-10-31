@@ -19,6 +19,7 @@ enrollment_scratch=""
 upgrade_transaction=""
 upgrade_transaction_scratch=""
 upgrade_rollback_required=false
+linux_upgrade_resume=false
 
 cleanup_scratch() {
   status=$?
@@ -598,7 +599,76 @@ install_linux_release() {
   for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
     install -m 0755 "$payload/bin/$binary" "$stage/$binary"
   done
+  # Records the state versions this release's services migrate to, so a later
+  # upgrade can tell whether rolling back to this release is safe.
+  if [[ -f "$payload/compatibility-v1.toml" && ! -L "$payload/compatibility-v1.toml" ]]; then
+    install -m 0644 "$payload/compatibility-v1.toml" "$stage/compatibility-v1.toml"
+  fi
   mv "$stage" "$release"
+}
+
+# Prints one field (current, downgrade_floor, migration_floor) of a service's
+# declared durable state, or nothing when the release predates the record.
+# The fields mean what they mean in install-macos.sh: `current` is the state
+# the release writes, `downgrade_floor` the oldest reader that can still open
+# it, and `migration_floor` the oldest state the release can migrate from.
+linux_release_state_field() {
+  local record="$1/usr/libexec/bloom/releases/$2/compatibility-v1.toml"
+  [[ -f "$record" && ! -L "$record" ]] || return 0
+  awk -v section="[state.$3]" -v field="$4" '
+    $0 == section { inside = 1; next }
+    inside && /^\[/ { exit }
+    inside && $1 == field && $2 == "=" { print $3; exit }
+  ' "$record"
+}
+
+# Succeeds when the candidate's services may migrate Machine, Broker, or
+# Signer state beyond what the previous release can read. Their first start
+# then makes rollback unsafe: the previous release could not open the
+# migrated state, and restoring older state would erase custody changes the
+# candidate accepted. A release installed before this record existed is
+# treated as forward-only, because nothing says which state it reads.
+linux_upgrade_is_forward_only() {
+  local install_root="$1" old_digest="$2" new_digest="$3" service installed floor
+  for service in machine broker signer; do
+    installed="$(linux_release_state_field "$install_root" "$old_digest" "$service" current)"
+    floor="$(linux_release_state_field "$install_root" "$new_digest" "$service" downgrade_floor)"
+    [[ "$installed" =~ ^[1-9][0-9]*$ && "$floor" =~ ^[1-9][0-9]*$ ]] || return 0
+    ((installed >= floor)) || return 0
+  done
+  return 1
+}
+
+# Refuses, before anything is stopped or switched, a candidate whose state
+# record is malformed, older than the installed state, or unable to migrate
+# from it — the same checks install-macos.sh makes. A release without a
+# record is not checked; its upgrade is forward-only instead. That includes a
+# candidate an older installer staged before records existed, which is reused
+# as is and would otherwise be refused on every retry.
+check_linux_candidate_state() {
+  local install_root="$1" old_digest="$2" new_digest="$3" service installed current floor migration
+  [[ -f "$install_root/usr/libexec/bloom/releases/$new_digest/compatibility-v1.toml" ]] || return 0
+  for service in machine broker signer; do
+    installed="$(linux_release_state_field "$install_root" "$old_digest" "$service" current)"
+    [[ -n "$installed" ]] || return 0
+    current="$(linux_release_state_field "$install_root" "$new_digest" "$service" current)"
+    floor="$(linux_release_state_field "$install_root" "$new_digest" "$service" downgrade_floor)"
+    migration="$(linux_release_state_field "$install_root" "$new_digest" "$service" migration_floor)"
+    [[ "$installed" =~ ^[1-9][0-9]*$ && "$current" =~ ^[1-9][0-9]*$ && \
+      "$floor" =~ ^[1-9][0-9]*$ && "$migration" =~ ^[1-9][0-9]*$ ]] &&
+      ((migration <= floor && floor <= current)) || {
+      echo "malformed $service state compatibility metadata; nothing was changed" >&2
+      return 65
+    }
+    ((current >= installed)) || {
+      echo "$service state-schema downgrade rejected; nothing was changed" >&2
+      return 65
+    }
+    ((installed >= migration)) || {
+      echo "$service installed state is below the candidate migration floor; nothing was changed" >&2
+      return 65
+    }
+  done
 }
 
 capture_legacy_linux_release() {
@@ -966,6 +1036,14 @@ start_linux_release_set() {
 upgrade_root=""
 upgrade_old_digest=""
 
+# Succeeds when the install must run the upgrade steps: it changes the
+# release, or recovery kept a forward-only candidate that has not yet
+# started under the health gate.
+linux_release_upgrade_required() {
+  local installed="$1" requested="$2"
+  [[ "$linux_upgrade_resume" == true || (-n "$installed" && "$installed" != "$requested") ]]
+}
+
 begin_linux_upgrade() {
   local install_root="$1" old_digest="$2" new_digest="$3"
   local transaction_root="$install_root/var/lib/bloom"
@@ -975,15 +1053,31 @@ begin_linux_upgrade() {
     return 65
   }
   upgrade_transaction="$transaction_root/upgrade-transaction"
+  if [[ "$linux_upgrade_resume" == true ]]; then
+    linux_upgrade_resume=false
+    # Retrying the kept candidate resumes its recorded transaction.
+    if [[ "$new_digest" == "$(<"$upgrade_transaction/new-digest")" ]]; then
+      upgrade_root="$install_root"
+      upgrade_rollback_required=true
+      return 0
+    fi
+    # A different release supersedes it; the kept candidate is now the
+    # installed release this upgrade starts from.
+    retire_linux_upgrade_transaction
+  fi
   [[ ! -e "$upgrade_transaction" && ! -L "$upgrade_transaction" ]] || {
     echo "an interrupted Linux upgrade must be recovered first" >&2
     return 65
   }
   upgrade_transaction_scratch="${upgrade_transaction}.new.$$"
   mkdir -m 0700 "$upgrade_transaction_scratch"
-  printf '%s\n' bloom.linux-upgrade-transaction.2 > "$upgrade_transaction_scratch/schema"
+  printf '%s\n' bloom.linux-upgrade-transaction.3 > "$upgrade_transaction_scratch/schema"
   printf '%s\n' "$old_digest" > "$upgrade_transaction_scratch/old-digest"
   printf '%s\n' "$new_digest" > "$upgrade_transaction_scratch/new-digest"
+  # Committed with the transaction, before the candidate is selected.
+  if linux_upgrade_is_forward_only "$install_root" "$old_digest" "$new_digest"; then
+    : > "$upgrade_transaction_scratch/forward-only"
+  fi
   if ! snapshot_linux_upgrade_units "$install_root" "$upgrade_transaction_scratch"; then
     rm -rf -- "$upgrade_transaction_scratch"
     upgrade_transaction_scratch=""
@@ -1027,6 +1121,13 @@ restore_linux_previous_release() {
 rollback_linux_upgrade() {
   local rollback_status=0
   [[ -n "$upgrade_root" && -n "$upgrade_old_digest" ]] || return 0
+  # The candidate stays selected and the transaction stays recorded, so the
+  # next run resumes forward. No previous binary may run on migrated state.
+  if [[ -e "$upgrade_transaction/forward-only" ]]; then
+    stop_linux_release_set "$upgrade_root" || true
+    echo "Bloom Linux upgrade failed after its state migration began; state migration is forward-only, so the previous release was not restored. Retry this candidate release or install a newer one." >&2
+    return 1
+  fi
   # Never start services over a partially restored installation: the restart
   # below only runs when the previous release is restored coherently.
   if restore_linux_previous_release; then
@@ -1035,7 +1136,7 @@ rollback_linux_upgrade() {
     rollback_status=$?
   fi
   if ((rollback_status == 0)); then
-    rm -rf -- "$upgrade_transaction"
+    retire_linux_upgrade_transaction
     upgrade_rollback_required=false
   else
     echo "Bloom Linux upgrade rollback failed; transaction preserved for retry" >&2
@@ -1043,15 +1144,26 @@ rollback_linux_upgrade() {
   return "$rollback_status"
 }
 
+# Renames the transaction out of recovery's reach before deleting it. An
+# interrupted deletion could otherwise leave a transaction that has lost its
+# forward-only marker but kept its unit snapshot, and recovery would then
+# restore the previous release over migrated state. Recovery removes what an
+# interrupted deletion leaves behind.
+retire_linux_upgrade_transaction() {
+  local retired="${upgrade_transaction}.retired.$$"
+  mv -T -- "$upgrade_transaction" "$retired" && sync && rm -rf -- "$retired"
+}
+
 finish_linux_upgrade() {
-  rm -rf -- "$upgrade_transaction"
+  retire_linux_upgrade_transaction
   upgrade_rollback_required=false
   upgrade_transaction=""
   upgrade_root=""
   upgrade_old_digest=""
 }
 
-# Interrupted transactions always recover through one path: restore the
+# A forward-only transaction keeps its candidate selected (see below). Every
+# other interrupted transaction recovers through one path: restore the
 # coherent previous installation, then let the verified installation that
 # triggered recovery retry the requested release through the normal upgrade
 # steps. Starting the interrupted candidate directly is unsafe because the
@@ -1071,6 +1183,7 @@ recover_interrupted_linux_upgrade() {
   local transaction="$install_root/var/lib/bloom/upgrade-transaction"
   local schema old_digest new_digest
 
+  rm -rf -- "$transaction".retired.*
   [[ -e "$transaction" || -L "$transaction" ]] || return 0
   [[ -d "$transaction" && ! -L "$transaction" ]] || {
     echo "invalid interrupted Linux upgrade" >&2
@@ -1085,11 +1198,13 @@ recover_interrupted_linux_upgrade() {
   schema="$(<"$transaction/schema")"
   old_digest="$(<"$transaction/old-digest")"
   new_digest="$(<"$transaction/new-digest")"
-  # Schema 1 predates unit snapshots and is recovered without one. It is the
-  # only format an already-deployed installer can leave behind, and there is
-  # no supported path that reaches a running release without rolling it back.
+  # Schema 1 predates unit snapshots and is recovered without one. Schemas 1
+  # and 2 predate the forward-only marker and always roll back, as the
+  # installers that wrote them would. Schema 3 keeps older installers, which
+  # would ignore the marker, from rolling a forward-only upgrade back.
   [[ ("$schema" == bloom.linux-upgrade-transaction.1 || \
-    "$schema" == bloom.linux-upgrade-transaction.2) && \
+    "$schema" == bloom.linux-upgrade-transaction.2 || \
+    "$schema" == bloom.linux-upgrade-transaction.3) && \
     "$old_digest" =~ ^[0-9a-f]{64}$ && \
     "$new_digest" =~ ^[0-9a-f]{64}$ ]] || {
     echo "invalid interrupted Linux upgrade" >&2
@@ -1101,6 +1216,20 @@ recover_interrupted_linux_upgrade() {
   # upgrade_rollback_required stays false: a failed restoration preserves the
   # transaction for the next run rather than attempting a restart from the
   # EXIT trap.
+  if [[ -e "$transaction/forward-only" ]]; then
+    # Keep the candidate and the transaction. The install that follows runs
+    # the upgrade steps even when it requests this same candidate, so every
+    # login is rewritten and started under the health gate before the
+    # transaction is retired. Until then, any later run lands here again.
+    echo "the interrupted Bloom Linux upgrade is forward-only; keeping its candidate release and retrying" >&2
+    if ! switch_linux_release "$install_root" "$new_digest" ||
+      ! rewrite_linux_release_set "$install_root" "$new_digest" active; then
+      echo "Bloom Linux upgrade recovery failed; transaction preserved for retry" >&2
+      return 65
+    fi
+    linux_upgrade_resume=true
+    return 0
+  fi
   echo "restoring the interrupted Bloom Linux release before retrying" >&2
   if ! restore_linux_previous_release; then
     echo "Bloom Linux upgrade recovery failed; transaction preserved for retry" >&2
@@ -1393,6 +1522,8 @@ case "$action" in
         echo "a different Linux release must be installed through an active enrollment" >&2
         exit 65
       }
+    fi
+    if linux_release_upgrade_required "$shared_release_digest" "$release_digest"; then
       release_upgrade=true
     fi
     if [[ "$release_upgrade" == true ]]; then
@@ -1401,6 +1532,7 @@ case "$action" in
     capture_legacy_linux_release "$root" "$shared_release_digest"
     install_linux_release "$root" "$payload" "$release_digest"
     if [[ "$release_upgrade" == true ]]; then
+      check_linux_candidate_state "$root" "$shared_release_digest" "$release_digest"
       begin_linux_upgrade "$root" "$shared_release_digest" "$release_digest"
       stop_linux_release_set "$root"
       rewrite_linux_release_set "$root" "$release_digest" activating
