@@ -86,11 +86,17 @@ reports only the blockhash/dwell trigger.
 Expiry cleanup retires unsigned pending entries after the live block height
 passes the blockhash window. A recorded signature also requires every configured
 endpoint to report history absence after that endpoint's finalized height passes
-the window, and that endpoint's oldest available block must precede the window.
-Errors, lagging endpoints and pruned history retain the entry; an observed
-signature moves to reconciliation. Simulation exposes signed bytes to an RPC,
-so a missing broadcast marker does not prove they were never submitted. A
-broadcast marker always prevents expiry cleanup. A broadcast attempt's signature
+the window, and that endpoint's oldest available block, sampled after its
+`null`, must precede the window. Errors, lagging endpoints and pruned history
+retain the entry; an observed signature moves to reconciliation. The oldest
+available block is a best-effort coverage check, not a proof: Agave reports
+the lower of its local ledger and BigTable starts, a BigTable lookup error
+reads as `null`, and a ledger stored while transaction history was disabled
+holds blocks without statuses. Simulation exposes signed bytes to an RPC, so
+broadcast writes its marker and moves the entry to `sent` before simulating;
+from then on cancel and restage refuse it and only reconciliation retires it,
+including after a failed simulation. A broadcast marker always prevents expiry
+cleanup. A broadcast attempt's signature
 stays readable in `broadcast_attempted.json` after retirement; a signature that
 was never broadcast stays private, and raw signed transactions are removed.
 The mounted `intent.json` reports the outbox's current status, including after

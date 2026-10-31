@@ -611,17 +611,17 @@ impl SolanaOutbox {
         Ok(entry.staged.signature.clone())
     }
 
-    /// Atomically persist the sanitized, public preflight result next to a
-    /// pending entry. It follows the entry across a successful transition.
+    /// Atomically persist the sanitized, public preflight result next to an
+    /// entry already claimed as `sent`, since simulation exposes signed bytes.
     pub fn write_simulation(
         &self,
         entry: &SolanaOutboxEntry,
         body: &[u8],
     ) -> Result<(), OutboxError> {
-        if entry.state != SolanaOutboxState::Pending {
+        if entry.state != SolanaOutboxState::Sent {
             return Err(OutboxError::StateMismatch {
                 id: entry.staged.id.clone(),
-                expected: SolanaOutboxState::Pending.dirname(),
+                expected: SolanaOutboxState::Sent.dirname(),
                 actual: entry.state.dirname(),
             });
         }

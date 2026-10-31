@@ -342,23 +342,17 @@ impl SolanaClient {
         last_valid_block_height: u64,
     ) -> Vec<SignatureStatusProbe> {
         // Establish each endpoint's finalized height BEFORE asking its
-        // history. A fast endpoint cannot qualify a lagging peer's absence.
-        // Both probe batches retain configured endpoint order (no failover).
+        // history, so every block the transfer could land in was already
+        // finalized when the `null` was produced. A fast endpoint cannot
+        // qualify a lagging peer's absence. Every probe batch retains
+        // configured endpoint order (no failover).
         let heights = self
             .inner
             .rpc
             .probe_all_endpoints("getBlockHeight", &json!([{ "commitment": "finalized" }]))
             .await;
-        // A history search only covers the blocks an endpoint still holds.
-        // A pruned endpoint answers `null` for a transfer that landed before
-        // its oldest block, so its absence counts only if that oldest block
-        // precedes every slot the transaction could have landed in.
-        let oldest = self
+        let statuses = self
             .inner
-            .rpc
-            .probe_all_endpoints("getFirstAvailableBlock", &json!([]))
-            .await;
-        self.inner
             .rpc
             .probe_all_endpoints(
                 "getSignatureStatuses",
@@ -370,7 +364,19 @@ impl SolanaClient {
                     }
                 ]),
             )
-            .await
+            .await;
+        // A history search only covers the blocks an endpoint still holds.
+        // A pruned endpoint answers `null` for a transfer that landed before
+        // its oldest block, so its absence counts only if that oldest block
+        // precedes every slot the transaction could have landed in. Sample
+        // it AFTER the `null`: pruning only advances, so a later sample also
+        // covered the earlier search.
+        let oldest = self
+            .inner
+            .rpc
+            .probe_all_endpoints("getFirstAvailableBlock", &json!([]))
+            .await;
+        statuses
             .into_iter()
             .zip(heights.into_iter().zip(oldest))
             .map(|(probe, (height, oldest))| SignatureStatusProbe {
