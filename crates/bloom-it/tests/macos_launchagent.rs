@@ -467,6 +467,17 @@ fn macos_conformance_workflows_consume_unified_candidates() {
     let ci = fs::read_to_string(workspace().join(".github/workflows/ci.yml")).unwrap();
     assert!(ci.contains(&format!("broker_ref: {broker_commit}")));
     assert!(ci.contains(&format!("signer_ref: {signer_commit}")));
+
+    // These assertions read both conformance workflows, so editing either
+    // must trigger CI, which runs this binary on Linux. The staged installer
+    // test compiles only on macOS and runs in the Unix-principal workflow.
+    let code_paths = ci.split("- \"Cargo.toml\"").next().unwrap();
+    assert!(code_paths.contains("- \".github/workflows/macos-unix-conformance.yml\""));
+    assert!(code_paths.contains("- \".github/workflows/macos-two-login-conformance.yml\""));
+    assert!(ci.contains("-E 'package(bloom-it) and binary(macos_launchagent)'"));
+    let unix = fs::read_to_string(workspace().join(".github/workflows/macos-unix-conformance.yml"))
+        .unwrap();
+    assert!(unix.contains("-p bloom-it --test macos_launchagent"));
 }
 
 #[test]
