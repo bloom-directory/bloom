@@ -499,6 +499,63 @@ requests can proceed within any remaining budget. Do not repeat an unresolved
 payment by restaging it. A failed merchant retry still counts toward recorded
 spending.
 
+A Petal that stages an EVM transaction usually produces a generic contract
+call: Bloom cannot check what the calldata does, so its staged plan describes
+an opaque call to the contract it is addressed to. One shape is different. A
+canonical ERC-20 `transfer(address,uint256)` call with no native value,
+**addressed to a token in Bloom's curated registry**, is decoded to its
+recipient and amount, and Bloom rebuilds the calldata from those two fields
+instead of forwarding the Petal's bytes. It is then classified as a token
+transfer: the staged plan (`plan.md`) names the token, the amount and the
+recipient, and the wallet's allowed destinations are checked against the
+**recipient**, not the token contract. A different selector, any nonzero
+native value, or a target contract the registry does not list keeps it
+generic, and so does a node whose reported chain id differs from the
+configured chain, since the registry is read by chain and the signature is
+for the reported id. The registry condition is what makes the classification
+mean anything: matching the selector only proves what the call looks like, and
+any contract can answer `decimals()` and `symbol()` while doing something else
+under that selector.
+
+The destination check runs once, when the transaction is staged, against the
+destinations the wallet allows at that moment. A recipient the wallet does not
+list shows as a failed `allowlists.recipients` check in the plan you get back,
+and confirming that entry fails, even if the token contract is listed. If the
+owner adds the recipient before you confirm, staging the same request again
+still returns the old pending entry, and confirming it fails; stage once more
+after that to get a fresh one.
+
+Either way, a Petal-staged transaction needs a fresh owner approval: Bloom
+signs it only through an exact approval the owner gives in the approval
+ceremony, which decodes the transaction bytes itself. Handle the ordinary
+approval challenge every time.
+
+Because Bloom rebuilds that one shape, it must encode exactly. Calldata that
+is already ERC-20 transfer shaped — the `transfer` selector, exactly 68 bytes,
+no native value — has to decode and then re-encode back to the bytes you
+supplied. What fails this is noncanonical padding: the address argument
+occupies a 32-byte word whose twelve high-order bytes must be zero. Such a
+write is refused at staging with an error that begins `invalid: ERC-20
+transfer calldata: type check failed for "(address,uint256)"`. Nothing is staged and
+no nonce is reserved: the check runs before the transaction is staged.
+Left-pad the address with zeros and stage again; retrying the same bytes fails
+the same way.
+
+The length is held exactly too. A `transfer` call with no native value to a
+registered token that is longer or shorter than 68 bytes is refused at
+staging, with an error that ERC-20 transfer calldata to a registered token
+must be exactly 68 bytes. It is not left generic: the token ignores trailing
+calldata and would still make the transfer, while a generic call is checked
+against the token contract instead of the recipient. Drop any suffix, such as
+an attribution tag, and send exactly the selector and its two words.
+
+This is not a general rule about padding. A call Bloom leaves generic keeps
+the bytes you gave it and stages normally, even with that padding — including
+a call carrying nonzero native value, one bearing another selector, and one
+addressed to a contract the registry does not list. Bloom rejects only what it
+would otherwise rewrite, and a transfer to a registered token in any other
+length.
+
 ## Local development chains
 
 A local Anvil node is not configured by default. Bloom reads a chain's files

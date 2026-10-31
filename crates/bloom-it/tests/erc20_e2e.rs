@@ -153,10 +153,11 @@ fn anvil_chain_spec(rpc_url: &str) -> ChainSpec {
     spec
 }
 
-/// Stage an ERC-20 transfer to a hardcoded token symbol that resolves
-/// to the canonical mainnet address. On a fresh anvil there is no code
-/// at that address, so `decimals()` returns empty and stage fails with
-/// a `Token` error — which proves the path is wired end-to-end.
+/// Stage an ERC-20 transfer naming mainnet USDC by address. On a fresh anvil
+/// there is no code at that address, so `decimals()` returns empty and stage
+/// fails with a `Token` error — which proves the path is wired end-to-end. A
+/// local Anvil has no curated tokens, so the token is named by address rather
+/// than by symbol.
 #[tokio::test(flavor = "multi_thread")]
 async fn erc20_stage_fails_when_decimals_unreadable() -> Result<()> {
     let anvil = spawn_anvil(false).await?;
@@ -173,7 +174,7 @@ async fn erc20_stage_fails_when_decimals_unreadable() -> Result<()> {
         body: RawIntentBody::Send {
             to: ANVIL_ADDR1.to_string(),
             value: String::new(),
-            token: Some("USDC".into()),
+            token: Some("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".into()),
             amount: "100".into(),
             data: None,
         },
