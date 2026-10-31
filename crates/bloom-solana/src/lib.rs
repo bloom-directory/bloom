@@ -349,6 +349,15 @@ impl SolanaClient {
             .rpc
             .probe_all_endpoints("getBlockHeight", &json!([{ "commitment": "finalized" }]))
             .await;
+        // A history search only covers the blocks an endpoint still holds.
+        // A pruned endpoint answers `null` for a transfer that landed before
+        // its oldest block, so its absence counts only if that oldest block
+        // precedes every slot the transaction could have landed in.
+        let oldest = self
+            .inner
+            .rpc
+            .probe_all_endpoints("getFirstAvailableBlock", &json!([]))
+            .await;
         self.inner
             .rpc
             .probe_all_endpoints(
@@ -363,8 +372,8 @@ impl SolanaClient {
             )
             .await
             .into_iter()
-            .zip(heights)
-            .map(|(probe, height)| SignatureStatusProbe {
+            .zip(heights.into_iter().zip(oldest))
+            .map(|(probe, (height, oldest))| SignatureStatusProbe {
                 endpoint_label: probe.endpoint_label,
                 status: probe.outcome.and_then(|result| {
                     let entry = result
@@ -379,11 +388,19 @@ impl SolanaClient {
                     if entry.is_null() {
                         let finalized = height.outcome?.as_u64().ok_or_else(||
                             SolanaRpcError::Decode("getBlockHeight: expected integer".into()))?;
-                        if finalized > last_valid_block_height {
-                            Ok(None)
-                        } else {
-                            Err(SolanaRpcError::Decode("signature absence is unproven before this endpoint's finalized blockhash expiry".into()))
+                        if finalized <= last_valid_block_height {
+                            return Err(SolanaRpcError::Decode("signature absence is unproven before this endpoint's finalized blockhash expiry".into()));
                         }
+                        let oldest = oldest.outcome?.as_u64().ok_or_else(||
+                            SolanaRpcError::Decode("getFirstAvailableBlock: expected integer".into()))?;
+                        // A slot is never below its block height, so the
+                        // transaction cannot land in a slot below its
+                        // blockhash's height. That height is at most
+                        // `HISTORY_MARGIN` below the last valid height.
+                        if oldest > last_valid_block_height.saturating_sub(HISTORY_MARGIN) {
+                            return Err(SolanaRpcError::Decode("signature absence is unproven: this endpoint's history starts after the blockhash window".into()));
+                        }
+                        Ok(None)
                     } else {
                         serde_json::from_value::<SignatureStatus>(entry)
                             .map(Some)
@@ -396,6 +413,10 @@ impl SolanaClient {
             .collect()
     }
 }
+
+/// Blocks between a blockhash and its last valid height. Validators use 150;
+/// older releases used 300, so the larger value keeps the bound conservative.
+const HISTORY_MARGIN: u64 = 300;
 
 /// One endpoint's independent finalized-status observation for a single
 /// signature, from [`SolanaClient::probe_signature_status_all_endpoints`].
