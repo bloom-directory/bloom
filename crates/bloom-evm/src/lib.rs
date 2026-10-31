@@ -593,6 +593,24 @@ impl ChainClient {
         Ok(self.primary.get_gas_price().await?)
     }
 
+    pub async fn max_priority_fee_per_gas(&self) -> Result<u128, ChainError> {
+        Ok(self.primary.get_max_priority_fee_per_gas().await?)
+    }
+
+    /// Fee caps from a known gas-price quote and the node's priority quote.
+    pub async fn eip1559_fees(&self, gas_price: u128) -> (u128, u128) {
+        let priority = match self.max_priority_fee_per_gas().await {
+            Ok(priority) => priority.max(1),
+            Err(error) => {
+                // A fraction of gasPrice can fall below a chain's minimum
+                // tip. Its full quote is the conservative fallback.
+                warn!(%error, chain = %self.spec.name, "tx.priority_fee_fallback");
+                gas_price.max(1)
+            }
+        };
+        (gas_price.max(priority).saturating_mul(2), priority)
+    }
+
     pub async fn estimate_gas(
         &self,
         tx: &alloy::rpc::types::eth::TransactionRequest,

@@ -369,7 +369,9 @@ project into the central outbox:
 5. Confirm only the exact inspected action.
 6. If approval is required, validate the challenge and hand its ceremony URL to
    the human.
-7. After the ceremony completes, retry only the exact documented `retry_path`.
+7. After the ceremony completes, write the challenge's `retry_body` to its
+   exact `retry_path`. An omitted `retry_body` means `confirm`; serialize an
+   object as JSON. Keep a fee-repair body unchanged through approval and retry.
 8. Read the sent, failed, or receipt projection before reporting success.
 
 A confirm write may return permission denied while projecting

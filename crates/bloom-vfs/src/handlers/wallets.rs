@@ -4531,44 +4531,43 @@ impl WalletsHandler {
                     .map_err(err_be)?;
                 Ok(())
             }
-            // outbox/pending/<id>/replace — restage with bumped fees from
-            // the same intent body the user provides (fix #10). Body is a
-            // RawIntent (TOML/JSON/shell). The original is left in place so
-            // diff against the bumped tx is visible; the engine writes
-            // `replacement_intent.json` alongside.
+            // outbox/pending/<id>/replace accepts only an exact EIP-1559 fee
+            // pair. Any other body is refused before anything is recorded.
             [state, id, fname] if state == "pending" && fname == "replace" => {
                 self.require_staged_by(wallet, chain, id, &scope)?;
-                let body = std::str::from_utf8(data)
-                    .map_err(|_| HandlerError::invalid("non-utf8 replace intent"))?;
-                if body.trim().is_empty() {
-                    return Err(HandlerError::invalid(
-                        "replace requires a non-empty intent body",
-                    ));
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct FeeRepair {
+                    max_fee_per_gas: String,
+                    max_priority_fee_per_gas: String,
                 }
-                let intent: RawIntent = intent_parser::parse(body).map_err(err_be)?;
-                // Bump at >= 10% (mempool floor) and substitute the
-                // calldata derived from the new intent — same nonce,
-                // possibly different to / value / data. Use the
-                // address book the handler holds so name lookups in
-                // the body resolve identically to a fresh stage.
+                let request: FeeRepair =
+                    serde_json::from_slice(data).map_err(|_| HandlerError::PermissionDenied)?;
+                let fees = bloom_tx::Eip1559FeeOverrides::from_decimal_pair(
+                    Some(&request.max_fee_per_gas),
+                    Some(&request.max_priority_fee_per_gas),
+                    client.spec().legacy_tx,
+                )
+                .map_err(err_be)?
+                .expect("complete fee pair");
                 self.require_outbox_petal_eligibility_for_action(wallet, chain, id, true)
                     .await?;
-                let _ = self
-                    .tx_engine
-                    .replace_with_intent(
+                self.tx_engine
+                    .replace_fees(
                         self.write_permit()?,
                         wallet,
                         chain,
                         id,
                         &client,
-                        10,
-                        Some(intent),
-                        Some(self.address_book.as_ref()),
+                        fees,
                         policy,
                     )
                     .await
-                    .map_err(err_be)?;
-                Ok(())
+                    .map(|_| ())
+                    .map_err(|error| match error {
+                        TxEngineError::ApprovalRequired(_) => HandlerError::PermissionDenied,
+                        other => err_be(other),
+                    })
             }
             _ => Err(HandlerError::PermissionDenied),
         }
@@ -10114,9 +10113,10 @@ value = "0""#,
         assert!(matches!(r, Err(HandlerError::Invalid(_))), "got: {r:?}");
     }
 
-    /// Fix #10: replace route exists and demands a non-empty body.
+    /// `replace` accepts only the exact fee pair; every other body is
+    /// permission denied and records nothing.
     #[tokio::test]
-    async fn replace_route_demands_body() {
+    async fn replace_refuses_any_body_but_the_fee_pair() {
         let f = make_handler_with_chain(true);
         seed_pending(&f, "0001-test");
         let p = VfsPath::parse(&format!(
@@ -10124,8 +10124,35 @@ value = "0""#,
             f.wallet_name
         ))
         .unwrap();
-        let r = f.handler.write(&p, b"").await;
-        assert!(matches!(r, Err(HandlerError::Invalid(_))), "got: {r:?}");
+        for body in [
+            &b""[..],
+            br#"{"max_fee_per_gas":"60000000000"}"#,
+            br#"{"max_fee_per_gas":"6","max_priority_fee_per_gas":"3","to":"0x00"}"#,
+            br#"to = "0x0000000000000000000000000000000000000002""#,
+        ] {
+            let r = f.handler.write(&p, body).await;
+            assert!(
+                matches!(r, Err(HandlerError::PermissionDenied)),
+                "got: {r:?}"
+            );
+        }
+        fn replacement_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    replacement_files(&path, out);
+                } else if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("replacement")
+                {
+                    out.push(path);
+                }
+            }
+        }
+        let mut recorded = Vec::new();
+        replacement_files(f._tmp.path(), &mut recorded);
+        assert!(recorded.is_empty(), "{recorded:?}");
     }
 
     /// Fix #10: list of `pending/<id>/` advertises the writable control

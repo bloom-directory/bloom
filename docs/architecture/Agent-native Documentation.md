@@ -42,6 +42,12 @@ from the release it ships with.
   Machine-owned; signing uses Broker authorization and Signer-held keys; the
   owner key is never handed to an agent or Machine;
 - the outbox stage/confirm flow;
+- pending EVM fee repair through `replace`, using a complete decimal-string
+  fee pair from the chain's mounted gas quote. IPC admits only those two
+  fields; the transaction engine preserves the call and nonce, requires
+  both caps to increase, and obtains fresh Broker authorization for the
+  replacement signing payload. The approval projection binds `retry_body`
+  and `retry_path` to that request;
 - paid HTTP under `/requests` (staging, `plan.md`, `confirm`, spend caps);
 - the mounted Sealed Approval lifecycle for the outbox confirm flow —
   permission-denied confirm writes, `approval_challenge.json`,
