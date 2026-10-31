@@ -2863,19 +2863,24 @@ impl TxEngine {
         )?;
         self.outbox
             .transition(entry, crate::outbox::OutboxState::Sent)?;
-        if let Some(action_id) = staged.action_id.as_deref() {
-            let signing_hash = self
+        // The sent row is the record from here on: a failed central
+        // projection must not report an accepted broadcast as failed.
+        if let Some(action_id) = staged.action_id.as_deref()
+            && let Err(error) = self
                 .build_unsigned_evm_tx(&staged, chain)
-                .map(|unsigned| Self::unsigned_signing_hash(&unsigned))?;
-            self.write_central_evm_result(EvmCentralResult {
-                action_id,
-                state: OutboxState::Sent,
-                outcome: "sent",
-                tx_hash,
-                nonce: staged.nonce,
-                signing_hash: &signing_hash,
-                action_kind: action_kind.action_kind(),
-            })?;
+                .and_then(|unsigned| {
+                    self.write_central_evm_result(EvmCentralResult {
+                        action_id,
+                        state: OutboxState::Sent,
+                        outcome: "sent",
+                        tx_hash,
+                        nonce: staged.nonce,
+                        signing_hash: &Self::unsigned_signing_hash(&unsigned),
+                        action_kind: action_kind.action_kind(),
+                    })
+                })
+        {
+            warn!(id = %staged.id, %action_id, %error, "tx.central_result_unwritten");
         }
         Ok(staged)
     }
@@ -4428,34 +4433,6 @@ impl TxEngine {
         }
     }
 
-    /// Issue a same-nonce replacement tx with bumped fees. The original
-    /// must already be persisted in the outbox and be either still staged
-    /// in `pending/` or broadcast-but-unmined in `sent/`. Floors `bump_pct`
-    /// at 10 to satisfy the mempool's >= 10% rule.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn replace(
-        &self,
-        permit: &HomeWritePermit,
-        wallet: &str,
-        chain_name: &str,
-        original_id: &str,
-        chain: &ChainClient,
-        bump_pct: u32,
-        policy: &Policy,
-    ) -> Result<StagedTx, TxEngineError> {
-        self.replace_inner(
-            permit,
-            wallet,
-            chain_name,
-            original_id,
-            chain,
-            bump_pct,
-            policy,
-            None,
-        )
-        .await
-    }
-
     /// Replace a rejected pending transaction's fees without changing its
     /// nonce, destination, value, calldata, account, or Petal provenance.
     #[allow(clippy::too_many_arguments)]
@@ -4469,33 +4446,7 @@ impl TxEngine {
         fees: Eip1559FeeOverrides,
         policy: &Policy,
     ) -> Result<StagedTx, TxEngineError> {
-        self.replace_inner(
-            permit,
-            wallet,
-            chain_name,
-            original_id,
-            chain,
-            10,
-            policy,
-            Some(fees),
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn replace_inner(
-        &self,
-        permit: &HomeWritePermit,
-        wallet: &str,
-        chain_name: &str,
-        original_id: &str,
-        chain: &ChainClient,
-        bump_pct: u32,
-        policy: &Policy,
-        fees: Option<Eip1559FeeOverrides>,
-    ) -> Result<StagedTx, TxEngineError> {
         self.assert_write_permit(permit)?;
-        let bump = bump_pct.max(10);
         let entry = self.read_replaceable_entry(wallet, chain_name, original_id)?;
         if entry
             .dir
@@ -4512,41 +4463,38 @@ impl TxEngine {
                     .into(),
             ));
         }
-        if fees.is_some()
-            && (entry.state != OutboxState::Pending || entry.staged.gas_price.is_some())
-        {
+        if entry.state != OutboxState::Pending || entry.staged.gas_price.is_some() {
             return Err(TxEngineError::InvalidFeeOverride(
                 "fee repair requires a pending EIP-1559 transaction".into(),
             ));
         }
-        if fees.is_some() {
-            // A repair whose send response was lost may already be signed and
-            // accepted. Settle that exact attempt; never sign another.
-            if let Some(attempt) = self
-                .outbox
-                .read_broadcast_attempt(&entry, BroadcastAttemptKind::Replacement)?
-            {
-                let replacement = serde_json::from_slice(
-                    &std::fs::read(entry.dir.join("replacement_intent.json"))
-                        .map_err(OutboxError::Io)?,
+        // A repair whose send response was lost may already be signed and
+        // accepted. Settle that exact attempt; never sign another.
+        if let Some(attempt) = self
+            .outbox
+            .read_broadcast_attempt(&entry, BroadcastAttemptKind::Replacement)?
+        {
+            let replacement = serde_json::from_slice(
+                &std::fs::read(entry.dir.join("replacement_intent.json"))
+                    .map_err(OutboxError::Io)?,
+            )
+            .map_err(OutboxError::Json)?;
+            let settled = self
+                .reconcile_attempt(
+                    &entry,
+                    EvmOutboxActionKind::Replace,
+                    replacement,
+                    attempt,
+                    chain,
+                    policy,
                 )
-                .map_err(OutboxError::Json)?;
-                return self
-                    .reconcile_attempt(
-                        &entry,
-                        EvmOutboxActionKind::Replace,
-                        replacement,
-                        attempt,
-                        chain,
-                        policy,
-                    )
-                    .await;
-            }
-            // Repair admits a pending entry to broadcast, so it passes the
-            // same dependency gate as confirm.
-            if let Some(dep_id) = entry.staged.depends_on.as_deref() {
-                self.ensure_dependency_satisfied(wallet, chain_name, dep_id)?;
-            }
+                .await;
+            return self.retire_if_rejected(&entry, settled);
+        }
+        // Repair admits a pending entry to broadcast, so it passes the
+        // same dependency gate as confirm.
+        if let Some(dep_id) = entry.staged.depends_on.as_deref() {
+            self.ensure_dependency_satisfied(wallet, chain_name, dep_id)?;
         }
         let original = &entry.staged;
         self.assert_nonce_still_replaceable(
@@ -4563,62 +4511,59 @@ impl TxEngine {
         bumped.status = TxStatus::Pending;
         bumped.tx_hash = None;
 
-        bump_fees_in_place(&mut bumped, bump);
-        if let Some(fees) = fees {
-            if fees.max_fee_per_gas
+        bump_fees_in_place(&mut bumped, 10);
+        if fees.max_fee_per_gas
+            < bumped
+                .max_fee_per_gas
+                .as_deref()
+                .unwrap_or("0")
+                .parse::<u128>()
+                .unwrap_or(u128::MAX)
+            || fees.max_priority_fee_per_gas
                 < bumped
-                    .max_fee_per_gas
+                    .max_priority_fee_per_gas
                     .as_deref()
                     .unwrap_or("0")
                     .parse::<u128>()
                     .unwrap_or(u128::MAX)
-                || fees.max_priority_fee_per_gas
-                    < bumped
-                        .max_priority_fee_per_gas
-                        .as_deref()
-                        .unwrap_or("0")
-                        .parse::<u128>()
-                        .unwrap_or(u128::MAX)
-            {
-                return Err(TxEngineError::InvalidFeeOverride(
-                    "replacement max fee and priority fee must each increase by at least 10%"
-                        .into(),
-                ));
-            }
-            bumped.max_fee_per_gas = Some(fees.max_fee_per_gas.to_string());
-            bumped.max_priority_fee_per_gas = Some(fees.max_priority_fee_per_gas.to_string());
-            // Same pre-broadcast simulation as confirm, before any ceremony.
-            self.simulate_or_reject(&bumped, chain).await?;
-            self.outbox.write_artefact(
-                &entry.dir,
-                "replacement_original.json",
-                &serde_json::to_vec_pretty(original).unwrap(),
-            )?;
-            self.outbox.write_artefact(
-                &entry.dir,
-                "replacement_intent.json",
-                &serde_json::to_vec_pretty(&bumped).unwrap(),
-            )?;
-            self.outbox.write_artefact(
-                &entry.dir,
-                "replacement_plan.md",
-                bloom_proto::PlanRender::render(
-                    &bumped,
-                    &chain.spec().native_symbol,
-                    chain.spec().native_decimals,
-                )
-                .as_bytes(),
-            )?;
-            self.outbox.write_artefact(
-                &entry.dir,
-                "replacement_request.json",
-                &serde_json::to_vec(&serde_json::json!({
-                    "max_fee_per_gas": fees.max_fee_per_gas.to_string(),
-                    "max_priority_fee_per_gas": fees.max_priority_fee_per_gas.to_string(),
-                }))
-                .unwrap(),
-            )?;
+        {
+            return Err(TxEngineError::InvalidFeeOverride(
+                "replacement max fee and priority fee must each increase by at least 10%".into(),
+            ));
         }
+        bumped.max_fee_per_gas = Some(fees.max_fee_per_gas.to_string());
+        bumped.max_priority_fee_per_gas = Some(fees.max_priority_fee_per_gas.to_string());
+        // Same pre-broadcast simulation as confirm, before any ceremony.
+        self.simulate_or_reject(&bumped, chain).await?;
+        self.outbox.write_artefact(
+            &entry.dir,
+            "replacement_original.json",
+            &serde_json::to_vec_pretty(original).unwrap(),
+        )?;
+        self.outbox.write_artefact(
+            &entry.dir,
+            "replacement_intent.json",
+            &serde_json::to_vec_pretty(&bumped).unwrap(),
+        )?;
+        self.outbox.write_artefact(
+            &entry.dir,
+            "replacement_plan.md",
+            bloom_proto::PlanRender::render(
+                &bumped,
+                &chain.spec().native_symbol,
+                chain.spec().native_decimals,
+            )
+            .as_bytes(),
+        )?;
+        self.outbox.write_artefact(
+            &entry.dir,
+            "replacement_request.json",
+            &serde_json::to_vec(&serde_json::json!({
+                "max_fee_per_gas": fees.max_fee_per_gas.to_string(),
+                "max_priority_fee_per_gas": fees.max_priority_fee_per_gas.to_string(),
+            }))
+            .unwrap(),
+        )?;
         let unsigned = self.build_unsigned_evm_tx(&bumped, chain)?;
         let prepared = PreparedEvmTx {
             signing_hash: Self::unsigned_signing_hash(&unsigned),
@@ -4634,7 +4579,7 @@ impl TxEngine {
         )
         .await?;
 
-        let tx_hash = match self
+        let submitted = self
             .submit_with_marker(
                 &entry,
                 EvmOutboxActionKind::Replace,
@@ -4643,60 +4588,14 @@ impl TxEngine {
                 policy,
                 prepared,
             )
-            .await
-        {
-            Err(TxEngineError::Chain(error))
-                if fees.is_some() && node_rejected_before_acceptance(&error) =>
-            {
-                // The node refused these bytes outright, so they never
-                // entered a mempool. Set the attempt and its completed signing
-                // record aside as evidence, so the next fee repair signs a new
-                // one instead of replaying the refused bytes.
-                let hash = self
-                    .outbox
-                    .set_aside_rejected_attempt(&entry, BroadcastAttemptKind::Replacement)?;
-                if let Some(hash) = hash {
-                    std::fs::rename(
-                        entry.dir.join(TRIAD_SIGNING_STATE_FILE),
-                        entry
-                            .dir
-                            .join(format!("{TRIAD_SIGNING_STATE_FILE}.rejected-{hash}")),
-                    )
-                    .or_else(|e| {
-                        if e.kind() == std::io::ErrorKind::NotFound {
-                            Ok(())
-                        } else {
-                            Err(e)
-                        }
-                    })
-                    .map_err(OutboxError::Io)?;
-                }
-                return Err(TxEngineError::Chain(error));
-            }
-            result => result?,
-        };
-        bumped.tx_hash = Some(format!("{:#x}", tx_hash));
-        bumped.status = TxStatus::Sent;
-
-        if fees.is_some() {
-            // Keep the original signed attempt as evidence, and follow the
-            // accepted replacement through the same account-owned outbox ID.
-            // `finalize_sent` records the hash and intent; nothing after the
-            // move to sent may fail the call.
-            bumped =
-                self.finalize_sent(&entry, bumped, tx_hash, EvmOutboxActionKind::Replace, chain)?;
-        } else {
-            self.outbox.write_artefact(
-                &entry.dir,
-                "replacement_tx_hash",
-                bumped.tx_hash.as_ref().unwrap().as_bytes(),
-            )?;
-            self.outbox.write_artefact(
-                &entry.dir,
-                "replacement_intent.json",
-                &serde_json::to_vec_pretty(&bumped).unwrap(),
-            )?;
-        }
+            .await;
+        let tx_hash = self.retire_if_rejected(&entry, submitted)?;
+        // Keep the original signed attempt as evidence, and follow the
+        // accepted replacement through the same account-owned outbox ID.
+        // `finalize_sent` records the hash and intent; nothing after the
+        // move to sent may fail the call.
+        let bumped =
+            self.finalize_sent(&entry, bumped, tx_hash, EvmOutboxActionKind::Replace, chain)?;
         let updated_entry = self.outbox.read(wallet, chain_name, original_id)?;
         let _ = self
             .outbox
@@ -4707,6 +4606,26 @@ impl TxEngine {
             "tx.replace"
         );
         Ok(bumped)
+    }
+
+    /// A node that refuses replacement bytes outright never put them in a
+    /// mempool. Set the attempt aside as evidence, so the next fee repair
+    /// signs a new one instead of replaying the refused bytes.
+    fn retire_if_rejected<T>(
+        &self,
+        entry: &crate::outbox::OutboxEntry,
+        result: Result<T, TxEngineError>,
+    ) -> Result<T, TxEngineError> {
+        if let Err(TxEngineError::Chain(error)) = &result
+            && node_rejected_before_acceptance(error)
+        {
+            self.outbox.set_aside_rejected_attempt(
+                entry,
+                BroadcastAttemptKind::Replacement,
+                TRIAD_SIGNING_STATE_FILE,
+            )?;
+        }
+        result
     }
 
     /// Issue a same-nonce self-send to cancel the original. The original
@@ -6724,7 +6643,15 @@ mod tests {
                 .is_none()
         );
         let err = engine
-            .replace(&permit, "alice", "anvil", &staged.id, &chain, 15, &policy)
+            .replace_fees(
+                &permit,
+                "alice",
+                "anvil",
+                &staged.id,
+                &chain,
+                repair_fees("500", "250"),
+                &policy,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, TxEngineError::ApprovalDenied(_)));
@@ -7834,9 +7761,22 @@ mod tests {
     }
 
     fn fee_repair_fixture(url: &str, edit: impl FnOnce(&mut StagedTx)) -> FeeRepair {
+        fee_repair_fixture_with(url, edit, None)
+    }
+
+    fn fee_repair_fixture_with(
+        url: &str,
+        edit: impl FnOnce(&mut StagedTx),
+        projection: Option<Arc<dyn crate::outbox::CentralOutboxProjection>>,
+    ) -> FeeRepair {
         let directory = tempfile::tempdir().unwrap();
         let permit = permit_for(&directory);
-        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let root = directory.path().join("outbox");
+        let outbox = match projection {
+            Some(projection) => Outbox::new_with_projection(root, projection),
+            None => Outbox::new(root),
+        }
+        .unwrap();
         let mut staged = fake_staged_1559("fee-repair");
         staged.created_ms = now_ms();
         staged.data_hex = "0x12345678".into();
@@ -8103,6 +8043,116 @@ mod tests {
         assert_eq!(settled.max_priority_fee_per_gas.as_deref(), Some("450"));
         let sent = f.outbox.read("alice", "anvil", "fee-repair").unwrap();
         assert_eq!(sent.state, OutboxState::Sent);
+    }
+
+    /// Retiring a refused repair renames its signing record, marker and raw
+    /// bytes. If the process stops before the marker moves, the next
+    /// higher-fee repair is refused once more, finishes the retirement, and
+    /// the one after that starts a fresh approval.
+    #[tokio::test]
+    async fn interrupted_rejection_retirement_finishes_on_the_next_repair() {
+        for signing_record_moved in [false, true] {
+            let underpriced =
+                r#"error:{"code":-32000,"message":"replacement transaction underpriced"}"#;
+            let url = spawn_queued_rpc(HashMap::from([
+                (
+                    "eth_chainId".to_string(),
+                    vec!["\"0x7a69\"".to_string(); 40],
+                ),
+                ("eth_call".into(), vec!["\"0x\"".into(); 40]),
+                ("eth_getTransactionCount".into(), vec!["\"0x0\"".into(); 40]),
+                ("eth_getTransactionByHash".into(), vec!["null".into(); 40]),
+                ("eth_getTransactionReceipt".into(), vec!["null".into(); 40]),
+                ("eth_sendRawTransaction".into(), vec![underpriced.into(); 2]),
+            ]))
+            .await;
+            let f = fee_repair_fixture(&url, |_| {});
+            let _ = f.repair(repair_fees("500", "250")).await;
+            f.fixture.active.store(true, Ordering::SeqCst);
+            assert!(matches!(
+                f.repair(repair_fees("500", "250")).await,
+                Err(TxEngineError::Chain(_))
+            ));
+            // Undo the retirement, as if the process stopped part way.
+            let dir = f.outbox.read("alice", "anvil", "fee-repair").unwrap().dir;
+            let mut names = vec![
+                BroadcastAttemptKind::Replacement.marker_name(),
+                BroadcastAttemptKind::Replacement.raw_name(),
+            ];
+            if !signing_record_moved {
+                names.push(TRIAD_SIGNING_STATE_FILE);
+            }
+            for name in names {
+                let retired = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .flatten()
+                    .find(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .starts_with(&format!("{name}.rejected-"))
+                    })
+                    .unwrap();
+                std::fs::rename(retired.path(), dir.join(name)).unwrap();
+            }
+
+            assert!(matches!(
+                f.repair(repair_fees("900", "450")).await,
+                Err(TxEngineError::Chain(_))
+            ));
+            assert!(!dir.join(TRIAD_SIGNING_STATE_FILE).exists());
+            f.fixture.active.store(false, Ordering::SeqCst);
+            *f.fixture.completed_result.lock() = None;
+            let fresh = f.repair(repair_fees("900", "450")).await;
+            assert!(
+                matches!(fresh, Err(TxEngineError::ApprovalRequired(_))),
+                "{fresh:?}"
+            );
+        }
+    }
+
+    /// Stages central actions but cannot write their result or status.
+    struct ResultlessProjection;
+
+    impl crate::outbox::CentralOutboxProjection for ResultlessProjection {
+        fn allocate_action_id(&self, _: &str, _: &str, _: &str, _: u64) -> Result<String, String> {
+            Ok("act-1".into())
+        }
+        fn stage_action(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: &str,
+            _: &[u8],
+            _: crate::outbox::CentralActionIdentity<'_>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn transition_action(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn write_action_file(&self, _: &str, _: &str, file: &str, _: &[u8]) -> Result<(), String> {
+            match file {
+                "approval_challenge.json" => Ok(()),
+                _ => Err("central store unavailable".into()),
+            }
+        }
+        fn read_action_file(&self, _: &str, _: &str, _: &str) -> Result<Vec<u8>, String> {
+            Err("not found".into())
+        }
+    }
+
+    /// Once the node accepts a repair, the sent row is the record: a failed
+    /// central projection must not tell the caller the repair failed.
+    #[tokio::test]
+    async fn accepted_fee_repair_succeeds_when_the_central_projection_fails() {
+        let url = spawn_batch_rpc(None).await;
+        let f = fee_repair_fixture_with(&url, |_| {}, Some(Arc::new(ResultlessProjection)));
+        let _ = f.repair(repair_fees("500", "250")).await;
+        f.fixture.active.store(true, Ordering::SeqCst);
+        let repaired = f.repair(repair_fees("500", "250")).await.unwrap();
+        let sent = f.outbox.read("alice", "anvil", "fee-repair").unwrap();
+        assert_eq!(sent.state, OutboxState::Sent);
+        assert_eq!(sent.staged.tx_hash, repaired.tx_hash);
     }
 
     /// A different action may not supersede a dispatched signing operation

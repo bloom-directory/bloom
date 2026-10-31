@@ -384,7 +384,8 @@ presenting its ceremony URL. This is a waiting state, not a reason to restage.
 Reading the challenge asks Bloom for the approval's current state, so poll it
 while the human approves. `state` is `awaiting_ceremony` until they finish,
 then `active`, and `next` says what to do. As soon as `state` is `active`,
-write `confirm` to `retry_path`; the approval does not broadcast on its own.
+write the exact `retry_body` to `retry_path`; the approval does not broadcast
+on its own.
 Retrying `retry_path` before then is also safe: it starts no new ceremony and
 returns permission denied again. Once the ceremony can no longer be used,
 `ceremony_url` is withdrawn. For `expired`, `cancelled` or `refused`, tell the
