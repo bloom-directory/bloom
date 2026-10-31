@@ -583,6 +583,39 @@ impl Outbox {
         }
     }
 
+    /// Retire a node-rejected attempt so a later write signs a new one
+    /// instead of replaying it. Its marker stays as non-executable evidence
+    /// at `<marker>.rejected-<tx hash>`, which the receipt reconciler still
+    /// follows; the signing record is hidden and the raw bytes are deleted.
+    pub fn set_aside_rejected_attempt(
+        &self,
+        entry: &OutboxEntry,
+        kind: BroadcastAttemptKind,
+        signing_record: &str,
+    ) -> Result<(), OutboxError> {
+        let Some(attempt) = self.read_broadcast_attempt(entry, kind)? else {
+            return Ok(());
+        };
+        let suffix = format!("rejected-{}", attempt.tx_hash);
+        // The marker moves after the signing record: until it does, a retry
+        // replays the refused bytes and, refused again, finishes this. The
+        // raw bytes go last; without a marker nothing reads them.
+        for (name, retired) in [
+            (signing_record, format!(".{signing_record}.{suffix}")),
+            (
+                kind.marker_name(),
+                format!("{}.{suffix}", kind.marker_name()),
+            ),
+        ] {
+            match fs::rename(entry.dir.join(name), entry.dir.join(retired)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        self.remove_broadcast_raw_tx(entry, kind)
+    }
+
     pub fn broadcast_attempts_for_nonce(
         &self,
         query: SameNonceAttemptQuery<'_>,
