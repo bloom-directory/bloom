@@ -251,8 +251,11 @@ configuration beyond it.
 
 ## Mounted VFS and audit readiness
 
-On either supported target, require the service checks above, both mounted reads,
-and audit health before reporting Bloom fully ready:
+On either supported target, require the service checks above, both VFS reads,
+and audit health before reporting Bloom fully ready. Use the mounted reads below
+when available. If native mounting is unavailable, run `bloom vfs cat /AGENTS.md`
+and `bloom vfs cat /status/daemon.json` instead; a working CLI VFS connection
+does not require the human to repair the mount first:
 
 ```sh
 BLOOM_MOUNT=${BLOOM_MOUNT:-"$HOME/bloom"}
