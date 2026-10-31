@@ -167,6 +167,27 @@ impl SolanaClient {
             .await
     }
 
+    /// The lowest finalized block height across every configured endpoint,
+    /// probed directly without failover. Any endpoint that cannot answer
+    /// fails the whole read, so a lagging or unavailable endpoint can never
+    /// be outvoted by a fast one.
+    pub async fn finalized_block_height_all_endpoints(&self) -> Result<u64, SolanaRpcError> {
+        let mut lowest = None;
+        for probe in self
+            .inner
+            .rpc
+            .probe_all_endpoints("getBlockHeight", &json!([{ "commitment": "finalized" }]))
+            .await
+        {
+            let height = probe
+                .outcome?
+                .as_u64()
+                .ok_or_else(|| SolanaRpcError::Decode("getBlockHeight: expected integer".into()))?;
+            lowest = Some(lowest.map_or(height, |low: u64| low.min(height)));
+        }
+        lowest.ok_or_else(|| SolanaRpcError::NoEndpoints(String::new()))
+    }
+
     /// Native SOL balance in lamports for a base58 account address.
     pub async fn get_balance(&self, account: &str) -> Result<u64, SolanaRpcError> {
         let result: Value = self.inner.rpc.call("getBalance", &json!([account])).await?;

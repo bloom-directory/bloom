@@ -83,10 +83,11 @@ reports only the blockhash/dwell trigger.
 
 ### Implemented freshness and restaging behavior
 
-Expiry cleanup retires unsigned pending entries after the live block height
-passes the blockhash window. A recorded signature also requires every configured
-endpoint to report history absence after that endpoint's finalized height passes
-the window, and that endpoint's oldest available block, sampled after its
+Expiry cleanup retires unsigned pending entries only after every configured
+endpoint's finalized height passes the blockhash window; a lagging or
+unavailable endpoint retains them. A recorded signature also requires every
+configured endpoint to report history absence after that endpoint's finalized
+height passes the window, and that endpoint's oldest available block, sampled after its
 `null`, must precede the window. Errors, lagging endpoints and pruned history
 retain the entry; an observed signature moves to reconciliation. The oldest
 available block is a best-effort coverage check, not a proof: Agave reports

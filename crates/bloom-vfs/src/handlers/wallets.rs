@@ -6261,11 +6261,18 @@ value = "0""#
             false,
         );
         let mut entry = outbox
-            .read_in_state("alice", "solana-devnet", "sol-crash", SolanaOutboxState::Pending)
+            .read_in_state(
+                "alice",
+                "solana-devnet",
+                "sol-crash",
+                SolanaOutboxState::Pending,
+            )
             .unwrap();
         entry.staged.status = SolanaTxStatus::Expired;
         // Move without the follow-up rewrite_intent, as a crash would.
-        let failed_dir = outbox.transition(&entry, SolanaOutboxState::Failed).unwrap();
+        let failed_dir = outbox
+            .transition(&entry, SolanaOutboxState::Failed)
+            .unwrap();
         let on_disk: StagedSolanaTransfer =
             serde_json::from_slice(&std::fs::read(failed_dir.join("intent.json")).unwrap())
                 .unwrap();
