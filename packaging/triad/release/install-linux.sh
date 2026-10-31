@@ -641,10 +641,13 @@ linux_upgrade_is_forward_only() {
 
 # Refuses, before anything is stopped or switched, a candidate whose state
 # record is malformed, older than the installed state, or unable to migrate
-# from it — the same checks install-macos.sh makes. An installed release with
-# no record is not checked; its upgrade is forward-only instead.
+# from it — the same checks install-macos.sh makes. A release without a
+# record is not checked; its upgrade is forward-only instead. That includes a
+# candidate an older installer staged before records existed, which is reused
+# as is and would otherwise be refused on every retry.
 check_linux_candidate_state() {
   local install_root="$1" old_digest="$2" new_digest="$3" service installed current floor migration
+  [[ -f "$install_root/usr/libexec/bloom/releases/$new_digest/compatibility-v1.toml" ]] || return 0
   for service in machine broker signer; do
     installed="$(linux_release_state_field "$install_root" "$old_digest" "$service" current)"
     [[ -n "$installed" ]] || return 0
