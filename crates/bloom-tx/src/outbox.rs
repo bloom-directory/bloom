@@ -34,6 +34,8 @@ pub struct LifecycleLock(#[allow(dead_code)] fs::File);
 struct SigningStateSummary {
     #[serde(default)]
     sign_dispatched: bool,
+    #[serde(default)]
+    action_id: String,
 }
 
 #[derive(Deserialize)]
@@ -99,6 +101,9 @@ pub enum SigningEvidence {
     /// The entry's own hash, broadcast attempt, raw bytes, or signing
     /// request: confirming the entry again reconciles it.
     Entry,
+    /// The entry's own same-nonce cancellation (`bloom wallet cancel`):
+    /// only running that cancel again reconciles it.
+    Cancel,
     /// A dispatched batch signing request. Only `confirm-batch` with these
     /// `chain:id` refs, in this order, reconciles it.
     Batch { ordered_refs: Vec<String> },
@@ -119,6 +124,47 @@ fn signing_dispatched(path: &Path) -> bool {
             .map_or(true, |state| state.sign_dispatched),
         Err(error) => error.kind() != std::io::ErrorKind::NotFound,
     }
+}
+
+/// Whether the entry's own same-nonce cancellation may have been signed or
+/// broadcast: a cancel hash, attempt marker or raw bytes, or a dispatched
+/// signing request for the cancel action (its action ID ends in `:cancel`).
+pub fn cancel_attempted(entry: &OutboxEntry) -> bool {
+    let cancel = BroadcastAttemptKind::CancelReplacement;
+    may_exist(&entry.dir.join("cancel_tx_hash"))
+        || may_exist(&entry.dir.join(cancel.marker_name()))
+        || may_exist(&entry.dir.join(cancel.raw_name()))
+        || fs::read(entry.dir.join(SIGNING_STATE_FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<SigningStateSummary>(&bytes).ok())
+            .is_some_and(|state| state.sign_dispatched && state.action_id.ends_with(":cancel"))
+}
+
+/// Beside a failed entry that may have been signed; see
+/// [`Outbox::mark_possibly_signed_failed`].
+pub const SIGNING_UNKNOWN_FILE: &str = "signing_unknown.json";
+
+fn signing_unknown_record(entry: &OutboxEntry) -> serde_json::Value {
+    let staged = &entry.staged;
+    let (chain, from, nonce) = (&staged.chain, &staged.from, staged.nonce);
+    let hash = recorded_hash(entry);
+    let check = match &hash {
+        Some(hash) => format!(
+            "Check whether it mined: `bloom vfs cat chains/{chain}/tx/{hash}/receipt.json`. If it did not, check the nonce:"
+        ),
+        None => "No transaction hash is recorded. Check the nonce:".to_owned(),
+    };
+    serde_json::json!({
+        "schema": "bloom.outbox-signing-unknown/1",
+        "tx_id": staged.id,
+        "chain": chain,
+        "from": from,
+        "nonce": nonce,
+        "tx_hash": hash,
+        "next": format!(
+            "Signing outcome unknown. An older Bloom moved this entry to failed/ although it may have been signed, so it can still land. Do not stage this payment again or reuse nonce {nonce} until you know its outcome. {check} `bloom vfs cat chains/{chain}/addresses/{from}/nonce`. A value above {nonce} means nonce {nonce} is used, possibly by this transaction. Otherwise a signed copy may still land: ask the owner before retrying, because a retry can pay twice."
+        ),
+    })
 }
 
 /// The transaction hash an entry records, from its intent or any broadcast
@@ -224,6 +270,7 @@ pub enum OutboxError {
     #[error("cannot discard a possibly signed transaction '{id}': {}", match (tx_hash, evidence) {
         (Some(hash), _) => format!("it may have been broadcast as {hash}"),
         (None, SigningEvidence::Entry) => "a signing request may have been sent, but no transaction hash is recorded".to_owned(),
+        (None, SigningEvidence::Cancel) => "a cancellation of it may have been signed, but no transaction hash is recorded; reconcile it by running `bloom wallet cancel` for it again".to_owned(),
         (None, SigningEvidence::Batch { ordered_refs }) => format!("a batch signing request covering it may have been sent; reconcile that batch with `bloom wallet confirm-batch {wallet} {}`, listing its refs in exactly this order", ordered_refs.join(" ")),
         (None, SigningEvidence::UnreadableBatch) => format!("a batch signing record under outbox/{BATCH_SIGNING_STATE_DIR} could not be read, so Bloom cannot prove this entry was never signed"),
     })]
@@ -1189,7 +1236,9 @@ impl Outbox {
         let entry = self.read_in_state(wallet, chain, id, OutboxState::Pending)?;
         let batches = self.batch_index();
         if self.possibly_signed(&entry, &batches) {
-            let evidence = if self.possibly_signed(&entry, &BatchIndex::default()) {
+            let evidence = if cancel_attempted(&entry) {
+                SigningEvidence::Cancel
+            } else if self.possibly_signed(&entry, &BatchIndex::default()) {
                 SigningEvidence::Entry
             } else if let Some(refs) = batches.covering(&entry.staged) {
                 SigningEvidence::Batch {
@@ -1369,6 +1418,63 @@ impl Outbox {
     pub fn sweep_expired(&self, now_ms: u128) -> Result<usize, OutboxError> {
         let selected = self.expired_pending(now_ms)?;
         self.retire_expired(selected, now_ms)
+    }
+
+    /// Mark failed entries that may have been signed. This Bloom never moves
+    /// such an entry to failed/, but Bloom 0.4.1 and earlier did (the expiry
+    /// sweep and discards read no signing evidence), and so does a rollback to
+    /// such a release. Moving them back to pending could clash with a nonce
+    /// reused since, so each gets `signing_unknown.json` saying how to check
+    /// its outcome before anyone retries the payment or reuses its nonce.
+    /// Returns the entries newly marked.
+    pub fn mark_possibly_signed_failed(&self) -> Result<Vec<OutboxEntry>, OutboxError> {
+        let mut batches = self.batch_index();
+        // An unreadable batch state "covers" every entry; that is enough to
+        // keep a pending entry, but would mark every failed one.
+        batches.unreadable = false;
+        let mut marked = Vec::new();
+        let wallets = match fs::read_dir(&self.inner.root) {
+            Ok(wallets) => wallets,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(marked),
+            Err(error) => return Err(error.into()),
+        };
+        for wallet in wallets.flatten() {
+            let Ok(chains) = fs::read_dir(wallet.path()) else {
+                continue;
+            };
+            for chain in chains.flatten() {
+                let Ok(entries) = fs::read_dir(chain.path().join("failed")) else {
+                    continue;
+                };
+                for dir in entries.flatten().map(|entry| entry.path()) {
+                    if may_exist(&dir.join(SIGNING_UNKNOWN_FILE)) {
+                        continue;
+                    }
+                    let Some(staged) = fs::read(dir.join("intent.json"))
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<StagedTx>(&bytes).ok())
+                    else {
+                        continue;
+                    };
+                    let entry = OutboxEntry {
+                        state: OutboxState::Failed,
+                        staged,
+                        dir,
+                    };
+                    if !self.possibly_signed(&entry, &batches) && !cancel_attempted(&entry) {
+                        continue;
+                    }
+                    let record = serde_json::to_vec_pretty(&signing_unknown_record(&entry))?;
+                    match self.write_artefact(&entry.dir, SIGNING_UNKNOWN_FILE, &record) {
+                        Ok(()) => marked.push(entry),
+                        Err(error) => {
+                            tracing::warn!(path = %entry.dir.display(), %error, "outbox.signing_unknown_mark_failed")
+                        }
+                    }
+                }
+            }
+        }
+        Ok(marked)
     }
 
     /// Recheck and move entries [`Self::expired_pending`] selected. Signing
@@ -2218,13 +2324,47 @@ mod tests {
         fs::write(raw.join("cancel_raw_tx"), "signed").unwrap();
         let error = ob.cancel("alice", "anvil", "raw").unwrap_err();
         assert!(
-            matches!(error, OutboxError::PossiblySigned { tx_hash: None, .. }),
+            matches!(
+                error,
+                OutboxError::PossiblySigned {
+                    tx_hash: None,
+                    evidence: SigningEvidence::Cancel,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("running `bloom wallet cancel`"),
             "{error}"
         );
         assert_eq!(
             ob.read("alice", "anvil", "raw").unwrap().state,
             OutboxState::Pending
         );
+
+        // Which action's signing request was dispatched decides which
+        // command reconciles it.
+        for (id, action, expected) in [
+            ("confirming", "31337:confirming", SigningEvidence::Entry),
+            (
+                "cancelling",
+                "31337:cancelling:cancel",
+                SigningEvidence::Cancel,
+            ),
+        ] {
+            let dir = ob.write_pending(&fake_staged(id), "p").unwrap();
+            fs::write(
+                dir.join(SIGNING_STATE_FILE),
+                serde_json::json!({"sign_dispatched": true, "action_id": action}).to_string(),
+            )
+            .unwrap();
+            let error = ob.cancel("alice", "anvil", id).unwrap_err();
+            let OutboxError::PossiblySigned { evidence, .. } = error else {
+                panic!("{error}");
+            };
+            assert_eq!(evidence, expected, "{id}");
+        }
 
         let attempted = ob.write_pending(&fake_staged("attempted"), "p").unwrap();
         fs::write(
@@ -2243,6 +2383,75 @@ mod tests {
         let discarded = ob.read("alice", "anvil", "unsigned").unwrap();
         assert_eq!(discarded.state, OutboxState::Failed);
         assert!(discarded.dir.join("cancel.txt").exists());
+    }
+
+    /// Bloom 0.4.1 moved expired entries to failed/ without reading signing
+    /// evidence. Such entries are marked, never moved back; unsigned failed
+    /// entries are left alone, and marking is idempotent.
+    #[test]
+    fn possibly_signed_failed_entries_are_marked() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::new(dir.path()).unwrap();
+        // How 0.4.1 swept: a plain move, whatever the entry holds.
+        let fail = |id: &str, evidence: &dyn Fn(&Path)| {
+            let path = ob.write_pending(&fake_staged(id), "p").unwrap();
+            evidence(&path);
+            let entry = ob.read("alice", "anvil", id).unwrap();
+            ob.transition(&entry, OutboxState::Failed).unwrap();
+        };
+        fail("unsigned", &|_| {});
+        fail("dispatched", &|path| {
+            fs::write(path.join(SIGNING_STATE_FILE), r#"{"sign_dispatched":true}"#).unwrap()
+        });
+        fail("broadcast", &|path| {
+            fs::write(
+                path.join(BroadcastAttemptKind::Confirm.marker_name()),
+                serde_json::json!({"schema":"bloom.broadcast_attempted.v1","tx_hash":"0xabc",
+                    "raw_tx_blake3":"","raw_tx_path":"raw_tx","from":"0x1","to":null,
+                    "nonce":0,"chain_id":31337,"created_ms":0,"transport":"public_rpc"})
+                .to_string(),
+            )
+            .unwrap()
+        });
+        // An unreadable batch state keeps pending entries, but must not mark
+        // every failed one.
+        let batch = dir.path().join(BATCH_SIGNING_STATE_DIR).join("bad");
+        fs::create_dir_all(&batch).unwrap();
+        fs::write(batch.join(SIGNING_STATE_FILE), "invalid").unwrap();
+
+        let mut marked = ob
+            .mark_possibly_signed_failed()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.staged.id)
+            .collect::<Vec<_>>();
+        marked.sort();
+        assert_eq!(marked, ["broadcast", "dispatched"]);
+        for (id, hash) in [("broadcast", Some("0xabc")), ("dispatched", None)] {
+            let entry = ob.read("alice", "anvil", id).unwrap();
+            assert_eq!(entry.state, OutboxState::Failed, "{id}");
+            let record: serde_json::Value =
+                serde_json::from_slice(&fs::read(entry.dir.join(SIGNING_UNKNOWN_FILE)).unwrap())
+                    .unwrap();
+            assert_eq!(record["tx_hash"].as_str(), hash, "{id}");
+            let next = record["next"].as_str().unwrap();
+            assert!(next.starts_with("Signing outcome unknown"), "{next}");
+            assert!(
+                next.contains(&format!(
+                    "bloom vfs cat chains/anvil/addresses/{}/nonce",
+                    entry.staged.from
+                )),
+                "{next}"
+            );
+            assert_eq!(
+                next.contains("bloom vfs cat chains/anvil/tx/0xabc/receipt.json"),
+                hash.is_some(),
+                "{next}"
+            );
+        }
+        let unsigned = ob.read("alice", "anvil", "unsigned").unwrap();
+        assert!(!unsigned.dir.join(SIGNING_UNKNOWN_FILE).exists());
+        assert!(ob.mark_possibly_signed_failed().unwrap().is_empty());
     }
 
     /// Fix #8: `read_in_state` must NotFound an id that exists in a

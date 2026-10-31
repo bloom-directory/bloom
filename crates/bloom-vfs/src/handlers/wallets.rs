@@ -2879,9 +2879,10 @@ fn clear_confirm_error(entry_dir: &Path) {
 /// Best effort, and never recreates an entry directory that has moved on:
 /// the temporary file is created inside the existing directory only.
 /// How to reconcile an entry that `cancel` kept because it may be signed.
-fn possibly_signed_next(error: &TxEngineError) -> Option<String> {
+fn possibly_signed_next(error: &TxEngineError, chain: &str) -> Option<String> {
     let TxEngineError::Outbox(OutboxError::PossiblySigned {
         wallet,
+        id,
         tx_hash,
         evidence,
         ..
@@ -2892,6 +2893,9 @@ fn possibly_signed_next(error: &TxEngineError) -> Option<String> {
     Some(match (tx_hash, evidence) {
         (Some(_), _) => "This entry may already be signed or broadcast, so `cancel` kept it. Do not reuse its nonce. Reconcile it by its recorded hash first; if it is still unmined, replace it with `bloom wallet cancel`, which needs its own owner approval.".to_owned(),
         (None, SigningEvidence::Entry) => "A signing request for this entry may have reached the Broker without its reply being recorded, so `cancel` kept the entry; no transaction hash is recorded yet. Do not reuse its nonce. Write the same confirm again: Bloom asks the Broker for the recorded signing operation's result and broadcasts or reconciles it. If it is still unmined afterwards, replace it with `bloom wallet cancel`, which needs its own owner approval.".to_owned(),
+        (None, SigningEvidence::Cancel) => format!(
+            "A cancellation of this entry may have been signed without its reply being recorded, so `cancel` kept the entry; no transaction hash is recorded yet. Do not reuse its nonce. Writing confirm here cannot reconcile a cancellation. Run `bloom wallet cancel {wallet} {chain} {id}` again: Bloom asks the Broker for the recorded cancellation's result and broadcasts or reconciles it."
+        ),
         (None, SigningEvidence::Batch { ordered_refs }) => format!(
             "A batch signing request covering this entry may have reached the Broker without its reply being recorded, so `cancel` kept the entry. Do not reuse its nonce. Writing confirm here cannot reconcile a batch. Run `bloom wallet confirm-batch {wallet} {}` with the refs in exactly this order: Bloom asks the Broker for that batch's result and broadcasts or reconciles each entry.",
             ordered_refs.join(" ")
@@ -4505,7 +4509,7 @@ impl WalletsHandler {
                         .discard_unsigned(permit, wallet, chain, id)
                         .await
                         .map_err(|error| {
-                            let next = possibly_signed_next(&error);
+                            let next = possibly_signed_next(&error, chain);
                             let error = err_be(error);
                             record_confirm_error(&entry_dir, wallet, id, &error, next);
                             error
@@ -10109,10 +10113,10 @@ value = "0""#,
     /// transaction may still land and its nonce must not be reused.
     #[tokio::test]
     async fn confirm_cancel_preserves_possible_signatures() {
-        let ceremony = |sign_dispatched: bool| {
+        let ceremony = |sign_dispatched: bool, action_id: &str| {
             let digest = "11".repeat(32);
             serde_json::to_vec(&serde_json::json!({
-                "schema": "bloom.machine-evm-signing.1", "action_id": "test",
+                "schema": "bloom.machine-evm-signing.1", "action_id": action_id,
                 "payload_digest": digest, "claimed_hash": digest,
                 "provenance_digest": digest, "canonical_plan_facts_digest": digest,
                 "approval_operation_id": "22".repeat(32), "signing_operation_id": "33".repeat(32),
@@ -10141,6 +10145,7 @@ value = "0""#,
             "replacement_raw_tx",
             "cancel_raw_tx",
             "dispatched",
+            "cancel_dispatched",
             "malformed",
             "batch",
             "unreadable_batch",
@@ -10153,7 +10158,8 @@ value = "0""#,
                 match marker {
                     "none" => {}
                     "approved" => {
-                        std::fs::write(entry.dir.join("ceremony.json"), ceremony(false)).unwrap()
+                        std::fs::write(entry.dir.join("ceremony.json"), ceremony(false, "test"))
+                            .unwrap()
                     }
                     "hash" => {
                         let mut staged = entry.staged.clone();
@@ -10165,8 +10171,14 @@ value = "0""#,
                         .unwrap();
                     }
                     "dispatched" => {
-                        std::fs::write(entry.dir.join("ceremony.json"), ceremony(true)).unwrap()
+                        std::fs::write(entry.dir.join("ceremony.json"), ceremony(true, "test"))
+                            .unwrap()
                     }
+                    "cancel_dispatched" => std::fs::write(
+                        entry.dir.join("ceremony.json"),
+                        ceremony(true, "31337:0001-test:cancel"),
+                    )
+                    .unwrap(),
                     "malformed" => {
                         std::fs::write(entry.dir.join("ceremony.json"), b"invalid").unwrap()
                     }
@@ -10235,6 +10247,14 @@ value = "0""#,
                         f.wallet_name
                     );
                     assert!(next.contains(&command), "{next}");
+                    assert!(!next.contains("Write the same confirm again"), "{next}");
+                    continue;
+                }
+                if matches!(marker, "cancel_raw_tx" | "cancel_dispatched") {
+                    // The cancellation holds the evidence; only rerunning it
+                    // reconciles it, and confirm would refuse.
+                    let command = format!("bloom wallet cancel {} anvil 0001-test", f.wallet_name);
+                    assert!(next.contains(&command), "{marker}: {next}");
                     assert!(!next.contains("Write the same confirm again"), "{next}");
                     continue;
                 }
