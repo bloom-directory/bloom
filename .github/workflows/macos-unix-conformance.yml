@@ -119,6 +119,11 @@ jobs:
             "$RUNNER_TEMP/triad-dist/bloom-triad-macos-unix-principals-w0.tar.gz" \
             -C "$RUNNER_TEMP/verified-w0"
 
+      # Includes the staged macOS installer lifecycle test, which compiles
+      # only on macOS. CI runs the remaining assertions on Linux.
+      - name: Run macOS LaunchAgent and staged installer tests
+        run: cargo test --manifest-path bloom/Cargo.toml -p bloom-it --test macos_launchagent --locked
+
       # The canonical-listener test must run before any installed Broker owns
       # port 18734. Installed acceptance repeats the other tests below.
       - name: Run complete Broker suite before installation
