@@ -1547,14 +1547,14 @@ impl TxEngine {
         let nonce = match intent.nonce {
             Some(n) => n,
             None => {
-                // The pinned block misses broadcast-but-unmined transactions,
-                // which have already left our pending outbox. Ask the mempool.
                 let chain_nonce = chain.nonce(from).await?;
                 let pending_high = self
                     .outbox
                     .highest_pending_nonce(wallet, &spec.name, from)?;
                 // If there are staged-but-unconfirmed txs, use the slot
-                // after the highest pending nonce.
+                // after the highest pending nonce. After broadcast they
+                // move to sent/ and the chain RPC returns the updated
+                // next nonce — no stale-data risk once the queue drains.
                 pending_high.map_or(chain_nonce, |h| chain_nonce.max(h + 1))
             }
         };
