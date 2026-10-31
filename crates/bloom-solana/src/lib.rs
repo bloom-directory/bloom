@@ -353,27 +353,15 @@ impl SolanaClient {
     /// finalized status. Each probe is a single direct request — no retry,
     /// no failover — so the returned quorum is honest per-endpoint evidence.
     ///
-    /// Reconciliation uses this before turning a `null` from the ordinary
-    /// failover path into a terminal "never landed": one lagging or
-    /// non-archival endpoint must not be able to outweigh an endpoint that
-    /// actually observed the signature.
+    /// Callers act only on an observed status. A `null`, even from every
+    /// endpoint, is not proof the transfer never landed: history search can
+    /// miss a landed transaction (BigTable lookup errors, pruned or
+    /// index-disabled ledgers).
     pub async fn probe_signature_status_all_endpoints(
         &self,
         signature: &str,
-        last_valid_block_height: u64,
     ) -> Vec<SignatureStatusProbe> {
-        // Establish each endpoint's finalized height BEFORE asking its
-        // history, so every block the transfer could land in was already
-        // finalized when the `null` was produced. A fast endpoint cannot
-        // qualify a lagging peer's absence. Every probe batch retains
-        // configured endpoint order (no failover).
-        let heights = self
-            .inner
-            .rpc
-            .probe_all_endpoints("getBlockHeight", &json!([{ "commitment": "finalized" }]))
-            .await;
-        let statuses = self
-            .inner
+        self.inner
             .rpc
             .probe_all_endpoints(
                 "getSignatureStatuses",
@@ -385,22 +373,9 @@ impl SolanaClient {
                     }
                 ]),
             )
-            .await;
-        // A history search only covers the blocks an endpoint still holds.
-        // A pruned endpoint answers `null` for a transfer that landed before
-        // its oldest block, so its absence counts only if that oldest block
-        // precedes every slot the transaction could have landed in. Sample
-        // it AFTER the `null`: pruning only advances, so a later sample also
-        // covered the earlier search.
-        let oldest = self
-            .inner
-            .rpc
-            .probe_all_endpoints("getFirstAvailableBlock", &json!([]))
-            .await;
-        statuses
+            .await
             .into_iter()
-            .zip(heights.into_iter().zip(oldest))
-            .map(|(probe, (height, oldest))| SignatureStatusProbe {
+            .map(|probe| SignatureStatusProbe {
                 endpoint_label: probe.endpoint_label,
                 status: probe.outcome.and_then(|result| {
                     let entry = result
@@ -413,20 +388,6 @@ impl SolanaClient {
                             )
                         })?;
                     if entry.is_null() {
-                        let finalized = height.outcome?.as_u64().ok_or_else(||
-                            SolanaRpcError::Decode("getBlockHeight: expected integer".into()))?;
-                        if finalized <= last_valid_block_height {
-                            return Err(SolanaRpcError::Decode("signature absence is unproven before this endpoint's finalized blockhash expiry".into()));
-                        }
-                        let oldest = oldest.outcome?.as_u64().ok_or_else(||
-                            SolanaRpcError::Decode("getFirstAvailableBlock: expected integer".into()))?;
-                        // A slot is never below its block height, so the
-                        // transaction cannot land in a slot below its
-                        // blockhash's height. That height is at most
-                        // `HISTORY_MARGIN` below the last valid height.
-                        if oldest > last_valid_block_height.saturating_sub(HISTORY_MARGIN) {
-                            return Err(SolanaRpcError::Decode("signature absence is unproven: this endpoint's history starts after the blockhash window".into()));
-                        }
                         Ok(None)
                     } else {
                         serde_json::from_value::<SignatureStatus>(entry)
@@ -440,10 +401,6 @@ impl SolanaClient {
             .collect()
     }
 }
-
-/// Blocks between a blockhash and its last valid height. Validators use 150;
-/// older releases used 300, so the larger value keeps the bound conservative.
-const HISTORY_MARGIN: u64 = 300;
 
 /// One endpoint's independent finalized-status observation for a single
 /// signature, from [`SolanaClient::probe_signature_status_all_endpoints`].

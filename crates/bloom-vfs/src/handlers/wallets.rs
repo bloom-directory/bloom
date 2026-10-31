@@ -2965,6 +2965,7 @@ const PUBLIC_SOLANA_OUTBOX_ARTIFACTS: &[&str] = &[
     "approval_challenge.json",
     "restage_advice.json",
     "restage.md",
+    bloom_solana_tx::types::UNRESOLVED_FILE,
 ];
 
 /// A Solana child account as projected by the Broker.

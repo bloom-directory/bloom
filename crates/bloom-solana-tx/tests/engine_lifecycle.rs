@@ -1406,16 +1406,13 @@ async fn simulated_bytes_cannot_be_swept_or_cancelled() {
                 .cancel("wallet", "solana-devnet", &staged.id)
                 .is_err()
         );
-        let pending = outbox.read("wallet", "solana-devnet", &staged.id).unwrap();
-        let signature = outbox.recorded_signature(&pending).unwrap().unwrap();
         let swept = outbox
-            .sweep_expired_with_statuses(
+            .sweep_expired(
                 u128::MAX,
                 &std::collections::HashMap::from([(
                     "solana-devnet".to_string(),
                     staged.last_valid_block_height + 1,
                 )]),
-                &std::collections::HashMap::from([(("solana-devnet".into(), signature), false)]),
             )
             .unwrap();
         release.notify_one();

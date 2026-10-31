@@ -5107,7 +5107,7 @@ impl Daemon {
                         }
                         if let Some(solana_outbox) = &solana_outbox {
                             let live_heights = solana_sweep_heights(&solana_chains).await;
-                            let mut signature_statuses = std::collections::HashMap::new();
+                            let mut observed = std::collections::HashSet::new();
                             match solana_outbox.expired_pending(now_ms, &live_heights) {
                                 Ok(entries) => for entry in entries {
                                     let Ok(Some(signature)) = solana_outbox.recorded_signature(&entry) else {
@@ -5116,18 +5116,16 @@ impl Daemon {
                                     let Some(client) = solana_chains.get(&entry.staged.chain) else {
                                         continue;
                                     };
-                                    // Each probe searches transaction history. A single
-                                    // lagging endpoint cannot establish absence.
-                                    let probes = client.probe_signature_status_all_endpoints(&signature, entry.staged.last_valid_block_height).await;
-                                    let found = probes.iter().any(|probe| matches!(&probe.status, Ok(Some(_))));
-                                    let absent = !probes.is_empty() && probes.iter().all(|probe| matches!(&probe.status, Ok(None)));
-                                    if found || absent {
-                                        signature_statuses.insert((entry.staged.chain, signature), found);
+                                    // Each probe searches transaction history. Only an
+                                    // observation counts; absence never retires a signature.
+                                    let probes = client.probe_signature_status_all_endpoints(&signature).await;
+                                    if probes.iter().any(|probe| matches!(&probe.status, Ok(Some(_)))) {
+                                        observed.insert((entry.staged.chain, signature));
                                     }
                                 },
                                 Err(error) => warn!(error = %error, "solana_outbox.sweep_signature_scan_failed"),
                             }
-                            match run_solana_expiry_sweep_once(solana_outbox, &audit, now_ms, &live_heights, &signature_statuses) {
+                            match run_solana_expiry_sweep_once(solana_outbox, &audit, now_ms, &live_heights, &observed) {
                                 Ok(0) => tracing::trace!("solana_outbox.sweep_expired.empty"),
                                 Ok(n) => info!(swept = n, "solana_outbox.sweep_expired"),
                                 Err(e) => warn!(error = %e, "solana_outbox.sweep_expired_failed"),
@@ -5351,11 +5349,11 @@ fn run_solana_expiry_sweep_once(
     audit: &AuditLog,
     now_ms: u128,
     live_block_heights: &std::collections::HashMap<String, u64>,
-    signature_statuses: &std::collections::HashMap<(String, String), bool>,
+    observed: &std::collections::HashSet<(String, String)>,
 ) -> Result<usize, String> {
     // As for EVM: an idle tick changes nothing and is not journaled.
     if outbox
-        .expired_pending(now_ms, live_block_heights)
+        .sweep_targets(now_ms, live_block_heights, observed)
         .map_err(|error| error.to_string())?
         .is_empty()
     {
@@ -5387,7 +5385,7 @@ fn run_solana_expiry_sweep_once(
         .map_err(|error| {
             format!("Machine audit unavailable before Solana expiry sweep: {error}")
         })?;
-    let swept = outbox.sweep_expired_with_statuses(now_ms, live_block_heights, signature_statuses);
+    let swept = outbox.sweep_expired_with_statuses(now_ms, live_block_heights, observed);
     let result = match &swept {
         Ok(count) => serde_json::json!({"outcome": "completed", "swept": count}),
         Err(error) => serde_json::json!({"outcome": "error", "error": error.to_string()}),
@@ -8199,7 +8197,7 @@ ws_url = "wss://example.invalid"
                     &d.audit,
                     now_ms,
                     &std::collections::HashMap::new(),
-                    &std::collections::HashMap::new(),
+                    &std::collections::HashSet::new(),
                 )
                 .unwrap(),
                 0
@@ -8308,7 +8306,7 @@ ws_url = "wss://example.invalid"
             &d.audit,
             2,
             &std::collections::HashMap::from([("solana-devnet".to_string(), 101_u64)]),
-            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         )
         .unwrap();
         assert_eq!(n, 1, "an abandoned, expired Solana stage must be reaped");
