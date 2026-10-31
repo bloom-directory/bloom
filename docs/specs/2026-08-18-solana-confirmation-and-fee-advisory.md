@@ -83,20 +83,27 @@ reports only the blockhash/dwell trigger.
 
 ### Implemented freshness and restaging behavior
 
-`SolanaOutbox::sweep_expired` moves pending entries past `expires_ms` to
-`failed` with status `expired`, signed or not, once the cluster's block height
-has passed the blockhash window. Broadcast moves an entry to `sent` before it
-submits, so a pending entry was never sent; only one with a broadcast marker
-is left in place. Signing and broadcast also query the current blockheight
-and refuse an expired message.
+Expiry cleanup retires unsigned pending entries after the live block height
+passes the blockhash window. A recorded signature also requires every configured
+endpoint to report history absence after that endpoint's finalized height passes
+the window, and that endpoint's oldest available block must precede the window.
+Errors, lagging endpoints and pruned history retain the entry; an observed
+signature moves to reconciliation. Simulation exposes signed bytes to an RPC,
+so a missing broadcast marker does not prove they were never submitted. A
+broadcast marker always prevents expiry cleanup. A broadcast attempt's signature
+stays readable in `broadcast_attempted.json` after retirement; a signature that
+was never broadcast stays private, and raw signed transactions are removed.
+The mounted `intent.json` reports the outbox's current status, including after
+an interrupted move. Signing and broadcast also refuse expired messages.
 
 For an expired pending entry, writing non-empty content to `restage` creates a
 new immutable stage with the same destination and lamports but a fresh
 blockhash and fee quote. The old entry becomes `failed/expired` and links to
 the replacement through `restage_advice.json`; approval and signature state
 are not reused. A sent-but-unobserved signature is reconciled to a terminal
-failed receipt once current height exceeds `lastValidBlockHeight`, rather than
-remaining unreconciled forever.
+failed receipt once every configured endpoint passes the same checks, rather
+than remaining unreconciled forever. An endpoint without the window's history
+keeps the transfer unresolved; configure one that retains it.
 
 ## Trigger thresholds (frozen defaults, operator-tunable)
 

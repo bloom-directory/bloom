@@ -21,6 +21,18 @@ async fn spawn_status_stub(
     finalized: bool,
     block_height: u64,
 ) -> String {
+    spawn_history_stub(confirmations, err, finalized, block_height, 0).await
+}
+
+/// Like `spawn_status_stub`, but the endpoint's history starts at
+/// `first_available_block`.
+async fn spawn_history_stub(
+    confirmations: Option<u64>,
+    err: bool,
+    finalized: bool,
+    block_height: u64,
+    first_available_block: u64,
+) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -83,11 +95,15 @@ async fn spawn_status_stub(
                         json!({ "context": {"slot": 42}, "value": [status] }).to_string()
                     }
                     "getBlockHeight" => block_height.to_string(),
+                    "getFirstAvailableBlock" => first_available_block.to_string(),
                     _ => r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}"#
                         .to_string(),
                 };
                 let payload =
-                    if matches!(method.as_str(), "getSignatureStatuses" | "getBlockHeight") {
+                    if matches!(
+                        method.as_str(),
+                        "getSignatureStatuses" | "getBlockHeight" | "getFirstAvailableBlock"
+                    ) {
                         format!(r#"{{"jsonrpc":"2.0","id":1,"result":{result}}}"#)
                     } else {
                         result
@@ -406,6 +422,30 @@ async fn a_null_from_the_preferred_endpoint_does_not_override_a_finalized_peer()
 }
 
 #[tokio::test]
+async fn a_lagging_peers_absence_cannot_expire_a_transfer() {
+    let current = spawn_status_stub(None, false, true, 2).await;
+    let lagging = spawn_status_stub(None, false, true, 1).await;
+    let dir = TempDir::new().unwrap();
+    let outbox = seed_sent(&dir);
+    let client = two_endpoint_client(&current, &lagging);
+    let probes = client
+        .probe_signature_status_all_endpoints("signature", 1)
+        .await;
+    assert!(matches!(probes[0].status, Ok(None)));
+    assert!(probes[1].status.is_err());
+    let registry = SolanaChainRegistry::new();
+    registry.add(client);
+    let reconciler = SolanaReconciler::new(outbox.clone(), registry, audit(&dir));
+    assert_eq!(reconciler.tick().await, 0);
+    assert!(
+        outbox
+            .read_receipt("alice", "solana-devnet", "0001-00001")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn terminal_absence_requires_every_configured_endpoint() {
     let first = spawn_status_stub(None, false, true, 2).await;
     let second = spawn_status_stub(None, false, true, 3).await;
@@ -423,6 +463,32 @@ async fn terminal_absence_requires_every_configured_endpoint() {
         .expect("all-null past the validity window is terminal");
     assert_eq!(receipt.outcome, "failed");
     assert_eq!(receipt.err.unwrap()["kind"], "blockhash_expired_unseen");
+}
+
+#[tokio::test]
+async fn a_pruned_endpoints_absence_cannot_expire_a_transfer() {
+    // Both endpoints are past the window and report the signature unseen,
+    // but the second no longer holds the blocks the transfer could be in.
+    let archival = spawn_status_stub(None, false, true, 2).await;
+    let pruned = spawn_history_stub(None, false, true, 2, 5).await;
+    let dir = TempDir::new().unwrap();
+    let outbox = seed_sent(&dir);
+    let client = two_endpoint_client(&archival, &pruned);
+    let probes = client
+        .probe_signature_status_all_endpoints("signature", 1)
+        .await;
+    assert!(matches!(probes[0].status, Ok(None)));
+    assert!(probes[1].status.is_err());
+    let registry = SolanaChainRegistry::new();
+    registry.add(client);
+    let reconciler = SolanaReconciler::new(outbox.clone(), registry, audit(&dir));
+    assert_eq!(reconciler.tick().await, 0);
+    assert!(
+        outbox
+            .read_receipt("alice", "solana-devnet", "0001-00001")
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
