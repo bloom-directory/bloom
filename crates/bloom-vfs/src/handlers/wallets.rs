@@ -63,7 +63,7 @@ use bloom_machine_client::{MachineBrokerClient, WalletProjectionReader};
 use bloom_proto::{AddressBook, HomeWritePermit, Policy, RawIntent};
 use bloom_tx::{
     intent_parser,
-    outbox::OutboxState,
+    outbox::{OutboxError, OutboxState, SigningEvidence},
     tx_engine::{TxEngine, TxEngineError},
 };
 use qrcode::QrCode;
@@ -2682,8 +2682,7 @@ fn newest_pending_target(mut pending: Vec<(u128, String)>) -> Option<String> {
 /// `StateMismatch` maps to `NotFound` deliberately: the caller named an id in a
 /// state it is not in, so the path it asked for does not exist. It lives
 /// somewhere else, which is what a lookup should report.
-fn outbox_err(e: bloom_tx::outbox::OutboxError) -> HandlerError {
-    use bloom_tx::outbox::OutboxError;
+fn outbox_err(e: OutboxError) -> HandlerError {
     match e {
         OutboxError::NotFound(what) => HandlerError::not_found(what),
         OutboxError::StateMismatch { id, .. } => HandlerError::not_found(id),
@@ -2879,31 +2878,47 @@ fn clear_confirm_error(entry_dir: &Path) {
 
 /// Best effort, and never recreates an entry directory that has moved on:
 /// the temporary file is created inside the existing directory only.
-fn record_confirm_error(entry_dir: &Path, wallet: &str, id: &str, error: &HandlerError) {
+/// How to reconcile an entry that `cancel` kept because it may be signed.
+fn possibly_signed_next(error: &TxEngineError) -> Option<String> {
+    let TxEngineError::Outbox(OutboxError::PossiblySigned {
+        wallet,
+        tx_hash,
+        evidence,
+        ..
+    }) = error
+    else {
+        return None;
+    };
+    Some(match (tx_hash, evidence) {
+        (Some(_), _) => "This entry may already be signed or broadcast, so `cancel` kept it. Do not reuse its nonce. Reconcile it by its recorded hash first; if it is still unmined, replace it with `bloom wallet cancel`, which needs its own owner approval.".to_owned(),
+        (None, SigningEvidence::Entry) => "A signing request for this entry may have reached the Broker without its reply being recorded, so `cancel` kept the entry; no transaction hash is recorded yet. Do not reuse its nonce. Write the same confirm again: Bloom asks the Broker for the recorded signing operation's result and broadcasts or reconciles it. If it is still unmined afterwards, replace it with `bloom wallet cancel`, which needs its own owner approval.".to_owned(),
+        (None, SigningEvidence::Batch { ordered_refs }) => format!(
+            "A batch signing request covering this entry may have reached the Broker without its reply being recorded, so `cancel` kept the entry. Do not reuse its nonce. Writing confirm here cannot reconcile a batch. Run `bloom wallet confirm-batch {wallet} {}` with the refs in exactly this order: Bloom asks the Broker for that batch's result and broadcasts or reconciles each entry.",
+            ordered_refs.join(" ")
+        ),
+        (None, SigningEvidence::UnreadableBatch) => "Bloom could not read a batch signing record, and that record could cover any entry, so `cancel` kept this one. Confirm still works. An operator must repair the record named by `outbox.batch_state_unreadable` in the Machine log, or remove it only after the Broker shows that batch never signed; then write cancel again.".to_owned(),
+    })
+}
+
+/// `possibly_signed` is the guidance from [`possibly_signed_next`], if any.
+fn record_confirm_error(
+    entry_dir: &Path,
+    wallet: &str,
+    id: &str,
+    error: &HandlerError,
+    possibly_signed: Option<String>,
+) {
     use std::io::Write as _;
 
     let message = error.to_string();
-    let (kind, next) = if message.contains("POLICY_APPROVAL_REQUIRED") {
+    let (kind, next) = if let Some(next) = possibly_signed {
+        ("possibly_signed", next)
+    } else if message.contains("POLICY_APPROVAL_REQUIRED") {
         (
             "policy_approval_required",
             format!(
                 "The wallet policy does not yet allow the Petal that staged this transaction. Give the owner the ceremony link in error (pending updates are under wallets/{wallet}/policy-updates/pending/); once they approve, write confirm again."
             ),
-        )
-    } else if message.contains("batch signing record") {
-        (
-            "possibly_signed",
-            "Bloom could not read a batch signing record, and that record could cover any entry, so `cancel` kept this one. Confirm still works. An operator must repair the record named by `outbox.batch_state_unreadable` in the Machine log, or remove it only after the Broker shows that batch never signed; then write cancel again.".to_owned(),
-        )
-    } else if message.contains("no transaction hash is recorded") {
-        (
-            "possibly_signed",
-            "A signing request for this entry may have reached the Broker without its reply being recorded, so `cancel` kept the entry; no transaction hash is recorded yet. Do not reuse its nonce. Write the same confirm again: Bloom asks the Broker for the recorded signing operation's result and broadcasts or reconciles it. If it is still unmined afterwards, replace it with `bloom wallet cancel`, which needs its own owner approval.".to_owned(),
-        )
-    } else if message.contains("cannot discard a possibly signed transaction") {
-        (
-            "possibly_signed",
-            "This entry may already be signed or broadcast, so `cancel` kept it. Do not reuse its nonce. Reconcile it by its recorded hash first; if it is still unmined, replace it with `bloom wallet cancel`, which needs its own owner approval.".to_owned(),
         )
     } else {
         (
@@ -4490,8 +4505,9 @@ impl WalletsHandler {
                         .discard_unsigned(permit, wallet, chain, id)
                         .await
                         .map_err(|error| {
+                            let next = possibly_signed_next(&error);
                             let error = err_be(error);
-                            record_confirm_error(&entry_dir, wallet, id, &error);
+                            record_confirm_error(&entry_dir, wallet, id, &error, next);
                             error
                         });
                 }
@@ -4533,7 +4549,7 @@ impl WalletsHandler {
                     // approval_challenge.json; anything else is recorded.
                     Err(HandlerError::PermissionDenied) => Err(HandlerError::PermissionDenied),
                     Err(error) => {
-                        record_confirm_error(&entry_dir, wallet, id, &error);
+                        record_confirm_error(&entry_dir, wallet, id, &error, None);
                         Err(error)
                     }
                 }
@@ -10013,6 +10029,7 @@ value = "0""#,
             &HandlerError::backend(
                 "POLICY_APPROVAL_REQUIRED: complete the owner ceremony at https://example.invalid/c then retry this operation; status: /wallets/alice/policy-updates/pending/x/status.json",
             ),
+            None,
         );
         let record: serde_json::Value = serde_json::from_slice(
             &std::fs::read(directory.path().join(CONFIRM_ERROR_FILE)).unwrap(),
@@ -10039,7 +10056,13 @@ value = "0""#,
         assert_eq!(leftovers.len(), 1, "{leftovers:?}");
 
         let moved = directory.path().join("moved-to-sent");
-        record_confirm_error(&moved, "alice", "0001-test", &HandlerError::backend("late"));
+        record_confirm_error(
+            &moved,
+            "alice",
+            "0001-test",
+            &HandlerError::backend("late"),
+            None,
+        );
         assert!(!moved.exists());
     }
 
@@ -10202,6 +10225,17 @@ value = "0""#,
                         next.contains("could not read a batch signing record"),
                         "{next}"
                     );
+                    assert!(!next.contains("Write the same confirm again"), "{next}");
+                    continue;
+                }
+                if marker == "batch" {
+                    // Single confirm reads only the entry's own state; only
+                    // the exact ordered batch reconciles a batch signature.
+                    let command = format!(
+                        "bloom wallet confirm-batch {} anvil:0001-test",
+                        f.wallet_name
+                    );
+                    assert!(next.contains(&command), "{next}");
                     assert!(!next.contains("Write the same confirm again"), "{next}");
                     continue;
                 }

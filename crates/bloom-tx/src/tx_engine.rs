@@ -9122,6 +9122,86 @@ mod tests {
         );
     }
 
+    /// A batch whose signing reply was lost and whose children then expired
+    /// is kept by cancel, which names the exact ordered batch. Following that
+    /// guidance reconciles the one signing operation and broadcasts both.
+    #[tokio::test]
+    async fn cancel_guidance_recovers_an_expired_batch_with_a_lost_reply() {
+        let url = spawn_batch_rpc(None).await;
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let (_, mut staged, _, _) = batch_material(&["lost-b", "lost-a"]);
+        for child in &mut staged {
+            child.expires_ms = now_ms() + 1_500;
+            outbox.write_pending(child, "batch review").unwrap();
+        }
+        let (engine, fixture, _) = triad_batch_fixture(outbox.clone(), false, false);
+        let permit = permit_for(&directory);
+        let chain = stage_chain(&url);
+        let targets = |refs: &[&str]| {
+            refs.iter()
+                .map(|reference| {
+                    let (chain_name, id) = reference.split_once(':').unwrap();
+                    ConfirmBatchTarget {
+                        chain_name: chain_name.into(),
+                        id: id.into(),
+                        chain: chain.clone(),
+                        policy: Policy::default(),
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let original = targets(&["anvil:lost-b", "anvil:lost-a"]);
+        assert!(matches!(
+            engine
+                .confirm_batch(&permit, "alice", original.clone(), false)
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        fixture.active.store(true, Ordering::SeqCst);
+        fixture
+            .lose_sign_response_once
+            .store(true, Ordering::SeqCst);
+        assert!(
+            engine
+                .confirm_batch(&permit, "alice", original, false)
+                .await
+                .is_err()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1_600)).await;
+
+        let Err(TxEngineError::Outbox(OutboxError::PossiblySigned {
+            evidence: crate::outbox::SigningEvidence::Batch { ordered_refs },
+            ..
+        })) = engine
+            .discard_unsigned(&permit, "alice", "anvil", "lost-a")
+            .await
+        else {
+            panic!("cancel must keep a child of a dispatched batch");
+        };
+        let refs = ordered_refs.iter().map(String::as_str).collect::<Vec<_>>();
+        let result = engine
+            .confirm_batch(&permit, "alice", targets(&refs), false)
+            .await
+            .unwrap();
+        assert!(
+            result
+                .transactions
+                .iter()
+                .all(|transaction| transaction.status == TxStatus::Sent)
+        );
+        assert_eq!(
+            fixture
+                .requests
+                .lock()
+                .iter()
+                .filter(|request| matches!(request, MachineBrokerRequest::SigningSignBatch(_)))
+                .count(),
+            1,
+            "recovery must query the recorded batch operation, not re-sign"
+        );
+    }
+
     #[tokio::test]
     async fn confirm_batch_recovers_marker_written_before_first_send() {
         let url = spawn_batch_rpc(None).await;

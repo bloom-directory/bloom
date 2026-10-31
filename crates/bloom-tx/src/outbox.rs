@@ -52,39 +52,58 @@ struct BatchStateRef {
     id: String,
 }
 
+/// A dispatched batch's payload digest for one child and its ordered refs.
+type BatchAttempt = (Option<Digest32>, Vec<String>);
+
 /// The pending attempts that dispatched batch signing states may have
 /// signed. Read once per sweep or discard.
 #[derive(Default)]
 pub struct BatchIndex {
     /// `(wallet, chain, id)` to the payload digest each dispatched batch
-    /// signed for it; `None` for a legacy state that records no digest.
-    dispatched: HashMap<(String, String, String), Vec<Option<Digest32>>>,
+    /// signed for it (`None` for a legacy state that records no digest) and
+    /// that batch's ordered `chain:id` refs.
+    dispatched: HashMap<(String, String, String), Vec<BatchAttempt>>,
     /// Some batch state could not be read, so it may cover any entry.
     unreadable: bool,
 }
 
 impl BatchIndex {
-    /// Whether a dispatched batch may have signed this specific attempt. A
-    /// batch that signed an earlier attempt under the same ID does not count:
-    /// its payload digest differs.
-    fn covers(&self, staged: &StagedTx) -> bool {
-        if self.unreadable {
-            return true;
-        }
+    /// The ordered refs of a readable dispatched batch that may have signed
+    /// this specific attempt. A batch that signed an earlier attempt under
+    /// the same ID does not count: its payload digest differs.
+    fn covering(&self, staged: &StagedTx) -> Option<&[String]> {
         let key = (
             staged.wallet.clone(),
             staged.chain.clone(),
             staged.id.clone(),
         );
-        let Some(signed) = self.dispatched.get(&key) else {
-            return false;
-        };
         let digest = crate::tx_engine::staged_payload_digest(staged);
-        signed.iter().any(|signed| match (signed, &digest) {
-            (Some(signed), Some(digest)) => signed == digest,
-            _ => true,
-        })
+        self.dispatched
+            .get(&key)?
+            .iter()
+            .find(|(signed, _)| match (signed, &digest) {
+                (Some(signed), Some(digest)) => signed == digest,
+                _ => true,
+            })
+            .map(|(_, refs)| refs.as_slice())
     }
+
+    fn covers(&self, staged: &StagedTx) -> bool {
+        self.unreadable || self.covering(staged).is_some()
+    }
+}
+
+/// What may have signed a kept entry, which decides how to reconcile it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SigningEvidence {
+    /// The entry's own hash, broadcast attempt, raw bytes, or signing
+    /// request: confirming the entry again reconciles it.
+    Entry,
+    /// A dispatched batch signing request. Only `confirm-batch` with these
+    /// `chain:id` refs, in this order, reconciles it.
+    Batch { ordered_refs: Vec<String> },
+    /// A batch signing state that cannot be read, so it may cover any entry.
+    UnreadableBatch,
 }
 
 /// Whether anything is at `path`. Only a clean "not found" proves absence.
@@ -202,17 +221,17 @@ pub enum OutboxError {
     InvalidChain(String),
     #[error("structured valuation unavailable for staged tx '{0}'")]
     UnknownValuation(String),
-    #[error("cannot discard a possibly signed transaction '{id}': {}", match (tx_hash, batch_state_unreadable) {
+    #[error("cannot discard a possibly signed transaction '{id}': {}", match (tx_hash, evidence) {
         (Some(hash), _) => format!("it may have been broadcast as {hash}"),
-        (None, true) => format!("a batch signing record under outbox/{BATCH_SIGNING_STATE_DIR} could not be read, so Bloom cannot prove this entry was never signed"),
-        (None, false) => "a signing request may have been sent, but no transaction hash is recorded".to_owned(),
+        (None, SigningEvidence::Entry) => "a signing request may have been sent, but no transaction hash is recorded".to_owned(),
+        (None, SigningEvidence::Batch { ordered_refs }) => format!("a batch signing request covering it may have been sent; reconcile that batch with `bloom wallet confirm-batch {wallet} {}`, listing its refs in exactly this order", ordered_refs.join(" ")),
+        (None, SigningEvidence::UnreadableBatch) => format!("a batch signing record under outbox/{BATCH_SIGNING_STATE_DIR} could not be read, so Bloom cannot prove this entry was never signed"),
     })]
     PossiblySigned {
+        wallet: String,
         id: String,
         tx_hash: Option<String>,
-        /// The only evidence of signing is a batch state that cannot be
-        /// read, so it may cover any entry.
-        batch_state_unreadable: bool,
+        evidence: SigningEvidence,
     },
     #[error("{0}")]
     Other(String),
@@ -1139,15 +1158,20 @@ impl Outbox {
         let entry = self.read_in_state(wallet, chain, id, OutboxState::Pending)?;
         let batches = self.batch_index();
         if self.possibly_signed(&entry, &batches) {
-            let readable = BatchIndex {
-                dispatched: batches.dispatched.clone(),
-                unreadable: false,
+            let evidence = if self.possibly_signed(&entry, &BatchIndex::default()) {
+                SigningEvidence::Entry
+            } else if let Some(refs) = batches.covering(&entry.staged) {
+                SigningEvidence::Batch {
+                    ordered_refs: refs.to_vec(),
+                }
+            } else {
+                SigningEvidence::UnreadableBatch
             };
             return Err(OutboxError::PossiblySigned {
+                wallet: wallet.into(),
                 id: id.into(),
                 tx_hash: recorded_hash(&entry),
-                batch_state_unreadable: batches.unreadable
-                    && !self.possibly_signed(&entry, &readable),
+                evidence,
             });
         }
         let new_dir = self.transition_with_status(&entry, TxStatus::Cancelled)?;
@@ -1199,6 +1223,11 @@ impl Outbox {
                 continue;
             }
             let digests_match = state.ordered_payload_digests.len() == state.ordered_refs.len();
+            let refs = state
+                .ordered_refs
+                .iter()
+                .map(|child| format!("{}:{}", child.chain, child.id))
+                .collect::<Vec<_>>();
             for (position, child) in state.ordered_refs.into_iter().enumerate() {
                 let digest = digests_match
                     .then(|| {
@@ -1209,7 +1238,7 @@ impl Outbox {
                     .dispatched
                     .entry((state.wallet.clone(), child.chain, child.id))
                     .or_default()
-                    .push(digest);
+                    .push((digest, refs.clone()));
             }
         }
         index
@@ -2050,7 +2079,7 @@ mod tests {
             matches!(
                 error,
                 OutboxError::PossiblySigned {
-                    batch_state_unreadable: true,
+                    evidence: SigningEvidence::UnreadableBatch,
                     ..
                 }
             ),
@@ -2068,10 +2097,47 @@ mod tests {
             matches!(
                 error,
                 OutboxError::PossiblySigned {
-                    batch_state_unreadable: false,
+                    evidence: SigningEvidence::Entry,
                     ..
                 }
             ),
+            "{error}"
+        );
+    }
+
+    /// An entry kept only because a readable batch may have signed it names
+    /// that batch's exact ordered refs: single confirm reads only the
+    /// entry's own state and cannot reconcile the batch.
+    #[test]
+    fn cancel_names_the_covering_batch_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::new(dir.path()).unwrap();
+        let digest = crate::tx_engine::staged_payload_digest(&fake_staged("x")).unwrap();
+        for id in ["second", "first"] {
+            ob.write_pending(&fake_staged(id), "p").unwrap();
+        }
+        write_batch(
+            dir.path(),
+            "set",
+            serde_json::json!({"wallet":"alice","sign_dispatched":true,
+                "ordered_refs":[{"chain":"anvil","id":"second"},{"chain":"anvil","id":"first"}],
+                "ordered_payload_digests":[digest, digest]}),
+        );
+        let error = ob.cancel("alice", "anvil", "first").unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                OutboxError::PossiblySigned {
+                    evidence: SigningEvidence::Batch { ordered_refs },
+                    ..
+                } if ordered_refs == &["anvil:second", "anvil:first"]
+            ),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("`bloom wallet confirm-batch alice anvil:second anvil:first`"),
             "{error}"
         );
     }
