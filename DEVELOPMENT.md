@@ -490,7 +490,8 @@ developer launcher does the same on every launch
 records such as locally enrolled Petals. A long-lived developer root therefore
 picks up new pinned releases on its next launch. An installation without
 source provenance (a manual local install of a default Petal) is never
-replaced: uninstall it first, then relaunch.
+replaced: uninstall it first, then relaunch. It is reused while its package
+hash equals the pinned release's hash.
 
 ## General local operation
 

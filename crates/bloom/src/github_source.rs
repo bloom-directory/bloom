@@ -818,19 +818,16 @@ fn install_github_source_with_expectation(
 
 /// How an already-installed owner relates to the pinned catalog entry.
 ///
-/// Anything that is neither of these two states is a refusal. Bloom replaces
-/// a Petal only when it can identify it as a catalogued release: either by
-/// source provenance from the trusted catalog repository, or, when no source
-/// was recorded, by a package hash equal to a catalogued release's hash. The
-/// hash proves the bytes match; it does not prove where they were fetched from.
+/// Anything that is neither of these two states is a refusal: Bloom only ever
+/// replaces a Petal it can prove it installed itself from the same trusted
+/// catalog repository. An install without source provenance whose package hash
+/// is the pinned hash is reused as `Current`, but never replaced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PreinstalledState {
     /// The installed package is the pinned release: same commit and hash, or,
     /// without source provenance, the pinned release's package hash.
     Current,
-    /// An older catalogued release of the same Petal: same trusted repository
-    /// at another commit, or, without source provenance, a predecessor release
-    /// hash (`installed_commit` is then `"unrecorded"`).
+    /// Same Petal name, same trusted catalog repository, older pinned commit.
     Outdated { installed_commit: String },
 }
 
@@ -1375,9 +1372,9 @@ fn validate_release_authority(
 /// Returns `Current` when the installation is already the pinned commit and
 /// hash, and `Outdated` when it is the same Petal from the same trusted catalog
 /// repository at a different commit. An installation without source
-/// provenance is identified by content alone: its package hash must equal the
-/// pinned or a predecessor release hash. Every other shape — missing
-/// provenance with an unknown hash, a different repository, or an identity
+/// provenance is `Current` when its package hash is the pinned hash. Every
+/// other shape — missing provenance with any other hash (including an older
+/// release, which may be a deliberate rollback), a different repository, or an identity
 /// that contradicts itself — is refused so that manually sourced or untrusted
 /// ownership is never overwritten.
 pub(crate) fn classify_existing_preinstalled(
@@ -1402,14 +1399,8 @@ pub(crate) fn classify_existing_preinstalled(
         if expected.expected_hash == Some(meta.hash.as_str()) {
             return Ok(PreinstalledState::Current);
         }
-        if expected
-            .predecessor_package_hashes
-            .contains(&meta.hash.as_str())
-        {
-            return Ok(PreinstalledState::Outdated {
-                installed_commit: "unrecorded".into(),
-            });
-        }
+        // Matching bytes do not mean Bloom may replace them: an older release
+        // installed by hand may be a deliberate rollback.
         bail!(
             "pre-installed Petal {} is already owned by an installation without source provenance; uninstall it before retrying",
             expected.name
@@ -2731,7 +2722,7 @@ mod tests {
     }
 
     #[test]
-    fn provenance_free_install_of_a_catalogued_release_hash_is_recognised() {
+    fn provenance_free_install_is_reused_only_at_the_pinned_hash() {
         let old = build_near_release("v0.1.0");
         let old_hash: &'static str = Box::leak(old.package.hash.clone().into_boxed_str());
         let home = tempfile::tempdir().unwrap();
@@ -2765,12 +2756,12 @@ mod tests {
             "near.tar.gz",
             Some("1111111111111111111111111111111111111111111111111111111111111111"),
         );
-        assert!(classify_existing_preinstalled(&successor, &meta).is_err());
+        // A listed predecessor is still never replaced without provenance.
         successor.predecessor_package_hashes = Box::leak(Box::new([old_hash]));
-        assert!(matches!(
-            classify_existing_preinstalled(&successor, &meta).unwrap(),
-            PreinstalledState::Outdated { .. }
-        ));
+        let err = classify_existing_preinstalled(&successor, &meta)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("without source provenance"), "{err}");
     }
 
     #[test]
