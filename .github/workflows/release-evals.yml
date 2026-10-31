@@ -1,0 +1,228 @@
+name: Release evals
+
+# The release gate that runs Bloom end to end with real agents. For every
+# selected agent: build the Machine from this ref with the Broker and Signer
+# the release matrix pins, prove the three services with the Solana smoke
+# (no model), then run every Harbor task with that agent and record reward,
+# tool calls, tokens and time. The report fails on a smoke failure, a missing
+# result or a regression against evals/harbor/baselines/README.md; the rest is a
+# number for the release reviewer. A failed trial is retried once, so one
+# nondeterministic miss does not fail a release. Runs on release-proposal PRs
+# and on dispatch. Model credentials are repository secrets, OAuth where the
+# agent supports it: CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`) or
+# ANTHROPIC_API_KEY for Claude Code; CODEX_AUTH_JSON (the contents of
+# ~/.codex/auth.json from `codex login`) or OPENAI_API_KEY for Codex;
+# DEEPSEEK_API_KEY for OpenCode. The agent container sees them, so use
+# dedicated revocable credentials. A selected agent without one fails the run
+# and the report says so.
+
+on:
+  workflow_dispatch:
+    inputs:
+      agents:
+        description: 'Comma-separated agents to run: claude-opus, codex, opencode by default; claude-sonnet on request.'
+        default: 'claude-opus,codex,opencode'
+  pull_request:
+
+concurrency:
+  group: release-evals-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # The release matrix; the report fails any cell without a summary.
+  TASKS: solana-transfer evm-transfer evm-transfer-denied hyperliquid-order-proposal polymarket-limit-order-proposal near-intents-swap-proposal polymarket-clarification
+
+jobs:
+  build:
+    name: Build the Triad with the developer harness
+    if: github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-proposal/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      agents: ${{ steps.select.outputs.agents }}
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          path: bloom
+      - name: Select agents
+        id: select
+        env:
+          AGENTS: ${{ inputs.agents || 'claude-opus,codex,opencode' }}
+        run: |
+          agents="$(printf '%s' "$AGENTS" | jq -Rc 'split(",") | map(select(length > 0))')"
+          # Agent names reach shell steps below; accept only the harness's names.
+          jq -e 'all(.[]; IN("claude-opus", "claude-sonnet", "codex", "opencode")) and length > 0' <<<"$agents" >/dev/null ||
+            { echo "::error::agents must be a comma-separated subset of claude-opus, claude-sonnet, codex, opencode"; exit 1; }
+          echo "agents=$agents" >> "$GITHUB_OUTPUT"
+      - name: Read the release matrix pins
+        id: pins
+        working-directory: bloom
+        run: |
+          matrix=packaging/triad/release/compatibility-v1.toml
+          broker="$(sed -n -E 's/^broker_commit = "([0-9a-f]{40})"$/\1/p' "$matrix")"
+          signer="$(sed -n -E 's/^signer_commit = "([0-9a-f]{40})"$/\1/p' "$matrix")"
+          [[ -n "$broker" && -n "$signer" ]] || { echo "::error::$matrix must pin full Broker and Signer commits"; exit 1; }
+          echo "broker=$broker" >> "$GITHUB_OUTPUT"
+          echo "signer=$signer" >> "$GITHUB_OUTPUT"
+      - name: Check out the pinned Broker
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: bloom-directory/bloom-broker
+          ref: ${{ steps.pins.outputs.broker }}
+          path: bloom-broker
+      - name: Check out the pinned Signer
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: bloom-directory/bloom-signer
+          ref: ${{ steps.pins.outputs.signer }}
+          path: bloom-signer
+      - name: Install Rust toolchain
+        working-directory: bloom
+        run: rustup show
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: |
+            bloom
+            bloom-broker
+            bloom-signer
+          cache-targets: false
+      - name: Build the three services with the developer harness
+        run: |
+          (cd bloom && cargo build --release --locked -p bloom --features triad-dev-harness)
+          (cd bloom-broker && cargo build --release --locked -p bloom-broker -p bloom-broker-debug-driver --features bloom-broker/triad-dev-harness)
+          (cd bloom-signer && cargo build --release --locked -p bloom-signer --features triad-dev-harness)
+          mkdir -p triad-bin
+          cp bloom/target/release/bloom bloom-broker/target/release/bloom-broker \
+             bloom-broker/target/release/bloom-broker-debug-driver bloom-signer/target/release/bloom-signer triad-bin/
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: triad-dev-binaries
+          path: triad-bin
+          if-no-files-found: error
+          retention-days: 7
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
+
+  evals:
+    name: ${{ matrix.agent }} trials
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        agent: ${{ fromJSON(needs.build.outputs.agents) }}
+    env:
+      AGENT: ${{ matrix.agent }}
+      BLOOM_INTEGRATION_MACHINE_BIN: ${{ github.workspace }}/triad-bin/bloom
+      BLOOM_INTEGRATION_BROKER_BIN: ${{ github.workspace }}/triad-bin/bloom-broker
+      BLOOM_INTEGRATION_SIGNER_BIN: ${{ github.workspace }}/triad-bin/bloom-signer
+      BLOOM_INTEGRATION_DEBUG_DRIVER_BIN: ${{ github.workspace }}/triad-bin/bloom-broker-debug-driver
+      BLOOM_EVAL_JOBS_DIR: ${{ github.workspace }}/harbor-jobs
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: triad-dev-binaries
+          path: triad-bin
+      - run: chmod +x triad-bin/*
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf # v1
+        with:
+          version: v1.7.1
+      - name: Install pinned agave v3.0.0 validator
+        run: |
+          curl -sSL -o /tmp/agave-install.sh https://release.anza.xyz/v3.0.0/install
+          echo "7d588d188cb9ea550434cabc62a9927cf75de22e1aeb2a87f2352071812944fb  /tmp/agave-install.sh" | sha256sum -c -
+          sh /tmp/agave-install.sh v3.0.0
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+      # The developer launcher runs the services as systemd user units and
+      # mounts the Machine over loopback NFS with a noninteractive sudo rule;
+      # the runner's unrestricted sudo satisfies that rule.
+      - name: Install the launcher's Linux prerequisites
+        run: |
+          sudo apt-get update && sudo apt-get install -y nfs-common
+          sudo loginctl enable-linger "$(id -un)"
+          for _ in $(seq 1 30); do
+            [ -S "/run/user/$(id -u)/bus" ] && break
+            sleep 1
+          done
+          XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user show-environment >/dev/null
+      - name: Smoke the real Triad without a model
+        run: scripts/evals/run-harbor.sh solana-transfer "$AGENT" --smoke
+      # One task at a time, as the baseline procedure requires. A failed
+      # trial runs once more; the report keeps the better attempt. Nothing
+      # here is fatal, so the report sees every task.
+      - name: Run every task with the selected agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          if [ -n "$CODEX_AUTH_JSON" ] && [ -z "$OPENAI_API_KEY" ]; then
+            (umask 077 && mkdir -p ~/.codex && printf '%s' "$CODEX_AUTH_JSON" > ~/.codex/auth.json)
+          fi
+          case "$AGENT" in
+            claude-*) key="${ANTHROPIC_API_KEY}${CLAUDE_CODE_OAUTH_TOKEN}" ;;
+            codex) key="${OPENAI_API_KEY}${CODEX_AUTH_JSON}" ;;
+            opencode) key="$DEEPSEEK_API_KEY" ;;
+          esac
+          if [ -z "$key" ]; then
+            echo "::error::no model credential for $AGENT"
+            exit 1
+          fi
+          for task in $TASKS; do
+            scripts/evals/run-harbor.sh "$task" "$AGENT" ||
+              scripts/evals/run-harbor.sh "$task" "$AGENT" ||
+              echo "::warning::$task with $AGENT failed twice"
+          done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: trials-${{ matrix.agent }}
+          path: ${{ github.workspace }}/harbor-jobs
+          if-no-files-found: error
+
+  report:
+    name: Release eval report
+    needs: [build, evals]
+    if: always() && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: trials-*
+          path: trials
+      - name: Write the report
+        id: report
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          AGENTS: ${{ join(fromJSON(needs.build.outputs.agents), ',') }}
+        run: |
+          python3 scripts/evals/release-report.py --agents "$AGENTS" --tasks "$TASKS" \
+            evals/harbor/baselines/README.md trials/*/summaries > report.md || echo "failed=true" >> "$GITHUB_OUTPUT"
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Comment on the pull request
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr comment ${{ github.event.pull_request.number }} --body-file report.md
+      - name: Fail on a smoke failure or a baseline regression
+        if: steps.report.outputs.failed == 'true'
+        run: exit 1
