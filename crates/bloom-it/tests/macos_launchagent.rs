@@ -470,14 +470,21 @@ fn macos_conformance_workflows_consume_unified_candidates() {
 
     // These assertions read both conformance workflows, so editing either
     // must trigger CI, which runs this binary on Linux. The staged installer
-    // test compiles only on macOS and runs in the Unix-principal workflow.
+    // test compiles only on macOS; the Unix-principal workflow runs its
+    // script, and the other packaging scripts, directly.
     let code_paths = ci.split("- \"Cargo.toml\"").next().unwrap();
     assert!(code_paths.contains("- \".github/workflows/macos-unix-conformance.yml\""));
     assert!(code_paths.contains("- \".github/workflows/macos-two-login-conformance.yml\""));
     assert!(ci.contains("-E 'package(bloom-it) and binary(macos_launchagent)'"));
     let unix = fs::read_to_string(workspace().join(".github/workflows/macos-unix-conformance.yml"))
         .unwrap();
-    assert!(unix.contains("-p bloom-it --test macos_launchagent"));
+    for script in [
+        "macos-installer-staged.sh",
+        "macos-pf-retirement.sh",
+        "macos-upgrade-rollback.sh",
+    ] {
+        assert!(unix.contains(&format!("bash bloom/tests/packaging/{script}")));
+    }
 }
 
 #[test]

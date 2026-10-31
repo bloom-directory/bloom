@@ -254,8 +254,8 @@ jobs:
           --no-fail-fast
       # The macOS LaunchAgent assertions read packaging and Machine sources,
       # so they run on Linux for every change. The one test that executes the
-      # staged macOS installer is compiled only on macOS and runs in the macOS
-      # Unix-principal conformance workflow.
+      # staged macOS installer is compiled only on macOS; the macOS
+      # Unix-principal conformance workflow runs its script directly.
       - name: Run macOS LaunchAgent source assertions from archive
         run: >
           cargo nextest run --archive-file target/nextest-archive.tar.zst
