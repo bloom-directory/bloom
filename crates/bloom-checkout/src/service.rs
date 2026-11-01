@@ -2205,6 +2205,7 @@ pub async fn serve_api(service: Arc<CheckoutService>, path: &Path, machine_uid: 
                             json!({"error": if BROWSE_ERRORS.contains(&message.as_str()) {
                                 message
                             } else {
+                                eprintln!("checkout browse failed: {}", loggable(&error));
                                 "The page could not be read or changed; open it again or request a new snapshot".into()
                             }})
                         }
@@ -2221,6 +2222,30 @@ pub async fn serve_api(service: Arc<CheckoutService>, path: &Path, machine_uid: 
             }
         });
     }
+}
+
+/// An error chain for the service log. Checkout's own messages and CDP
+/// method names stay; quoted text, which parsers copy from page values, does not.
+fn loggable(error: &anyhow::Error) -> String {
+    let mut out = String::new();
+    for cause in error.chain() {
+        if !out.is_empty() {
+            out.push_str(": ");
+        }
+        let mut quoted = None;
+        for c in cause.to_string().chars() {
+            match quoted {
+                Some(q) if c == q => quoted = None,
+                Some(_) => {}
+                None if matches!(c, '"' | '`' | '\'') => {
+                    quoted = Some(c);
+                    out.push_str("[...]");
+                }
+                None => out.push(c),
+            }
+        }
+    }
+    out.chars().take(300).collect()
 }
 
 const BROWSE_ERRORS: &[&str] = &[
@@ -3067,6 +3092,17 @@ mod tests {
         let _ = service.private_action(&token, ViewAction::Finish).await;
         assert_eq!(service.store.get(&id).unwrap().state, "booked");
         server.abort();
+    }
+
+    #[test]
+    fn browse_failures_are_logged_without_quoted_page_values() {
+        let error = anyhow::anyhow!("invalid type: string \"Ada Lovelace\", expected u64")
+            .context("Checkout browser command failed during Runtime.evaluate");
+        assert_eq!(
+            loggable(&error),
+            "Checkout browser command failed during Runtime.evaluate: invalid type: string [...], expected u64"
+        );
+        assert!(loggable(&anyhow::anyhow!("{}", "x".repeat(500))).len() <= 300);
     }
 
     #[test]
