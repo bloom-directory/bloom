@@ -2813,6 +2813,16 @@ impl PetalHost for DaemonPetalHost {
             {
                 "cancelling".to_owned()
             }
+            // An older Bloom released this entry although it may be signed;
+            // "failed" would invite a second payment.
+            None if entry.state == bloom_tx::outbox::OutboxState::Failed
+                && entry
+                    .dir
+                    .join(bloom_tx::outbox::SIGNING_UNKNOWN_FILE)
+                    .exists() =>
+            {
+                "signing_unknown".to_owned()
+            }
             None => entry.staged.status.to_string(),
         };
         let receipt_json = receipt
@@ -7476,6 +7486,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(inspection.state, "cancelling");
+        assert_eq!(inspection.tx_hash.as_deref(), Some(tx_hash.as_str()));
+
+        // An entry an older Bloom moved to failed/ although it may be signed
+        // is not reported as a retryable failure.
+        let entry = daemon
+            .tx_engine
+            .outbox
+            .read("w", "anvil", &unacknowledged.id)
+            .unwrap();
+        daemon
+            .tx_engine
+            .outbox
+            .transition(&entry, bloom_tx::outbox::OutboxState::Failed)
+            .unwrap();
+        assert_eq!(
+            daemon
+                .tx_engine
+                .outbox
+                .mark_possibly_signed_failed()
+                .unwrap()
+                .len(),
+            1
+        );
+        let inspection = host
+            .evm_tx_inspect(
+                "w".into(),
+                "anvil".into(),
+                unacknowledged.id.clone(),
+                Some(context.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inspection.state, "signing_unknown");
         assert_eq!(inspection.tx_hash.as_deref(), Some(tx_hash.as_str()));
 
         let mut other_app = context.clone();

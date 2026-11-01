@@ -400,7 +400,8 @@ recorded yet, Bloom keeps the entry and its `last_error.json` says how to
 reconcile it; an expired entry stays pending for the same reason. A
 `failed/` entry with `signing_unknown.json` was released by an older Bloom
 although it may be signed: follow its `next` before staging that payment
-again or reusing its nonce. An already broadcast transaction needs `bloom
+again or reusing its nonce; Petal outbox inspection reports it as
+`signing_unknown`, not `failed`. An already broadcast transaction needs `bloom
 wallet cancel` and its own approval. Dropping a reservation does not renumber
 later rows: restage with an explicit nonce to fill a gap.
 
