@@ -23,10 +23,12 @@ use bloom_paid_http::{
 };
 use serde_json::json;
 use x402_chain_eip155::chain::Eip155ChainReference;
-use x402_chain_eip155::chain::permit2::EXACT_PERMIT2_PROXY_ADDRESS;
+use x402_chain_eip155::chain::permit2::{EXACT_PERMIT2_PROXY_ADDRESS, PERMIT2_ADDRESS};
 use x402_chain_eip155::v1_eip155_exact::SignerLike;
 use x402_chain_eip155::v1_eip155_exact::{self as v1_exact, TransferWithAuthorization};
-use x402_chain_eip155::v2_eip155_exact as v2_exact;
+use x402_chain_eip155::v2_eip155_exact::{
+    self as v2_exact, ISignatureTransfer, PermitWitnessTransferFrom, x402ExactPermit2Proxy,
+};
 use x402_chain_eip155::{V1Eip155ExactClient, V2Eip155ExactClient};
 use x402_types::chain::ChainId;
 use x402_types::proto::{self, OriginalJson};
@@ -462,11 +464,9 @@ fn exact_signing_payload(
                         eip3009.authorization,
                     )
                 }
-                // Broker cannot show a Permit2 payment to the owner yet, so
-                // it refuses to approve one; fail here before asking.
-                v2_exact::ExactEvmPayload::Permit2(_) => Err(
-                    "x402 Permit2 payments are not supported: Bloom can only show EIP-3009 payments for approval".into(),
-                ),
+                v2_exact::ExactEvmPayload::Permit2(permit) => {
+                    permit2_preimage(chain_id, permit.permit_2_authorization)
+                }
             }
         }
     }
@@ -513,12 +513,69 @@ fn eip3009_preimage(
             "value": message.value.to_string(), "validAfter": message.validAfter.to_string(),
             "validBefore": message.validBefore.to_string(), "nonce": format!("{:#x}", message.nonce)},
     });
-    let envelope = serde_json::to_vec(
+    let (preimage, hash) = eip712_preimage(&domain, message.eip712_hash_struct());
+    Ok((preimage, hash, review_envelope(typed_data)?))
+}
+
+/// Permit2 `PermitWitnessTransferFrom` to the x402 exact proxy, which pays
+/// only `witness.to`.
+fn permit2_preimage(
+    chain_id: u64,
+    authorization: x402_chain_eip155::chain::permit2::Permit2Authorization<
+        x402_chain_eip155::chain::permit2::ExactPermit2Witness,
+    >,
+) -> Result<ExactPayment, String> {
+    let domain = eip712_domain! {
+        name: "Permit2",
+        chain_id: chain_id,
+        verifying_contract: PERMIT2_ADDRESS,
+    };
+    let message = PermitWitnessTransferFrom {
+        permitted: ISignatureTransfer::TokenPermissions {
+            token: authorization.permitted.token.0,
+            amount: authorization.permitted.amount,
+        },
+        spender: EXACT_PERMIT2_PROXY_ADDRESS,
+        nonce: authorization.nonce,
+        deadline: U256::from(authorization.deadline.as_secs()),
+        witness: x402ExactPermit2Proxy::Witness {
+            to: authorization.witness.to.0,
+            validAfter: U256::from(authorization.witness.valid_after.as_secs()),
+        },
+    };
+    let field = |name: &str, kind: &str| json!({"name": name, "type": kind});
+    let typed_data = json!({
+        "types": {
+            "EIP712Domain": [field("name", "string"), field("chainId", "uint256"),
+                field("verifyingContract", "address")],
+            "PermitWitnessTransferFrom": [field("permitted", "TokenPermissions"),
+                field("spender", "address"), field("nonce", "uint256"),
+                field("deadline", "uint256"), field("witness", "Witness")],
+            "TokenPermissions": [field("token", "address"), field("amount", "uint256")],
+            "Witness": [field("to", "address"), field("validAfter", "uint256")],
+        },
+        "primaryType": "PermitWitnessTransferFrom",
+        "domain": {"name": "Permit2", "chainId": chain_id,
+            "verifyingContract": format!("{PERMIT2_ADDRESS:#x}")},
+        "message": {
+            "permitted": {"token": format!("{:#x}", message.permitted.token),
+                "amount": message.permitted.amount.to_string()},
+            "spender": format!("{:#x}", message.spender),
+            "nonce": message.nonce.to_string(),
+            "deadline": message.deadline.to_string(),
+            "witness": {"to": format!("{:#x}", message.witness.to),
+                "validAfter": message.witness.validAfter.to_string()},
+        },
+    });
+    let (preimage, hash) = eip712_preimage(&domain, message.eip712_hash_struct());
+    Ok((preimage, hash, review_envelope(typed_data)?))
+}
+
+fn review_envelope(typed_data: serde_json::Value) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(
         &json!({"schema": "bloom.message.review.v1", "kind": "eip712", "typed_data": typed_data}),
     )
-    .map_err(|error| format!("encode x402 payment review: {error}"))?;
-    let (preimage, hash) = eip712_preimage(&domain, message.eip712_hash_struct());
-    Ok((preimage, hash, envelope))
+    .map_err(|error| format!("encode x402 payment review: {error}"))
 }
 
 fn eip712_preimage(domain: &Eip712Domain, struct_hash: FixedBytes<32>) -> (Vec<u8>, [u8; 32]) {
@@ -582,6 +639,7 @@ mod tests {
     #[derive(Default)]
     struct ExactHost {
         preimages: Mutex<Vec<Vec<u8>>>,
+        reviews: Mutex<Vec<Vec<u8>>>,
     }
 
     #[async_trait]
@@ -609,6 +667,7 @@ mod tests {
             rebuilt.extend_from_slice(typed.hash_struct().unwrap().as_slice());
             assert_eq!(rebuilt, preimage);
             self.preimages.lock().unwrap().push(preimage.to_vec());
+            self.reviews.lock().unwrap().push(review.unwrap().to_vec());
             Ok([2_u8; 65])
         }
 
@@ -837,5 +896,95 @@ mod tests {
         };
         assert!(error.contains("selected payment terms"));
         assert_eq!(host.preimages.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn v2_permit2_sends_the_typed_data_broker_rebuilds() {
+        let pay_to = "0x93053f1e7A5eFEDa532Fe69CbbE43cBEc3A0F13f";
+        let asset = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+        let url = Url::parse("https://merchant.test/paid").unwrap();
+        let required = serde_json::json!({
+            "x402Version": 2,
+            "error": "Payment required",
+            "resource": {"url": url.as_str(), "description": "", "mimeType": ""},
+            "accepts": [{
+                "scheme": "exact", "network": "eip155:8453", "asset": asset,
+                "amount": "10000", "payTo": pay_to, "maxTimeoutSeconds": 300,
+                "extra": {"assetTransferMethod": "permit2", "name": "USD Coin", "version": "2"}
+            }]
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "payment-required",
+            HeaderValue::from_str(
+                &Base64Bytes::encode(serde_json::to_vec(&required).unwrap()).to_string(),
+            )
+            .unwrap(),
+        );
+        let challenge = normalize_challenge(&headers, b"{}", &url);
+        let requirement = bloom_paid_http::PaymentRequirement {
+            scheme: Some("exact".into()),
+            network: Some("eip155:8453".into()),
+            asset: Some(asset.into()),
+            amount: Some("10000".into()),
+            pay_to: Some(pay_to.into()),
+            resource: Some(url.to_string()),
+            raw: serde_json::json!({}),
+        };
+        let request = ParsedRequest {
+            method: "GET".into(),
+            url,
+            wallet: Some("alice".into()),
+            max_amount_usd: Some(1.0),
+            headers: BTreeMap::new(),
+            body: None,
+        };
+        let host = Arc::new(ExactHost::default());
+        let host_trait: Arc<dyn PaidHttpHostSigner> = host.clone();
+        let temporary = tempfile::tempdir().unwrap();
+        let draft = temporary.path().join("draft");
+        let facts = PaidHttpSigningFacts::default();
+        // The adapter also checks its rebuilt hash against the hash the
+        // upstream Permit2 client signed, and ExactHost rebuilds the preimage
+        // from the envelope as Broker does.
+        HostX402PaymentSigner::new()
+            .sign_x402_payment(&X402SignContext {
+                wallet: "alice",
+                request_id: "req-1",
+                request: &request,
+                challenge: &challenge,
+                requirement: &requirement,
+                rpc_resolver: &EmptyPaidHttpChainRpcResolver,
+                wallet_address: Address::repeat_byte(0x11),
+                host_signer: &host_trait,
+                facts: &facts,
+                draft_path: &draft,
+            })
+            .await
+            .unwrap();
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&host.reviews.lock().unwrap()[0]).unwrap();
+        let typed = &envelope["typed_data"];
+        assert_eq!(envelope["kind"], "eip712");
+        assert_eq!(typed["primaryType"], "PermitWitnessTransferFrom");
+        assert_eq!(
+            typed["domain"],
+            serde_json::json!({"name": "Permit2", "chainId": 8453,
+                "verifyingContract": "0x000000000022d473030f116ddee9f6b43ac78ba3"})
+        );
+        let message = &typed["message"];
+        assert_eq!(
+            message["spender"],
+            "0x402085c248eea27d92e8b30b2c58ed07f9e20001"
+        );
+        assert_eq!(message["witness"]["to"], pay_to.to_ascii_lowercase());
+        assert_eq!(message["permitted"]["token"], asset.to_ascii_lowercase());
+        assert_eq!(message["permitted"]["amount"], "10000");
+        let typed: alloy_dyn_abi::eip712::TypedData =
+            serde_json::from_value(typed.clone()).unwrap();
+        assert_eq!(
+            typed.encode_type().unwrap(),
+            "PermitWitnessTransferFrom(TokenPermissions permitted,address spender,uint256 nonce,uint256 deadline,Witness witness)TokenPermissions(address token,uint256 amount)Witness(address to,uint256 validAfter)"
+        );
     }
 }

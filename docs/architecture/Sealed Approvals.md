@@ -300,13 +300,27 @@ catalog pins select compatible published packages. Broker #103 landed as
 and the Machine x402 payment review (#125). Both must land on Broker master,
 and this pin must move to the landed commit, before #224 merges.
 
-Machine's own x402 payments (System subject, class `paid-http.x402`) send the
-EIP-3009 typed data as a message review envelope. Broker rebuilds the signed
-preimage from it, refuses an approval without it or with one that differs, and
-shows the owner the token, amount, recipient and validity window. Machine
-refuses x402 Permit2 payments, which Broker cannot show yet. `paid-http.mpp`
-signs Tempo transactions and vouchers that Broker cannot decode; its approval
-still shows only the System subject (bloom-directory/pm#89).
+Machine's own paid-HTTP payments (System subjects `paid-http.x402` and
+`paid-http.mpp`) send a message review envelope with every signature. Broker
+rebuilds or decodes the signed preimage from it, refuses an approval without it
+or with one that differs, and shows the owner what the signature pays
+(bloom-directory/pm#89):
+
+- x402 sends EIP-712 typed data: EIP-3009 `TransferWithAuthorization`, or
+  Permit2 `PermitWitnessTransferFrom` whose spender is the x402 exact proxy,
+  which pays only `witness.to`. The owner sees the token, amount, recipient and
+  validity window.
+- A Tempo MPP charge or session-open transaction sends its exact signing
+  preimage (`tempo_transaction`). The owner sees each recipient and amount, or
+  the channel's payee, token and deposit.
+- A Tempo MPP voucher (session open, voucher or close) sends `tempo_voucher`:
+  chain, escrow, channel ID and cumulative amount. When Machine opened the
+  channel it reads the payee, token, salt and authorized signer from the open
+  call and records them in Machine-private state (`requests/private/mpp-channels`,
+  keyed by channel ID). Later vouchers include them, and Broker checks they hash
+  to the channel ID. A channel opened before Machine recorded it has no
+  parameters, so the owner sees only the channel ID and amount with a warning.
+  Machine refuses MPP topUp, which it never builds.
 Polymarket v0.1.6 and Hyperliquid v0.1.7 do not satisfy the package contract.
 
 When combining Bloom #322 and #293 with the compiled token catalog, policy

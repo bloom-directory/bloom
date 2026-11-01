@@ -767,6 +767,8 @@ impl RequestsHandler {
                 host_signer,
                 facts,
                 draft_path: Some(pending.join("private/mpp-unsigned-draft")),
+                // No VFS route reaches `requests/private`.
+                channel_dir: Some(self.requests_root().join("private/mpp-channels")),
             };
             let result = confirm_with_backend(
                 &self.root,
