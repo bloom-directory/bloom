@@ -203,13 +203,6 @@ fn validate_persisted_draft_binding(
     Ok(authorization.to_owned())
 }
 
-alloy::sol! {
-    struct BloomMppVoucher {
-        bytes32 channelId;
-        uint128 cumulativeAmount;
-    }
-}
-
 async fn exactize_credential(
     mut credential: mpp::PaymentCredential,
     challenge: &mpp::PaymentChallenge,
@@ -395,7 +388,9 @@ async fn exactize_voucher(
         chain_id: chain_id,
         verifying_contract: escrow,
     };
-    let voucher = BloomMppVoucher {
+    // The escrow verifies `Voucher(bytes32 channelId,uint128 cumulativeAmount)`;
+    // use mpp's struct so the EIP-712 type name cannot drift.
+    let voucher = mpp::protocol::methods::tempo::voucher::Voucher {
         channelId: channel_id
             .parse::<B256>()
             .map_err(|error| format!("parse MPP channel id: {error}"))?,
@@ -761,6 +756,84 @@ mod tests {
         let preimages = host.0.lock().unwrap();
         assert_eq!(preimages.len(), 1);
         assert!(!preimages[0].is_empty());
+    }
+
+    /// Records the hash mpp's own voucher signer asks to sign.
+    struct HashRecorder(Mutex<Vec<alloy::primitives::B256>>);
+
+    #[async_trait]
+    impl alloy::signers::Signer for HashRecorder {
+        async fn sign_hash(
+            &self,
+            hash: &alloy::primitives::B256,
+        ) -> alloy::signers::Result<alloy::primitives::Signature> {
+            self.0.lock().unwrap().push(*hash);
+            Ok(alloy::primitives::Signature::from_raw(&[1_u8; 65]).unwrap())
+        }
+        fn address(&self) -> Address {
+            Address::ZERO
+        }
+        fn chain_id(&self) -> Option<u64> {
+            None
+        }
+        fn set_chain_id(&mut self, _chain_id: Option<u64>) {}
+    }
+
+    #[tokio::test]
+    async fn voucher_signing_hash_matches_mpp_and_the_escrow_type() {
+        use alloy::primitives::{B256, keccak256};
+        use alloy::sol_types::SolStruct;
+        use mpp::protocol::methods::tempo::voucher::{Voucher, sign_voucher};
+
+        let channel = B256::repeat_byte(0x44);
+        let escrow: Address = "0x33b901018174DDabE4841042ab76ba85D4e24f25"
+            .parse()
+            .unwrap();
+        let host = ExactHost::default();
+        super::exactize_voucher(
+            &format!("{channel:#x}"),
+            "5000",
+            escrow,
+            4217,
+            "session-voucher",
+            &host,
+            &PaidHttpSigningFacts::default(),
+        )
+        .await
+        .unwrap();
+        let bloom_hash = keccak256(&host.0.lock().unwrap()[0]);
+
+        let recorder = HashRecorder(Mutex::new(Vec::new()));
+        sign_voucher(&recorder, channel, 5000, escrow, 4217)
+            .await
+            .unwrap();
+        assert_eq!(bloom_hash, recorder.0.lock().unwrap()[0]);
+        assert_eq!(
+            Voucher::eip712_type_hash(&Voucher {
+                channelId: channel,
+                cumulativeAmount: 5000,
+            }),
+            keccak256("Voucher(bytes32 channelId,uint128 cumulativeAmount)")
+        );
+
+        // The struct name Bloom used before signs a different hash.
+        alloy::sol! {
+            struct BloomMppVoucher {
+                bytes32 channelId;
+                uint128 cumulativeAmount;
+            }
+        }
+        let domain = alloy::sol_types::eip712_domain! {
+            name: mpp::protocol::methods::tempo::voucher::DOMAIN_NAME,
+            version: mpp::protocol::methods::tempo::voucher::DOMAIN_VERSION,
+            chain_id: 4217,
+            verifying_contract: escrow,
+        };
+        let old = BloomMppVoucher {
+            channelId: channel,
+            cumulativeAmount: 5000,
+        };
+        assert_ne!(bloom_hash, old.eip712_signing_hash(&domain));
     }
 
     #[tokio::test]
