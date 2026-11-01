@@ -16,15 +16,16 @@ instead of writing Web3 code, unless the user asks for code.
 Run this first. It prints the operating contract and pending actions:
 
 ```sh
-cat ~/bloom/AGENTS.md ~/bloom/next.md || (bloom vfs cat /AGENTS.md && bloom vfs cat /next.md)
+if command -v bloom >/dev/null; then bloom vfs cat /AGENTS.md && bloom vfs cat /next.md; else cat ~/bloom/AGENTS.md ~/bloom/next.md; fi
 ```
 
-Use the user's mount path instead of `~/bloom` if they gave one.
+The CLI goes first because it fails fast; a read from a stale mount can hang.
+If the user gave a mount path, read from that path instead.
 
-- `~/bloom` works: follow its `AGENTS.md`. It is the contract for the installed
-  version and overrides this skill.
-- Only the CLI works: use `bloom vfs ls|cat` with the same paths, from `/`.
-- Both fail: report the error. If the user asked to install Bloom, read
+- It works: follow the printed `AGENTS.md`. It is the contract for the
+  installed version and overrides this skill. Without a mount, use
+  `bloom vfs ls|cat` with the same paths, from `/`.
+- It fails: report the error. If the user asked to install Bloom, read
   [references/install.md](references/install.md) (beside this file, or beside
   its URL) in full first. Otherwise do not install, restart, or launch another
   Bloom; a remote or sandboxed agent uses its existing connection.

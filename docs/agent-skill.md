@@ -14,7 +14,8 @@ signature checks and platform-specific privileged handoff intact.
 The private `bloom-directory/website` repository consumes this public package at
 an exact commit. Advance its skill revision after the Bloom PR lands, using the
 landed commit rather than the PR head. Its build publishes `SKILL.md`, the install
-reference, and setup script; `/setup.sh` remains the existing installation URL.
+reference, and `scripts/setup.sh`, which the skill fetches; `/setup.sh` remains a
+copy for existing links.
 Do not edit generated website copies.
 
 ## skills.sh

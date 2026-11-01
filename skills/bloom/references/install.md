@@ -2,20 +2,6 @@
 
 Read this entire reference only when a new Bloom installation is needed.
 
-## How to communicate
-
-Use simple language and be concise. Use a table, checklist, or other visual
-structure when it makes a longer explanation easier to scan; do not force one
-into a short answer.
-
-Offer **expert mode** as an option. Unless the user selects it, assume they are
-non-technical: perform setup and operations for them. On macOS, and on Linux when
-`pkexec` is installed, you run the reviewed privileged command yourself and the
-operating system asks the user for their credential. Only on Linux without
-`pkexec` do you ask them to run the single reviewed sudo command themselves. In
-expert mode, treat the user as technical and show commands or implementation
-detail when useful.
-
 ## Setup: reviewed download and one privileged handoff
 
 A request to set up Bloom authorizes installing the signed Bloom software,
@@ -71,8 +57,9 @@ into a shell. When this skill is installed locally, copy its bundled
 and execute that exact copy. Resolve the bundled path relative to the skill
 directory, not the current working directory.
 
-When the user supplies a specific `SKILL.md` URL, use that document's sibling
-`setup.sh`; never silently replace a preview or custom origin with production.
+When the user supplies a specific `SKILL.md` URL, use the `scripts/setup.sh`
+beside that document; never silently replace a preview or custom origin with
+production.
 For a website-loaded skill, fetch the script as follows:
 
 For every setup or privileged handoff invocation, set the working directory to
@@ -81,14 +68,14 @@ installation can restart it and invalidate the current working directory.
 
 ```sh
 skill_url=${BLOOM_SKILL_URL:-https://bloom.directory/SKILL.md}
-setup_url=${skill_url%/SKILL.md}/setup.sh
+setup_url=${skill_url%/SKILL.md}/scripts/setup.sh
 review_dir="$(mktemp -d "${TMPDIR:-/tmp}/bloom-review.XXXXXX")"
 curl -fsSL "$setup_url" -o "$review_dir/setup.sh"
 cat "$review_dir/setup.sh"
 ```
 
 Set `BLOOM_SKILL_URL` to the exact URL the user supplied when it is not the
-production URL. The sibling setup script must come from the same origin and path
+production URL. The setup script must come from the same origin and path
 prefix as that skill.
 
 Inspect the complete downloaded script before execution. It should contact only the
@@ -115,22 +102,20 @@ values. On Linux x86_64 or aarch64,
 ```text
 BLOOM_RELEASE_TAG=<resolved-tag>
 BLOOM_STAGE=<home>/.cache/bloom/install/<resolved-tag>-<platform>
-BLOOM_INSTALLER_SHA256=<64 hex digits>
 BLOOM_LOGIN_UID=<decimal UID>
 BLOOM_LOGIN_USER=<login name>
-BLOOM_SUDO_REQUIRED=1
 ```
 
-`BLOOM_SUDO_REQUIRED=1` means one privileged step remains. Root never runs files
-from the user-owned stage: the privileged command below copies the stage into a
-new root-owned directory, checks the copied installer against
-`BLOOM_INSTALLER_SHA256`, and runs that copy, which verifies the copied payload's
-signature before installing. Every supported path runs this identical command;
-only who runs it and who asks for the credential differs.
+One privileged step remains. Root never runs files from the user-owned stage:
+the privileged command below copies the stage into a new root-owned directory,
+checks the copied installer against the reviewed digest written into the
+command, and runs that copy, which verifies the copied payload's signature
+before installing. Every supported path runs this identical command; only who
+runs it and who asks for the credential differs.
 
-The command is fixed. Replace only the four placeholders `STAGE`, `SHA256`,
-`UID`, and `USER` with the captured `BLOOM_STAGE`, `BLOOM_INSTALLER_SHA256`,
-`BLOOM_LOGIN_UID`, and `BLOOM_LOGIN_USER` values as shell-quoted literals:
+The command is fixed. Replace only the three placeholders `STAGE`, `UID`, and
+`USER` with the captured `BLOOM_STAGE`, `BLOOM_LOGIN_UID`, and
+`BLOOM_LOGIN_USER` values as shell-quoted literals:
 single-quote each value, replacing any embedded `'` with `'\''`. Shell
 variables are not available, because staging runs in a child process and its
 output must not be evaluated. Do not add arguments, add environment variables,
@@ -153,19 +138,20 @@ Check `command -v pkexec`. If it is installed, run the command yourself; the
 system authentication agent shows its own credential dialog:
 
 ```sh
-pkexec /bin/sh -c 'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); trap "rm -rf -- $s" EXIT; trap "exit 129" HUP INT TERM; cp -R "$1/." "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; d=$(sha256sum "$s/install-reviewed-triad.sh" 2>/dev/null || shasum -a 256 "$s/install-reviewed-triad.sh" || true); if [ "${d%% *}" != "$2" ]; then echo "Bloom installer changed after staging." >&2; exit 65; fi; /bin/sh "$s/install-reviewed-triad.sh" install / "$3" "$4" "$s/bloom-triad"' bloom-install 'STAGE' 'SHA256' 'UID' 'USER'
+pkexec /bin/sh -c 'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); trap "rm -rf -- $s" EXIT; trap "exit 129" HUP INT TERM; cp -R "$1/." "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; d=$(sha256sum "$s/install-reviewed-triad.sh" 2>/dev/null || shasum -a 256 "$s/install-reviewed-triad.sh" || true); if [ "${d%% *}" != 1c21729dfedbf141ee6eed8b6361c2e470eb95a664316a39b162ec8151d789c8 ]; then echo "Bloom installer does not match the reviewed installer." >&2; exit 65; fi; /bin/sh "$s/install-reviewed-triad.sh" install / "$2" "$3" "$s/bloom-triad"' bloom-install 'STAGE' 'UID' 'USER'
 ```
 
 Nothing may sit between `pkexec` and `/bin/sh`: no `sudo`, `env`, variable
-assignments, or `pkexec` options. Do not fall back to sudo when `pkexec` is
-available.
+assignments, or `pkexec` options. Do not fall back to sudo when the user
+cancels the dialog.
 
-If `pkexec` is not installed, give the user the same command with `sudo` in
+If `pkexec` is not installed, or it exits `127` with no dialog shown (for
+example "No authentication agent found" over SSH), give the user the same command with `sudo` in
 place of `pkexec` to run in their terminal, values already substituted. For
 example, if staging reported these values:
 
 ```sh
-sudo /bin/sh -c 'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); trap "rm -rf -- $s" EXIT; trap "exit 129" HUP INT TERM; cp -R "$1/." "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; d=$(sha256sum "$s/install-reviewed-triad.sh" 2>/dev/null || shasum -a 256 "$s/install-reviewed-triad.sh" || true); if [ "${d%% *}" != "$2" ]; then echo "Bloom installer changed after staging." >&2; exit 65; fi; /bin/sh "$s/install-reviewed-triad.sh" install / "$3" "$4" "$s/bloom-triad"' bloom-install '/home/lee/.cache/bloom/install/v1.2.3-linux-x86_64' '1c21729dfedbf141ee6eed8b6361c2e470eb95a664316a39b162ec8151d789c8' '1000' 'lee'
+sudo /bin/sh -c 'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); trap "rm -rf -- $s" EXIT; trap "exit 129" HUP INT TERM; cp -R "$1/." "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; d=$(sha256sum "$s/install-reviewed-triad.sh" 2>/dev/null || shasum -a 256 "$s/install-reviewed-triad.sh" || true); if [ "${d%% *}" != 1c21729dfedbf141ee6eed8b6361c2e470eb95a664316a39b162ec8151d789c8 ]; then echo "Bloom installer does not match the reviewed installer." >&2; exit 65; fi; /bin/sh "$s/install-reviewed-triad.sh" install / "$2" "$3" "$s/bloom-triad"' bloom-install '/home/lee/.cache/bloom/install/v1.2.3-linux-x86_64' '1000' 'lee'
 ```
 
 Use the actual captured values, not the example values. The user types their
@@ -174,15 +160,15 @@ sudo password into their own terminal.
 ### macOS: the agent runs osascript
 
 Run the command yourself through `/usr/bin/osascript`; macOS shows its own
-administrator dialog. Pass the fixed script and the four values as arguments so
+administrator dialog. Pass the fixed script and the three values as arguments so
 they stay out of the AppleScript source:
 
 ```sh
 /usr/bin/osascript \
   -e 'on run argv' \
-  -e 'do shell script ("/bin/sh -c " & quoted form of (item 1 of argv) & " bloom-install " & quoted form of (item 2 of argv) & " " & quoted form of (item 3 of argv) & " " & quoted form of (item 4 of argv) & " " & quoted form of (item 5 of argv)) with administrator privileges' \
+  -e 'do shell script ("/bin/sh -c " & quoted form of (item 1 of argv) & " bloom-install " & quoted form of (item 2 of argv) & " " & quoted form of (item 3 of argv) & " " & quoted form of (item 4 of argv)) with administrator privileges' \
   -e 'end run' \
-  'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); trap "rm -rf -- $s" EXIT; trap "exit 129" HUP INT TERM; cp -R "$1/." "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; d=$(sha256sum "$s/install-reviewed-triad.sh" 2>/dev/null || shasum -a 256 "$s/install-reviewed-triad.sh" || true); if [ "${d%% *}" != "$2" ]; then echo "Bloom installer changed after staging." >&2; exit 65; fi; /bin/sh "$s/install-reviewed-triad.sh" install / "$3" "$4" "$s/bloom-triad"' 'STAGE' 'SHA256' 'UID' 'USER'
+  'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); trap "rm -rf -- $s" EXIT; trap "exit 129" HUP INT TERM; cp -R "$1/." "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; d=$(sha256sum "$s/install-reviewed-triad.sh" 2>/dev/null || shasum -a 256 "$s/install-reviewed-triad.sh" || true); if [ "${d%% *}" != 1c21729dfedbf141ee6eed8b6361c2e470eb95a664316a39b162ec8151d789c8 ]; then echo "Bloom installer does not match the reviewed installer." >&2; exit 65; fi; /bin/sh "$s/install-reviewed-triad.sh" install / "$2" "$3" "$s/bloom-triad"' 'STAGE' 'UID' 'USER'
 ```
 
 Never add a `user name` or `password` parameter to `do shell script`.
@@ -202,10 +188,11 @@ run it yourself or broaden the reviewed invocation to include it.
 
 ### Linux post-install readiness
 
-On Linux, success includes `BLOOM_RELOGIN_REQUIRED`. If it is `0` (an upgrade),
-continue to the checks below. If it is `1` (a first install), tell the user that
-Bloom was installed but the current login session does not yet have its new
-access groups. Do not attempt a group workaround; resume after a fresh login.
+On Linux, success includes `BLOOM_RELOGIN_REQUIRED`. `0` means an upgrade. `1`
+means the session may lack Bloom's access groups: it is printed for first
+installs and for reinstalls of the same release. Either way, run the checks
+below. If they fail after `1`, tell the user that Bloom was installed but needs
+a fresh login. Do not attempt a group workaround; resume after the login.
 
 Once the session has the groups, the package starts Machine and mounts `~/bloom` through
 `bloom-machine.service`; the agent must not launch a second Machine. Require:

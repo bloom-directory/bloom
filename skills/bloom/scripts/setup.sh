@@ -391,6 +391,14 @@ BLOOM_RELEASE_PUBLIC_KEY="$pin_path" \
 INSTALL_REVIEWED_TRIAD
   } > "$privileged_installer"
   chmod 755 "$privileged_installer"
+  # The privileged command in references/install.md checks this same digest.
+  # Change both together whenever the wrapper text or release key changes.
+  if [ "$(sha256_file "$privileged_installer")" != \
+    1c21729dfedbf141ee6eed8b6361c2e470eb95a664316a39b162ec8151d789c8 ]
+  then
+    printf '%s\n' "Bloom's generated installer does not match the reviewed digest." >&2
+    exit 1
+  fi
 
   # Replace only a stage this script made: owned by the user, with an intact
   # marker naming a release tag and the reviewed installer beside it.
@@ -410,10 +418,8 @@ INSTALL_REVIEWED_TRIAD
   printf 'BLOOM_INSTALL_MODE=%s\n' "$install_mode"
   printf 'BLOOM_RELEASE_TAG=%s\n' "$triad_release_tag"
   printf 'BLOOM_STAGE=%s\n' "$install_stage"
-  printf 'BLOOM_INSTALLER_SHA256=%s\n' "$(sha256_file "$install_stage/install-reviewed-triad.sh")"
   printf 'BLOOM_LOGIN_UID=%s\n' "$login_uid"
   printf 'BLOOM_LOGIN_USER=%s\n' "$login_user"
-  printf 'BLOOM_SUDO_REQUIRED=1\n'
 }
 
 main() {
