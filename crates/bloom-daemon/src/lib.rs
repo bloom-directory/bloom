@@ -2916,30 +2916,6 @@ impl PetalHost for DaemonPetalHost {
             .as_ref()
             .map(|receipt| receipt.outcome.clone())
             .unwrap_or_else(|| entry.staged.status.to_string());
-        // Older hard-policy refusals moved the entry but did not persist its
-        // failed status. Report that terminal outcome so a Petal can retry.
-        // A signed or broadcast attempt must keep its reconciliation path.
-        let state = if entry.state == bloom_tx::outbox::OutboxState::Failed
-            && state == "pending"
-            && entry.staged.tx_hash.is_none()
-            && entry
-                .staged
-                .policy_checks
-                .iter()
-                .any(|check| check.is_hard_violation())
-            && service
-                .tx_engine
-                .outbox
-                .read_broadcast_attempt(&entry, bloom_tx::outbox::BroadcastAttemptKind::Confirm)
-                .map_err(|error| {
-                    HostError::Backend(format!("read EVM broadcast attempt: {error}"))
-                })?
-                .is_none()
-        {
-            "failed".to_owned()
-        } else {
-            state
-        };
         let receipt_json = receipt
             .map(|receipt| serde_json::to_string(&receipt))
             .transpose()
@@ -7725,72 +7701,52 @@ mod tests {
             .unwrap_err();
         assert!(matches!(denied, HostError::Denied(_)));
 
-        // Legacy failed entries can still persist status=pending. Only an
-        // unbroadcast hard-policy refusal is safe to expose as retryable.
-        for (id, known_hash, broadcast, expected) in [
-            ("legacy-refusal", None, false, "failed"),
-            ("legacy-hashed", Some(tx_hash.clone()), false, "pending"),
-            ("legacy-broadcast", None, true, "pending"),
-        ] {
-            let mut legacy = staged.clone();
-            legacy.id = id.into();
-            legacy.tx_hash = known_hash;
-            legacy.policy_checks = vec![bloom_proto::policy::PolicyCheck::hard(
-                "recipient",
-                bloom_proto::policy::PolicyOutcome::Deny,
-                "Safe is not an allowed destination",
-            )];
-            daemon
-                .tx_engine
-                .outbox
-                .write_pending(&legacy, "plan")
-                .unwrap();
-            let entry = daemon.tx_engine.outbox.read("w", "anvil", id).unwrap();
-            if broadcast {
-                daemon
-                    .tx_engine
-                    .outbox
-                    .write_broadcast_attempt(
-                        &entry,
-                        bloom_tx::outbox::BroadcastAttemptKind::Confirm,
-                        &bloom_tx::outbox::BroadcastAttempt {
-                            schema: "bloom.evm.broadcast-attempt.v1".into(),
-                            tx_hash: tx_hash.clone(),
-                            raw_tx_blake3: "ab".repeat(32),
-                            raw_tx_path: "raw_tx".into(),
-                            from: legacy.from.clone(),
-                            to: legacy.to.clone(),
-                            nonce: legacy.nonce,
-                            chain_id: legacy.chain_id,
-                            created_ms: 1,
-                            transport: bloom_tx::outbox::BroadcastTransport::PublicRpc,
-                            private_provider: None,
-                        },
-                    )
-                    .unwrap();
-            }
-            daemon
-                .tx_engine
-                .outbox
-                .transition(&entry, bloom_tx::outbox::OutboxState::Failed)
-                .unwrap();
-            let inspection = host
-                .evm_tx_inspect("w".into(), "anvil".into(), id.into(), Some(context.clone()))
-                .await
-                .unwrap();
-            assert_eq!(inspection.state, expected, "{id}");
-            assert_eq!(
-                daemon
-                    .tx_engine
-                    .outbox
-                    .read("w", "anvil", id)
-                    .unwrap()
-                    .staged
-                    .status,
-                bloom_proto::TxStatus::Pending,
-                "inspection must be read-only"
-            );
-        }
+        // A legacy hard-policy refusal moved to failed/ without persisting its
+        // status. Outbox reads report it failed, so a Petal can retry, and
+        // inspection does not rewrite it.
+        let mut legacy = staged.clone();
+        legacy.id = "legacy-refusal".into();
+        legacy.policy_checks = vec![bloom_proto::policy::PolicyCheck::hard(
+            "recipient",
+            bloom_proto::policy::PolicyOutcome::Deny,
+            "Safe is not an allowed destination",
+        )];
+        daemon
+            .tx_engine
+            .outbox
+            .write_pending(&legacy, "plan")
+            .unwrap();
+        let entry = daemon
+            .tx_engine
+            .outbox
+            .read("w", "anvil", &legacy.id)
+            .unwrap();
+        daemon
+            .tx_engine
+            .outbox
+            .transition(&entry, bloom_tx::outbox::OutboxState::Failed)
+            .unwrap();
+        let entry = daemon
+            .tx_engine
+            .outbox
+            .read("w", "anvil", &legacy.id)
+            .unwrap();
+        let intent = std::fs::read(entry.dir.join("intent.json")).unwrap();
+        let inspection = host
+            .evm_tx_inspect(
+                "w".into(),
+                "anvil".into(),
+                legacy.id.clone(),
+                Some(context.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inspection.state, "failed");
+        assert_eq!(
+            std::fs::read(entry.dir.join("intent.json")).unwrap(),
+            intent,
+            "inspection must be read-only"
+        );
 
         let mut other_context = context;
         other_context.package_hash = "c".repeat(64);
