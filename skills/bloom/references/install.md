@@ -158,12 +158,26 @@ or receive the password. If the user dismisses the dialog, pkexec exits `126`;
 report the cancellation and stop rather than retrying through a different
 privileged path.
 
-If `pkexec` is not installed, present this exact command and ask the user to
-execute it themselves:
+If `pkexec` is not installed, ask the user to run the reviewed invocation under
+`sudo` in their terminal. Before presenting it, replace all four variables below
+with the captured values as shell-quoted literals. The user's terminal does not
+inherit the agent's variables; never hand them this variable-based template:
 
 ```sh
 sudo "$BLOOM_INSTALLER" install / "$BLOOM_LOGIN_UID" "$BLOOM_LOGIN_USER" "$BLOOM_PAYLOAD"
 ```
+
+Single-quote each captured value, replacing any embedded `'` with `'\''`.
+This preserves spaces and shell metacharacters without executing them. For
+example, if staging reported these paths, UID, and login, the user-facing command
+would be:
+
+```sh
+sudo '/home/lee/.cache/bloom/install/v1.2.3-linux/install-reviewed-triad.sh' install / '1000' 'lee' '/home/lee/.cache/bloom/install/v1.2.3-linux/bloom-triad'
+```
+
+Use the actual captured values, not the example values. Do not ask the user to
+recreate variables or resolve paths themselves.
 
 The user may enter their sudo password directly into their terminal; the agent
 must never request, read, or relay it. Do not fall back to sudo when `pkexec` is
