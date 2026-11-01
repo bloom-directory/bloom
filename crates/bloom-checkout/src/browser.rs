@@ -114,6 +114,7 @@ impl Browser {
         self.available()?;
         let mut tab = self.tab.lock().await;
         self.available()?;
+        self.recover_closed_tab(&mut tab).await?;
         if let BrowseRequest::Open { url } = &mut request {
             let parsed = shopping_url(url)?;
             *url = parsed.to_string();
@@ -653,14 +654,58 @@ impl Browser {
         }
         let target = child["targetId"].as_str().context("Missing popup target")?;
         let journey = tab.journey;
-        *tab = attach_tab(
+        match attach_tab(
             &self.cdp,
             tab.context.clone(),
             target.to_owned(),
             tab.generation + 1,
         )
-        .await?;
+        .await
+        {
+            Ok(popup) => {
+                *tab = popup;
+                tab.journey = journey;
+                Ok(())
+            }
+            // A download (such as a PDF link) or a self-closing popup can
+            // disappear while attaching. Keep shopping on the current page.
+            Err(_) if !self.target_exists(target).await => {
+                eprintln!("checkout ignored a popup that closed while opening");
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn target_exists(&self, target: &str) -> bool {
+        self.cdp
+            .call(None, "Target.getTargetInfo", json!({"targetId":target}))
+            .await
+            .is_ok()
+    }
+
+    /// A followed popup can close itself later. Continue on the one page left
+    /// in this browsing context, or a blank tab there, so the journey and its
+    /// cookies survive and later requests do not fail forever.
+    async fn recover_closed_tab(&self, tab: &mut Tab) -> Result<()> {
+        if self.target_exists(&tab.target).await {
+            return Ok(());
+        }
+        let targets = self.cdp.call(None, "Target.getTargets", json!({})).await?;
+        let pages = targets["targetInfos"]
+            .as_array()
+            .context("Missing browser targets")?
+            .iter()
+            .filter(|page| page["type"] == "page" && page["browserContextId"] == tab.context)
+            .filter_map(|page| page["targetId"].as_str())
+            .collect::<Vec<_>>();
+        let (context, generation, journey) = (tab.context.clone(), tab.generation + 1, tab.journey);
+        *tab = match pages.as_slice() {
+            [page] => attach_tab(&self.cdp, context, (*page).to_owned(), generation).await?,
+            _ => new_tab(&self.cdp, Some(context), generation).await?,
+        };
         tab.journey = journey;
+        eprintln!("checkout recovered shopping after its page closed");
         Ok(())
     }
 
@@ -1672,6 +1717,77 @@ mod tests {
         .expect("shopping popup never became ready");
         assert!(popup["url"].as_str().unwrap().ends_with("/flight"));
         assert!(popup["text"].as_str().unwrap().contains("Flight AR1554"));
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn document_and_closing_popups_leave_shopping_usable() {
+        let root = tempfile::tempdir().unwrap();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.path().join("profile"),
+            &["--no-sandbox".into()],
+        )
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let fixture =
+            tokio::spawn(async move {
+                axum::serve(listener, Router::new()
+                .route("/", get(|| async { Html(r#"<!doctype html><h1>Product page</h1>
+                  <a href="/manual.pdf" target="_blank">Manual del usuario</a>
+                  <button onclick="window.open('/gone')">Brief popup</button>
+                  <button onclick="window.open('/late')">Late popup</button>"#) }))
+                .route("/gone", get(|| async { Html("<script>window.close()</script>") }))
+                .route("/late", get(|| async {
+                    Html("<h1>Popup</h1><script>setTimeout(()=>window.close(),400)</script>")
+                }))
+                .route("/manual.pdf", get(|| async {
+                    ([("content-type", "application/pdf")], "%PDF-1.4\n%%EOF\n")
+                })))
+                .await.unwrap();
+            });
+        let reference = |snapshot: &Value, label: &str| {
+            snapshot["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["label"] == label)
+                .unwrap()["ref"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        for label in ["Manual del usuario", "Brief popup", "Late popup"] {
+            browser
+                .browse(BrowseRequest::Open { url: url.clone() })
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let page = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+            browser
+                .browse(BrowseRequest::Click {
+                    element_ref: reference(&page, label),
+                })
+                .await
+                .unwrap();
+            // Give the popup time to load, download or close itself.
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let _ = browser.browse(BrowseRequest::Snapshot).await;
+            }
+            browser
+                .browse(BrowseRequest::Open { url: url.clone() })
+                .await
+                .unwrap_or_else(|e| panic!("open after {label}: {e:#}"));
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let again = browser
+                .browse(BrowseRequest::Snapshot)
+                .await
+                .unwrap_or_else(|e| panic!("snapshot after {label}: {e:#}"));
+            assert!(again["text"].as_str().unwrap().contains("Product page"));
+        }
         fixture.abort();
     }
 
