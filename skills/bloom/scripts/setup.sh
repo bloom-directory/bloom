@@ -283,17 +283,14 @@ stage_triad() {
     exit 1
   fi
 
-  # The privileged release installers intentionally refuse to trust the copy of
-  # the release key inside the payload they are authenticating. Stage the
-  # already reviewed outer-signature key separately and use a narrow root
-  # handoff to install that pin before invoking the signed payload installer
-  # for this platform.
-  cp "$public_key" "$staged_new/bloom-release-v1.pub"
-  chmod 644 "$staged_new/bloom-release-v1.pub"
+  # Root never runs files from this user-owned stage. The privileged command
+  # copies the stage into a root-owned directory, checks this wrapper's digest
+  # there, and runs the copy. The wrapper then verifies the copied payload with
+  # the release key built into its own text, never a staged key file.
   privileged_installer="$staged_new/install-reviewed-triad.sh"
-  cat > "$privileged_installer" <<'INSTALL_REVIEWED_TRIAD'
-#!/bin/sh
-set -eu
+  {
+    printf '#!/bin/sh\nset -eu\nrelease_key_line=%s\n' "'$pinned_release_key'"
+    cat <<'INSTALL_REVIEWED_TRIAD'
 
 if [ "$(id -u)" -ne 0 ]; then
   printf '%s\n' "Bloom's reviewed triad handoff requires root." >&2
@@ -322,34 +319,55 @@ case "$(uname -s)" in
 esac
 
 wrapper_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+if [ "$(ls -ldn "$wrapper_dir" | awk '{print $3}')" != 0 ] ||
+  find "$wrapper_dir" \( -type l -o \( ! -type f ! -type d \) -o -perm -0020 -o -perm -0002 \) -print | grep -q .
+then
+  printf '%s\n' "Bloom's reviewed installer must run from a root-owned snapshot of its stage." >&2
+  exit 65
+fi
 expected_payload="$wrapper_dir/bloom-triad"
 payload=$(CDPATH= cd -- "$5" && pwd -P)
 if [ "$payload" != "$expected_payload" ]; then
   printf '%s\n' "Bloom payload does not match the reviewed installation stage." >&2
   exit 65
 fi
-release_key="$wrapper_dir/bloom-release-v1.pub"
 payload_key="$payload/RELEASE_PUBLIC_KEY.pem"
 release_installer="$payload/$release_installer_path"
-for required_file in "$release_key" "$payload_key" "$release_installer"; do
-  if [ ! -f "$required_file" ] || [ -L "$required_file" ]; then
+for required_file in "$payload_key" "$payload/RELEASE_SIGNATURE" "$payload/SHA256SUMS" "$release_installer"; do
+  if [ ! -f "$required_file" ]; then
     printf '%s\n' "Bloom reviewed installation stage is incomplete." >&2
     exit 65
   fi
 done
-if ! cmp -s "$release_key" "$payload_key"; then
-  printf '%s\n' "Bloom payload key does not match the separately staged release key." >&2
+if ! printf '%s\n' "$release_key_line" | cmp -s - "$payload_key"; then
+  printf '%s\n' "Bloom payload key does not match the reviewed release key." >&2
   exit 65
 fi
 
+scratch=$(mktemp -d)
+trap 'rm -rf -- "$scratch"' EXIT HUP INT TERM
+printf '%s\n' "$release_key_line" > "$scratch/release-key.pub"
+printf 'bloom-release %s\n' "$release_key_line" > "$scratch/allowed_signers"
+if ! /usr/bin/ssh-keygen -Y verify -f "$scratch/allowed_signers" -I bloom-release \
+  -n bloom-release-payload-v1 -s "$payload/RELEASE_SIGNATURE" \
+  < "$payload/SHA256SUMS" >/dev/null
+then
+  printf '%s\n' "Bloom payload signature is invalid." >&2
+  exit 65
+fi
 if command -v sha256sum >/dev/null 2>&1; then
-  key_digest=$(sha256sum "$release_key" | awk '{print $1}')
+  sha256() { sha256sum "$@"; }
 elif command -v shasum >/dev/null 2>&1; then
-  key_digest=$(shasum -a 256 "$release_key" | awk '{print $1}')
+  sha256() { shasum -a 256 "$@"; }
 else
   printf '%s\n' "A SHA-256 tool is required to install Bloom." >&2
   exit 69
 fi
+if ! (cd "$payload" && sha256 -c SHA256SUMS >/dev/null); then
+  printf '%s\n' "Bloom payload files do not match the signed manifest." >&2
+  exit 65
+fi
+key_digest=$(sha256 "$scratch/release-key.pub" | awk '{print $1}')
 case "$key_digest" in
   *[!0-9a-f]*|'')
     printf '%s\n' "Bloom release-key digest is malformed." >&2
@@ -359,17 +377,9 @@ esac
 
 pin_dir=/etc/bloom/release-keys
 pin_path="$pin_dir/$key_digest.pub"
-pin_new="$pin_path.new.$$"
-cleanup_pin_new() {
-  if [ -f "$pin_new" ]; then
-    rm -f -- "$pin_new"
-  fi
-}
-trap cleanup_pin_new EXIT HUP INT TERM
 install -d -o root -g "$key_group" -m 0755 "$pin_dir"
-install -o root -g "$key_group" -m 0644 "$release_key" "$pin_new"
-mv -f -- "$pin_new" "$pin_path"
-trap - EXIT HUP INT TERM
+install -o root -g "$key_group" -m 0644 "$scratch/release-key.pub" "$pin_path.new.$$"
+mv -f -- "$pin_path.new.$$" "$pin_path"
 
 platform_claim=$(cat "$payload/PLATFORM_CLAIM")
 if [ "$platform_claim" != "$expected_platform_claim" ]; then
@@ -379,6 +389,7 @@ fi
 BLOOM_RELEASE_PUBLIC_KEY="$pin_path" \
   "$release_installer" "$@"
 INSTALL_REVIEWED_TRIAD
+  } > "$privileged_installer"
   chmod 755 "$privileged_installer"
 
   if [ -L "$install_stage" ] ||
@@ -391,12 +402,10 @@ INSTALL_REVIEWED_TRIAD
   rm -rf -- "$install_stage"
   mv "$staged_new" "$install_stage"
   staged_new=
-  payload="$install_stage/bloom-triad"
-  privileged_installer="$install_stage/install-reviewed-triad.sh"
   printf 'BLOOM_INSTALL_MODE=%s\n' "$install_mode"
   printf 'BLOOM_RELEASE_TAG=%s\n' "$triad_release_tag"
-  printf 'BLOOM_INSTALLER=%s\n' "$privileged_installer"
-  printf 'BLOOM_PAYLOAD=%s\n' "$payload"
+  printf 'BLOOM_STAGE=%s\n' "$install_stage"
+  printf 'BLOOM_INSTALLER_SHA256=%s\n' "$(sha256_file "$install_stage/install-reviewed-triad.sh")"
   printf 'BLOOM_LOGIN_UID=%s\n' "$login_uid"
   printf 'BLOOM_LOGIN_USER=%s\n' "$login_user"
   printf 'BLOOM_SUDO_REQUIRED=1\n'

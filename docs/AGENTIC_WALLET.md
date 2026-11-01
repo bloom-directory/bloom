@@ -20,7 +20,7 @@ The happy path for a new user is:
 Tell your agent: "Read https://bloom.directory/SKILL.md and set up Bloom."
 ```
 
-That skill instructs the agent to install or build `bloom`, run `bloom init`, inspect `/docs`, and prefer `bloom vfs` or the mounted `/bloom` filesystem over custom Web3 code.
+That [skill](../skills/bloom/SKILL.md) connects to an existing Bloom first. Only when asked to install does it stage the signed release and hand the one privileged step to the user's operating system. It then follows the mounted `AGENTS.md` and prefers the filesystem over custom Web3 code.
 
 ## What the wallet enables
 
@@ -37,7 +37,7 @@ An agent using Bloom can:
   challenges staged for review before any x402 or Tempo MPP credential is
   signed;
 - enforce wallet policy: spend caps, allow/deny lists, contract-call gates, private orderflow preferences, and audit logging;
-- use thirteen read-ready public EVM networks immediately after `bloom init`: Ethereum, Base, Tempo, Robinhood Chain, Arbitrum, Optimism, Polygon, BNB Smart Chain, Avalanche, Gnosis, Linea, HyperEVM, and Arc, plus local Anvil.
+- use thirteen read-ready public EVM networks immediately after setup: Ethereum, Base, Tempo, Robinhood Chain, Arbitrum, Optimism, Polygon, BNB Smart Chain, Avalanche, Gnosis, Linea, HyperEVM, and Arc, plus local Anvil.
 
 Mainnet and L2 broadcast routing is enabled by default. Live sends still require the applicable signing, policy, confirmation, and Sealed Approval gates.
 

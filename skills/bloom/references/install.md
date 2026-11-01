@@ -110,104 +110,78 @@ values. On Linux x86_64 or aarch64,
 
 ```text
 BLOOM_RELEASE_TAG=<resolved-tag>
-BLOOM_INSTALLER=<home>/.cache/bloom/install/<resolved-tag>-<platform>/install-reviewed-triad.sh
-BLOOM_PAYLOAD=<home>/.cache/bloom/install/<resolved-tag>-<platform>/bloom-triad
+BLOOM_STAGE=<home>/.cache/bloom/install/<resolved-tag>-<platform>
+BLOOM_INSTALLER_SHA256=<64 hex digits>
 BLOOM_LOGIN_UID=<decimal UID>
 BLOOM_LOGIN_USER=<login name>
 BLOOM_SUDO_REQUIRED=1
 ```
 
-`BLOOM_SUDO_REQUIRED=1` means the staged installer still needs one privileged
-step. Every supported path runs the identical reviewed installer invocation with
-the captured values; only who runs it and who asks for the credential differs.
-The privileged command must stay exactly that invocation. Do not add arguments,
-add environment variables, change the root, or substitute a different payload.
+`BLOOM_SUDO_REQUIRED=1` means one privileged step remains. Root never runs files
+from the user-owned stage: the privileged command below copies the stage into a
+new root-owned directory, checks the copied installer against
+`BLOOM_INSTALLER_SHA256`, and runs that copy, which verifies the copied payload's
+signature before installing. Every supported path runs this identical command;
+only who runs it and who asks for the credential differs.
 
-The platform distinction is exact:
+The command is fixed. Replace only the four placeholders `STAGE`, `SHA256`,
+`UID`, and `USER` with the captured `BLOOM_STAGE`, `BLOOM_INSTALLER_SHA256`,
+`BLOOM_LOGIN_UID`, and `BLOOM_LOGIN_USER` values as shell-quoted literals:
+single-quote each value, replacing any embedded `'` with `'\''`. Shell
+variables are not available, because staging runs in a child process and its
+output must not be evaluated. Do not add arguments, add environment variables,
+change the root, or substitute a different stage.
 
 | Target | Privileged path |
 | --- | --- |
-| macOS arm64 | the agent runs the invocation through `/usr/bin/osascript` |
-| Linux x86_64 or aarch64 with `pkexec` | the agent runs the invocation through `pkexec` |
-| Linux x86_64 or aarch64 without `pkexec` | the user runs the invocation under `sudo` |
+| macOS arm64 | the agent runs the command through `/usr/bin/osascript` |
+| Linux x86_64 or aarch64 with `pkexec` | the agent runs the command through `pkexec` |
+| Linux x86_64 or aarch64 without `pkexec` | the user runs the command under `sudo` |
 
-### Linux privileged handoff: pkexec when installed, otherwise user-run sudo
+The credential belongs to the operating system and the user alone. Never
+request, read, relay, or receive a password. If the user cancels the dialog
+(pkexec exits `126`; osascript fails with `-128`), report the cancellation and
+stop rather than retrying through a different privileged path.
 
-On Linux, first check whether `pkexec` is installed:
+### Linux: pkexec when installed, otherwise user-run sudo
 
-```sh
-command -v pkexec
-```
-
-If it is installed, do not ask the user to paste a command into another terminal.
-Execute the reviewed invocation yourself through `pkexec`, so the system
-authentication agent presents its own credential dialog directly to the user:
+Check `command -v pkexec`. If it is installed, run the command yourself; the
+system authentication agent shows its own credential dialog:
 
 ```sh
-pkexec "$BLOOM_INSTALLER" install / "$BLOOM_LOGIN_UID" "$BLOOM_LOGIN_USER" "$BLOOM_PAYLOAD"
+pkexec /bin/sh -c 'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); cp -R "$1/." "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; d=$(sha256sum "$s/install-reviewed-triad.sh" 2>/dev/null || shasum -a 256 "$s/install-reviewed-triad.sh" || true); if [ "${d%% *}" = "$2" ]; then /bin/sh "$s/install-reviewed-triad.sh" install / "$3" "$4" "$s/bloom-triad" && r=0 || r=$?; else echo "Bloom installer changed after staging." >&2; r=65; fi; rm -rf -- "$s"; exit "$r"' bloom-install 'STAGE' 'SHA256' 'UID' 'USER'
 ```
 
-`pkexec` is what elevates, so the elevated command must not also contain `sudo`,
-and nothing may sit between `pkexec` and `"$BLOOM_INSTALLER"`: no environment
-variable assignments, no `env`, and no `pkexec` options. The four captured values
-are the only arguments.
+Nothing may sit between `pkexec` and `/bin/sh`: no `sudo`, `env`, variable
+assignments, or `pkexec` options. Do not fall back to sudo when `pkexec` is
+available.
 
-The credential belongs to the authentication agent and the user alone. The dialog
-is drawn by the operating system, and the agent must never request, read, relay,
-or receive the password. If the user dismisses the dialog, pkexec exits `126`;
-report the cancellation and stop rather than retrying through a different
-privileged path.
-
-If `pkexec` is not installed, ask the user to run the reviewed invocation under
-`sudo` in their terminal. Before presenting it, replace all four variables below
-with the captured values as shell-quoted literals. The user's terminal does not
-inherit the agent's variables; never hand them this variable-based template:
+If `pkexec` is not installed, give the user the same command with `sudo` in
+place of `pkexec` to run in their terminal, values already substituted. For
+example, if staging reported these values:
 
 ```sh
-sudo "$BLOOM_INSTALLER" install / "$BLOOM_LOGIN_UID" "$BLOOM_LOGIN_USER" "$BLOOM_PAYLOAD"
+sudo /bin/sh -c 'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); cp -R "$1/." "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; d=$(sha256sum "$s/install-reviewed-triad.sh" 2>/dev/null || shasum -a 256 "$s/install-reviewed-triad.sh" || true); if [ "${d%% *}" = "$2" ]; then /bin/sh "$s/install-reviewed-triad.sh" install / "$3" "$4" "$s/bloom-triad" && r=0 || r=$?; else echo "Bloom installer changed after staging." >&2; r=65; fi; rm -rf -- "$s"; exit "$r"' bloom-install '/home/lee/.cache/bloom/install/v1.2.3-linux-x86_64' '1c21729dfedbf141ee6eed8b6361c2e470eb95a664316a39b162ec8151d789c8' '1000' 'lee'
 ```
 
-Single-quote each captured value, replacing any embedded `'` with `'\''`.
-This preserves spaces and shell metacharacters without executing them. For
-example, if staging reported these paths, UID, and login, the user-facing command
-would be:
+Use the actual captured values, not the example values. The user types their
+sudo password into their own terminal.
 
-```sh
-sudo '/home/lee/.cache/bloom/install/v1.2.3-linux/install-reviewed-triad.sh' install / '1000' 'lee' '/home/lee/.cache/bloom/install/v1.2.3-linux/bloom-triad'
-```
+### macOS: the agent runs osascript
 
-Use the actual captured values, not the example values. Do not ask the user to
-recreate variables or resolve paths themselves.
-
-The user may enter their sudo password directly into their terminal; the agent
-must never request, read, or relay it. Do not fall back to sudo when `pkexec` is
-available, and never combine the two.
-
-### macOS privileged handoff: the agent runs osascript
-
-On macOS, do not ask the user to paste a command into another terminal. Execute
-the same reviewed invocation yourself through `/usr/bin/osascript`, so macOS
-presents its own administrator credential dialog directly to the user:
+Run the command yourself through `/usr/bin/osascript`; macOS shows its own
+administrator dialog. Pass the fixed script and the four values as arguments so
+they stay out of the AppleScript source:
 
 ```sh
 /usr/bin/osascript \
   -e 'on run argv' \
-  -e 'do shell script (quoted form of (item 1 of argv) & " install / " & quoted form of (item 2 of argv) & " " & quoted form of (item 3 of argv) & " " & quoted form of (item 4 of argv)) with administrator privileges' \
+  -e 'do shell script ("/bin/sh -c " & quoted form of (item 1 of argv) & " bloom-install " & quoted form of (item 2 of argv) & " " & quoted form of (item 3 of argv) & " " & quoted form of (item 4 of argv) & " " & quoted form of (item 5 of argv)) with administrator privileges' \
   -e 'end run' \
-  "$BLOOM_INSTALLER" "$BLOOM_LOGIN_UID" "$BLOOM_LOGIN_USER" "$BLOOM_PAYLOAD"
+  'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); cp -R "$1/." "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; d=$(sha256sum "$s/install-reviewed-triad.sh" 2>/dev/null || shasum -a 256 "$s/install-reviewed-triad.sh" || true); if [ "${d%% *}" = "$2" ]; then /bin/sh "$s/install-reviewed-triad.sh" install / "$3" "$4" "$s/bloom-triad" && r=0 || r=$?; else echo "Bloom installer changed after staging." >&2; r=65; fi; rm -rf -- "$s"; exit "$r"' 'STAGE' 'SHA256' 'UID' 'USER'
 ```
 
-Passing the captured values after the script keeps them out of the AppleScript
-source, and `quoted form of` quotes each one for the shell that `do shell script`
-starts. `with administrator privileges` is what elevates, so the elevated command
-must not also contain `sudo`.
-
-The credential belongs to macOS and the user alone. The dialog is drawn by the
-operating system, and the agent must never request, read, relay, or receive the
-password: never add a `user name` or `password` parameter to `do shell script`,
-and never collect the password through any other prompt. If the user cancels the
-dialog, osascript fails with error `-128`; report the cancellation and stop
-rather than retrying through a different privileged path.
+Never add a `user name` or `password` parameter to `do shell script`.
 
 Require a successful privileged installer exit on either target. Keep the signed
 staging directory available for reinstall or diagnosis.
