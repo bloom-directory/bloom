@@ -401,7 +401,7 @@ fn exact_signing_payload(
     header: &str,
     required: &proto::PaymentRequired,
     candidate: &x402_types::scheme::client::PaymentCandidate,
-) -> Result<(Vec<u8>, [u8; 32], Vec<u8>), String> {
+) -> Result<ExactPayment, String> {
     let decoded = Base64Bytes::from(header.as_bytes())
         .decode()
         .map_err(|error| format!("decode x402 unsigned payload: {error}"))?;
@@ -474,13 +474,15 @@ fn exact_signing_payload(
 
 /// The exact preimage, its Keccak hash, and the typed-data review envelope
 /// Broker rebuilds that preimage from to show the owner the payment.
+type ExactPayment = (Vec<u8>, [u8; 32], Vec<u8>);
+
 fn eip3009_preimage(
     chain_id: u64,
     asset: Address,
     name: &str,
     version: &str,
     authorization: v1_exact::ExactEvmPayloadAuthorization,
-) -> Result<(Vec<u8>, [u8; 32], Vec<u8>), String> {
+) -> Result<ExactPayment, String> {
     let domain = eip712_domain! {
         name: name.to_owned(),
         version: version.to_owned(),

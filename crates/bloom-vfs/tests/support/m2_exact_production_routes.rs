@@ -383,6 +383,20 @@ async fn production_x402_route_prepares_then_signs_through_broker() {
     assert!(temporary.path().join("requests/sent").join(&id).exists());
     let requests = broker.requests.lock().unwrap();
     assert!(operation_classes(&requests).contains(&"paid-http.x402".into()));
+    // Broker shows the owner this payment, decoded from the envelope.
+    let envelope: Vec<serde_json::Value> = requests
+        .iter()
+        .filter_map(|request| match request {
+            MachineBrokerRequest::SealedApprovalPrepare(prepared) => {
+                Some(serde_json::from_slice(&prepared.message_review_payloads[0].decode()).unwrap())
+            }
+            _ => None,
+        })
+        .collect();
+    let message = &envelope[0]["typed_data"]["message"];
+    assert_eq!(envelope[0]["kind"], "eip712");
+    assert_eq!(message["value"], "10000");
+    assert_eq!(message["to"], "0x93053f1e7a5efeda532fe69cbbe43cbec3a0f13f");
     assert!(
         requests
             .iter()
