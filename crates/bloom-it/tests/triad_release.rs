@@ -179,9 +179,11 @@ fn release_compatibility_declares_each_edge_without_a_global_protocol_range() {
     ] {
         assert!(compatibility.contains(&format!("{revision} = \"")));
     }
-    for component in ["machine", "broker", "signer"] {
+    for (component, current, downgrade_floor) in
+        [("machine", 3, 3), ("broker", 3, 3), ("signer", 2, 2)]
+    {
         assert!(compatibility.contains(&format!(
-            "[state.{component}]\ncurrent = 2\ndowngrade_floor = 2\nmigration_floor = 1"
+            "[state.{component}]\ncurrent = {current}\ndowngrade_floor = {downgrade_floor}\nmigration_floor = 1"
         )));
     }
 }
@@ -1566,11 +1568,16 @@ fn triad_bundle_is_reproducible_signed_and_self_verifying() {
     // (here a lowered Broker downgrade floor) fails both verifiers.
     let tampered = directory.path().join("tampered.tar.gz");
     let tampered_build = build_with_record(&staging, &tampered, &key, |record| {
-        record.replacen(
-            "[state.broker]\ncurrent = 2\ndowngrade_floor = 2",
-            "[state.broker]\ncurrent = 2\ndowngrade_floor = 1",
+        let tampered = record.replacen(
+            "[state.broker]\ncurrent = 3\ndowngrade_floor = 3",
+            "[state.broker]\ncurrent = 3\ndowngrade_floor = 2",
             1,
-        )
+        );
+        assert_ne!(
+            tampered, record,
+            "Broker downgrade-floor mutation did not apply"
+        );
+        tampered
     });
     assert!(
         tampered_build.status.success(),
@@ -4088,10 +4095,10 @@ fn set_linux_candidate_broker_state(root: &Path, state: &str) {
     fs::write(root.join("var/lib/bloom/candidate-broker-state"), state).unwrap();
 }
 
-/// Makes the harness candidate write Broker state 3 that state-2 readers
-/// cannot open.
+/// Makes the harness candidate write Broker state 4 that the installed
+/// state-3 readers cannot open.
 fn raise_linux_candidate_broker_state(root: &Path) {
-    set_linux_candidate_broker_state(root, "3 3 1");
+    set_linux_candidate_broker_state(root, "4 4 1");
 }
 
 /// The candidate's declared state decides, before anything changes, whether
@@ -4101,18 +4108,19 @@ fn linux_candidate_state_record_gates_the_upgrade() {
     let harness_directory = tempfile::tempdir().unwrap();
     let harness = write_linux_upgrade_harness(harness_directory.path());
     let installer = release_script("install-linux.sh");
-    // Installed Broker state is 2. (candidate state, refusal, forward-only)
+    // The installed release declares compatibility-v1.toml's Broker state 3.
+    // (candidate state, refusal, forward-only)
     let cases = [
-        ("2 2 1", None, false),
-        ("3 2 1", None, false),
-        ("3 3 1", None, true),
+        ("3 3 1", None, false),
+        ("4 3 1", None, false),
+        ("4 4 1", None, true),
         (
-            "1 1 1",
+            "2 2 1",
             Some("broker state-schema downgrade rejected"),
             false,
         ),
-        ("4 4 3", Some("below the candidate migration floor"), false),
-        ("3 1 2", Some("malformed broker state"), false),
+        ("5 5 4", Some("below the candidate migration floor"), false),
+        ("4 1 2", Some("malformed broker state"), false),
     ];
     for (state, refusal, forward_only) in cases {
         let directory = tempfile::tempdir().unwrap();

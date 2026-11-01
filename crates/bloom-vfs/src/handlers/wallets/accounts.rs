@@ -1837,6 +1837,10 @@ impl WalletsHandler {
         record.state = AccountCreationState::Created;
         record.number = number;
         write_atomic_json(path, &record)?;
+        // Navigation may reuse a projection observed before the ceremony
+        // finished. Refresh it now so the reported account is readable at
+        // once. A failed refresh leaves the old view to age out normally.
+        let _ = self.wallet_projection_authority(&record.wallet_id).await;
         Self::render_record(&record, true)
     }
 

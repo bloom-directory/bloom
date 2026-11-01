@@ -92,6 +92,244 @@ therefore consume the remaining approved capacity by lying within that trust
 model. Exact selectors prevent payload substitution; reusable selectors rely
 on the documented claim assurance.
 
+The `safe.transaction.confirm` operation has an additional review contract. The
+trusted signing registration must declare that class to trigger Safe review.
+An arbitrary EIP-712 preimage under another signing class receives that class's
+ordinary exact review; Machine cannot identify a Safe transaction from its
+hash alone. Correctly registering the Safe Petal is part of this boundary.
+The Petal supplies one canonical Safe review envelope alongside the exact EIP-712
+preimage. Machine accepts and forwards that envelope only for this operation
+class, requires it for that class on the single-payload exact path, and refuses
+the class on every other path — the batch request and the reusable
+single-payload request both carry no envelope field, so each refuses it in its
+own validation rather than relying on the other. Broker independently rebuilds
+the Safe transaction hash from the envelope and rejects a malformed envelope or
+one whose reconstruction does not equal the exact selector. It then reads the
+transaction as the `execTransaction` call the Safe will run, with the same
+built-in catalog it uses for every EVM call: inner calls, owner and threshold
+changes, batches through Safe's MultiSendCallOnly and deployments through its
+CreateCall. A delegatecall is read only when it enters one of those Safe
+libraries, and a gas refund is not read at all. Anything Broker cannot read is
+shown as exact bytes with the reason, and the owner decides.
+
+A Safe-declaring route is limited to that one operation class for now. Machine
+keys the envelope requirement on the claim's class and Broker keys it on the
+classes the route's installer provenance declares, so a route that declared the
+Safe class alongside a second exact-signing class could not sign the second
+one.
+
+Only the EIP-712 members are bound that way, and Broker checks nothing else.
+The envelope's account of the Safe's own configuration — owner set, threshold,
+guard, enabled modules, fallback handler, singleton, singleton code hash and
+version — is not part of the preimage, and Broker holds no chain client, so none
+of it can be corroborated. It is therefore not matched against pinned tables
+either: both operands of such a check would come from the same Petal message, so
+it could only refuse an honest Petal reporting a Safe the table has not heard of.
+Approval text does not show it. The one fact Broker establishes about the
+signer is that the envelope's owner equals the key this approval will sign
+with; `safe_tx.to` is an EIP-712 member, so the selector binds the call that is
+read. The exact selector remains the signing authority.
+
+Both sides require the envelope. Machine refuses the class without one; Broker
+reads the package's installer-signed provenance record, and a package declaring
+the class gets no exact approval without an envelope and no reusable approval
+that names the Safe class. A claim sent beside an envelope may not declare amounts, destinations
+or fees: the rebuilt transaction is the review.
+
+### Payment, authentication and exchange message reviews
+
+Exact Petal signing can carry a bounded `bloom.message.review.v1` envelope in
+the existing `PayloadSignRequest.action` field. Machine binds it into the
+persisted exact-operation identity and forwards it to Broker through
+`message_review_payloads`; it does not interpret the Petal's prose as facts.
+Broker reconstructs EIP-712 or EIP-191 preimages, or supported Hyperliquid
+ordered MessagePack actions and their Agent domain, and checks the approved
+SHA-256 preimage commitment and Keccak signing hash. Every typed leaf is read
+from the signed value. Known ERC-3009 and HyperCore payment claims must match
+the signed debit, recipient and value limit. Quoted outputs, available balances,
+fees not in the signature, proof validity and settlement remain unverified.
+
+The known exact-message classes in Broker API's
+`MESSAGE_REVIEW_OPERATION_CLASSES` require full envelopes and refuse opaque,
+batch or reusable downgrades. This does not turn an existing delegated agent
+grant into a fresh owner ceremony for each future action. Full per-call
+interpretation and reusable scope enforcement are separate properties.
+
+Delegated `hyperliquid.agent_action` uses also forward the full ordered action
+witness through the existing `claim_assurance_evidence` channel. Broker
+reconstructs and checks the actual signing preimage before reserving authority
+or requesting a signature, including uses of older grants. The assurance stays
+`MachineAsserted`; local session caps, market identities and venue effects are
+not thereby verified. Matching Hyperliquid packages are required because old
+hash-only agent callers are refused. No per-trade owner ceremony is added.
+
+Polymarket's current caller uses the batch host API with one prepared record.
+Machine forwards that complete record for exact orders, wallet permissions and
+relayer batches; Broker reconstructs the ERC-7739 order or DepositWallet Batch.
+The outer exact preimage/hash, selected owner and every call remain bound.
+Unrecognized call contents remain explicit, and auxiliary draft labels never
+become signed facts. pUSD is a separate Polygon token, not Circle USDC.
+
+Polymarket orders currently require exact approvals. A reviewed batch requesting
+the reusable selector now steps up to exact approval before Machine derives
+its durable request identity or checks an approval hint. It must supply the
+same complete prepared record as an exact request. An old reusable approval
+hint cannot authorize this exact request. CLOB authentication keeps its separate
+one-use scope.
+
+Single and batch exact signing states also bind the review envelope digest
+directly, independently of caller-supplied plan facts. Changing or dropping the
+envelope on retry fails without changing the saved approval or calling Broker.
+Older states without a digest remain usable for requests without an envelope;
+reviewed legacy states migrate in place only when their saved facts digest
+matches the current facts and those facts contain the envelope's `action_digest`.
+This preserves approval and signing operation IDs, including lost-response
+recovery. Missing or inconsistent evidence fails closed and is retained for
+reconciliation; never delete or reset it to retry a potentially signed operation.
+
+Bounded persona trading is a separate integration; exact approval does not
+require it. Implementation dependencies and future session acceptance criteria
+are tracked in [PM #80](https://github.com/bloom-directory/pm/issues/80).
+
+CLOB authentication uses the distinct immutable `polymarket.clob_auth.v1`
+permission: one operation/signature, Polygon ClobAuthDomain version 1, selected
+owner, nonce zero, fixed wallet attestation and a timestamp within 300 seconds
+of Broker's guarded clock at use. The review describes this future profile,
+not an invented exact hash. Broker reconstructs the actual 66-byte preimage
+before reserving budgets or requesting a signature. Any wider profile needs a
+new class; old `polymarket.onboard` reusable grants are refused at preparation
+and use. The caller can refresh Polymarket server time after owner approval.
+This signature can create or derive API credentials; those credentials confer
+account API access and must not be described as harmless read-only login.
+
+Broker's compiled catalog binds token units/artwork to exact chain/address
+identities. Mainnet HyperCore USDC uses an explicit venue/asset identity;
+test collateral and unknown assets do not borrow its mark. Protocol readers
+remain bounded: Enso source inputs do not establish shortcut effects, and a
+Privacy Pools direct withdrawal does not establish ZK-proof validity or relay
+recipient semantics. Unknown content retains an explicit missing-coverage reason.
+
+Enso Router V2 `safeRouteSingle`/`safeRouteMulti` also expose the actual receiver
+and requested token/native balance-increase minimums. Output units come from
+their own encoded token identity; native minimums never borrow transaction
+value. Empty output checks warn explicitly. These requested constraints do not
+prove code, shortcut effects, fees, received funds or settlement.
+
+### Pump Solana transaction review
+
+The four `pumpfun.buy`, `pumpfun.sell`, `pumpfun.close_token_account` and
+`pumpfun.launch` classes require one raw Ed25519 message and a one-operation,
+one-signature approval. Machine forwards the actual legacy or v0 message from
+the existing batch host call. An app-supplied review cannot replace it. Broker
+checks the selected Signer-derived fee payer and the actual message commitments,
+then reads supported Pump/PumpSwap, System, Compute Budget, ATA and SPL Token
+instructions from their bytes. Unknown instructions retain their raw data and
+coverage reason. Token amounts without trusted mint metadata stay in raw units;
+they never borrow another token's decimals or artwork.
+
+The owner approves the full message with only its recent blockhash excluded
+from the approval binding. Broker recovers that binding from the exact durable
+review manifest and checks it again before reserving authority or signing.
+Changing instructions, accounts, amounts, programs, lookup references or their
+order requires a new review. Machine includes the same binding in its durable
+request identity, so old opaque grants are replaced and blockhash-only retries
+retain the reviewed identity. No SDK ABI or native Solana proof digest changes.
+
+Blockhash refresh is permitted before the single signature is consumed. It is
+not permission to sign a second transaction after the first signature exists.
+Broker requires `max_operations = 1` and `max_signatures = 1`; the authority
+reservation and Signer's counters enforce those limits. A changed blockhash
+after signing must not receive another signature under that approval, even if
+the first transaction has not expired or its submission outcome is unknown.
+
+This is structural interpretation, with `MachineAsserted` claim assurance.
+It does not establish cluster identity, blockhash freshness, address-table
+contents, program code/CPI effects, token metadata, execution or settlement.
+The requested priority-fee ceiling is derived only when both compute-unit limit
+and price are present exactly once; it excludes base and program fees. Pump
+launch may include a separate mint cosigner outside this owner-signature call.
+
+Publish matching Gasless, Venice, Hyperliquid and Polymarket packages with the new services.
+Old hash-only caller packages cannot satisfy the required exact-message review.
+This is a coordinated package compatibility change, not a new SDK signing ABI
+or a new wallet clear-signing mode.
+
+### Caller and catalog migration
+
+`reviewMode` no longer selects signing authority. Deploy retains its deprecated
+`--review-mode` flag (with a warning) and `reviewMode` request field for one
+migration release. Saved deployment `review_mode` values remain part of their
+original submission identities; they do not control review. Other unknown
+deployment fields are still rejected. There is no replacement opt-in flag. Broker derives the review from
+the actual transaction and the registered signing class. Known message
+classes and every Keccak signing payload beginning with `0x19` require their
+full review envelopes, including messages under otherwise unlisted classes.
+Batches that cannot carry a review envelope must use the single-payload exact
+path instead. The separately verified CLOB login and Hyperliquid agent scopes
+retain their use-time witness contracts.
+
+Symbol lookup uses the pinned Broker catalog and refuses ambiguity. Comparing
+the previous five-chain table with this catalog leaves its existing addresses
+unchanged; Arbitrum's `USDT` is now named `USDT0` at
+`0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9`. Use `USDT0` or the address there.
+Existing WBTC and DAI entries still resolve. Symbols such as Ethereum LIT and
+Gnosis EURE/JPYC/USDC.E are ambiguous in the expanded catalog: use addresses.
+Approval amounts for unknown tokens use raw units, not contract-reported
+symbols or decimals.
+
+Before shipping this combination, publish the compatible Petal packages and
+update `github_source.rs` release commits, archives, package hashes, lineage
+predecessors and authority routes together. Existing wallets must approve the
+new package identities. A source branch or local package build is not a
+published catalog release. Keep required reviews enforced while those releases
+are pending; the old catalog is not compatible merely because Machine CI passes.
+Package publication must precede the Machine catalog update: after each Petal's
+own changes have landed and its package checks pass, its compatible immutable
+release may be tagged and published before Machine #224 merges. Publication
+does not install the package, switch the default catalog or deploy services.
+Then update the catalog pins, pass the required producer/authority tests and
+final-combination conformance, and deploy the coordinated service/package
+combination. Do not require #224 to merge before publishing its package inputs;
+that creates a circular release dependency. Older installations retain their
+pinned packages; upgraded wallets still require owner approval of new identities.
+Bloom #224 must remain unmergeable until the default Polymarket and Hyperliquid
+catalog pins select compatible published packages. Broker #103 landed as
+`e2f55a7e291eff32d3d544f0f94dc770945bafd7`. This branch pins Broker
+`bd1fc4b0de7d139ed900b907804b0b89c0fd20ec` (open bloom-broker #125 on #119):
+`e2f55a7` plus the trusted clock rollback fix that Bloom v0.4.1 ships (#119)
+and the Machine x402 and MPP payment review (#125). Both must land on Broker master,
+and this pin must move to the landed commit, before #224 merges.
+
+Machine's own paid-HTTP payments (System subjects `paid-http.x402` and
+`paid-http.mpp`) send a message review envelope with every signature. Broker
+rebuilds or decodes the signed preimage from it, refuses an approval without it
+or with one that differs, and shows the owner what the signature pays
+(bloom-directory/pm#89):
+
+- x402 sends EIP-712 typed data: EIP-3009 `TransferWithAuthorization`, or
+  Permit2 `PermitWitnessTransferFrom` whose spender is the x402 exact proxy,
+  which pays only `witness.to`. The owner sees the token, amount, recipient and
+  validity window.
+- A Tempo MPP charge or session-open transaction sends its exact signing
+  preimage (`tempo_transaction`). The owner sees each recipient and amount, or
+  the channel's payee, token and deposit.
+- A Tempo MPP voucher (session open, voucher or close) sends `tempo_voucher`:
+  chain, escrow, channel ID and cumulative amount. When Machine opened the
+  channel it reads the payee, token, salt and authorized signer from the open
+  call and records them in Machine-private state (`requests/private/mpp-channels`,
+  keyed by channel ID). Later vouchers include them, and Broker checks they hash
+  to the channel ID. A channel opened before Machine recorded it has no
+  parameters, so the owner sees only the channel ID and amount with a warning.
+  Machine refuses MPP topUp, which it never builds.
+Polymarket v0.1.6 and Hyperliquid v0.1.7 do not satisfy the package contract.
+
+When combining Bloom #322 and #293 with the compiled token catalog, policy
+symbols must resolve uniquely back to the same chain/address. Ambiguous tickers
+must not authorize multiple tokens. Typed pUSD funding checks the user's deposit
+wallet as recipient, not the pUSD contract. Use a specific recipient approval
+or an explicitly approved Petal destination rule; do not widen the default
+recipient allowlist to accommodate every deposit wallet.
+
 Petals always submit complete payload bytes through a payload-bearing host
 call. Hash-only guest signing is unsupported. Machine may validate guest
 capabilities and provenance, but only Broker can authorize and only Signer can
@@ -170,9 +408,11 @@ rejects widening and supplies the resolved route IDs itself. Packages predating
 that complete manifest scope retain their legacy request semantics only as a
 compatibility path.
 
-Venue-specific custody and signing protocols do not belong in Machine, Broker,
-or Signer. An installed Hyperliquid Petal, for example, uses this generic scope
-instead of a native Machine agent-session key.
+Petals construct venue actions through the generic custody/signing interfaces;
+Machine and Signer do not implement a native venue account or submission flow.
+Broker independently reads supported signing formats before owner approval.
+An installed Hyperliquid Petal uses the generic derived-key scope instead of a
+native Machine agent-session key.
 
 ## By-key revocation and Exact survival
 

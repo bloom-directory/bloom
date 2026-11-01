@@ -101,7 +101,7 @@ use bloom_broker_api::{
     MachineSignRequest, OperationId, OperationPublicStatus, OperationRequest, PetalUseClaim,
     PolicyCommitReceipt, PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse,
     PolicyUpdateRequest, ProtocolError, ProtocolErrorCode, ProvenanceCatalog, ProvenanceSubject,
-    RequestNonce, ReviewMode, RevocationState, RevokeForKeyRequest, RevokeRequest,
+    RequestNonce, RevocationState, RevokeForKeyRequest, RevokeRequest,
     SealedApprovalPrepareResponse, SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads,
     SigningResult, SystemUseClaim, Token, TypedRequestMethod, ValueLimit, WalletAccountsPublic,
     WalletOperationRequest, WalletPublic, WalletRequest, is_read_only_method,
@@ -1065,18 +1065,25 @@ impl MachineBrokerClient {
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-            safe_review_payloads: Vec::new(),
             evm_review_payloads: if native_evm_review(&request.provenance) {
                 vec![Base64UrlBytes::from_bytes(&request.preimage)]
             } else {
                 Vec::new()
             },
+            safe_review_payloads: request
+                .safe_review_payload
+                .map(|payload| vec![Base64UrlBytes::from_bytes(&payload)])
+                .unwrap_or_default(),
+            message_review_payloads: request
+                .message_review_payload
+                .map(|payload| vec![Base64UrlBytes::from_bytes(&payload)])
+                .unwrap_or_default(),
+            evm_reported_token: request.evm_reported_token,
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
             petal_use_claim: request.petal_use_claim,
             system_use_claim: request.system_use_claim,
-            requested_review_mode: request.requested_review_mode,
         })
         .await
         .map(ExactPayloadSignOutcome::ApprovalRequired)
@@ -1111,7 +1118,7 @@ impl MachineBrokerClient {
         request: ExactPayloadBatchSignRequest,
         recover: bool,
     ) -> Result<ExactPayloadSignOutcome, ProtocolError> {
-        request.validate()?;
+        request.validate(false)?;
         let wallet = self.wallet(request.wallet_id.clone()).await?;
         let ordered_payload_digests = request
             .preimages
@@ -1263,8 +1270,8 @@ impl MachineBrokerClient {
         };
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
+            evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-            safe_review_payloads: Vec::new(),
             evm_review_payloads: if native_evm_review(&request.provenance) {
                 request
                     .preimages
@@ -1274,12 +1281,17 @@ impl MachineBrokerClient {
             } else {
                 Vec::new()
             },
+            safe_review_payloads: Vec::new(),
+            message_review_payloads: request
+                .message_review_payload
+                .as_ref()
+                .map(|bytes| vec![Base64UrlBytes::from_bytes(bytes)])
+                .unwrap_or_default(),
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
             petal_use_claim: request.petal_use_claim,
             system_use_claim: None,
-            requested_review_mode: request.requested_review_mode,
         })
         .await
         .map(ExactPayloadSignOutcome::ApprovalRequired)
@@ -1295,7 +1307,18 @@ impl MachineBrokerClient {
         &self,
         request: ExactPayloadBatchSignRequest,
     ) -> Result<ExactPayloadSignOutcome, ProtocolError> {
-        request.validate()?;
+        request.validate(true)?;
+        let pump_review = request.petal_use_claim.as_ref().is_some_and(|claim| {
+            bloom_broker_api::pumpfun_review_required(claim.operation_class.as_str())
+        });
+        if pump_review
+            && (request.preimages.len() != 1 || request.crypto_suite != CryptoSuite::Ed25519Message)
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::ClaimInvalid,
+                "Pump transaction review requires one Ed25519 message",
+            ));
+        }
         let claim = request.petal_use_claim.as_ref().ok_or_else(|| {
             ProtocolError::new(
                 ProtocolErrorCode::ClaimInvalid,
@@ -1432,17 +1455,26 @@ impl MachineBrokerClient {
         };
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
+            evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-            safe_review_payloads: Vec::new(),
             evm_review_payloads: Vec::new(),
+            safe_review_payloads: Vec::new(),
+            message_review_payloads: if pump_review {
+                request
+                    .preimages
+                    .iter()
+                    .map(|payload| Base64UrlBytes::from_bytes(payload))
+                    .collect()
+            } else {
+                Vec::new()
+            },
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
             petal_use_claim: Some(claim.clone()),
             system_use_claim: None,
-            // A reusable Petal batch carries no EVM review payloads, so
-            // there is no contract call to read either way.
-            requested_review_mode: None,
+            // Pump's one-operation permission carries its actual message;
+            // Broker binds every byte except the refreshable blockhash.
         })
         .await
         .map(ExactPayloadSignOutcome::ApprovalRequired)
@@ -2186,6 +2218,10 @@ pub struct ExactPayloadSignRequest {
     pub petal_use_claim: Option<PetalUseClaim>,
     pub system_use_claim: Option<SystemUseClaim>,
     pub claim_assurance_evidence: Option<Vec<u8>>,
+    pub safe_review_payload: Option<Vec<u8>>,
+    pub message_review_payload: Option<Vec<u8>>,
+    /// What an unlisted token reports about itself, for Broker's display.
+    pub evm_reported_token: Option<bloom_broker_api::EvmReportedToken>,
     /// Value movement authorized by the reviewed exact claim. System callers
     /// must supply an exact per-asset ceiling; non-value signing leaves this
     /// empty.
@@ -2194,19 +2230,12 @@ pub struct ExactPayloadSignRequest {
     /// BIP-39 and holds more than one child for `crypto_suite`; `None` keeps
     /// the single-account and legacy-root behaviour.
     pub account_key_ref: Option<KeyRef>,
-    /// Which review the owner should be shown for a native EVM contract
-    /// call. `None` lets Broker choose under the wallet's policy: clear when
-    /// the wallet enables it and a signed description covers the call,
-    /// otherwise the existing envelope review. `OpaqueExact` is the caller
-    /// deliberately asking to approve bytes Bloom will not explain, and
-    /// Broker refuses it unless policy allows it. Nothing here can downgrade
-    /// a clear review silently: an unreadable call under a clear request
-    /// fails the preparation.
-    pub requested_review_mode: Option<ReviewMode>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ExactPayloadBatchSignRequest {
+    /// Complete public message envelope for a reviewed one-item Petal batch.
+    pub message_review_payload: Option<Vec<u8>>,
     pub wallet_id: Token,
     pub preimages: Vec<Vec<u8>>,
     pub claimed_hashes: Vec<Digest32>,
@@ -2229,19 +2258,66 @@ pub struct ExactPayloadBatchSignRequest {
     /// BIP-39 and holds more than one child for `crypto_suite`; `None` keeps
     /// the single-account and legacy-root behaviour.
     pub account_key_ref: Option<KeyRef>,
-    /// Which review the owner should be shown for a native EVM contract
-    /// call. `None` lets Broker choose under the wallet's policy: clear when
-    /// the wallet enables it and a signed description covers the call,
-    /// otherwise the existing envelope review. `OpaqueExact` is the caller
-    /// deliberately asking to approve bytes Bloom will not explain, and
-    /// Broker refuses it unless policy allows it. Nothing here can downgrade
-    /// a clear review silently: an unreadable call under a clear request
-    /// fails the preparation.
-    pub requested_review_mode: Option<ReviewMode>,
+}
+
+/// EIP-191/712 messages need semantic review independently of their Petal label.
+pub fn is_signed_message(suite: CryptoSuite, payload: &[u8]) -> bool {
+    suite == CryptoSuite::Secp256k1Keccak256Recoverable && payload.first() == Some(&0x19)
 }
 
 impl ExactPayloadBatchSignRequest {
-    fn validate(&self) -> Result<(), ProtocolError> {
+    fn validate(&self, reusable: bool) -> Result<(), ProtocolError> {
+        let polymarket = self.petal_use_claim.as_ref().is_some_and(|claim| {
+            bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES
+                .contains(&claim.operation_class.as_str())
+        });
+        let class = self
+            .petal_use_claim
+            .as_ref()
+            .map(|claim| claim.operation_class.as_str());
+        if self
+            .preimages
+            .iter()
+            .any(|bytes| is_signed_message(self.crypto_suite, bytes))
+            && !polymarket
+            && class != Some(bloom_broker_api::POLYMARKET_CLOB_AUTH_CLASS)
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::ClaimInvalid,
+                "Signed-message batches require the single-payload exact path with a review envelope",
+            ));
+        }
+        if class == Some(bloom_broker_api::POLYMARKET_CLOB_AUTH_CLASS)
+            && (!reusable
+                || self.preimages.len() != 1
+                || self.crypto_suite != CryptoSuite::Secp256k1Keccak256Recoverable)
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::ClaimInvalid,
+                "CLOB authentication requires its one-signature versioned permission",
+            ));
+        }
+        if reusable
+            && (self.message_review_payload.is_some()
+                || class.is_some_and(bloom_broker_api::message_review_requires_exact))
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::ClaimInvalid,
+                "Reviewed Petal messages require exact approval; reusable signing cannot carry an exact review envelope",
+            ));
+        }
+        if (!reusable && polymarket != self.message_review_payload.is_some())
+            || self.message_review_payload.as_ref().is_some_and(|payload| {
+                payload.len() > bloom_broker_api::SINGLE_PAYLOAD_MAX_BYTES
+                    || self.preimages.len() != 1
+                    || self.crypto_suite != CryptoSuite::Secp256k1Keccak256Recoverable
+            })
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::ClaimInvalid,
+                "only Polymarket exact batches carry a review envelope, and each needs exactly one recoverable Keccak payload with its complete envelope",
+            ));
+        }
         if self.expires_at_ms.get() <= self.issued_at_ms.get() {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::MalformedFrame,
@@ -2252,6 +2328,18 @@ impl ExactPayloadBatchSignRequest {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::MalformedFrame,
                 "exact batch payload and claimed-hash counts differ",
+            ));
+        }
+        // Batches carry no Safe envelope, so a Safe confirmation here would be
+        // signed unreviewed. Broker also refuses it; this keeps the error local.
+        if self.petal_use_claim.as_ref().is_some_and(|claim| {
+            claim.operation_class.as_str() == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS
+                || bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES
+                    .contains(&claim.operation_class.as_str())
+        }) {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::ClaimInvalid,
+                "Reviewed Petal signatures require the single-payload exact path with a review envelope",
             ));
         }
         SigningPayloads::Batch {
@@ -2271,6 +2359,70 @@ impl ExactPayloadSignRequest {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::MalformedFrame,
                 "exact approval validity interval is invalid",
+            ));
+        }
+        if self
+            .safe_review_payload
+            .as_ref()
+            .is_some_and(|payload| payload.len() > bloom_broker_api::SINGLE_PAYLOAD_MAX_BYTES)
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::LimitExceededFrame,
+                "Safe review payload is too large",
+            ));
+        }
+        // The Safe route declares only this class. Its review contract and
+        // Broker gate are defined in bloom-broker#37.
+        let safe_operation = self.petal_use_claim.as_ref().is_some_and(|claim| {
+            claim.operation_class.as_str() == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS
+        });
+        if safe_operation != self.safe_review_payload.is_some() {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::ClaimInvalid,
+                "Safe confirmation requires exactly one Safe review payload",
+            ));
+        }
+        if self
+            .message_review_payload
+            .as_ref()
+            .is_some_and(|payload| payload.len() > bloom_broker_api::SINGLE_PAYLOAD_MAX_BYTES)
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::LimitExceededFrame,
+                "Message review payload is too large",
+            ));
+        }
+        let message_required = self.petal_use_claim.as_ref().is_some_and(|claim| {
+            bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES
+                .contains(&claim.operation_class.as_str())
+                || bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES
+                    .contains(&claim.operation_class.as_str())
+        });
+        // Machine builds System messages itself, so no Petal can label them.
+        // Broker decodes the x402 and MPP payment envelopes for the owner.
+        let system = matches!(self.provenance, ProvenanceSubject::System { .. });
+        let system_payment = matches!(&self.provenance, ProvenanceSubject::System { operation_class, .. }
+            if [bloom_broker_api::SYSTEM_X402_OPERATION_CLASS, bloom_broker_api::SYSTEM_MPP_OPERATION_CLASS]
+                .contains(&operation_class.as_str()));
+        if (message_required
+            || system_payment
+            || (!system && is_signed_message(self.crypto_suite, &self.preimage)))
+            && self.message_review_payload.is_none()
+            && !safe_operation
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::ClaimInvalid,
+                "This message operation requires a review envelope",
+            ));
+        }
+        if self.message_review_payload.is_some()
+            && (safe_operation
+                || (self.petal_use_claim.is_none() && !system_payment)
+                || self.crypto_suite != CryptoSuite::Secp256k1Keccak256Recoverable)
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::ClaimInvalid,
+                "Message review requires an independent recoverable secp256k1 Petal or paid-HTTP signature",
             ));
         }
         SigningPayloads::Single {
@@ -2763,6 +2915,29 @@ impl TrustedPetalSignRequest {
                 "payload and trusted route must be non-empty",
             ));
         }
+        // This request has no Safe envelope field at all, and `frozen_action`
+        // feeds only the operation id -- it never reaches Broker. So a Safe
+        // confirmation on this path would be signed with nothing reviewed.
+        // The batch path refuses the class for the same reason; refusing it
+        // here too makes that true of every Machine path that carries no
+        // envelope, rather than of one of the two.
+        if self.claim.operation_class.as_str() == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS
+            || self.operation_class.as_str() == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS
+            || bloom_broker_api::message_review_requires_exact(self.claim.operation_class.as_str())
+            || bloom_broker_api::message_review_requires_exact(self.operation_class.as_str())
+            || (is_signed_message(self.crypto_suite, &self.preimage)
+                && !(self.operation_class.as_str() == "hyperliquid.agent_action"
+                    && self.claim.operation_class == self.operation_class
+                    && self
+                        .claim_assurance_evidence
+                        .as_ref()
+                        .is_some_and(|bytes| !bytes.is_empty())))
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::ClaimInvalid,
+                "Reviewed Petal signatures require the single-payload exact path with a review envelope",
+            ));
+        }
         SigningPayloads::Single {
             payload: Base64UrlBytes::from_bytes(&self.preimage),
         }
@@ -2867,19 +3042,8 @@ struct ClaimedPolicyAuthorityDiff {
     removed_destinations: Vec<ClaimedPolicyAuthorityDestination>,
     added_required_verifiers: Vec<ClaimedPolicyAuthorityVerifier>,
     removed_required_verifiers: Vec<ClaimedPolicyAuthorityVerifier>,
-    /// Present only when clear signing actually changed, so every policy
-    /// update that predates it keeps its exact claimed-diff bytes. Broker
-    /// recomputes the same shape; a mismatch is refused there.
     #[serde(skip_serializing_if = "Option::is_none")]
-    clear_signing: Option<ClaimedPolicyAuthorityClearSigning>,
-}
-
-#[derive(Clone, Eq, PartialEq, Serialize)]
-struct ClaimedPolicyAuthorityClearSigning {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    before: Option<bloom_broker_api::ClearSigningPolicy>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    after: Option<bloom_broker_api::ClearSigningPolicy>,
+    removed_legacy_clear_signing: Option<bloom_broker_api::LegacyClearSigningPolicy>,
 }
 
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -2901,6 +3065,12 @@ pub fn claimed_policy_authority_diff_digest(
     current: &bloom_broker_api::CanonicalWalletPolicy,
     proposed: &bloom_broker_api::CanonicalWalletPolicy,
 ) -> Result<Digest32, ProtocolError> {
+    if proposed.clear_signing.is_some() && proposed.clear_signing != current.clear_signing {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::ClaimInvalid,
+            "Legacy clear_signing policy may only be retained unchanged or removed",
+        ));
+    }
     fn set_diff<T: Ord + Clone>(
         before: impl IntoIterator<Item = T>,
         after: impl IntoIterator<Item = T>,
@@ -2958,12 +3128,9 @@ pub fn claimed_policy_authority_diff_digest(
         removed_destinations,
         added_required_verifiers,
         removed_required_verifiers,
-        clear_signing: (current.clear_signing != proposed.clear_signing).then(|| {
-            ClaimedPolicyAuthorityClearSigning {
-                before: current.clear_signing.clone(),
-                after: proposed.clear_signing.clone(),
-            }
-        }),
+        removed_legacy_clear_signing: (current.clear_signing != proposed.clear_signing)
+            .then(|| current.clear_signing.clone())
+            .flatten(),
     };
     let mut hasher = Sha256::new();
     hasher.update(CLAIMED_POLICY_AUTHORITY_DIFF_DOMAIN);
@@ -3186,7 +3353,7 @@ mod tests {
         let claim: PetalUseClaim = serde_json::from_value(serde_json::json!({
             "package_hash": "0000000000000000000000000000000000000000000000000000000000000000",
             "route": "r000045",
-            "operation_class": "hyperliquid.withdraw",
+            "operation_class": "fixture.withdraw",
             "crypto_suite": "secp256k1-keccak256-recoverable",
             "payload_digest": "0100000000000000000000000000000000000000000000000000000000000000",
             "ordered_hashes": ["0200000000000000000000000000000000000000000000000000000000000000"],
@@ -3234,10 +3401,12 @@ mod tests {
     }
 
     fn value_limit_claim(debit_amount: &str, fee: serde_json::Value) -> PetalUseClaim {
+        // Generic accounting fixture; protocol-specific payment shapes are
+        // independently checked by Broker's message reader.
         serde_json::from_value(serde_json::json!({
             "package_hash": "0000000000000000000000000000000000000000000000000000000000000000",
             "route": "r000045",
-            "operation_class": "hyperliquid.withdraw",
+            "operation_class": "fixture.withdraw",
             "crypto_suite": "secp256k1-keccak256-recoverable",
             "payload_digest": "0100000000000000000000000000000000000000000000000000000000000000",
             "ordered_hashes": ["0200000000000000000000000000000000000000000000000000000000000000"],
@@ -3457,120 +3626,10 @@ mod tests {
         );
     }
 
-    /// The exact canonical bytes Broker computes for the same change.
-    /// `bloom-broker`'s `w9_clear_signing` suite asserts this same literal:
-    /// if the two shapes drift, every clear-signing policy ceremony fails
-    /// preflight with a diff mismatch, and this catches it here instead.
-    const UNLIMITED_ALLOWANCE_DIFF_JCS: &str = concat!(
-        r#"{"added_destinations":[],"added_petal_packages":[],"added_required_verifiers":[],"#,
-        r#""clear_signing":{"after":{"catalog_id":"bloom-tokens","maximum_observation_age_ms":86400000,"#,
-        r#""opaque_exact_allowed":false,"signature_threshold":1,"#,
-        r#""trusted_keys":[{"key_id":"publisher-1","verifying_key":"bnoc3Smwt4_ROvTFWY_v9O8qlxZuPKby5Pv8zYBQW_E"}],"#,
-        r#""unlimited_allowance_allowed":true,"#,
-        r#""verifier":{"verifier_digest":"VERIFIER","verifier_id":"evm-clear-signing-v1"}},"#,
-        r#""before":{"catalog_id":"bloom-tokens","maximum_observation_age_ms":86400000,"#,
-        r#""opaque_exact_allowed":false,"signature_threshold":1,"#,
-        r#""trusted_keys":[{"key_id":"publisher-1","verifying_key":"bnoc3Smwt4_ROvTFWY_v9O8qlxZuPKby5Pv8zYBQW_E"}],"#,
-        r#""unlimited_allowance_allowed":false,"#,
-        r#""verifier":{"verifier_digest":"VERIFIER","verifier_id":"evm-clear-signing-v1"}}},"#,
-        r#""maximum_approval_lifetime_ms_after":"100000","maximum_approval_lifetime_ms_before":"100000","#,
-        r#""removed_destinations":[],"removed_petal_packages":[],"removed_required_verifiers":[]}"#,
-    );
-
-    fn clear_signing_wallet_policy(
-        unlimited_allowance_allowed: bool,
-    ) -> bloom_broker_api::CanonicalWalletPolicy {
-        bloom_broker_api::CanonicalWalletPolicy {
-            wallet_id: Token::new("wallet-1").unwrap(),
-            maximum_approval_lifetime_ms: 100_000,
-            allowed_petal_packages: Vec::new(),
-            allowed_destinations: Vec::new(),
-            required_verifiers: Vec::new(),
-            clear_signing: Some(bloom_broker_api::ClearSigningPolicy {
-                catalog_id: Token::new("bloom-tokens").unwrap(),
-                trusted_keys: vec![bloom_broker_api::CatalogTrustedKey {
-                    key_id: Token::new("publisher-1").unwrap(),
-                    verifying_key: bloom_broker_api::Base64UrlBytes::from_bytes(
-                        &ed25519_dalek::SigningKey::from_bytes(&[5; 32])
-                            .verifying_key()
-                            .to_bytes(),
-                    ),
-                }],
-                signature_threshold: 1,
-                maximum_observation_age_ms: 86_400_000,
-                opaque_exact_allowed: false,
-                unlimited_allowance_allowed,
-                verifier: bloom_broker_api::RequiredVerifier {
-                    verifier_id: Token::new(bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_ID)
-                        .unwrap(),
-                    verifier_digest: Digest32::from_bytes(
-                        bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES,
-                    ),
-                },
-            }),
-        }
-    }
-
-    #[test]
-    fn enabling_unlimited_allowances_reaches_the_owner_as_an_authority_change() {
-        let before = clear_signing_wallet_policy(false);
-        let after = clear_signing_wallet_policy(true);
-
-        // An unchanged policy claims no clear-signing change, so a policy
-        // update that never touches it keeps the exact bytes it had before
-        // this field existed.
-        let unchanged = claimed_diff(&before, &before);
-        assert!(!unchanged.contains("clear_signing"), "{unchanged}");
-
-        assert_eq!(
-            claimed_diff(&before, &after),
-            UNLIMITED_ALLOWANCE_DIFF_JCS.replace(
-                "VERIFIER",
-                Digest32::from_bytes(bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES)
-                    .as_str()
-            ),
-            "Broker asserts these same bytes; a change here must be made on both sides"
-        );
-
-        // And the digest actually differs, so the ceremony cannot present the
-        // enabling update as the no-op it would otherwise look like.
-        assert_ne!(
-            claimed_policy_authority_diff_digest(&before, &after).unwrap(),
-            claimed_policy_authority_diff_digest(&before, &before).unwrap()
-        );
-    }
-
-    fn claimed_diff(
-        current: &bloom_broker_api::CanonicalWalletPolicy,
-        proposed: &bloom_broker_api::CanonicalWalletPolicy,
-    ) -> String {
-        let (added_petal_packages, removed_petal_packages) = (Vec::new(), Vec::new());
-        serde_jcs::to_string(&ClaimedPolicyAuthorityDiff {
-            maximum_approval_lifetime_ms_before: DecimalU64::new(
-                current.maximum_approval_lifetime_ms,
-            ),
-            maximum_approval_lifetime_ms_after: DecimalU64::new(
-                proposed.maximum_approval_lifetime_ms,
-            ),
-            added_petal_packages,
-            removed_petal_packages,
-            added_destinations: Vec::new(),
-            removed_destinations: Vec::new(),
-            added_required_verifiers: Vec::new(),
-            removed_required_verifiers: Vec::new(),
-            clear_signing: (current.clear_signing != proposed.clear_signing).then(|| {
-                ClaimedPolicyAuthorityClearSigning {
-                    before: current.clear_signing.clone(),
-                    after: proposed.clear_signing.clone(),
-                }
-            }),
-        })
-        .unwrap()
-    }
-
     #[test]
     fn claimed_policy_authority_diff_digest_matches_reviewed_v1_vector() {
         let current = bloom_broker_api::CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: Token::new("wallet").unwrap(),
             maximum_approval_lifetime_ms: 10,
             allowed_petal_packages: vec![
@@ -3586,9 +3645,9 @@ mod tests {
                 verifier_id: Token::new("human").unwrap(),
                 verifier_digest: Digest32::from_bytes([3; 32]),
             }],
-            clear_signing: None,
         };
         let proposed = bloom_broker_api::CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: Token::new("wallet").unwrap(),
             maximum_approval_lifetime_ms: 20,
             allowed_petal_packages: vec![
@@ -3601,7 +3660,6 @@ mod tests {
                 destination: "new".into(),
             }],
             required_verifiers: Vec::new(),
-            clear_signing: None,
         };
         assert_eq!(
             claimed_policy_authority_diff_digest(&current, &proposed)
@@ -3609,6 +3667,32 @@ mod tests {
                 .as_str(),
             "3cb245d0d885a2802566aca5c7af7caed5a069d4d205ec484538a1e4f67b9e42"
         );
+    }
+
+    #[test]
+    fn legacy_removal_diff_matches_broker_vector_without_other_authority_changes() {
+        let vector: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/legacy-policy-removal.json"))
+                .unwrap();
+        let current: bloom_broker_api::CanonicalWalletPolicy =
+            serde_json::from_value(vector["current"].clone()).unwrap();
+        let proposed: bloom_broker_api::CanonicalWalletPolicy =
+            serde_json::from_value(vector["proposed"].clone()).unwrap();
+        assert_eq!(
+            claimed_policy_authority_diff_digest(&current, &proposed)
+                .unwrap()
+                .as_str(),
+            "65f348e08a8ded736ad13843456a1afbaacf16bf5518147b1d7d900f703e7401"
+        );
+        let mut restored = proposed.clone();
+        restored.clear_signing = current.clear_signing.clone();
+        restored.required_verifiers = current.required_verifiers.clone();
+        assert_eq!(restored, current);
+        assert!(claimed_policy_authority_diff_digest(&proposed, &restored).is_err());
+        let mut changed = current.clone();
+        changed.clear_signing.as_mut().unwrap().opaque_exact_allowed =
+            !current.clear_signing.as_ref().unwrap().opaque_exact_allowed;
+        assert!(claimed_policy_authority_diff_digest(&current, &changed).is_err());
     }
 
     #[tokio::test(start_paused = true)]
@@ -3748,6 +3832,8 @@ mod tests {
                         let supported_crypto_suites =
                             if returned_key_ref.locator.contains("unsupported-suite") {
                                 vec![]
+                            } else if returned_key_ref.key_spec == KeySpec::Ed25519 {
+                                vec![CryptoSuite::Ed25519Message]
                             } else {
                                 vec![
                                     CryptoSuite::Secp256k1Keccak256Recoverable,
@@ -4208,6 +4294,7 @@ mod tests {
 
     fn exact_request(payload: Vec<u8>, approval_id: Option<Digest32>) -> ExactPayloadSignRequest {
         ExactPayloadSignRequest {
+            evm_reported_token: None,
             wallet_id: token("wallet"),
             claimed_hash: Digest32::from_bytes(Keccak256::digest(&payload).into()),
             preimage: payload,
@@ -4228,10 +4315,233 @@ mod tests {
             petal_use_claim: None,
             system_use_claim: None,
             claim_assurance_evidence: None,
+            safe_review_payload: None,
+            message_review_payload: None,
             approval_value_limits: Vec::new(),
             account_key_ref: None,
-            requested_review_mode: None,
         }
+    }
+
+    #[test]
+    fn safe_exact_request_requires_a_bounded_semantic_review_envelope() {
+        let mut request = exact_request(vec![0x19, 0x01], None);
+        request.petal_use_claim = Some(PetalUseClaim {
+            package_hash: digest(70),
+            route: "transactions/wallet/one/confirm.json".into(),
+            operation_class: token("safe.transaction.confirm"),
+            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+            payload_digest: digest(71),
+            ordered_hashes: vec![request.claimed_hash.clone()],
+            declared_debits: vec![],
+            declared_destinations: vec![],
+            declared_fee: DeclaredFee::None,
+            nonce: RequestNonce::from_bytes([72; 16]),
+            claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
+        });
+        assert_eq!(
+            request.validate().unwrap_err().code,
+            ProtocolErrorCode::ClaimInvalid
+        );
+        request.safe_review_payload = Some(br#"{"schema":"bloom.safe.review.v1"}"#.to_vec());
+        request.validate().unwrap();
+        request.safe_review_payload = Some(vec![0; bloom_broker_api::SINGLE_PAYLOAD_MAX_BYTES + 1]);
+        assert_eq!(
+            request.validate().unwrap_err().code,
+            ProtocolErrorCode::LimitExceededFrame
+        );
+        request.safe_review_payload = None;
+        for class in bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES {
+            request.petal_use_claim.as_mut().unwrap().operation_class = token(class);
+            request.message_review_payload = None;
+            assert_eq!(
+                request.validate().unwrap_err().code,
+                ProtocolErrorCode::ClaimInvalid
+            );
+            request.message_review_payload =
+                Some(br#"{"schema":"bloom.message.review.v1"}"#.to_vec());
+            request.validate().unwrap();
+            request.message_review_payload =
+                Some(vec![0; bloom_broker_api::SINGLE_PAYLOAD_MAX_BYTES + 1]);
+            assert_eq!(
+                request.validate().unwrap_err().code,
+                ProtocolErrorCode::LimitExceededFrame
+            );
+        }
+    }
+
+    #[test]
+    fn safe_confirmations_cannot_take_the_unreviewed_batch_path() {
+        let mut request = exact_batch_request(vec![vec![0x19, 0x01], vec![0x19, 0x02]], None);
+        assert!(request.validate(false).is_err());
+        // The batch request has no Safe review envelope and its approval is
+        // prepared with an empty safe_review_payloads, so a Safe confirmation
+        // here would reach the owner with no Safe decoding at all.
+        request.petal_use_claim = Some(PetalUseClaim {
+            package_hash: digest(80),
+            route: "transactions/wallet/one/confirm.json".into(),
+            operation_class: token("safe.transaction.confirm"),
+            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+            payload_digest: digest(81),
+            ordered_hashes: request.claimed_hashes.clone(),
+            declared_debits: vec![],
+            declared_destinations: vec![],
+            declared_fee: DeclaredFee::None,
+            nonce: RequestNonce::from_bytes([82; 16]),
+            claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
+        });
+        assert_eq!(
+            request.validate(false).unwrap_err().code,
+            ProtocolErrorCode::ClaimInvalid
+        );
+    }
+
+    #[test]
+    fn signed_message_checks_every_batch_leaf_without_trusting_a_class() {
+        for index in 0..3 {
+            let mut payloads = vec![vec![1]; 3];
+            payloads[index] = vec![0x19];
+            let request = exact_batch_request(payloads, None);
+            for reusable in [false, true] {
+                assert!(request.validate(reusable).is_err());
+            }
+        }
+        for suite in [
+            CryptoSuite::Ed25519Message,
+            CryptoSuite::Secp256k1Sha256Recoverable,
+        ] {
+            let mut request = exact_batch_request(vec![vec![0x19]], None);
+            request.crypto_suite = suite;
+            request.validate(false).unwrap();
+        }
+        assert!(exact_request(vec![0x19, 0x01], None).validate().is_err());
+    }
+
+    #[test]
+    fn only_system_payment_messages_carry_and_require_an_envelope() {
+        let envelope = br#"{"schema":"bloom.message.review.v1"}"#.to_vec();
+        for class in [
+            bloom_broker_api::SYSTEM_X402_OPERATION_CLASS,
+            bloom_broker_api::SYSTEM_MPP_OPERATION_CLASS,
+        ] {
+            // A Tempo transaction preimage is not an EIP-191/712 message, so
+            // the envelope requirement must come from the subject.
+            for preimage in [vec![0x19, 0x01], vec![0x76, 0xc0]] {
+                let mut request = exact_request(preimage, None);
+                request.provenance = ProvenanceSubject::System {
+                    component_id: token("bloom-machine"),
+                    operation_class: token(class),
+                };
+                assert_eq!(
+                    request.validate().unwrap_err().code,
+                    ProtocolErrorCode::ClaimInvalid,
+                    "{class} without an envelope"
+                );
+                request.message_review_payload = Some(envelope.clone());
+                request.validate().unwrap();
+            }
+        }
+        // Other System subjects have no envelope Broker reads.
+        let mut request = exact_request(vec![0x19, 0x01], None);
+        request.provenance = ProvenanceSubject::System {
+            component_id: token("bloom-machine"),
+            operation_class: token("paid-http.other"),
+        };
+        request.validate().unwrap();
+        request.message_review_payload = Some(envelope);
+        assert_eq!(
+            request.validate().unwrap_err().code,
+            ProtocolErrorCode::ClaimInvalid
+        );
+    }
+
+    /// The batch path refused the Safe class; the reusable single-payload
+    /// path did not, and it is the one a Petal reaches for any selector that
+    /// is not `Exact`. That request has no Safe envelope field at all, and
+    /// its `frozen_action` feeds only the operation id -- it never reaches
+    /// Broker -- so a Safe confirmation here would be signed with nothing
+    /// reviewed. Broker refused it for want of an approval, which is one
+    /// barrier and not the one the architecture doc describes.
+    #[test]
+    fn reviewed_signatures_cannot_take_the_unreviewed_reusable_path() {
+        let payload = b"\x19\x01safe preimage".to_vec();
+        let payload_digest = Digest32::from_bytes(Keccak256::digest(&payload).into());
+        let build = |class: &str| TrustedPetalSignRequest {
+            wallet_id: token("wallet"),
+            preimage: payload.clone(),
+            claimed_hash: payload_digest.clone(),
+            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+            operation_class: token(class),
+            selector: bloom_broker_api::PetalSignSelector::Reusable,
+            claim: PetalUseClaim {
+                package_hash: digest(40),
+                route: "transactions/wallet/one/confirm.json".into(),
+                operation_class: token(class),
+                crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+                payload_digest: petal_batch_payload_digest(std::slice::from_ref(&payload)),
+                ordered_hashes: vec![payload_digest.clone()],
+                declared_debits: vec![],
+                declared_destinations: vec![],
+                declared_fee: DeclaredFee::None,
+                nonce: RequestNonce::from_bytes([5; 16]),
+                claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
+            },
+            claim_assurance_evidence: None,
+            approval_id: Some(digest(50)),
+            trusted_provenance: ProvenanceSubject::Petal {
+                package_hash: digest(40),
+                route: "transactions/wallet/one/confirm.json".into(),
+            },
+            frozen_action: Some(b"safe envelope that never reaches Broker".to_vec()),
+            frozen_advisory: None,
+        };
+
+        // An ordinary class still signs on this path.
+        assert!(build("order.cancel").validate().is_err());
+        let mut ordinary = build("order.cancel");
+        ordinary.preimage = vec![1];
+        ordinary.validate().unwrap();
+        let mut delegated = build("hyperliquid.agent_action");
+        assert!(delegated.validate().is_err());
+        delegated.claim_assurance_evidence = Some(b"full witness checked by Broker".to_vec());
+        delegated.validate().unwrap();
+
+        for class in bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES
+            .iter()
+            .copied()
+            .filter(|class| bloom_broker_api::message_review_requires_exact(class))
+        {
+            for (operation, claim) in [
+                (class, class),
+                (class, "order.cancel"),
+                ("order.cancel", class),
+            ] {
+                let mut request = build(operation);
+                request.claim.operation_class = token(claim);
+                let error = request.validate().unwrap_err();
+                assert_eq!(
+                    error.code,
+                    ProtocolErrorCode::ClaimInvalid,
+                    "{operation}/{claim}"
+                );
+                assert!(error.message.contains("single-payload exact path"));
+            }
+        }
+
+        // The Safe class is refused before any wire call, on the claim and on
+        // the request, so neither half can be the one that carries it.
+        assert_eq!(
+            build("safe.transaction.confirm")
+                .validate()
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::ClaimInvalid
+        );
+        let mut mismatched = build("order.cancel");
+        mismatched.operation_class = token("safe.transaction.confirm");
+        assert_eq!(
+            mismatched.validate().unwrap_err().code,
+            ProtocolErrorCode::ClaimInvalid
+        );
     }
 
     fn exact_batch_request(
@@ -4243,6 +4553,7 @@ mod tests {
             .map(|payload| Digest32::from_bytes(Keccak256::digest(payload).into()))
             .collect();
         ExactPayloadBatchSignRequest {
+            message_review_payload: None,
             wallet_id: token("wallet"),
             preimages,
             claimed_hashes,
@@ -4263,8 +4574,58 @@ mod tests {
             petal_use_claim: None,
             claim_assurance_evidence: None,
             account_key_ref: None,
-            requested_review_mode: None,
         }
+    }
+
+    #[test]
+    fn polymarket_exact_batch_requires_review_and_cannot_be_downgraded() {
+        let mut request = exact_batch_request(vec![vec![0x19, 0x01]], None);
+        request.petal_use_claim = Some(PetalUseClaim {
+            package_hash: digest(70),
+            route: "orders/wallet/0/submit.json".into(),
+            operation_class: token("polymarket.order.poly1271"),
+            crypto_suite: request.crypto_suite,
+            payload_digest: digest(71),
+            ordered_hashes: request.claimed_hashes.clone(),
+            declared_debits: vec![],
+            declared_destinations: vec![],
+            declared_fee: DeclaredFee::None,
+            nonce: RequestNonce::from_bytes([72; 16]),
+            claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
+        });
+        for class in bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES {
+            request.petal_use_claim.as_mut().unwrap().operation_class = token(class);
+            request.message_review_payload = None;
+            assert!(request.validate(false).is_err());
+            request.message_review_payload = Some(b"[{}]".to_vec());
+            request.validate(false).unwrap();
+            assert!(request.validate(true).is_err());
+            request.preimages.push(vec![1]);
+            request.claimed_hashes.push(digest(90));
+            assert!(request.validate(false).is_err());
+            request.preimages.pop();
+            request.claimed_hashes.pop();
+            request.crypto_suite = CryptoSuite::Secp256k1Sha256Recoverable;
+            assert!(request.validate(false).is_err());
+            request.crypto_suite = CryptoSuite::Secp256k1Keccak256Recoverable;
+            request.message_review_payload = None;
+            let error = request.validate(true).unwrap_err();
+            assert_eq!(error.code, ProtocolErrorCode::ClaimInvalid);
+        }
+        // The same refusal applies outside Polymarket, including callers that
+        // omit the envelope while requesting a reusable approval.
+        for class in bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES {
+            request.petal_use_claim.as_mut().unwrap().operation_class = token(class);
+            let error = request.validate(true).unwrap_err();
+            assert_eq!(error.code, ProtocolErrorCode::ClaimInvalid);
+        }
+        request.petal_use_claim.as_mut().unwrap().operation_class =
+            token(bloom_broker_api::POLYMARKET_CLOB_AUTH_CLASS);
+        request.validate(true).unwrap();
+        assert!(request.validate(false).is_err());
+        request.petal_use_claim = None;
+        request.message_review_payload = Some(b"[{}]".to_vec());
+        assert!(request.validate(false).is_err());
     }
 
     #[tokio::test]
@@ -4371,7 +4732,7 @@ mod tests {
         request.petal_use_claim = Some(PetalUseClaim {
             package_hash,
             route,
-            operation_class: token("hyperliquid.approve_agent"),
+            operation_class: token("fixture.approve_agent"),
             crypto_suite: request.crypto_suite,
             payload_digest: petal_batch_payload_digest(std::slice::from_ref(&payload)),
             ordered_hashes: vec![request.claimed_hash.clone()],
@@ -4389,7 +4750,94 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_confirm_replace_cancel_forward_payload_and_review_mode() {
+    async fn pump_batch_forwards_actual_message_instead_of_an_app_review() {
+        let mut key = key_ref();
+        key.key_spec = KeySpec::Ed25519;
+        let broker = Arc::new(MockBroker {
+            wallet: WalletPublic {
+                wallet_id: token("wallet"),
+                wallet_kind: token("local"),
+                root_key_ref: Some(key.clone()),
+                key_refs: vec![key],
+                policy_version: DecimalU64::new(7),
+                policy_digest: digest(7),
+                wallet_revocation_epoch: DecimalU64::new(2),
+            },
+            accounts: empty_accounts(),
+            requests: Mutex::new(vec![]),
+            corrupt_response: false,
+        });
+        let client = MachineBrokerClient::new(broker.clone());
+        // A native message is a transport fixture only, not Pump trade acceptance.
+        let payload: Vec<u8> = bloom_broker_api::solana_vectors::MESSAGE_HEX
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect();
+        for class in bloom_broker_api::PUMPFUN_REVIEW_OPERATION_CLASSES {
+            broker.requests.lock().unwrap().clear();
+            let mut request = exact_batch_request(vec![payload.clone()], None);
+            request.crypto_suite = CryptoSuite::Ed25519Message;
+            request.claimed_hashes = vec![Digest32::from_bytes(Sha256::digest(&payload).into())];
+            request.provenance = ProvenanceSubject::Petal {
+                package_hash: digest(80),
+                route: "r000021".into(),
+            };
+            request.petal_use_claim = Some(PetalUseClaim {
+                package_hash: digest(80),
+                route: "r000021".into(),
+                operation_class: token(class),
+                crypto_suite: request.crypto_suite,
+                payload_digest: petal_batch_payload_digest(&request.preimages),
+                ordered_hashes: request.claimed_hashes.clone(),
+                declared_debits: vec![],
+                declared_destinations: vec![],
+                declared_fee: DeclaredFee::None,
+                nonce: RequestNonce::from_bytes([81; 16]),
+                claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
+            });
+            let mut excess = request.clone();
+            excess.preimages.push(payload.clone());
+            assert!(
+                client
+                    .sign_reusable_petal_payload_batch(excess)
+                    .await
+                    .is_err()
+            );
+            assert!(broker.requests.lock().unwrap().is_empty());
+            assert!(matches!(
+                client
+                    .sign_reusable_petal_payload_batch(request)
+                    .await
+                    .unwrap(),
+                ExactPayloadSignOutcome::ApprovalRequired(_)
+            ));
+            let captured = broker.requests.lock().unwrap();
+            let prepared = captured
+                .iter()
+                .find_map(|r| match r {
+                    MachineBrokerRequest::SealedApprovalPrepare(p) => Some(p),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(
+                prepared.message_review_payloads,
+                vec![Base64UrlBytes::from_bytes(&payload)]
+            );
+            assert!(prepared.evm_review_payloads.is_empty());
+            assert!(prepared.safe_review_payloads.is_empty());
+            assert!(matches!(
+                prepared.terms.selector,
+                ApprovalSelector::Petal { .. }
+            ));
+            assert_eq!(prepared.terms.limits.max_operations.get(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn native_confirm_replace_cancel_forward_payload() {
         let broker = Arc::new(MockBroker {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
@@ -4410,7 +4858,7 @@ mod tests {
             "transaction.replace",
             "transaction.cancel",
         ] {
-            for mode in [ReviewMode::Clear, ReviewMode::OpaqueExact] {
+            {
                 broker.requests.lock().unwrap().clear();
                 let payload = format!("unsigned {class}").into_bytes();
                 let mut request = exact_request(payload.clone(), None);
@@ -4418,7 +4866,6 @@ mod tests {
                     client_id: token("bloom-cli"),
                     command_class: token(class),
                 };
-                request.requested_review_mode = Some(mode);
                 client.sign_exact_payload(request).await.unwrap();
                 let requests = broker.requests.lock().unwrap();
                 let prepare = requests
@@ -4432,7 +4879,6 @@ mod tests {
                     prepare.evm_review_payloads,
                     vec![Base64UrlBytes::from_bytes(&payload)]
                 );
-                assert_eq!(prepare.requested_review_mode, Some(mode));
             }
         }
     }
@@ -4458,8 +4904,7 @@ mod tests {
             b"unsigned EVM child 1".to_vec(),
             b"unsigned EVM child 2".to_vec(),
         ];
-        let mut native_batch = exact_batch_request(payloads.clone(), None);
-        native_batch.requested_review_mode = Some(ReviewMode::OpaqueExact);
+        let native_batch = exact_batch_request(payloads.clone(), None);
         let prepared = client.sign_exact_payload_batch(native_batch).await.unwrap();
         let ExactPayloadSignOutcome::ApprovalRequired(prepared) = prepared else {
             panic!("first call must prepare one exact batch approval");
@@ -4472,7 +4917,6 @@ mod tests {
             };
             assert_eq!(request.terms.limits.max_operations.get(), 1);
             assert_eq!(request.terms.limits.max_signatures.get(), 2);
-            assert_eq!(request.requested_review_mode, Some(ReviewMode::OpaqueExact));
             assert_eq!(
                 request.evm_review_payloads,
                 payloads
@@ -4901,15 +5345,16 @@ mod tests {
         let client = MachineBrokerClient::new(broker);
 
         let approval = ApprovalPrepareRequest {
+            evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-            safe_review_payloads: Vec::new(),
             evm_review_payloads: Vec::new(),
+            safe_review_payloads: Vec::new(),
+            message_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([94; 32]),
             terms: approval_terms("wallet", None),
             canonical_plan_facts_digest: digest(95),
             petal_use_claim: None,
             system_use_claim: None,
-            requested_review_mode: None,
         };
         assert_eq!(
             client.prepare_approval(approval).await.unwrap_err().code,

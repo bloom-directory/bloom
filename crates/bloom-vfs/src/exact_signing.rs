@@ -27,6 +27,27 @@ const REUSABLE_ATTEMPT_DOMAIN: &[u8] = b"bloom.machine.reusable-signing-attempt/
 const APPROVAL_TTL_MS: u64 = 5 * 60 * 1000;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+// Old daemon facts already committed to the exact action bytes. Backfill only
+// that authenticated local identity, never invent a new approval or sign ID.
+fn migrate_review_digest(
+    saved: &mut Option<Digest32>,
+    current: &Option<Digest32>,
+    saved_facts: &Digest32,
+    current_facts: &Digest32,
+    facts: &serde_json::Value,
+) {
+    if saved.is_none()
+        && saved_facts == current_facts
+        && let Some(digest) = current
+        && facts
+            .get("action_digest")
+            .and_then(serde_json::Value::as_str)
+            == Some(digest.as_str())
+    {
+        *saved = Some(digest.clone());
+    }
+}
+
 fn exact_claim_value_limits(claim: &PetalUseClaim) -> Result<Vec<ValueLimit>, String> {
     let mut totals = BTreeMap::<(String, String), alloy::primitives::U256>::new();
     let mut add = |chain: &Token, asset: &str, amount: &DecimalU256| -> Result<(), String> {
@@ -158,6 +179,8 @@ struct ExactSigningState {
     crypto_suite: CryptoSuite,
     payload_digest: Digest32,
     claimed_hash: Digest32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    review_payload_digest: Option<Digest32>,
     provenance_digest: Digest32,
     approval_operation_id: OperationId,
     signing_operation_id: OperationId,
@@ -180,6 +203,8 @@ struct ExactBatchSigningState {
     crypto_suite: CryptoSuite,
     payload_digests: Vec<Digest32>,
     claimed_hashes: Vec<Digest32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    review_payload_digest: Option<Digest32>,
     provenance_digest: Digest32,
     approval_operation_id: OperationId,
     signing_operation_id: OperationId,
@@ -256,6 +281,7 @@ impl BrokerExactPayloadSigner {
         preimage: &[u8],
         claimed_hash: Digest32,
         canonical_plan_facts: &serde_json::Value,
+        review_payload: Option<&[u8]>,
     ) -> Result<ExactPayloadOutcome, String> {
         let parent = state_path
             .parent()
@@ -290,6 +316,7 @@ impl BrokerExactPayloadSigner {
                 canonical_plan_facts,
                 None,
                 None,
+                review_payload,
             )
             .await;
         let _ = lock.unlock();
@@ -314,6 +341,7 @@ impl BrokerExactPayloadSigner {
         trusted_subject: &ProvenanceSubject,
         claim: &PetalUseClaim,
         claim_assurance_evidence: Option<&[u8]>,
+        petal_review_payload: Option<&[u8]>,
     ) -> Result<ExactPayloadOutcome, ExactSigningError> {
         let parent = state_path
             .parent()
@@ -347,6 +375,7 @@ impl BrokerExactPayloadSigner {
                 canonical_plan_facts,
                 Some(trusted_subject),
                 Some((claim, claim_assurance_evidence)),
+                petal_review_payload,
             )
             .await;
         let _ = lock.unlock();
@@ -409,6 +438,7 @@ impl BrokerExactPayloadSigner {
         canonical_plan_facts: &serde_json::Value,
         trusted_subject: Option<&ProvenanceSubject>,
         petal_claim: Option<(&PetalUseClaim, Option<&[u8]>)>,
+        petal_review_payload: Option<&[u8]>,
     ) -> Result<ExactPayloadOutcome, ExactSigningError> {
         let operation_class_token = Token::new(operation_class.to_owned())
             .map_err(|error| format!("operation class: {error}"))?;
@@ -430,6 +460,8 @@ impl BrokerExactPayloadSigner {
             .digest()
             .map_err(|error| format!("digest installer provenance: {error}"))?;
         let payload_digest = Digest32::from_bytes(Sha256::digest(preimage).into());
+        let review_payload_digest =
+            petal_review_payload.map(|bytes| Digest32::from_bytes(Sha256::digest(bytes).into()));
         let plan_bytes = serde_jcs::to_vec(canonical_plan_facts)
             .map_err(|error| format!("canonicalize exact signing facts: {error}"))?;
         let canonical_plan_facts_digest = Digest32::from_bytes(Sha256::digest(plan_bytes).into());
@@ -449,6 +481,7 @@ impl BrokerExactPayloadSigner {
                     crypto_suite,
                     payload_digest: payload_digest.clone(),
                     claimed_hash: claimed_hash.clone(),
+                    review_payload_digest: review_payload_digest.clone(),
                     provenance_digest: provenance_digest.clone(),
                     approval_operation_id: random_operation_id(),
                     signing_operation_id: random_operation_id(),
@@ -461,6 +494,13 @@ impl BrokerExactPayloadSigner {
             }
             Err(error) => return Err(format!("read exact signing state: {error}").into()),
         };
+        migrate_review_digest(
+            &mut state.review_payload_digest,
+            &review_payload_digest,
+            &state.canonical_plan_facts_digest,
+            &canonical_plan_facts_digest,
+            canonical_plan_facts,
+        );
         if state.schema != STATE_SCHEMA
             || state.action_id != action_id
             || state.wallet_id != wallet_id
@@ -469,6 +509,7 @@ impl BrokerExactPayloadSigner {
             || state.crypto_suite != crypto_suite
             || state.payload_digest != payload_digest
             || state.claimed_hash != claimed_hash
+            || state.review_payload_digest != review_payload_digest
             || state.provenance_digest != provenance_digest
             || state.canonical_plan_facts_digest != canonical_plan_facts_digest
         {
@@ -493,6 +534,7 @@ impl BrokerExactPayloadSigner {
             .transpose()?
             .unwrap_or_default();
         let request = ExactPayloadSignRequest {
+            evm_reported_token: None,
             wallet_id,
             preimage: preimage.to_vec(),
             claimed_hash,
@@ -507,15 +549,17 @@ impl BrokerExactPayloadSigner {
             expires_at_ms: state.expires_at_ms.clone(),
             canonical_plan_facts_digest,
             approval_id: state.approval_id.clone(),
-            // This path signs Petal and system exact payloads, not staged
-            // EVM transactions, so it never asks for a review mode: Broker
-            // decides under the wallet's policy.
-            requested_review_mode: None,
             account_key_ref: self.account_key_ref.clone(),
             petal_use_claim: petal_claim.map(|(claim, _)| claim.clone()),
             system_use_claim: None,
             claim_assurance_evidence: petal_claim
                 .and_then(|(_, evidence)| evidence.map(<[u8]>::to_vec)),
+            safe_review_payload: petal_review_payload
+                .filter(|_| operation_class == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS)
+                .map(<[u8]>::to_vec),
+            message_review_payload: petal_review_payload
+                .filter(|_| operation_class != bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS)
+                .map(<[u8]>::to_vec),
             approval_value_limits,
         };
         if let Some((approval_id, ceremony_url, ceremony_expires_at_ms)) =
@@ -571,6 +615,7 @@ impl BrokerExactPayloadSigner {
         trusted_subject: &ProvenanceSubject,
         claim: &PetalUseClaim,
         claim_assurance_evidence: Option<&[u8]>,
+        message_review_payload: Option<&[u8]>,
     ) -> Result<ExactPayloadBatchOutcome, ExactSigningError> {
         let parent = state_path
             .parent()
@@ -605,6 +650,7 @@ impl BrokerExactPayloadSigner {
                 trusted_subject,
                 claim,
                 claim_assurance_evidence,
+                message_review_payload,
             )
             .await;
         let _ = lock.unlock();
@@ -834,6 +880,7 @@ impl BrokerExactPayloadSigner {
             write_state(&attempt_path, attempt)?;
         }
         let request = ExactPayloadBatchSignRequest {
+            message_review_payload: None,
             wallet_id,
             preimages: preimages.to_vec(),
             claimed_hashes: claimed_hashes.to_vec(),
@@ -848,10 +895,6 @@ impl BrokerExactPayloadSigner {
             expires_at_ms: state.expires_at_ms.clone(),
             canonical_plan_facts_digest,
             approval_id: state.approval_id.clone(),
-            // This path signs Petal and system exact payloads, not staged
-            // EVM transactions, so it never asks for a review mode: Broker
-            // decides under the wallet's policy.
-            requested_review_mode: None,
             account_key_ref: self.account_key_ref.clone(),
             petal_use_claim: Some(claim.clone()),
             claim_assurance_evidence: claim_assurance_evidence.map(<[u8]>::to_vec),
@@ -940,6 +983,7 @@ impl BrokerExactPayloadSigner {
         trusted_subject: &ProvenanceSubject,
         claim: &PetalUseClaim,
         claim_assurance_evidence: Option<&[u8]>,
+        message_review_payload: Option<&[u8]>,
     ) -> Result<ExactPayloadBatchOutcome, ExactSigningError> {
         let operation_class_token = Token::new(operation_class.to_owned())
             .map_err(|error| format!("operation class: {error}"))?;
@@ -962,6 +1006,8 @@ impl BrokerExactPayloadSigner {
             .iter()
             .map(|payload| Digest32::from_bytes(Sha256::digest(payload).into()))
             .collect::<Vec<_>>();
+        let review_payload_digest =
+            message_review_payload.map(|bytes| Digest32::from_bytes(Sha256::digest(bytes).into()));
         let plan_bytes = serde_jcs::to_vec(canonical_plan_facts)
             .map_err(|error| format!("canonicalize exact batch signing facts: {error}"))?;
         let canonical_plan_facts_digest = Digest32::from_bytes(Sha256::digest(plan_bytes).into());
@@ -981,6 +1027,7 @@ impl BrokerExactPayloadSigner {
                     crypto_suite,
                     payload_digests: payload_digests.clone(),
                     claimed_hashes: claimed_hashes.to_vec(),
+                    review_payload_digest: review_payload_digest.clone(),
                     provenance_digest: provenance_digest.clone(),
                     approval_operation_id: random_operation_id(),
                     signing_operation_id: random_operation_id(),
@@ -993,6 +1040,13 @@ impl BrokerExactPayloadSigner {
             }
             Err(error) => return Err(format!("read exact batch signing state: {error}").into()),
         };
+        migrate_review_digest(
+            &mut state.review_payload_digest,
+            &review_payload_digest,
+            &state.canonical_plan_facts_digest,
+            &canonical_plan_facts_digest,
+            canonical_plan_facts,
+        );
         if state.schema != STATE_SCHEMA
             || state.action_id != action_id
             || state.wallet_id != wallet_id
@@ -1001,6 +1055,7 @@ impl BrokerExactPayloadSigner {
             || state.crypto_suite != crypto_suite
             || state.payload_digests != payload_digests
             || state.claimed_hashes != claimed_hashes
+            || state.review_payload_digest != review_payload_digest
             || state.provenance_digest != provenance_digest
             || state.canonical_plan_facts_digest != canonical_plan_facts_digest
         {
@@ -1021,6 +1076,7 @@ impl BrokerExactPayloadSigner {
         }
         write_state(state_path, &state)?;
         let request = ExactPayloadBatchSignRequest {
+            message_review_payload: message_review_payload.map(<[u8]>::to_vec),
             wallet_id,
             preimages: preimages.to_vec(),
             claimed_hashes: claimed_hashes.to_vec(),
@@ -1035,10 +1091,6 @@ impl BrokerExactPayloadSigner {
             expires_at_ms: state.expires_at_ms.clone(),
             canonical_plan_facts_digest,
             approval_id: state.approval_id.clone(),
-            // This path signs Petal and system exact payloads, not staged
-            // EVM transactions, so it never asks for a review mode: Broker
-            // decides under the wallet's policy.
-            requested_review_mode: None,
             account_key_ref: self.account_key_ref.clone(),
             petal_use_claim: Some(claim.clone()),
             claim_assurance_evidence: claim_assurance_evidence.map(<[u8]>::to_vec),
@@ -1564,6 +1616,7 @@ mod tests {
                 payload,
                 hash.clone(),
                 &serde_json::json!({"amount": "1"}),
+                None,
             )
             .await
             .unwrap();
@@ -1585,6 +1638,7 @@ mod tests {
                     payload,
                     hash.clone(),
                     &serde_json::json!({"amount": "1"}),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1616,6 +1670,7 @@ mod tests {
                 b"altered",
                 Digest32::from_bytes(alloy::primitives::keccak256(b"altered").into()),
                 &serde_json::json!({"amount": "1"}),
+                None,
             )
             .await
             .unwrap_err();
@@ -1662,6 +1717,7 @@ mod tests {
                 payload,
                 hash.clone(),
                 &facts,
+                None,
             )
         };
         let signs = || {
@@ -1737,6 +1793,7 @@ mod tests {
                 hash.clone(),
                 CryptoSuite::Secp256k1Keccak256Recoverable,
                 &facts,
+                None,
                 None,
                 None,
             )
@@ -1940,6 +1997,7 @@ mod tests {
                     &facts,
                     None,
                     None,
+                    None,
                 )
             };
             attempt().await.unwrap();
@@ -2035,6 +2093,7 @@ mod tests {
                 &subject,
                 &claim,
                 Some(b"assurance"),
+                None,
             )
             .await
             .unwrap();
@@ -2055,6 +2114,7 @@ mod tests {
                 &subject,
                 &claim,
                 Some(b"assurance"),
+                None,
             )
             .await
             .unwrap();
@@ -2079,6 +2139,7 @@ mod tests {
                 &subject,
                 &claim,
                 Some(b"assurance"),
+                None,
             )
             .await
             .unwrap_err();
@@ -2123,6 +2184,7 @@ mod tests {
                             &subject,
                             &claim,
                             Some(b"assurance"),
+                            None,
                         )
                         .await
                 };
@@ -2164,8 +2226,271 @@ mod tests {
         assert_eq!(signed.crypto_suite, CryptoSuite::Secp256k1Sha256Recoverable);
     }
 
+    #[tokio::test]
+    async fn safe_confirmation_forwards_its_review_envelope_to_approval_preparation() {
+        review_envelope_forwarding(
+            bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS,
+            "bloom.safe.review.v1",
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn message_signatures_forward_their_review_envelopes_and_refuse_omission() {
+        for class in bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES {
+            review_envelope_forwarding(class, "bloom.message.review.v1", false).await;
+        }
+        for class in bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES {
+            review_envelope_forwarding(class, "prepared", true).await;
+        }
+    }
+
+    async fn review_envelope_forwarding(class: &str, schema: &str, batch: bool) {
+        let broker = Arc::new(MockBroker::default());
+        let package_hash = digest(30);
+        let subject = ProvenanceSubject::Petal {
+            package_hash: package_hash.clone(),
+            route: "transactions/confirm".into(),
+        };
+        let signer = BrokerExactPayloadSigner::new(
+            MachineBrokerClient::new(broker.clone()),
+            ProvenanceCatalog {
+                schema: PROVENANCE_CATALOG_SCHEMA.into(),
+                records: vec![ProvenanceRecord {
+                    subject: subject.clone(),
+                    publisher: token("bloom-installer"),
+                    petal_lineage: None,
+                    operation_classes: vec![ProvenanceOperationClass {
+                        operation_class: token(class),
+                        fee_asset: None,
+                    }],
+                    installer_key_id: token("test-key"),
+                    installer_signature: Base64UrlBytes::from_bytes(&[]),
+                }],
+            },
+        );
+        let temporary = tempfile::tempdir().unwrap();
+        let payload = b"\x19\x01safe preimage";
+        let ordered_hash = Digest32::from_bytes(alloy::primitives::keccak256(payload).into());
+        let claim = PetalUseClaim {
+            package_hash,
+            route: "transactions/confirm".into(),
+            operation_class: token(class),
+            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+            payload_digest: {
+                let mut digest = Sha256::new();
+                digest.update(b"bloom.petal.payload-batch.v1\0");
+                digest.update(1_u64.to_be_bytes());
+                digest.update((payload.len() as u64).to_be_bytes());
+                digest.update(payload);
+                Digest32::from_bytes(digest.finalize().into())
+            },
+            ordered_hashes: vec![ordered_hash.clone()],
+            declared_debits: Vec::new(),
+            declared_destinations: Vec::new(),
+            declared_fee: bloom_broker_api::DeclaredFee::None,
+            nonce: RequestNonce::from_bytes([31; 16]),
+            claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
+        };
+        let envelope = serde_json::to_vec(&serde_json::json!({"schema":schema})).unwrap();
+        let facts = serde_json::json!({"action_digest": hex::encode(Sha256::digest(&envelope))});
+        let prepared_envelopes = || {
+            broker
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|request| match request {
+                    MachineBrokerRequest::SealedApprovalPrepare(prepared) => {
+                        Some(if class == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS {
+                            assert!(prepared.message_review_payloads.is_empty());
+                            prepared.safe_review_payloads.clone()
+                        } else {
+                            assert!(prepared.safe_review_payloads.is_empty());
+                            prepared.message_review_payloads.clone()
+                        })
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Without the envelope the class must not reach approval preparation.
+        let missing = if batch {
+            signer
+                .sign_or_prepare_petal_batch(
+                    &temporary.path().join("missing.json"),
+                    "confirm",
+                    "wallet",
+                    class,
+                    &[payload.to_vec()],
+                    std::slice::from_ref(&ordered_hash),
+                    CryptoSuite::Secp256k1Keccak256Recoverable,
+                    &facts,
+                    &subject,
+                    &claim,
+                    None,
+                    None,
+                )
+                .await
+                .map(|_| ())
+        } else {
+            signer
+                .sign_or_prepare_petal(
+                    &temporary.path().join("missing.json"),
+                    "confirm",
+                    "wallet",
+                    class,
+                    payload,
+                    ordered_hash.clone(),
+                    CryptoSuite::Secp256k1Keccak256Recoverable,
+                    &facts,
+                    &subject,
+                    &claim,
+                    None,
+                    None,
+                )
+                .await
+                .map(|_| ())
+        };
+        let error = missing.unwrap_err();
+        assert!(
+            error.to_string().to_lowercase().contains("review"),
+            "{error}"
+        );
+        assert!(prepared_envelopes().is_empty());
+
+        let prepared = if batch {
+            let outcome = signer
+                .sign_or_prepare_petal_batch(
+                    &temporary.path().join("confirm.json"),
+                    "confirm",
+                    "wallet",
+                    class,
+                    &[payload.to_vec()],
+                    std::slice::from_ref(&ordered_hash),
+                    CryptoSuite::Secp256k1Keccak256Recoverable,
+                    &facts,
+                    &subject,
+                    &claim,
+                    None,
+                    Some(&envelope),
+                )
+                .await
+                .unwrap();
+            matches!(outcome, ExactPayloadBatchOutcome::ApprovalRequired { .. })
+        } else {
+            let outcome = signer
+                .sign_or_prepare_petal(
+                    &temporary.path().join("confirm.json"),
+                    "confirm",
+                    "wallet",
+                    class,
+                    payload,
+                    ordered_hash.clone(),
+                    CryptoSuite::Secp256k1Keccak256Recoverable,
+                    &facts,
+                    &subject,
+                    &claim,
+                    None,
+                    Some(&envelope),
+                )
+                .await
+                .unwrap();
+            matches!(outcome, ExactPayloadOutcome::ApprovalRequired { .. })
+        };
+        assert!(prepared);
+        assert_eq!(
+            prepared_envelopes(),
+            vec![vec![Base64UrlBytes::from_bytes(&envelope)]]
+        );
+        // The signer binds the witness itself, even when its caller supplies
+        // unchanged plan facts. Neither replacing nor dropping it may reuse
+        // the saved approval, and rejection must leave that approval intact.
+        let changed = br#"{"schema":"changed"}"#;
+        let state_path = temporary.path().join("confirm.json");
+        let saved = fs::read(&state_path).unwrap();
+        let calls = broker.requests.lock().unwrap().len();
+        for (migrate, witness) in [
+            (false, Some(changed.as_slice())),
+            (false, None),
+            (true, Some(envelope.as_slice())),
+        ] {
+            if migrate {
+                let mut legacy: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+                legacy
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("review_payload_digest");
+                fs::write(&state_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+            }
+            let result = if batch {
+                signer
+                    .sign_or_prepare_petal_batch(
+                        &state_path,
+                        "confirm",
+                        "wallet",
+                        class,
+                        &[payload.to_vec()],
+                        std::slice::from_ref(&ordered_hash),
+                        CryptoSuite::Secp256k1Keccak256Recoverable,
+                        &facts,
+                        &subject,
+                        &claim,
+                        None,
+                        witness,
+                    )
+                    .await
+                    .map(|_| ())
+            } else {
+                signer
+                    .sign_or_prepare_petal(
+                        &state_path,
+                        "confirm",
+                        "wallet",
+                        class,
+                        payload,
+                        ordered_hash.clone(),
+                        CryptoSuite::Secp256k1Keccak256Recoverable,
+                        &facts,
+                        &subject,
+                        &claim,
+                        None,
+                        witness,
+                    )
+                    .await
+                    .map(|_| ())
+            };
+            if migrate {
+                result.unwrap();
+                let migrated: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+                let original: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+                for field in [
+                    "approval_id",
+                    "approval_operation_id",
+                    "signing_operation_id",
+                    "review_payload_digest",
+                ] {
+                    assert_eq!(migrated[field], original[field], "{field}");
+                }
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    error.to_string().contains("persisted operation identity"),
+                    "{error}"
+                );
+                assert_eq!(fs::read(&state_path).unwrap(), saved);
+                assert_eq!(broker.requests.lock().unwrap().len(), calls);
+            }
+        }
+    }
+
     /// Builds the shared fixture: a petal exact signer whose provenance
     /// catalog marks one class with the scenario's fee asset.
+    /// Its arbitrary SHA-256 payload and multiple assets exercise generic
+    /// accounting, not Hyperliquid's single-message protocol contract.
     fn debiting_claim_fixture(
         broker: &Arc<MockBroker>,
         class_fee_asset: Option<bloom_broker_api::ProvenanceFeeAsset>,
@@ -2189,7 +2514,7 @@ mod tests {
                     publisher: token("bloom-installer"),
                     petal_lineage: None,
                     operation_classes: vec![ProvenanceOperationClass {
-                        operation_class: token("hyperliquid.withdraw"),
+                        operation_class: token("fixture.withdraw"),
                         fee_asset: class_fee_asset,
                     }],
                     installer_key_id: token("test-key"),
@@ -2203,7 +2528,7 @@ mod tests {
         let claim = PetalUseClaim {
             package_hash,
             route: "withdraw/request".into(),
-            operation_class: token("hyperliquid.withdraw"),
+            operation_class: token("fixture.withdraw"),
             crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
             payload_digest: {
                 let mut digest = Sha256::new();
@@ -2250,7 +2575,7 @@ mod tests {
                 &home.path().join("petal-exact.json"),
                 "withdraw-action",
                 "wallet",
-                "hyperliquid.withdraw",
+                "fixture.withdraw",
                 b"exact withdraw payload",
                 hash.clone(),
                 CryptoSuite::Secp256k1Sha256Recoverable,
@@ -2261,6 +2586,7 @@ mod tests {
                 },
                 claim,
                 Some(b"assurance"),
+                None,
             )
             .await
     }
@@ -2370,6 +2696,101 @@ mod tests {
         );
     }
 
+    /// Released v0.4.0 Machine reads this same schema with
+    /// `deny_unknown_fields`; state without a review digest must not carry
+    /// the key, or a rollback cannot read it.
+    #[test]
+    fn digestless_state_omits_review_payload_digest() {
+        let single = ExactSigningState {
+            schema: STATE_SCHEMA.into(),
+            action_id: "confirm".into(),
+            wallet_id: token("wallet"),
+            account_key_ref: None,
+            operation_class: token("class"),
+            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+            payload_digest: digest(1),
+            claimed_hash: digest(2),
+            review_payload_digest: None,
+            provenance_digest: digest(3),
+            approval_operation_id: random_operation_id(),
+            signing_operation_id: random_operation_id(),
+            request_nonce: random_request_nonce(),
+            issued_at_ms: DecimalU64::new(1),
+            expires_at_ms: DecimalU64::new(2),
+            canonical_plan_facts_digest: digest(4),
+            approval_id: None,
+        };
+        let batch = ExactBatchSigningState {
+            schema: single.schema.clone(),
+            action_id: single.action_id.clone(),
+            wallet_id: single.wallet_id.clone(),
+            account_key_ref: None,
+            operation_class: single.operation_class.clone(),
+            crypto_suite: single.crypto_suite,
+            payload_digests: vec![digest(1)],
+            claimed_hashes: vec![digest(2)],
+            review_payload_digest: None,
+            provenance_digest: digest(3),
+            approval_operation_id: random_operation_id(),
+            signing_operation_id: random_operation_id(),
+            request_nonce: random_request_nonce(),
+            issued_at_ms: DecimalU64::new(1),
+            expires_at_ms: DecimalU64::new(2),
+            canonical_plan_facts_digest: digest(4),
+            approval_id: None,
+        };
+        for value in [
+            serde_json::to_value(&single).unwrap(),
+            serde_json::to_value(&batch).unwrap(),
+        ] {
+            assert!(value.get("review_payload_digest").is_none(), "{value}");
+        }
+        let mut with_digest = single;
+        with_digest.review_payload_digest = Some(digest(5));
+        assert!(serde_json::to_value(&with_digest).unwrap()["review_payload_digest"].is_string());
+
+        // The v0.4.x single-payload reader rejects a populated digest, so
+        // compatibility-v1.toml declares Machine state 3 with downgrade floor 3.
+        #[allow(dead_code)]
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ReleasedExactSigningState {
+            schema: IgnoredAny,
+            action_id: IgnoredAny,
+            wallet_id: IgnoredAny,
+            #[serde(default)]
+            account_key_ref: Option<IgnoredAny>,
+            operation_class: IgnoredAny,
+            crypto_suite: IgnoredAny,
+            payload_digest: IgnoredAny,
+            claimed_hash: IgnoredAny,
+            provenance_digest: IgnoredAny,
+            approval_operation_id: IgnoredAny,
+            signing_operation_id: IgnoredAny,
+            request_nonce: IgnoredAny,
+            issued_at_ms: IgnoredAny,
+            expires_at_ms: IgnoredAny,
+            canonical_plan_facts_digest: IgnoredAny,
+            approval_id: IgnoredAny,
+        }
+        use serde::de::IgnoredAny;
+        let mut digestless = with_digest.clone();
+        digestless.review_payload_digest = None;
+        serde_json::from_slice::<ReleasedExactSigningState>(
+            &serde_json::to_vec(&digestless).unwrap(),
+        )
+        .unwrap();
+        let error = serde_json::from_slice::<ReleasedExactSigningState>(
+            &serde_json::to_vec(&with_digest).unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            error.to_string().contains("review_payload_digest"),
+            "{error}"
+        );
+    }
+
     async fn reusable_once(
         signer: &BrokerExactPayloadSigner,
         home: &tempfile::TempDir,
@@ -2394,7 +2815,7 @@ mod tests {
                 &home.path().join("petal-reusable.json"),
                 "reusable-action",
                 "wallet",
-                "hyperliquid.withdraw",
+                "fixture.withdraw",
                 &[payload.to_vec()],
                 &[hash],
                 CryptoSuite::Secp256k1Sha256Recoverable,
@@ -2769,7 +3190,7 @@ mod tests {
                             &path,
                             "withdraw-action",
                             "wallet",
-                            "hyperliquid.withdraw",
+                            "fixture.withdraw",
                             &[b"exact withdraw payload".to_vec()],
                             std::slice::from_ref(&hash),
                             CryptoSuite::Secp256k1Sha256Recoverable,
@@ -2780,6 +3201,7 @@ mod tests {
                             },
                             &claim,
                             Some(b"assurance"),
+                            None,
                         )
                         .await
                         .map(|outcome| matches!(outcome, ExactPayloadBatchOutcome::Signed(_)))

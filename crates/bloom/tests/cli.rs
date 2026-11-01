@@ -331,12 +331,12 @@ fn seed_wallet_projection_fixture(home: &Path, name: &str) {
         derivation: None,
     };
     let canonical_policy = serde_jcs::to_vec(&CanonicalWalletPolicy {
+        clear_signing: None,
         wallet_id: wallet_id.clone(),
         maximum_approval_lifetime_ms: 300_000,
         allowed_petal_packages: Vec::new(),
         allowed_destinations: Vec::new(),
         required_verifiers: Vec::new(),
-        clear_signing: None,
     })
     .expect("canonicalize fixture policy");
     let policy_digest = Digest32::from_bytes(Sha256::digest(&canonical_policy).into());
@@ -2933,7 +2933,7 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         return;
     }
     // Exercise source installation of the current pinned Polymarket release.
-    let petal_ref = "74f1f928313916b332d9059f2e4363eac8f147af";
+    let petal_ref = "7c83978b99a10b5f5617863a461291781bda6f54";
     let home = fresh_home();
     let home_dir = bloom_proto::HomeDir::at(home.path());
     let config = bloom_proto::Config::local_default();
@@ -2962,8 +2962,8 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         )))
         .stdout(predicate::str::contains("Building source package..."))
         .stdout(predicate::str::contains("Validating Petal package..."))
-        .stdout(predicate::str::contains("\"routes\": 109"))
-        .stdout(predicate::str::contains("routes: 109"));
+        .stdout(predicate::str::contains("\"routes\": 110"))
+        .stdout(predicate::str::contains("routes: 110"));
 
     bloom_cmd(home.path())
         .args(["petals", "ls"])

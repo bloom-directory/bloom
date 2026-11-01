@@ -599,7 +599,6 @@ mod tests {
             expires_ms: 0,
             status: TxStatus::Sent,
             action_kind: TxActionKind::Unknown,
-            review_mode: None,
             tx_hash: Some(format!(
                 "{:#x}",
                 alloy::primitives::B256::repeat_byte(hash_byte)

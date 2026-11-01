@@ -131,12 +131,12 @@ fn projection(address: String) -> (WalletPublic, Arc<dyn WalletProjectionReader>
         derivation: None,
     };
     let policy = CanonicalWalletPolicy {
+        clear_signing: None,
         wallet_id: token("alice"),
         maximum_approval_lifetime_ms: 300_000,
         allowed_petal_packages: Vec::new(),
         allowed_destinations: Vec::new(),
         required_verifiers: Vec::new(),
-        clear_signing: None,
     };
     let policy_bytes = serde_jcs::to_vec(&policy).unwrap();
     let policy_digest = Digest32::from_bytes(Sha256::digest(&policy_bytes).into());
@@ -383,6 +383,20 @@ async fn production_x402_route_prepares_then_signs_through_broker() {
     assert!(temporary.path().join("requests/sent").join(&id).exists());
     let requests = broker.requests.lock().unwrap();
     assert!(operation_classes(&requests).contains(&"paid-http.x402".into()));
+    // Broker shows the owner this payment, decoded from the envelope.
+    let envelope: Vec<serde_json::Value> = requests
+        .iter()
+        .filter_map(|request| match request {
+            MachineBrokerRequest::SealedApprovalPrepare(prepared) => {
+                Some(serde_json::from_slice(&prepared.message_review_payloads[0].decode()).unwrap())
+            }
+            _ => None,
+        })
+        .collect();
+    let message = &envelope[0]["typed_data"]["message"];
+    assert_eq!(envelope[0]["kind"], "eip712");
+    assert_eq!(message["value"], "10000");
+    assert_eq!(message["to"], "0x93053f1e7a5efeda532fe69cbbe43cbec3a0f13f");
     assert!(
         requests
             .iter()
@@ -467,6 +481,17 @@ async fn production_mpp_route_prepares_then_signs_through_broker() {
     });
     let sign = sign.expect("MPP retry must submit the exact payload for signing");
     assert_eq!(sign.approval_id, prepare.terms.approval_id().unwrap());
+    // Broker decodes the exact Tempo transaction it is asked to approve.
+    let review: serde_json::Value =
+        serde_json::from_slice(&prepare.message_review_payloads[0].decode()).unwrap();
+    let bloom_broker_api::SigningPayloads::Single { payload } = &sign.payloads else {
+        panic!("MPP charge signs one payload");
+    };
+    assert_eq!(review["kind"], "tempo_transaction");
+    assert_eq!(
+        review["transaction"],
+        alloy::hex::encode_prefixed(payload.decode())
+    );
     let signing_results = broker.signing_results.lock().unwrap();
     let result = signing_results
         .first()
