@@ -281,6 +281,7 @@ impl BrokerExactPayloadSigner {
         preimage: &[u8],
         claimed_hash: Digest32,
         canonical_plan_facts: &serde_json::Value,
+        review_payload: Option<&[u8]>,
     ) -> Result<ExactPayloadOutcome, String> {
         let parent = state_path
             .parent()
@@ -315,7 +316,7 @@ impl BrokerExactPayloadSigner {
                 canonical_plan_facts,
                 None,
                 None,
-                None,
+                review_payload,
             )
             .await;
         let _ = lock.unlock();
@@ -1615,6 +1616,7 @@ mod tests {
                 payload,
                 hash.clone(),
                 &serde_json::json!({"amount": "1"}),
+                None,
             )
             .await
             .unwrap();
@@ -1636,6 +1638,7 @@ mod tests {
                     payload,
                     hash.clone(),
                     &serde_json::json!({"amount": "1"}),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1667,6 +1670,7 @@ mod tests {
                 b"altered",
                 Digest32::from_bytes(alloy::primitives::keccak256(b"altered").into()),
                 &serde_json::json!({"amount": "1"}),
+                None,
             )
             .await
             .unwrap_err();
@@ -1713,6 +1717,7 @@ mod tests {
                 payload,
                 hash.clone(),
                 &facts,
+                None,
             )
         };
         let signs = || {

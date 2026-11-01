@@ -23,12 +23,10 @@ use bloom_paid_http::{
 };
 use serde_json::json;
 use x402_chain_eip155::chain::Eip155ChainReference;
-use x402_chain_eip155::chain::permit2::{EXACT_PERMIT2_PROXY_ADDRESS, PERMIT2_ADDRESS};
+use x402_chain_eip155::chain::permit2::EXACT_PERMIT2_PROXY_ADDRESS;
 use x402_chain_eip155::v1_eip155_exact::SignerLike;
 use x402_chain_eip155::v1_eip155_exact::{self as v1_exact, TransferWithAuthorization};
-use x402_chain_eip155::v2_eip155_exact::{
-    self as v2_exact, ISignatureTransfer, PermitWitnessTransferFrom, x402ExactPermit2Proxy,
-};
+use x402_chain_eip155::v2_eip155_exact as v2_exact;
 use x402_chain_eip155::{V1Eip155ExactClient, V2Eip155ExactClient};
 use x402_types::chain::ChainId;
 use x402_types::proto::{self, OriginalJson};
@@ -166,7 +164,7 @@ impl X402PaymentSigner for HostX402PaymentSigner {
             &candidate,
             ctx.wallet_address,
         )?;
-        let (preimage, signing_hash) =
+        let (preimage, signing_hash, review) =
             exact_signing_payload(&unsigned_header, &payment_required, &candidate)?;
         if let Some(observed) = *observed_hash.lock().expect("draft hash lock")
             && observed != signing_hash
@@ -181,6 +179,7 @@ impl X402PaymentSigner for HostX402PaymentSigner {
                 &preimage,
                 signing_hash,
                 ctx.facts,
+                Some(&review),
             )
             .await?;
         let header_value = replace_payload_signature(&unsigned_header, &signature)?;
@@ -402,7 +401,7 @@ fn exact_signing_payload(
     header: &str,
     required: &proto::PaymentRequired,
     candidate: &x402_types::scheme::client::PaymentCandidate,
-) -> Result<(Vec<u8>, [u8; 32]), String> {
+) -> Result<(Vec<u8>, [u8; 32], Vec<u8>), String> {
     let decoded = Base64Bytes::from(header.as_bytes())
         .decode()
         .map_err(|error| format!("decode x402 unsigned payload: {error}"))?;
@@ -463,21 +462,25 @@ fn exact_signing_payload(
                         eip3009.authorization,
                     )
                 }
-                v2_exact::ExactEvmPayload::Permit2(permit) => {
-                    permit2_preimage(chain_id, permit.permit_2_authorization)
-                }
+                // Broker cannot show a Permit2 payment to the owner yet, so
+                // it refuses to approve one; fail here before asking.
+                v2_exact::ExactEvmPayload::Permit2(_) => Err(
+                    "x402 Permit2 payments are not supported: Bloom can only show EIP-3009 payments for approval".into(),
+                ),
             }
         }
     }
 }
 
+/// The exact preimage, its Keccak hash, and the typed-data review envelope
+/// Broker rebuilds that preimage from to show the owner the payment.
 fn eip3009_preimage(
     chain_id: u64,
     asset: Address,
     name: &str,
     version: &str,
     authorization: v1_exact::ExactEvmPayloadAuthorization,
-) -> Result<(Vec<u8>, [u8; 32]), String> {
+) -> Result<(Vec<u8>, [u8; 32], Vec<u8>), String> {
     let domain = eip712_domain! {
         name: name.to_owned(),
         version: version.to_owned(),
@@ -492,34 +495,28 @@ fn eip3009_preimage(
         validBefore: U256::from(authorization.valid_before.as_secs()),
         nonce: authorization.nonce,
     };
-    Ok(eip712_preimage(&domain, message.eip712_hash_struct()))
-}
-
-fn permit2_preimage(
-    chain_id: u64,
-    authorization: x402_chain_eip155::chain::permit2::Permit2Authorization<
-        x402_chain_eip155::chain::permit2::ExactPermit2Witness,
-    >,
-) -> Result<(Vec<u8>, [u8; 32]), String> {
-    let domain = eip712_domain! {
-        name: "Permit2",
-        chain_id: chain_id,
-        verifying_contract: PERMIT2_ADDRESS,
-    };
-    let message = PermitWitnessTransferFrom {
-        permitted: ISignatureTransfer::TokenPermissions {
-            token: authorization.permitted.token.0,
-            amount: authorization.permitted.amount,
+    let field = |name: &str, kind: &str| json!({"name": name, "type": kind});
+    let typed_data = json!({
+        "types": {
+            "EIP712Domain": [field("name", "string"), field("version", "string"),
+                field("chainId", "uint256"), field("verifyingContract", "address")],
+            "TransferWithAuthorization": [field("from", "address"), field("to", "address"),
+                field("value", "uint256"), field("validAfter", "uint256"),
+                field("validBefore", "uint256"), field("nonce", "bytes32")],
         },
-        spender: EXACT_PERMIT2_PROXY_ADDRESS,
-        nonce: authorization.nonce,
-        deadline: U256::from(authorization.deadline.as_secs()),
-        witness: x402ExactPermit2Proxy::Witness {
-            to: authorization.witness.to.0,
-            validAfter: U256::from(authorization.witness.valid_after.as_secs()),
-        },
-    };
-    Ok(eip712_preimage(&domain, message.eip712_hash_struct()))
+        "primaryType": "TransferWithAuthorization",
+        "domain": {"name": name, "version": version, "chainId": chain_id,
+            "verifyingContract": format!("{asset:#x}")},
+        "message": {"from": format!("{:#x}", message.from), "to": format!("{:#x}", message.to),
+            "value": message.value.to_string(), "validAfter": message.validAfter.to_string(),
+            "validBefore": message.validBefore.to_string(), "nonce": format!("{:#x}", message.nonce)},
+    });
+    let envelope = serde_json::to_vec(
+        &json!({"schema": "bloom.message.review.v1", "kind": "eip712", "typed_data": typed_data}),
+    )
+    .map_err(|error| format!("encode x402 payment review: {error}"))?;
+    let (preimage, hash) = eip712_preimage(&domain, message.eip712_hash_struct());
+    Ok((preimage, hash, envelope))
 }
 
 fn eip712_preimage(domain: &Eip712Domain, struct_hash: FixedBytes<32>) -> (Vec<u8>, [u8; 32]) {
@@ -594,11 +591,21 @@ mod tests {
             preimage: &[u8],
             signing_hash: [u8; 32],
             _facts: &PaidHttpSigningFacts,
+            review: Option<&[u8]>,
         ) -> Result<[u8; 65], String> {
             assert_eq!(
                 alloy::primitives::keccak256(preimage).as_slice(),
                 signing_hash
             );
+            // Rebuild the preimage from the envelope the way Broker does.
+            let envelope: serde_json::Value = serde_json::from_slice(review.unwrap()).unwrap();
+            assert_eq!(envelope["schema"], "bloom.message.review.v1");
+            let typed: alloy_dyn_abi::eip712::TypedData =
+                serde_json::from_value(envelope["typed_data"].clone()).unwrap();
+            let mut rebuilt = vec![0x19, 0x01];
+            rebuilt.extend_from_slice(typed.domain.separator().as_slice());
+            rebuilt.extend_from_slice(typed.hash_struct().unwrap().as_slice());
+            assert_eq!(rebuilt, preimage);
             self.preimages.lock().unwrap().push(preimage.to_vec());
             Ok([2_u8; 65])
         }
@@ -722,11 +729,11 @@ mod tests {
         let mut selected = candidate(10_000);
         selected.asset = selected_asset.into();
 
-        let (actual_preimage, actual_hash) =
+        let (actual_preimage, actual_hash, _) =
             exact_signing_payload(&header, &payment_required, &selected).unwrap();
         let decoded = Base64Bytes::from(header.as_bytes()).decode().unwrap();
         let payload: v1_exact::types::PaymentPayload = serde_json::from_slice(&decoded).unwrap();
-        let (expected_preimage, expected_hash) = eip3009_preimage(
+        let (expected_preimage, expected_hash, _) = eip3009_preimage(
             8453,
             selected_asset.parse().unwrap(),
             "Selected Token",

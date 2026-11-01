@@ -2398,10 +2398,14 @@ impl ExactPayloadSignRequest {
                 || bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES
                     .contains(&claim.operation_class.as_str())
         });
-        // Machine builds System messages (x402, MPP) itself, so no Petal can
-        // label them; Broker reviews message envelopes for Petal subjects only.
+        // Machine builds System messages itself, so no Petal can label them.
+        // Broker reviews the x402 payment envelope; MPP has none it can read.
         let system = matches!(self.provenance, ProvenanceSubject::System { .. });
-        if (message_required || (!system && is_signed_message(self.crypto_suite, &self.preimage)))
+        let system_x402 = matches!(&self.provenance, ProvenanceSubject::System { operation_class, .. }
+            if operation_class.as_str() == bloom_broker_api::SYSTEM_X402_OPERATION_CLASS);
+        if (message_required
+            || system_x402
+            || (!system && is_signed_message(self.crypto_suite, &self.preimage)))
             && self.message_review_payload.is_none()
             && !safe_operation
         {
@@ -2412,12 +2416,12 @@ impl ExactPayloadSignRequest {
         }
         if self.message_review_payload.is_some()
             && (safe_operation
-                || self.petal_use_claim.is_none()
+                || (self.petal_use_claim.is_none() && !system_x402)
                 || self.crypto_suite != CryptoSuite::Secp256k1Keccak256Recoverable)
         {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::ClaimInvalid,
-                "Message review requires an independent recoverable secp256k1 Petal signature",
+                "Message review requires an independent recoverable secp256k1 Petal or x402 signature",
             ));
         }
         SigningPayloads::Single {
@@ -4412,19 +4416,30 @@ mod tests {
     }
 
     #[test]
-    fn system_signed_message_needs_no_envelope_and_cannot_carry_one() {
+    fn only_system_x402_messages_carry_and_require_an_envelope() {
+        let envelope = br#"{"schema":"bloom.message.review.v1"}"#.to_vec();
         let mut request = exact_request(vec![0x19, 0x01], None);
         request.provenance = ProvenanceSubject::System {
             component_id: token("bloom-machine"),
-            operation_class: token("paid-http.x402"),
+            operation_class: token(bloom_broker_api::SYSTEM_X402_OPERATION_CLASS),
         };
-        request.validate().unwrap();
-        // Broker refuses message envelopes on non-Petal subjects.
-        request.message_review_payload = Some(br#"{"schema":"bloom.message.review.v1"}"#.to_vec());
         assert_eq!(
             request.validate().unwrap_err().code,
             ProtocolErrorCode::ClaimInvalid
         );
+        request.message_review_payload = Some(envelope.clone());
+        request.validate().unwrap();
+        // MPP signs Tempo payloads Broker cannot read: no envelope either way.
+        request.provenance = ProvenanceSubject::System {
+            component_id: token("bloom-machine"),
+            operation_class: token("paid-http.mpp"),
+        };
+        assert_eq!(
+            request.validate().unwrap_err().code,
+            ProtocolErrorCode::ClaimInvalid
+        );
+        request.message_review_payload = None;
+        request.validate().unwrap();
     }
 
     /// The batch path refused the Safe class; the reusable single-payload

@@ -2343,7 +2343,7 @@ dependencies = [
 [[package]]
 name = "bloom-broker-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=529c3a4d00b286eea77603b7922e111b268e95ab#529c3a4d00b286eea77603b7922e111b268e95ab"
+source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=28ab3ed94c62801f0287d5fabcca0ba2bef3415d#28ab3ed94c62801f0287d5fabcca0ba2bef3415d"
 dependencies = [
  "bech32",
  "bloom-rpc-wire",
@@ -2626,6 +2626,7 @@ name = "bloom-paid-x402"
 version = "0.4.1"
 dependencies = [
  "alloy 2.0.5",
+ "alloy-dyn-abi",
  "async-trait",
  "base64 0.22.1",
  "bloom-paid-http",

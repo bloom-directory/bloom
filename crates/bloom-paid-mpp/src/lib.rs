@@ -359,7 +359,7 @@ async fn exactize_tempo_transaction(
         let preimage = recoverable.tx().encoded_for_signing();
         let hash: [u8; 32] = alloy::primitives::keccak256(&preimage).into();
         let raw = host
-            .sign_paid_http_payload(MPP_SIGN_INTENT, signing_slot, &preimage, hash, facts)
+            .sign_paid_http_payload(MPP_SIGN_INTENT, signing_slot, &preimage, hash, facts, None)
             .await?;
         let signature = Signature::from_raw(&raw).map_err(|error| error.to_string())?;
         envelope.signature = TempoSignature::Primitive(PrimitiveSignature::Secp256k1(signature));
@@ -371,7 +371,7 @@ async fn exactize_tempo_transaction(
     let preimage = tx.encoded_for_signing();
     let hash: [u8; 32] = alloy::primitives::keccak256(&preimage).into();
     let raw = host
-        .sign_paid_http_payload(MPP_SIGN_INTENT, signing_slot, &preimage, hash, facts)
+        .sign_paid_http_payload(MPP_SIGN_INTENT, signing_slot, &preimage, hash, facts, None)
         .await?;
     let signature = Signature::from_raw(&raw).map_err(|error| error.to_string())?;
     let signed = tx.into_signed(TempoSignature::Primitive(PrimitiveSignature::Secp256k1(
@@ -409,7 +409,7 @@ async fn exactize_voucher(
     preimage.extend_from_slice(voucher.eip712_hash_struct().as_slice());
     let hash: [u8; 32] = alloy::primitives::keccak256(&preimage).into();
     let raw = host
-        .sign_paid_http_payload(MPP_SIGN_INTENT, signing_slot, &preimage, hash, facts)
+        .sign_paid_http_payload(MPP_SIGN_INTENT, signing_slot, &preimage, hash, facts, None)
         .await?;
     Ok(alloy::hex::encode_prefixed(raw))
 }
@@ -703,6 +703,7 @@ mod tests {
             preimage: &[u8],
             signing_hash: [u8; 32],
             _facts: &PaidHttpSigningFacts,
+            _review: Option<&[u8]>,
         ) -> Result<[u8; 65], String> {
             assert_eq!(intent, MPP_SIGN_INTENT);
             assert_eq!(
