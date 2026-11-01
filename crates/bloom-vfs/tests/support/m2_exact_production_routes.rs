@@ -481,6 +481,17 @@ async fn production_mpp_route_prepares_then_signs_through_broker() {
     });
     let sign = sign.expect("MPP retry must submit the exact payload for signing");
     assert_eq!(sign.approval_id, prepare.terms.approval_id().unwrap());
+    // Broker decodes the exact Tempo transaction it is asked to approve.
+    let review: serde_json::Value =
+        serde_json::from_slice(&prepare.message_review_payloads[0].decode()).unwrap();
+    let bloom_broker_api::SigningPayloads::Single { payload } = &sign.payloads else {
+        panic!("MPP charge signs one payload");
+    };
+    assert_eq!(review["kind"], "tempo_transaction");
+    assert_eq!(
+        review["transaction"],
+        alloy::hex::encode_prefixed(payload.decode())
+    );
     let signing_results = broker.signing_results.lock().unwrap();
     let result = signing_results
         .first()
