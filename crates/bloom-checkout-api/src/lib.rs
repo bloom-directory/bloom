@@ -221,6 +221,9 @@ pub struct Element {
     pub value: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checked: Option<bool>,
+    /// A link's http(s) origin and path, without query or fragment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub href: Option<String>,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

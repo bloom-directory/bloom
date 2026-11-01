@@ -128,6 +128,9 @@
     value: field(e) && e.type !== 'checkbox' && e.type !== 'radio' && !privateInput(e) ?
       (e.value && globalThis.__bloomPrivateFields?.has(e) ? `[saved ${globalThis.__bloomPrivateFields.get(e)}]` : String(e.value).slice(0, 200)) : undefined,
     checked: checked(e),
+    // Lets an agent read a document link without opening it. Like the page
+    // url, the query and fragment, which can carry tokens, are left out.
+    href: e.tagName === 'A' && !privateDisplay(e) && /^https?:$/.test(e.protocol) ? e.origin + e.pathname : undefined,
     options: e.tagName === 'SELECT' ? [...e.options].map(o => ({value: o.value, label: o.text})) : undefined
   }));
   // Child frames are observed separately; their contents are never merged here.
