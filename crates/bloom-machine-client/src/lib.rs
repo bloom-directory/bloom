@@ -113,8 +113,6 @@ use sha2::{Digest as _, Sha256};
 use sha3::Keccak256;
 
 const SIGN_OPERATION_DOMAIN: &[u8] = b"bloom-sign-operation/v1";
-/// System subject of Machine's Tempo MPP payment signatures.
-pub const SYSTEM_MPP_OPERATION_CLASS: &str = "paid-http.mpp";
 
 /// Machine-owned identity used to bind a logical north-edge signing operation.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2404,7 +2402,7 @@ impl ExactPayloadSignRequest {
         // Broker decodes the x402 and MPP payment envelopes for the owner.
         let system = matches!(self.provenance, ProvenanceSubject::System { .. });
         let system_payment = matches!(&self.provenance, ProvenanceSubject::System { operation_class, .. }
-            if [bloom_broker_api::SYSTEM_X402_OPERATION_CLASS, SYSTEM_MPP_OPERATION_CLASS]
+            if [bloom_broker_api::SYSTEM_X402_OPERATION_CLASS, bloom_broker_api::SYSTEM_MPP_OPERATION_CLASS]
                 .contains(&operation_class.as_str()));
         if (message_required
             || system_payment
@@ -4423,7 +4421,7 @@ mod tests {
         let envelope = br#"{"schema":"bloom.message.review.v1"}"#.to_vec();
         for class in [
             bloom_broker_api::SYSTEM_X402_OPERATION_CLASS,
-            super::SYSTEM_MPP_OPERATION_CLASS,
+            bloom_broker_api::SYSTEM_MPP_OPERATION_CLASS,
         ] {
             // A Tempo transaction preimage is not an EIP-191/712 message, so
             // the envelope requirement must come from the subject.

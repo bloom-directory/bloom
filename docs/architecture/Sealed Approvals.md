@@ -295,9 +295,9 @@ pinned packages; upgraded wallets still require owner approval of new identities
 Bloom #224 must remain unmergeable until the default Polymarket and Hyperliquid
 catalog pins select compatible published packages. Broker #103 landed as
 `e2f55a7e291eff32d3d544f0f94dc770945bafd7`. This branch pins Broker
-`28ab3ed94c62801f0287d5fabcca0ba2bef3415d` (open bloom-broker #125 on #119):
+`bd1fc4b0de7d139ed900b907804b0b89c0fd20ec` (open bloom-broker #125 on #119):
 `e2f55a7` plus the trusted clock rollback fix that Bloom v0.4.1 ships (#119)
-and the Machine x402 payment review (#125). Both must land on Broker master,
+and the Machine x402 and MPP payment review (#125). Both must land on Broker master,
 and this pin must move to the landed commit, before #224 merges.
 
 Machine's own paid-HTTP payments (System subjects `paid-http.x402` and
