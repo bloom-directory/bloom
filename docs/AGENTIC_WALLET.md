@@ -43,30 +43,8 @@ Mainnet and L2 broadcast routing is enabled by default. Live sends still require
 
 ## First five minutes
 
-```sh
-# 1. Install/build Bloom, then initialize the default home.
-bloom init
-
-# 2. See what the agent can read.
-bloom vfs ls /
-bloom vfs cat /docs/README.md
-bloom vfs cat /chains/ethereum/head/number
-bloom vfs cat /prices/spot/eth.usd
-
-# 3. Create a demo wallet. Passkey is the default — Broker launches a WebAuthn
-# ceremony in the browser and Signer retains all private key material.
-bloom wallet new alice
-bloom wallet list
-
-# 4. Stage a devnet transaction when Anvil is running.
-bloom vfs write \
-  /wallets/alice/0/chains/anvil/outbox/new.tx \
-  --data 'send 0.01 eth to 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 on anvil'
-
-# 5. Review the generated plan before confirming.
-bloom vfs ls /wallets/alice/0/chains/anvil/outbox/pending
-bloom vfs cat /wallets/alice/0/chains/anvil/outbox/pending/<id>/plan.md
-```
+After setup, the mounted `AGENTS.md` and `docs/` describe discovery, wallet
+creation, and the transaction loop for the installed version.
 
 ## Paid HTTP requests
 

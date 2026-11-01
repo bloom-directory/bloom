@@ -1,6 +1,6 @@
 ---
 name: bloom
-description: Crypto wallet for agents. Check balances, send or swap tokens, and use onchain apps on EVM chains and Solana through the Bloom filesystem, with a human passkey approving every transaction. Use when the user mentions Bloom or asks to set it up, or asks about their crypto wallet, balances, addresses, transfers, or onchain actions.
+description: "Bloom crypto wallet: balances, transfers, swaps, setup. Use when the user mentions Bloom or their wallet, addresses, or onchain actions on EVM chains or Solana. A human passkey approves every transaction."
 metadata:
   version: "0.5.0"
 ---
