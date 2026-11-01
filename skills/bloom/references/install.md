@@ -54,6 +54,10 @@ never fall back to an older release or cached payload.
 
 This setup script supports only the targets above. On macOS x86_64 or any other
 platform the script stops; report that instead of improvising an install.
+Linux also needs systemd with a user session, and every target needs
+`/usr/bin/ssh-keygen` to verify release signatures. If setup reports a missing
+command, tell the user which package provides it (OpenSSH's client for
+`ssh-keygen`) and stop; do not install packages yourself.
 Bloom requires macOS 26 or later: it mounts `~/bloom` over NFSv4.1, which
 earlier versions lack, and the privileged installer refuses an older macOS
 before changing anything. Report that the user must update macOS first.
@@ -149,7 +153,7 @@ Check `command -v pkexec`. If it is installed, run the command yourself; the
 system authentication agent shows its own credential dialog:
 
 ```sh
-pkexec /bin/sh -c 'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); cp -R "$1/." "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; d=$(sha256sum "$s/install-reviewed-triad.sh" 2>/dev/null || shasum -a 256 "$s/install-reviewed-triad.sh" || true); if [ "${d%% *}" = "$2" ]; then /bin/sh "$s/install-reviewed-triad.sh" install / "$3" "$4" "$s/bloom-triad" && r=0 || r=$?; else echo "Bloom installer changed after staging." >&2; r=65; fi; rm -rf -- "$s"; exit "$r"' bloom-install 'STAGE' 'SHA256' 'UID' 'USER'
+pkexec /bin/sh -c 'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); trap "rm -rf -- $s" EXIT; trap "exit 129" HUP INT TERM; cp -R "$1/." "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; d=$(sha256sum "$s/install-reviewed-triad.sh" 2>/dev/null || shasum -a 256 "$s/install-reviewed-triad.sh" || true); if [ "${d%% *}" != "$2" ]; then echo "Bloom installer changed after staging." >&2; exit 65; fi; /bin/sh "$s/install-reviewed-triad.sh" install / "$3" "$4" "$s/bloom-triad"' bloom-install 'STAGE' 'SHA256' 'UID' 'USER'
 ```
 
 Nothing may sit between `pkexec` and `/bin/sh`: no `sudo`, `env`, variable
@@ -161,7 +165,7 @@ place of `pkexec` to run in their terminal, values already substituted. For
 example, if staging reported these values:
 
 ```sh
-sudo /bin/sh -c 'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); cp -R "$1/." "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; d=$(sha256sum "$s/install-reviewed-triad.sh" 2>/dev/null || shasum -a 256 "$s/install-reviewed-triad.sh" || true); if [ "${d%% *}" = "$2" ]; then /bin/sh "$s/install-reviewed-triad.sh" install / "$3" "$4" "$s/bloom-triad" && r=0 || r=$?; else echo "Bloom installer changed after staging." >&2; r=65; fi; rm -rf -- "$s"; exit "$r"' bloom-install '/home/lee/.cache/bloom/install/v1.2.3-linux-x86_64' '1c21729dfedbf141ee6eed8b6361c2e470eb95a664316a39b162ec8151d789c8' '1000' 'lee'
+sudo /bin/sh -c 'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); trap "rm -rf -- $s" EXIT; trap "exit 129" HUP INT TERM; cp -R "$1/." "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; d=$(sha256sum "$s/install-reviewed-triad.sh" 2>/dev/null || shasum -a 256 "$s/install-reviewed-triad.sh" || true); if [ "${d%% *}" != "$2" ]; then echo "Bloom installer changed after staging." >&2; exit 65; fi; /bin/sh "$s/install-reviewed-triad.sh" install / "$3" "$4" "$s/bloom-triad"' bloom-install '/home/lee/.cache/bloom/install/v1.2.3-linux-x86_64' '1c21729dfedbf141ee6eed8b6361c2e470eb95a664316a39b162ec8151d789c8' '1000' 'lee'
 ```
 
 Use the actual captured values, not the example values. The user types their
@@ -178,7 +182,7 @@ they stay out of the AppleScript source:
   -e 'on run argv' \
   -e 'do shell script ("/bin/sh -c " & quoted form of (item 1 of argv) & " bloom-install " & quoted form of (item 2 of argv) & " " & quoted form of (item 3 of argv) & " " & quoted form of (item 4 of argv) & " " & quoted form of (item 5 of argv)) with administrator privileges' \
   -e 'end run' \
-  'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); cp -R "$1/." "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; d=$(sha256sum "$s/install-reviewed-triad.sh" 2>/dev/null || shasum -a 256 "$s/install-reviewed-triad.sh" || true); if [ "${d%% *}" = "$2" ]; then /bin/sh "$s/install-reviewed-triad.sh" install / "$3" "$4" "$s/bloom-triad" && r=0 || r=$?; else echo "Bloom installer changed after staging." >&2; r=65; fi; rm -rf -- "$s"; exit "$r"' 'STAGE' 'SHA256' 'UID' 'USER'
+  'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); trap "rm -rf -- $s" EXIT; trap "exit 129" HUP INT TERM; cp -R "$1/." "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; d=$(sha256sum "$s/install-reviewed-triad.sh" 2>/dev/null || shasum -a 256 "$s/install-reviewed-triad.sh" || true); if [ "${d%% *}" != "$2" ]; then echo "Bloom installer changed after staging." >&2; exit 65; fi; /bin/sh "$s/install-reviewed-triad.sh" install / "$3" "$4" "$s/bloom-triad"' 'STAGE' 'SHA256' 'UID' 'USER'
 ```
 
 Never add a `user name` or `password` parameter to `do shell script`.
@@ -198,11 +202,12 @@ run it yourself or broaden the reviewed invocation to include it.
 
 ### Linux post-install readiness
 
-On Linux, success includes `BLOOM_RELOGIN_REQUIRED=1`. Tell the user that Bloom
-was installed but the current login session does not yet have its new access
-groups. Do not attempt a group workaround; resume after a fresh login.
+On Linux, success includes `BLOOM_RELOGIN_REQUIRED`. If it is `0` (an upgrade),
+continue to the checks below. If it is `1` (a first install), tell the user that
+Bloom was installed but the current login session does not yet have its new
+access groups. Do not attempt a group workaround; resume after a fresh login.
 
-After that fresh login, the package starts Machine and mounts `~/bloom` through
+Once the session has the groups, the package starts Machine and mounts `~/bloom` through
 `bloom-machine.service`; the agent must not launch a second Machine. Require:
 
 ```sh

@@ -1,6 +1,6 @@
 ---
 name: bloom
-description: "Bloom crypto wallet: balances, transfers, swaps, setup. Use when the user mentions Bloom or their wallet, addresses, or onchain actions on EVM chains or Solana. A human passkey approves every transaction."
+description: "Bloom crypto wallet: balances, transfers, swaps, setup. Use when the user mentions Bloom or their wallet, addresses, or onchain actions on EVM chains or Solana. Transactions need the user's passkey or a Sealed Approval they signed."
 metadata:
   version: "0.5.0"
 ---
@@ -16,7 +16,7 @@ instead of writing Web3 code, unless the user asks for code.
 Run this first. It prints the operating contract and pending actions:
 
 ```sh
-cat ~/bloom/AGENTS.md ~/bloom/next.md || bloom vfs cat /AGENTS.md
+cat ~/bloom/AGENTS.md ~/bloom/next.md || (bloom vfs cat /AGENTS.md && bloom vfs cat /next.md)
 ```
 
 Use the user's mount path instead of `~/bloom` if they gave one.

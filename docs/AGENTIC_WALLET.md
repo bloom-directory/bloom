@@ -39,12 +39,7 @@ An agent using Bloom can:
 - enforce wallet policy: spend caps, allow/deny lists, contract-call gates, private orderflow preferences, and audit logging;
 - use thirteen read-ready public EVM networks immediately after setup: Ethereum, Base, Tempo, Robinhood Chain, Arbitrum, Optimism, Polygon, BNB Smart Chain, Avalanche, Gnosis, Linea, HyperEVM, and Arc, plus local Anvil.
 
-Mainnet and L2 broadcast routing is enabled by default. Live sends still require the applicable signing, policy, confirmation, and Sealed Approval gates.
-
-## First five minutes
-
-After setup, the mounted `AGENTS.md` and `docs/` describe discovery, wallet
-creation, and the transaction loop for the installed version.
+Mainnet and L2 broadcast routing is enabled by default. Live sends still require the applicable signing, policy, confirmation, and Sealed Approval gates. After setup, the mounted `AGENTS.md` and `docs/` describe discovery, wallet creation, and the transaction loop for the installed version.
 
 ## Paid HTTP requests
 

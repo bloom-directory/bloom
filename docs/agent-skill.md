@@ -57,10 +57,3 @@ Keep credentials out of the repository. Do not create a publishing workflow or
 store an API token until recurring releases justify automation. See
 <https://docs.openclaw.ai/clawhub/quickstart> for the current authentication and
 publishing flow.
-
-## Other catalogs
-
-LobeHub's agent catalog and browse.sh's browser-automation catalog serve different
-formats and workflows. Do not create duplicate agent personas or browser recipes
-just to list this filesystem skill. Pursue those only if a useful integration
-emerges. A Hermes plugin is likewise unnecessary for CLI/filesystem access.

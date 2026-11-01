@@ -392,8 +392,13 @@ INSTALL_REVIEWED_TRIAD
   } > "$privileged_installer"
   chmod 755 "$privileged_installer"
 
-  if [ -L "$install_stage" ] ||
-    { [ -e "$install_stage" ] && [ ! -f "$install_stage/.bloom-triad-stage" ]; }
+  # Replace only a stage this script made: owned by the user, with an intact
+  # marker naming a release tag and the reviewed installer beside it.
+  stage_marker="$install_stage/.bloom-triad-stage"
+  if [ -L "$install_stage" ] || { [ -e "$install_stage" ] && {
+    [ ! -O "$install_stage" ] || [ -L "$stage_marker" ] || [ ! -O "$stage_marker" ] ||
+      [ ! -f "$install_stage/install-reviewed-triad.sh" ] ||
+      ! grep -qx 'v[0-9][0-9A-Za-z.+-]*' "$stage_marker"; }; }
   then
     printf '%s\n' "Bloom will not replace an unrecognized installation stage: $install_stage" >&2
     exit 1
