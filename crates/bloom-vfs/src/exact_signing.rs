@@ -2743,6 +2743,47 @@ mod tests {
         let mut with_digest = single;
         with_digest.review_payload_digest = Some(digest(5));
         assert!(serde_json::to_value(&with_digest).unwrap()["review_payload_digest"].is_string());
+
+        // The v0.4.x single-payload reader rejects a populated digest, so
+        // compatibility-v1.toml declares Machine state 3 with downgrade floor 3.
+        #[allow(dead_code)]
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ReleasedExactSigningState {
+            schema: IgnoredAny,
+            action_id: IgnoredAny,
+            wallet_id: IgnoredAny,
+            #[serde(default)]
+            account_key_ref: Option<IgnoredAny>,
+            operation_class: IgnoredAny,
+            crypto_suite: IgnoredAny,
+            payload_digest: IgnoredAny,
+            claimed_hash: IgnoredAny,
+            provenance_digest: IgnoredAny,
+            approval_operation_id: IgnoredAny,
+            signing_operation_id: IgnoredAny,
+            request_nonce: IgnoredAny,
+            issued_at_ms: IgnoredAny,
+            expires_at_ms: IgnoredAny,
+            canonical_plan_facts_digest: IgnoredAny,
+            approval_id: IgnoredAny,
+        }
+        use serde::de::IgnoredAny;
+        let mut digestless = with_digest.clone();
+        digestless.review_payload_digest = None;
+        serde_json::from_slice::<ReleasedExactSigningState>(
+            &serde_json::to_vec(&digestless).unwrap(),
+        )
+        .unwrap();
+        let error = serde_json::from_slice::<ReleasedExactSigningState>(
+            &serde_json::to_vec(&with_digest).unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            error.to_string().contains("review_payload_digest"),
+            "{error}"
+        );
     }
 
     async fn reusable_once(

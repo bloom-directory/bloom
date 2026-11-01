@@ -293,8 +293,11 @@ combination. Do not require #224 to merge before publishing its package inputs;
 that creates a circular release dependency. Older installations retain their
 pinned packages; upgraded wallets still require owner approval of new identities.
 Bloom #224 must remain unmergeable until the default Polymarket and Hyperliquid
-catalog pins select compatible published packages. Broker #103 has landed and
-this branch pins its landed commit `e2f55a7e291eff32d3d544f0f94dc770945bafd7`.
+catalog pins select compatible published packages. Broker #103 landed as
+`e2f55a7e291eff32d3d544f0f94dc770945bafd7`. This branch pins Broker
+`529c3a4d00b286eea77603b7922e111b268e95ab` (open bloom-broker #119), which is
+`e2f55a7` plus the trusted clock rollback fix that Bloom v0.4.1 ships; it must
+land on Broker master before #224 merges.
 Polymarket v0.1.6 and Hyperliquid v0.1.7 do not satisfy the package contract.
 
 When combining Bloom #322 and #293 with the compiled token catalog, policy
