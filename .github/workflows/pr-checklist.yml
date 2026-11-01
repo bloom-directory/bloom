@@ -20,6 +20,9 @@ jobs:
     needs: [release_impact, signing_producers]
     if: always()
     name: checklist-complete
+    # Dependabot writes its own PR body, which has no checklist. A job skipped
+    # by `if:` still satisfies the required check; human PRs are unaffected.
+    if: github.event.pull_request.user.login != 'dependabot[bot]' || github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     steps:
       - name: Require compatible shipped signing packages

@@ -702,6 +702,38 @@ async fn vfs_policy_write_prepares_then_commits_only_with_completed_custody_rece
         .unwrap();
     assert_eq!(current, serde_jcs::to_vec(&policy(120_000)).unwrap());
 
+    // `latest` names only a pending update, so it is gone after the commit.
+    // The walkthrough in docs/examples.md must read a status that exists.
+    assert!(matches!(
+        restarted
+            .read(&VfsPath::parse("alice/policy-updates/latest/status.json").unwrap())
+            .await,
+        Err(HandlerError::NotFound(_))
+    ));
+    let examples = include_str!("../src/docs/examples.md");
+    let walkthrough = examples
+        .split_once("## Updating wallet policy")
+        .and_then(|(_, rest)| rest.split("```sh").nth(2))
+        .and_then(|block| block.split_once("```"))
+        .map(|(block, _)| block)
+        .expect("examples.md has a post-commit policy block");
+    let documented: Vec<_> = walkthrough
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("cat \"$BLOOM/wallets/"))
+        .filter_map(|path| path.split('"').next())
+        .filter(|path| path.contains("/policy-updates/"))
+        .map(|path| path.replace("<action_id>", operation_id.as_str()))
+        .collect();
+    assert!(!documented.is_empty(), "{walkthrough}");
+    for path in documented {
+        let status = restarted
+            .read(&VfsPath::parse(&path).unwrap())
+            .await
+            .unwrap_or_else(|error| panic!("documented {path}: {error:?}"));
+        let status: serde_json::Value = serde_json::from_slice(&status).unwrap();
+        assert_eq!(status["status"], "confirmed", "{path}");
+    }
+
     let requests = fixture.requests.lock();
     assert!(matches!(
         requests.as_slice(),

@@ -2100,9 +2100,21 @@ mod tests {
     #[ignore = "requires downloaded release assets in BLOOM_PETAL_RELEASE_ASSETS"]
     fn published_release_assets_match_pins_and_authority() {
         let root = PathBuf::from(std::env::var_os("BLOOM_PETAL_RELEASE_ASSETS").unwrap());
+        let selected = std::env::var("BLOOM_PETAL_RELEASE_NAME").ok();
+        assert!(
+            selected
+                .as_deref()
+                .is_none_or(|name| DEFAULT_PETALS.contains(&name))
+        );
         let home = tempfile::tempdir().unwrap();
         let daemon = Daemon::from_home(HomeDir::at(home.path())).unwrap();
         for name in DEFAULT_PETALS {
+            if selected
+                .as_deref()
+                .is_some_and(|selected| selected != *name)
+            {
+                continue;
+            }
             let entry = preinstalled_petal(name).unwrap();
             let dir = root.join(name);
             let manifest: PetalReleaseManifest =

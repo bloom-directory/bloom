@@ -22,9 +22,10 @@ pub enum UnitError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedAmount {
-    /// Either a numeric raw value (`raw`) when `unit` is a known native
-    /// metric (eth/gwei/wei) — pre-applied to wei, OR `None` when the
-    /// caller must resolve `symbol` against ERC-20 decimals.
+    /// The value in wei when an explicit native unit (eth/gwei/wei) was
+    /// written, OR `None` when the caller must scale `number` itself: a
+    /// token symbol, or a bare number (wei for native, token decimals for
+    /// ERC-20).
     pub raw: Option<U256>,
     /// Lowercased unit/token symbol, e.g. "eth", "gwei", "usdc".
     pub unit: String,
@@ -65,7 +66,9 @@ pub fn parse_amount(s: &str) -> Result<ParsedAmount, UnitError> {
     }
 
     let unit = unit_part;
+    let explicit_unit = first_alpha.is_some();
     let raw = match unit.as_str() {
+        _ if !explicit_unit => None,
         "wei" => Some(parse_decimal(num_part, 0)?),
         "gwei" => Some(parse_decimal(num_part, 9)?),
         "eth" | "ether" => Some(parse_decimal(num_part, 18)?),
@@ -75,7 +78,7 @@ pub fn parse_amount(s: &str) -> Result<ParsedAmount, UnitError> {
         raw,
         unit,
         number: num_part.to_string(),
-        explicit_unit: first_alpha.is_some(),
+        explicit_unit,
     })
 }
 
@@ -87,6 +90,9 @@ pub fn parse_units(s: &str, decimals: u8) -> Result<U256, UnitError> {
 /// Parse "1.5 eth" -> wei.
 pub fn parse_eth(s: &str) -> Result<U256, UnitError> {
     let p = parse_amount(s)?;
+    if !p.explicit_unit {
+        return parse_decimal(&p.number, 0);
+    }
     p.raw.ok_or(UnitError::UnknownUnit(p.unit))
 }
 
@@ -204,6 +210,10 @@ mod tests {
         let bare = parse_amount("10").unwrap();
         assert_eq!(bare.unit, "wei");
         assert!(!bare.explicit_unit);
+        assert_eq!(parse_eth("10").unwrap(), U256::from(10u64));
+        // A bare fraction is a valid token amount; only native rejects it.
+        assert_eq!(parse_amount("0.5").unwrap().number, "0.5");
+        assert!(parse_eth("0.5").is_err());
         // Explicit "wei" is flagged so the ERC-20 path can reject it on a token.
         let wei = parse_amount("10 wei").unwrap();
         assert_eq!(wei.unit, "wei");

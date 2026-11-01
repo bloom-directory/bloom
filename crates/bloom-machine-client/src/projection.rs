@@ -806,7 +806,11 @@ impl WalletProjectionReader for CachedWalletProjectionReader {
         &self,
         wallet_id: &Token,
     ) -> Result<WalletProjection, ProtocolError> {
-        self.refresh_wallet(wallet_id)
+        // An earlier observation may share this request's millisecond. Even
+        // timestamp-based refresh sharing must be disabled for authority.
+        self.clone()
+            .with_max_age(Duration::ZERO)
+            .refresh_wallet(wallet_id)
             .await?
             .ok_or_else(|| invalid_projection(format!("wallet {} not found", wallet_id.as_str())))
     }
@@ -2095,6 +2099,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(durable.policy.version.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_policy_commit_can_outpace_display_cache_but_not_authority_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let broker = Arc::new(FakeBroker::new(fixture(1)));
+        let reader = CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(broker.clone())),
+            FileProjectionStore::new(directory.path().join("wallets.json")),
+        )
+        .unwrap()
+        .with_max_age(Duration::from_secs(60));
+        let wallet = token("alice");
+        let initial = reader.get_wallet(&wallet).await.unwrap();
+        assert_eq!(initial.policy.version.get(), 1);
+
+        broker
+            .wallets
+            .lock()
+            .unwrap()
+            .insert("alice".into(), fixture(2));
+        let cached = reader.get_wallet(&wallet).await.unwrap();
+        assert_eq!(cached.policy.version.get(), 1);
+        // Force the refresh-sharing condition without relying on the test
+        // completing within one wall-clock millisecond. Authority must bypass
+        // it even if the clock moved backwards after the cached observation.
+        reader
+            .wallet_refreshed_ms
+            .lock()
+            .unwrap()
+            .insert("alice".into(), u64::MAX);
+        let authoritative = reader.get_wallet_authority(&wallet).await.unwrap();
+        assert_eq!(authoritative.policy.version.get(), 2);
+        let refreshed = reader.get_wallet(&wallet).await.unwrap();
+        assert_eq!(refreshed.policy.version.get(), 2);
     }
 
     #[tokio::test]

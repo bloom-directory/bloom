@@ -82,8 +82,8 @@ futures = "0.3"
 lru = "0.18.2"
 fs2 = "0.4"
 bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "48b83c54c1787b4aff2456bd3adbe18856902e45" }
-wasmtime = { version = "=36.0.19", default-features = false, features = ["async", "cranelift", "runtime", "parallel-compilation"] }
-wasmtime-wasi = "=36.0.19"
+wasmtime = { version = "=36.0.20", default-features = false, features = ["async", "cranelift", "runtime", "parallel-compilation"] }
+wasmtime-wasi = "=36.0.20"
 wat = "1"
 # danger-allow-state-serialisation: webauthn-rs requires this feature to allow
 # the PasskeyRegistration / PasskeyAuthentication state structs to be serialised
