@@ -304,7 +304,7 @@ impl Browser {
             }
             if let Some(elements) = value.get_mut("elements").and_then(Value::as_array_mut) {
                 for element in elements {
-                    for key in ["label", "context", "value"] {
+                    for key in ["label", "context", "value", "href"] {
                         if let Some(value) = element.get_mut(key) {
                             replace(value);
                         }
@@ -1736,7 +1736,8 @@ mod tests {
             tokio::spawn(async move {
                 axum::serve(listener, Router::new()
                 .route("/", get(|| async { Html(r#"<!doctype html><h1>Product page</h1>
-                  <a href="/manual.pdf" target="_blank">Manual del usuario</a>
+                  <a href="/manual.pdf?token=secret#page=2" target="_blank">Manual del usuario</a>
+                  <a href="javascript:void(0)">Script link</a>
                   <button onclick="window.open('/gone')">Brief popup</button>
                   <button onclick="window.open('/late')">Late popup</button>"#) }))
                 .route("/gone", get(|| async { Html("<script>window.close()</script>") }))
@@ -1766,6 +1767,24 @@ mod tests {
                 .unwrap();
             tokio::time::sleep(Duration::from_millis(200)).await;
             let page = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+            serde_json::from_value::<bloom_checkout_api::BrowseResponse>(page.clone()).unwrap();
+            let link = |label: &str| {
+                page["elements"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["label"] == label)
+                    .unwrap()["href"]
+                    .clone()
+            };
+            // Agents can read a document link without opening it; queries and
+            // fragments can carry tokens and stay out.
+            assert_eq!(
+                link("Manual del usuario"),
+                json!(format!("{url}manual.pdf"))
+            );
+            assert_eq!(link("Script link"), Value::Null);
+            assert_eq!(link("Brief popup"), Value::Null);
             browser
                 .browse(BrowseRequest::Click {
                     element_ref: reference(&page, label),
