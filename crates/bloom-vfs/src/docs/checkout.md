@@ -39,6 +39,9 @@ minutes). Reuse the slot. Actions: `open` + `url`, `snapshot`, `click` +
 - Bloom blocks typing card or password data and clicking pay buttons. That
   is the cue to request payment approval, not to work around it.
 - After Add to cart, confirm the cart changed before leaving the page.
+- Links carry `href` (no query or fragment): read a document link instead of
+  clicking it. If a popup closes or downloads a file, shopping continues on the
+  remaining page; take a new snapshot.
 
 ## Travelers on a booking
 
