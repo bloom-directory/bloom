@@ -1006,6 +1006,15 @@ fn accessibility_text(tree: &Value) -> Result<String> {
             }
         }
     }
+    // Text nodes repeat the name of the node that contains them.
+    let mut parent_name = std::collections::HashMap::new();
+    for node in nodes {
+        for child in node["childIds"].as_array().into_iter().flatten() {
+            if let (Some(child), Some(name)) = (child.as_str(), node["name"]["value"].as_str()) {
+                parent_name.insert(child, name);
+            }
+        }
+    }
     let text = nodes
         .iter()
         .filter(|n| n["ignored"] != true)
@@ -1013,7 +1022,12 @@ fn accessibility_text(tree: &Value) -> Result<String> {
         .filter_map(|n| {
             let role = n["role"]["value"].as_str()?;
             let name = n["name"]["value"].as_str()?;
-            if name.is_empty() || matches!(role, "textbox" | "Iframe" | "IframePresentational") {
+            let repeats_parent = matches!(role, "StaticText" | "InlineTextBox")
+                && parent_name.get(n["nodeId"].as_str()?) == Some(&name);
+            if name.is_empty()
+                || repeats_parent
+                || matches!(role, "textbox" | "Iframe" | "IframePresentational")
+            {
                 None
             } else {
                 Some(format!("{role}: {name}"))
@@ -1028,6 +1042,23 @@ fn accessibility_text(tree: &Value) -> Result<String> {
 mod tests {
     use super::*;
     use axum::{Router, response::Html, routing::get};
+
+    #[test]
+    fn page_text_names_each_line_once() {
+        let node = |id: &str, role: &str, name: &str, children: &[&str]| json!({"nodeId":id,"role":{"value":role},"name":{"value":name},"childIds":children});
+        let tree = json!({"nodes":[
+            node("1", "link", "Sign in", &["2"]),
+            node("2", "StaticText", "Sign in", &["3"]),
+            node("3", "InlineTextBox", "Sign in", &[]),
+            node("4", "heading", "Top flights", &["5"]),
+            node("5", "StaticText", "From 305 US dollars", &["6"]),
+            node("6", "InlineTextBox", "From 305 US dollars", &[]),
+        ]});
+        assert_eq!(
+            accessibility_text(&tree).unwrap(),
+            "link: Sign in\nheading: Top flights\nStaticText: From 305 US dollars"
+        );
+    }
 
     #[tokio::test]
     async fn short_private_tokens_do_not_change_control_metadata_or_other_words() {
