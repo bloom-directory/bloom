@@ -107,8 +107,11 @@ jobs:
           machine_version="$(sed -n -E 's/^machine = "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' <<<"$matrix")"
           broker_sha="$(sed -n -E 's/^broker_commit = "([0-9a-f]{40})"$/\1/p' <<<"$matrix")"
           signer_sha="$(sed -n -E 's/^signer_commit = "([0-9a-f]{40})"$/\1/p' <<<"$matrix")"
-          if [[ "$workspace_version" != "$version" || "$machine_version" != "$version" ]]; then
-            echo "::error::$tag must match both the workspace and triad matrix versions"
+          skill_version="$(git show "$release_sha:skills/bloom/SKILL.md" |
+            sed -n -E 's/^  version: "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p')"
+          if [[ "$workspace_version" != "$version" || "$machine_version" != "$version" ||
+            "$skill_version" != "$version" ]]; then
+            echo "::error::$tag must match the workspace, triad matrix, and skill versions"
             exit 1
           fi
           [[ -n "$broker_sha" && -n "$signer_sha" ]] || {
