@@ -2,7 +2,7 @@
 name: bloom
 description: "Bloom financial harness: balances, payments, trades, wallet. The programmable financial harness for AI agents. Use when the user mentions Bloom, asks to set it up, or asks to check balances or positions, send, receive, or pay (including paid APIs via x402 or MPP), swap, trade, lend, or use prediction markets, or to work with wallets, addresses, stablecoins, or other digital assets on EVM chains or Solana. Use it instead of writing SDK code or asking for keys. Transactions need the user's passkey or a Sealed Approval they signed."
 metadata:
-  version: "0.5.0"
+  version: "0.4.1"
 ---
 
 # Bloom
