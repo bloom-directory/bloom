@@ -194,7 +194,7 @@ fn legacy_monitor_preserves_session_lifecycle_without_claiming_network_containme
     assert!(monitor.contains("status.json"));
     assert!(monitor.contains("restart_services_for_live_session"));
     assert!(monitor.contains("if enrollment_state == \"active\""));
-    assert!(monitor.contains("gui/{login_uid}/com.bloom.session"));
+    assert!(monitor.contains("user/{login_uid}/com.bloom.session"));
     assert!(monitor.contains("session.sock"));
     assert!(monitor.contains("metadata.file_type().is_socket()"));
     assert!(monitor.contains("system/com.bloom.{service}.{login_uid}"));
@@ -204,10 +204,13 @@ fn legacy_monitor_preserves_session_lifecycle_without_claiming_network_containme
     assert_ordered(
         &monitor,
         &[
-            "gui/{login_uid}/com.bloom.session",
-            "state = running",
+            "fn restart_services_for_live_session",
+            "prepare_login_sentinel(",
             "session.sock",
             "[\"signer\", \"broker\"]",
+            "fn prepare_login_sentinel",
+            "user/{login_uid}/com.bloom.session",
+            "state = running",
         ],
     );
 
@@ -307,16 +310,6 @@ fn macos_installer_manages_the_path_entry_and_migrates_legacy_cli_post_activatio
         ],
     );
     assert!(!source.contains("rm -rf -- \"$login_home/.local"));
-}
-
-#[test]
-#[cfg(target_os = "macos")]
-fn staged_macos_installer_cli_lifecycle_passes() {
-    let status = Command::new("bash")
-        .arg(workspace().join("tests/packaging/macos-installer-staged.sh"))
-        .status()
-        .expect("run staged macOS installer CLI lifecycle");
-    assert!(status.success());
 }
 
 #[test]
@@ -464,6 +457,23 @@ fn macos_conformance_workflows_consume_unified_candidates() {
     let ci = fs::read_to_string(workspace().join(".github/workflows/ci.yml")).unwrap();
     assert!(ci.contains(&format!("broker_ref: {broker_commit}")));
     assert!(ci.contains(&format!("signer_ref: {signer_commit}")));
+
+    // These assertions read both conformance workflows, so editing either
+    // must trigger CI, which runs this binary on Linux. The Unix-principal
+    // workflow runs the packaging scripts directly.
+    let code_paths = ci.split("- \"Cargo.toml\"").next().unwrap();
+    assert!(code_paths.contains("- \".github/workflows/macos-unix-conformance.yml\""));
+    assert!(code_paths.contains("- \".github/workflows/macos-two-login-conformance.yml\""));
+    assert!(ci.contains("-E 'package(bloom-it) and binary(macos_launchagent)'"));
+    let unix = fs::read_to_string(workspace().join(".github/workflows/macos-unix-conformance.yml"))
+        .unwrap();
+    for script in [
+        "macos-installer-staged.sh",
+        "macos-pf-retirement.sh",
+        "macos-upgrade-rollback.sh",
+    ] {
+        assert!(unix.contains(&format!("bash bloom/tests/packaging/{script}")));
+    }
 }
 
 #[test]
