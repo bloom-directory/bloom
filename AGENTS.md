@@ -52,6 +52,8 @@ Use the [owner-to-integration workflow](./DEVELOPMENT.md#cross-repository-change
 and the [change-to-test map](./TESTING.md#change-to-test-map). Run the smallest
 check that exercises the change, then the broader gates required by its scope.
 Mounted Markdown is embedded in the VFS and has executable documentation tests.
+Agent evals live in [evals/harbor](./evals/harbor/README.md); read its Purpose
+before changing Bloom's agent-facing docs, routes or errors.
 
 Use separate target directories for concurrent Cargo builds. Select the exact
 Machine, Broker, and Signer binaries for integration work, and record their

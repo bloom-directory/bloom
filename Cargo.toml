@@ -33,7 +33,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.86"
 license = "MIT"
@@ -85,8 +85,8 @@ futures = "0.3"
 lru = "0.18.2"
 fs2 = "0.4"
 bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "48b83c54c1787b4aff2456bd3adbe18856902e45" }
-wasmtime = { version = "=36.0.19", default-features = false, features = ["async", "cranelift", "runtime", "parallel-compilation"] }
-wasmtime-wasi = "=36.0.19"
+wasmtime = { version = "=36.0.20", default-features = false, features = ["async", "cranelift", "runtime", "parallel-compilation"] }
+wasmtime-wasi = "=36.0.20"
 wat = "1"
 # danger-allow-state-serialisation: webauthn-rs requires this feature to allow
 # the PasskeyRegistration / PasskeyAuthentication state structs to be serialised
@@ -134,7 +134,7 @@ bloom-ens      = { path = "crates/bloom-ens" }
 bloom-prices   = { path = "crates/bloom-prices" }
 bloom-revert   = { path = "crates/bloom-revert" }
 bloom-petals   = { path = "crates/bloom-petals" }
-bloom-petal-contract = { git = "https://github.com/bloom-directory/petal", rev = "73c5b06a77599368fbc79fb7947a629b5b4c630e" }
+bloom-petal-contract = { git = "https://github.com/bloom-directory/petal", rev = "7dd2722db5de305dd63ca4ed03591f3ab82fa40b" }
 bloom-daemon   = { path = "crates/bloom-daemon" }
 bloom-update   = { path = "crates/bloom-update" }
 bloom-broker-api = { git = "https://github.com/bloom-directory/bloom-broker.git", rev = "f3b8a6ded2292c3b9d5c31efd153f515aa6f8b7e" }

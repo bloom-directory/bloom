@@ -54,6 +54,13 @@ directory and inspect the resulting projection before retrying or continuing.
 
 Use the error class to decide what to inspect. An error alone does not establish
 whether an earlier operation completed or whether retrying a write is safe.
+When a Petal route refuses a write under `petals/<name>/`, its reason is kept
+in `petals/<name>/last_error.json`; read it and fix the request rather than
+repeating it. The record names the `path` it describes and the `at_ms` it was
+written: a write the mount rejects before the route runs records nothing, so an
+older record left by a different attempt can still be there. Check both fields
+against the write you just made, and treat no record as no information — never
+as a write that succeeded.
 
 - **No such file or directory** — the path is absent in the requested state.
   A discarded transfer or one that advanced out of `pending/` no longer has its
@@ -67,6 +74,12 @@ whether an earlier operation completed or whether retrying a write is safe.
 - **Operation not permitted** — policy or a transaction safety check refused the
   operation. Inspect `policy_check.json` where exposed and the chain's status.
   Repeating the write does not remove the gate.
+- **"signing outcome unknown; it may already be signed"** — a signing request
+  failed in a way that does not prove no signature exists. Retry the identical
+  request (same bytes, same operation id) to reconcile it; never rebuild the
+  operation under a new identifier, and never rebroadcast, until the earlier
+  attempt is confirmed not to have landed.
+- **Invalid argument** — the target rejected what you wrote.
 - **Input/output error** — a backend or I/O operation failed. Inspect action
   state and diagnostics before considering a retry. On an EVM outbox confirm,
   read `last_error.json` beside the pending entry: it gives the refusal and the
@@ -75,6 +88,18 @@ whether an earlier operation completed or whether retrying a write is safe.
   ceremony link in `error`, then confirm again once they approve. For a
   possibly submitted transaction, reconcile by its recorded hash or signature;
   never blindly restage or rebroadcast.
+
+Machine's Petal HTTP transport errors omit URL userinfo, paths and queries,
+which can contain credentials. Petals may still return upstream response bodies.
+A policy denial is one of:
+
+- `net.fetch requires https`;
+- `net.fetch disallows non-default https port <port>`;
+- `<METHOD> <host>: not allowed by effective network policy (check manifest and invocation grant)`.
+  Both `[[net.allow]]` and the invocation's runtime grant must permit the request.
+
+Transport errors read `http_fetch <send|body>: <METHOD> <host>: <cause>`, where
+the cause is the underlying DNS, connect, TLS or timeout error.
 
 If you write to a control file and then cannot find what you wrote, check
 whether the transfer moved to `sent/` or `failed/` before assuming the write
@@ -354,7 +379,9 @@ project into the central outbox:
 5. Confirm only the exact inspected action.
 6. If approval is required, validate the challenge and hand its ceremony URL to
    the human.
-7. After the ceremony completes, retry only the exact documented `retry_path`.
+7. After the ceremony completes, write the challenge's `retry_body` to its
+   exact `retry_path`. An omitted `retry_body` means `confirm`; serialize an
+   object as JSON. Keep a fee-repair body unchanged through approval and retry.
 8. Read the sent, failed, or receipt projection before reporting success.
 
 A confirm write may return permission denied while projecting
@@ -367,7 +394,8 @@ presenting its ceremony URL. This is a waiting state, not a reason to restage.
 Reading the challenge asks Bloom for the approval's current state, so poll it
 while the human approves. `state` is `awaiting_ceremony` until they finish,
 then `active`, and `next` says what to do. As soon as `state` is `active`,
-write `confirm` to `retry_path`; the approval does not broadcast on its own.
+write the exact `retry_body` to `retry_path`; the approval does not broadcast
+on its own.
 Retrying `retry_path` before then is also safe: it starts no new ceremony and
 returns permission denied again. Once the ceremony can no longer be used,
 `ceremony_url` is withdrawn. For `expired`, `cancelled` or `refused`, tell the
@@ -375,10 +403,20 @@ human rather than retrying on your own.
 
 `bloom wallet confirm` exits 3 when owner approval is pending and 4 when
 confirmation has no recorded result yet. Exit 0 reports a recorded broadcast
-or a completed local discard. Use `--text cancel` to discard an unsigned
-pending entry; an already broadcast transaction needs `bloom wallet cancel`
-and its own approval. Dropping a reservation does not renumber later rows:
-restage with an explicit nonce to fill a gap.
+or a completed local discard. Use `--text cancel` to discard a pending entry
+that was never sent for signing; through the mount, write `cancel` to the
+entry's `confirm` file. Writing the entry's own `cancel` file returns
+permission denied and records nothing, because that control signs a new
+same-nonce transaction. "Never broadcast" or an `active` approval does not
+prove an entry is unsigned: if a signature may exist, even with no hash
+recorded yet, Bloom keeps the entry and its `last_error.json` says how to
+reconcile it; an expired entry stays pending for the same reason. A
+`failed/` entry with `signing_unknown.json` was released by an older Bloom
+although it may be signed: follow its `next` before staging that payment
+again or reusing its nonce; Petal outbox inspection reports it as
+`signing_unknown`, not `failed`. An already broadcast transaction needs `bloom
+wallet cancel` and its own approval. Dropping a reservation does not renumber
+later rows: restage with an explicit nonce to fill a gap.
 
 `confirm.override` is not a general escape hatch. Use it only when the
 inspected policy projection explicitly permits that control and the human has
@@ -390,7 +428,11 @@ signature in `broadcast_attempted.json` with `receipt.json` and inspect the
 outcome and confirmation status. Receipts have no account fingerprint and
 private signing sidecars are not mounted. Genesis checks must pass before
 broadcast; ambiguous sends reconcile by signature, never blind retry or
-endpoint failover. See the Solana walkthrough in `docs/examples.md`.
+endpoint failover. A `sent` entry with `unresolved.md` and no receipt is one
+no RPC reports after its blockhash expired; that does not prove it failed. Show
+the owner its signature to check in an explorer, and stage a new transfer only
+if they confirm it did not land. See the Solana walkthrough in
+`docs/examples.md`.
 
 ## Sealed Approvals
 
@@ -450,8 +492,11 @@ files or environment variables. See `docs/examples.md` for commands.
 Replacing `wallets/<wallet>/policy.json` starts a Broker ceremony. Prepare
 the complete proposal outside the mount and keep the exact same proposed bytes
 through `policy.validate_update`, human approval, and the
-`policy.commit_update` retry. Inspect the update's status and challenge, then
-verify the committed policy and terminal status. Editing or reformatting the
+`policy.commit_update` retry. Inspect the update's status and challenge under
+`policy-updates/latest/` and note its `action_id`. `latest` names only a
+pending update; after the commit, verify the committed policy and read the
+terminal status at `policy-updates/confirmed/<action_id>/status.json` (or
+`failed/<action_id>/`). Editing or reformatting the
 proposal creates a different request. Commands are in the policy-update
 walkthrough in `docs/examples.md`.
 

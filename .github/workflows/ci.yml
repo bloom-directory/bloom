@@ -61,6 +61,8 @@ jobs:
         run: scripts/test-harbor-evals.sh
       - name: Validate hosted relay launcher readiness
         run: scripts/test-triad-dev-hosted-relay.sh
+      - name: Validate macOS logout drain timing
+        run: bash tests/conformance/macos-unix-principals/test-logout-drain.sh
       # Failure-mode cases for the ceremony-port A/B concurrency script
       # (stub launchers; binds no ports and needs no Triad).
       - name: Run concurrency script failure-mode cases
