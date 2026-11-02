@@ -767,6 +767,11 @@ impl WalletsHandler {
             .get(chain)
             .ok_or_else(|| HandlerError::not_found(format!("chain '{chain}'")))?;
         let address = Self::evm_address(family)?;
+        if let [leaf] = rest
+            && leaf.starts_with("balance")
+        {
+            crate::handlers::balances::require_native_asset(client.spec())?;
+        }
         match rest {
             [leaf] if leaf == "balance" => {
                 let balance = client.balance(address).await.map_err(err_be)?;

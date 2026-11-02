@@ -15,6 +15,19 @@ use std::time::Duration;
 /// to cache briefly during agent bursts and mounted filesystem probes.
 pub(crate) const LIVE_BALANCE_TTL: Duration = Duration::from_secs(5);
 
+/// Refuse a native balance read on a chain without a native token (Tempo),
+/// whose RPC answers with a placeholder rather than a balance.
+pub(crate) fn require_native_asset(
+    spec: &bloom_proto::ChainSpec,
+) -> Result<(), crate::handler::HandlerError> {
+    if spec.has_native_asset() {
+        return Ok(());
+    }
+    Err(crate::handler::HandlerError::not_found(
+        bloom_evm::no_native_asset(spec).to_string(),
+    ))
+}
+
 /// ERC-20 metadata is effectively static for normal tokens. Keep this separate
 /// from live balance TTLs so display leaves can refresh balances without
 /// repeatedly calling `symbol()` and `decimals()`.

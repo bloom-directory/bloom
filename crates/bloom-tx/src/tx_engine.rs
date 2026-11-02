@@ -1733,7 +1733,12 @@ impl TxEngine {
         } else {
             (Some(max_fee.to_string()), Some(prio.to_string()), None)
         };
-        let funding_check = match session.balance(from).await {
+        // A chain without a native token answers with a placeholder, not a balance.
+        let balance = match spec.has_native_asset() {
+            true => session.balance(from).await.map_err(|e| e.to_string()),
+            false => Err(bloom_evm::no_native_asset(spec).to_string()),
+        };
+        let funding_check = match balance {
             Ok(available) => insufficient_native_funds_check(
                 &bloom_proto::checksum_address(&from),
                 spec.display_name.as_deref().unwrap_or(&spec.name),

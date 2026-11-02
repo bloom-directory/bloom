@@ -984,6 +984,9 @@ impl ChainsHandler {
             "addresses" if segs.len() == 4 => {
                 let addr = parse_addr(&segs[2])?;
                 let spec = client.spec();
+                if segs[3].starts_with("balance") {
+                    super::balances::require_native_asset(spec)?;
+                }
                 match segs[3].as_str() {
                     "balance" => {
                         let bal = client.balance(addr).await.map_err(err_be)?;
@@ -1353,6 +1356,9 @@ impl ChainsHandler {
             "addresses" if segs.len() == 4 => {
                 let addr = parse_addr(&segs[2])?;
                 let spec = client.spec().clone();
+                if segs[3].starts_with("balance") {
+                    super::balances::require_native_asset(&spec)?;
+                }
                 let session = client.open_session_at(block_number).await.map_err(err_be)?;
                 match segs[3].as_str() {
                     "balance" => {
@@ -3592,6 +3598,29 @@ mod tests {
         assert_eq!(json["symbol"], "ETH");
         assert_eq!(json["raw"], "1000000000000000000");
         assert_eq!(json["display"], "1 ETH");
+    }
+
+    #[tokio::test]
+    async fn tempo_native_balance_is_refused_not_rendered() {
+        // Tempo's RPC returns this placeholder for every address (bloom#288).
+        let mut responses = std::collections::HashMap::new();
+        responses.insert(
+            "eth_getBalance".to_string(),
+            serde_json::Value::String(
+                "0x9612084f0316e0ebd5182f398e5195a51b5ca47667d4c9b26c9b26c9b26c9b2".into(),
+            ),
+        );
+        let tempo = bloom_proto::chain::TEMPO_MAINNET_CHAIN_ID;
+        let h = ChainsHandler::new(registry_for_rpc(spawn_rpc(tempo, responses), tempo));
+        for leaf in ["balance", "balance.raw", "balance.json"] {
+            let path = VfsPath::parse(&format!("/test/addresses/{HOLDER_ADDR}/{leaf}")).unwrap();
+            match h.read(&path).await {
+                Err(HandlerError::NotFound(message)) => {
+                    assert!(message.contains("no native token"), "{message}")
+                }
+                other => panic!("{leaf}: expected NotFound, got {other:?}"),
+            }
+        }
     }
 
     // ---- methods/ enumeration + EIP-1967 proxy resolution ----------------
