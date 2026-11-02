@@ -70,7 +70,9 @@ Agreed on 2026-09-14:
 9. **Petal settings survive an update.** Signed package lineage carries a
    Petal's settings and receipts to its successor release (section 5). Bloom
    writes setup's values after an update only when `main`'s account does not
-   exist yet, so nothing the owner wrote is replaced.
+   exist yet, or when a write setup queued earlier is still waiting, and in
+   both cases only while nothing is stored, so nothing the owner wrote is
+   replaced.
 10. **`bloom init` runs once.** Afterwards users add, update, or remove
     Petals. Setup is recorded when it finishes, so a run that was
     interrupted, or a config `bloom serve` created first, still gets setup
@@ -110,11 +112,13 @@ Agreed on 2026-09-14:
       dropped Arc, so its router there is not proposed.
     - NEAR Intents: `petal:near-intents` on Arbitrum, Avalanche, Base, BNB
       Chain, Ethereum, Gnosis, Optimism, and Polygon (decision 14).
-    - Polymarket: pUSD, native USDC, USDC.e, and Enso Router V2 on Polygon,
-      for funding its deposit wallet. A swap's exact approval goes to the
-      input token, so each token an owner can fund from needs its own entry;
-      native USDC is included because it is what a Polygon wallet normally
-      holds.
+    - Polymarket: `petal:polymarket` on Polygon (decision 14). It funds its
+      deposit wallet with a direct pUSD transfer to that wallet, or an Enso
+      swap after an exact approval, all staged as calls to the token
+      contracts and the Enso router. Machine takes a contract call's `to` as
+      its recipient, so listing those contracts would let any Petal, or the
+      agent, transfer or approve pUSD, USDC or USDC.e to anyone with a raw
+      call. The entry trusts only what Polymarket itself stages there.
 
     Destinations that change per transaction cannot be listed ahead of time,
     such as the token contract for a swap from a token the catalog does not
@@ -124,7 +128,9 @@ Agreed on 2026-09-14:
 14. **A Petal may be trusted with every destination it calls.** NEAR Intents deposits
     go to a fresh address for every quote, signed by the 1Click API, so no
     address can be listed in advance. Its catalog entries are
-    `petal:near-intents` on the chains it supports, and Machine accepts the
+    `petal:near-intents` on the chains it supports; Polymarket's is
+    `petal:polymarket` on Polygon, because its funding calls token contracts
+    (decision 13). Machine accepts the
     destination of a transaction that Petal staged, matching the entry against
     the `petal_id` recorded on the outbox entry. This is a broad grant for any
     transaction that Petal stages on those chains, including arbitrary
@@ -289,10 +295,10 @@ max_daily_usd = "100"
 `[setup]` is a top-level table, not part of `[petals]`: a Bloom release
 refuses unknown keys under `[petals]` but ignores an unknown top-level table,
 so a home this setup ran on still starts if its owner goes back to a release.
-That release drops `[setup]` the next time it saves the config, and the next
-`bloom init` of this design then runs setup again. An earlier build of this
-design saved the choices under `[petals]`; they still load and move to
-`[setup]` on the next save.
+A release never rewrites an existing config, so `[setup]` survives the
+downgrade, and nothing runs setup again after it. An earlier build of this
+design saved the choices under `[petals]`; they still load, and the next
+`bloom init` moves them to `[setup]`, so a release can then start too.
 
 The policy uses the installed package hash for each chosen name, so a Petal
 installed another way, such as the local builds the developer triad installs,
@@ -347,10 +353,7 @@ chosen Petals:
     "6eb2065e8558f3761399fcb0516731a600fdb0b49974c8ed0808abd38fde7db4"
   ],
   "allowed_destinations": [
-    { "chain": "polygon", "destination": "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb" },
-    { "chain": "polygon", "destination": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359" },
-    { "chain": "polygon", "destination": "0x2791bca1f2de4661ed88a30c99a7a9449aa84174" },
-    { "chain": "polygon", "destination": "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf" }
+    { "chain": "polygon", "destination": "petal:polymarket" }
   ],
   "required_verifiers": []
 }
@@ -407,10 +410,13 @@ default-policy main`, a rerun of `bloom init` once `main` exists, or `bloom
 serve`, which checks every 30 seconds while a write is queued, so a `main`
 an agent creates by writing `wallets/new` gets them too. A rerun of `bloom
 init` covers a home where `main` already existed, so no wallet creation
-follows; a rerun that updates the Petal instead keeps the settings it
-carries, clears the marker and prints the command (section 1). A queued
-write that fails stays queued, and a command that stops on an applied or
-changed policy names the command that retries it. It writes them only while
+follows. A rerun or `bloom serve` that updates the Petal makes a queued
+write too, while nothing is stored, and otherwise keeps the settings the
+update carries (section 5). A queued write that fails stays queued, and a
+command that stops on an applied or changed policy names the command that
+retries it. A write waiting for its Petal's update is reported apart, with
+what makes it: the update `bloom serve` tries when it starts and `bloom init`
+when it runs. It writes them only while
 the Petal stores nothing for them: for Polymarket, no
 `state/settings/main/venue.toml` in account 0's partition of its private
 store (its SDK's `state` namespace plus its own key), pinned with the
@@ -490,7 +496,7 @@ be. It does not count sells, and it has no total limit.
 | User action | Policy change proposed for `main` | Petal settings |
 |---|---|---|
 | Add a Petal with `bloom petals install` | Allow its package hash | Write Bloom's suggested settings, if it is a catalog Petal |
-| Update a Petal by installing a newer release | Replace the old package hash with the new one | Preserved through the signed package lineage; initial settings are written only when the wallet is known not to exist |
+| Update a Petal by installing a newer release | Replace the old package hash with the new one | Preserved through the signed package lineage; initial settings are written only when the wallet is known not to exist, or when a write setup queued earlier is waiting, and only while nothing is stored |
 | Remove a Petal with `bloom petals uninstall` | Remove its package hash | Kept on disk under the package hash; a reinstall of the same release finds them, and setup leaves them as they are |
 
 An update carries settings and trade receipts forward through the signed
@@ -507,7 +513,8 @@ when the Petal stores nothing for them, which holds unless the same release
 was installed before and its settings kept. An update receives them
 only when the default wallet is known not to exist, and on the same terms.
 A write setup queued earlier is setup's own choice, not a new one, so an
-update makes it, again only while nothing is stored.
+update by either makes it, again only while nothing is stored; while Broker
+cannot say whether `main` exists, it stays queued.
 `bloom init` prints the outcome, and `bloom serve` logs it.
 
 Each change is one policy update ceremony. Changes waiting at the same time
@@ -789,7 +796,7 @@ Automated:
   keeps earlier choices (declines included) and values on an existing one.
   The choices are saved outside `[petals]`, so a Bloom release still loads
   the config, and choices an earlier build saved under `[petals]` still
-  load.
+  load; `bloom init` moves them even when setup does not run again.
 - `bloom init` on an existing config with a declined Petal and a custom cap
   keeps both.
 - The settings decision writes for a Petal just installed, and for one
@@ -810,7 +817,9 @@ Automated:
 - A queued write that fails stays queued and is reported with the command
   that retries it; one whose retry cannot be recorded says so and gives the
   manual command. `bloom serve` makes a queued write once `main` exists, and
-  an update makes one rather than dropping it.
+  an update, by `bloom serve` or a `bloom init` rerun, makes one rather than
+  dropping it. A write waiting for its Petal's update is reported apart,
+  without the retry command, which cannot make it.
 - Setup queues exactly the writes an uninterrupted run would make, before
   `[setup] complete` is saved; an interrupted `bloom init` leaves them queued
   (`crates/bloom/tests/cli.rs`). A rerun finishes a queued write once
@@ -836,7 +845,9 @@ Automated:
   release gets nothing. The catalog bump test lists both and checks each is
   the catalog release or one it updates from.
 - Enso's router is proposed on exactly the 12 chains pinned Enso v0.1.7
-  allows.
+  allows. Polymarket's entry is `petal:polymarket`, and a call to pUSD staged
+  by another Petal or by hand is refused under it
+  (`crates/bloom-tx/src/policy_engine.rs`).
 - A Petal's VFS write to a wallet's `outbox/new.tx` is refused before it
   reaches the VFS, while its reads and other writes are not
   (`crates/bloom-petals/src/runner.rs`).

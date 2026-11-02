@@ -3846,6 +3846,12 @@ async fn run(cli: Cli) -> Result<()> {
                 ) {
                     println!("{note}");
                 }
+            } else if d.config.holds_legacy_setup_keys() {
+                // An earlier build kept setup's choices under `[petals]`,
+                // where a Bloom release refuses them; move them to `[setup]`.
+                d.config
+                    .save(&d.home.config_path())
+                    .context("move setup choices to [setup]")?;
             }
             let preinstalled = github_source::ensure_preinstalled_petals(&home, &d)
                 .context("provision canonical pre-installed Petals")?;

@@ -118,6 +118,10 @@ pub struct PetalsConfig {
     legacy_setup: BTreeMap<String, PetalSetupConfig>,
     #[serde(default, skip_serializing, rename = "setup_complete")]
     legacy_setup_complete: bool,
+    /// Whether load found those keys, so the file still holds them until it
+    /// is saved.
+    #[serde(skip)]
+    legacy_setup_loaded: bool,
 }
 
 /// What `bloom init` setup chose, as the top-level `[setup]` table. It is
@@ -564,6 +568,12 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Whether the file this config was loaded from keeps setup's choices
+    /// under `[petals]`, where a Bloom release refuses them, until it is saved.
+    pub fn holds_legacy_setup_keys(&self) -> bool {
+        self.petals.legacy_setup_loaded
+    }
+
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
         let s = toml::to_string_pretty(self)?;
         if let Some(parent) = path.parent() {
@@ -589,6 +599,8 @@ impl Config {
     /// and swap retired default endpoints that a saved config still holds verbatim.
     /// Like other load migrations, this updates the effective config; save persists it.
     fn migrate(&mut self) {
+        self.petals.legacy_setup_loaded =
+            self.petals.legacy_setup_complete || !self.petals.legacy_setup.is_empty();
         if self.setup.is_empty() {
             self.setup = SetupConfig {
                 complete: self.petals.legacy_setup_complete,
@@ -1312,13 +1324,21 @@ rpc_urls = ["https://ethereum-rpc.publicnode.com"]
         );
         std::fs::write(&path, &legacy).unwrap();
         let loaded = Config::load(&path).unwrap();
+        assert!(loaded.holds_legacy_setup_keys());
+        assert!(
+            !Config::load_or_init(&td.path().join("fresh.toml"))
+                .unwrap()
+                .holds_legacy_setup_keys()
+        );
         assert!(loaded.setup.complete);
         assert_eq!(loaded.setup.petals, cfg.setup.petals);
         loaded.save(&path).unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(!saved.contains("[petals.setup"), "{saved}");
         assert!(!saved.contains("setup_complete"), "{saved}");
-        assert!(Config::load(&path).unwrap().setup.complete);
+        let reloaded = Config::load(&path).unwrap();
+        assert!(reloaded.setup.complete);
+        assert!(!reloaded.holds_legacy_setup_keys());
     }
 
     #[test]

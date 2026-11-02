@@ -720,6 +720,8 @@ pub(crate) struct PendingSettings {
     pub(crate) written: Vec<String>,
     /// Each write that failed and stays queued: the Petal and why.
     pub(crate) still_queued: Vec<String>,
+    /// Each write that waits for its Petal's update: the Petal and why.
+    pub(crate) waiting: Vec<String>,
 }
 
 /// Retry every queued setup write for an installed Petal.
@@ -737,9 +739,12 @@ async fn apply_queued_writes(
         match apply_queued_settings(vfs, home, setup, &name, installed).await {
             QueuedWrite::Written(message) => outcome.written.push(message),
             QueuedWrite::Settled => {}
-            QueuedWrite::Failed(error) | QueuedWrite::Waiting(error) => outcome
+            QueuedWrite::Failed(error) => outcome
                 .still_queued
                 .push(format!("{} ({error})", petal_label(&name))),
+            QueuedWrite::Waiting(reason) => outcome
+                .waiting
+                .push(format!("{} ({reason})", petal_label(&name))),
         }
     }
     outcome
@@ -772,7 +777,7 @@ pub(crate) async fn retry_queued_settings(daemon: Daemon) {
         )
         .await;
         wait = match &outcome {
-            Some(outcome) if !outcome.still_queued.is_empty() => {
+            Some(outcome) if !outcome.still_queued.is_empty() || !outcome.waiting.is_empty() => {
                 (wait * 2).min(QUEUED_SETTINGS_RETRY_MAX)
             }
             _ => QUEUED_SETTINGS_RETRY,
@@ -947,8 +952,15 @@ async fn settle_setup_settings(
         )),
     };
     if let Some(reason) = reason {
-        // Nothing deferred may later write what setup just declined to.
-        clear_settings_pending(home, name);
+        // A write an earlier setup queued is setup's own choice, and it goes
+        // in only while nothing is stored, so it is made or kept as on
+        // `bloom serve`'s update. Only a write this run would add is declined.
+        if pending_settings(home, setup)
+            .iter()
+            .any(|pending| pending == name)
+        {
+            return finish_interrupted_setup(vfs, home, setup, name, installed, account).await;
+        }
         return match render_petal_settings(setup, name, DEFAULT_POLICY_WALLET) {
             Ok(Some(settings)) => Some(settings_not_written(name, &settings, &reason)),
             Ok(None) => None,
@@ -970,10 +982,7 @@ async fn settle_setup_settings(
         }
         Ok(SetupWrite::Waiting(settings, reason)) => {
             Some(match mark_settings_pending(home, name) {
-                Ok(()) => format!(
-                    "petal_settings_pending: {} settings chosen during setup are queued: {reason}",
-                    petal_label(name)
-                ),
+                Ok(()) => settings_waiting(name, &reason),
                 Err(marker_error) => settings_not_written(
                     name,
                     &settings,
@@ -995,6 +1004,18 @@ async fn settle_setup_settings(
         }),
     }
 }
+
+/// A setup write that waits for its Petal's update, and what makes it.
+fn settings_waiting(name: &str, reason: &str) -> String {
+    format!(
+        "petal_settings_waiting: {} settings chosen during setup are queued: {reason}. {UPDATE_RETRIED}",
+        petal_label(name)
+    )
+}
+
+/// What updates a catalog Petal, and with it makes a write that waits for it.
+const UPDATE_RETRIED: &str =
+    "Bloom tries the update each time `bloom serve` starts or `bloom init` runs";
 
 /// Make the write an earlier `bloom init` queued for a Petal this run leaves
 /// alone, once `main`'s account exists. That run stopped after installing
@@ -1029,7 +1050,9 @@ async fn finish_interrupted_setup(
                 QueuedWrite::Written(message) => return Some(message),
                 QueuedWrite::Settled => return None,
                 QueuedWrite::Failed(error) => format!("writing them did not complete ({error})"),
-                QueuedWrite::Waiting(reason) => reason,
+                QueuedWrite::Waiting(reason) => {
+                    return queued(home).then(|| settings_waiting(name, &reason));
+                }
             }
         }
         AccountPresence::Unknown(error) => {
@@ -1321,6 +1344,19 @@ fn report_settings_pending(
     Ok(())
 }
 
+/// Say which setup writes wait for their Petal's update, and what makes it.
+/// Rerunning this command cannot: it does not update Petals.
+fn report_settings_waiting(output: &mut dyn Write, settings_waiting: &[String]) -> Result<()> {
+    if !settings_waiting.is_empty() {
+        writeln!(
+            output,
+            "petal_settings_waiting: settings chosen during setup are queued for {}. {UPDATE_RETRIED}",
+            settings_waiting.join("; ")
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn settings_message(name: &str, summary: &str, updated: bool) -> String {
     if updated {
         format!(
@@ -1368,6 +1404,9 @@ pub(crate) enum DefaultPolicyStatus {
         /// Setup writes that failed this time and stay queued.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         settings_pending: Vec<String>,
+        /// Setup writes that wait for their Petal's update.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        settings_waiting: Vec<String>,
         /// What the policy still allows that the saved persona does not
         /// propose, such as Degen's transfers after the owner chose another
         /// persona. Bloom never removes it; the owner can.
@@ -1381,6 +1420,9 @@ pub(crate) enum DefaultPolicyStatus {
         /// Setup writes that failed this time and stay queued.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         settings_pending: Vec<String>,
+        /// As for `Applied`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        settings_waiting: Vec<String>,
         /// As for `Applied`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         beyond_persona: Vec<String>,
@@ -1443,12 +1485,14 @@ pub(crate) async fn advance_default_policy(
         return Ok(status);
     }
     let mut settings_pending = Vec::new();
+    let mut settings_waiting = Vec::new();
     if wallet == DEFAULT_POLICY_WALLET {
         let pending = apply_pending_settings(daemon).await;
         for message in pending.written {
             tracing::info!(%message, "petal.setup_settings_written");
         }
         settings_pending = pending.still_queued;
+        settings_waiting = pending.waiting;
     }
     let eligibility = match policy_step(
         daemon
@@ -1462,12 +1506,14 @@ pub(crate) async fn advance_default_policy(
         bloom_machine_client::PetalEligibility::Allowed(current) => DefaultPolicyStatus::Applied {
             petals: request.allowed(),
             settings_pending,
+            settings_waiting,
             beyond_persona: request.beyond_persona(&current)?,
         },
         bloom_machine_client::PetalEligibility::ChangedSinceCreation(current) => {
             DefaultPolicyStatus::ChangedSinceCreation {
                 missing: request.missing(&current)?,
                 settings_pending,
+                settings_waiting,
                 beyond_persona: request.beyond_persona(&current)?,
             }
         }
@@ -1812,6 +1858,7 @@ impl DefaultPolicyWait {
             DefaultPolicyStatus::Applied {
                 petals,
                 settings_pending,
+                settings_waiting,
                 beyond_persona,
             } => {
                 writeln!(
@@ -1821,11 +1868,13 @@ impl DefaultPolicyWait {
                 )?;
                 report_beyond_persona(output, wallet, beyond_persona)?;
                 report_settings_pending(output, wallet, settings_pending)?;
+                report_settings_waiting(output, settings_waiting)?;
                 Ok(WaitStep::Stop)
             }
             DefaultPolicyStatus::ChangedSinceCreation {
                 missing,
                 settings_pending,
+                settings_waiting,
                 beyond_persona,
             } => {
                 writeln!(
@@ -1842,6 +1891,7 @@ impl DefaultPolicyWait {
                 }
                 report_beyond_persona(output, wallet, beyond_persona)?;
                 report_settings_pending(output, wallet, settings_pending)?;
+                report_settings_waiting(output, settings_waiting)?;
                 Ok(WaitStep::Stop)
             }
             DefaultPolicyStatus::WaitingForWallet { reason } => {
@@ -2372,11 +2422,13 @@ mod tests {
             DefaultPolicyStatus::Applied {
                 petals: vec!["polymarket".into()],
                 settings_pending: outcome.still_queued.clone(),
+                settings_waiting: outcome.waiting.clone(),
                 beyond_persona: Vec::new(),
             },
             DefaultPolicyStatus::ChangedSinceCreation {
                 missing: vec!["polymarket".into()],
                 settings_pending: outcome.still_queued.clone(),
+                settings_waiting: outcome.waiting.clone(),
                 beyond_persona: Vec::new(),
             },
         ] {
@@ -2769,12 +2821,14 @@ mod tests {
         assert_eq!(*route.stored.lock().await, None);
         assert_eq!(pending_settings(home.path(), &petals), ["polymarket"]);
 
-        // `bloom wallet default-policy` reports it as still queued, and why.
+        // `bloom wallet default-policy` reports it as waiting, and why, apart
+        // from writes that failed: rerunning that command cannot make it.
         let owners = BTreeMap::from([("polymarket".to_owned(), older.to_owned())]);
         let pending = apply_queued_writes(&vfs, home.path(), &petals, &owners).await;
         assert!(pending.written.is_empty());
+        assert!(pending.still_queued.is_empty(), "{pending:?}");
         assert!(
-            pending.still_queued[0]
+            pending.waiting[0]
                 .starts_with("Polymarket (the installed Polymarket is an earlier release"),
             "{pending:?}"
         );
@@ -2794,12 +2848,83 @@ mod tests {
         .unwrap();
         assert!(
             message.starts_with(
-                "petal_settings_pending: Polymarket settings chosen during setup are queued: "
+                "petal_settings_waiting: Polymarket settings chosen during setup are queued: "
             ),
+            "{message}"
+        );
+        assert!(message.ends_with(UPDATE_RETRIED), "{message}");
+        assert!(!message.contains("default-policy"), "{message}");
+        assert_eq!(*route.stored.lock().await, None);
+        assert_eq!(pending_settings(home.path(), &petals), ["polymarket"]);
+    }
+
+    /// A `bloom init` rerun that updates a chosen Petal on a home whose
+    /// `main` exists makes a write setup queued earlier, as `bloom serve`'s
+    /// update does, rather than dropping it; while Broker cannot say whether
+    /// `main` exists the write stays queued.
+    #[tokio::test]
+    async fn a_rerun_that_updates_the_petal_makes_the_write_setup_queued() {
+        let petals = chosen_setup(&["polymarket"]);
+        let rerun = |vfs, home, step, account| async move {
+            settle_setup_settings(
+                vfs,
+                home,
+                &chosen_setup(&["polymarket"]),
+                "polymarket",
+                release(),
+                step,
+                true,
+                account,
+            )
+            .await
+        };
+
+        let route = SettingsRoute::holding(Some(UNSET));
+        let (home, vfs) = queued_polymarket(&route);
+        let message = rerun(
+            &vfs,
+            home.path(),
+            SetupSettingsStep::KeepOwners,
+            &AccountPresence::Exists,
+        )
+        .await
+        .unwrap();
+        assert!(message.starts_with("petal_settings: "), "{message}");
+        assert_eq!(route.value().await.unwrap(), polymarket_setup_body());
+        assert!(pending_settings(home.path(), &petals).is_empty());
+
+        let route = SettingsRoute::holding(Some(UNSET));
+        let (home, vfs) = queued_polymarket(&route);
+        let unknown = AccountPresence::Unknown("Broker is down".into());
+        let message = rerun(&vfs, home.path(), SetupSettingsStep::Unverified, &unknown)
+            .await
+            .unwrap();
+        assert!(
+            message.starts_with("petal_settings_pending: ") && message.contains("Broker is down"),
             "{message}"
         );
         assert_eq!(*route.stored.lock().await, None);
         assert_eq!(pending_settings(home.path(), &petals), ["polymarket"]);
+
+        // With nothing queued, the rerun still leaves the owner's settings.
+        let route = SettingsRoute::holding(Some(UNSET));
+        let vfs = bloom_vfs::Vfs::builder()
+            .mount("petals", route.clone())
+            .build();
+        let home = tempfile::tempdir().unwrap();
+        let message = rerun(
+            &vfs,
+            home.path(),
+            SetupSettingsStep::KeepOwners,
+            &AccountPresence::Exists,
+        )
+        .await
+        .unwrap();
+        assert!(
+            message.starts_with("petal_settings_not_written: "),
+            "{message}"
+        );
+        assert_eq!(*route.stored.lock().await, None);
     }
 
     /// When `bloom serve` updates a chosen Petal on a home whose `main`
@@ -3231,7 +3356,7 @@ mod tests {
             ..degen_only.clone()
         };
         assert_eq!(with_petal.allowed(), ["polymarket", PERSONA_TRANSFERS]);
-        assert_eq!(with_petal.destinations().len(), 4 + degen.len());
+        assert_eq!(with_petal.destinations().len(), 1 + degen.len());
 
         let mut policy = bloom_broker_api::CanonicalWalletPolicy {
             wallet_id: bloom_broker_api::Token::new("main").unwrap(),
@@ -3344,6 +3469,7 @@ mod tests {
         let output = observe(DefaultPolicyStatus::Applied {
             petals: vec!["polymarket".into()],
             settings_pending: Vec::new(),
+            settings_waiting: Vec::new(),
             beyond_persona: vec![PERSONA_TRANSFERS.into()],
         });
         assert!(output.contains("main allows Polymarket"), "{output}");
@@ -3365,6 +3491,7 @@ mod tests {
         let output = observe(DefaultPolicyStatus::ChangedSinceCreation {
             missing: vec![PERSONA_TRANSFERS.into()],
             settings_pending: Vec::new(),
+            settings_waiting: Vec::new(),
             beyond_persona: Vec::new(),
         });
         assert!(output.contains("To allow one, propose it"), "{output}");
@@ -3379,6 +3506,7 @@ mod tests {
             serde_json::to_value(DefaultPolicyStatus::Applied {
                 petals: Vec::new(),
                 settings_pending: Vec::new(),
+                settings_waiting: Vec::new(),
                 beyond_persona: Vec::new(),
             })
             .unwrap(),
@@ -3737,16 +3865,11 @@ mod tests {
                 )
             })
             .collect();
+        // The Petal, not the token contracts it calls: listing those would
+        // let anything staged on the wallet transfer them to anyone.
         assert_eq!(
             destinations,
-            [
-                // pUSD, native USDC, USDC.e, and the Enso router.
-                "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb",
-                "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359",
-                "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
-                "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf",
-            ]
-            .map(|address| ("polygon".to_owned(), address.to_owned()))
+            [("polygon".to_owned(), "petal:polymarket".to_owned())]
         );
         for name in ["hyperliquid", "tolly", "not-in-catalog"] {
             assert!(policy_destinations(name).unwrap().is_empty(), "{name}");
@@ -3827,21 +3950,28 @@ mod tests {
             serde_json::to_value(DefaultPolicyStatus::ChangedSinceCreation {
                 missing: vec!["hyperliquid".into()],
                 settings_pending: Vec::new(),
+                settings_waiting: Vec::new(),
                 beyond_persona: Vec::new(),
             })
             .unwrap(),
             serde_json::json!({"state": "changed_since_creation", "missing": ["hyperliquid"]})
         );
-        // A still-queued write is carried to the CLI; none is left out.
+        // A still-queued or waiting write is carried to the CLI; none is left
+        // out.
         let applied = DefaultPolicyStatus::Applied {
             petals: vec!["polymarket".into()],
             settings_pending: vec!["Polymarket (busy)".into()],
+            settings_waiting: vec!["Polymarket (older release)".into()],
             beyond_persona: Vec::new(),
         };
         let value = serde_json::to_value(&applied).unwrap();
         assert_eq!(
             value["settings_pending"],
             serde_json::json!(["Polymarket (busy)"])
+        );
+        assert_eq!(
+            value["settings_waiting"],
+            serde_json::json!(["Polymarket (older release)"])
         );
         assert_eq!(
             serde_json::from_value::<DefaultPolicyStatus>(value).unwrap(),
@@ -3956,6 +4086,7 @@ mod tests {
         let applied = DefaultPolicyStatus::Applied {
             petals: vec!["polymarket".into(), "near-intents".into()],
             settings_pending: Vec::new(),
+            settings_waiting: Vec::new(),
             beyond_persona: Vec::new(),
         };
         assert_eq!(
@@ -4006,6 +4137,7 @@ mod tests {
         let changed = DefaultPolicyStatus::ChangedSinceCreation {
             missing: vec!["near-intents".into()],
             settings_pending: Vec::new(),
+            settings_waiting: Vec::new(),
             beyond_persona: Vec::new(),
         };
         assert_eq!(

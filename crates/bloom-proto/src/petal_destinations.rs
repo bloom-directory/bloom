@@ -8,7 +8,11 @@
 //! runtime, and the owner still approves the policy ceremony that adds them.
 //!
 //! Destinations that change per transaction cannot be listed here: an ERC-20
-//! approval's token contract, or a NEAR Intents deposit address.
+//! approval's token contract, a NEAR Intents deposit address, or the deposit
+//! wallet Polymarket funds. Nor can a token contract a Petal calls: Machine
+//! takes a contract call's `to` as its recipient, so listing a token would let
+//! any staged call to it, from any Petal or the agent, transfer or approve
+//! that token to anyone. Such Petals get a `petal:<name>` entry instead.
 
 /// A wallet policy destination: a Bloom chain name and an address on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,35 +154,19 @@ const NEAR_INTENTS_POLICY_DESTINATIONS: &[PetalPolicyDestination] = &[
 /// `petal_id` Machine records on an outbox entry.
 const NEAR_INTENTS_STAGED: &str = "petal:near-intents";
 
-/// Polymarket funds its deposit wallet on Polygon with a direct pUSD transfer,
-/// or an Enso swap after an exact ERC-20 approval. The pUSD and USDC.e
-/// addresses are Polymarket's own constants (`polymarket/eip712.rs` in the
-/// pinned release); the router is Enso Router V2.
-///
-/// The approval in a swap goes to the input token, so each token an owner can
-/// fund from needs its own entry. Native USDC is here because it is what a
-/// Polygon wallet normally holds — `eth_call` on it returns name "USD Coin",
-/// symbol "USDC" and 6 decimals — and onboarding otherwise fails at `confirm`
-/// on a destination denial. Funding from any other token still needs that
-/// token added.
-pub const POLYMARKET_POLICY_DESTINATIONS: &[PetalPolicyDestination] = &[
-    // pUSD, the CLOB collateral.
-    PetalPolicyDestination {
-        chain: "polygon",
-        destination: "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb",
-    },
-    // Native USDC (Circle).
-    PetalPolicyDestination {
-        chain: "polygon",
-        destination: "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359",
-    },
-    // USDC.e, the bridged token.
-    PetalPolicyDestination {
-        chain: "polygon",
-        destination: "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
-    },
-    PetalPolicyDestination {
-        chain: "polygon",
-        destination: ENSO_ROUTER_V2,
-    },
-];
+/// Polymarket funds its deposit wallet on Polygon with a direct pUSD transfer
+/// to that wallet, or an Enso swap after an exact ERC-20 approval, all staged
+/// as calls to the token contracts and the Enso router. Listing those
+/// contracts would let any Petal, or the agent, call them too, so a raw
+/// `transfer` or `approve` of pUSD, USDC or USDC.e to anyone would pass.
+/// `petal:polymarket` instead trusts only what this Petal stages on Polygon,
+/// as NEAR Intents is trusted; every transaction is still an approval the
+/// owner signs. The pinned release checks a direct funding transfer against
+/// its spend cap and the wallet's balance.
+pub const POLYMARKET_POLICY_DESTINATIONS: &[PetalPolicyDestination] = &[PetalPolicyDestination {
+    chain: "polygon",
+    destination: POLYMARKET_STAGED,
+}];
+
+/// What Polymarket stages, as Machine records it on an outbox entry.
+const POLYMARKET_STAGED: &str = "petal:polymarket";

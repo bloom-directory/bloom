@@ -563,6 +563,42 @@ mod tests {
         }
     }
 
+    /// Polymarket's catalog entry names the Petal, not the tokens it calls.
+    /// Machine takes a contract call's `to` as its recipient, so a listed
+    /// token would let any Petal, or the agent, transfer or approve that token
+    /// to anyone with a raw call.
+    #[test]
+    fn only_polymarket_may_call_the_tokens_it_funds_from() {
+        let listed: Vec<&str> = bloom_proto::petal_destinations::for_petal("polymarket")
+            .iter()
+            .map(|destination| destination.destination)
+            .collect();
+        assert_eq!(listed, ["petal:polymarket"]);
+        let policy = policy_allowing(&listed);
+        const PUSD: &str = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb";
+        // Polymarket funding its deposit wallet: a call to pUSD it staged.
+        assert!(!has_hard_violation(&evaluate(
+            &policy,
+            "polygon",
+            U256::ZERO,
+            18,
+            staged_by(Some("petal:polymarket"), PUSD),
+        )));
+        // The same call staged by another Petal, or by the agent, is refused.
+        for origin in [Some("petal:enso"), None] {
+            assert!(
+                has_hard_violation(&evaluate(
+                    &policy,
+                    "polygon",
+                    U256::ZERO,
+                    18,
+                    staged_by(origin, PUSD),
+                )),
+                "{origin:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_petal_entry_covers_only_the_petal_it_names_exactly() {
         // Another Petal whose name differs only in case is a different Petal.

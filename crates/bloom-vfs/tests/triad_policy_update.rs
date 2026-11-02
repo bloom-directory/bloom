@@ -1467,11 +1467,12 @@ async fn policy_ceremony_past_expiry_is_cancelled_and_replaced() {
     );
 }
 
-/// A destination the setup Petals contribute, as the catalog does.
+/// A destination the setup Petals contribute, as the catalog does: Enso's
+/// router on Polygon.
 fn setup_destination() -> bloom_broker_api::PolicyDestination {
     bloom_broker_api::PolicyDestination {
         chain: Token::new("polygon").unwrap(),
-        destination: "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb".into(),
+        destination: "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf".into(),
     }
 }
 

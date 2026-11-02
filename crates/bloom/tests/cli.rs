@@ -1188,6 +1188,68 @@ fn init_setup_on_an_existing_config_keeps_earlier_choices() {
     );
 }
 
+/// A home whose setup an earlier build saved under `[petals]`, where a Bloom
+/// release refuses unknown keys, has them moved to `[setup]` by the next
+/// `bloom init`, even though setup itself does not run again.
+#[test]
+fn init_moves_setup_choices_out_of_the_petals_table() {
+    let home = fresh_home();
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    home_dir.ensure().unwrap();
+    let mut config = bloom_proto::Config::local_default();
+    config.setup.complete = true;
+    config.setup.petals.insert(
+        "polymarket".into(),
+        bloom_proto::config::PetalSetupConfig {
+            values: std::collections::BTreeMap::from([("max_daily_usd".into(), "42.5".into())]),
+        },
+    );
+    let current = toml::to_string_pretty(&config).unwrap();
+    let legacy = current
+        .replace(
+            "[setup]\ncomplete = true",
+            "[petals]\nsetup_complete = true",
+        )
+        .replace("[setup.petals.", "[petals.setup.");
+    assert!(
+        legacy.contains("[petals.setup.polymarket.values]"),
+        "{legacy}"
+    );
+    std::fs::write(home_dir.config_path(), &legacy).unwrap();
+
+    bloom_cmd(home.path())
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("https_proxy", "http://127.0.0.1:1")
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .arg("init")
+        .assert()
+        // The move is saved before Petal provisioning, which is offline here.
+        .failure()
+        .stderr(predicate::str::contains(
+            "provision canonical pre-installed Petals",
+        ));
+
+    let saved = std::fs::read_to_string(home_dir.config_path()).unwrap();
+    let document: toml::Value = toml::from_str(&saved).unwrap();
+    assert_eq!(
+        document["petals"]
+            .as_table()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        ["runtime"],
+        "{saved}"
+    );
+    let config = bloom_proto::Config::load(&home_dir.config_path()).unwrap();
+    assert!(config.setup.complete);
+    assert_eq!(
+        config.setup.petals["polymarket"].values["max_daily_usd"],
+        "42.5"
+    );
+    assert!(!config.holds_legacy_setup_keys());
+}
+
 #[test]
 fn vfs_write_help_exposes_no_unlock_or_secret_flags() {
     let home = fresh_home();
