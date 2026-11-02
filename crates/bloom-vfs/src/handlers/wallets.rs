@@ -55,6 +55,10 @@ pub use accounts::{
     ACCOUNT_KEY_FILES, accounts_json_with_numbers, derivation_path_number, parse_account_segment,
 };
 
+/// Control entries `/wallets` lists beside the wallets. No wallet takes these
+/// names, and wallet inventories must skip them.
+pub const RESERVED_WALLET_ENTRIES: [&str; 4] = ["new", "registrations", "recover", "recoveries"];
+
 use async_trait::async_trait;
 use bloom_broker_api::ProtocolErrorCode;
 use bloom_evm::ChainRegistry;
@@ -750,10 +754,8 @@ impl WalletsHandler {
             }
         };
         let requested_name = request.name.as_str();
-        if matches!(
-            requested_name,
-            "new" | "registrations" | "recover" | "recoveries"
-        ) || requested_name.is_empty()
+        if RESERVED_WALLET_ENTRIES.contains(&requested_name)
+            || requested_name.is_empty()
             || requested_name.len() > 64
             || !requested_name.chars().all(|character| {
                 character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
@@ -1144,10 +1146,8 @@ impl WalletsHandler {
             }
         };
         let requested_name = request.name.as_str();
-        if matches!(
-            requested_name,
-            "new" | "registrations" | "recover" | "recoveries"
-        ) || requested_name.is_empty()
+        if RESERVED_WALLET_ENTRIES.contains(&requested_name)
+            || requested_name.is_empty()
             || requested_name.len() > 64
             || !requested_name.chars().all(|character| {
                 character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
