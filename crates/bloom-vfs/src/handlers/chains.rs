@@ -1289,7 +1289,16 @@ impl ChainsHandler {
             "contracts" if segs.len() >= 4 => self.read_contracts(path, segs, &client).await,
             "gas" if segs.get(2).map(|s| s.as_str()) == Some("current.json") => {
                 let gp = client.gas_price().await.map_err(err_be)?;
-                let body = serde_json::json!({ "gas_price_wei": gp });
+                let eip1559 = if client.spec().legacy_tx {
+                    None
+                } else {
+                    let (max_fee, priority) = client.eip1559_fees(gp).await;
+                    Some(serde_json::json!({
+                        "max_fee_per_gas": max_fee.to_string(),
+                        "max_priority_fee_per_gas": priority.to_string(),
+                    }))
+                };
+                let body = serde_json::json!({ "gas_price_wei": gp, "eip1559": eip1559 });
                 Ok(serde_json::to_vec_pretty(&body).unwrap())
             }
             "mempool" => match self.mempool_handlers.get(chain.as_str()) {

@@ -369,7 +369,9 @@ project into the central outbox:
 5. Confirm only the exact inspected action.
 6. If approval is required, validate the challenge and hand its ceremony URL to
    the human.
-7. After the ceremony completes, retry only the exact documented `retry_path`.
+7. After the ceremony completes, write the challenge's `retry_body` to its
+   exact `retry_path`. An omitted `retry_body` means `confirm`; serialize an
+   object as JSON. Keep a fee-repair body unchanged through approval and retry.
 8. Read the sent, failed, or receipt projection before reporting success.
 
 A confirm write may return permission denied while projecting
@@ -382,7 +384,8 @@ presenting its ceremony URL. This is a waiting state, not a reason to restage.
 Reading the challenge asks Bloom for the approval's current state, so poll it
 while the human approves. `state` is `awaiting_ceremony` until they finish,
 then `active`, and `next` says what to do. As soon as `state` is `active`,
-write `confirm` to `retry_path`; the approval does not broadcast on its own.
+write the exact `retry_body` to `retry_path`; the approval does not broadcast
+on its own.
 Retrying `retry_path` before then is also safe: it starts no new ceremony and
 returns permission denied again. Once the ceremony can no longer be used,
 `ceremony_url` is withdrawn. For `expired`, `cancelled` or `refused`, tell the
@@ -390,10 +393,20 @@ human rather than retrying on your own.
 
 `bloom wallet confirm` exits 3 when owner approval is pending and 4 when
 confirmation has no recorded result yet. Exit 0 reports a recorded broadcast
-or a completed local discard. Use `--text cancel` to discard an unsigned
-pending entry; an already broadcast transaction needs `bloom wallet cancel`
-and its own approval. Dropping a reservation does not renumber later rows:
-restage with an explicit nonce to fill a gap.
+or a completed local discard. Use `--text cancel` to discard a pending entry
+that was never sent for signing; through the mount, write `cancel` to the
+entry's `confirm` file. Writing the entry's own `cancel` file returns
+permission denied and records nothing, because that control signs a new
+same-nonce transaction. "Never broadcast" or an `active` approval does not
+prove an entry is unsigned: if a signature may exist, even with no hash
+recorded yet, Bloom keeps the entry and its `last_error.json` says how to
+reconcile it; an expired entry stays pending for the same reason. A
+`failed/` entry with `signing_unknown.json` was released by an older Bloom
+although it may be signed: follow its `next` before staging that payment
+again or reusing its nonce; Petal outbox inspection reports it as
+`signing_unknown`, not `failed`. An already broadcast transaction needs `bloom
+wallet cancel` and its own approval. Dropping a reservation does not renumber
+later rows: restage with an explicit nonce to fill a gap.
 
 `confirm.override` is not a general escape hatch. Use it only when the
 inspected policy projection explicitly permits that control and the human has
@@ -405,7 +418,11 @@ signature in `broadcast_attempted.json` with `receipt.json` and inspect the
 outcome and confirmation status. Receipts have no account fingerprint and
 private signing sidecars are not mounted. Genesis checks must pass before
 broadcast; ambiguous sends reconcile by signature, never blind retry or
-endpoint failover. See the Solana walkthrough in `docs/examples.md`.
+endpoint failover. A `sent` entry with `unresolved.md` and no receipt is one
+no RPC reports after its blockhash expired; that does not prove it failed. Show
+the owner its signature to check in an explorer, and stage a new transfer only
+if they confirm it did not land. See the Solana walkthrough in
+`docs/examples.md`.
 
 ## Sealed Approvals
 

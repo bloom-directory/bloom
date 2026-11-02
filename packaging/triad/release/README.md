@@ -191,11 +191,22 @@ an immutable release directory and a coordinated host-wide transaction: stop
 all active enrollments, atomically switch `current`, update the release digest
 in active and retained configuration, and validate active services before
 committing. Active enrollments require available user session buses. Failed
-activation and interrupted transactions restore the previous release. Custody,
-identity material, and allocated NFS ports are preserved.
+activation and interrupted transactions restore the previous release unless
+the upgrade is forward-only (below). Custody, identity material, and allocated
+NFS ports are preserved.
+
+Each release directory keeps its `compatibility-v1.toml`. Before anything is
+stopped, Linux applies the same state checks as macOS: it refuses a candidate
+whose record is malformed, whose `current` state is older than the installed
+release's, or whose `migration_floor` is above it. The upgrade is
+forward-only when the installed release's `current` state is below the
+candidate's `downgrade_floor`, or when the installed release has no record.
+A failed forward-only upgrade stops the release set, keeps the candidate
+selected, keeps the transaction, and exits with "state migration is
+forward-only". The previous binaries could not read the migrated state.
 
 Before any unit is mutated, the transaction (`schema
-bloom.linux-upgrade-transaction.2`) snapshots the installed Bloom-owned unit
+bloom.linux-upgrade-transaction.3`) snapshots the installed Bloom-owned unit
 templates — both ceremony sockets, the Broker and Signer service templates, the
 session path, the two user service units, and the retired RPC/control socket
 templates — recording explicit absence alongside bytes and modes. A rollback
@@ -209,7 +220,14 @@ payload of the last installation, so a KMS host that rolls back after an
 upgrade with a payload lacking the KMS overlay is repaired by rerunning the
 installer with that overlay.
 
-Recovery after an interruption restores the coherent previous installation and
+Recovery of a forward-only transaction selects its candidate and keeps the
+transaction. The installer run that triggered recovery then runs the full
+upgrade steps even when it requests that same candidate: every login is
+rewritten and started under the authenticated health gate, and only then is
+the transaction retired. Requesting a different release instead retires the
+kept transaction and upgrades from the candidate.
+
+Recovery of any other transaction restores the coherent previous installation and
 then lets the verified installer retry the requested release; it never
 completes the interrupted candidate in place. Recovery clears the transaction
 as soon as the previous installation is restored and only then restarts it,
@@ -222,7 +240,8 @@ transaction recorded by an earlier installer (`schema
 bloom.linux-upgrade-transaction.1`) carries no unit snapshot; it is recovered
 by rolling the binary selection and release metadata back on their own, as the
 installer that opened it would have, and the retried installation then rewrites
-every Bloom-owned unit coherently before starting anything.
+every Bloom-owned unit coherently before starting anything. Schemas 1 and 2
+carry no forward-only marker and always roll back, as their installers would.
 
 Linux installs provide `bloom-uninstall`. Its default `--retain-custody` mode
 stops and disables the selected enrollment, removes runtime integration, and
