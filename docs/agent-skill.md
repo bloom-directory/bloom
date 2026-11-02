@@ -71,4 +71,6 @@ Release workflow bumps it with `Cargo.toml`. After tagging `vX.Y.Z`:
 3. Test the upgrade in a clean `HOME` that has the previous release's skill
    installed: `npx skills update -g -y` and `npx clawhub update bloom` must
    leave `metadata.version: "X.Y.Z"` in the installed `SKILL.md`, and the
-   Connect command must still work against an upgraded Bloom.
+   Connect command must still work against an upgraded Bloom. v0.4.2 is the
+   first skill release, so it gets a fresh-install check instead; upgrade
+   tests start at v0.5.0.

@@ -50,7 +50,7 @@ and the workflow and release driver checked into the commit being released.
 8. Publish the skill at the tag, following [docs/agent-skill.md](docs/agent-skill.md):
    publish `skills/bloom` to ClawHub as `X.Y.Z`, repin the website to the tag's
    commit, and test the upgrade from the previous release's skill on skills.sh
-   and ClawHub.
+   and ClawHub (a fresh install for v0.4.2, the first skill release).
 
 The previous v0.3.0 and v0.3.1 releases used lightweight version tags on their
 reviewed merge commits. Artifact authentication uses SSHSIG, with namespaces

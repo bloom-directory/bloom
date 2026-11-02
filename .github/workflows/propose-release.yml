@@ -108,6 +108,10 @@ jobs:
           sed -i -E 's/^machine = "[0-9]+\.[0-9]+\.[0-9]+"/machine = "'"$VERSION"'"/' \
             packaging/triad/release/compatibility-v1.toml
           sed -i -E 's/^  version: "[0-9]+\.[0-9]+\.[0-9]+"/  version: "'"$VERSION"'"/' skills/bloom/SKILL.md
+          [[ "$(grep -cx "  version: \"$VERSION\"" skills/bloom/SKILL.md)" == 1 ]] || {
+            echo "::error::skills/bloom/SKILL.md must have exactly one metadata.version line, set to $VERSION"
+            exit 1
+          }
           cargo check --workspace
 
           cargo metadata --locked --format-version 1 \
