@@ -32,8 +32,9 @@ ${skill}
 </retrieved_skill>
 
 This evaluation intentionally provides no tools. The user's request already
-authorizes the reviewed setup. Respond as you would immediately before the first
-tool call; do not claim that you executed commands or that setup succeeded.
+authorizes the reviewed setup. Write the message you send the user immediately
+before your first tool call, in the voice you would use with them; do not claim
+that you executed commands or that setup succeeded.
 
 Platform context: {{platformContext}}.
 
