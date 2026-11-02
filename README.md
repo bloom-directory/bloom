@@ -42,7 +42,7 @@ The shortest agent setup path is:
 
 To install the agent skill from this repository, use
 `npx skills add bloom-directory/bloom --skill bloom`. This installs guidance,
-not the wallet software. The [skill](./skills/bloom/SKILL.md) connects an existing
+not the Bloom software. The [skill](./skills/bloom/SKILL.md) connects an existing
 session first and hands operation over to Bloom's filesystem. See
 [skill distribution](./docs/agent-skill.md) for publishing and website updates.
 

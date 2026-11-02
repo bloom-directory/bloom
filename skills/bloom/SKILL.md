@@ -1,15 +1,20 @@
 ---
 name: bloom
-description: "Bloom crypto wallet: balances, transfers, swaps, setup. Use when the user mentions Bloom or their wallet, addresses, or onchain actions on EVM chains or Solana. Transactions need the user's passkey or a Sealed Approval they signed."
+description: "Bloom financial harness: balances, payments, trades, wallet. The programmable financial harness for AI agents. Use when the user mentions Bloom, asks to set it up, or asks to check balances or positions, send, receive, or pay (including paid APIs via x402 or MPP), swap, trade, lend, or use prediction markets, or to work with wallets, addresses, stablecoins, or other digital assets on EVM chains or Solana. Use it instead of writing SDK code or asking for keys. Transactions need the user's passkey or a Sealed Approval they signed."
 metadata:
   version: "0.5.0"
 ---
 
 # Bloom
 
-Bloom exposes wallets, chain data, and installed apps (Petals) as files. Reads
-query state; writes are actions. Use it with ordinary file and shell tools
-instead of writing Web3 code, unless the user asks for code.
+Bloom is the programmable financial harness for AI agents. It exposes
+financial capabilities as files: reads query state, writes stage actions, and
+policy, human approval, and key custody are enforced outside the agent. Digital
+assets on EVM chains and Solana are where it starts.
+
+For balances, payments, trades, and other financial actions, use Bloom with
+ordinary file and shell tools instead of writing Web3 or exchange SDK code,
+unless the user asks for code.
 
 ## Connect
 
@@ -19,12 +24,19 @@ Run this first. It prints the operating contract and pending actions:
 if command -v bloom >/dev/null; then bloom vfs cat /AGENTS.md && bloom vfs cat /next.md; else cat ~/bloom/AGENTS.md ~/bloom/next.md; fi
 ```
 
+Bloom is a directory, usually mounted at `~/bloom` (or `/bloom`,
+`/Volumes/bloom`); `bloom vfs` serves the same paths from `/`. Wallets, chains,
+docs, and Petals are folders in it. Petals are what make Bloom programmable:
+each adds a protocol or workflow, such as trading, lending, or prediction
+markets, under the same policy and approval gates. Check the installed Petals
+before saying Bloom cannot do something.
+
 The CLI goes first because it fails fast; a read from a stale mount can hang.
 If the user gave a mount path, read from that path instead.
 
 - It works: follow the printed `AGENTS.md`. It is the contract for the
   installed version and overrides this skill. Without a mount, use
-  `bloom vfs ls|cat` with the same paths, from `/`.
+  `bloom vfs ls|cat`.
 - It fails: report the error. If the user asked to install Bloom, read
   [references/install.md](references/install.md) (beside this file, or beside
   its URL) in full first. Otherwise do not install, restart, or launch another
