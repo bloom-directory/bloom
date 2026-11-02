@@ -665,9 +665,12 @@ impl Outbox {
             .state_dir(wallet, chain, OutboxState::Pending)?
             .join(id);
         fs::create_dir_all(&dir)?;
-        let path = dir.join("nonce_conflict.json");
-        fs::write(&path, serde_json::to_vec_pretty(body)?)?;
-        Ok(path)
+        self.write_artefact(
+            &dir,
+            "nonce_conflict.json",
+            &serde_json::to_vec_pretty(body)?,
+        )?;
+        Ok(dir.join("nonce_conflict.json"))
     }
 
     /// Write a `mev_risk.json` artefact next to a pending tx with the
@@ -686,9 +689,8 @@ impl Outbox {
             .state_dir(wallet, chain, OutboxState::Pending)?
             .join(id);
         fs::create_dir_all(&dir)?;
-        let path = dir.join("mev_risk.json");
-        fs::write(&path, serde_json::to_vec_pretty(report)?)?;
-        Ok(path)
+        self.write_artefact(&dir, "mev_risk.json", &serde_json::to_vec_pretty(report)?)?;
+        Ok(dir.join("mev_risk.json"))
     }
 
     pub fn write_broadcast_attempt(
@@ -1169,9 +1171,11 @@ impl Outbox {
         let entry = self.read_in_state(wallet, chain, id, OutboxState::Pending)?;
         let mut staged = entry.staged;
         staged.depends_on = Some(dep_id.to_string());
-        fs::write(
-            entry.dir.join("intent.json"),
-            serde_json::to_vec_pretty(&staged)?,
+        // intent.json holds the staged nonce: a torn rewrite would strand the entry.
+        self.write_artefact(
+            &entry.dir,
+            "intent.json",
+            &serde_json::to_vec_pretty(&staged)?,
         )?;
         Ok(())
     }
