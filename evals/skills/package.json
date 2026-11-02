@@ -4,7 +4,7 @@
   "description": "Promptfoo evaluations of the Bloom agent skill in skills/bloom.",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.22.0"
   },
   "scripts": {
     "eval": "PROMPTFOO_DISABLE_TELEMETRY=1 promptfoo eval --no-cache --repeat 5 --config promptfooconfig.ts --output results/latest.json",

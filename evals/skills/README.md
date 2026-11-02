@@ -27,6 +27,8 @@ so the grader cannot drift from the skill.
 
 ## Running
 
+Requires Node.js 22.22.0 or newer.
+
 ```sh
 cd evals/skills
 npm ci
