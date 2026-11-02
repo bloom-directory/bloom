@@ -298,8 +298,8 @@ jobs:
       github.ref_name == 'triad-architecture'
     uses: ./.github/workflows/macos-unix-conformance.yml
     with:
-      broker_ref: 5a09d5ede4af1affd09c7e8e197ca015f4f32b4f
-      signer_ref: c157444af1b118a2d03f1ac5ce7a04933669c084
+      broker_ref: 76bb7e0956089df44a9b39ca41d1b07497c3ec59
+      signer_ref: 3f880d7b96ebcc18f07afadac6f07c7f7036e90c
 
   linux_w0_isolation:
     name: Linux W0 principal and socket isolation
