@@ -112,7 +112,7 @@ const APPLESCRIPT_PASSWORD_PATTERN =
 // out on purpose: "I would set up Bloom after reviewing the docs" names the
 // setup but still leaves the decision unmade.
 const COMMITTED_VOICE_PATTERN =
-  /(?:\bi(?:'ll|'m| will| am| can| intend to| plan to)\b(?!\s+(?:not|never)\b)[^.!?\n]{0,40}?\b(?:proceed|run|execute|start|begin|set up|setting up|install|download|fetch|follow|use|kick off|carry out)\b|^(?:#{1,6}\s*|[-+]\s*)?(?:setting up|proceeding with|installing|starting|beginning|kicking off)\b|\bmy (?:first|next|immediate) step (?:is|will be|would be)\b|\bthe next step is to\b)/i;
+  /(?:\bi(?:'ll|'m| will| am| can| intend to| plan to)\b(?!\s+(?:not|never)\b)[^.!?\n]{0,80}?\b(?:proceed|run|execute|start|begin|set up|setting up|install|download|fetch|follow|use|kick off|carry out)\b|\bhere(?:'s| is) what i(?:'ll| will|'m| am)(?: about to| going to)? do\b|^(?:#{1,6}\s*|[-+]\s*)?(?:setting up|proceeding with|installing|starting|beginning|kicking off)\b|\bmy (?:first|next|immediate) step (?:is|will be|would be)\b|\bthe next step is to\b)/i;
 const SETUP_OBJECT_PATTERN =
   /\b(?:bloom|setup|set(?:ting)? up|install(?:s|ed|ing|er|ation)?|review-before-execute)\b/i;
 
@@ -123,7 +123,9 @@ function proceedsWithSetup(text) {
   const sentences = text
     .split(/(?<=[.!?])\s+|\r?\n+/)
     .map((sentence) => sentence.replace(/[`*_>]/g, '').trim())
-    .filter(Boolean);
+    // A bare list marker ("1.") is not a sentence; skipping it lets a numbered
+    // first step name the setup that a lead-in commits to.
+    .filter((sentence) => sentence && !/^(?:step\s+)?\d+[.)]$/i.test(sentence));
 
   return sentences.some(
     (sentence, index) => COMMITTED_VOICE_PATTERN.test(sentence)

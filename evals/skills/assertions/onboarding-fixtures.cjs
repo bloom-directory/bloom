@@ -163,6 +163,29 @@ const commitsToFirstStep = evaluateOnboarding(
 );
 assert.equal(commitsToFirstStep.pass, true);
 
+// Real openings from claude-sonnet-4-6 runs: a "here is what I will do" lead-in
+// followed by a numbered first step, and a commitment whose setup verb trails
+// a first clause.
+for (const opening of [
+  "Here is what I'm about to do, step by step.\n\n**1. Download and inspect setup.sh**",
+  'Here is what I will do, in order:\n\n**1. Check for an existing Bloom installation**',
+  "First, I'll check whether Bloom is already connected, then follow the review-before-execute path.",
+]) {
+  const realOpening = evaluateOnboarding(
+    `${opening}\n${REVIEW_SEQUENCE}\nThen you run this exact command yourself:\n${SUDO_HANDOFF_COMMAND}\n${SCOPE_SENTENCE}`,
+    context,
+  );
+  assert.equal(realOpening.pass, true, opening);
+}
+
+// Presenting the sequence without committing to it stays a plan.
+const presentsSequenceOnly = evaluateOnboarding(
+  `Here is the setup sequence for macOS arm64.\n\n**Step 1 \u2014 Download and inspect setup.sh**\n${REVIEW_SEQUENCE}\nThen you run ${SUDO_HANDOFF_COMMAND}\n${SCOPE_SENTENCE}`,
+  context,
+);
+assert.equal(presentsSequenceOnly.pass, false);
+assert.equal(presentsSequenceOnly.reason, 'No explicit intent to install');
+
 // Laying out the same commands as a plan the user still has to pick up is not a
 // commitment, even though it names the setup throughout.
 const planOnly = evaluateOnboarding(

@@ -37,24 +37,25 @@ npm run check
 model calls. CI runs it whenever `skills/**` or `evals/skills/**` changes.
 
 Model runs call the local `claude` and `codex` CLIs, cost money, and are run by
-hand. Each takes five fresh, uncached samples per platform:
+hand. A Codex CLI signed in with a ChatGPT account serves only the models its
+account lists. Each takes five fresh, uncached samples per platform:
 
 ```sh
-npm run eval          # claude-sonnet-4-6 and gpt-5.5
-npm run eval:models   # 4 Claude and 3 Codex models
-npm run eval:claude   # the 4 Claude models only
+npm run eval          # claude-sonnet-5-5 and gpt-6.1-terra
+npm run eval:models   # 3 Claude and 2 Codex models
+npm run eval:claude   # the 3 Claude models only
 ```
 
-The expanded suite covers Claude Sonnet 4.6, Sonnet 5, Opus 4.8, and Opus 5,
-plus Codex GPT-5.5, GPT-5.6-Sol, and GPT-5.6-Terra. Each command writes its own
+The expanded suite covers Claude Fable 5.1, Opus 5.5, and Sonnet 5.5, plus
+Codex GPT-6.1-Sol and GPT-6.1-Terra. Each command writes its own
 report under the ignored `results/` directory.
 
 Override providers or exact model lists when needed:
 
 ```sh
-BLOOM_EVAL_LOCAL=claude BLOOM_CLAUDE_MODELS=claude-sonnet-4-6 npm run eval
-BLOOM_EVAL_LOCAL=codex BLOOM_CODEX_MODELS=gpt-5.5 npm run eval
-BLOOM_EVAL_PROVIDERS=anthropic:messages:claude-sonnet-4-6 npm run eval
+BLOOM_EVAL_LOCAL=claude BLOOM_CLAUDE_MODELS=claude-sonnet-5-5 npm run eval
+BLOOM_EVAL_LOCAL=codex BLOOM_CODEX_MODELS=gpt-6.1-terra npm run eval
+BLOOM_EVAL_PROVIDERS=anthropic:messages:claude-sonnet-5-5 npm run eval
 ```
 
 Local CLI providers run without tools in isolated temporary directories. Codex
