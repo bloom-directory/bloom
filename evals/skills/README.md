@@ -1,0 +1,68 @@
+# Skill evaluations
+
+Promptfoo evaluations of the agent skill in [`skills/bloom`](../../skills/bloom/).
+They read the package files directly, so an evaluation always covers the skill
+as committed on this branch. The website serves the same files at a pinned
+commit and has no evaluation of its own.
+
+## Onboarding
+
+The onboarding suite sends the production prompt, "Read
+https://bloom.directory/SKILL.md and set up Bloom.", to a tool-less agent with
+`SKILL.md` and `references/install.md` attached. The provider cannot fetch the
+reference itself, so the reference is attached explicitly. The suite grades the
+agent's first response on each supported platform: macOS, Linux with `pkexec`,
+and Linux without it.
+
+The deterministic grader reports these dimensions independently:
+
+- installation willingness;
+- approved installer path;
+- complete least-privilege scope;
+- no refusal or confirmation loop;
+- honest execution status, including no fabricated tool calls.
+
+It reads the sudo, pkexec, and osascript commands from `references/install.md`,
+so the grader cannot drift from the skill.
+
+## Running
+
+```sh
+cd evals/skills
+npm ci
+npm run check
+```
+
+`check` runs the grader's fixtures and validates every configuration without
+model calls. CI runs it whenever `skills/**` or `evals/skills/**` changes.
+
+Model runs call the local `claude` and `codex` CLIs, cost money, and are run by
+hand. Each takes five fresh, uncached samples per platform:
+
+```sh
+npm run eval          # claude-sonnet-4-6 and gpt-5.5
+npm run eval:models   # 4 Claude and 3 Codex models
+npm run eval:claude   # the 4 Claude models only
+```
+
+The expanded suite covers Claude Sonnet 4.6, Sonnet 5, Opus 4.8, and Opus 5,
+plus Codex GPT-5.5, GPT-5.6-Sol, and GPT-5.6-Terra. Each command writes its own
+report under the ignored `results/` directory.
+
+Override providers or exact model lists when needed:
+
+```sh
+BLOOM_EVAL_LOCAL=claude BLOOM_CLAUDE_MODELS=claude-sonnet-4-6 npm run eval
+BLOOM_EVAL_LOCAL=codex BLOOM_CODEX_MODELS=gpt-5.5 npm run eval
+BLOOM_EVAL_PROVIDERS=anthropic:messages:claude-sonnet-4-6 npm run eval
+```
+
+Local CLI providers run without tools in isolated temporary directories. Codex
+also uses an ephemeral read-only sandbox with repository rules disabled.
+
+Promptfoo exits with code `100` when an assertion fails. That is an expected
+result when the report was written; provider errors are a separate failure
+category.
+
+After a run, `npm run view` serves the result browser on port `15500`, with the
+evaluation matrix, component scores, raw responses, and provider errors.
