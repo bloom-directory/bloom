@@ -459,9 +459,8 @@ fn macos_conformance_workflows_consume_unified_candidates() {
     assert!(ci.contains(&format!("signer_ref: {signer_commit}")));
 
     // These assertions read both conformance workflows, so editing either
-    // must trigger CI, which runs this binary on Linux. The staged installer
-    // test compiles only on macOS; the Unix-principal workflow runs its
-    // script, and the other packaging scripts, directly.
+    // must trigger CI, which runs this binary on Linux. The Unix-principal
+    // workflow runs the packaging scripts directly.
     let code_paths = ci.split("- \"Cargo.toml\"").next().unwrap();
     assert!(code_paths.contains("- \".github/workflows/macos-unix-conformance.yml\""));
     assert!(code_paths.contains("- \".github/workflows/macos-two-login-conformance.yml\""));
