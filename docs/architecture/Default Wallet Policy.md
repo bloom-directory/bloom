@@ -218,7 +218,9 @@ Agreed on 2026-09-14:
     setup are unchanged. Degen's entry is proposed only while `main`'s policy
     is still the one wallet creation installed; otherwise
     `bloom wallet default-policy main` reports it missing, with the entries
-    to add through `bloom wallet update-policy`. Leaving Degen does not
+    to add: `bloom wallet update-policy` prepares the change, and
+    `bloom wallet commit-policy` commits it once the owner approves its
+    ceremony. Leaving Degen does not
     remove the entry, because Bloom never removes one: that command reports
     what the policy still allows beyond the saved persona, and how to remove
     it. Machine reads the persona from the config each time it proposes. A

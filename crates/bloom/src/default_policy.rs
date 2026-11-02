@@ -1309,6 +1309,15 @@ fn settings_not_written(name: &str, settings: &PetalSettingsWrite, reason: &str)
     )
 }
 
+/// How the owner changes a wallet's policy by hand. `update-policy` only
+/// prepares the change and prints its ceremony; nothing changes until the
+/// owner approves it there and commits it.
+fn policy_update_steps(wallet: &str, file: &str) -> String {
+    format!(
+        "run `bloom wallet update-policy {wallet} --file {file}`, approve the change at the ceremony_url it prints, then run `bloom wallet commit-policy <operation_id>` with the operation_id it printed"
+    )
+}
+
 /// Say what the policy still allows beyond the saved persona, and how to
 /// remove it. Bloom never removes an entry itself.
 fn report_beyond_persona(
@@ -1319,9 +1328,10 @@ fn report_beyond_persona(
     if !beyond_persona.is_empty() {
         writeln!(
             output,
-            "default_policy: {wallet}'s policy still allows {}, which the saved persona does not propose; Bloom never removes an entry. To remove it, save `bloom vfs cat /wallets/{wallet}/policy.json` to a file, delete its \"{}\" entries from allowed_destinations, and run `bloom wallet update-policy {wallet} --file <that file>`",
+            "default_policy: {wallet}'s policy still allows {}, which the saved persona does not propose; Bloom never removes an entry. To remove it, save `bloom vfs cat /wallets/{wallet}/policy.json` to a file, delete its \"{}\" entries from allowed_destinations, and {}",
             beyond_persona.join(", "),
-            bloom_proto::policy::ERC20_ANY_RECIPIENT
+            bloom_proto::policy::ERC20_ANY_RECIPIENT,
+            policy_update_steps(wallet, "<that file>")
         )?;
     }
     Ok(())
@@ -1879,14 +1889,16 @@ impl DefaultPolicyWait {
             } => {
                 writeln!(
                     output,
-                    "default_policy: {wallet}'s policy has changed since the wallet was created and does not allow {}; Bloom proposes the default policy only for a new wallet, so nothing was proposed. To allow one, propose it with `bloom wallet update-policy {wallet} --file <policy.json>`",
-                    petal_labels(missing)
+                    "default_policy: {wallet}'s policy has changed since the wallet was created and does not allow {}; Bloom proposes the default policy only for a new wallet, so nothing was proposed. To allow one, {}",
+                    petal_labels(missing),
+                    policy_update_steps(wallet, "<policy.json>")
                 )?;
                 if missing.iter().any(|label| label == PERSONA_TRANSFERS) {
                     writeln!(
                         output,
-                        "default_policy: to allow {PERSONA_TRANSFERS}, add {{\"chain\": \"evm-1\", \"destination\": \"{marker}\"}} for Ethereum and {{\"chain\": \"evm-137\", \"destination\": \"{marker}\"}} for Polygon to allowed_destinations in a copy of `bloom vfs cat /wallets/{wallet}/policy.json`, and propose that file",
-                        marker = bloom_proto::policy::ERC20_ANY_RECIPIENT
+                        "default_policy: to allow {PERSONA_TRANSFERS}, add {{\"chain\": \"evm-1\", \"destination\": \"{marker}\"}} for Ethereum and {{\"chain\": \"evm-137\", \"destination\": \"{marker}\"}} for Polygon to allowed_destinations in a copy of `bloom vfs cat /wallets/{wallet}/policy.json`, then {steps}",
+                        marker = bloom_proto::policy::ERC20_ANY_RECIPIENT,
+                        steps = policy_update_steps(wallet, "<that file>")
                     )?;
                 }
                 report_beyond_persona(output, wallet, beyond_persona)?;
@@ -3487,6 +3499,11 @@ mod tests {
             output.contains("bloom wallet update-policy main"),
             "{output}"
         );
+        // Preparing changes nothing until the owner approves and commits.
+        assert!(
+            output.contains("then run `bloom wallet commit-policy <operation_id>`"),
+            "{output}"
+        );
 
         let output = observe(DefaultPolicyStatus::ChangedSinceCreation {
             missing: vec![PERSONA_TRANSFERS.into()],
@@ -3494,9 +3511,19 @@ mod tests {
             settings_waiting: Vec::new(),
             beyond_persona: Vec::new(),
         });
-        assert!(output.contains("To allow one, propose it"), "{output}");
+        assert!(
+            output.contains("To allow one, run `bloom wallet update-policy main --file"),
+            "{output}"
+        );
         assert!(
             output.contains(r#"{"chain": "evm-1", "destination": "erc20:any-recipient"}"#),
+            "{output}"
+        );
+        assert_eq!(
+            output
+                .matches("bloom wallet commit-policy <operation_id>")
+                .count(),
+            2,
             "{output}"
         );
         assert!(!output.contains("still allows"), "{output}");
@@ -4150,6 +4177,7 @@ mod tests {
         ));
         assert!(output.contains("nothing was proposed"));
         assert!(output.contains("bloom wallet update-policy main --file"));
+        assert!(output.contains("bloom wallet commit-policy <operation_id>"));
         assert!(!output.contains("default_policy_url: "));
     }
 
