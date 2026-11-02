@@ -820,10 +820,12 @@ fn install_github_source_with_expectation(
 ///
 /// Anything that is neither of these two states is a refusal: Bloom only ever
 /// replaces a Petal it can prove it installed itself from the same trusted
-/// catalog repository.
+/// catalog repository. An install without source provenance whose package hash
+/// is the pinned hash is reused as `Current`, but never replaced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PreinstalledState {
-    /// The installed owner is exactly the pinned commit and package hash.
+    /// The installed package is the pinned release: same commit and hash, or,
+    /// without source provenance, the pinned release's package hash.
     Current,
     /// Same Petal name, same trusted catalog repository, older pinned commit.
     Outdated { installed_commit: String },
@@ -1369,9 +1371,12 @@ fn validate_release_authority(
 ///
 /// Returns `Current` when the installation is already the pinned commit and
 /// hash, and `Outdated` when it is the same Petal from the same trusted catalog
-/// repository at a different commit. Every other shape — missing provenance, a
-/// different repository, or an identity that contradicts itself — is refused so
-/// that manually sourced or untrusted ownership is never overwritten.
+/// repository at a different commit. An installation without source
+/// provenance is `Current` when its package hash is the pinned hash. Every
+/// other shape — missing provenance with any other hash (including an older
+/// release, which may be a deliberate rollback), a different repository, or an identity
+/// that contradicts itself — is refused so that manually sourced or untrusted
+/// ownership is never overwritten.
 pub(crate) fn classify_existing_preinstalled(
     expected: &PreinstalledPetal,
     meta: &bloom_petals::meta::PetalMeta,
@@ -1387,12 +1392,20 @@ pub(crate) fn classify_existing_preinstalled(
             package.name
         );
     }
-    let source = meta.source.as_ref().ok_or_else(|| {
-        anyhow!(
+    // A local install of a pinned release archive records no source, but the
+    // package hash is content-derived: matching a catalogued release hash
+    // identifies the same bytes as that release.
+    let Some(source) = meta.source.as_ref() else {
+        if expected.expected_hash == Some(meta.hash.as_str()) {
+            return Ok(PreinstalledState::Current);
+        }
+        // Matching bytes do not mean Bloom may replace them: an older release
+        // installed by hand may be a deliberate rollback.
+        bail!(
             "pre-installed Petal {} is already owned by an installation without source provenance; uninstall it before retrying",
             expected.name
-        )
-    })?;
+        );
+    };
     let expected_repo = expected
         .repository
         .strip_prefix("https://github.com/")
@@ -2127,9 +2140,16 @@ mod tests {
             .to_string();
         assert!(err.contains("does not match expected hash"), "{err}");
 
-        // Provenance-free ownership is refused outright.
+        // Provenance-free ownership of the pinned bytes is the pinned release.
         meta.hash = entry.expected_hash.unwrap().into();
         meta.source = None;
+        assert_eq!(
+            classify_existing_preinstalled(entry, &meta).unwrap(),
+            PreinstalledState::Current
+        );
+
+        // Provenance-free ownership of any other package is refused outright.
+        meta.hash = "c".repeat(64);
         let err = classify_existing_preinstalled(entry, &meta)
             .unwrap_err()
             .to_string();
@@ -2699,6 +2719,49 @@ mod tests {
             installed_owner(&manual_daemon).as_deref(),
             Some(&*old.package.hash)
         );
+    }
+
+    #[test]
+    fn provenance_free_install_is_reused_only_at_the_pinned_hash() {
+        let old = build_near_release("v0.1.0");
+        let old_hash: &'static str = Box::leak(old.package.hash.clone().into_boxed_str());
+        let home = tempfile::tempdir().unwrap();
+        let home_dir = HomeDir::at(home.path());
+        home_dir.ensure().unwrap();
+        bloom_proto::Config::local_default()
+            .save(&home_dir.config_path())
+            .unwrap();
+        let daemon = Daemon::from_home(home_dir).unwrap();
+        daemon
+            .petals
+            .store()
+            .install_prepared_petal_package(old.package.clone())
+            .unwrap();
+        let meta = daemon.petals.store().load_meta(old_hash).unwrap();
+        assert!(meta.source.is_none());
+
+        let pinned = near_catalog_entry(NEAR_OLD_COMMIT, "v0.1.0", "near.tar.gz", Some(old_hash));
+        let ready = ensure_preinstalled_petals_with(
+            &daemon,
+            &["near-intents"],
+            |_| Some(pinned),
+            |_, _| panic!("the pinned package is already installed"),
+        )
+        .unwrap();
+        assert_eq!(ready, ["near-intents"]);
+
+        let mut successor = near_catalog_entry(
+            NEAR_NEW_COMMIT,
+            "v0.1.1",
+            "near.tar.gz",
+            Some("1111111111111111111111111111111111111111111111111111111111111111"),
+        );
+        // A listed predecessor is still never replaced without provenance.
+        successor.predecessor_package_hashes = Box::leak(Box::new([old_hash]));
+        let err = classify_existing_preinstalled(&successor, &meta)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("without source provenance"), "{err}");
     }
 
     #[test]
