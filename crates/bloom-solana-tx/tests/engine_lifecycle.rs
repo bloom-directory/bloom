@@ -1131,7 +1131,7 @@ async fn expired_transfer_restages_with_fresh_facts_and_no_reused_authority() {
 async fn failed_signature_verifying_simulation_is_persisted_and_blocks_broadcast() {
     let height = Arc::new(std::sync::atomic::AtomicU64::new(1));
     let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let endpoint = spawn_node_with_controls(height, true, false, requests.clone()).await;
+    let endpoint = spawn_node_with_controls(height.clone(), true, false, requests.clone()).await;
     let dir = tempfile::tempdir().unwrap();
     let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
     let broker = Arc::new(BrokerFixture::new());
@@ -1147,17 +1147,29 @@ async fn failed_signature_verifying_simulation_is_persisted_and_blocks_broadcast
         .await
         .unwrap_err();
     assert!(error.to_string().contains("simulation failed"));
-    let pending = outbox
+    // Simulation gave the signed bytes to an RPC, so they may still land.
+    // Neither cancel nor restage may present the original as terminal.
+    let sent = outbox
         .read_in_state(
             "wallet",
             "solana-devnet",
             &staged.id,
-            SolanaOutboxState::Pending,
+            SolanaOutboxState::Sent,
         )
         .unwrap();
+    assert!(engine.cancel("wallet", &staged.id).await.is_err());
+    height.store(
+        staged.last_valid_block_height + 1,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    assert!(
+        engine
+            .restage_expired("wallet", &staged.id, &broker.child_pubkey(), 1_400)
+            .await
+            .is_err()
+    );
     let artifact: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(pending.dir.join("simulation.json")).unwrap())
-            .unwrap();
+        serde_json::from_slice(&std::fs::read(sent.dir.join("simulation.json")).unwrap()).unwrap();
     assert_eq!(artifact["success"], false);
     assert_eq!(artifact["units_consumed"], 321);
     assert!(artifact.get("signature").is_none());
@@ -1358,7 +1370,7 @@ async fn spawn_node_with_held_simulation(
 }
 
 #[tokio::test]
-async fn expiry_sweep_during_broadcast_leaves_one_state_and_no_send() {
+async fn simulated_bytes_cannot_be_swept_or_cancelled() {
     let height = Arc::new(std::sync::atomic::AtomicU64::new(1));
     let simulation_started = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
@@ -1381,24 +1393,26 @@ async fn expiry_sweep_during_broadcast_leaves_one_state_and_no_send() {
     let staged = stage_and_sign(&engine, &broker).await;
 
     // Broadcast passes its freshness check, then the cluster crosses the
-    // blockhash window while simulation is in flight and the sweep retires
-    // the still-pending entry.
+    // blockhash window while simulation is in flight. The signed bytes are
+    // already with an RPC, so neither the sweep nor cancel may retire them.
     let sweep = async {
         simulation_started.notified().await;
         height.store(
             staged.last_valid_block_height + 1,
             std::sync::atomic::Ordering::SeqCst,
         );
-        let pending = outbox.read("wallet", "solana-devnet", &staged.id).unwrap();
-        let signature = outbox.recorded_signature(&pending).unwrap().unwrap();
+        assert!(
+            outbox
+                .cancel("wallet", "solana-devnet", &staged.id)
+                .is_err()
+        );
         let swept = outbox
-            .sweep_expired_with_statuses(
+            .sweep_expired(
                 u128::MAX,
                 &std::collections::HashMap::from([(
                     "solana-devnet".to_string(),
                     staged.last_valid_block_height + 1,
                 )]),
-                &std::collections::HashMap::from([(("solana-devnet".into(), signature), false)]),
             )
             .unwrap();
         release.notify_one();
@@ -1406,25 +1420,17 @@ async fn expiry_sweep_during_broadcast_leaves_one_state_and_no_send() {
     };
     let (broadcast, swept) = tokio::join!(engine.broadcast("wallet", &staged.id, 1_300), sweep);
 
-    assert_eq!(swept, 1);
-    assert!(broadcast.is_err(), "a retired entry must not be broadcast");
+    assert_eq!(swept, 0);
+    broadcast.unwrap();
     let state_root = dir.path().join("outbox/wallet/solana-devnet");
     assert!(!state_root.join("pending").join(&staged.id).exists());
-    assert!(!state_root.join("sent").join(&staged.id).exists());
-    let expired = outbox
+    assert!(!state_root.join("failed").join(&staged.id).exists());
+    outbox
         .read_in_state(
             "wallet",
             "solana-devnet",
             &staged.id,
-            SolanaOutboxState::Failed,
+            SolanaOutboxState::Sent,
         )
         .unwrap();
-    assert_eq!(expired.staged.status, SolanaTxStatus::Expired);
-    assert!(
-        !requests
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|r| r["method"] == "sendTransaction")
-    );
 }

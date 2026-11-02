@@ -49,8 +49,8 @@ If confirmation requires fresh approval, read this exact pending action's
 `approval_challenge.json`. Check its wallet, action, intent, and expiry before
 forwarding the ceremony URL to the human. Re-read it while they approve: its
 `state` turns from `awaiting_ceremony` to `active` as soon as they finish. Then
-write `confirm` to the challenge's `retry_path`. Do not restage while approval
-is pending.
+write the challenge's exact `retry_body` to its `retry_path` (an omitted
+`retry_body` means `confirm`). Do not restage while approval is pending.
 
 
 Follow `$ID` into its resulting state and read its intent and receipt before
@@ -62,6 +62,41 @@ The explicit account-0 outbox above spends from account 0. For another account,
 verify `wallets/alice/<n>/account.json` and use
 `wallets/alice/<n>/chains/anvil/outbox/` throughout the same procedure.
 Numbered outboxes expose only actions staged by that account.
+
+## Repairing rejected EIP-1559 fees
+
+A node can reject a signed transaction when its priority fee is below the
+chain minimum. Keep the exact pending entry and inspect its `last_error.json`,
+`intent.json`, `broadcast_attempted.json`, and the chain's
+`chains/<chain>/gas/current.json`. Do not restage it at another nonce.
+
+`gas/current.json` exposes current decimal-wei fee suggestions in `eip1559`.
+For a pending EIP-1559 entry, write a JSON fee pair to `replace`. Both caps
+must be at least 10% above the original caps and satisfy the node's quoted
+minimum. This preserves the account, nonce, destination, value, calldata, and
+Petal origin. Like `confirm`, it is refused until a `depends_on` predecessor
+has mined successfully, or while the call fails simulation. It requires a new
+exact owner approval. Any other body written to `replace` returns permission
+denied and records nothing: through the mount, `replace` accepts only this fee
+pair. For example, when the
+node requires a 25 gwei tip and the original max fee is 50 gwei:
+
+```sh
+# Keep this proposal in scratch outside the mount. Quantities are wei.
+printf '%s\n' '{"max_fee_per_gas":"60000000000","max_priority_fee_per_gas":"30000000000"}' > fees.json
+cat fees.json > "$BLOOM/wallets/<wallet>/0/chains/<chain>/outbox/pending/<id>/replace"
+cat "$BLOOM/wallets/<wallet>/0/chains/<chain>/outbox/pending/<id>/replacement_plan.md"
+cat "$BLOOM/wallets/<wallet>/0/chains/<chain>/outbox/pending/<id>/approval_challenge.json"
+```
+
+Open that challenge's ceremony URL once. Poll its state; when active, write
+its exact `retry_body` to `retry_path`. For fee repair this is the same fee
+JSON, not a new transaction intent. Read the resulting sent entry's receipt
+before continuing the Petal operation. Original attempt metadata remains for
+reconciliation, and the receipt records whichever attempt mined. A transport
+error does not prove a transaction was absent. Write the same `retry_body`
+again: once a replacement was signed, the retry settles that recorded
+replacement and never signs another.
 
 ## Deploying an EVM contract
 
