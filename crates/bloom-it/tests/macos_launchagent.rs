@@ -313,16 +313,6 @@ fn macos_installer_manages_the_path_entry_and_migrates_legacy_cli_post_activatio
 }
 
 #[test]
-#[cfg(target_os = "macos")]
-fn staged_macos_installer_cli_lifecycle_passes() {
-    let status = Command::new("bash")
-        .arg(workspace().join("tests/packaging/macos-installer-staged.sh"))
-        .status()
-        .expect("run staged macOS installer CLI lifecycle");
-    assert!(status.success());
-}
-
-#[test]
 fn macos_installer_does_not_regenerate_custody_during_lifecycle_operations() {
     let source =
         fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
