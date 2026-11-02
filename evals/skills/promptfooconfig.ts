@@ -63,7 +63,7 @@ const currentSkill = [
 // together with its installation reference. A "no persistent service" prompt
 // is not evaluated: the triad installs services, so no correct answer exists.
 const prompt = {
-  label: 'current prompt | v0.5.0 triad SKILL.md',
+  label: 'current prompt | SKILL.md',
   raw: renderEvaluationPrompt(currentPrompt, currentSkill),
 };
 
