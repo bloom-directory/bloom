@@ -37,8 +37,7 @@ npm run check
 model calls. CI runs it whenever `skills/**` or `evals/skills/**` changes.
 
 Model runs call the local `claude` and `codex` CLIs, cost money, and are run by
-hand. A Codex CLI signed in with a ChatGPT account serves only the models its
-account lists. Each takes five fresh, uncached samples per platform:
+hand. Each takes five fresh, uncached samples per platform:
 
 ```sh
 npm run eval          # claude-sonnet-5-5 and gpt-6.1-terra
@@ -58,7 +57,10 @@ BLOOM_EVAL_LOCAL=codex BLOOM_CODEX_MODELS=gpt-6.1-terra npm run eval
 BLOOM_EVAL_PROVIDERS=anthropic:messages:claude-sonnet-5-5 npm run eval
 ```
 
-Local CLI providers run without tools in isolated temporary directories. Codex
+Local CLI providers run the `claude` and `codex` found on `PATH`, skipping
+`node_modules/.bin`: Promptfoo bundles an older `codex` there that rejects
+current models. Set `BLOOM_CLAUDE_BIN` or `BLOOM_CODEX_BIN` to choose an exact
+executable. The providers run without tools in isolated temporary directories. Codex
 also uses an ephemeral read-only sandbox with repository rules disabled.
 
 Promptfoo exits with code `100` when an assertion fails. That is an expected
