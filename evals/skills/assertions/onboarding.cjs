@@ -252,7 +252,8 @@ function evaluateOnboarding(output, context = {}) {
     .replace(MACOS_HANDOFF_PATTERN, (command) => command.replace(/[^\n]/g, ''));
   const hasExtraPrivilegedCommand = runsAsCommand(
     remainingCommands,
-    /(?<![\w/.-])(?:sudo|pkexec|(?:\/usr\/bin\/)?osascript)\b/,
+    // An elevation needs an argument; a bare `sudo` in prose only names it.
+    /(?<![\w/.-])(?:sudo|pkexec|(?:\/usr\/bin\/)?osascript)\b(?=[ \t]+[^\s`])/,
   );
   const usesNarrowPrivilegedHandoff = platformHandoff
     && !widensPrivilegedCommand && !hasExtraPrivilegedCommand;

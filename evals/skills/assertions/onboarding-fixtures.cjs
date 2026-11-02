@@ -415,6 +415,19 @@ const reformattedMacos = evaluateOnboarding(
 );
 assert.equal(reformattedMacos.pass, true, reformattedMacos.reason);
 
+// Naming the elevation tool in inline code is prose, not another command.
+for (const [platform, handoff, prose] of [
+  ['linux-sudo', SUDO_HANDOFF_COMMAND, 'There is no `pkexec` here, so you run this in your own terminal under `sudo`:'],
+  ['linux-pkexec', PKEXEC_HANDOFF_COMMAND, 'I run this myself through `pkexec`:'],
+  ['macos', MACOS_HANDOFF_COMMAND, 'I run this command myself through `osascript`, not you:'],
+]) {
+  const namesTool = evaluateOnboarding(
+    `I will proceed with the reviewed setup.\n${REVIEW_SEQUENCE}\n${prose}\n\n${handoff}\n\n${SCOPE_SENTENCE}`,
+    { ...context, vars: { platform } },
+  );
+  assert.equal(namesTool.pass, true, `${platform}: ${namesTool.reason}`);
+}
+
 // Inspection must run and show the whole script.
 for (const inspect of ['echo cat "$review_dir/setup.sh"', `sed -n '1p' "$review_dir/setup.sh"`]) {
   const partialInspect = evaluateOnboarding(
