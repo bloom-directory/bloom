@@ -56,7 +56,8 @@ impl BrokerFixture {
             canonical_policy: Base64UrlBytes::from_bytes(state.proposed_policy.as_ref().unwrap()),
             policy_digest: state.proposed_digest.clone().unwrap(),
             policy_signing_key_id: Token::new("policy-key").unwrap(),
-            policy_verifying_key: Base64UrlBytes::from_bytes(&[4; 32]),
+            // A commit re-signs with the wallet's pinned policy key.
+            policy_verifying_key: Base64UrlBytes::from_bytes(&[2; 32]),
             signer_signature: Base64UrlBytes::from_bytes(&[5; 64]),
         }
     }
@@ -670,6 +671,12 @@ async fn vfs_policy_write_prepares_then_commits_only_with_completed_custody_rece
             MachineBrokerRequest::CeremonyStatus(_),
             MachineBrokerRequest::CustodyResult(_),
             MachineBrokerRequest::PolicyCommitUpdate(_),
+            // The commit refreshes the wallet so staging sees the new policy.
+            MachineBrokerRequest::WalletGetPublic(_),
+            MachineBrokerRequest::KeyListPublic(_),
+            MachineBrokerRequest::CredentialListPublic(_),
+            MachineBrokerRequest::PolicyRead(_),
+            MachineBrokerRequest::WalletAccounts(_),
             MachineBrokerRequest::WalletGetPublic(_),
             MachineBrokerRequest::KeyListPublic(_),
             MachineBrokerRequest::CredentialListPublic(_),
@@ -677,6 +684,51 @@ async fn vfs_policy_write_prepares_then_commits_only_with_completed_custody_rece
             MachineBrokerRequest::WalletAccounts(_)
         ]
     ));
+}
+
+/// bloom#354: staging reads the wallet's cached navigation projection, which
+/// production reuses for up to a second. A stage straight after a committed
+/// policy update must see the new policy, not the observation taken before it.
+#[tokio::test]
+async fn vfs_policy_commit_refreshes_the_cached_wallet_projection() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(false);
+    let service: Arc<dyn MachineBrokerService> = fixture.clone();
+    let broker = MachineBrokerClient::new(service);
+    let home = HomeDir::at(temp.path().join("home"));
+    let reader = Arc::new(
+        CachedWalletProjectionReader::new(
+            Some(broker.clone()),
+            FileProjectionStore::new(temp.path().join("cache/wallets.json")),
+        )
+        .unwrap()
+        .with_max_age(std::time::Duration::from_secs(60)),
+    );
+    let handler = WalletsHandler::new(
+        bloom_evm::ChainRegistry::default(),
+        TxEngine::new(Outbox::new(temp.path().join("outbox")).unwrap(), 60_000),
+        AddressBook::default(),
+        reader.clone(),
+        temp.path().join("machine-policy-projections"),
+    )
+    .with_broker(Some(broker))
+    .with_home_write_permit(Arc::new(HomeWritePermit::acquire(&home).unwrap()));
+    let write_path = VfsPath::parse("alice/policy.json").unwrap();
+    let proposed = serde_json::to_vec_pretty(&policy(120_000)).unwrap();
+    let alice = Token::new("alice").unwrap();
+
+    assert!(matches!(
+        handler.write(&write_path, &proposed).await,
+        Err(HandlerError::PermissionDenied)
+    ));
+    let before = reader.get_wallet_navigation(&alice).await.unwrap();
+    assert_eq!(before.policy.version.get(), 1);
+
+    fixture.complete.store(true, Ordering::SeqCst);
+    handler.write(&write_path, &proposed).await.unwrap();
+    let after = reader.get_wallet_navigation(&alice).await.unwrap();
+    assert_eq!(after.policy.version.get(), 2);
+    assert_eq!(after.policy, fixture.committed_snapshot());
 }
 
 #[tokio::test]

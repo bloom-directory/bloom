@@ -2188,6 +2188,12 @@ impl WalletsHandler {
                     "pending",
                     "confirmed",
                 )?;
+                // Staging reads the cached wallet projection. Observe the new
+                // policy now, or a stage in the next second keeps the old
+                // verdict and its entry is refused at confirm (bloom#354).
+                if let Err(error) = self.wallet_projection_authority(wallet).await {
+                    tracing::warn!(wallet, %error, "policy committed; wallet refresh failed");
+                }
                 Ok(())
             }
             bloom_broker_api::CeremonyState::Cancelled
