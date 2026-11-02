@@ -1905,8 +1905,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
         // Includes records for the replaced Polymarket v0.1.6 and v0.1.8 (five
-        // routes each), Hyperliquid v0.1.7 (sixteen) and Enso v0.1.6 (one).
-        assert_eq!(petal_hashes.len(), 75);
+        // routes each), Hyperliquid v0.1.7 (sixteen), Enso v0.1.6 (one) and
+        // NEAR Intents v0.1.4 (one).
+        assert_eq!(petal_hashes.len(), 76);
         for name in crate::github_source::DEFAULT_PETALS {
             let expected = crate::github_source::preinstalled_petal(name)
                 .unwrap()
