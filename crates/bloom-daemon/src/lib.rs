@@ -2803,18 +2803,47 @@ impl PetalHost for DaemonPetalHost {
             .outbox
             .read_receipt(&wallet, &chain_name, &outbox_id)
             .map_err(|e| HostError::Backend(format!("read EVM outbox receipt: {e}")))?;
-        let state = receipt
-            .as_ref()
-            .map(|receipt| receipt.outcome.clone())
-            .unwrap_or_else(|| entry.staged.status.to_string());
+        // A same-nonce cancellation that may be signed or broadcast is not
+        // visible in the status; report it, or the Petal sees an untouched
+        // pending or sent entry.
+        let state = match &receipt {
+            Some(receipt) => receipt.outcome.clone(),
+            None if entry.state != bloom_tx::outbox::OutboxState::Failed
+                && bloom_tx::outbox::cancel_attempted(&entry) =>
+            {
+                "cancelling".to_owned()
+            }
+            // An older Bloom released this entry although it may be signed;
+            // "failed" would invite a second payment.
+            None if entry.state == bloom_tx::outbox::OutboxState::Failed
+                && entry
+                    .dir
+                    .join(bloom_tx::outbox::SIGNING_UNKNOWN_FILE)
+                    .exists() =>
+            {
+                "signing_unknown".to_owned()
+            }
+            None => entry.staged.status.to_string(),
+        };
         let receipt_json = receipt
             .map(|receipt| serde_json::to_string(&receipt))
             .transpose()
             .map_err(|e| HostError::Backend(format!("encode EVM outbox receipt: {e}")))?;
+        // A broadcast whose RPC reply was lost records its hash only in the
+        // attempt marker; report it so the caller can still track the tx.
+        let tx_hash = match entry.staged.tx_hash.clone() {
+            Some(hash) => Some(hash),
+            None => service
+                .tx_engine
+                .outbox
+                .read_broadcast_attempt(&entry, bloom_tx::outbox::BroadcastAttemptKind::Confirm)
+                .map_err(|e| HostError::Backend(format!("read EVM broadcast attempt: {e}")))?
+                .map(|attempt| attempt.tx_hash),
+        };
         Ok(EvmOutboxInspection {
             outbox_id,
             state,
-            tx_hash: entry.staged.tx_hash,
+            tx_hash,
             receipt_json,
         })
     }
@@ -5085,6 +5114,19 @@ impl Daemon {
         let interval = Duration::from_secs(60);
         let background_span = tracing::Span::current();
         let handle = tokio::spawn(async move {
+            // Once per start: an older Bloom may have moved possibly signed
+            // entries to failed/; mark them so nobody retries them blindly.
+            let marking = outbox.clone();
+            match tokio::task::spawn_blocking(move || marking.mark_possibly_signed_failed()).await {
+                Ok(Ok(marked)) => {
+                    for entry in marked {
+                        let staged = entry.staged;
+                        warn!(id = %staged.id, wallet = %staged.wallet, chain = %staged.chain, nonce = staged.nonce, "outbox.failed_entry_signing_unknown");
+                    }
+                }
+                Ok(Err(error)) => warn!(%error, "outbox.signing_unknown_scan_failed"),
+                Err(error) => warn!(%error, "outbox.signing_unknown_scan_failed"),
+            }
             // Tick at `interval`, but exit promptly when the cancel
             // channel flips. We use `tokio::select!` so a long sleep
             // doesn't delay shutdown.
@@ -5097,7 +5139,15 @@ impl Daemon {
                             .duration_since(UNIX_EPOCH)
                             .map(|d| d.as_millis())
                             .unwrap_or(0);
-                        match run_expiry_sweep_once(&outbox, &audit, now_ms) {
+                        // The sweep waits for the outbox lifecycle file lock;
+                        // keep that wait off the async worker.
+                        let (sweep_outbox, sweep_audit) = (outbox.clone(), audit.clone());
+                        let swept = tokio::task::spawn_blocking(move || {
+                            run_expiry_sweep_once(&sweep_outbox, &sweep_audit, now_ms)
+                        })
+                        .await
+                        .unwrap_or_else(|error| Err(error.to_string()));
+                        match swept {
                             Ok(0) => tracing::trace!("outbox.sweep_expired.empty"),
                             Ok(n) => info!(swept = n, "outbox.sweep_expired"),
                             Err(error) => {
@@ -7366,6 +7416,110 @@ mod tests {
         )
         .await
         .unwrap();
+
+        // A broadcast whose RPC reply was lost has no hash in intent.json;
+        // inspection reports the hash recorded in its attempt marker.
+        let mut unacknowledged = staged.clone();
+        unacknowledged.id = "petal-inspect-lost-reply".into();
+        unacknowledged.tx_hash = None;
+        daemon
+            .tx_engine
+            .outbox
+            .write_pending(&unacknowledged, "# plan")
+            .unwrap();
+        let entry = daemon
+            .tx_engine
+            .outbox
+            .read("w", "anvil", &unacknowledged.id)
+            .unwrap();
+        daemon
+            .tx_engine
+            .outbox
+            .write_broadcast_attempt(
+                &entry,
+                bloom_tx::outbox::BroadcastAttemptKind::Confirm,
+                &bloom_tx::outbox::BroadcastAttempt {
+                    schema: "bloom.broadcast_attempted.v1".into(),
+                    tx_hash: tx_hash.clone(),
+                    raw_tx_blake3: String::new(),
+                    raw_tx_path: "raw_tx".into(),
+                    from: unacknowledged.from.clone(),
+                    to: unacknowledged.to.clone(),
+                    nonce: unacknowledged.nonce,
+                    chain_id: unacknowledged.chain_id,
+                    created_ms: 1,
+                    transport: bloom_tx::outbox::BroadcastTransport::PublicRpc,
+                    private_provider: None,
+                },
+            )
+            .unwrap();
+        let inspection = host
+            .evm_tx_inspect(
+                "w".into(),
+                "anvil".into(),
+                unacknowledged.id.clone(),
+                Some(context.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inspection.state, "pending");
+        assert_eq!(inspection.tx_hash.as_deref(), Some(tx_hash.as_str()));
+
+        // A dispatched cancellation is reported, not hidden behind the
+        // unchanged status; the hash stays the original transaction's.
+        daemon
+            .tx_engine
+            .outbox
+            .write_artefact(
+                &entry.dir,
+                bloom_tx::outbox::SIGNING_STATE_FILE,
+                br#"{"sign_dispatched":true,"action_id":"31337:petal-inspect-lost-reply:cancel"}"#,
+            )
+            .unwrap();
+        let inspection = host
+            .evm_tx_inspect(
+                "w".into(),
+                "anvil".into(),
+                unacknowledged.id.clone(),
+                Some(context.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inspection.state, "cancelling");
+        assert_eq!(inspection.tx_hash.as_deref(), Some(tx_hash.as_str()));
+
+        // An entry an older Bloom moved to failed/ although it may be signed
+        // is not reported as a retryable failure.
+        let entry = daemon
+            .tx_engine
+            .outbox
+            .read("w", "anvil", &unacknowledged.id)
+            .unwrap();
+        daemon
+            .tx_engine
+            .outbox
+            .transition(&entry, bloom_tx::outbox::OutboxState::Failed)
+            .unwrap();
+        assert_eq!(
+            daemon
+                .tx_engine
+                .outbox
+                .mark_possibly_signed_failed()
+                .unwrap()
+                .len(),
+            1
+        );
+        let inspection = host
+            .evm_tx_inspect(
+                "w".into(),
+                "anvil".into(),
+                unacknowledged.id.clone(),
+                Some(context.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inspection.state, "signing_unknown");
+        assert_eq!(inspection.tx_hash.as_deref(), Some(tx_hash.as_str()));
 
         let mut other_app = context.clone();
         other_app.petal_root = "other".into();

@@ -418,10 +418,12 @@ fn classify_action_kind(
 /// Inner lock: `tokio` async mutex (held for the stage critical section).
 type NonceLocks =
     Arc<parking_lot::Mutex<HashMap<(String, String, Address), Arc<tokio::sync::Mutex<()>>>>>;
+type SigningLocks =
+    Arc<parking_lot::Mutex<HashMap<std::path::PathBuf, Arc<tokio::sync::Mutex<()>>>>>;
 
-const TRIAD_SIGNING_STATE_FILE: &str = "ceremony.json";
-const TRIAD_BATCH_STATE_DIR: &str = ".batch-signing";
-const TRIAD_BATCH_STATE_FILE: &str = "ceremony.json";
+const TRIAD_SIGNING_STATE_FILE: &str = crate::outbox::SIGNING_STATE_FILE;
+const TRIAD_BATCH_STATE_DIR: &str = crate::outbox::BATCH_SIGNING_STATE_DIR;
+const TRIAD_BATCH_STATE_FILE: &str = crate::outbox::SIGNING_STATE_FILE;
 const TRIAD_EXACT_APPROVAL_TTL_MS: u64 = 10 * 60 * 1_000;
 
 #[derive(Clone)]
@@ -511,6 +513,9 @@ pub struct TxEngine {
     /// microseconds only (HashMap lookup/insert); the inner
     /// `tokio::sync::Mutex` is the actual per-sender stage lock.
     nonce_locks: NonceLocks,
+    /// Per-entry async mutex held for a whole single-entry signing call, so
+    /// a concurrent confirm cannot overwrite a dispatch marker it never saw.
+    signing_locks: SigningLocks,
     triad_signing: Option<Arc<TriadSigningService>>,
 }
 
@@ -525,6 +530,7 @@ impl TxEngine {
             mempool_indexes: Arc::new(RwLock::new(BTreeMap::new())),
             private_rpcs: Arc::new(RwLock::new(BTreeMap::new())),
             nonce_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            signing_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             triad_signing: None,
         }
     }
@@ -573,6 +579,94 @@ impl TxEngine {
             .entry(key)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    /// Take the outbox lifecycle lock to record a signing dispatch for these
+    /// `(chain, id)` entries, refusing if the expiry sweep or a discard has
+    /// already moved one to failed/, or a pending one has expired: new signing
+    /// never starts after expiry. The sweep and discards make their final
+    /// check under the same lock, so either they see the dispatch marker or
+    /// signing sees their move.
+    async fn lock_signing_dispatch(
+        &self,
+        wallet: &str,
+        expected: &[&StagedTx],
+    ) -> Result<crate::outbox::LifecycleLock, TxEngineError> {
+        let lock = self.off_worker(|outbox| outbox.lock_lifecycle()).await??;
+        let now = now_ms();
+        for expected in expected {
+            let id = &expected.id;
+            let retired = || {
+                TxEngineError::ApprovalState(format!(
+                    "transaction '{id}' was expired, discarded, or restaged before signing; nothing was signed"
+                ))
+            };
+            let entry = match self.outbox.read(wallet, &expected.chain, id) {
+                Ok(entry) => entry,
+                Err(OutboxError::NotFound(_)) => return Err(retired()),
+                Err(error) => return Err(error.into()),
+            };
+            let staged = &entry.staged;
+            // Deployment ids are deterministic, so a discarded deployment can
+            // be restaged under the same id with different gas or fees. Sign
+            // only the exact row this confirm read, never its replacement.
+            if entry.state == OutboxState::Failed
+                || serde_json::to_value(staged).ok() != serde_json::to_value(expected).ok()
+            {
+                return Err(retired());
+            }
+            if entry.state == OutboxState::Pending
+                && staged.expires_ms != 0
+                && now >= staged.expires_ms
+            {
+                return Err(TxEngineError::Outbox(OutboxError::StagedExpired {
+                    id: staged.id.clone(),
+                    expired_at: staged.expires_ms,
+                    now,
+                }));
+            }
+        }
+        Ok(lock)
+    }
+
+    /// Run outbox work that may wait for the lifecycle file lock on a
+    /// blocking thread. Waiting on an async worker could stall the task that
+    /// holds the lock and must run on that worker to release it.
+    async fn off_worker<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&Outbox) -> T + Send + 'static,
+    ) -> Result<T, TxEngineError> {
+        let outbox = self.outbox.clone();
+        tokio::task::spawn_blocking(move || work(&outbox))
+            .await
+            .map_err(|error| {
+                TxEngineError::ApprovalState(format!("join outbox lifecycle work: {error}"))
+            })
+    }
+
+    /// Discard a pending entry only if it is provably unsigned (see
+    /// [`Outbox::possibly_signed`]); a possibly signed entry is kept.
+    pub async fn discard_unsigned(
+        &self,
+        permit: &HomeWritePermit,
+        wallet: &str,
+        chain: &str,
+        id: &str,
+    ) -> Result<(), TxEngineError> {
+        self.assert_write_permit(permit)?;
+        Ok(self.outbox_cancel(wallet, chain, id).await??)
+    }
+
+    /// [`Outbox::cancel`] off the async worker (see [`Self::off_worker`]).
+    async fn outbox_cancel(
+        &self,
+        wallet: &str,
+        chain: &str,
+        id: &str,
+    ) -> Result<Result<(), OutboxError>, TxEngineError> {
+        let (wallet, chain, id) = (wallet.to_owned(), chain.to_owned(), id.to_owned());
+        self.off_worker(move |outbox| outbox.cancel(&wallet, &chain, &id))
+            .await
     }
 
     fn assert_write_permit(&self, permit: &HomeWritePermit) -> Result<(), TxEngineError> {
@@ -1488,7 +1582,9 @@ impl TxEngine {
         // reported it as a reservation and refused a deployment that the very
         // next statement would have freed.
         let now_ms = now_ms();
-        let swept = self.outbox.sweep_expired(now_ms)?;
+        let swept = self
+            .off_worker(move |outbox| outbox.sweep_expired(now_ms))
+            .await??;
         if swept > 0 {
             tracing::info!(
                 wallet,
@@ -2014,7 +2110,12 @@ impl TxEngine {
         }
 
         let now = now_ms();
-        if staged.expires_ms != 0 && now >= staged.expires_ms {
+        if staged.expires_ms != 0
+            && now >= staged.expires_ms
+            && !self
+                .outbox
+                .possibly_signed(&entry, &self.outbox.batch_index())
+        {
             return Err(TxEngineError::Outbox(OutboxError::StagedExpired {
                 id: staged.id.clone(),
                 expired_at: staged.expires_ms,
@@ -2146,6 +2247,7 @@ impl TxEngine {
         let mut entries = Vec::with_capacity(targets.len());
         let mut prepared = Vec::with_capacity(targets.len());
         let mut already_attempted = Vec::with_capacity(targets.len());
+        let batches = self.outbox.batch_index();
         let now = now_ms();
         for target in &targets {
             let policy = &target.policy;
@@ -2175,7 +2277,11 @@ impl TxEngine {
             };
             if entry.state == OutboxState::Pending && attempt.is_none() {
                 let staged = &entry.staged;
-                if staged.expires_ms != 0 && now >= staged.expires_ms {
+                // A dispatched batch may still reconcile after expiry.
+                if staged.expires_ms != 0
+                    && now >= staged.expires_ms
+                    && !self.outbox.possibly_signed(&entry, &batches)
+                {
                     return Err(TxEngineError::Outbox(OutboxError::StagedExpired {
                         id: staged.id.clone(),
                         expired_at: staged.expires_ms,
@@ -2408,10 +2514,16 @@ impl TxEngine {
         }
 
         // Expiry check: stage TTL is enforced regardless of whether the
-        // sweeper has run yet. We use wall-clock here; sweep_expired is the
-        // background mop-up that removes stale dirs.
+        // sweeper has run yet. A possibly signed entry may still reconcile
+        // its recorded signing operation; signing refuses to start anything
+        // new after expiry (`lock_signing_dispatch`, `new_state`).
         let now = now_ms();
-        if staged.expires_ms != 0 && now >= staged.expires_ms {
+        if staged.expires_ms != 0
+            && now >= staged.expires_ms
+            && !self
+                .outbox
+                .possibly_signed(&entry, &self.outbox.batch_index())
+        {
             return Err(TxEngineError::Outbox(OutboxError::StagedExpired {
                 id: staged.id.clone(),
                 expired_at: staged.expires_ms,
@@ -2492,11 +2604,12 @@ impl TxEngine {
         {
             Ok(h) => h,
             Err(e @ TxEngineError::ApprovalDenied(_)) => {
-                let state = read_triad_signing_state(&entry.dir.join(TRIAD_SIGNING_STATE_FILE))?;
-                if state.is_none_or(|state| !state.sign_dispatched) {
-                    // A terminal refusal before signing cannot yield a
-                    // transaction. Release the local nonce reservation.
-                    self.outbox.cancel(wallet, chain_name, id)?;
+                // A terminal refusal before signing cannot yield a
+                // transaction. Release the local nonce reservation unless
+                // the entry is possibly signed.
+                match self.outbox_cancel(wallet, chain_name, id).await? {
+                    Ok(()) | Err(OutboxError::PossiblySigned { .. }) => {}
+                    Err(error) => return Err(error.into()),
                 }
                 return Err(e);
             }
@@ -2942,55 +3055,7 @@ impl TxEngine {
                 "staged chain ID differs from the current chain profile".into(),
             ));
         }
-        let _from: Address = staged
-            .from
-            .parse()
-            .map_err(|e: alloy::hex::FromHexError| TxEngineError::Address(e.to_string()))?;
-        let destination = staged.transaction_kind().map_err(TxEngineError::Address)?;
-        let value: U256 = staged
-            .value_wei
-            .parse()
-            .map_err(|_| TxEngineError::Amount("value_wei".into()))?;
-        let data = decode_data(&staged.data_hex)?;
-
-        if staged.gas_price.is_some() {
-            let gp: u128 = staged
-                .gas_price
-                .as_deref()
-                .and_then(|s| s.parse::<u128>().ok())
-                .unwrap_or(1_000_000_000);
-            Ok(UnsignedEvmTx::Legacy(TxLegacy {
-                chain_id: Some(staged.chain_id),
-                nonce: staged.nonce,
-                gas_price: gp,
-                gas_limit: staged.gas_limit,
-                to: destination,
-                value,
-                input: data,
-            }))
-        } else {
-            let max_fee: u128 = staged
-                .max_fee_per_gas
-                .as_deref()
-                .and_then(|s| s.parse::<u128>().ok())
-                .unwrap_or(2_000_000_000);
-            let prio: u128 = staged
-                .max_priority_fee_per_gas
-                .as_deref()
-                .and_then(|s| s.parse::<u128>().ok())
-                .unwrap_or(1_000_000);
-            Ok(UnsignedEvmTx::Eip1559(TxEip1559 {
-                chain_id: staged.chain_id,
-                nonce: staged.nonce,
-                gas_limit: staged.gas_limit,
-                max_fee_per_gas: max_fee,
-                max_priority_fee_per_gas: prio,
-                to: destination,
-                value,
-                access_list: AccessList::default(),
-                input: data,
-            }))
-        }
+        unsigned_evm_tx(staged)
     }
 
     fn unsigned_signing_hash(unsigned: &UnsignedEvmTx) -> B256 {
@@ -3228,6 +3293,16 @@ impl TxEngine {
             .digest()
             .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?;
         let state_path = entry.dir.join(TRIAD_SIGNING_STATE_FILE);
+        // Every step below rewrites the whole state from what it read at the
+        // start. Serialize the entry's signing so a stale copy never erases a
+        // dispatch marker that a concurrent call wrote meanwhile.
+        let signing_lock = self
+            .signing_locks
+            .lock()
+            .entry(state_path.clone())
+            .or_default()
+            .clone();
+        let _signing = signing_lock.lock().await;
         let new_state = || -> Result<TriadEvmSigningState, TxEngineError> {
             let now = now_ms() as u64;
             let expires = now.saturating_add(TRIAD_EXACT_APPROVAL_TTL_MS);
@@ -3368,7 +3443,12 @@ impl TxEngine {
                             // produced no signature, so nothing was signed and
                             // nothing can be double-signed. Replace the dead
                             // lineage and prepare a fresh ceremony in this same
-                            // call instead of stranding the outbox entry.
+                            // call instead of stranding the outbox entry. Record
+                            // that first: after expiry no fresh lineage can be
+                            // prepared, and the entry is then provably unsigned.
+                            state.sign_dispatched = false;
+                            state.expected_operation_digest = None;
+                            write_triad_signing_state(&state_path, &state)?;
                             state = new_state()?;
                             write_triad_signing_state(&state_path, &state)?;
                         }
@@ -3484,6 +3564,9 @@ impl TxEngine {
             // and the durable dispatch marker is written first: a lost
             // response reconciles through operation status instead of signing
             // twice, and an absent marker proves no signature exists.
+            let _lifecycle = self
+                .lock_signing_dispatch(&entry.staged.wallet, &[&entry.staged])
+                .await?;
             state.sign_dispatched = true;
             state.expected_operation_digest = Some(expected_operation_digest);
             write_triad_signing_state(&state_path, &state)?;
@@ -3694,6 +3777,9 @@ impl TxEngine {
                         | OperationState::Failed => {
                             // No signature was produced, so a fresh lineage
                             // cannot double-sign; prepare a new ceremony now.
+                            state.sign_dispatched = false;
+                            state.expected_operation_digest = None;
+                            write_triad_batch_signing_state(&state_path, &state)?;
                             state = new_state()?;
                             write_triad_batch_signing_state(&state_path, &state)?;
                         }
@@ -3834,6 +3920,8 @@ impl TxEngine {
             // signing only ever dispatches with an activated approval, so a
             // lost response reconciles and an absent marker proves no batch
             // signature exists.
+            let children = staged_plans.iter().collect::<Vec<_>>();
+            let _lifecycle = self.lock_signing_dispatch(wallet, &children).await?;
             state.sign_dispatched = true;
             write_triad_batch_signing_state(&state_path, &state)?;
         }
@@ -4355,21 +4443,14 @@ impl TxEngine {
         self.assert_write_permit(permit)?;
         let bump = bump_pct.max(10);
         let entry = self.read_replaceable_entry(wallet, chain_name, original_id)?;
-        if entry.state == OutboxState::Pending
-            && entry.staged.tx_hash.is_none()
-            && self
-                .outbox
-                .read_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm)?
-                .is_none()
-            && self
-                .outbox
-                .read_broadcast_attempt(&entry, BroadcastAttemptKind::Replacement)?
-                .is_none()
-            && read_triad_signing_state(&entry.dir.join(TRIAD_SIGNING_STATE_FILE))?
-                .is_none_or(|state| !state.sign_dispatched)
-        {
-            self.outbox.cancel(wallet, chain_name, original_id)?;
-            return Ok(self.outbox.read(wallet, chain_name, original_id)?.staged);
+        // A provably unsigned pending entry is released locally; anything
+        // possibly signed needs a same-nonce cancellation.
+        if entry.state == OutboxState::Pending {
+            match self.outbox_cancel(wallet, chain_name, original_id).await? {
+                Ok(()) => return Ok(self.outbox.read(wallet, chain_name, original_id)?.staged),
+                Err(OutboxError::PossiblySigned { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         // Recover the original hash before submitting a cancel, so a lost
         // send response cannot leave it outside the reconciler's sent queue.
@@ -4448,28 +4529,10 @@ impl TxEngine {
         let _ = self
             .outbox
             .remove_broadcast_raw_tx(&entry, BroadcastAttemptKind::CancelReplacement);
-        // Broadcast does not settle the nonce race. Keep a sent original
-        // visible to the reconciler so it can record a receipt if it wins.
-        if original.tx_hash.is_none()
-            && self
-                .outbox
-                .read_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm)?
-                .is_none()
-            && self
-                .outbox
-                .read_broadcast_attempt(&entry, BroadcastAttemptKind::Replacement)?
-                .is_none()
-            && entry.state != OutboxState::Failed
-            && let Err(e) = self
-                .outbox
-                .transition_with_status(&entry, TxStatus::Cancelled)
-        {
-            debug!(
-                id = %original.id,
-                error = %e,
-                "tx.cancel_transition_failed"
-            );
-        }
+        // Broadcast does not settle the nonce race, so the original stays
+        // where it is: a sent original stays visible to the reconciler, and a
+        // pending one reached here only because it is possibly signed, so it
+        // keeps holding its nonce rather than moving to failed/.
         info!(
             id = %original.id,
             cancel = %cancel_tx.tx_hash.as_deref().unwrap_or(""),
@@ -5042,6 +5105,68 @@ fn protocol_signing_error(error: bloom_broker_api::ProtocolError) -> TxEngineErr
         }
         _ => TxEngineError::ApprovalDenied(format!("{}: {}", error.code.as_str(), error.message)),
     }
+}
+
+/// The unsigned EVM transaction a staged plan signs.
+fn unsigned_evm_tx(staged: &StagedTx) -> Result<UnsignedEvmTx, TxEngineError> {
+    let _from: Address = staged
+        .from
+        .parse()
+        .map_err(|e: alloy::hex::FromHexError| TxEngineError::Address(e.to_string()))?;
+    let destination = staged.transaction_kind().map_err(TxEngineError::Address)?;
+    let value: U256 = staged
+        .value_wei
+        .parse()
+        .map_err(|_| TxEngineError::Amount("value_wei".into()))?;
+    let data = decode_data(&staged.data_hex)?;
+
+    if staged.gas_price.is_some() {
+        let gp: u128 = staged
+            .gas_price
+            .as_deref()
+            .and_then(|s| s.parse::<u128>().ok())
+            .unwrap_or(1_000_000_000);
+        Ok(UnsignedEvmTx::Legacy(TxLegacy {
+            chain_id: Some(staged.chain_id),
+            nonce: staged.nonce,
+            gas_price: gp,
+            gas_limit: staged.gas_limit,
+            to: destination,
+            value,
+            input: data,
+        }))
+    } else {
+        let max_fee: u128 = staged
+            .max_fee_per_gas
+            .as_deref()
+            .and_then(|s| s.parse::<u128>().ok())
+            .unwrap_or(2_000_000_000);
+        let prio: u128 = staged
+            .max_priority_fee_per_gas
+            .as_deref()
+            .and_then(|s| s.parse::<u128>().ok())
+            .unwrap_or(1_000_000);
+        Ok(UnsignedEvmTx::Eip1559(TxEip1559 {
+            chain_id: staged.chain_id,
+            nonce: staged.nonce,
+            gas_limit: staged.gas_limit,
+            max_fee_per_gas: max_fee,
+            max_priority_fee_per_gas: prio,
+            to: destination,
+            value,
+            access_list: AccessList::default(),
+            input: data,
+        }))
+    }
+}
+
+/// SHA-256 of a staged transaction's exact signing preimage: the identity a
+/// batch signing state records for each child it signs.
+pub(crate) fn staged_payload_digest(staged: &StagedTx) -> Option<Digest32> {
+    let unsigned = unsigned_evm_tx(staged).ok()?;
+    Some(Digest32::from_bytes(
+        sha2::Sha256::digest(TxEngine::unsigned_signing_preimage(&unsigned)).into(),
+    ))
 }
 
 fn decode_data(s: &str) -> Result<Bytes, TxEngineError> {
@@ -6178,24 +6303,7 @@ mod tests {
                 &serde_json::to_vec(&staged).unwrap(),
             )
             .unwrap();
-        let (engine, _, broker) = triad_batch_fixture(outbox.clone(), true, false);
-        let mut catalog = triad_catalog();
-        let mut cancel_record = catalog.records[0].clone();
-        cancel_record.subject = ProvenanceSubject::System {
-            component_id: Token::new("bloom-machine").unwrap(),
-            operation_class: Token::new("transaction.cancel").unwrap(),
-        };
-        cancel_record.operation_classes[0].operation_class =
-            Token::new("transaction.cancel").unwrap();
-        if !catalog
-            .records
-            .iter()
-            .any(|record| record.subject == cancel_record.subject)
-        {
-            catalog.records.push(cancel_record);
-        }
-        let engine = engine.with_triad_signing(broker, catalog).unwrap();
-        let chain = stage_chain(&spawn_batch_rpc(None).await);
+        let (engine, chain) = triad_cancel_engine(&outbox).await;
         let permit = permit_for(&directory);
         let policy = Policy::default();
         let result = engine
@@ -6230,6 +6338,71 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, TxEngineError::ApprovalDenied(_)));
+    }
+
+    /// A Triad engine authorized to cancel, with an active approval, and a
+    /// chain client for it.
+    async fn triad_cancel_engine(outbox: &Outbox) -> (TxEngine, ChainClient) {
+        let (engine, _, broker) = triad_batch_fixture(outbox.clone(), true, false);
+        let mut catalog = triad_catalog();
+        let mut cancel_record = catalog.records[0].clone();
+        cancel_record.subject = ProvenanceSubject::System {
+            component_id: Token::new("bloom-machine").unwrap(),
+            operation_class: Token::new("transaction.cancel").unwrap(),
+        };
+        cancel_record.operation_classes[0].operation_class =
+            Token::new("transaction.cancel").unwrap();
+        if !catalog
+            .records
+            .iter()
+            .any(|record| record.subject == cancel_record.subject)
+        {
+            catalog.records.push(cancel_record);
+        }
+        let engine = engine.with_triad_signing(broker, catalog).unwrap();
+        (engine, stage_chain(&spawn_batch_rpc(None).await))
+    }
+
+    #[tokio::test]
+    async fn cancel_broadcast_keeps_a_hashless_possibly_signed_original_pending() {
+        // The original has no hash, but its signed raw transaction exists, so
+        // it can still win the nonce race against the cancellation.
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let mut staged = fake_staged_1559("hashless-signed");
+        staged.created_ms = now_ms();
+        outbox.write_pending(&staged, "original").unwrap();
+        let pending = outbox.read("alice", "anvil", &staged.id).unwrap();
+        outbox
+            .write_artefact(
+                &pending.dir,
+                BroadcastAttemptKind::Confirm.raw_name(),
+                b"raw",
+            )
+            .unwrap();
+        let (engine, chain) = triad_cancel_engine(&outbox).await;
+        let permit = permit_for(&directory);
+        let policy = Policy::default();
+        let result = engine
+            .cancel(&permit, "alice", "anvil", &staged.id, &chain, 15, &policy)
+            .await;
+        if matches!(result, Err(TxEngineError::ApprovalRequired(_))) {
+            engine
+                .cancel(&permit, "alice", "anvil", &staged.id, &chain, 15, &policy)
+                .await
+                .unwrap();
+        } else {
+            result.unwrap();
+        }
+        let original = outbox.read("alice", "anvil", &staged.id).unwrap();
+        assert!(original.dir.join("cancel_tx_hash").exists());
+        assert_eq!(original.state, OutboxState::Pending);
+        assert_eq!(
+            outbox
+                .highest_pending_nonce("alice", "anvil", TEST_SIGNER_ADDRESS.parse().unwrap())
+                .unwrap(),
+            Some(staged.nonce)
+        );
     }
 
     #[tokio::test]
@@ -7789,6 +7962,187 @@ mod tests {
         );
     }
 
+    /// Delegates to the fixture, but holds the first armed approval-status
+    /// response until released, and can fail the next wallet lookup.
+    struct HeldStatusBroker {
+        inner: Arc<TriadBrokerFixture>,
+        hold_next_status: AtomicBool,
+        fail_next_wallet: AtomicBool,
+        held: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl MachineBrokerService for HeldStatusBroker {
+        fn dispatch<'a>(
+            &'a self,
+            request: MachineBrokerRequest,
+        ) -> ServiceFuture<'a, MachineBrokerResponse> {
+            Box::pin(async move {
+                if matches!(request, MachineBrokerRequest::WalletGetPublic(_))
+                    && self.fail_next_wallet.swap(false, Ordering::SeqCst)
+                {
+                    return Err(bloom_broker_api::ProtocolError::new(
+                        ProtocolErrorCode::ServiceUnavailable,
+                        "simulated wallet lookup failure",
+                    ));
+                }
+                let hold = matches!(request, MachineBrokerRequest::SealedApprovalStatus(_))
+                    && self.hold_next_status.swap(false, Ordering::SeqCst);
+                let response = self.inner.dispatch(request).await;
+                if hold {
+                    self.held.notify_one();
+                    self.release.notified().await;
+                }
+                response
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn triad_concurrent_confirm_cannot_erase_a_dispatch_marker() {
+        // Confirm A reads the state before dispatch and waits on approval
+        // status. Confirm B dispatches signing and loses the response. A then
+        // resumes and fails before dispatching. The marker B wrote must
+        // survive, or discard and expiry would treat a signed entry as unsigned.
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let mut staged = fake_staged_1559("triad-concurrent");
+        staged.wallet = "alice".into();
+        staged.created_ms = now_ms();
+        outbox.write_pending(&staged, "exact EVM review").unwrap();
+        let entry = outbox
+            .read_in_state("alice", "anvil", &staged.id, OutboxState::Pending)
+            .unwrap();
+        let (engine, fixture, _) = triad_batch_fixture(outbox.clone(), false, false);
+        let unsigned = UnsignedEvmTx::Eip1559(TxEip1559 {
+            chain_id: staged.chain_id,
+            nonce: staged.nonce,
+            gas_limit: staged.gas_limit,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 10,
+            to: TxKind::Call(staged.to.as_deref().unwrap().parse().unwrap()),
+            value: U256::ZERO,
+            access_list: AccessList::default(),
+            input: Bytes::new(),
+        });
+        let preimage = TxEngine::unsigned_signing_preimage(&unsigned);
+        let signing_hash = TxEngine::unsigned_signing_hash(&unsigned);
+        macro_rules! sign {
+            ($engine:expr) => {
+                $engine.triad_sign_evm_payload(
+                    &entry,
+                    &staged,
+                    EvmOutboxActionKind::Confirm,
+                    &preimage,
+                    signing_hash,
+                )
+            };
+        }
+        assert!(matches!(
+            sign!(engine).await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        fixture.active.store(true, Ordering::SeqCst);
+        fixture
+            .lose_sign_response_once
+            .store(true, Ordering::SeqCst);
+        let broker = Arc::new(HeldStatusBroker {
+            inner: fixture.clone(),
+            hold_next_status: AtomicBool::new(true),
+            fail_next_wallet: AtomicBool::new(false),
+            held: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let service: Arc<dyn MachineBrokerService> = broker.clone();
+        let engine = TxEngine::new(outbox.clone(), 60_000)
+            .with_triad_signing(MachineBrokerClient::new(service), triad_catalog())
+            .unwrap();
+
+        let confirm_b = async {
+            broker.held.notified().await;
+            let b = sign!(engine);
+            tokio::pin!(b);
+            // Without serialization B finishes while A is held; with it, B
+            // waits for A, so release A after a bounded wait.
+            let finished = tokio::select! {
+                result = &mut b => Some(result),
+                () = tokio::time::sleep(Duration::from_millis(300)) => None,
+            };
+            broker.fail_next_wallet.store(true, Ordering::SeqCst);
+            broker.release.notify_one();
+            match finished {
+                Some(result) => result,
+                None => b.await,
+            }
+        };
+        let (a, b) = tokio::join!(sign!(engine), confirm_b);
+        assert!(a.is_err() && b.is_err(), "{a:?} {b:?}");
+
+        let dispatched = fixture
+            .requests
+            .lock()
+            .iter()
+            .filter(|request| matches!(request, MachineBrokerRequest::SigningSign(_)))
+            .count();
+        assert_eq!(dispatched, 1);
+        let state = read_triad_signing_state(&entry.dir.join(TRIAD_SIGNING_STATE_FILE))
+            .unwrap()
+            .unwrap();
+        assert!(state.sign_dispatched, "a stale write erased the marker");
+        assert!(matches!(
+            outbox.cancel("alice", "anvil", &staged.id),
+            Err(OutboxError::PossiblySigned { .. })
+        ));
+    }
+
+    #[test]
+    fn lifecycle_lock_waits_do_not_block_the_async_worker() {
+        // Signing takes the lifecycle lock on a blocking thread and hands it
+        // to its task. If a discard on the same single worker waited for the
+        // lock synchronously, that task could never run to release it.
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let mut staged = fake_staged_1559("unsigned");
+        staged.created_ms = now_ms();
+        outbox.write_pending(&staged, "unsigned").unwrap();
+        let permit = permit_for(&directory);
+        drop(outbox.lock_lifecycle().unwrap());
+        let engine = Arc::new(TxEngine::new(outbox, 60_000));
+        let lock_path = directory.path().join("outbox/.lifecycle.lock");
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let signer = engine.clone();
+                let signing = tokio::spawn(async move {
+                    signer
+                        .lock_signing_dispatch("alice", &[&staged])
+                        .await
+                        .map(drop)
+                });
+                // Let the blocking thread take the lock before the discard.
+                tokio::task::yield_now().await;
+                let probe = std::fs::File::open(&lock_path).unwrap();
+                while fs2::FileExt::try_lock_exclusive(&probe).is_ok() {
+                    fs2::FileExt::unlock(&probe).unwrap();
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let discarded = engine
+                    .discard_unsigned(&permit, "alice", "anvil", "unsigned")
+                    .await;
+                signing.await.unwrap().unwrap();
+                discarded.unwrap();
+            });
+            done.send(()).unwrap();
+        });
+        finished
+            .recv_timeout(Duration::from_secs(10))
+            .expect("discard deadlocked against a lifecycle lock handoff");
+    }
+
     #[tokio::test]
     async fn triad_confirm_quarantined_operation_stays_blocked_on_reconciliation() {
         let directory = tempfile::tempdir().unwrap();
@@ -8306,6 +8660,9 @@ mod tests {
         let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
         let (engine, fixture, _) = triad_batch_fixture(outbox, false, false);
         let (refs, staged, preimages, hashes) = batch_material(&["batch-a", "batch-b"]);
+        for plan in &staged {
+            engine.outbox.write_pending(plan, "p").unwrap();
+        }
 
         let error = engine
             .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
@@ -8399,6 +8756,9 @@ mod tests {
         let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
         let (engine, fixture, broker) = triad_batch_fixture(outbox.clone(), false, false);
         let (refs, staged, preimages, hashes) = batch_material(&["loss-a", "loss-b"]);
+        for plan in &staged {
+            engine.outbox.write_pending(plan, "p").unwrap();
+        }
         assert!(matches!(
             engine
                 .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
@@ -8446,6 +8806,9 @@ mod tests {
         let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
         let (engine, fixture, _) = triad_batch_fixture(outbox, false, false);
         let (refs, staged, preimages, hashes) = batch_material(&["bad-a", "bad-b"]);
+        for plan in &staged {
+            engine.outbox.write_pending(plan, "p").unwrap();
+        }
         assert!(matches!(
             engine
                 .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
@@ -8756,6 +9119,86 @@ mod tests {
                 .count(),
             1,
             "partial-broadcast recovery must query the completed parent operation, not re-sign"
+        );
+    }
+
+    /// A batch whose signing reply was lost and whose children then expired
+    /// is kept by cancel, which names the exact ordered batch. Following that
+    /// guidance reconciles the one signing operation and broadcasts both.
+    #[tokio::test]
+    async fn cancel_guidance_recovers_an_expired_batch_with_a_lost_reply() {
+        let url = spawn_batch_rpc(None).await;
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let (_, mut staged, _, _) = batch_material(&["lost-b", "lost-a"]);
+        for child in &mut staged {
+            child.expires_ms = now_ms() + 1_500;
+            outbox.write_pending(child, "batch review").unwrap();
+        }
+        let (engine, fixture, _) = triad_batch_fixture(outbox.clone(), false, false);
+        let permit = permit_for(&directory);
+        let chain = stage_chain(&url);
+        let targets = |refs: &[&str]| {
+            refs.iter()
+                .map(|reference| {
+                    let (chain_name, id) = reference.split_once(':').unwrap();
+                    ConfirmBatchTarget {
+                        chain_name: chain_name.into(),
+                        id: id.into(),
+                        chain: chain.clone(),
+                        policy: Policy::default(),
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let original = targets(&["anvil:lost-b", "anvil:lost-a"]);
+        assert!(matches!(
+            engine
+                .confirm_batch(&permit, "alice", original.clone(), false)
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        fixture.active.store(true, Ordering::SeqCst);
+        fixture
+            .lose_sign_response_once
+            .store(true, Ordering::SeqCst);
+        assert!(
+            engine
+                .confirm_batch(&permit, "alice", original, false)
+                .await
+                .is_err()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1_600)).await;
+
+        let Err(TxEngineError::Outbox(OutboxError::PossiblySigned {
+            evidence: crate::outbox::SigningEvidence::Batch { ordered_refs },
+            ..
+        })) = engine
+            .discard_unsigned(&permit, "alice", "anvil", "lost-a")
+            .await
+        else {
+            panic!("cancel must keep a child of a dispatched batch");
+        };
+        let refs = ordered_refs.iter().map(String::as_str).collect::<Vec<_>>();
+        let result = engine
+            .confirm_batch(&permit, "alice", targets(&refs), false)
+            .await
+            .unwrap();
+        assert!(
+            result
+                .transactions
+                .iter()
+                .all(|transaction| transaction.status == TxStatus::Sent)
+        );
+        assert_eq!(
+            fixture
+                .requests
+                .lock()
+                .iter()
+                .filter(|request| matches!(request, MachineBrokerRequest::SigningSignBatch(_)))
+                .count(),
+            1,
+            "recovery must query the recorded batch operation, not re-sign"
         );
     }
 
@@ -9436,6 +9879,141 @@ mod tests {
             }
             other => panic!("expected StagedExpired, got {other:?}"),
         }
+    }
+
+    /// A signing request whose reply was lost leaves the entry pending with
+    /// no hash. After expiry, confirm must still reconcile that recorded
+    /// operation (here: collect its signature and broadcast) rather than
+    /// refuse with `StagedExpired` and strand the reserved nonce.
+    #[tokio::test]
+    async fn confirm_reconciles_a_dispatched_signature_after_expiry() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let (engine, fixture, _) = triad_batch_fixture(outbox.clone(), false, true);
+        let permit = permit_for(&directory);
+        let chain = stage_chain(&spawn_queued_rpc(HashMap::new()).await);
+        let policy = Policy::default();
+        let mut staged = fake_staged_1559("expired-dispatch");
+        staged.created_ms = now_ms();
+        let entry_dir = outbox.write_pending(&staged, "p").unwrap();
+        let confirm = || {
+            engine.confirm(
+                &permit,
+                "alice",
+                "anvil",
+                "expired-dispatch",
+                &chain,
+                &policy,
+                policy.override_sentinel(),
+            )
+        };
+        assert!(matches!(
+            confirm().await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        fixture.active.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            confirm().await,
+            Err(TxEngineError::ApprovalServiceUnavailable(_))
+        ));
+
+        staged.expires_ms = 1;
+        std::fs::write(
+            entry_dir.join("intent.json"),
+            serde_json::to_vec(&staged).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(outbox.sweep_expired(now_ms()).unwrap(), 0);
+        let result = confirm().await;
+        assert!(
+            !matches!(
+                result,
+                Err(TxEngineError::Outbox(OutboxError::StagedExpired { .. }))
+            ),
+            "{result:?}"
+        );
+        assert!(entry_dir.join("broadcast_attempted.json").exists());
+        assert_eq!(
+            fixture
+                .requests
+                .lock()
+                .iter()
+                .filter(|request| matches!(request, MachineBrokerRequest::SigningSign(_)))
+                .count(),
+            1,
+            "reconciliation must not send a second signing request"
+        );
+    }
+
+    /// Signing records a dispatch only under the lifecycle lock, and only
+    /// for the exact row the confirm read: not expired, not moved to failed/,
+    /// not missing, and not replaced by a restage under the same id.
+    #[tokio::test]
+    async fn signing_dispatch_refuses_expired_or_retired_entries() {
+        let (engine, _, _dir) = fake_engine(60_000);
+        let mut staged = fake_staged_1559("late");
+        staged.expires_ms = 1;
+        engine.outbox.write_pending(&staged, "p").unwrap();
+        assert!(matches!(
+            engine.lock_signing_dispatch("alice", &[&staged]).await,
+            Err(TxEngineError::Outbox(OutboxError::StagedExpired { .. }))
+        ));
+        assert_eq!(engine.outbox.sweep_expired(now_ms()).unwrap(), 1);
+        assert!(matches!(
+            engine.lock_signing_dispatch("alice", &[&staged]).await,
+            Err(TxEngineError::ApprovalState(_))
+        ));
+        assert!(matches!(
+            engine
+                .lock_signing_dispatch("alice", &[&fake_staged_1559("absent")])
+                .await,
+            Err(TxEngineError::ApprovalState(_))
+        ));
+        let live = fake_staged_1559("live");
+        engine.outbox.write_pending(&live, "p").unwrap();
+        drop(
+            engine
+                .lock_signing_dispatch("alice", &[&live])
+                .await
+                .unwrap(),
+        );
+        // A restage under the same id (deterministic deployment ids) must not
+        // admit a confirm that read the earlier bytes.
+        let mut stale = live.clone();
+        stale.gas_limit += 1;
+        assert!(matches!(
+            engine.lock_signing_dispatch("alice", &[&stale]).await,
+            Err(TxEngineError::ApprovalState(_))
+        ));
+    }
+
+    /// `bloom wallet cancel` releases a pending entry locally only under the
+    /// shared rule: a bare signed raw transaction keeps it pending.
+    #[tokio::test]
+    async fn wallet_cancel_keeps_a_pending_entry_with_signed_raw_bytes() {
+        let (engine, spec, dir) = fake_engine(60_000);
+        let permit = permit_for(&dir);
+        let chain = bloom_evm::ChainClient::new(spec).unwrap();
+        let entry = engine
+            .outbox
+            .write_pending(&fake_staged_1559("raw-only"), "p")
+            .unwrap();
+        std::fs::write(entry.join("raw_tx"), b"signed").unwrap();
+        let result = engine
+            .cancel(
+                &permit,
+                "alice",
+                "anvil",
+                "raw-only",
+                &chain,
+                15,
+                &Policy::default(),
+            )
+            .await;
+        assert!(result.is_err(), "{result:?}");
+        let entry = engine.outbox.read("alice", "anvil", "raw-only").unwrap();
+        assert_eq!(entry.state, OutboxState::Pending);
+        assert!(entry.dir.join("raw_tx").exists());
     }
 
     #[test]

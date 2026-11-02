@@ -259,6 +259,9 @@ Before publishing, test both direct VFS fallback and a mounted daemon. Cover
 lookup, list, read, invalid input, backend failure, and every writable route.
 For a staged transaction workflow, verify that documentation and route output
 distinguish staging, approval, confirmation, broadcast, and receipt states.
+Treat an outbox inspection state you do not recognize as unresolved, never as
+a failure to retry: `signing_unknown` marks an entry an older Bloom moved to
+`failed/` although it may have been signed, so staging it again can pay twice.
 
 ## GitHub source packages
 
