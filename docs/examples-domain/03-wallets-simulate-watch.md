@@ -261,16 +261,17 @@ a sent tx — including its receipt — is accessed through
 
 ### Replace and cancel
 
-Both routes live next to `confirm` on a `pending/<id>/`. Both require a
-non-empty body and the same Broker/Signer authorization as confirmation.
+Both routes live next to `confirm` on a `pending/<id>/`. Both require the
+same Broker/Signer authorization as confirmation.
 
 ```sh
-# Replace: bumped fees plus a substituted intent body. Same nonce, the
-# original record stays in place; the engine writes replacement_intent.json
-# and replacement_tx_hash alongside.
-cat <<'EOF' > /bloom/wallets/alice/0/chains/anvil/outbox/pending/$ID/replace
-send 0.02 eth to 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 on anvil
-EOF
+# Replace: repair the fees of a pending EIP-1559 tx the node refused. The
+# body is exactly this fee pair (decimal wei); any other body is refused.
+# Nonce, destination, value and calldata stay the same.
+echo '{"max_fee_per_gas":"60000000000","max_priority_fee_per_gas":"30000000000"}' \
+  > /bloom/wallets/alice/0/chains/anvil/outbox/pending/$ID/replace
+# After the owner approves, write the challenge's exact `retry_body` to its
+# `retry_path`.
 
 # Cancel: fires a self-send replacement at the same nonce with a >=10%
 # fee bump. Body is any non-empty token, conventionally 'y'.

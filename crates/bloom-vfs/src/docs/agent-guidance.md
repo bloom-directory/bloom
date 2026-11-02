@@ -369,7 +369,9 @@ project into the central outbox:
 5. Confirm only the exact inspected action.
 6. If approval is required, validate the challenge and hand its ceremony URL to
    the human.
-7. After the ceremony completes, retry only the exact documented `retry_path`.
+7. After the ceremony completes, write the challenge's `retry_body` to its
+   exact `retry_path`. An omitted `retry_body` means `confirm`; serialize an
+   object as JSON. Keep a fee-repair body unchanged through approval and retry.
 8. Read the sent, failed, or receipt projection before reporting success.
 
 A confirm write may return permission denied while projecting
@@ -382,7 +384,8 @@ presenting its ceremony URL. This is a waiting state, not a reason to restage.
 Reading the challenge asks Bloom for the approval's current state, so poll it
 while the human approves. `state` is `awaiting_ceremony` until they finish,
 then `active`, and `next` says what to do. As soon as `state` is `active`,
-write `confirm` to `retry_path`; the approval does not broadcast on its own.
+write the exact `retry_body` to `retry_path`; the approval does not broadcast
+on its own.
 Retrying `retry_path` before then is also safe: it starts no new ceremony and
 returns permission denied again. Once the ceremony can no longer be used,
 `ceremony_url` is withdrawn. For `expired`, `cancelled` or `refused`, tell the
