@@ -1371,6 +1371,13 @@ impl WalletsHandler {
                 }
                 let entry = self.solana_outbox_entry(wallet, family, chain, state, id)?;
                 let mut file = open_regular_outbox_artifact(&entry.dir, fname)?;
+                if fname == "intent.json" {
+                    // Serve the status the outbox itself uses. A crash between
+                    // a state move and the intent rewrite leaves stale bytes.
+                    let mut public = entry.staged;
+                    public.signature = None;
+                    return serde_json::to_vec_pretty(&public).map_err(err_be);
+                }
                 let mut bytes = Vec::new();
                 std::io::Read::read_to_end(&mut file, &mut bytes)?;
                 if fname == APPROVAL_CHALLENGE {
