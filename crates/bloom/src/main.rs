@@ -2962,12 +2962,14 @@ enum WalletCmd {
         #[arg(long, default_value = "y")]
         text: String,
     },
-    /// Submit a same-nonce replacement request from a new intent body.
+    /// Repair the fees of a pending EIP-1559 tx the node refused, keeping its
+    /// nonce and call.
     Replace {
         wallet: String,
         chain: String,
         id: String,
-        /// Replacement intent body (JSON, TOML, or shell-style). If omitted, read stdin.
+        /// Exactly `{"max_fee_per_gas":"<wei>","max_priority_fee_per_gas":"<wei>"}`;
+        /// any other body is refused. If omitted, read stdin.
         #[arg(long)]
         intent: Option<String>,
     },

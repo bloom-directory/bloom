@@ -159,6 +159,16 @@ cat wallets/alice/policy.json > proposed-policy.json      # edit the complete pr
 cp proposed-policy.json wallets/alice/policy.json
 cat wallets/alice/policy-updates/latest/status.json
 cat wallets/alice/policy-updates/latest/approval_challenge.json   # verify, then forward its ceremony URL
-cp proposed-policy.json wallets/alice/policy.json          # after approval: the same bytes
-cat wallets/alice/policy.json                              # verify the committed policy
 ```
+
+Note the `action_id` in `status.json`. After the human approves, retry the
+exact same proposal bytes:
+
+```sh
+cp proposed-policy.json wallets/alice/policy.json
+cat wallets/alice/policy.json                              # verify the committed policy
+cat wallets/alice/policy-updates/confirmed/<action_id>/status.json
+```
+
+`latest` names only a pending update, so it is gone once the update commits.
+A refused or failed update is under `failed/<action_id>/` instead.

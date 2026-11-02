@@ -26,7 +26,7 @@ use bloom_evm::ChainRegistry;
 use bloom_proto::{AuditLog, AuditRecord};
 use tokio::sync::oneshot;
 
-use crate::outbox::{MinedReceipt, Outbox, RECEIPT_FILE};
+use crate::outbox::{BroadcastAttempt, BroadcastAttemptKind, MinedReceipt, Outbox, RECEIPT_FILE};
 
 /// How long a transaction whose nonce is spent but whose receipt is missing
 /// keeps [`RECEIPT_LOOKUP_SPACING`] before backing off further. That covers RPC endpoints that lag one another;
@@ -213,7 +213,7 @@ impl Reconciler {
         // Confirmed nonce per (chain, sender) for this tick; None when the
         // provider could not answer.
         let mut confirmed_nonces = HashMap::new();
-        for se in entries {
+        'entries: for se in entries {
             if se.mined {
                 continue;
             }
@@ -283,7 +283,8 @@ impl Reconciler {
             let Some(receipt_correlation) = self.audit_intent(&se, receipt_details) else {
                 break;
             };
-            let receipt_call = chain.receipt(se.hash).await;
+            let mut hash = se.hash;
+            let mut receipt_call = chain.receipt(hash).await;
             let receipt_result = match &receipt_call {
                 Ok(Some(receipt)) => serde_json::json!({
                     "outcome": "found",
@@ -297,6 +298,50 @@ impl Reconciler {
             };
             if !self.audit_result(&se, &receipt_correlation, receipt_result) {
                 break;
+            }
+            // A replacement or cancel competes for the same nonce; broadcast
+            // does not decide which one mines. When the followed hash has no
+            // receipt, look up every other recorded attempt and settle the
+            // one that mined. Only a mined cancel records a cancellation.
+            if matches!(&receipt_call, Ok(None)) {
+                for (other, cancel) in self.competing_attempts(&se) {
+                    let operation = if cancel {
+                        "tx.reconcile.cancel_receipt_lookup"
+                    } else {
+                        "tx.reconcile.competing_receipt_lookup"
+                    };
+                    let Some(correlation) = self.audit_intent(
+                        &se,
+                        serde_json::json!({
+                            "operation": operation, "tx_hash": format!("{other:#x}")
+                        }),
+                    ) else {
+                        break 'entries;
+                    };
+                    let found = chain.receipt(other).await;
+                    if !self.audit_result(&se, &correlation, serde_json::json!({
+                        "outcome": match &found { Ok(Some(_)) => "found", Ok(None) => "not_found", Err(_) => "error" }
+                    })) { break 'entries; }
+                    let Ok(Some(receipt)) = found else { continue };
+                    if !cancel {
+                        hash = other;
+                        receipt_call = Ok(Some(receipt));
+                        break;
+                    }
+                    let record = MinedReceipt {
+                        outcome: "cancelled".into(),
+                        tx_hash: format!("{other:#x}"),
+                        block_number: receipt.block_number,
+                        contract_address: None,
+                        revert_reason: None,
+                    };
+                    if let Ok(bytes) = serde_json::to_vec_pretty(&record)
+                        && self.project_receipt(&se, &bytes).is_ok()
+                    {
+                        updated += 1;
+                    }
+                    continue 'entries;
+                }
             }
             let receipt = match receipt_call {
                 Ok(Some(r)) => {
@@ -331,8 +376,8 @@ impl Reconciler {
                 None
             } else {
                 let Some(trace_call) = self
-                    .audited_trace_revert(&se, || async {
-                        chain.trace_revert(se.hash).await.map_err(|e| e.to_string())
+                    .audited_trace_revert(&se, hash, || async {
+                        chain.trace_revert(hash).await.map_err(|e| e.to_string())
                     })
                     .await
                 else {
@@ -345,7 +390,7 @@ impl Reconciler {
             };
             let record = MinedReceipt {
                 outcome: if success { "success" } else { "reverted" }.to_string(),
-                tx_hash: format!("{:#x}", se.hash),
+                tx_hash: format!("{hash:#x}"),
                 block_number: receipt.block_number,
                 contract_address: receipt
                     .contract_address
@@ -375,6 +420,53 @@ impl Reconciler {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .retain(|key, _| waiting.contains(key));
         updated
+    }
+
+    /// Recorded same-nonce attempts other than the followed hash, each
+    /// flagged when it is a cancel.
+    fn competing_attempts(
+        &self,
+        entry: &crate::outbox::SentEntry,
+    ) -> Vec<(alloy::primitives::B256, bool)> {
+        let Ok(dir) = self.outbox.sent_dir(&entry.wallet, &entry.chain, &entry.id) else {
+            return Vec::new();
+        };
+        let marker = |kind: BroadcastAttemptKind| {
+            std::fs::read(dir.join(kind.marker_name()))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<BroadcastAttempt>(&bytes).ok())
+                .map(|attempt| attempt.tx_hash)
+        };
+        let file = |name: &str| std::fs::read_to_string(dir.join(name)).ok();
+        // A node-refused fee repair is retired but its bytes may still mine.
+        let retired_prefix = format!(
+            "{}.rejected-",
+            BroadcastAttemptKind::Replacement.marker_name()
+        );
+        let retired = std::fs::read_dir(&dir).into_iter().flatten().flatten();
+        let retired = retired.filter_map(|item| {
+            let name = item.file_name().into_string().ok()?;
+            Some((Some(name.strip_prefix(&retired_prefix)?.to_owned()), false))
+        });
+        let mut out: Vec<(alloy::primitives::B256, bool)> = Vec::new();
+        for (hash, cancel) in [
+            (file("cancel_tx_hash"), true),
+            (marker(BroadcastAttemptKind::CancelReplacement), true),
+            (marker(BroadcastAttemptKind::Confirm), false),
+            (marker(BroadcastAttemptKind::Replacement), false),
+            (file("replacement_tx_hash"), false),
+        ]
+        .into_iter()
+        .chain(retired)
+        {
+            if let Some(hash) = hash.and_then(|hash| hash.trim().parse().ok())
+                && hash != entry.hash
+                && !out.iter().any(|(seen, _)| *seen == hash)
+            {
+                out.push((hash, cancel));
+            }
+        }
+        out
     }
 
     fn project_receipt(
@@ -410,6 +502,7 @@ impl Reconciler {
     async fn audited_trace_revert<F, Fut>(
         &self,
         entry: &crate::outbox::SentEntry,
+        hash: alloy::primitives::B256,
         trace: F,
     ) -> Option<Result<Option<alloy::primitives::Bytes>, String>>
     where
@@ -421,7 +514,7 @@ impl Reconciler {
             "wallet": entry.wallet,
             "chain": entry.chain,
             "tx_id": entry.id,
-            "tx_hash": format!("{:#x}", entry.hash),
+            "tx_hash": format!("{hash:#x}"),
         });
         let correlation = self.audit_intent(entry, trace_details)?;
         let trace_call = trace().await;
@@ -606,6 +699,7 @@ mod tests {
         /// is answered, simulating a slow read inside one tick.
         clock_on_nonce: ClockOnNonce,
         fail_result_audit: Option<Arc<AuditLog>>,
+        receipt_hash: Option<String>,
     }
 
     impl MockRpc {
@@ -620,6 +714,7 @@ mod tests {
                 nonce_calls: Arc::new(AtomicUsize::new(0)),
                 clock_on_nonce: Arc::new(Mutex::new(None)),
                 fail_result_audit: None,
+                receipt_hash: None,
             }
         }
 
@@ -676,6 +771,10 @@ mod tests {
                             }
                             if *rpc.receipt_fails.lock().unwrap() {
                                 reply("error", rpc.receipt_error.clone())
+                            } else if rpc.receipt_hash.as_ref().is_some_and(|hash| {
+                                request_json["params"][0].as_str() != Some(hash.as_str())
+                            }) {
+                                reply("result", serde_json::Value::Null)
                             } else {
                                 reply("result", rpc.receipt.lock().unwrap().clone())
                             }
@@ -856,6 +955,143 @@ mod tests {
         let reconciler = Reconciler::new(outbox, chains, audit)
             .with_clock(Arc::new(move || start + *clock_elapsed.lock().unwrap()));
         (reconciler, elapsed)
+    }
+
+    #[tokio::test]
+    async fn a_mined_cancel_terminates_the_original_without_reporting_its_success() {
+        let (_directory, outbox) = sent_outbox();
+        let entry = outbox.read("alice", "anvil", "tx-1").unwrap();
+        let hash = format!("{:#x}", alloy::primitives::B256::repeat_byte(8));
+        outbox
+            .write_artefact(&entry.dir, "cancel_tx_hash", hash.as_bytes())
+            .unwrap();
+        let audit_directory = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(audit_directory.path().join("audit.jsonl")).unwrap());
+        let mut rpc = MockRpc::new(Some(1), mined_receipt());
+        rpc.receipt_hash = Some(hash.clone());
+        let chains = ChainRegistry::default();
+        chains.add(mock_chain(rpc).await);
+        let reconciler = Reconciler::new(outbox.clone(), chains, audit);
+        assert_eq!(reconciler.tick().await, 1);
+        let receipt = outbox
+            .read_receipt("alice", "anvil", "tx-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.outcome, "cancelled");
+        assert_eq!(receipt.tx_hash, hash);
+        assert!(!receipt.is_success());
+        assert_eq!(
+            outbox.read("alice", "anvil", "tx-1").unwrap().staged.status,
+            TxStatus::Cancelled
+        );
+        assert_eq!(reconciler.tick().await, 0);
+    }
+
+    #[tokio::test]
+    async fn original_receipt_is_recorded_when_it_beats_a_cancel_replacement() {
+        let (_directory, outbox) = sent_outbox();
+        let entry = outbox.read("alice", "anvil", "tx-1").unwrap();
+        outbox
+            .write_artefact(
+                &entry.dir,
+                "cancel_tx_hash",
+                format!("{:#x}", alloy::primitives::B256::repeat_byte(8)).as_bytes(),
+            )
+            .unwrap();
+        let audit_directory = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(audit_directory.path().join("audit.jsonl")).unwrap());
+        let rpc = MockRpc::new(Some(1), mined_receipt());
+        let chains = ChainRegistry::default();
+        chains.add(mock_chain(rpc).await);
+        let reconciler = Reconciler::new(outbox.clone(), chains, audit);
+        assert_eq!(reconciler.tick().await, 1);
+        assert!(
+            outbox
+                .read_receipt("alice", "anvil", "tx-1")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// A fee repair follows the replacement hash, but the rejected original
+    /// can still win the nonce. Its receipt settles the row.
+    #[tokio::test]
+    async fn the_original_receipt_settles_a_row_that_follows_its_replacement() {
+        let (_directory, outbox) = sent_outbox();
+        let entry = outbox.read("alice", "anvil", "tx-1").unwrap();
+        let original = format!("{:#x}", alloy::primitives::B256::repeat_byte(8));
+        let attempt = BroadcastAttempt {
+            schema: "bloom.broadcast_attempted.v1".into(),
+            tx_hash: original.clone(),
+            raw_tx_blake3: String::new(),
+            raw_tx_path: BroadcastAttemptKind::Confirm.raw_name().into(),
+            from: entry.staged.from.clone(),
+            to: entry.staged.to.clone(),
+            nonce: 0,
+            chain_id: 31337,
+            created_ms: 0,
+            transport: crate::outbox::BroadcastTransport::PublicRpc,
+            private_provider: None,
+        };
+        outbox
+            .write_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm, &attempt)
+            .unwrap();
+        let audit_directory = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(audit_directory.path().join("audit.jsonl")).unwrap());
+        let mut rpc = MockRpc::new(Some(1), mined_receipt());
+        rpc.receipt_hash = Some(original.clone());
+        let chains = ChainRegistry::default();
+        chains.add(mock_chain(rpc).await);
+        let reconciler = Reconciler::new(outbox.clone(), chains, audit);
+        assert_eq!(reconciler.tick().await, 1);
+        let receipt = outbox
+            .read_receipt("alice", "anvil", "tx-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.outcome, "success");
+        assert_eq!(receipt.tx_hash, original);
+        assert_eq!(reconciler.tick().await, 0);
+    }
+
+    /// A refused fee repair is retired, but its signed bytes may still be
+    /// mined. Its retained hash settles the row.
+    #[tokio::test]
+    async fn a_retired_rejected_attempt_still_settles_the_row() {
+        let (_directory, outbox) = sent_outbox();
+        let entry = outbox.read("alice", "anvil", "tx-1").unwrap();
+        let rejected = format!("{:#x}", alloy::primitives::B256::repeat_byte(9));
+        let attempt = BroadcastAttempt {
+            schema: "bloom.broadcast_attempted.v1".into(),
+            tx_hash: rejected.clone(),
+            raw_tx_blake3: String::new(),
+            raw_tx_path: BroadcastAttemptKind::Replacement.raw_name().into(),
+            from: entry.staged.from.clone(),
+            to: entry.staged.to.clone(),
+            nonce: 0,
+            chain_id: 31337,
+            created_ms: 0,
+            transport: crate::outbox::BroadcastTransport::PublicRpc,
+            private_provider: None,
+        };
+        outbox
+            .write_broadcast_attempt(&entry, BroadcastAttemptKind::Replacement, &attempt)
+            .unwrap();
+        outbox
+            .set_aside_rejected_attempt(&entry, BroadcastAttemptKind::Replacement, "ceremony.json")
+            .unwrap();
+        let audit_directory = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(audit_directory.path().join("audit.jsonl")).unwrap());
+        let mut rpc = MockRpc::new(Some(1), mined_receipt());
+        rpc.receipt_hash = Some(rejected.clone());
+        let chains = ChainRegistry::default();
+        chains.add(mock_chain(rpc).await);
+        let reconciler = Reconciler::new(outbox.clone(), chains, audit);
+        assert_eq!(reconciler.tick().await, 1);
+        let receipt = outbox
+            .read_receipt("alice", "anvil", "tx-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.tx_hash, rejected);
     }
 
     #[tokio::test]
@@ -1204,7 +1440,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         audit.fail_next_write_for_test();
         let result = reconciler
-            .audited_trace_revert(&entry, {
+            .audited_trace_revert(&entry, entry.hash, {
                 let calls = calls.clone();
                 move || async move {
                     calls.fetch_add(1, Ordering::SeqCst);
@@ -1226,7 +1462,7 @@ mod tests {
         let audit = Arc::new(AuditLog::open(&audit_path).unwrap());
         let reconciler = Reconciler::new(outbox, ChainRegistry::default(), audit.clone());
         let result = reconciler
-            .audited_trace_revert(&entry, {
+            .audited_trace_revert(&entry, entry.hash, {
                 let audit = audit.clone();
                 move || async move {
                     audit.fail_next_write_for_test();
@@ -1250,7 +1486,9 @@ mod tests {
         let audit = Arc::new(AuditLog::open(audit_directory.path().join("audit.jsonl")).unwrap());
         let reconciler = Reconciler::new(outbox, ChainRegistry::default(), audit.clone());
         let result = reconciler
-            .audited_trace_revert(&entry, || async { Err("trace unavailable".to_owned()) })
+            .audited_trace_revert(&entry, entry.hash, || async {
+                Err("trace unavailable".to_owned())
+            })
             .await
             .expect("audit result must be durable");
         assert_eq!(result.unwrap_err(), "trace unavailable");

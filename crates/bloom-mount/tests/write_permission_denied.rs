@@ -486,3 +486,115 @@ async fn mounted_async_command_rejections_keep_the_mount_live() {
     mount.unmount().await.expect("unmount test VFS");
     let _ = std::fs::remove_dir(&mount_dir);
 }
+
+/// A synchronous command sink that, like a Petal route, accepts a valid
+/// request and rejects an invalid one with a reason.
+#[derive(Default)]
+struct ValidatingCommandHandler {
+    accepted: AtomicUsize,
+    rejected: AtomicUsize,
+}
+
+impl ValidatingCommandHandler {
+    fn invocations(&self) -> usize {
+        self.accepted.load(Ordering::SeqCst) + self.rejected.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl Handler for ValidatingCommandHandler {
+    async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+        match path.first() {
+            None => Ok(Entry::dir("")),
+            Some("command") => Ok(Entry::writable_file("command")),
+            _ => Err(HandlerError::NotFound(path.to_string_path())),
+        }
+    }
+
+    async fn list(&self, _path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+        Ok(vec![Entry::writable_file("command")])
+    }
+
+    async fn write(&self, _path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if data.starts_with(b"{\"action\"") {
+            self.accepted.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        } else {
+            self.rejected.fetch_add(1, Ordering::SeqCst);
+            Err(HandlerError::invalid("missing field action"))
+        }
+    }
+}
+
+/// Issue #371: a shell writer must see its command write rejected, and every
+/// command — accepted or refused — must reach the handler exactly once. A
+/// refused write leaves the page dirty and `cat` flushes it again at close, so
+/// the rejected bodies are counted too, not just the accepted ones.
+#[tokio::test]
+async fn mounted_command_rejection_fails_the_shell_writer() {
+    if !require_real_mount_test() {
+        eprintln!("skip: BLOOM_MOUNT_TEST_REQUIRE_REAL is not set");
+        return;
+    }
+    let mount_dir = unique_mount_dir();
+    std::fs::create_dir(&mount_dir).expect("create temporary mount dir");
+    let handler = Arc::new(ValidatingCommandHandler::default());
+    let vfs = Vfs::builder().mount("stage", handler.clone()).build();
+    let mount = serve_test_mount(vfs, &mount_dir)
+        .await
+        .expect("mount command VFS");
+    let target = mount_dir.join("stage/command");
+
+    let scripts = [
+        "printf '%s' \"$2\" > \"$1\"",
+        "echo \"$2\" > \"$1\"",
+        "printf '%s\\n' \"$2\" | cat > \"$1\"",
+    ];
+    let shells = ["sh", "bash"];
+    let mut outputs = Vec::new();
+    let mut counted = 0;
+    for body in ["{\"order\":1}", "{\"action\":1}"] {
+        for script in scripts {
+            for shell in shells {
+                let mut command = Command::new(shell);
+                command
+                    .arg("-c")
+                    .arg(script)
+                    .arg(shell)
+                    .arg(&target)
+                    .arg(body);
+                let output = command_output_with_timeout(command, Duration::from_secs(10))
+                    .await
+                    .expect("run mounted command writer");
+                let invocations = handler.invocations() - counted;
+                counted += invocations;
+                outputs.push((body, shell, script, output, invocations));
+            }
+        }
+    }
+    if let Err(err) = mount.unmount().await {
+        eprintln!("mounted command rejection test cleanup: unmount failed: {err}");
+    }
+    let _ = std::fs::remove_dir(&mount_dir);
+
+    for (body, shell, script, output, invocations) in outputs {
+        let output = output.unwrap_or_else(|| panic!("{shell} hung: {script}"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if body.contains("action") {
+            assert!(output.status.success(), "{shell} {script}: {stderr}");
+        } else {
+            assert!(
+                !output.status.success() && stderr.contains("Invalid argument"),
+                "{shell} {script} did not report the rejection: {stderr}"
+            );
+        }
+        assert_eq!(
+            invocations, 1,
+            "{shell} {script}: one command reached the handler {invocations} times"
+        );
+    }
+    let per_body = scripts.len() * shells.len();
+    assert_eq!(handler.accepted.load(Ordering::SeqCst), per_body);
+    assert_eq!(handler.rejected.load(Ordering::SeqCst), per_body);
+}
