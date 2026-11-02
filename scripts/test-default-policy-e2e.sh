@@ -2,7 +2,7 @@
 # End-to-end check of the default wallet policy on a throwaway developer triad.
 #
 # 1. Launch a triad whose Machine config chooses Hyperliquid and Polymarket in
-#    [petals.setup], and wait for Machine to install both from the release
+#    [setup], and wait for Machine to install both from the release
 #    catalog, as it does on a release install.
 # 2. `bloom wallet new main`: the debug driver completes the wallet
 #    registration ceremony, then the default-policy ceremony the command opens.
@@ -114,12 +114,12 @@ native_decimals = 18
 legacy_tx = false
 op_stack = false
 
-[petals]
-setup_complete = true
+[setup]
+complete = true
 
-[petals.setup.hyperliquid]
+[setup.petals.hyperliquid]
 
-[petals.setup.polymarket.values]
+[setup.petals.polymarket.values]
 max_daily_usd = "73"
 EOF
 chmod 0600 "$machine_config"
@@ -144,8 +144,8 @@ done
 source "$log_dir/triad.env"
 say "triad ready"
 
-grep -q '^\[petals.setup.polymarket.values\]' "$machine_home/config.toml" ||
-  die "launcher dropped the [petals.setup] tables"
+grep -q '^\[setup.petals.polymarket.values\]' "$machine_home/config.toml" ||
+  die "launcher dropped the [setup] tables"
 
 # Machine installs the catalog Petals in the background once it is ready.
 owners_dir="$machine_home/petals/store/owners"

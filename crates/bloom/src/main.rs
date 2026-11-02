@@ -3785,7 +3785,7 @@ async fn run(cli: Cli) -> Result<()> {
             // Building the daemon writes a default config when none exists, and
             // `bloom serve` does the same, so the file's presence says nothing
             // about setup. The marker is saved only together with the choices.
-            let first_setup = !d.config.petals.setup_complete;
+            let first_setup = !d.config.setup.complete;
             // `--persona` replaces any saved persona. Otherwise only first
             // setup asks, and an existing home keeps what it has.
             let previous_persona = d.config.persona.clone();
@@ -3812,14 +3812,14 @@ async fn run(cli: Cli) -> Result<()> {
             if first_setup {
                 if !structured_service_output() && default_policy::interactive_setup_available() {
                     default_policy::run_setup_menu(
-                        &mut d.config.petals,
+                        &mut d.config.setup,
                         d.config.persona.as_ref(),
                         &mut std::io::stdin().lock(),
                         &mut std::io::stdout(),
                     )?;
                 } else {
                     default_policy::accept_setup_suggestions(
-                        &mut d.config.petals,
+                        &mut d.config.setup,
                         d.config.persona.as_ref(),
                     );
                 }
@@ -3828,7 +3828,7 @@ async fn run(cli: Cli) -> Result<()> {
                 default_policy::record_pending_setup_settings(&d, &owners_before)
                     .await
                     .context("queue the chosen Petal settings")?;
-                d.config.petals.setup_complete = true;
+                d.config.setup.complete = true;
                 d.config
                     .save(&d.home.config_path())
                     .context("save setup choices")?;

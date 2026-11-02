@@ -37,14 +37,12 @@ pub fn for_petal(name: &str) -> &'static [PetalPolicyDestination] {
 /// Each address is Enso's published deployment for that chain
 /// (https://docs.enso.build/pages/build/reference/deployments) and was checked
 /// with `eth_getCode`: identical bytecode wherever the address repeats, and a
-/// distinct deployment on Linea and on the Arc/Robinhood/Tempo family. Adding
-/// a chain means checking its router the same way.
+/// distinct deployment on Linea and on Robinhood Chain and Tempo. Adding a
+/// chain means checking its router the same way, and a chain Enso's rules stop
+/// allowing comes out: Enso v0.1.7 dropped Arc, so its router is not listed.
 ///
 /// Enso's approvals go to the input token, which varies per route, so a swap
-/// from an ERC-20 still needs that token allowed separately. Enso v0.1.6's
-/// shipped rules also name BNB Chain `bnb` while Bloom names it `bsc`, so they
-/// refuse `bsc` routes until they use Bloom's name; the destination is listed
-/// here so the policy is ready when they do.
+/// from an ERC-20 still needs that token allowed separately.
 pub const ENSO_POLICY_DESTINATIONS: &[PetalPolicyDestination] = &[
     PetalPolicyDestination {
         chain: "arbitrum",
@@ -87,25 +85,21 @@ pub const ENSO_POLICY_DESTINATIONS: &[PetalPolicyDestination] = &[
         destination: ENSO_ROUTER_V2_LINEA,
     },
     PetalPolicyDestination {
-        chain: "arc",
-        destination: ENSO_ROUTER_V2_ARC_FAMILY,
-    },
-    PetalPolicyDestination {
         chain: "robinhood",
-        destination: ENSO_ROUTER_V2_ARC_FAMILY,
+        destination: ENSO_ROUTER_V2_ROBINHOOD_TEMPO,
     },
     PetalPolicyDestination {
         chain: "tempo",
-        destination: ENSO_ROUTER_V2_ARC_FAMILY,
+        destination: ENSO_ROUTER_V2_ROBINHOOD_TEMPO,
     },
 ];
 
-/// Enso Router V2 on every covered chain except Linea and the Arc family.
+/// Enso Router V2 on every covered chain except Linea, Robinhood Chain and Tempo.
 const ENSO_ROUTER_V2: &str = "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf";
 /// Enso's separate Linea deployment.
 const ENSO_ROUTER_V2_LINEA: &str = "0xa146d46823f3f594b785200102be5385cafce9b5";
-/// Enso's deployment shared by Arc, Robinhood Chain, and Tempo.
-const ENSO_ROUTER_V2_ARC_FAMILY: &str = "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7";
+/// Enso's deployment shared by Robinhood Chain and Tempo.
+const ENSO_ROUTER_V2_ROBINHOOD_TEMPO: &str = "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7";
 
 /// NEAR Intents deposits go to a fresh address for every quote, signed by the
 /// 1Click API, so no fixed address can be listed. `petal:near-intents` instead

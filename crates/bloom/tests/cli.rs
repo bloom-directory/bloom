@@ -956,7 +956,7 @@ fn init_ignores_legacy_preinstalled_opt_out() {
 
 /// Setup is recorded when it finishes, not inferred from the config file:
 /// `bloom serve` writes a default config before any `bloom init`, and an
-/// empty `[petals.setup]` is a valid choice rather than "never asked".
+/// empty `[setup.petals]` is a valid choice rather than "never asked".
 #[test]
 fn init_runs_setup_once_even_when_the_config_already_exists() {
     let home = fresh_home();
@@ -983,20 +983,20 @@ fn init_runs_setup_once_even_when_the_config_already_exists() {
 
     init(home.path());
     let mut config = bloom_proto::Config::load(&home_dir.config_path()).unwrap();
-    assert!(config.petals.setup_complete);
+    assert!(config.setup.complete);
     assert!(
-        config.petals.setup.contains_key("hyperliquid"),
+        config.setup.petals.contains_key("hyperliquid"),
         "non-interactive setup records the catalog's suggestions: {:?}",
-        config.petals.setup
+        config.setup.petals
     );
 
     // The owner's choice was "none of them"; a later run must keep it.
-    config.petals.setup.clear();
+    config.setup.petals.clear();
     config.save(&home_dir.config_path()).unwrap();
     init(home.path());
     let config = bloom_proto::Config::load(&home_dir.config_path()).unwrap();
-    assert!(config.petals.setup_complete);
-    assert!(config.petals.setup.is_empty(), "{:?}", config.petals.setup);
+    assert!(config.setup.complete);
+    assert!(config.setup.petals.is_empty(), "{:?}", config.setup.petals);
 }
 
 /// `bloom init` records a persona before the Petal setup it suggests values
@@ -1034,7 +1034,7 @@ fn init_records_the_chosen_persona_before_petal_setup() {
         )
     };
     let polymarket_limit = |config: &bloom_proto::Config| {
-        config.petals.setup["polymarket"].values["max_daily_usd"].clone()
+        config.setup.petals["polymarket"].values["max_daily_usd"].clone()
     };
 
     let degen_home = fresh_home();
@@ -1078,7 +1078,7 @@ fn init_leaves_a_legacy_home_alone_and_replaces_an_unusable_persona() {
     let home_dir = bloom_proto::HomeDir::at(home.path());
     home_dir.ensure().unwrap();
     let mut legacy = bloom_proto::Config::local_default();
-    legacy.petals.setup_complete = true;
+    legacy.setup.complete = true;
     legacy.save(&home_dir.config_path()).unwrap();
     let init = |persona: Option<&str>| {
         let mut command = bloom_cmd(home.path());
@@ -1143,7 +1143,7 @@ fn an_interrupted_init_still_queues_the_chosen_petal_settings() {
     assert!(!pending.join("hyperliquid").exists());
 }
 
-/// A home that recorded choices before `setup_complete` existed (an earlier
+/// A home that recorded choices before `setup.complete` existed (an earlier
 /// build of this setup) keeps them when `bloom init` runs setup again: a
 /// declined Petal stays declined and a custom value stays.
 #[test]
@@ -1152,13 +1152,13 @@ fn init_setup_on_an_existing_config_keeps_earlier_choices() {
     let home_dir = bloom_proto::HomeDir::at(home.path());
     home_dir.ensure().unwrap();
     let mut config = bloom_proto::Config::local_default();
-    config.petals.setup.insert(
+    config.setup.petals.insert(
         "polymarket".into(),
         bloom_proto::config::PetalSetupConfig {
             values: std::collections::BTreeMap::from([("max_daily_usd".into(), "42.5".into())]),
         },
     );
-    assert!(!config.petals.setup_complete);
+    assert!(!config.setup.complete);
     config.save(&home_dir.config_path()).unwrap();
 
     bloom_cmd(home.path())
@@ -1175,15 +1175,15 @@ fn init_setup_on_an_existing_config_keeps_earlier_choices() {
         ));
 
     let config = bloom_proto::Config::load(&home_dir.config_path()).unwrap();
-    assert!(config.petals.setup_complete);
+    assert!(config.setup.complete);
     assert_eq!(
-        config.petals.setup.keys().collect::<Vec<_>>(),
+        config.setup.petals.keys().collect::<Vec<_>>(),
         ["polymarket"],
         "declined Petals were added back: {:?}",
-        config.petals.setup
+        config.setup.petals
     );
     assert_eq!(
-        config.petals.setup["polymarket"].values["max_daily_usd"],
+        config.setup.petals["polymarket"].values["max_daily_usd"],
         "42.5"
     );
 }

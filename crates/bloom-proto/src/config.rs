@@ -70,6 +70,9 @@ pub struct Config {
     /// upper bound.
     #[serde(default)]
     pub petals: PetalsConfig,
+    /// What `bloom init` setup chose.
+    #[serde(default, skip_serializing_if = "SetupConfig::is_empty")]
+    pub setup: SetupConfig,
     #[serde(default)]
     pub mempool: BTreeMap<String, MempoolChainConfig>,
     #[serde(default)]
@@ -109,24 +112,44 @@ pub struct PetalsConfig {
     pub preinstalled: Vec<String>,
     #[serde(default)]
     pub runtime: BTreeMap<String, PetalRuntimeConfig>,
-    /// Petals chosen during `bloom init` setup, with the values each one's
-    /// settings need. Bloom provisions its canonical Petals regardless; the
-    /// default wallet policy proposes exactly these. They grant no authority.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub setup: BTreeMap<String, PetalSetupConfig>,
-    /// Written together with `setup` when `bloom init` finished. This, not an
-    /// empty `setup`, is what tells a later run that setup already happened:
-    /// declining every Petal is a valid choice, and `bloom serve` or an
-    /// interrupted menu can leave a config with no choices in it.
+    /// Where an earlier build of setup kept its choices. Read so such a home
+    /// still loads, and moved to [`Config::setup`] on load; never written.
+    #[serde(default, skip_serializing, rename = "setup")]
+    legacy_setup: BTreeMap<String, PetalSetupConfig>,
+    #[serde(default, skip_serializing, rename = "setup_complete")]
+    legacy_setup_complete: bool,
+}
+
+/// What `bloom init` setup chose, as the top-level `[setup]` table. It is
+/// not part of `[petals]`: a Bloom release refuses unknown keys there, but
+/// ignores an unknown top-level table, so a home this setup ran on still
+/// starts with an older Bloom. Unknown keys are ignored here for the same
+/// reason, so a later Bloom's additions never stop this one from starting.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SetupConfig {
+    /// Written when `bloom init` finished. This, not an empty `petals`, is
+    /// what tells a later run that setup already happened: declining every
+    /// Petal is a valid choice, and `bloom serve` or an interrupted menu can
+    /// leave a config with no choices in it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub setup_complete: bool,
+    pub complete: bool,
+    /// Petals chosen during setup, with the values each one's settings need.
+    /// Bloom provisions its canonical Petals regardless; the default wallet
+    /// policy proposes exactly these. They grant no authority.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub petals: BTreeMap<String, PetalSetupConfig>,
+}
+
+impl SetupConfig {
+    fn is_empty(&self) -> bool {
+        !self.complete && self.petals.is_empty()
+    }
 }
 
 /// Wallet whose default policy allows the Petals chosen during setup.
 pub const DEFAULT_POLICY_WALLET: &str = "main";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PetalSetupConfig {
     /// Named values substituted into the catalog's settings template.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -525,6 +548,7 @@ impl Config {
             )]),
             etherscan: None,
             petals: PetalsConfig::default(),
+            setup: SetupConfig::default(),
             mempool: BTreeMap::new(),
             private_rpc: BTreeMap::new(),
             backends: BackendsConfig::default(),
@@ -565,6 +589,14 @@ impl Config {
     /// and swap retired default endpoints that a saved config still holds verbatim.
     /// Like other load migrations, this updates the effective config; save persists it.
     fn migrate(&mut self) {
+        if self.setup.is_empty() {
+            self.setup = SetupConfig {
+                complete: self.petals.legacy_setup_complete,
+                petals: std::mem::take(&mut self.petals.legacy_setup),
+            };
+        }
+        self.petals.legacy_setup.clear();
+        self.petals.legacy_setup_complete = false;
         let mut defaults = Self::local_default();
         // Respect names already assigned to either family; never create a collision.
         if !self.chains.contains_key("arc") && !self.solana_chains.contains_key("arc") {
@@ -1209,29 +1241,90 @@ rpc_urls = ["https://ethereum-rpc.publicnode.com"]
     #[test]
     fn setup_completion_is_written_only_once_recorded() {
         let mut cfg = Config::local_default();
-        assert!(!cfg.petals.setup_complete);
+        assert!(!cfg.setup.complete);
         let encoded = toml::to_string_pretty(&cfg).unwrap();
-        assert!(!encoded.contains("setup_complete"), "{encoded}");
+        assert!(!encoded.contains("[setup"), "{encoded}");
 
         // Petal tables alone do not mean setup finished.
-        let mut with_tables = toml::Value::try_from(&cfg).unwrap();
-        with_tables["petals"]
-            .as_table_mut()
-            .unwrap()
-            .insert("setup".into(), toml::toml! { hyperliquid = {} }.into());
-        let decoded: Config = with_tables.try_into().unwrap();
-        assert!(decoded.petals.setup.contains_key("hyperliquid"));
-        assert!(!decoded.petals.setup_complete);
-
-        cfg.petals.setup_complete = true;
+        cfg.setup
+            .petals
+            .insert("hyperliquid".into(), PetalSetupConfig::default());
         let decoded: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
-        assert!(decoded.petals.setup_complete);
+        assert!(decoded.setup.petals.contains_key("hyperliquid"));
+        assert!(!decoded.setup.complete);
+
+        cfg.setup.complete = true;
+        let decoded: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        assert!(decoded.setup.complete);
+    }
+
+    /// Setup's choices sit outside `[petals]`, whose unknown keys a Bloom
+    /// release refuses, so going back to a release still loads the config.
+    /// The `[petals]` keys an earlier build of setup wrote still load, and
+    /// move to `[setup]` when the config is next saved.
+    #[test]
+    fn setup_choices_stay_out_of_the_table_releases_refuse_unknown_keys_in() {
+        let mut cfg = Config::local_default();
+        cfg.setup.complete = true;
+        cfg.setup.petals.insert(
+            "polymarket".into(),
+            PetalSetupConfig {
+                values: BTreeMap::from([("max_daily_usd".into(), "100".into())]),
+            },
+        );
+        let encoded = toml::to_string_pretty(&cfg).unwrap();
+        let document: toml::Value = toml::from_str(&encoded).unwrap();
+        assert_eq!(
+            document["petals"]
+                .as_table()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            ["runtime"],
+            "{encoded}"
+        );
+        // A release's `[petals]` table: only these keys, unknown ones refused.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct ReleasePetals {
+            #[serde(default)]
+            preinstalled: Vec<String>,
+            #[serde(default)]
+            runtime: BTreeMap<String, PetalRuntimeConfig>,
+        }
+        document["petals"]
+            .clone()
+            .try_into::<ReleasePetals>()
+            .unwrap();
+
+        let td = tempdir().unwrap();
+        let path = td.path().join("config.toml");
+        let legacy = encoded
+            .replace(
+                "[setup]\ncomplete = true",
+                "[petals]\nsetup_complete = true",
+            )
+            .replace("[setup.petals.", "[petals.setup.");
+        assert!(
+            legacy.contains("[petals.setup.polymarket.values]"),
+            "{legacy}"
+        );
+        std::fs::write(&path, &legacy).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert!(loaded.setup.complete);
+        assert_eq!(loaded.setup.petals, cfg.setup.petals);
+        loaded.save(&path).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("[petals.setup"), "{saved}");
+        assert!(!saved.contains("setup_complete"), "{saved}");
+        assert!(Config::load(&path).unwrap().setup.complete);
     }
 
     #[test]
     fn persona_migration_keeps_legacy_absent_and_independent_of_petal_setup() {
         let mut cfg = Config::local_default();
-        cfg.petals.setup_complete = true;
+        cfg.setup.complete = true;
         let legacy = toml::to_string(&cfg).unwrap();
         assert!(!legacy.contains("[persona]"));
         let mut decoded: Config = toml::from_str(&legacy).unwrap();
@@ -1242,7 +1335,7 @@ rpc_urls = ["https://ethereum-rpc.publicnode.com"]
         let encoded = toml::to_string(&decoded).unwrap();
         let reloaded: Config = toml::from_str(&encoded).unwrap();
         assert_eq!(reloaded.persona, decoded.persona);
-        assert!(reloaded.petals.setup_complete);
+        assert!(reloaded.setup.complete);
     }
 
     /// A saved persona that is not usable is set aside on load instead of

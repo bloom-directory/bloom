@@ -76,20 +76,19 @@ Agreed on 2026-09-14:
     interrupted, or a config `bloom serve` created first, still gets setup
     on the next `bloom init`.
 11. **Enso owns its own route rules.** Bloom writes no Enso settings. The
-    pinned Enso v0.1.6 keeps per-account rules at
-    `settings/<wallet>/<index>/venue.toml` and ships defaults covering the 13
-    chains it supports, so a fresh wallet can swap without a setup write. The
+    pinned Enso v0.1.7 keeps per-account rules at
+    `settings/<wallet>/<index>/venue.toml` and ships defaults covering the 12
+    chains it supports, by Bloom's chain names, so a fresh wallet can swap
+    without a setup write. The
     owner can replace those rules through Enso's own route. Bloom's part is
     decision 13: allowing Enso's router as a destination on each of those
     chains.
 
     Enso's shipped rules allow at most 100 bps of slippage and do not require
-    calldata verification, because Enso cannot yet prove a route's receiver or
-    minimum output; each plan still reports both as warnings. Enso v0.1.6's
-    shipped rules name BNB Chain `bnb` while Bloom names it `bsc`, so they
-    refuse `bsc` routes until they use Bloom's name. Its token-symbol table
-    covers every chain it supports except Arc, where an intent needs `0x`
-    token addresses.
+    calldata verification. Same-chain routes carry Router V2 receiver and
+    minimum-output checks; cross-chain routes stay unverified and are reported
+    as warnings. Where its token-symbol table has no entry for a chain, an
+    intent names tokens by `0x` address.
 12. **Feedback needs no setup settings or destination allowance.** It is the
     fifth canonical Petal, replacing retired Tolly. Setup does not enable any
     Petal's runtime writes.
@@ -105,9 +104,10 @@ Agreed on 2026-09-14:
     added with `bloom wallet update-policy`:
     - Enso: its router on every chain its shipped rules allow — one address
       on Arbitrum, Avalanche, Base, BNB Chain, Ethereum, Gnosis, HyperEVM,
-      Optimism, and Polygon, a second on Linea, and a third shared by Arc,
-      Robinhood Chain, and Tempo. Each address is Enso's published deployment,
-      checked with `eth_getCode`, and never taken from a quote.
+      Optimism, and Polygon, a second on Linea, and a third shared by
+      Robinhood Chain and Tempo. Each address is Enso's published deployment,
+      checked with `eth_getCode`, and never taken from a quote. Enso v0.1.7
+      dropped Arc, so its router there is not proposed.
     - NEAR Intents: `petal:near-intents` on Arbitrum, Avalanche, Base, BNB
       Chain, Ethereum, Gnosis, Optimism, and Polygon (decision 14).
     - Polymarket: pUSD, native USDC, USDC.e, and Enso Router V2 on Polygon,
@@ -192,7 +192,10 @@ Agreed on 2026-09-14:
       sessions cover only chains 1, 137 and 31337. Only the
       exact-transaction path uses it, never a Petal, and a token outside the
       table still needs its recipient listed, because any contract can answer
-      `decimals()` and run its own code under the `transfer` selector. Broker
+      `decimals()` and run its own code under the `transfer` selector. A
+      Petal cannot pass its transfer off as the wallet's own: Bloom refuses a
+      Petal's VFS write to a wallet's `outbox/new.tx`, so a Petal stages only
+      with its own staging call, which records it as the origin. Broker
       checks no destination on the wallet's own exact EVM approval, which
       carries no claim, so the owner's approval of each transfer is the only
       recipient check. On the pinned Broker that check is hard to make: a
@@ -254,7 +257,7 @@ Agreed on 2026-09-14:
 Bloom installs its canonical Petals (`DEFAULT_PETALS` in
 `crates/bloom/src/github_source.rs`) for every home and ignores the legacy
 `[petals] preinstalled` setting. Setup records each chosen Petal under
-`[petals.setup]`, with the values the menu asked about, and the default
+`[setup.petals]`, with the values the menu asked about, and the default
 policy proposes exactly these Petals. Canonical setup does not add runtime
 write switches. Saving the choices rewrites `config.toml` in full: comments
 and keys this build does not know are dropped, and anything it migrates on
@@ -268,17 +271,28 @@ schema_version = 2
 preset = "custodian"
 window_secs = 0
 
-[petals.setup.enso]
+[setup]
+complete = true
 
-[petals.setup.hyperliquid]
+[setup.petals.enso]
 
-[petals.setup.near-intents]
+[setup.petals.hyperliquid]
 
-[petals.setup.polymarket.values]
+[setup.petals.near-intents]
+
+[setup.petals.polymarket.values]
 max_daily_usd = "100"
 
-[petals.setup.feedback]
+[setup.petals.feedback]
 ```
+
+`[setup]` is a top-level table, not part of `[petals]`: a Bloom release
+refuses unknown keys under `[petals]` but ignores an unknown top-level table,
+so a home this setup ran on still starts if its owner goes back to a release.
+That release drops `[setup]` the next time it saves the config, and the next
+`bloom init` of this design then runs setup again. An earlier build of this
+design saved the choices under `[petals]`; they still load and move to
+`[setup]` on the next save.
 
 The policy uses the installed package hash for each chosen name, so a Petal
 installed another way, such as the local builds the developer triad installs,
@@ -292,10 +306,10 @@ suggestions, and writes the result through the Petal's own settings route,
 so it never interprets a Petal's settings format.
 
 The menu runs only on first-time setup and only in a terminal. Setup is
-recorded by `setup_complete = true` under `[petals]`, saved together with
-the choices once the menu finishes; a config file on its own proves nothing,
+recorded by `complete = true` under `[setup]`, saved together with the
+choices once the menu finishes; a config file on its own proves nothing,
 because `bloom serve` creates one too, and an interrupted menu saves nothing.
-An empty `[petals.setup]` is not the marker either: declining every Petal is
+An empty `[setup.petals]` is not the marker either: declining every Petal is
 a valid choice. Scripts and packaged installs record the catalog's
 suggestions instead of asking. Later runs of `bloom init` see the marker and
 use the config as it is, with the catalog's suggestions for any value not
@@ -342,8 +356,12 @@ chosen Petals:
 }
 ```
 
-- **`allowed_petal_packages`** lists each chosen Petal by the exact hash
-  Bloom's catalog pins: Hyperliquid v0.1.7 and Polymarket v0.1.8.
+- **`allowed_petal_packages`** lists each chosen Petal by its installed
+  package hash. On an up-to-date home that is the hash Bloom's catalog pins:
+  Hyperliquid v0.1.7 and Polymarket v0.1.8. A home still updating proposes
+  the release it runs. Until proposals from Petal changes are built
+  (section 5), the Petal's first signed action after the update opens a
+  policy ceremony that allows the new hash (`ensure_petal_eligibility`).
 - **`allowed_destinations`** lists the fixed contracts each chosen Petal
   transacts with (decision 13), from Bloom's catalog only; an edited config
   cannot add any. Existing destinations are kept. Only a wallet's first
@@ -488,6 +506,8 @@ Catalog Petals are installed and updated in two places: `bloom init`
 when the Petal stores nothing for them, which holds unless the same release
 was installed before and its settings kept. An update receives them
 only when the default wallet is known not to exist, and on the same terms.
+A write setup queued earlier is setup's own choice, not a new one, so an
+update makes it, again only while nothing is stored.
 `bloom init` prints the outcome, and `bloom serve` logs it.
 
 Each change is one policy update ceremony. Changes waiting at the same time
@@ -573,7 +593,7 @@ this design and those stacks:
   this rule and propose at any policy version. Rebased, their
   `WalletDefaultPolicy { name }` no longer compiles: onboarding must set
   `owner_just_chose` only right after it saves the selection. It should
-  preselect from `[petals.setup]` while the policy is still the one creation
+  preselect from `[setup.petals]` while the policy is still the one creation
   installed, and from what the current policy allows after that. Inside Machine
   this is `AfterPolicyChange::Propose` rather than a `bool`, so another flag
   passed in its place, such as bloom#377's `standing`, does not compile;
@@ -614,10 +634,14 @@ this design and those stacks:
   setup obligation has no frozen package/config revision"), so they must
   migrate or reconcile these markers. A build of this design on a home
   bloom#352 used treats their entry as its own marker. A queued retry writes
-  `[petals.setup]`'s values while nothing is stored under the settings key,
+  `[setup.petals]`'s values while nothing is stored under the settings key,
   and deletes the entry. It deletes it without writing when settings are
-  already stored or the installed release is not one setup checked, and
-  leaves it when the retry fails. A first-setup `bloom init` overwrites it
+  already stored or the installed release is one setup does not know. It
+  leaves it when the retry fails, and while the installed release is an
+  earlier one the catalog release updates from but whose settings live
+  elsewhere, such as Polymarket v0.1.5; the update then makes the write. A
+  setup write never touches the Petal's `last_error.json`, which reports an
+  agent's own writes. A first-setup `bloom init` overwrites it
   with an empty marker when it queues that Petal, and deletes it when it
   does not.
 - **Versions.** The sessions need Broker and Signer changes that are not
@@ -691,6 +715,10 @@ destination the owner removed is not proposed again behind a later request
   owner's approval of each transfer is the only recipient check. On the
   pinned Broker the approval page does not name the recipient; it appears
   only inside the raw calldata (decision 15).
+- A Petal cannot stage a transaction as the wallet's own. Bloom refuses a
+  Petal's VFS write to a wallet's `outbox/new.tx`; a Petal stages with its
+  own staging call, which records it as the origin, so a rule for the
+  wallet's own transfers, such as Degen's entry, never applies to it.
 - Signing the policy grants no signing authority. Every signature still
   needs an approval the owner gave for that transaction.
 - Petal limits live in each Petal's settings, not the signed policy. Any
@@ -709,7 +737,6 @@ These need other repositories and are out of scope:
 | Sign the policy inside the creation ceremony, for one ceremony in total | bloom-broker, bloom-signer |
 | Count Polymarket sells, add a total limit, and reset a count when its limit changes | bloom-petal-polymarket |
 | Keep Petal settings across updates outside a signed package lineage | The stable installation slot in [Petal derived keys and package succession](./Petal%20derived%20key%20succession.md) |
-| Accept Bloom's `bsc` chain name so BNB Chain routes work | bloom-petal-enso |
 | Create Hyperliquid sessions with fewer ceremonies | [bloom#171](https://github.com/bloom-directory/bloom/issues/171) |
 | Agree one chain naming for Petal policy destinations and typed persona sessions | bloom, bloom-broker ([bloom-broker#100](https://github.com/bloom-directory/bloom-broker/pull/100), [bloom-broker#112](https://github.com/bloom-directory/bloom-broker/pull/112)) |
 | Migrate pending setup-settings markers to versioned journals | bloom ([bloom#352](https://github.com/bloom-directory/bloom/pull/352)) |
@@ -723,7 +750,7 @@ changes come next.
 
 - **Setup** (`crates/bloom/src/default_policy.rs`, `crates/bloom-proto`):
   the `bloom init` menu and its non-interactive form, settings templates in
-  the catalog, and choices saved under `[petals.setup]` together with a
+  the catalog, and choices saved under `[setup]` together with a
   queued settings write for each chosen Petal setup will write. Settings are
   written through
   each Petal's route by `bloom init`, and by `bloom serve` when it installs a
@@ -759,8 +786,10 @@ Automated:
   invalid limits, and accepts the suggestions at the end of input. On a
   config with earlier choices it suggests exactly those choices and saved
   values. The scripted form chooses every canonical Petal on a fresh config,
-  keeps earlier choices (declines included) and values on an existing one,
-  and leaves runtime values unchanged.
+  keeps earlier choices (declines included) and values on an existing one.
+  The choices are saved outside `[petals]`, so a Bloom release still loads
+  the config, and choices an earlier build saved under `[petals]` still
+  load.
 - `bloom init` on an existing config with a declined Petal and a custom cap
   keeps both.
 - The settings decision writes for a Petal just installed, and for one
@@ -775,13 +804,15 @@ Automated:
   check lands after it, a check's own callbacks and other writes can write
   through the VFS meanwhile, and a check gives up untouched while writes to
   its key keep running (`crates/bloom-vfs/src/router.rs`). The Petal router
-  checks the key in the route's account partition and holds the Petal alone
-  for it (`crates/bloom-petals/src/router.rs`).
+  checks the key in the route's account partition, holds the Petal alone
+  for it, and leaves the agent's `last_error.json` record alone when the
+  write fails (`crates/bloom-petals/src/router.rs`).
 - A queued write that fails stays queued and is reported with the command
   that retries it; one whose retry cannot be recorded says so and gives the
-  manual command. `bloom serve` makes a queued write once `main` exists.
+  manual command. `bloom serve` makes a queued write once `main` exists, and
+  an update makes one rather than dropping it.
 - Setup queues exactly the writes an uninterrupted run would make, before
-  `setup_complete` is saved; an interrupted `bloom init` leaves them queued
+  `[setup] complete` is saved; an interrupted `bloom init` leaves them queued
   (`crates/bloom/tests/cli.rs`). A rerun finishes a queued write once
   `main` exists, and says how to make it when Broker cannot tell.
 - The wallet read and the policy step wait out Broker refusals that may
@@ -800,8 +831,15 @@ Automated:
   (`crates/bloom-vfs/tests/triad_policy_update.rs`).
 - Catalog provisioning reports an update separately from a fresh install.
 - A queued write goes into Polymarket v0.1.6 as well as the catalog's
-  v0.1.8, which store settings under the same key, and into no other
-  release; the catalog bump test lists both.
+  v0.1.8, which store settings under the same key. On v0.1.5, an earlier
+  release whose route differs, it stays queued for the update; any other
+  release gets nothing. The catalog bump test lists both and checks each is
+  the catalog release or one it updates from.
+- Enso's router is proposed on exactly the 12 chains pinned Enso v0.1.7
+  allows.
+- A Petal's VFS write to a wallet's `outbox/new.tx` is refused before it
+  reaches the VFS, while its reads and other writes are not
+  (`crates/bloom-petals/src/runner.rs`).
 - Each persona's menu choice, `--persona` and Polymarket suggestion; Degen's
   entry on configured chains and for `main` only; an unusable saved persona
   set aside; staging that passes only the wallet's own curated ERC-20

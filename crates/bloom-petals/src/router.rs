@@ -551,36 +551,28 @@ impl PetalRouter {
         }
     }
 
-    /// Run a route's write; the caller holds the Petal's write lock.
+    /// Run a route's write; the caller holds the Petal's write lock. On a
+    /// refusal it also returns the Petal's own reason, which dispatch_error
+    /// drops for a -2.
     async fn write_route(
         &self,
         mount: &str,
         rest: String,
         data: &[u8],
         path: &VfsPath,
-    ) -> Result<(), HandlerError> {
-        // dispatch_error drops a -2 message, so keep the Petal's own reason.
-        let mut reason = None;
-        let result = match self
-            .dispatch(mount, DispatchOp::Write, rest.clone(), data.to_vec())
+    ) -> Result<(), (HandlerError, Option<String>)> {
+        match self
+            .dispatch(mount, DispatchOp::Write, rest, data.to_vec())
             .await
         {
             Ok(DispatchResponse::Write) => Ok(()),
-            Ok(DispatchResponse::Error { code, message }) => {
-                reason = Some(message.clone());
-                Err(dispatch_error(code, message, path.to_string_path()))
-            }
-            Ok(other) => Err(unexpected_response("write", other)),
-            Err(error) => Err(error),
-        };
-        match &result {
-            Ok(()) => self.clear_write_error(mount, &rest),
-            Err(error) => {
-                let message = reason.unwrap_or_else(|| error.to_string());
-                self.record_write_error(mount, &rest, &message);
-            }
+            Ok(DispatchResponse::Error { code, message }) => Err((
+                dispatch_error(code, message.clone(), path.to_string_path()),
+                Some(message),
+            )),
+            Ok(other) => Err((unexpected_response("write", other), None)),
+            Err(error) => Err((error, None)),
         }
-        result
     }
 
     /// Whether this operation is a security effect: a write, or a read whose
@@ -838,7 +830,17 @@ impl Handler for PetalRouter {
             return Err(HandlerError::PermissionDenied);
         }
         let _held = self.write_locks.shared(mount).await;
-        self.write_route(mount, rest, data, path).await
+        match self.write_route(mount, rest.clone(), data, path).await {
+            Ok(()) => {
+                self.clear_write_error(mount, &rest);
+                Ok(())
+            }
+            Err((error, reason)) => {
+                let message = reason.unwrap_or_else(|| error.to_string());
+                self.record_write_error(mount, &rest, &message);
+                Err(error)
+            }
+        }
     }
 
     /// Write the route only while the Petal stores nothing under `key` for
@@ -846,6 +848,9 @@ impl Handler for PetalRouter {
     /// Petal lands in between. What is stored decides, not what the route
     /// reads: a route may read the same default whether its value is missing
     /// or was saved that way.
+    ///
+    /// Only Machine writes this way, and it reports its own failures, so the
+    /// Petal's `last_error.json` is left to the writes an agent made.
     async fn write_if_absent(
         &self,
         path: &VfsPath,
@@ -867,7 +872,9 @@ impl Handler for PetalRouter {
         if stored {
             return Ok(false);
         }
-        self.write_route(mount, rest, data, path).await?;
+        self.write_route(mount, rest, data, path)
+            .await
+            .map_err(|(error, _)| error)?;
         Ok(true)
     }
 
@@ -1390,7 +1397,8 @@ name = "example"
     /// A conditional write checks whether the Petal stores the key in the
     /// route's account partition, never writes the Petal root or its
     /// documents, and holds the Petal alone: it gives up while a write to the
-    /// Petal runs, and an ordinary write waits for it.
+    /// Petal runs, and an ordinary write waits for it. Its failures never
+    /// replace the error record an agent's write left.
     #[tokio::test]
     async fn write_if_absent_checks_the_store_and_holds_the_petal_alone() {
         let (dir, runner) = runner();
@@ -1406,8 +1414,19 @@ name = "example"
         let path = VfsPath::parse("/example/operations/alice/0/submit").unwrap();
         let key = "settings/alice/venue.toml";
 
+        // An agent's failed write is recorded for the agent to read.
+        let other = VfsPath::parse("/example/operations/alice/0/other").unwrap();
+        router.write(&other, b"agent").await.unwrap_err();
+        let recorded = router.last_error("example").unwrap();
+        assert!(
+            String::from_utf8_lossy(&recorded).contains("operations/alice/0/other"),
+            "{}",
+            String::from_utf8_lossy(&recorded)
+        );
+
         // Nothing stored: it goes on to the route's write, which this fixture
-        // refuses.
+        // refuses. Machine reports that failure itself, so the agent's record
+        // is left as it was.
         let error = router
             .write_if_absent(&path, key, b"new")
             .await
@@ -1416,6 +1435,7 @@ name = "example"
             error.to_string().contains("component route write"),
             "{error}"
         );
+        assert_eq!(router.last_error("example").unwrap(), recorded);
 
         // Stored in the account's partition, whatever it reads: kept.
         crate::private_store::PrivateStore::open_account(

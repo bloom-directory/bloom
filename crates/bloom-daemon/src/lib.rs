@@ -4699,14 +4699,14 @@ impl Daemon {
         // The default-policy wallet's first Petal proposal also allows every
         // installed Petal chosen during setup, and the persona's destinations.
         let default_policy_packages: bloom_vfs::handlers::DefaultPolicyPackages = {
-            // Read once: only `bloom init` writes `[petals.setup]`, and it needs
+            // Read once: only `bloom init` writes `[setup]`, and it needs
             // the home write lock this daemon holds, so the choice cannot change
             // while this closure is alive. Installed hashes are resolved on each
             // call, so a Petal update is picked up without a restart. The
             // persona is read from disk on each call instead, so a persona
             // saved while Machine runs is never proposed from a stale copy; a
             // config that cannot be read stops the proposal.
-            let chosen: Vec<String> = config.petals.setup.keys().cloned().collect();
+            let chosen: Vec<String> = config.setup.petals.keys().cloned().collect();
             let config_path = home.config_path();
             let store = petal_store.clone();
             Arc::new(move |wallet: &str| {
