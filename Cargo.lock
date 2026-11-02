@@ -2153,9 +2153,9 @@ dependencies = [
 
 [[package]]
 name = "bip39"
-version = "2.2.2"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90dbd31c98227229239363921e60fcf5e558e43ec69094d46fc4996f08d1d5bc"
+checksum = "4559bb9225f8401dcea601cf8dc9ed81ea0dadd9cf7755fdefdd93ef7961e19e"
 dependencies = [
  "bitcoin_hashes",
  "serde",
@@ -2805,7 +2805,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=c157444af1b118a2d03f1ac5ce7a04933669c084#c157444af1b118a2d03f1ac5ce7a04933669c084"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=3f880d7b96ebcc18f07afadac6f07c7f7036e90c#3f880d7b96ebcc18f07afadac6f07c7f7036e90c"
 dependencies = [
  "bloom-rpc-wire",
  "ed25519-dalek",
@@ -2820,7 +2820,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-derive"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=c157444af1b118a2d03f1ac5ce7a04933669c084#c157444af1b118a2d03f1ac5ce7a04933669c084"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=3f880d7b96ebcc18f07afadac6f07c7f7036e90c#3f880d7b96ebcc18f07afadac6f07c7f7036e90c"
 dependencies = [
  "bip39",
  "ed25519-dalek",
@@ -9102,7 +9102,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.2",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.52.0",
