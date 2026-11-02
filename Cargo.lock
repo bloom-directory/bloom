@@ -2443,7 +2443,7 @@ dependencies = [
 [[package]]
 name = "bloom-broker-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=f3b8a6ded2292c3b9d5c31efd153f515aa6f8b7e#f3b8a6ded2292c3b9d5c31efd153f515aa6f8b7e"
+source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=13c4240a9a74a3f9ee5bb84d407e0262484dad24#13c4240a9a74a3f9ee5bb84d407e0262484dad24"
 dependencies = [
  "bech32",
  "bloom-rpc-wire",
@@ -9520,7 +9520,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.2",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
