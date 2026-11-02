@@ -10,8 +10,9 @@ and the workflow and release driver checked into the commit being released.
    than the current workspace version, including when preparing the PR by hand.
    The Propose Release workflow enforces this comparison; production publication
    does not enforce monotonicity. Update the workspace version in
-   `Cargo.toml`, workspace package records in `Cargo.lock`, and the Machine
-   version in `packaging/triad/release/compatibility-v1.toml`. The optional
+   `Cargo.toml`, workspace package records in `Cargo.lock`, the Machine
+   version in `packaging/triad/release/compatibility-v1.toml`, and the skill's
+   `metadata.version` in `skills/bloom/SKILL.md`. The optional
    **Propose Release** workflow creates this PR; it never tags or publishes.
    Keep reviewed source and Petal pins unless a separate change validates them.
 2. Require normal PR CI and acceptance evidence appropriate to the changes.
@@ -46,6 +47,10 @@ and the workflow and release driver checked into the commit being released.
 7. Coordinate website guide updates and verify the live setup script selects
    the new stable release and uses the reviewed key. It discovers the release
    tag dynamically; do not add a floating `latest` Git tag.
+8. Publish the skill at the tag, following [docs/agent-skill.md](docs/agent-skill.md):
+   publish `skills/bloom` to ClawHub as `X.Y.Z`, repin the website to the tag's
+   commit, and test the upgrade from the previous release's skill on skills.sh
+   and ClawHub.
 
 The previous v0.3.0 and v0.3.1 releases used lightweight version tags on their
 reviewed merge commits. Artifact authentication uses SSHSIG, with namespaces

@@ -49,8 +49,8 @@ the workflow.
 
 Run **Actions → Propose Release → Run workflow** with the next version without
 `v`. Review changes to `Cargo.toml`, workspace metadata in `Cargo.lock`, and
-the Machine version in `packaging/triad/release/compatibility-v1.toml`. The
-workflow refuses to upgrade unrelated external dependencies. The compatibility
+the Machine version in `packaging/triad/release/compatibility-v1.toml`, and the
+skill version in `skills/bloom/SKILL.md`. The workflow refuses to upgrade unrelated external dependencies. The compatibility
 matrix also pins the reviewed Broker and Signer source commits; changes to
 those pins require review independently of the version bump.
 
