@@ -77,11 +77,11 @@ const modelSuites = {
     codex: ['gpt-6.1-terra'],
   },
   expanded: {
-    claude: ['claude-fable-5-1', 'claude-opus-5-5', 'claude-sonnet-5-5'],
+    claude: ['claude-opus-5-5', 'claude-sonnet-5-5'],
     codex: ['gpt-6.1-sol', 'gpt-6.1-terra'],
   },
   'claude-revisions': {
-    claude: ['claude-fable-5-1', 'claude-opus-5-5', 'claude-sonnet-5-5'],
+    claude: ['claude-opus-5-5', 'claude-sonnet-5-5'],
     codex: [],
   },
 } as const;

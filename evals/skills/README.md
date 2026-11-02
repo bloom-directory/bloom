@@ -41,12 +41,12 @@ hand. Each takes five fresh, uncached samples per platform:
 
 ```sh
 npm run eval          # claude-sonnet-5-5 and gpt-6.1-terra
-npm run eval:models   # 3 Claude and 2 Codex models
-npm run eval:claude   # the 3 Claude models only
+npm run eval:models   # 2 Claude and 2 Codex models
+npm run eval:claude   # the 2 Claude models only
 ```
 
-The expanded suite covers Claude Fable 5.1, Opus 5.5, and Sonnet 5.5, plus
-Codex GPT-6.1-Sol and GPT-6.1-Terra. Each command writes its own
+The expanded suite covers Claude Opus 5.5 and Sonnet 5.5, plus Codex
+GPT-6.1-Sol and GPT-6.1-Terra. Each command writes its own
 report under the ignored `results/` directory.
 
 Override providers or exact model lists when needed:
