@@ -298,6 +298,41 @@ impl Reconciler {
             if !self.audit_result(&se, &receipt_correlation, receipt_result) {
                 break;
             }
+            // A cancel is a competing same-nonce transaction, not proof that
+            // the original lost. Prefer its original receipt; only record a
+            // cancellation after observing the replacement on chain.
+            if matches!(&receipt_call, Ok(None)) {
+                let cancel_hash = self
+                    .outbox
+                    .sent_dir(&se.wallet, &se.chain, &se.id)
+                    .ok()
+                    .and_then(|dir| std::fs::read_to_string(dir.join("cancel_tx_hash")).ok())
+                    .and_then(|hash| hash.trim().parse::<alloy::primitives::B256>().ok());
+                if let Some(hash) = cancel_hash {
+                    let Some(correlation) = self.audit_intent(&se, serde_json::json!({
+                        "operation": "tx.reconcile.cancel_receipt_lookup", "tx_hash": format!("{hash:#x}")
+                    })) else { break; };
+                    let cancel = chain.receipt(hash).await;
+                    if !self.audit_result(&se, &correlation, serde_json::json!({
+                        "outcome": match &cancel { Ok(Some(_)) => "found", Ok(None) => "not_found", Err(_) => "error" }
+                    })) { break; }
+                    if let Ok(Some(receipt)) = cancel {
+                        let record = MinedReceipt {
+                            outcome: "cancelled".into(),
+                            tx_hash: format!("{hash:#x}"),
+                            block_number: receipt.block_number,
+                            contract_address: None,
+                            revert_reason: None,
+                        };
+                        if let Ok(bytes) = serde_json::to_vec_pretty(&record)
+                            && self.project_receipt(&se, &bytes).is_ok()
+                        {
+                            updated += 1;
+                        }
+                        continue;
+                    }
+                }
+            }
             let receipt = match receipt_call {
                 Ok(Some(r)) => {
                     self.backoff
@@ -606,6 +641,7 @@ mod tests {
         /// is answered, simulating a slow read inside one tick.
         clock_on_nonce: ClockOnNonce,
         fail_result_audit: Option<Arc<AuditLog>>,
+        receipt_hash: Option<String>,
     }
 
     impl MockRpc {
@@ -620,6 +656,7 @@ mod tests {
                 nonce_calls: Arc::new(AtomicUsize::new(0)),
                 clock_on_nonce: Arc::new(Mutex::new(None)),
                 fail_result_audit: None,
+                receipt_hash: None,
             }
         }
 
@@ -676,6 +713,10 @@ mod tests {
                             }
                             if *rpc.receipt_fails.lock().unwrap() {
                                 reply("error", rpc.receipt_error.clone())
+                            } else if rpc.receipt_hash.as_ref().is_some_and(|hash| {
+                                request_json["params"][0].as_str() != Some(hash.as_str())
+                            }) {
+                                reply("result", serde_json::Value::Null)
                             } else {
                                 reply("result", rpc.receipt.lock().unwrap().clone())
                             }
@@ -856,6 +897,62 @@ mod tests {
         let reconciler = Reconciler::new(outbox, chains, audit)
             .with_clock(Arc::new(move || start + *clock_elapsed.lock().unwrap()));
         (reconciler, elapsed)
+    }
+
+    #[tokio::test]
+    async fn a_mined_cancel_terminates_the_original_without_reporting_its_success() {
+        let (_directory, outbox) = sent_outbox();
+        let entry = outbox.read("alice", "anvil", "tx-1").unwrap();
+        let hash = format!("{:#x}", alloy::primitives::B256::repeat_byte(8));
+        outbox
+            .write_artefact(&entry.dir, "cancel_tx_hash", hash.as_bytes())
+            .unwrap();
+        let audit_directory = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(audit_directory.path().join("audit.jsonl")).unwrap());
+        let mut rpc = MockRpc::new(Some(1), mined_receipt());
+        rpc.receipt_hash = Some(hash.clone());
+        let chains = ChainRegistry::default();
+        chains.add(mock_chain(rpc).await);
+        let reconciler = Reconciler::new(outbox.clone(), chains, audit);
+        assert_eq!(reconciler.tick().await, 1);
+        let receipt = outbox
+            .read_receipt("alice", "anvil", "tx-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.outcome, "cancelled");
+        assert_eq!(receipt.tx_hash, hash);
+        assert!(!receipt.is_success());
+        assert_eq!(
+            outbox.read("alice", "anvil", "tx-1").unwrap().staged.status,
+            TxStatus::Cancelled
+        );
+        assert_eq!(reconciler.tick().await, 0);
+    }
+
+    #[tokio::test]
+    async fn original_receipt_is_recorded_when_it_beats_a_cancel_replacement() {
+        let (_directory, outbox) = sent_outbox();
+        let entry = outbox.read("alice", "anvil", "tx-1").unwrap();
+        outbox
+            .write_artefact(
+                &entry.dir,
+                "cancel_tx_hash",
+                format!("{:#x}", alloy::primitives::B256::repeat_byte(8)).as_bytes(),
+            )
+            .unwrap();
+        let audit_directory = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(audit_directory.path().join("audit.jsonl")).unwrap());
+        let rpc = MockRpc::new(Some(1), mined_receipt());
+        let chains = ChainRegistry::default();
+        chains.add(mock_chain(rpc).await);
+        let reconciler = Reconciler::new(outbox.clone(), chains, audit);
+        assert_eq!(reconciler.tick().await, 1);
+        assert!(
+            outbox
+                .read_receipt("alice", "anvil", "tx-1")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

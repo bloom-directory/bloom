@@ -1660,7 +1660,9 @@ impl WalletsHandler {
             return Ok(());
         }
 
-        let projection = self.wallet_projection(wallet).await?;
+        // Allocation terms bind policy and revocation versions; display cache
+        // freshness is not authority to prepare a new custody operation.
+        let projection = self.wallet_projection_authority(wallet).await?;
         if projection.wallet.root_key_ref.is_some() {
             return Err(HandlerError::invalid(
                 "account creation requires a BIP-39 wallet; imported and legacy wallets have no \

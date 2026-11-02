@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bloom_broker_api::{
-    AssetId, CryptoSuite, DecimalU64, DecimalU256, DeclaredFee, Digest32, OperationId,
-    PetalUseClaim, ProtocolErrorCode, ProvenanceCatalog, ProvenanceSubject, RequestNonce, Token,
-    ValueLimit,
+    ApprovalLifecycleState, AssetId, CryptoSuite, DecimalU64, DecimalU256, DeclaredFee, Digest32,
+    DurableEffect, OperationId, OperationState, PetalUseClaim, ProtocolErrorCode,
+    ProvenanceCatalog, ProvenanceSubject, RequestNonce, Token, ValueLimit,
 };
 use bloom_machine_client::{
     ExactPayloadBatchSignRequest, ExactPayloadSignOutcome, ExactPayloadSignRequest,
@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 const STATE_SCHEMA: &str = "bloom.machine_exact_signing.v1";
+const REUSABLE_ATTEMPT_SCHEMA: &str = "bloom.machine_reusable_signing_attempt.v1";
+const REUSABLE_ATTEMPT_DOMAIN: &[u8] = b"bloom.machine.reusable-signing-attempt/v1\0";
 const APPROVAL_TTL_MS: u64 = 5 * 60 * 1000;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -94,6 +96,56 @@ pub enum ExactPayloadBatchOutcome {
     Signed(Vec<Vec<u8>>),
 }
 
+/// Why exact signing returned no outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExactSigningError {
+    /// Nothing was signed: a local check, an approval prepare, or a signing
+    /// refusal Broker marks final.
+    Refused(String),
+    /// A signing request may already have produced a signature.
+    OutcomeUnknown(String),
+}
+
+impl From<String> for ExactSigningError {
+    fn from(message: String) -> Self {
+        Self::Refused(message)
+    }
+}
+
+impl From<&str> for ExactSigningError {
+    fn from(message: &str) -> Self {
+        Self::Refused(message.to_owned())
+    }
+}
+
+impl std::fmt::Display for ExactSigningError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(message) | Self::OutcomeUnknown(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl ExactSigningError {
+    /// Classify a Broker failure. A request that could have signed
+    /// (`signing`) is a refusal only when Broker's error contract says it
+    /// left nothing behind; otherwise a signature may already exist.
+    pub fn from_broker(error: bloom_broker_api::ProtocolError, signing: bool) -> Self {
+        if signing && !leaves_nothing_signed(&error) {
+            Self::OutcomeUnknown(error.to_string())
+        } else {
+            Self::Refused(error.to_string())
+        }
+    }
+}
+
+fn leaves_nothing_signed(error: &bloom_broker_api::ProtocolError) -> bool {
+    matches!(
+        error.durable_effect,
+        DurableEffect::None | DurableEffect::ReservationReleased
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExactSigningState {
@@ -159,6 +211,27 @@ struct ReusablePetalBatchSigningState {
     approval_id: Option<Digest32>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReusablePetalBatchSigningAttempt {
+    schema: String,
+    signing_operation_id: OperationId,
+    request_digest: Digest32,
+    /// The signing call for this attempt returned an outcome that leaves
+    /// nothing in flight: a signature, or a refusal with no lasting effect.
+    /// Absent until then, including in attempts recorded before this field.
+    #[serde(default)]
+    settled: bool,
+}
+
+#[derive(Serialize)]
+struct ReusablePetalBatchSigningAttemptIdentity<'a> {
+    ordered_payload_digests: &'a [Digest32],
+    ordered_hashes: &'a [Digest32],
+    petal_use_claim: &'a PetalUseClaim,
+    claim_assurance_evidence_digest: Option<Digest32>,
+}
+
 impl BrokerExactPayloadSigner {
     pub fn new(broker: MachineBrokerClient, provenance_catalog: ProvenanceCatalog) -> Self {
         Self {
@@ -220,7 +293,7 @@ impl BrokerExactPayloadSigner {
             )
             .await;
         let _ = lock.unlock();
-        result
+        result.map_err(|error| error.to_string())
     }
 
     /// Exact Petal payload signing uses installer-authenticated package and
@@ -241,7 +314,7 @@ impl BrokerExactPayloadSigner {
         trusted_subject: &ProvenanceSubject,
         claim: &PetalUseClaim,
         claim_assurance_evidence: Option<&[u8]>,
-    ) -> Result<ExactPayloadOutcome, String> {
+    ) -> Result<ExactPayloadOutcome, ExactSigningError> {
         let parent = state_path
             .parent()
             .ok_or_else(|| "exact signing state path has no parent".to_owned())?;
@@ -280,6 +353,49 @@ impl BrokerExactPayloadSigner {
         result
     }
 
+    /// The owner ceremony a stored approval still waits on. Signing with it
+    /// now would fail CLAIM_INVALID, which reads as a final refusal, so a
+    /// retry returns the same pending approval instead. A status Broker cannot
+    /// confirm is outcome-unknown: never sign, never drop the approval. A
+    /// Broker without the status method predates the check; let signing report.
+    async fn awaiting_owner(
+        &self,
+        approval_id: Option<&Digest32>,
+    ) -> Result<Option<(Digest32, String, u64)>, ExactSigningError> {
+        let Some(approval_id) = approval_id else {
+            return Ok(None);
+        };
+        let unconfirmed = || {
+            ExactSigningError::OutcomeUnknown(
+                "the stored approval's ceremony is unconfirmed; retry without rebuilding".into(),
+            )
+        };
+        let status = match self.broker.approval_status(approval_id.clone()).await {
+            Ok(status) => status,
+            Err(error)
+                if matches!(
+                    error.code,
+                    ProtocolErrorCode::UnknownMethod | ProtocolErrorCode::UnknownField
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(_) => return Err(unconfirmed()),
+        };
+        if !matches!(
+            status.state,
+            ApprovalLifecycleState::Prepared | ApprovalLifecycleState::AwaitingCeremony
+        ) {
+            return Ok(None);
+        }
+        match (status.ceremony_url, status.ceremony_expires_at_ms) {
+            (Some(url), Some(expires)) => Ok(Some((approval_id.clone(), url, expires.get()))),
+            // Pending, but with no ceremony to await: the lookup may have
+            // missed a live one, and signing now would refuse and drop it.
+            _ => Err(unconfirmed()),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn sign_or_prepare_locked(
         &self,
@@ -293,7 +409,7 @@ impl BrokerExactPayloadSigner {
         canonical_plan_facts: &serde_json::Value,
         trusted_subject: Option<&ProvenanceSubject>,
         petal_claim: Option<(&PetalUseClaim, Option<&[u8]>)>,
-    ) -> Result<ExactPayloadOutcome, String> {
+    ) -> Result<ExactPayloadOutcome, ExactSigningError> {
         let operation_class_token = Token::new(operation_class.to_owned())
             .map_err(|error| format!("operation class: {error}"))?;
         let provenance = self
@@ -343,7 +459,7 @@ impl BrokerExactPayloadSigner {
                     approval_id: None,
                 }
             }
-            Err(error) => return Err(format!("read exact signing state: {error}")),
+            Err(error) => return Err(format!("read exact signing state: {error}").into()),
         };
         if state.schema != STATE_SCHEMA
             || state.action_id != action_id
@@ -359,7 +475,11 @@ impl BrokerExactPayloadSigner {
             return Err("exact signing retry differs from its persisted operation identity".into());
         }
         let now = now_ms()?;
-        if state.expires_at_ms.get() <= now {
+        // A local TTL cannot retire an approval or a signing operation. Once
+        // prepared, replay the same identity so Broker can recover its result
+        // or report its authoritative expiry. In particular, do not replace
+        // a ceremony that the owner is still completing.
+        if state.expires_at_ms.get() <= now && state.approval_id.is_none() {
             state.approval_operation_id = random_operation_id();
             state.signing_operation_id = random_operation_id();
             state.request_nonce = random_request_nonce();
@@ -372,7 +492,7 @@ impl BrokerExactPayloadSigner {
             .map(|(claim, _)| exact_claim_value_limits(claim))
             .transpose()?
             .unwrap_or_default();
-        let mut request = ExactPayloadSignRequest {
+        let request = ExactPayloadSignRequest {
             wallet_id,
             preimage: preimage.to_vec(),
             claimed_hash,
@@ -398,21 +518,16 @@ impl BrokerExactPayloadSigner {
                 .and_then(|(_, evidence)| evidence.map(<[u8]>::to_vec)),
             approval_value_limits,
         };
-        let mut response = self.broker.sign_exact_payload(request.clone()).await;
-        if response
-            .as_ref()
-            .is_err_and(|error| error.code == ProtocolErrorCode::OperationIdConflict)
-            && state.approval_id.is_some()
+        if let Some((approval_id, ceremony_url, ceremony_expires_at_ms)) =
+            self.awaiting_owner(state.approval_id.as_ref()).await?
         {
-            // A prior attempt may have committed at Broker before its response
-            // reached Machine. Keep the activated approval and immutable payload,
-            // but never retry a signing reservation that Broker finalized.
-            state.signing_operation_id = random_operation_id();
-            request.signing_operation_id = state.signing_operation_id.clone();
-            write_state(state_path, &state)?;
-            response = self.broker.sign_exact_payload(request).await;
+            return Ok(ExactPayloadOutcome::ApprovalRequired {
+                approval_id,
+                ceremony_url,
+                ceremony_expires_at_ms,
+            });
         }
-        match response {
+        match self.broker.sign_exact_payload_recovering(request).await {
             Ok(ExactPayloadSignOutcome::ApprovalRequired(prepared)) => {
                 state.approval_id = Some(prepared.approval_id.clone());
                 write_state(state_path, &state)?;
@@ -423,18 +538,21 @@ impl BrokerExactPayloadSigner {
                 })
             }
             Ok(ExactPayloadSignOutcome::Signed(result)) => {
-                let signature = result
-                    .signatures
-                    .first()
-                    .ok_or_else(|| "Broker returned no exact signature".to_owned())?;
                 if result.signatures.len() != 1 {
-                    return Err("Broker returned an unexpected exact signature count".into());
+                    return Err(ExactSigningError::OutcomeUnknown(
+                        "Broker returned an unexpected exact signature count".into(),
+                    ));
                 }
-                Ok(ExactPayloadOutcome::Signed(signature.bytes.decode()))
+                Ok(ExactPayloadOutcome::Signed(
+                    result.signatures[0].bytes.decode(),
+                ))
             }
             Err(error) => {
                 tracing::error!(code = ?error.code, message = %error.message, action_id, "petal exact signing failed");
-                Err(error.to_string())
+                Err(ExactSigningError::from_broker(
+                    error,
+                    state.approval_id.is_some(),
+                ))
             }
         }
     }
@@ -453,7 +571,7 @@ impl BrokerExactPayloadSigner {
         trusted_subject: &ProvenanceSubject,
         claim: &PetalUseClaim,
         claim_assurance_evidence: Option<&[u8]>,
-    ) -> Result<ExactPayloadBatchOutcome, String> {
+    ) -> Result<ExactPayloadBatchOutcome, ExactSigningError> {
         let parent = state_path
             .parent()
             .ok_or_else(|| "exact batch signing state path has no parent".to_owned())?;
@@ -511,7 +629,7 @@ impl BrokerExactPayloadSigner {
         trusted_subject: &ProvenanceSubject,
         claim: &PetalUseClaim,
         claim_assurance_evidence: Option<&[u8]>,
-    ) -> Result<ExactPayloadBatchOutcome, String> {
+    ) -> Result<ExactPayloadBatchOutcome, ExactSigningError> {
         let parent = state_path
             .parent()
             .ok_or_else(|| "reusable batch signing state path has no parent".to_owned())?;
@@ -565,7 +683,7 @@ impl BrokerExactPayloadSigner {
         trusted_subject: &ProvenanceSubject,
         claim: &PetalUseClaim,
         claim_assurance_evidence: Option<&[u8]>,
-    ) -> Result<ExactPayloadBatchOutcome, String> {
+    ) -> Result<ExactPayloadBatchOutcome, ExactSigningError> {
         let operation_class_token = Token::new(operation_class.to_owned())
             .map_err(|error| format!("operation class: {error}"))?;
         let provenance = self
@@ -613,7 +731,7 @@ impl BrokerExactPayloadSigner {
                     approval_id: None,
                 }
             }
-            Err(error) => return Err(format!("read reusable batch signing state: {error}")),
+            Err(error) => return Err(format!("read reusable batch signing state: {error}").into()),
         };
         if state.schema != STATE_SCHEMA
             || state.action_id != action_id
@@ -629,8 +747,58 @@ impl BrokerExactPayloadSigner {
                 "reusable batch retry differs from its persisted authorization scope".into(),
             );
         }
+        let payload_digests = preimages
+            .iter()
+            .map(|payload| Digest32::from_bytes(Sha256::digest(payload).into()))
+            .collect::<Vec<_>>();
+        let attempt_identity = ReusablePetalBatchSigningAttemptIdentity {
+            ordered_payload_digests: &payload_digests,
+            ordered_hashes: claimed_hashes,
+            petal_use_claim: claim,
+            claim_assurance_evidence_digest: claim_assurance_evidence
+                .map(|evidence| Digest32::from_bytes(Sha256::digest(evidence).into())),
+        };
+        let attempt_bytes = serde_jcs::to_vec(&attempt_identity)
+            .map_err(|error| format!("canonicalize reusable signing attempt: {error}"))?;
+        let mut attempt_hasher = Sha256::new();
+        attempt_hasher.update(REUSABLE_ATTEMPT_DOMAIN);
+        attempt_hasher.update(attempt_bytes);
+        let request_digest = Digest32::from_bytes(attempt_hasher.finalize().into());
+        let attempt_path = state_path.with_extension("attempt.json");
+        let previous_attempt = match fs::read(&attempt_path) {
+            Ok(bytes) => Some(
+                serde_json::from_slice::<ReusablePetalBatchSigningAttempt>(&bytes)
+                    .map_err(|error| format!("read reusable signing attempt: {error}"))?,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(format!("read reusable signing attempt: {error}").into()),
+        };
+        if previous_attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.schema != REUSABLE_ATTEMPT_SCHEMA)
+        {
+            return Err("reusable signing attempt schema is unsupported".into());
+        }
         let now = now_ms()?;
-        if state.expires_at_ms.get() <= now {
+        let expired = state.expires_at_ms.get() <= now && state.approval_id.is_none();
+        let different_request = previous_attempt.as_ref().filter(|attempt| {
+            attempt.signing_operation_id == state.signing_operation_id
+                && attempt.request_digest != request_digest
+        });
+        if let Some(attempt) = previous_attempt.as_ref().filter(|attempt| {
+            attempt.signing_operation_id == state.signing_operation_id
+                && (different_request.is_some() || expired)
+        }) && !attempt.settled
+        {
+            // New bytes replace the attempt's identity, and with it the
+            // approval. Do that only once the earlier operation is final:
+            // while it may still sign, a fresh approval would put a second
+            // operation beside it. Approval expiry does not prove that an
+            // operation accepted before expiry has finished signing.
+            self.require_attempt_final(&attempt.signing_operation_id)
+                .await?;
+        }
+        if different_request.is_some() || expired {
             state.approval_operation_id = random_operation_id();
             state.signing_operation_id = random_operation_id();
             state.request_nonce = random_request_nonce();
@@ -639,6 +807,32 @@ impl BrokerExactPayloadSigner {
             state.approval_id = None;
         }
         write_state(state_path, &state)?;
+        // A write made while the owner's ceremony is still open cannot sign.
+        // Recording an attempt for its bytes would make the rebuild after the
+        // ceremony look like a different request and set the approval aside,
+        // so the owner would have to approve again. Report the open ceremony
+        // instead, and record nothing.
+        if let Some((approval_id, ceremony_url, ceremony_expires_at_ms)) =
+            self.awaiting_owner(state.approval_id.as_ref()).await?
+        {
+            return Ok(ExactPayloadBatchOutcome::ApprovalRequired {
+                approval_id,
+                ceremony_url,
+                ceremony_expires_at_ms,
+            });
+        }
+        let attempt = state
+            .approval_id
+            .is_some()
+            .then(|| ReusablePetalBatchSigningAttempt {
+                schema: REUSABLE_ATTEMPT_SCHEMA.into(),
+                signing_operation_id: state.signing_operation_id.clone(),
+                request_digest,
+                settled: false,
+            });
+        if let Some(attempt) = &attempt {
+            write_state(&attempt_path, attempt)?;
+        }
         let request = ExactPayloadBatchSignRequest {
             wallet_id,
             preimages: preimages.to_vec(),
@@ -662,7 +856,15 @@ impl BrokerExactPayloadSigner {
             petal_use_claim: Some(claim.clone()),
             claim_assurance_evidence: claim_assurance_evidence.map(<[u8]>::to_vec),
         };
-        match self.broker.sign_reusable_petal_payload_batch(request).await {
+        let response = self.broker.sign_reusable_petal_payload_batch(request).await;
+        if let Some(mut attempt) = attempt
+            && response.as_ref().err().is_none_or(leaves_nothing_signed)
+        {
+            attempt.settled = true;
+            // A signature may exist; a failed write must not read as a refusal.
+            write_state(&attempt_path, &attempt).map_err(ExactSigningError::OutcomeUnknown)?;
+        }
+        match response {
             Ok(ExactPayloadSignOutcome::ApprovalRequired(prepared)) => {
                 state.approval_id = Some(prepared.approval_id.clone());
                 write_state(state_path, &state)?;
@@ -674,9 +876,9 @@ impl BrokerExactPayloadSigner {
             }
             Ok(ExactPayloadSignOutcome::Signed(result)) => {
                 if result.signatures.len() != preimages.len() {
-                    return Err(
+                    return Err(ExactSigningError::OutcomeUnknown(
                         "Broker returned an unexpected reusable batch signature count".into(),
-                    );
+                    ));
                 }
                 Ok(ExactPayloadBatchOutcome::Signed(
                     result
@@ -686,7 +888,41 @@ impl BrokerExactPayloadSigner {
                         .collect(),
                 ))
             }
-            Err(error) => Err(error.to_string()),
+            Err(error) => Err(ExactSigningError::from_broker(
+                error,
+                state.approval_id.is_some(),
+            )),
+        }
+    }
+
+    /// Succeed only when Broker reports the signing operation in a final
+    /// state. A response that never arrived, an operation still moving, a
+    /// quarantined one, or a status Broker cannot give all leave it open.
+    async fn require_attempt_final(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<(), ExactSigningError> {
+        let unsettled = "the previous reusable signing attempt has not settled";
+        match self.broker.operation_status(operation_id.clone()).await {
+            Ok(status)
+                if status.operation_id == *operation_id
+                    && matches!(
+                        status.state,
+                        OperationState::Succeeded
+                            | OperationState::Denied
+                            | OperationState::Cancelled
+                            | OperationState::Failed
+                    ) =>
+            {
+                Ok(())
+            }
+            Ok(status) => Err(ExactSigningError::OutcomeUnknown(format!(
+                "{unsettled} (Broker reports {:?}); retry the same request or wait for it to finish",
+                status.state
+            ))),
+            Err(error) => Err(ExactSigningError::OutcomeUnknown(format!(
+                "{unsettled} and its outcome is unknown ({error}); retry the same request or wait for it to resolve"
+            ))),
         }
     }
 
@@ -704,7 +940,7 @@ impl BrokerExactPayloadSigner {
         trusted_subject: &ProvenanceSubject,
         claim: &PetalUseClaim,
         claim_assurance_evidence: Option<&[u8]>,
-    ) -> Result<ExactPayloadBatchOutcome, String> {
+    ) -> Result<ExactPayloadBatchOutcome, ExactSigningError> {
         let operation_class_token = Token::new(operation_class.to_owned())
             .map_err(|error| format!("operation class: {error}"))?;
         let provenance = self
@@ -755,7 +991,7 @@ impl BrokerExactPayloadSigner {
                     approval_id: None,
                 }
             }
-            Err(error) => return Err(format!("read exact batch signing state: {error}")),
+            Err(error) => return Err(format!("read exact batch signing state: {error}").into()),
         };
         if state.schema != STATE_SCHEMA
             || state.action_id != action_id
@@ -773,7 +1009,9 @@ impl BrokerExactPayloadSigner {
             );
         }
         let now = now_ms()?;
-        if state.expires_at_ms.get() <= now {
+        // Preserve the operation across local expiry, including lost replies
+        // and open ceremonies. Broker owns approval expiry and replay.
+        if state.expires_at_ms.get() <= now && state.approval_id.is_none() {
             state.approval_operation_id = random_operation_id();
             state.signing_operation_id = random_operation_id();
             state.request_nonce = random_request_nonce();
@@ -782,7 +1020,7 @@ impl BrokerExactPayloadSigner {
             state.approval_id = None;
         }
         write_state(state_path, &state)?;
-        let mut request = ExactPayloadBatchSignRequest {
+        let request = ExactPayloadBatchSignRequest {
             wallet_id,
             preimages: preimages.to_vec(),
             claimed_hashes: claimed_hashes.to_vec(),
@@ -805,22 +1043,20 @@ impl BrokerExactPayloadSigner {
             petal_use_claim: Some(claim.clone()),
             claim_assurance_evidence: claim_assurance_evidence.map(<[u8]>::to_vec),
         };
-        let mut response = self.broker.sign_exact_payload_batch(request.clone()).await;
-        if response
-            .as_ref()
-            .is_err_and(|error| error.code == ProtocolErrorCode::OperationIdConflict)
-            && state.approval_id.is_some()
+        if let Some((approval_id, ceremony_url, ceremony_expires_at_ms)) =
+            self.awaiting_owner(state.approval_id.as_ref()).await?
         {
-            // A prior sign attempt may have durably finalized its reservation
-            // before returning a retryable error. Preserve the completed
-            // approval and exact payload identity, but never reuse that
-            // finalized signing operation ID.
-            state.signing_operation_id = random_operation_id();
-            request.signing_operation_id = state.signing_operation_id.clone();
-            write_state(state_path, &state)?;
-            response = self.broker.sign_exact_payload_batch(request).await;
+            return Ok(ExactPayloadBatchOutcome::ApprovalRequired {
+                approval_id,
+                ceremony_url,
+                ceremony_expires_at_ms,
+            });
         }
-        match response {
+        match self
+            .broker
+            .sign_exact_payload_batch_recovering(request)
+            .await
+        {
             Ok(ExactPayloadSignOutcome::ApprovalRequired(prepared)) => {
                 state.approval_id = Some(prepared.approval_id.clone());
                 write_state(state_path, &state)?;
@@ -832,7 +1068,9 @@ impl BrokerExactPayloadSigner {
             }
             Ok(ExactPayloadSignOutcome::Signed(result)) => {
                 if result.signatures.len() != preimages.len() {
-                    return Err("Broker returned an unexpected exact batch signature count".into());
+                    return Err(ExactSigningError::OutcomeUnknown(
+                        "Broker returned an unexpected exact batch signature count".into(),
+                    ));
                 }
                 Ok(ExactPayloadBatchOutcome::Signed(
                     result
@@ -844,7 +1082,10 @@ impl BrokerExactPayloadSigner {
             }
             Err(error) => {
                 tracing::error!(code = ?error.code, message = %error.message, action_id, "petal exact batch signing failed");
-                Err(error.to_string())
+                Err(ExactSigningError::from_broker(
+                    error,
+                    state.approval_id.is_some(),
+                ))
             }
         }
     }
@@ -920,17 +1161,17 @@ mod tests {
     };
 
     use bloom_broker_api::{
-        ApprovalPrepareState, Base64UrlBytes, KeyPublic, KeyRef, KeyRole, KeySpec,
-        MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, NormalizedSignature,
-        PROVENANCE_CATALOG_SCHEMA, ProtocolError, ProtocolErrorCode, ProvenanceOperationClass,
-        ProvenanceRecord, SealedApprovalPrepareResponse, ServiceFuture, SigningResult,
-        WalletPublic,
+        ApprovalPrepareState, ApprovalPublicStatus, Base64UrlBytes, KeyPublic, KeyRef, KeyRole,
+        KeySpec, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService,
+        NormalizedSignature, OperationPublicStatus, OperationState, PROVENANCE_CATALOG_SCHEMA,
+        ProtocolError, ProtocolErrorCode, ProvenanceOperationClass, ProvenanceRecord,
+        SealedApprovalPrepareResponse, ServiceFuture, SigningResult, WalletPublic,
     };
 
     #[derive(Default)]
     struct MockBroker {
         requests: Mutex<Vec<MachineBrokerRequest>>,
-        conflict_sign_once: AtomicBool,
+        lose_sign_response_once: AtomicBool,
         /// Simulates the pre-#265 derivation defect for the negative twin: the
         /// approval presents no `value_limits` even though the claim declares
         /// value, so the accounting mirror must refuse it.
@@ -938,9 +1179,70 @@ mod tests {
         /// The fee asset the provenance catalog marks for the operation class
         /// under test, mirroring `account_declared_values`' fee matching.
         class_fee_asset: Option<bloom_broker_api::ProvenanceFeeAsset>,
+        /// Signings so far, as (approval, operation, operation digest, suite).
+        /// Like the Broker, one approval admits one signing operation, and a
+        /// signing operation id is bound to its digest.
+        signings: Mutex<Vec<(Digest32, OperationId, Digest32, CryptoSuite)>>,
+        /// While set, every prepared approval is still awaiting the owner's
+        /// ceremony: it reports so, and the Broker refuses to sign under it.
+        ceremony_open: AtomicBool,
+        /// While set, operation status cannot be read.
+        operation_status_unavailable: AtomicBool,
+        /// Reported in place of a retained operation's final state.
+        operation_state: Mutex<Option<OperationState>>,
+        /// Errors the next signing requests return, in order.
+        sign_errors: Mutex<Vec<ProtocolError>>,
+        /// Errors the next approval status queries return, in order.
+        status_errors: Mutex<Vec<ProtocolError>>,
     }
 
     impl MockBroker {
+        /// Broker's signing admission: no signing under an open ceremony, one
+        /// operation per approval, and an operation id bound to its digest.
+        fn record_signing(
+            &self,
+            request: &bloom_broker_api::MachineSignRequest,
+        ) -> Result<(), ProtocolError> {
+            if self.ceremony_open.load(Ordering::SeqCst) {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::ClaimInvalid,
+                    "approval is not active",
+                ));
+            }
+            let mut signings = self.signings.lock().unwrap();
+            for (approval, operation, operation_digest, _) in signings.iter() {
+                if *operation == request.operation_id {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::OperationIdConflict,
+                        if *operation_digest == request.operation_digest {
+                            "signing operation already finalized"
+                        } else {
+                            "signing operation id reused for a different request"
+                        },
+                    ));
+                }
+                if *approval == request.approval_id {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::LimitExceededOperations,
+                        "approval already used by another signing operation",
+                    ));
+                }
+            }
+            signings.push((
+                request.approval_id.clone(),
+                request.operation_id.clone(),
+                request.operation_digest.clone(),
+                request.crypto_suite,
+            ));
+            if self.lose_sign_response_once.swap(false, Ordering::SeqCst) {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    "simulated lost response after signing committed",
+                ));
+            }
+            Ok(())
+        }
+
         /// Mirrors `account_declared_values` in bloom-broker's `authority.rs`
         /// (the accounting a real Broker runs whenever a claim declares
         /// value): the claim's declared debits plus its declared fee must
@@ -1080,6 +1382,32 @@ mod tests {
                             },
                         ))
                     }
+                    MachineBrokerRequest::SealedApprovalStatus(request) => {
+                        let scripted = {
+                            let mut errors = self.status_errors.lock().unwrap();
+                            (!errors.is_empty()).then(|| errors.remove(0))
+                        };
+                        if let Some(error) = scripted {
+                            return Err(error);
+                        }
+                        let waiting = self.ceremony_open.load(Ordering::SeqCst);
+                        Ok(MachineBrokerResponse::SealedApprovalStatus(
+                            ApprovalPublicStatus {
+                                approval_id: request.id,
+                                wallet_id: token("wallet"),
+                                state: if waiting {
+                                    ApprovalLifecycleState::AwaitingCeremony
+                                } else {
+                                    ApprovalLifecycleState::Active
+                                },
+                                effective_claim_assurance: None,
+                                ceremony_url: waiting
+                                    .then(|| "http://localhost:18734/ceremony/test".into()),
+                                ceremony_expires_at_ms: waiting
+                                    .then(|| DecimalU64::new(u64::MAX / 2)),
+                            },
+                        ))
+                    }
                     MachineBrokerRequest::SigningSign(ref request) => {
                         // The real Broker re-runs accounting at sign time
                         // against the sealed approval terms, not the request.
@@ -1102,12 +1430,14 @@ mod tests {
                             })?;
                             self.assert_accounting_accepts(claim, limits)?;
                         }
-                        if self.conflict_sign_once.swap(false, Ordering::SeqCst) {
-                            return Err(ProtocolError::new(
-                                ProtocolErrorCode::OperationIdConflict,
-                                "simulated finalized signing reservation",
-                            ));
+                        let scripted = {
+                            let mut errors = self.sign_errors.lock().unwrap();
+                            (!errors.is_empty()).then(|| errors.remove(0))
+                        };
+                        if let Some(error) = scripted {
+                            return Err(error);
                         }
+                        self.record_signing(request)?;
                         Ok(MachineBrokerResponse::SigningSign(SigningResult {
                             operation_id: request.operation_id.clone(),
                             operation_digest: request.operation_digest.clone(),
@@ -1120,6 +1450,7 @@ mod tests {
                         }))
                     }
                     MachineBrokerRequest::SigningSignBatch(request) => {
+                        self.record_signing(&request)?;
                         Ok(MachineBrokerResponse::SigningSignBatch(SigningResult {
                             operation_id: request.operation_id,
                             operation_digest: request.operation_digest,
@@ -1130,6 +1461,49 @@ mod tests {
                             signer_receipt_digest: digest(9),
                             broker_receipt_digest: digest(10),
                         }))
+                    }
+                    MachineBrokerRequest::OperationStatus(request) => {
+                        if self.operation_status_unavailable.load(Ordering::SeqCst) {
+                            return Err(ProtocolError::new(
+                                ProtocolErrorCode::ServiceUnavailable,
+                                "simulated unavailable operation status",
+                            ));
+                        }
+                        let signings = self.signings.lock().unwrap();
+                        // Broker's own answer for an operation it never journaled.
+                        let (_, operation_id, operation_digest, crypto_suite) = signings
+                            .iter()
+                            .find(|(_, operation, ..)| *operation == request.operation_id)
+                            .ok_or_else(|| {
+                                ProtocolError::new(
+                                    ProtocolErrorCode::ApprovalNotFound,
+                                    "operation not found",
+                                )
+                            })?;
+                        let state = self
+                            .operation_state
+                            .lock()
+                            .unwrap()
+                            .unwrap_or(OperationState::Succeeded);
+                        let result = SigningResult {
+                            operation_id: operation_id.clone(),
+                            operation_digest: operation_digest.clone(),
+                            signatures: vec![NormalizedSignature {
+                                crypto_suite: *crypto_suite,
+                                bytes: Base64UrlBytes::from_bytes(&[7_u8; 65]),
+                            }],
+                            signer_receipt_digest: digest(9),
+                            broker_receipt_digest: digest(10),
+                        };
+                        Ok(MachineBrokerResponse::OperationStatus(
+                            OperationPublicStatus {
+                                operation_id: operation_id.clone(),
+                                operation_digest: operation_digest.clone(),
+                                state,
+                                result: (state == OperationState::Succeeded).then_some(result),
+                                error: None,
+                            },
+                        ))
                     }
                     _ => Err(ProtocolError::new(
                         ProtocolErrorCode::UnknownMethod,
@@ -1155,7 +1529,6 @@ mod tests {
     async fn persists_identity_reuses_approval_and_rejects_payload_drift() {
         let broker = Arc::new(MockBroker {
             requests: Mutex::new(Vec::new()),
-            conflict_sign_once: AtomicBool::new(false),
             ..MockBroker::default()
         });
         let signer = BrokerExactPayloadSigner::new(
@@ -1198,20 +1571,26 @@ mod tests {
             first,
             ExactPayloadOutcome::ApprovalRequired { .. }
         ));
-        broker.conflict_sign_once.store(true, Ordering::SeqCst);
-        let second = signer
-            .sign_or_prepare(
-                &state,
-                "action-1",
-                "wallet",
-                "transaction.confirm",
-                payload,
-                hash,
-                &serde_json::json!({"amount": "1"}),
-            )
-            .await
-            .unwrap();
-        assert_eq!(second, ExactPayloadOutcome::Signed(vec![7_u8; 65]));
+        // The signing commits but its response is lost; that attempt and a
+        // later retry, which Broker refuses as a replay, both recover the
+        // retained result instead of signing again.
+        broker.lose_sign_response_once.store(true, Ordering::SeqCst);
+        for _ in 0..2 {
+            let retry = signer
+                .sign_or_prepare(
+                    &state,
+                    "action-1",
+                    "wallet",
+                    "transaction.confirm",
+                    payload,
+                    hash.clone(),
+                    &serde_json::json!({"amount": "1"}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(retry, ExactPayloadOutcome::Signed(vec![7_u8; 65]));
+        }
+        assert_eq!(broker.signings.lock().unwrap().len(), 1);
         let signing_operation_ids = broker
             .requests
             .lock()
@@ -1223,10 +1602,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(signing_operation_ids.len(), 2);
-        assert_ne!(signing_operation_ids[0], signing_operation_ids[1]);
+        assert_eq!(signing_operation_ids[0], signing_operation_ids[1]);
         let persisted: ExactSigningState =
             serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
-        assert_eq!(persisted.signing_operation_id, signing_operation_ids[1]);
+        assert_eq!(persisted.signing_operation_id, signing_operation_ids[0]);
         let requests_after_sign = broker.requests.lock().unwrap().len();
         let error = signer
             .sign_or_prepare(
@@ -1244,11 +1623,340 @@ mod tests {
         assert_eq!(broker.requests.lock().unwrap().len(), requests_after_sign);
     }
 
+    /// A retry while the owner has not finished the ceremony returns the same
+    /// pending approval and never asks Broker to sign with it.
+    #[tokio::test]
+    async fn a_retry_before_the_owner_approves_stays_pending() {
+        let broker = Arc::new(MockBroker::default());
+        let signer = BrokerExactPayloadSigner::new(
+            MachineBrokerClient::new(broker.clone()),
+            ProvenanceCatalog {
+                schema: PROVENANCE_CATALOG_SCHEMA.into(),
+                records: vec![ProvenanceRecord {
+                    subject: ProvenanceSubject::System {
+                        component_id: token("bloom-machine"),
+                        operation_class: token("transaction.confirm"),
+                    },
+                    publisher: token("bloom-installer"),
+                    petal_lineage: None,
+                    operation_classes: vec![ProvenanceOperationClass {
+                        operation_class: token("transaction.confirm"),
+                        fee_asset: None,
+                    }],
+                    installer_key_id: token("test-key"),
+                    installer_signature: Base64UrlBytes::from_bytes(&[]),
+                }],
+            },
+        );
+        let temporary = tempfile::tempdir().unwrap();
+        let state = temporary.path().join("exact.json");
+        let payload = b"exact transaction bytes";
+        let hash = Digest32::from_bytes(alloy::primitives::keccak256(payload).into());
+        let facts = serde_json::json!({"amount": "1"});
+        let attempt = || {
+            signer.sign_or_prepare(
+                &state,
+                "action-1",
+                "wallet",
+                "transaction.confirm",
+                payload,
+                hash.clone(),
+                &facts,
+            )
+        };
+        let signs = || {
+            broker
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| matches!(request, MachineBrokerRequest::SigningSign(_)))
+                .count()
+        };
+        let ExactPayloadOutcome::ApprovalRequired { approval_id, .. } = attempt().await.unwrap()
+        else {
+            panic!("first attempt must prepare an approval")
+        };
+        broker.ceremony_open.store(true, Ordering::SeqCst);
+        let ExactPayloadOutcome::ApprovalRequired {
+            approval_id: retried,
+            ceremony_url,
+            ..
+        } = attempt().await.unwrap()
+        else {
+            panic!("a retry before approval must stay pending")
+        };
+        assert_eq!(retried, approval_id);
+        assert_eq!(ceremony_url, "http://localhost:18734/ceremony/test");
+        assert_eq!(signs(), 0, "a waiting approval is never signed with");
+        broker.ceremony_open.store(false, Ordering::SeqCst);
+        assert_eq!(
+            attempt().await.unwrap(),
+            ExactPayloadOutcome::Signed(vec![7_u8; 65])
+        );
+        assert_eq!(signs(), 1);
+    }
+
+    /// A retry that cannot confirm the stored approval's ceremony waits
+    /// instead of signing into a refusal that would drop a live approval.
+    #[tokio::test]
+    async fn an_unconfirmed_approval_ceremony_is_unknown_not_a_refusal() {
+        let broker = Arc::new(MockBroker::default());
+        let signer = BrokerExactPayloadSigner::new(
+            MachineBrokerClient::new(broker.clone()),
+            ProvenanceCatalog {
+                schema: PROVENANCE_CATALOG_SCHEMA.into(),
+                records: vec![ProvenanceRecord {
+                    subject: ProvenanceSubject::System {
+                        component_id: token("bloom-machine"),
+                        operation_class: token("transaction.confirm"),
+                    },
+                    publisher: token("bloom-installer"),
+                    petal_lineage: None,
+                    operation_classes: vec![ProvenanceOperationClass {
+                        operation_class: token("transaction.confirm"),
+                        fee_asset: None,
+                    }],
+                    installer_key_id: token("test-key"),
+                    installer_signature: Base64UrlBytes::from_bytes(&[]),
+                }],
+            },
+        );
+        let temporary = tempfile::tempdir().unwrap();
+        let state = temporary.path().join("exact.json");
+        let payload = b"exact transaction bytes";
+        let hash = Digest32::from_bytes(alloy::primitives::keccak256(payload).into());
+        let facts = serde_json::json!({"amount": "1"});
+        let attempt = || {
+            signer.sign_or_prepare_locked(
+                &state,
+                "action-1",
+                "wallet",
+                "transaction.confirm",
+                payload,
+                hash.clone(),
+                CryptoSuite::Secp256k1Keccak256Recoverable,
+                &facts,
+                None,
+                None,
+            )
+        };
+        let signs = || {
+            broker
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| matches!(request, MachineBrokerRequest::SigningSign(_)))
+                .count()
+        };
+        let ExactPayloadOutcome::ApprovalRequired { approval_id, .. } = attempt().await.unwrap()
+        else {
+            panic!("first attempt must prepare an approval")
+        };
+        *broker.status_errors.lock().unwrap() = vec![ProtocolError::new(
+            ProtocolErrorCode::ServiceUnavailable,
+            "approval status query lost",
+        )];
+        let error = attempt().await.unwrap_err();
+        assert!(
+            matches!(error, ExactSigningError::OutcomeUnknown(_)),
+            "an unconfirmed ceremony must wait, not refuse: {error}"
+        );
+        assert_eq!(signs(), 0, "an unconfirmed approval is never signed with");
+        // Nothing was dropped: once status answers, the retry pends again.
+        broker.ceremony_open.store(true, Ordering::SeqCst);
+        let ExactPayloadOutcome::ApprovalRequired {
+            approval_id: retried,
+            ..
+        } = attempt().await.unwrap()
+        else {
+            panic!("the stored approval must survive an unconfirmed retry")
+        };
+        assert_eq!(retried, approval_id);
+    }
+
+    /// A reusable batch retry while the owner has not finished the ceremony
+    /// returns the same pending approval and never asks Broker to sign.
+    #[tokio::test]
+    async fn a_reusable_batch_retry_before_the_owner_approves_stays_pending() {
+        let broker = Arc::new(MockBroker::default());
+        let package_hash = digest(20);
+        let subject = ProvenanceSubject::Petal {
+            package_hash: package_hash.clone(),
+            route: "orders/place".into(),
+        };
+        let signer = BrokerExactPayloadSigner::new(
+            MachineBrokerClient::new(broker.clone()),
+            ProvenanceCatalog {
+                schema: PROVENANCE_CATALOG_SCHEMA.into(),
+                records: vec![ProvenanceRecord {
+                    subject: subject.clone(),
+                    publisher: token("bloom-installer"),
+                    petal_lineage: None,
+                    operation_classes: vec![ProvenanceOperationClass {
+                        operation_class: token("order.place"),
+                        fee_asset: None,
+                    }],
+                    installer_key_id: token("test-key"),
+                    installer_signature: Base64UrlBytes::from_bytes(&[]),
+                }],
+            },
+        );
+        let temporary = tempfile::tempdir().unwrap();
+        let state = temporary.path().join("reusable-batch.json");
+        let payload = b"reusable batch payload";
+        let ordered_hash = Digest32::from_bytes(Sha256::digest(payload).into());
+        let claim = PetalUseClaim {
+            package_hash,
+            route: "orders/place".into(),
+            operation_class: token("order.place"),
+            crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
+            payload_digest: {
+                let mut digest = Sha256::new();
+                digest.update(b"bloom.petal.payload-batch.v1\0");
+                digest.update(1_u64.to_be_bytes());
+                digest.update((payload.len() as u64).to_be_bytes());
+                digest.update(payload);
+                Digest32::from_bytes(digest.finalize().into())
+            },
+            ordered_hashes: vec![ordered_hash.clone()],
+            declared_debits: Vec::new(),
+            declared_destinations: Vec::new(),
+            declared_fee: bloom_broker_api::DeclaredFee::None,
+            nonce: RequestNonce::from_bytes([22; 16]),
+            claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
+        };
+        let payloads = vec![payload.to_vec()];
+        let claimed_hashes = vec![ordered_hash.clone()];
+        let facts = serde_json::json!({"asset": "BTC"});
+        let attempt = || {
+            signer.sign_or_prepare_reusable_petal_batch(
+                &state,
+                "batch-action",
+                "wallet",
+                "order.place",
+                &payloads,
+                &claimed_hashes,
+                CryptoSuite::Secp256k1Sha256Recoverable,
+                &facts,
+                &subject,
+                &claim,
+                Some(b"assurance"),
+            )
+        };
+        let signs = || {
+            broker
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| matches!(request, MachineBrokerRequest::SigningSignBatch(_)))
+                .count()
+        };
+        let ExactPayloadBatchOutcome::ApprovalRequired { approval_id, .. } =
+            attempt().await.unwrap()
+        else {
+            panic!("first attempt must prepare an approval")
+        };
+        broker.ceremony_open.store(true, Ordering::SeqCst);
+        let ExactPayloadBatchOutcome::ApprovalRequired {
+            approval_id: retried,
+            ceremony_url,
+            ..
+        } = attempt().await.unwrap()
+        else {
+            panic!("a retry before approval must stay pending")
+        };
+        assert_eq!(retried, approval_id);
+        assert_eq!(ceremony_url, "http://localhost:18734/ceremony/test");
+        assert_eq!(signs(), 0, "a waiting approval is never signed with");
+    }
+
+    /// A signing failure is a refusal only when Broker marks it final with no
+    /// lasting effect. A lost response, or a retry after a finalized attempt,
+    /// may already have produced a signature.
+    #[tokio::test]
+    async fn signing_failures_are_refusals_only_under_brokers_contract() {
+        let cases = [
+            (
+                vec![ProtocolError::new(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    "read local frame prefix: early eof",
+                )],
+                false,
+            ),
+            (
+                vec![ProtocolError::new(
+                    ProtocolErrorCode::ClaimInvalid,
+                    "approval is not active",
+                )],
+                true,
+            ),
+            (
+                vec![ProtocolError::new(
+                    ProtocolErrorCode::OperationIdConflict,
+                    "finalized",
+                )],
+                false,
+            ),
+        ];
+        for (errors, refused) in cases {
+            let broker = Arc::new(MockBroker::default());
+            let signer = BrokerExactPayloadSigner::new(
+                MachineBrokerClient::new(broker.clone()),
+                ProvenanceCatalog {
+                    schema: PROVENANCE_CATALOG_SCHEMA.into(),
+                    records: vec![ProvenanceRecord {
+                        subject: ProvenanceSubject::System {
+                            component_id: token("bloom-machine"),
+                            operation_class: token("transaction.confirm"),
+                        },
+                        publisher: token("bloom-installer"),
+                        petal_lineage: None,
+                        operation_classes: vec![ProvenanceOperationClass {
+                            operation_class: token("transaction.confirm"),
+                            fee_asset: None,
+                        }],
+                        installer_key_id: token("test-key"),
+                        installer_signature: Base64UrlBytes::from_bytes(&[]),
+                    }],
+                },
+            );
+            let temporary = tempfile::tempdir().unwrap();
+            let state = temporary.path().join("exact.json");
+            let payload = b"exact transaction bytes";
+            let hash = Digest32::from_bytes(alloy::primitives::keccak256(payload).into());
+            let facts = serde_json::json!({"amount": "1"});
+            let attempt = || {
+                signer.sign_or_prepare_locked(
+                    &state,
+                    "action-1",
+                    "wallet",
+                    "transaction.confirm",
+                    payload,
+                    hash.clone(),
+                    CryptoSuite::Secp256k1Keccak256Recoverable,
+                    &facts,
+                    None,
+                    None,
+                )
+            };
+            attempt().await.unwrap();
+            *broker.sign_errors.lock().unwrap() = errors;
+            let error = attempt().await.unwrap_err();
+            assert_eq!(
+                matches!(error, ExactSigningError::Refused(_)),
+                refused,
+                "{error}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn petal_retry_preserves_the_requested_crypto_suite_through_prepare_and_sign() {
         let broker = Arc::new(MockBroker {
             requests: Mutex::new(Vec::new()),
-            conflict_sign_once: AtomicBool::new(false),
             ..MockBroker::default()
         });
         let package_hash = digest(20);
@@ -1374,7 +2082,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.contains("persisted"), "{error}");
+        assert!(error.to_string().contains("persisted"), "{error}");
         assert_eq!(broker.requests.lock().unwrap().len(), before);
 
         for reusable in [false, true] {
@@ -1419,7 +2127,7 @@ mod tests {
                         .await
                 };
                 if should_reject {
-                    assert!(outcome.unwrap_err().contains("persisted"));
+                    assert!(outcome.unwrap_err().to_string().contains("persisted"));
                     assert_eq!(broker.requests.lock().unwrap().len(), before);
                 } else {
                     outcome.unwrap();
@@ -1447,7 +2155,10 @@ mod tests {
             prepared.terms.limits.value_limits[0].lifetime.as_str(),
             "12"
         );
-        let MachineBrokerRequest::SigningSign(signed) = &requests[5] else {
+        let Some(signed) = requests.iter().find_map(|request| match request {
+            MachineBrokerRequest::SigningSign(signed) => Some(signed),
+            _ => None,
+        }) else {
             panic!("approved retry must sign");
         };
         assert_eq!(signed.crypto_suite, CryptoSuite::Secp256k1Sha256Recoverable);
@@ -1532,7 +2243,7 @@ mod tests {
         home: &tempfile::TempDir,
         claim: &PetalUseClaim,
         hash: &Digest32,
-    ) -> Result<ExactPayloadOutcome, String> {
+    ) -> Result<ExactPayloadOutcome, ExactSigningError> {
         let package_hash = claim.package_hash.clone();
         signer
             .sign_or_prepare_petal(
@@ -1574,7 +2285,6 @@ mod tests {
         ] {
             let broker = Arc::new(MockBroker {
                 requests: Mutex::new(Vec::new()),
-                conflict_sign_once: AtomicBool::new(false),
                 class_fee_asset: class_fee_asset.clone(),
                 ..MockBroker::default()
             });
@@ -1631,7 +2341,6 @@ mod tests {
         // VALUE_ASSET_NOT_ALLOWED denial, and nothing may sign.
         let broker = Arc::new(MockBroker {
             requests: Mutex::new(Vec::new()),
-            conflict_sign_once: AtomicBool::new(false),
             drop_value_limits: true,
             ..MockBroker::default()
         });
@@ -1644,7 +2353,10 @@ mod tests {
             ExactPayloadOutcome::ApprovalRequired { .. }
         ));
         let error = flow_once(&signer, &home, &claim, &hash).await.unwrap_err();
-        assert!(error.contains("VALUE_ASSET_NOT_ALLOWED"), "{error}");
+        assert!(
+            format!("{error:?}").contains("VALUE_ASSET_NOT_ALLOWED"),
+            "{error:?}"
+        );
         // The refusal fired at the signing gate: the sign was dispatched and
         // refused before any signature existed (proven by the error above).
         assert!(
@@ -1656,6 +2368,502 @@ mod tests {
                 .any(|record| matches!(record, MachineBrokerRequest::SigningSign(_))),
             "the refusal must happen at signing, not before it"
         );
+    }
+
+    async fn reusable_once(
+        signer: &BrokerExactPayloadSigner,
+        home: &tempfile::TempDir,
+        base: &PetalUseClaim,
+        payload: &[u8],
+    ) -> Result<ExactPayloadBatchOutcome, ExactSigningError> {
+        let hash = Digest32::from_bytes(Sha256::digest(payload).into());
+        let claim = PetalUseClaim {
+            payload_digest: {
+                let mut digest = Sha256::new();
+                digest.update(b"bloom.petal.payload-batch.v1\0");
+                digest.update(1_u64.to_be_bytes());
+                digest.update((payload.len() as u64).to_be_bytes());
+                digest.update(payload);
+                Digest32::from_bytes(digest.finalize().into())
+            },
+            ordered_hashes: vec![hash.clone()],
+            ..base.clone()
+        };
+        signer
+            .sign_or_prepare_reusable_petal_batch(
+                &home.path().join("petal-reusable.json"),
+                "reusable-action",
+                "wallet",
+                "hyperliquid.withdraw",
+                &[payload.to_vec()],
+                &[hash],
+                CryptoSuite::Secp256k1Sha256Recoverable,
+                &serde_json::json!({"max_operations": 1}),
+                &ProvenanceSubject::Petal {
+                    package_hash: base.package_hash.clone(),
+                    route: "withdraw/request".into(),
+                },
+                &claim,
+                None,
+            )
+            .await
+    }
+
+    fn approval_of(outcome: &ExactPayloadBatchOutcome) -> Digest32 {
+        match outcome {
+            ExactPayloadBatchOutcome::ApprovalRequired { approval_id, .. } => approval_id.clone(),
+            other => panic!("expected an approval, got {other:?}"),
+        }
+    }
+
+    /// A reusable approval covers one operation. Once it has signed, the next
+    /// payload prepares its own approval at once rather than failing against
+    /// the spent one until its TTL runs out.
+    #[tokio::test]
+    async fn a_spent_reusable_approval_lets_the_next_payload_prepare_a_fresh_one() {
+        let broker = Arc::new(MockBroker::default());
+        let (signer, home, claim, _) = debiting_claim_fixture(&broker, None);
+
+        let first = approval_of(
+            &reusable_once(&signer, &home, &claim, b"first")
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            reusable_once(&signer, &home, &claim, b"first")
+                .await
+                .unwrap(),
+            ExactPayloadBatchOutcome::Signed(vec![vec![7_u8; 65]])
+        );
+        let next = approval_of(
+            &reusable_once(&signer, &home, &claim, b"second")
+                .await
+                .unwrap(),
+        );
+        assert_ne!(first, next, "the next payload asks for its own approval");
+        assert_eq!(
+            reusable_once(&signer, &home, &claim, b"second")
+                .await
+                .unwrap(),
+            ExactPayloadBatchOutcome::Signed(vec![vec![7_u8; 65]])
+        );
+    }
+
+    /// A Petal that writes again while the owner's ceremony is still open,
+    /// each time with rebuilt bytes, is told the approval is pending and
+    /// nothing is recorded; the rebuild after the ceremony signs under the
+    /// approval the owner completed instead of asking for another.
+    #[tokio::test]
+    async fn writes_during_an_open_ceremony_keep_the_approval_for_the_rebuild() {
+        let broker = Arc::new(MockBroker {
+            ceremony_open: AtomicBool::new(true),
+            ..MockBroker::default()
+        });
+        let (signer, home, claim, _) = debiting_claim_fixture(&broker, None);
+
+        let approval = approval_of(
+            &reusable_once(&signer, &home, &claim, b"build-1")
+                .await
+                .unwrap(),
+        );
+        for rebuild in [&b"build-2"[..], b"build-3"] {
+            assert_eq!(
+                approval_of(
+                    &reusable_once(&signer, &home, &claim, rebuild)
+                        .await
+                        .unwrap()
+                ),
+                approval,
+                "a write during the ceremony reports the same pending approval"
+            );
+        }
+        broker.ceremony_open.store(false, Ordering::SeqCst);
+        assert_eq!(
+            reusable_once(&signer, &home, &claim, b"build-4")
+                .await
+                .unwrap(),
+            ExactPayloadBatchOutcome::Signed(vec![vec![7_u8; 65]])
+        );
+        let requests = broker.requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| matches!(r, MachineBrokerRequest::SealedApprovalPrepare(_)))
+                .count(),
+            1,
+            "the owner approves once"
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|r| matches!(r, MachineBrokerRequest::SigningSignBatch(req) if req.approval_id != approval)),
+        );
+    }
+
+    /// A retry of the exact signing attempt recovers the Broker's retained
+    /// result for the same operation. It never prepares a second approval.
+    #[tokio::test]
+    async fn a_retry_of_the_signed_attempt_recovers_its_result() {
+        let broker = Arc::new(MockBroker::default());
+        let (signer, home, claim, _) = debiting_claim_fixture(&broker, None);
+
+        reusable_once(&signer, &home, &claim, b"only")
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                reusable_once(&signer, &home, &claim, b"only")
+                    .await
+                    .unwrap(),
+                ExactPayloadBatchOutcome::Signed(vec![vec![7_u8; 65]])
+            );
+        }
+        let requests = broker.requests.lock().unwrap();
+        let prepares = requests
+            .iter()
+            .filter(|r| matches!(r, MachineBrokerRequest::SealedApprovalPrepare(_)))
+            .count();
+        assert_eq!(prepares, 1);
+        let signings = broker.signings.lock().unwrap();
+        assert_eq!(signings.len(), 1, "Broker signs the operation only once");
+        assert!(
+            requests
+                .iter()
+                .any(|request| { matches!(request, MachineBrokerRequest::OperationStatus(_)) })
+        );
+    }
+
+    #[tokio::test]
+    async fn the_same_payload_with_a_different_claim_gets_a_fresh_approval() {
+        let broker = Arc::new(MockBroker::default());
+        let (signer, home, claim, _) = debiting_claim_fixture(&broker, None);
+
+        let first = approval_of(
+            &reusable_once(&signer, &home, &claim, b"same")
+                .await
+                .unwrap(),
+        );
+        reusable_once(&signer, &home, &claim, b"same")
+            .await
+            .unwrap();
+
+        let mut changed_claim = claim;
+        changed_claim.nonce = RequestNonce::from_bytes([99; 16]);
+        let next = approval_of(
+            &reusable_once(&signer, &home, &changed_claim, b"same")
+                .await
+                .unwrap(),
+        );
+        assert_ne!(first, next);
+        assert_eq!(broker.signings.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_lost_signing_response_is_recovered_without_reusing_it_for_new_bytes() {
+        let broker = Arc::new(MockBroker {
+            lose_sign_response_once: AtomicBool::new(true),
+            ..MockBroker::default()
+        });
+        let (signer, home, claim, _) = debiting_claim_fixture(&broker, None);
+
+        reusable_once(&signer, &home, &claim, b"first")
+            .await
+            .unwrap();
+        assert_eq!(
+            reusable_once(&signer, &home, &claim, b"first")
+                .await
+                .unwrap(),
+            ExactPayloadBatchOutcome::Signed(vec![vec![7_u8; 65]])
+        );
+
+        let main_state: serde_json::Value =
+            serde_json::from_slice(&fs::read(home.path().join("petal-reusable.json")).unwrap())
+                .unwrap();
+        assert!(main_state.get("signed_payload_digests").is_none());
+        assert!(home.path().join("petal-reusable.attempt.json").is_file());
+        assert!(
+            broker
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| { matches!(request, MachineBrokerRequest::OperationStatus(_)) })
+        );
+
+        assert_eq!(
+            reusable_once(&signer, &home, &claim, b"first")
+                .await
+                .unwrap(),
+            ExactPayloadBatchOutcome::Signed(vec![vec![7_u8; 65]])
+        );
+        assert!(matches!(
+            reusable_once(&signer, &home, &claim, b"second")
+                .await
+                .unwrap(),
+            ExactPayloadBatchOutcome::ApprovalRequired { .. }
+        ));
+        assert_eq!(broker.signings.lock().unwrap().len(), 1);
+    }
+
+    fn prepares(broker: &MockBroker) -> usize {
+        broker
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| matches!(r, MachineBrokerRequest::SealedApprovalPrepare(_)))
+            .count()
+    }
+
+    fn reusable_state(home: &tempfile::TempDir) -> ReusablePetalBatchSigningState {
+        serde_json::from_slice(&fs::read(home.path().join("petal-reusable.json")).unwrap()).unwrap()
+    }
+
+    /// The response to a signing call is lost and Broker cannot yet say what
+    /// became of the operation. New bytes arriving now must not replace the
+    /// attempt and ask the owner for a second approval beside an operation
+    /// that may have signed; once Broker reports it final, they may.
+    #[tokio::test]
+    async fn new_bytes_wait_while_the_earlier_attempt_is_unresolved() {
+        let broker = Arc::new(MockBroker {
+            lose_sign_response_once: AtomicBool::new(true),
+            operation_status_unavailable: AtomicBool::new(true),
+            ..MockBroker::default()
+        });
+        let (signer, home, claim, _) = debiting_claim_fixture(&broker, None);
+
+        approval_of(
+            &reusable_once(&signer, &home, &claim, b"first")
+                .await
+                .unwrap(),
+        );
+        reusable_once(&signer, &home, &claim, b"first")
+            .await
+            .unwrap_err();
+        let before = reusable_state(&home);
+
+        for _ in 0..2 {
+            let error = reusable_once(&signer, &home, &claim, b"second")
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, ExactSigningError::OutcomeUnknown(m) if m.contains("has not settled")),
+                "{error}"
+            );
+        }
+        let after = reusable_state(&home);
+        assert_eq!(after.signing_operation_id, before.signing_operation_id);
+        assert_eq!(after.approval_id, before.approval_id);
+        assert_eq!(prepares(&broker), 1, "the owner is not asked again");
+        assert_eq!(broker.signings.lock().unwrap().len(), 1);
+
+        // Broker can answer again: the earlier operation is final, so the new
+        // bytes get their own approval.
+        broker
+            .operation_status_unavailable
+            .store(false, Ordering::SeqCst);
+        let next = approval_of(
+            &reusable_once(&signer, &home, &claim, b"second")
+                .await
+                .unwrap(),
+        );
+        assert_ne!(Some(next), before.approval_id);
+        assert_ne!(
+            reusable_state(&home).signing_operation_id,
+            before.signing_operation_id
+        );
+    }
+
+    /// An operation Broker still reports in progress or quarantined is not
+    /// final, and one it never journaled may yet arrive.
+    #[tokio::test]
+    async fn new_bytes_wait_for_an_operation_broker_has_not_finished() {
+        for (state, journaled) in [
+            (Some(OperationState::Dispatched), true),
+            (Some(OperationState::Quarantined), true),
+            (None, false),
+        ] {
+            let broker = Arc::new(MockBroker {
+                lose_sign_response_once: AtomicBool::new(true),
+                operation_status_unavailable: AtomicBool::new(true),
+                ..MockBroker::default()
+            });
+            let (signer, home, claim, _) = debiting_claim_fixture(&broker, None);
+            approval_of(
+                &reusable_once(&signer, &home, &claim, b"first")
+                    .await
+                    .unwrap(),
+            );
+            reusable_once(&signer, &home, &claim, b"first")
+                .await
+                .unwrap_err();
+            if !journaled {
+                broker.signings.lock().unwrap().clear();
+            }
+            *broker.operation_state.lock().unwrap() = state;
+            broker
+                .operation_status_unavailable
+                .store(false, Ordering::SeqCst);
+
+            let error = reusable_once(&signer, &home, &claim, b"second")
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, ExactSigningError::OutcomeUnknown(m) if m.contains("has not settled")),
+                "{state:?}: {error}"
+            );
+            assert_eq!(prepares(&broker), 1, "{state:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_expiry_does_not_replace_an_unresolved_attempt() {
+        let broker = Arc::new(MockBroker {
+            lose_sign_response_once: AtomicBool::new(true),
+            operation_status_unavailable: AtomicBool::new(true),
+            ..MockBroker::default()
+        });
+        let (signer, home, claim, _) = debiting_claim_fixture(&broker, None);
+        approval_of(
+            &reusable_once(&signer, &home, &claim, b"first")
+                .await
+                .unwrap(),
+        );
+        reusable_once(&signer, &home, &claim, b"first")
+            .await
+            .unwrap_err();
+        let mut before = reusable_state(&home);
+        before.issued_at_ms = DecimalU64::new(0);
+        before.expires_at_ms = DecimalU64::new(1);
+        write_state(&home.path().join("petal-reusable.json"), &before).unwrap();
+
+        for bytes in [b"first".as_slice(), b"second".as_slice()] {
+            let error = reusable_once(&signer, &home, &claim, bytes)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, ExactSigningError::OutcomeUnknown(_)),
+                "{error}"
+            );
+            let after = reusable_state(&home);
+            assert_eq!(after.signing_operation_id, before.signing_operation_id);
+            assert_eq!(after.approval_id, before.approval_id);
+        }
+        assert_eq!(prepares(&broker), 1);
+        assert_eq!(broker.signings.lock().unwrap().len(), 1);
+    }
+
+    // Exercise both exact entrypoints with an expired local timestamp. The
+    // owner's ceremony and a committed-but-unacknowledged signature must each
+    // retain their identity; TTL expiry is not evidence of a final refusal.
+    #[tokio::test]
+    async fn exact_expiry_preserves_ceremony_and_recovers_the_original_signature() {
+        for batch in [false, true] {
+            let broker = Arc::new(MockBroker::default());
+            let (signer, home, claim, hash) = debiting_claim_fixture(&broker, None);
+            let path = home.path().join("petal-exact.json");
+            let attempt = || async {
+                if batch {
+                    signer
+                        .sign_or_prepare_petal_batch(
+                            &path,
+                            "withdraw-action",
+                            "wallet",
+                            "hyperliquid.withdraw",
+                            &[b"exact withdraw payload".to_vec()],
+                            std::slice::from_ref(&hash),
+                            CryptoSuite::Secp256k1Sha256Recoverable,
+                            &serde_json::json!({"asset": "USDC"}),
+                            &ProvenanceSubject::Petal {
+                                package_hash: claim.package_hash.clone(),
+                                route: "withdraw/request".into(),
+                            },
+                            &claim,
+                            Some(b"assurance"),
+                        )
+                        .await
+                        .map(|outcome| matches!(outcome, ExactPayloadBatchOutcome::Signed(_)))
+                } else {
+                    flow_once(&signer, &home, &claim, &hash)
+                        .await
+                        .map(|outcome| matches!(outcome, ExactPayloadOutcome::Signed(_)))
+                }
+            };
+            assert!(!attempt().await.unwrap());
+            let mut state: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            state["issued_at_ms"] = serde_json::json!("0");
+            state["expires_at_ms"] = serde_json::json!("1");
+            write_state(&path, &state).unwrap();
+            broker.ceremony_open.store(true, Ordering::SeqCst);
+            assert!(!attempt().await.unwrap());
+            assert_eq!(prepares(&broker), 1);
+            broker.ceremony_open.store(false, Ordering::SeqCst);
+            broker.lose_sign_response_once.store(true, Ordering::SeqCst);
+            broker
+                .operation_status_unavailable
+                .store(true, Ordering::SeqCst);
+            assert!(matches!(
+                attempt().await,
+                Err(ExactSigningError::OutcomeUnknown(_))
+            ));
+            assert!(matches!(
+                attempt().await,
+                Err(ExactSigningError::OutcomeUnknown(_))
+            ));
+            assert_eq!(prepares(&broker), 1);
+            assert_eq!(broker.signings.lock().unwrap().len(), 1);
+            let after: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(after, state);
+            broker
+                .operation_status_unavailable
+                .store(false, Ordering::SeqCst);
+            assert!(attempt().await.unwrap());
+            assert_eq!(broker.signings.lock().unwrap().len(), 1);
+        }
+    }
+
+    /// A refusal with no lasting effect settles the attempt where it
+    /// happens, so new bytes move on without asking Broker about it.
+    #[tokio::test]
+    async fn a_refused_attempt_lets_new_bytes_move_on() {
+        let broker = Arc::new(MockBroker::default());
+        let (signer, home, claim, _) = debiting_claim_fixture(&broker, None);
+        approval_of(
+            &reusable_once(&signer, &home, &claim, b"first")
+                .await
+                .unwrap(),
+        );
+        // Another operation already spent the approval, so Broker refuses
+        // this one with its reservation released.
+        let attempt_path = home.path().join("petal-reusable.attempt.json");
+        broker.signings.lock().unwrap().push((
+            reusable_state(&home).approval_id.unwrap(),
+            random_operation_id(),
+            digest(1),
+            CryptoSuite::Secp256k1Sha256Recoverable,
+        ));
+        let refusal = reusable_once(&signer, &home, &claim, b"first")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&refusal, ExactSigningError::Refused(m) if m.contains("already used")),
+            "{refusal}"
+        );
+        let attempt: ReusablePetalBatchSigningAttempt =
+            serde_json::from_slice(&fs::read(&attempt_path).unwrap()).unwrap();
+        assert!(attempt.settled);
+
+        broker
+            .operation_status_unavailable
+            .store(true, Ordering::SeqCst);
+        approval_of(
+            &reusable_once(&signer, &home, &claim, b"second")
+                .await
+                .unwrap(),
+        );
+        assert_eq!(prepares(&broker), 2);
     }
 
     fn token(value: &str) -> Token {

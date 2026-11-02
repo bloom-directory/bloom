@@ -31,7 +31,9 @@ pub(crate) mod test_support;
 pub mod write_locks;
 
 pub use cache::PathCache;
-pub use exact_signing::{BrokerExactPayloadSigner, ExactPayloadBatchOutcome, ExactPayloadOutcome};
+pub use exact_signing::{
+    BrokerExactPayloadSigner, ExactPayloadBatchOutcome, ExactPayloadOutcome, ExactSigningError,
+};
 pub use handler::{
     Entry, EntryKind, Handler, HandlerError, entry_for_fs_path, entry_from_fs_dir_entry,
     entry_from_fs_metadata, fs_path_modified,

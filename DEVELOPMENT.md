@@ -154,10 +154,14 @@ temporary per-user systemd socket units for Broker and Signer; an active
 systemd user manager is required. Paths embedded in those units may contain
 only ASCII letters, digits, and `_./:@+-`.
 
-Linux also uses the reviewed `linux-chrony-nts` trusted-time profile. The host
-clock must already be synchronized through the production two-source NTS
-configuration; the developer harness does not replace it with unauthenticated
-NTP.
+On Linux the launcher writes the trusted-time source `linux-chrony-nts`. That
+is a legacy wire name kept for rollback compatibility; the runtime reads it as
+the `linux-system-clock` source described in the
+[Linux packaging README](./packaging/triad/linux/README.md): Bloom uses the
+ordinary host wall clock and guards it against backward steps. No Chrony, NTS
+or second time source is required. Keep the host clock synchronized as usual;
+a clock stepped backwards freezes Broker and Signer mutations until wall time
+catches up.
 
 The launcher writes public connection settings to
 `/tmp/bloom-triad-logs/triad.env`. Source that file only in the terminal meant
