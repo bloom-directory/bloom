@@ -6,7 +6,9 @@ The entrypoint connects an existing Bloom session or routes new installations to
 Operating procedures belong in the installed VFS, not in marketplace copies.
 
 Installing the skill does not install Bloom or create a wallet. Check both
-existing-session use and new-install guidance when changing it. Keep setup's
+existing-session use and new-install guidance when changing it. The
+[skill evals](../evals/skills/README.md) grade new-install responses; CI runs
+their deterministic `check`, and model runs are manual. Keep setup's
 signature checks and platform-specific privileged handoff intact.
 
 ## Website
