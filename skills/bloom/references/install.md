@@ -107,11 +107,11 @@ BLOOM_LOGIN_USER=<login name>
 ```
 
 One privileged step remains. Root never runs files from the user-owned stage:
-the privileged command below copies the stage into a new root-owned directory,
-checks the copied installer against the reviewed digest written into the
-command, and runs that copy, which verifies the copied payload's signature
-before installing. Every supported path runs this identical command; only who
-runs it and who asks for the credential differs.
+the privileged command below copies the payload into a new root-owned
+directory, verifies the copy's signature with the release key written into the
+command, and only then runs the signed release installer from the copy. Every
+supported path runs this identical command; only who runs it and who asks for
+the credential differs.
 
 The command is fixed. Replace only the three placeholders `STAGE`, `UID`, and
 `USER` with the captured `BLOOM_STAGE`, `BLOOM_LOGIN_UID`, and
@@ -138,7 +138,7 @@ Check `command -v pkexec`. If it is installed, run the command yourself; the
 system authentication agent shows its own credential dialog:
 
 ```sh
-pkexec /bin/sh -c 'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); trap "rm -rf -- $s" EXIT; trap "exit 129" HUP INT TERM; cp -R "$1/." "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; d=$(sha256sum "$s/install-reviewed-triad.sh" 2>/dev/null || shasum -a 256 "$s/install-reviewed-triad.sh" || true); if [ "${d%% *}" != 1c21729dfedbf141ee6eed8b6361c2e470eb95a664316a39b162ec8151d789c8 ]; then echo "Bloom installer does not match the reviewed installer." >&2; exit 65; fi; /bin/sh "$s/install-reviewed-triad.sh" install / "$2" "$3" "$s/bloom-triad"' bloom-install 'STAGE' 'UID' 'USER'
+pkexec /bin/sh -c 'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); trap "rm -rf -- $s" EXIT; trap "exit 129" HUP INT TERM; cp -R "$1/bloom-triad" "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; if find "$s" -type l -o ! -type f ! -type d | grep -q .; then echo "Bloom stage contains a link or special file." >&2; exit 65; fi; k="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFY9na4hytUNsW+8LWu//HrX9TaPU7H7Vg0GRWcZM+uP"; printf "%s\n" "$k" > "$s/key.pub"; printf "bloom-release %s\n" "$k" > "$s/signers"; p="$s/bloom-triad"; /usr/bin/ssh-keygen -Y verify -f "$s/signers" -I bloom-release -n bloom-release-payload-v1 -s "$p/RELEASE_SIGNATURE" < "$p/SHA256SUMS" > /dev/null; cd "$p"; { sha256sum -c SHA256SUMS 2>/dev/null || shasum -a 256 -c SHA256SUMS; } > /dev/null; case $(uname -s) in Linux) i=linux;; Darwin) i=macos;; *) exit 65;; esac; BLOOM_RELEASE_PUBLIC_KEY="$s/key.pub" "$p/installer/release/install-$i.sh" install / "$2" "$3" "$p"' bloom-install 'STAGE' 'UID' 'USER'
 ```
 
 Nothing may sit between `pkexec` and `/bin/sh`: no `sudo`, `env`, variable
@@ -151,7 +151,7 @@ place of `pkexec` to run in their terminal, values already substituted. For
 example, if staging reported these values:
 
 ```sh
-sudo /bin/sh -c 'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); trap "rm -rf -- $s" EXIT; trap "exit 129" HUP INT TERM; cp -R "$1/." "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; d=$(sha256sum "$s/install-reviewed-triad.sh" 2>/dev/null || shasum -a 256 "$s/install-reviewed-triad.sh" || true); if [ "${d%% *}" != 1c21729dfedbf141ee6eed8b6361c2e470eb95a664316a39b162ec8151d789c8 ]; then echo "Bloom installer does not match the reviewed installer." >&2; exit 65; fi; /bin/sh "$s/install-reviewed-triad.sh" install / "$2" "$3" "$s/bloom-triad"' bloom-install '/home/lee/.cache/bloom/install/v1.2.3-linux-x86_64' '1000' 'lee'
+sudo /bin/sh -c 'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); trap "rm -rf -- $s" EXIT; trap "exit 129" HUP INT TERM; cp -R "$1/bloom-triad" "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; if find "$s" -type l -o ! -type f ! -type d | grep -q .; then echo "Bloom stage contains a link or special file." >&2; exit 65; fi; k="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFY9na4hytUNsW+8LWu//HrX9TaPU7H7Vg0GRWcZM+uP"; printf "%s\n" "$k" > "$s/key.pub"; printf "bloom-release %s\n" "$k" > "$s/signers"; p="$s/bloom-triad"; /usr/bin/ssh-keygen -Y verify -f "$s/signers" -I bloom-release -n bloom-release-payload-v1 -s "$p/RELEASE_SIGNATURE" < "$p/SHA256SUMS" > /dev/null; cd "$p"; { sha256sum -c SHA256SUMS 2>/dev/null || shasum -a 256 -c SHA256SUMS; } > /dev/null; case $(uname -s) in Linux) i=linux;; Darwin) i=macos;; *) exit 65;; esac; BLOOM_RELEASE_PUBLIC_KEY="$s/key.pub" "$p/installer/release/install-$i.sh" install / "$2" "$3" "$p"' bloom-install '/home/lee/.cache/bloom/install/v1.2.3-linux-x86_64' '1000' 'lee'
 ```
 
 Use the actual captured values, not the example values. The user types their
@@ -168,7 +168,7 @@ they stay out of the AppleScript source:
   -e 'on run argv' \
   -e 'do shell script ("/bin/sh -c " & quoted form of (item 1 of argv) & " bloom-install " & quoted form of (item 2 of argv) & " " & quoted form of (item 3 of argv) & " " & quoted form of (item 4 of argv)) with administrator privileges' \
   -e 'end run' \
-  'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); trap "rm -rf -- $s" EXIT; trap "exit 129" HUP INT TERM; cp -R "$1/." "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; d=$(sha256sum "$s/install-reviewed-triad.sh" 2>/dev/null || shasum -a 256 "$s/install-reviewed-triad.sh" || true); if [ "${d%% *}" != 1c21729dfedbf141ee6eed8b6361c2e470eb95a664316a39b162ec8151d789c8 ]; then echo "Bloom installer does not match the reviewed installer." >&2; exit 65; fi; /bin/sh "$s/install-reviewed-triad.sh" install / "$2" "$3" "$s/bloom-triad"' 'STAGE' 'UID' 'USER'
+  'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); trap "rm -rf -- $s" EXIT; trap "exit 129" HUP INT TERM; cp -R "$1/bloom-triad" "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; if find "$s" -type l -o ! -type f ! -type d | grep -q .; then echo "Bloom stage contains a link or special file." >&2; exit 65; fi; k="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFY9na4hytUNsW+8LWu//HrX9TaPU7H7Vg0GRWcZM+uP"; printf "%s\n" "$k" > "$s/key.pub"; printf "bloom-release %s\n" "$k" > "$s/signers"; p="$s/bloom-triad"; /usr/bin/ssh-keygen -Y verify -f "$s/signers" -I bloom-release -n bloom-release-payload-v1 -s "$p/RELEASE_SIGNATURE" < "$p/SHA256SUMS" > /dev/null; cd "$p"; { sha256sum -c SHA256SUMS 2>/dev/null || shasum -a 256 -c SHA256SUMS; } > /dev/null; case $(uname -s) in Linux) i=linux;; Darwin) i=macos;; *) exit 65;; esac; BLOOM_RELEASE_PUBLIC_KEY="$s/key.pub" "$p/installer/release/install-$i.sh" install / "$2" "$3" "$p"' 'STAGE' 'UID' 'USER'
 ```
 
 Never add a `user name` or `password` parameter to `do shell script`.

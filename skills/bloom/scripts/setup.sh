@@ -96,7 +96,7 @@ resolve_triad_target() {
 
 require_triad_environment() {
   for required_command in \
-    awk cat chmod cmp cp curl dirname grep id install mkdir mktemp mv rm tar uname
+    awk cat chmod cmp cp curl dirname grep id mkdir mktemp mv rm tar uname
   do
     if ! command -v "$required_command" >/dev/null 2>&1; then
       printf '%s\n' "$required_command is required to prepare Bloom." >&2
@@ -283,129 +283,16 @@ stage_triad() {
     exit 1
   fi
 
-  # Root never runs files from this user-owned stage. The privileged command
-  # copies the stage into a root-owned directory, checks this wrapper's digest
-  # there, and runs the copy. The wrapper then verifies the copied payload with
-  # the release key built into its own text, never a staged key file.
-  privileged_installer="$staged_new/install-reviewed-triad.sh"
-  {
-    printf '#!/bin/sh\nset -eu\nrelease_key_line=%s\n' "'$pinned_release_key'"
-    cat <<'INSTALL_REVIEWED_TRIAD'
-
-if [ "$(id -u)" -ne 0 ]; then
-  printf '%s\n' "Bloom's reviewed triad handoff requires root." >&2
-  exit 77
-fi
-if [ "$#" -ne 5 ] || [ "$1" != install ] || [ "$2" != / ]; then
-  printf '%s\n' "usage: install-reviewed-triad.sh install / LOGIN_UID LOGIN_USER PAYLOAD_DIR" >&2
-  exit 64
-fi
-
-case "$(uname -s)" in
-  Linux)
-    release_installer_path=installer/release/install-linux.sh
-    expected_platform_claim=linux
-    key_group=root
-    ;;
-  Darwin)
-    release_installer_path=installer/release/install-macos.sh
-    expected_platform_claim=macos-unix-principals
-    key_group=wheel
-    ;;
-  *)
-    printf '%s\n' "Bloom installs only on Linux and macOS." >&2
-    exit 65
-    ;;
-esac
-
-wrapper_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-if [ "$(ls -ldn "$wrapper_dir" | awk '{print $3}')" != 0 ] ||
-  find "$wrapper_dir" \( -type l -o \( ! -type f ! -type d \) -o -perm -0020 -o -perm -0002 \) -print | grep -q .
-then
-  printf '%s\n' "Bloom's reviewed installer must run from a root-owned snapshot of its stage." >&2
-  exit 65
-fi
-expected_payload="$wrapper_dir/bloom-triad"
-payload=$(CDPATH= cd -- "$5" && pwd -P)
-if [ "$payload" != "$expected_payload" ]; then
-  printf '%s\n' "Bloom payload does not match the reviewed installation stage." >&2
-  exit 65
-fi
-payload_key="$payload/RELEASE_PUBLIC_KEY.pem"
-release_installer="$payload/$release_installer_path"
-for required_file in "$payload_key" "$payload/RELEASE_SIGNATURE" "$payload/SHA256SUMS" "$release_installer"; do
-  if [ ! -f "$required_file" ]; then
-    printf '%s\n' "Bloom reviewed installation stage is incomplete." >&2
-    exit 65
-  fi
-done
-if ! printf '%s\n' "$release_key_line" | cmp -s - "$payload_key"; then
-  printf '%s\n' "Bloom payload key does not match the reviewed release key." >&2
-  exit 65
-fi
-
-scratch=$(mktemp -d)
-trap 'rm -rf -- "$scratch"' EXIT HUP INT TERM
-printf '%s\n' "$release_key_line" > "$scratch/release-key.pub"
-printf 'bloom-release %s\n' "$release_key_line" > "$scratch/allowed_signers"
-if ! /usr/bin/ssh-keygen -Y verify -f "$scratch/allowed_signers" -I bloom-release \
-  -n bloom-release-payload-v1 -s "$payload/RELEASE_SIGNATURE" \
-  < "$payload/SHA256SUMS" >/dev/null
-then
-  printf '%s\n' "Bloom payload signature is invalid." >&2
-  exit 65
-fi
-if command -v sha256sum >/dev/null 2>&1; then
-  sha256() { sha256sum "$@"; }
-elif command -v shasum >/dev/null 2>&1; then
-  sha256() { shasum -a 256 "$@"; }
-else
-  printf '%s\n' "A SHA-256 tool is required to install Bloom." >&2
-  exit 69
-fi
-if ! (cd "$payload" && sha256 -c SHA256SUMS >/dev/null); then
-  printf '%s\n' "Bloom payload files do not match the signed manifest." >&2
-  exit 65
-fi
-key_digest=$(sha256 "$scratch/release-key.pub" | awk '{print $1}')
-case "$key_digest" in
-  *[!0-9a-f]*|'')
-    printf '%s\n' "Bloom release-key digest is malformed." >&2
-    exit 65
-    ;;
-esac
-
-pin_dir=/etc/bloom/release-keys
-pin_path="$pin_dir/$key_digest.pub"
-install -d -o root -g "$key_group" -m 0755 "$pin_dir"
-install -o root -g "$key_group" -m 0644 "$scratch/release-key.pub" "$pin_path.new.$$"
-mv -f -- "$pin_path.new.$$" "$pin_path"
-
-platform_claim=$(cat "$payload/PLATFORM_CLAIM")
-if [ "$platform_claim" != "$expected_platform_claim" ]; then
-  printf '%s\n' "Bloom release has the wrong platform claim." >&2
-  exit 65
-fi
-BLOOM_RELEASE_PUBLIC_KEY="$pin_path" \
-  "$release_installer" "$@"
-INSTALL_REVIEWED_TRIAD
-  } > "$privileged_installer"
-  chmod 755 "$privileged_installer"
-  # The privileged command in references/install.md checks this same digest.
-  # Change both together whenever the wrapper text or release key changes.
-  if [ "$(sha256_file "$privileged_installer")" != \
-    1c21729dfedbf141ee6eed8b6361c2e470eb95a664316a39b162ec8151d789c8 ]
-  then
-    printf '%s\n' "Bloom's generated installer does not match the reviewed digest." >&2
-    exit 1
-  fi
+  # The checks above only fail early. Root trusts none of this stage: the
+  # privileged command in references/install.md copies it, verifies it again
+  # with the same release key, and only then runs the signed installer.
 
   # Replace only a stage this script made: owned by the user, with an intact
-  # marker naming a release tag and the reviewed installer beside it.
+  # marker naming a release tag and the payload beside it.
   stage_marker="$install_stage/.bloom-triad-stage"
   if [ -L "$install_stage" ] || { [ -e "$install_stage" ] && {
     [ ! -O "$install_stage" ] || [ -L "$stage_marker" ] || [ ! -O "$stage_marker" ] ||
-      [ ! -f "$install_stage/install-reviewed-triad.sh" ] ||
+      [ ! -d "$install_stage/bloom-triad" ] ||
       ! grep -qx 'v[0-9][0-9A-Za-z.+-]*' "$stage_marker"; }; }
   then
     printf '%s\n' "Bloom will not replace an unrecognized installation stage: $install_stage" >&2
