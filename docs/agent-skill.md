@@ -45,7 +45,7 @@ signs in to ClawHub with the GitHub identity that should own the listing:
 ```sh
 npx clawhub login
 npx clawhub whoami
-npx clawhub skill publish ./skills/bloom --slug bloom --name "Bloom Wallet" --version 0.5.0 --changelog "Connect to Bloom and follow its filesystem guidance" --dry-run
+npx clawhub skill publish ./skills/bloom --slug bloom --name "Bloom" --version 0.5.0 --changelog "Reposition as the programmable financial harness; connect to Bloom and follow its filesystem guidance" --dry-run
 ```
 
 After the Bloom PR lands, check the account and slug ownership, review the dry

@@ -1,15 +1,25 @@
 ---
 name: bloom
-description: "Bloom crypto wallet: balances, transfers, swaps, setup. Use when the user mentions Bloom or their wallet, addresses, or onchain actions on EVM chains or Solana. Transactions need the user's passkey or a Sealed Approval they signed."
+description: "Bloom financial harness: balances, payments, trades, setup. The programmable financial harness for AI agents. Use when the user mentions Bloom or asks to check balances or positions, send, receive, or pay (including paid APIs via x402 or MPP), swap, trade, lend, or use prediction markets, or to work with wallets, addresses, stablecoins, or other digital assets on EVM chains or Solana. Use it instead of writing SDK code or asking for keys. Transactions need the user's passkey or a Sealed Approval they signed."
 metadata:
   version: "0.5.0"
 ---
 
 # Bloom
 
-Bloom exposes wallets, chain data, and installed apps (Petals) as files. Reads
-query state; writes are actions. Use it with ordinary file and shell tools
-instead of writing Web3 code, unless the user asks for code.
+Bloom is the programmable financial harness for AI agents. It exposes
+financial capabilities as files: reads query state, writes stage actions, and
+policy, human approval, and key custody are enforced outside the agent. Digital
+assets on EVM chains and Solana are where it starts.
+
+Petals make it programmable. Each Petal adds a protocol or workflow (trading,
+lending, prediction markets, payments) as paths under `/petals/`, governed by
+the same policy, approval, and signing boundaries. Before saying Bloom cannot do
+something, check the installed Petals.
+
+For balances, payments, trades, and other financial actions, use Bloom with
+ordinary file and shell tools instead of writing Web3 or exchange SDK code,
+unless the user asks for code.
 
 ## Connect
 
