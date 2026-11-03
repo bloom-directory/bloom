@@ -139,6 +139,8 @@ class HyperliquidProposalEval(PetalEval):
                         "s": expected["size"],
                         "r": False,
                         "t": {"limit": {"tif": "Alo"}},
+                        # order.json requires a fresh client order id.
+                        "c": "0x" + secrets.token_hex(16),
                     }
                 ],
                 "grouping": "na",
