@@ -447,10 +447,16 @@ impl PlanRender {
             "Chain:  {} (id {})\n",
             staged.chain, staged.chain_id
         ));
-        s.push_str(&format!(
-            "Value:  {} {} ({} wei)\n",
-            value_human, native_symbol, staged.value_wei
-        ));
+        if crate::chain::chain_has_native_asset(staged.chain_id) {
+            s.push_str(&format!(
+                "Value:  {} {} ({} wei)\n",
+                value_human, native_symbol, staged.value_wei
+            ));
+        } else {
+            // Tempo has no native token, so "0 ETH" would name an asset the
+            // chain does not have. Fees are paid in tokens.
+            s.push_str("Value:  none (this chain has no native token)\n");
+        }
         s.push_str(&format!("Nonce:  {}\n", staged.nonce));
         if let Some(gp) = staged.gas_price.as_deref() {
             s.push_str(&format!(
@@ -721,6 +727,19 @@ Write `y` to `confirm` to broadcast, `cancel` to discard, `override` to bypass s
             out.contains("Value:  0 ETH (not-a-number wei)"),
             "out: {out}"
         );
+    }
+
+    #[test]
+    fn render_names_no_native_value_on_tempo() {
+        let mut staged = base_eth_send();
+        staged.chain_id = crate::chain::TEMPO_MAINNET_CHAIN_ID;
+        staged.value_wei = "0".into();
+        let plan = PlanRender::render(&staged, "ETH", 18);
+        assert!(
+            plan.contains("Value:  none (this chain has no native token)"),
+            "{plan}"
+        );
+        assert!(!plan.contains("ETH"), "{plan}");
     }
 
     #[test]
