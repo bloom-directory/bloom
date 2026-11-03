@@ -74,16 +74,25 @@ async fn serve(client: TcpStream, policy: &Policy) -> Result<()> {
         let mut request = format!("{method} {path} {version}\r\n");
         for header in headers.split("\r\n").filter(|h| !h.is_empty()) {
             let name = header.split(':').next().unwrap_or("").trim();
-            if !["connection", "proxy-connection", "keep-alive", "proxy-authorization"]
-                .iter()
-                .any(|n| name.eq_ignore_ascii_case(n))
+            if ![
+                "connection",
+                "proxy-connection",
+                "keep-alive",
+                "proxy-authorization",
+            ]
+            .iter()
+            .any(|n| name.eq_ignore_ascii_case(n))
             {
                 request.push_str(header);
                 request.push_str("\r\n");
             }
         }
         request.push_str("Connection: close\r\n\r\n");
-        (host, url.port_or_known_default().unwrap_or(80), Some(request))
+        (
+            host,
+            url.port_or_known_default().unwrap_or(80),
+            Some(request),
+        )
     };
     let host = host.trim_start_matches('[').trim_end_matches(']');
     let upstream = match connect(host, port, policy).await {
@@ -91,7 +100,9 @@ async fn serve(client: TcpStream, policy: &Policy) -> Result<()> {
         Err(_) => {
             client
                 .get_mut()
-                .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
                 .await?;
             return Ok(());
         }
@@ -205,7 +216,12 @@ mod tests {
         ] {
             assert!(!allowed(refused.parse().unwrap(), false), "{refused}");
         }
-        for public in ["93.184.216.34", "1.1.1.1", "2606:4700:4700::1111", "64:ff9b::808:808"] {
+        for public in [
+            "93.184.216.34",
+            "1.1.1.1",
+            "2606:4700:4700::1111",
+            "64:ff9b::808:808",
+        ] {
             assert!(allowed(public.parse().unwrap(), false), "{public}");
         }
         // Test fixtures may use loopback, never other private networks.

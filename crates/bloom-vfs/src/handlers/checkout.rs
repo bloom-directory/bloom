@@ -402,7 +402,8 @@ impl Handler for CheckoutHandler {
                 operation(id)?;
                 let request: CheckoutInput = input(bytes)?;
                 if let Some(traveler_id) = request.traveler_id {
-                    if request.card_id.is_some() || request.take_over || request.resolves.is_some() {
+                    if request.card_id.is_some() || request.take_over || request.resolves.is_some()
+                    {
                         return Err(HandlerError::invalid(
                             "Traveler autofill does not accept payment or takeover options",
                         ));

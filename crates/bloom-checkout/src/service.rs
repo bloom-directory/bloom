@@ -133,11 +133,12 @@ impl Store {
         Ok(())
     }
     fn shop(&self, id: &str) -> Result<Option<String>> {
-        Ok(self.0.lock().query_row(
-            "SELECT shop FROM operations WHERE id=?1",
-            [id],
-            |row| row.get(0),
-        )?)
+        Ok(self
+            .0
+            .lock()
+            .query_row("SELECT shop FROM operations WHERE id=?1", [id], |row| {
+                row.get(0)
+            })?)
     }
     /// The shop and, when Bloom read one, the total the human approved.
     fn unresolved(&self, shop: &str) -> Result<Option<String>> {
@@ -4214,7 +4215,7 @@ mod tests {
         // refused, and a take-over Broker never approved changes nothing.
         let refused = service
             .request(Request::Checkout {
-                operation_id: "r".repeat(64),
+                operation_id: "1".repeat(64),
                 card_id: None,
                 agent_description: "It went through".into(),
                 take_over: false,
@@ -4226,7 +4227,7 @@ mod tests {
         assert!(refused.contains("Only a take-over"), "{refused}");
         let unapproved = service
             .request(Request::Checkout {
-                operation_id: "s".repeat(64),
+                operation_id: "2".repeat(64),
                 card_id: None,
                 agent_description: "It went through".into(),
                 take_over: true,
@@ -4243,7 +4244,7 @@ mod tests {
             .store
             .insert(
                 &Status {
-                    operation_id: "t".repeat(64),
+                    operation_id: "3".repeat(64),
                     state: "human_control".into(),
                     ceremony_url: None,
                     filled_fields: vec![],
@@ -4257,7 +4258,7 @@ mod tests {
             )
             .unwrap();
         *service.private.lock().await = Some(PrivateCheckout {
-            operation_id: "t".repeat(64),
+            operation_id: "3".repeat(64),
             mode: Mode::TakeOver,
             view_target: tab.target.clone(),
             view_session: tab.session.clone(),
@@ -4319,7 +4320,7 @@ mod tests {
             .unwrap();
         let refused = service
             .request(Request::Checkout {
-                operation_id: "u".repeat(64),
+                operation_id: "4".repeat(64),
                 card_id: None,
                 agent_description: "Check it".into(),
                 take_over: true,
@@ -4823,7 +4824,10 @@ mod tests {
             .browse(crate::browser::BrowseRequest::Snapshot)
             .await
             .unwrap();
-        assert!(snapshot["text"].as_str().unwrap().contains("Signed out"), "{snapshot}");
+        assert!(
+            snapshot["text"].as_str().unwrap().contains("Signed out"),
+            "{snapshot}"
+        );
         fixture_task.abort();
     }
 

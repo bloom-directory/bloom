@@ -1177,14 +1177,20 @@ mod tests {
             snapshot["text"],
             "Hello [saved given_name], receipt to [saved email]"
         );
-        assert_eq!(snapshot["url"], "https://shop.example/?n=[saved given_name]");
+        assert_eq!(
+            snapshot["url"],
+            "https://shop.example/?n=[saved given_name]"
+        );
         let element = &snapshot["elements"][0];
         assert_eq!(element["label"], "[saved given_name]");
         assert_eq!(element["context"], "For [saved given_name]");
         assert_eq!(element["value"], "[saved given_name]");
         assert_eq!(element["options"][0]["label"], "[saved given_name]");
         let seen = fold(&snapshot.to_string());
-        assert!(!seen.contains("alice") && !seen.contains("ada@example"), "{seen}");
+        assert!(
+            !seen.contains("alice") && !seen.contains("ada@example"),
+            "{seen}"
+        );
     }
 
     #[tokio::test]
