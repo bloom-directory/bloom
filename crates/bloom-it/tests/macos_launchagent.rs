@@ -743,10 +743,12 @@ fn macos_checkout_logs_uses_a_per_login_port_and_cleans_up_its_accounts() {
         fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
     let linux =
         fs::read_to_string(workspace().join("packaging/triad/release/install-linux.sh")).unwrap();
-    // Both platforms derive the same port from the login UID.
-    let derivation = "$((10000 + login_uid % 8000))";
-    assert!(installer.contains(&format!("checkout_view_port=\"{derivation}\"")));
-    assert!(linux.contains("$((10000 + uid % 8000))"));
+    // Both platforms start from the login UID's slot and skip ports another
+    // login records or something already listens on.
+    assert!(installer.contains("port=$((10000 + (login_uid + offset) % 8000))"));
+    assert!(installer.contains("lsof -nP -iTCP:\"$port\" -sTCP:LISTEN"));
+    assert!(installer.contains("checkout_view_port=\"$(checkout_view_port)\""));
+    assert!(linux.contains("port=$((10000 + (uid + offset) % 8000))"));
     assert!(installer.contains("-e \"s|@BLOOM_CHECKOUT_VIEW_PORT@|$checkout_view_port|g\""));
     assert!(installer.contains("checkout_log=\"$log_root/checkout.log\""));
     assert!(installer.contains("-e \"s|@BLOOM_CHECKOUT_LOG@|$checkout_log|g\""));

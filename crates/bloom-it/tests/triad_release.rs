@@ -2450,6 +2450,42 @@ fn linux_installer_refuses_aws_kms_signer_configuration_before_changing_state() 
 }
 
 #[test]
+fn linux_installer_gives_congruent_uids_distinct_checkout_view_ports() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let payload = make_installer_payload(&directory.path().join("release-a"));
+    let installer = release_script("install-linux.sh");
+    let view_port = |uid: &str| {
+        fs::read_to_string(root.join(format!("etc/bloom/{uid}/checkout.env")))
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("BLOOM_CHECKOUT_VIEW_PORT="))
+            .unwrap()
+            .to_owned()
+    };
+    // 1000 and 9000 share the slot 10000 + uid % 8000; reinstalling keeps
+    // each login's port.
+    for (uid, user) in [("1000", "alice"), ("9000", "carol"), ("1000", "alice")] {
+        let installed = Command::new(&installer)
+            .args(["install"])
+            .arg(&root)
+            .args([uid, user])
+            .arg(&payload)
+            .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+            .output()
+            .unwrap();
+        assert!(
+            installed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        assert_eq!(view_port("1000"), "11000");
+    }
+    assert_eq!(view_port("9000"), "11001");
+}
+
+#[test]
 fn linux_installer_allocates_distinct_ports_and_rejects_mixed_release_sets() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
