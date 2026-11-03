@@ -125,9 +125,12 @@ fn default_native_decimals() -> u8 {
 /// `eth_getBalance` returns the same placeholder for every address.
 pub const TEMPO_MAINNET_CHAIN_ID: u64 = 4217;
 
+/// Tempo Moderato testnet, which also has no native token.
+pub const TEMPO_MODERATO_CHAIN_ID: u64 = 42431;
+
 /// False for a chain id with no native token, such as Tempo.
 pub fn chain_has_native_asset(chain_id: u64) -> bool {
-    chain_id != TEMPO_MAINNET_CHAIN_ID
+    !matches!(chain_id, TEMPO_MAINNET_CHAIN_ID | TEMPO_MODERATO_CHAIN_ID)
 }
 
 impl ChainSpec {
@@ -233,6 +236,13 @@ pub const SOLANA_MAINNET_BETA_GENESIS_HASH: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZ
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn both_tempo_chains_have_no_native_asset() {
+        assert!(!chain_has_native_asset(TEMPO_MAINNET_CHAIN_ID));
+        assert!(!chain_has_native_asset(TEMPO_MODERATO_CHAIN_ID));
+        assert!(chain_has_native_asset(1));
+    }
 
     #[test]
     fn chain_id_display_and_from() {
