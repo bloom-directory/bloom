@@ -337,8 +337,12 @@ fn refresh_developer_provenance_catalog(
     // without this an upgraded developer triad stays silently broken until each
     // Petal is enrolled again by hand.
     //
-    // Petal subjects only: System records come from the shipped template and
-    // name their own fee assets, which this table does not govern.
+    // Petal subjects only. The filter above already drops any record whose
+    // subject the current template still lists, so the template's own System
+    // records never reach this loop. What the guard protects is a System
+    // subject the template has since dropped or renamed: it is carried here as
+    // a developer record, and this table does not govern it, so it must keep
+    // the fee asset it was signed with.
     let mut developer_records = developer_records;
     for record in &mut developer_records {
         if matches!(record.subject, ProvenanceSubject::Petal { .. }) {
@@ -1816,6 +1820,7 @@ mod tests {
     #[cfg(feature = "triad-dev-harness")]
     #[test]
     fn developer_catalog_refresh_rederives_a_stale_fee_asset() {
+        const LEGACY_COMPONENT: &str = "bloom-legacy-component";
         let _fixture = FIXTURE_PETAL
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -1861,6 +1866,24 @@ mod tests {
             }
         }
         assert!(rewritten > 0, "the fixture must enroll a developer record");
+
+        // A System subject the current template does not list, so the refresh
+        // carries it instead of replacing it from the template.
+        let mut renamed = 0;
+        for record in &mut stale.records {
+            // The fee asset lives in `operation_classes`; the subject's own
+            // `operation_class` is a different token (`solana.transfer.confirm`).
+            if record
+                .operation_classes
+                .iter()
+                .any(|class| class.operation_class.as_str() == "solana.native-transfer")
+                && let ProvenanceSubject::System { component_id, .. } = &mut record.subject
+            {
+                *component_id = Token::new(LEGACY_COMPONENT).unwrap();
+                renamed += 1;
+            }
+        }
+        assert_eq!(renamed, 1, "the template must ship one native-transfer row");
         rewrite_private_json(&catalog_path, &serde_json::to_value(&stale).unwrap()).unwrap();
 
         let template = template_dir().join("provenance-catalog.unsigned.json");
@@ -1868,8 +1891,16 @@ mod tests {
         let refreshed = read();
         refreshed.validate_shape().unwrap();
 
+        let release_publisher = Token::new("bloom-release-pins").unwrap();
         let mut healed = 0;
         for record in &refreshed.records {
+            // Release records are rebuilt from the pins, not carried, so they
+            // are not what this counts. Including them would make the test
+            // fail the moment a pin lists a catalogued class, which is exactly
+            // what releasing bloom-petal-hyperliquid#19 does.
+            if record.publisher == release_publisher {
+                continue;
+            }
             for class in &record.operation_classes {
                 if class.operation_class == builder_class {
                     let fee = class
@@ -1884,17 +1915,22 @@ mod tests {
         }
         assert_eq!(healed, rewritten, "every stale record must be re-derived");
 
-        // System records come from the template and name their own fee assets;
-        // the Petal table must not reach them.
-        let system_fee = refreshed
+        // The carve-out the Petal guard provides: a System subject this
+        // template no longer lists is carried over like a developer record,
+        // and must keep the fee asset it was signed with rather than being
+        // re-derived from a table that does not govern it. Asserting the
+        // template's own System row proves nothing — it is re-added verbatim
+        // on every refresh whatever this loop does.
+        let legacy_fee = refreshed
             .records
             .iter()
+            .filter(|record| matches!(&record.subject, ProvenanceSubject::System { component_id, .. } if component_id.as_str() == LEGACY_COMPONENT))
             .flat_map(|record| &record.operation_classes)
             .find(|class| class.operation_class.as_str() == "solana.native-transfer")
             .and_then(|class| class.fee_asset.as_ref())
-            .expect("the shipped template names a fee asset for native transfers");
-        assert_eq!(system_fee.chain.as_str(), "solana");
-        assert_eq!(system_fee.asset, "native");
+            .expect("a carried legacy System record must survive the refresh");
+        assert_eq!(legacy_fee.chain.as_str(), "solana");
+        assert_eq!(legacy_fee.asset, "native");
     }
 
     #[cfg(feature = "triad-dev-harness")]

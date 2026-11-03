@@ -121,9 +121,11 @@ jobs:
 
   dev_harness_tests:
     # The nextest archive builds with default features, so every test behind
-    # `triad-dev-harness` is neither run nor type-checked by any other job —
-    # five in `triad_enrollment` alone, including the ones that assert the
-    # developer enrollment path catalogues builder-order classes fee-bearing.
+    # `triad-dev-harness` is neither run nor type-checked by any other job,
+    # including the ones that assert the developer enrollment path catalogues
+    # builder-order classes fee-bearing. Plain `cargo test` rather than nextest
+    # on purpose: three of these serialize a fixture rebuild through a
+    # process-local Mutex, which a process-per-test runner would not honour.
     # `cargo build --all-features` elsewhere does not set `cfg(test)`, so it
     # does not cover them either. Scoped to `bloom` to keep this cheap.
     name: dev-harness tests
