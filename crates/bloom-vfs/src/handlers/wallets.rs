@@ -11402,8 +11402,12 @@ value = "0""#,
     }
 
     /// An EVM node for chain id 1 holding no ETH and 2.5 USDC, whose DAI
-    /// `balanceOf` fails. Returns its URL and a count of requests served.
-    async fn spawn_usdc_only_evm_node() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    /// `balanceOf` fails. With `multicall`, it answers Multicall3
+    /// `aggregate3`; without it, Multicall3 has no code there. Returns its URL
+    /// and a count of requests served.
+    async fn spawn_usdc_only_evm_node(
+        multicall: bool,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let usdc = bloom_proto::tokens::for_chain(1)
             .iter()
@@ -11442,9 +11446,55 @@ value = "0""#,
                     };
                     let word = |value: u64| format!("0x{value:064x}");
                     let to = request["params"][0]["to"].as_str().unwrap_or_default();
+                    let held = |token: &str| {
+                        if token.eq_ignore_ascii_case(&usdc) {
+                            2_500_000
+                        } else {
+                            0
+                        }
+                    };
+                    let multicall3 = format!("{:#x}", bloom_evm::MULTICALL3);
                     let result = match request["method"].as_str().unwrap_or_default() {
                         "eth_chainId" => serde_json::json!("0x1"),
                         "eth_getBalance" => serde_json::json!("0x0"),
+                        "eth_call" if to.eq_ignore_ascii_case(&multicall3) && !multicall => {
+                            serde_json::json!("0x")
+                        }
+                        "eth_call" if to.eq_ignore_ascii_case(&multicall3) => {
+                            use alloy::sol_types::SolCall;
+                            use bloom_evm::IMulticall3::{Call3Result, aggregate3Call};
+                            let params = &request["params"][0];
+                            let input = params["input"].as_str().or(params["data"].as_str());
+                            let input = hex::decode(input.unwrap().trim_start_matches("0x"));
+                            let calls = aggregate3Call::abi_decode(&input.unwrap()).unwrap().calls;
+                            let results: Vec<Call3Result> = calls
+                                .iter()
+                                .map(|call| {
+                                    let target = format!("{:#x}", call.target);
+                                    let failed = target.eq_ignore_ascii_case(dai);
+                                    let value = if target == multicall3 {
+                                        0
+                                    } else {
+                                        held(&target)
+                                    };
+                                    Call3Result {
+                                        success: !failed,
+                                        returnData: if failed {
+                                            Default::default()
+                                        } else {
+                                            alloy::primitives::U256::from(value)
+                                                .to_be_bytes::<32>()
+                                                .to_vec()
+                                                .into()
+                                        },
+                                    }
+                                })
+                                .collect();
+                            serde_json::json!(format!(
+                                "0x{}",
+                                hex::encode(aggregate3Call::abi_encode_returns(&results))
+                            ))
+                        }
                         "eth_call" if to.eq_ignore_ascii_case(dai) => {
                             let body = serde_json::json!({"jsonrpc":"2.0","id":request["id"],
                                 "error":{"code":3,"message":"execution reverted"}})
@@ -11452,14 +11502,7 @@ value = "0""#,
                             let _ = socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
                             return;
                         }
-                        "eth_call" => {
-                            let held = if to.eq_ignore_ascii_case(&usdc) {
-                                2_500_000
-                            } else {
-                                0
-                            };
-                            serde_json::json!(word(held))
-                        }
+                        "eth_call" => serde_json::json!(word(held(to))),
                         method => panic!("unexpected holdings RPC {method}"),
                     };
                     let body =
@@ -11478,6 +11521,15 @@ value = "0""#,
     /// whole read.
     #[tokio::test]
     async fn holdings_list_nonzero_balances_and_record_unreachable_chains() {
+        // Without Multicall3, ethereum costs one request for ETH plus one per
+        // known token; with it, one request in all.
+        let tokens = bloom_proto::tokens::for_chain(1).len();
+        for (multicall, requests) in [(false, 1 + tokens), (true, 1)] {
+            holdings_read(multicall, requests).await;
+        }
+    }
+
+    async fn holdings_read(multicall: bool, requests: usize) {
         let f = make_handler();
         let chain = |name: &str, chain_id: u64, url: String| {
             bloom_evm::ChainClient::new(bloom_proto::ChainSpec {
@@ -11494,7 +11546,7 @@ value = "0""#,
             })
             .unwrap()
         };
-        let (ethereum, served) = spawn_usdc_only_evm_node().await;
+        let (ethereum, served) = spawn_usdc_only_evm_node(multicall).await;
         f.handler.chains.add(chain("ethereum", 1, ethereum));
         f.handler
             .chains
@@ -11563,6 +11615,10 @@ value = "0""#,
             "{v}"
         );
         assert_eq!(errors["ethereum"], "could not read DAI", "{v}");
+        let served = served.load(std::sync::atomic::Ordering::SeqCst);
+        // A fallback also sends the one Multicall3 probe first.
+        let probe = usize::from(!multicall);
+        assert_eq!(served, requests + probe, "multicall={multicall}");
     }
 
     // ---- errno semantics -------------------------------------------------

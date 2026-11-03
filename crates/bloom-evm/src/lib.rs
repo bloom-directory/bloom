@@ -83,6 +83,21 @@ sol! {
     }
 }
 
+sol! {
+    #[sol(rpc)]
+    #[allow(missing_docs)]
+    interface IMulticall3 {
+        struct Call3 { address target; bool allowFailure; bytes callData; }
+        struct Call3Result { bool success; bytes returnData; }
+        function aggregate3(Call3[] calldata calls) external payable returns (Call3Result[] memory returnData);
+        function getEthBalance(address addr) external view returns (uint256 balance);
+    }
+}
+
+/// Multicall3's address, the same on every chain where it is deployed.
+pub const MULTICALL3: Address =
+    alloy::primitives::address!("cA11bde05977b3631167028862bE2a173976CA11");
+
 /// ERC-165 interface IDs for the standards we care about.
 pub const ERC165_INTERFACE_ID_ERC721: [u8; 4] = [0x80, 0xac, 0x58, 0xcd];
 pub const ERC165_INTERFACE_ID_ERC1155: [u8; 4] = [0xd9, 0xb6, 0x7a, 0x26];
@@ -667,6 +682,88 @@ impl ChainClient {
                 Ok(None)
             }
         }
+    }
+
+    /// `holder`'s native balance and its `balanceOf` for each token; a token
+    /// whose read fails is `None`. Uses one Multicall3 `eth_call` where the
+    /// contract exists, so a rate-limited free RPC sees one request instead
+    /// of one per token. Where it does not (a fresh local node, or a revert),
+    /// reads one by one. A transport failure is returned without retrying,
+    /// so an unreachable or throttling node is not asked again.
+    pub async fn native_and_token_balances(
+        &self,
+        holder: Address,
+        tokens: &[Address],
+    ) -> Result<(U256, Vec<Option<U256>>), ChainError> {
+        if !tokens.is_empty()
+            && let Some(read) = self.balances_by_multicall(holder, tokens).await?
+        {
+            return Ok(read);
+        }
+        let native = self.balance(holder).await?;
+        let mut balances = Vec::with_capacity(tokens.len());
+        for &token in tokens {
+            balances.push(self.erc20_balance(token, holder).await?);
+        }
+        Ok((native, balances))
+    }
+
+    /// The Multicall3 half of [`Self::native_and_token_balances`]. `Ok(None)`
+    /// means the node answered but Multicall3 is unusable there.
+    async fn balances_by_multicall(
+        &self,
+        holder: Address,
+        tokens: &[Address],
+    ) -> Result<Option<(U256, Vec<Option<U256>>)>, ChainError> {
+        use alloy::sol_types::SolCall;
+        let call = |target, allow_failure, data: Vec<u8>| IMulticall3::Call3 {
+            target,
+            allowFailure: allow_failure,
+            callData: data.into(),
+        };
+        let mut calls = vec![call(
+            MULTICALL3,
+            false,
+            IMulticall3::getEthBalanceCall { addr: holder }.abi_encode(),
+        )];
+        calls.extend(tokens.iter().map(|&token| {
+            call(
+                token,
+                true,
+                IERC20::balanceOfCall { account: holder }.abi_encode(),
+            )
+        }));
+        let results = match IMulticall3::new(MULTICALL3, self.primary.clone())
+            .aggregate3(calls)
+            .call()
+            .await
+        {
+            Ok(results) => results,
+            // An error reply that is not a revert (often a rate limit) and a
+            // failed transport both mean: do not send more requests.
+            Err(alloy::contract::Error::TransportError(e))
+                if e.as_error_resp()
+                    .is_none_or(|resp| !resp.message.contains("revert")) =>
+            {
+                return Err(e.into());
+            }
+            Err(e) => {
+                debug!(error = %e, "multicall3.unavailable");
+                return Ok(None);
+            }
+        };
+        if results.len() != tokens.len() + 1 {
+            return Ok(None);
+        }
+        let value = |r: &IMulticall3::Call3Result| {
+            r.success
+                .then(|| IERC20::balanceOfCall::abi_decode_returns(&r.returnData).ok())
+                .flatten()
+        };
+        let Some(native) = value(&results[0]) else {
+            return Ok(None);
+        };
+        Ok(Some((native, results[1..].iter().map(value).collect())))
     }
 
     /// Read an ERC-20 token's `allowance(owner, spender)`. Returns
@@ -1761,6 +1858,47 @@ mod mock_rpc_tests {
         let token = address!("0x6666666666666666666666666666666666666666");
         let holder = address!("0x7777777777777777777777777777777777777777");
         assert_eq!(c.erc20_balance(token, holder).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn token_balances_fall_back_when_multicall_reverts() {
+        let mut r = responses();
+        r.insert(
+            "eth_call".into(),
+            vec![
+                MockResponse::Err(3, "execution reverted".into(), None),
+                MockResponse::Ok(enc_uint256(U256::from(7u64))),
+            ],
+        );
+        r.insert("eth_getBalance".into(), vec![MockResponse::Ok(qty(5))]);
+        let c = client_at(&spawn_mock(r).await);
+        let token = address!("0x6666666666666666666666666666666666666666");
+        let holder = address!("0x7777777777777777777777777777777777777777");
+        let (native, tokens) = c.native_and_token_balances(holder, &[token]).await.unwrap();
+        assert_eq!(
+            (native, tokens),
+            (U256::from(5u64), vec![Some(U256::from(7u64))])
+        );
+    }
+
+    #[tokio::test]
+    async fn token_balances_stop_when_the_node_rate_limits() {
+        // Falling back here would send one more request per token to a node
+        // that just refused one.
+        let mut r = responses();
+        r.insert(
+            "eth_call".into(),
+            vec![MockResponse::Err(
+                -32005,
+                "rate limit exceeded".into(),
+                None,
+            )],
+        );
+        r.insert("eth_getBalance".into(), vec![MockResponse::Ok(qty(5))]);
+        let c = client_at(&spawn_mock(r).await);
+        let token = address!("0x6666666666666666666666666666666666666666");
+        let holder = address!("0x7777777777777777777777777777777777777777");
+        assert!(c.native_and_token_balances(holder, &[token]).await.is_err());
     }
 
     #[tokio::test]

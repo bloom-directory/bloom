@@ -538,7 +538,16 @@ impl WalletsHandler {
                 .ok_or_else(|| HandlerError::not_found(format!("chain '{chain}'")))?;
             let holder = Self::evm_address(Self::evm_family(view, chain)?)?;
             let spec = client.spec();
-            let native = client.balance(holder).await.map_err(err_be)?;
+            let tokens = bloom_proto::tokens::for_chain(spec.chain_id);
+            let contracts = tokens
+                .iter()
+                .map(|token| token.address.parse())
+                .collect::<Result<Vec<alloy::primitives::Address>, _>>()
+                .map_err(err_be)?;
+            let (native, balances) = client
+                .native_and_token_balances(holder, &contracts)
+                .await
+                .map_err(err_be)?;
             found.push(amount_fields(
                 chain,
                 "native",
@@ -546,9 +555,8 @@ impl WalletsHandler {
                 spec.native_decimals,
                 native,
             ));
-            for token in bloom_proto::tokens::for_chain(spec.chain_id) {
-                let contract: alloy::primitives::Address = token.address.parse().map_err(err_be)?;
-                let Ok(Some(raw)) = client.erc20_balance(contract, holder).await else {
+            for ((token, contract), balance) in tokens.iter().zip(contracts).zip(balances) {
+                let Some(raw) = balance else {
                     unread.push(token.symbol);
                     continue;
                 };
