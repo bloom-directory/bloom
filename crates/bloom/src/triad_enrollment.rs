@@ -343,11 +343,30 @@ fn refresh_developer_provenance_catalog(
     // subject the template has since dropped or renamed: it is carried here as
     // a developer record, and this table does not govern it, so it must keep
     // the fee asset it was signed with.
+    //
+    // Every Petal record IS governed, including the authority fixture that
+    // `scripts/triad-dev-launch.sh` injects with `jq` — its hand-written
+    // `fee_asset` literal is re-derived here like any other, so that literal
+    // has to stay null unless its class joins the table.
+    //
+    // A change is reported because this is an authoritative write: healing a
+    // stale None is the point, but the same line would silently drop a value
+    // the table does not know, and Broker's denial at claim time is otherwise
+    // the only symptom.
     let mut developer_records = developer_records;
     for record in &mut developer_records {
         if matches!(record.subject, ProvenanceSubject::Petal { .. }) {
             for class in &mut record.operation_classes {
-                class.fee_asset = catalogued_fee_asset(class.operation_class.as_str())?;
+                let derived = catalogued_fee_asset(class.operation_class.as_str())?;
+                if derived != class.fee_asset {
+                    eprintln!(
+                        "note: re-derived fee asset for {} from {:?} to {:?}",
+                        class.operation_class.as_str(),
+                        class.fee_asset.as_ref().map(|fee| fee.asset.as_str()),
+                        derived.as_ref().map(|fee| fee.asset.as_str()),
+                    );
+                }
+                class.fee_asset = derived;
             }
         }
     }
@@ -566,8 +585,16 @@ fn developer_route_operation_classes(
 }
 
 /// The one Hyperliquid operation class whose every claim declares a fee:
-/// builder-bearing orders, owner- or session-signed, sign under it and
-/// nothing else does (bloom-petal-hyperliquid's `BUILDER_ORDER_INTENT`).
+/// builder-bearing orders sign under it and nothing else does
+/// (bloom-petal-hyperliquid's `BUILDER_ORDER_INTENT`).
+///
+/// Owner-signed only, in practice. The Petal routes session-signed builder
+/// orders here too, but the reusable key-scope approval is prepared with
+/// `value_limits: Vec::new()` (`bloom-daemon`), and Broker refuses a claim
+/// whose fee asset is absent from those limits with `VALUE_ASSET_NOT_ALLOWED`.
+/// A builder fee is the first declared value ever to reach that approval —
+/// plain session actions declare nothing — so the session path is denied at
+/// use time until those limits are populated.
 const HYPERLIQUID_BUILDER_ORDER_CLASS: &str = "hyperliquid.builder_order";
 
 /// Polymarket's fee-bearing CLOB order class, separate from the fee-free
@@ -603,6 +630,17 @@ const POLYMARKET_BUILDER_CODE_ORDER_CLASS: &str = "polymarket.builder_code_order
 /// `PetalAuthorityRoute` row in `github_source.rs` and a pin bump, or
 /// `validate_release_authority` rejects the release for declaring a class the
 /// pin does not list.
+///
+/// It is not sufficient on its own. Broker reviews a class only if it is
+/// registered there: neither `hyperliquid.builder_order` nor
+/// `polymarket.builder_code_order.poly1271` appears in
+/// `MESSAGE_REVIEW_OPERATION_CLASSES` or
+/// `POLYMARKET_REVIEW_OPERATION_CLASSES`, so a builder order is not required
+/// to carry the decoded order review its fee-free sibling must, and a
+/// session-signed one falls outside `verify_hyperliquid_agent_use`, which
+/// matches `hyperliquid.agent_action` with no declared fee. Cataloguing a fee
+/// asset makes the claim authorizable; it does not make the operation
+/// reviewed.
 const FEE_BEARING_OPERATION_CLASSES: &[CataloguedFeeAsset] = &[
     CataloguedFeeAsset {
         operation_class: HYPERLIQUID_BUILDER_ORDER_CLASS,

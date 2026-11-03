@@ -155,7 +155,16 @@ Adding a venue is one row in `FEE_BEARING_OPERATION_CLASSES`
 makes the new class uniformly fee-bearing, and then the class on that Petal's
 `PetalAuthorityRoute` row with a pin bump — without which
 `validate_release_authority` rejects the release for declaring a class the pin
-does not list. That table governs Petal provenance only; System records come
+does not list.
+
+That makes the claim authorizable, not reviewed. Broker reviews a class only if
+it is registered in `MESSAGE_REVIEW_OPERATION_CLASSES` or
+`POLYMARKET_REVIEW_OPERATION_CLASSES`, and neither fee-bearing class is, so a
+builder order is not required to carry the decoded order review its fee-free
+sibling must. A session-signed one is further outside Broker's delegated-action
+witness, which matches `hyperliquid.agent_action` with no declared fee — and
+cannot be authorized at all today, because the reusable key-scope approval
+carries empty `value_limits` and a declared fee is the first value to reach it. That table governs Petal provenance only; System records come
 from the shipped catalog template and carry their own fee assets, as
 `solana.native-transfer` does. The row is inert until a Petal
 emits that exact class, and the catalogued chain and asset must match the
