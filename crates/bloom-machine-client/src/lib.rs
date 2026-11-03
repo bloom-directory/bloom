@@ -4448,7 +4448,10 @@ mod tests {
         PetalUseClaim {
             package_hash: digest(80),
             route: "r000021".to_owned(),
-            operation_class: token("hyperliquid.agent_action"),
+            // Must be the fee-bearing class: a fee declared under
+            // hyperliquid.agent_action is exactly what enrollment now denies
+            // with FEE_NOT_ALLOWED, and MockBroker skips that check.
+            operation_class: token("hyperliquid.builder_order"),
             crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
             payload_digest: digest(1),
             ordered_hashes: vec![digest(2)],

@@ -119,6 +119,34 @@ jobs:
         if: always()
         run: sccache --show-stats
 
+  dev_harness_tests:
+    # The nextest archive builds with default features, so every test behind
+    # `triad-dev-harness` is neither run nor type-checked by any other job —
+    # five in `triad_enrollment` alone, including the ones that assert the
+    # developer enrollment path catalogues builder-order classes fee-bearing.
+    # `cargo build --all-features` elsewhere does not set `cfg(test)`, so it
+    # does not cover them either. Scoped to `bloom` to keep this cheap.
+    name: dev-harness tests
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+      - name: Run feature-gated bloom tests
+        run: cargo test -p bloom --bins --features triad-dev-harness --locked
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
+
   build_test_archive:
     name: build test archive
     runs-on: ubuntu-latest

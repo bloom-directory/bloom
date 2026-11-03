@@ -152,7 +152,12 @@ claim must name; it does not make the amount enforceable.
 
 Adding a venue is one row in `FEE_BEARING_OPERATION_CLASSES`
 (`crates/bloom/src/triad_enrollment.rs`) plus the Petal-side route split that
-makes the new class uniformly fee-bearing. The row is inert until a Petal
+makes the new class uniformly fee-bearing, and then the class on that Petal's
+`PetalAuthorityRoute` row with a pin bump — without which
+`validate_release_authority` rejects the release for declaring a class the pin
+does not list. That table governs Petal provenance only; System records come
+from the shipped catalog template and carry their own fee assets, as
+`solana.native-transfer` does. The row is inert until a Petal
 emits that exact class, and the catalogued chain and asset must match the
 Petal's `DeclaredFee::Fee` exactly or Broker answers `FEE_ASSET_MISMATCH`.
 

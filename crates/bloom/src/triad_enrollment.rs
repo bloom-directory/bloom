@@ -329,6 +329,24 @@ fn refresh_developer_provenance_catalog(
         })
         .cloned()
         .collect();
+    // A developer record enrolled before a class was catalogued keeps the fee
+    // asset it was written with, and this refresh re-signs it as valid, so the
+    // stale value would outlive the upgrade: the Petal declares a fee the
+    // catalogue says its class does not take, and Broker denies every one with
+    // FEE_NOT_ALLOWED. Only `bloom-release-pins` records are rebuilt below, so
+    // without this an upgraded developer triad stays silently broken until each
+    // Petal is enrolled again by hand.
+    //
+    // Petal subjects only: System records come from the shipped template and
+    // name their own fee assets, which this table does not govern.
+    let mut developer_records = developer_records;
+    for record in &mut developer_records {
+        if matches!(record.subject, ProvenanceSubject::Petal { .. }) {
+            for class in &mut record.operation_classes {
+                class.fee_asset = catalogued_fee_asset(class.operation_class.as_str())?;
+            }
+        }
+    }
     catalog.records.extend(developer_records);
     append_release_petal_provenance(&mut catalog, &installer_key_id, &signing_key)?;
     for record in &mut catalog.records {
@@ -576,8 +594,11 @@ const POLYMARKET_BUILDER_CODE_ORDER_CLASS: &str = "polymarket.builder_code_order
 /// One row per operation class whose *every* claim declares an exact fee.
 ///
 /// Adding a venue is one row here plus the Petal-side route split that makes
-/// the new class uniformly fee-bearing. Nothing else in enrollment needs to
-/// change, and a row for a class no installed Petal emits stays inert.
+/// the new class uniformly fee-bearing. A row for a class no installed Petal
+/// emits stays inert — and releasing it also needs the class on the Petal's
+/// `PetalAuthorityRoute` row in `github_source.rs` and a pin bump, or
+/// `validate_release_authority` rejects the release for declaring a class the
+/// pin does not list.
 const FEE_BEARING_OPERATION_CLASSES: &[CataloguedFeeAsset] = &[
     CataloguedFeeAsset {
         operation_class: HYPERLIQUID_BUILDER_ORDER_CLASS,
@@ -617,8 +638,11 @@ struct CataloguedFeeAsset {
 /// that declares a fee, and it signs under its own class through a dedicated
 /// route, which is what makes the fee asset safe to assert.
 ///
-/// Every class absent from `FEE_BEARING_OPERATION_CLASSES` stays `None` so
-/// enrollment cannot outrun what the Petals actually declare. See
+/// Every Petal class absent from `FEE_BEARING_OPERATION_CLASSES` stays `None`,
+/// so enrollment cannot outrun what the Petals actually declare. This governs
+/// Petal provenance only: the signed catalog also carries System records from
+/// the shipped template, and one of those (`solana.native-transfer`) names a
+/// fee asset of its own, since a native transfer always pays a network fee. See
 /// "Operation-class granularity and `fee_asset`" in
 /// `docs/architecture/Sealed Approvals.md`.
 fn catalogued_fee_asset(operation_class: &str) -> Result<Option<ProvenanceFeeAsset>> {
@@ -1536,7 +1560,7 @@ mod tests {
     }
 
     #[test]
-    fn only_builder_order_classes_are_catalogued_with_a_fee_asset() {
+    fn only_builder_order_petal_classes_are_catalogued_with_a_fee_asset() {
         for class in [
             "hyperliquid.agent_action",
             "hyperliquid.order",
@@ -1783,6 +1807,94 @@ mod tests {
         let fee = by_class["hyperliquid.builder_order"].expect("builder orders are fee-bearing");
         assert_eq!(fee.chain.as_str(), "hyperliquid");
         assert_eq!(fee.asset, "usdc");
+    }
+
+    /// A developer root enrolled before a class was catalogued carries its
+    /// records across the refresh verbatim. Without re-deriving the fee asset
+    /// the stale `None` survives, re-signed and valid, and every builder order
+    /// is denied FEE_NOT_ALLOWED on a Bloom that looks correct.
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
+    fn developer_catalog_refresh_rederives_a_stale_fee_asset() {
+        let _fixture = FIXTURE_PETAL
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("config");
+        fs::create_dir(&output).unwrap();
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o700)).unwrap();
+        let owner = rustix::process::geteuid().as_raw();
+        let plan = EnrollmentPlan {
+            template_dir: template_dir(),
+            output_dir: output.clone(),
+            login_uid: 1_001,
+            broker_uid: 1_002,
+            signer_uid: 1_003,
+            session_socket_gid: 1_004,
+            release_digest: "44".repeat(32),
+        };
+        generate_for_owner(&plan, owner).unwrap();
+        let petal_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join("tests/fixtures/triad-authority-petal");
+        enroll_developer_petal_provenance(&output, &petal_dir, owner).unwrap();
+        let catalog_path = output.join("provenance-catalog.json");
+        let read = || -> ProvenanceCatalog {
+            serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap()
+        };
+
+        // What an older binary wrote: the fee-bearing class, enrolled fee-free
+        // because no table existed to catalogue it.
+        let builder_class = Token::new(HYPERLIQUID_BUILDER_ORDER_CLASS).unwrap();
+        let mut stale = read();
+        let mut rewritten = 0;
+        for record in &mut stale.records {
+            if matches!(record.subject, ProvenanceSubject::Petal { .. })
+                && record.publisher != Token::new("bloom-release-pins").unwrap()
+                && let Some(class) = record.operation_classes.first_mut()
+            {
+                class.operation_class = builder_class.clone();
+                class.fee_asset = None;
+                rewritten += 1;
+            }
+        }
+        assert!(rewritten > 0, "the fixture must enroll a developer record");
+        rewrite_private_json(&catalog_path, &serde_json::to_value(&stale).unwrap()).unwrap();
+
+        let template = template_dir().join("provenance-catalog.unsigned.json");
+        refresh_developer_provenance_catalog(&template, &output, owner).unwrap();
+        let refreshed = read();
+        refreshed.validate_shape().unwrap();
+
+        let mut healed = 0;
+        for record in &refreshed.records {
+            for class in &record.operation_classes {
+                if class.operation_class == builder_class {
+                    let fee = class
+                        .fee_asset
+                        .as_ref()
+                        .expect("the refresh must re-derive a catalogued fee asset");
+                    assert_eq!(fee.chain.as_str(), "hyperliquid");
+                    assert_eq!(fee.asset, "usdc");
+                    healed += 1;
+                }
+            }
+        }
+        assert_eq!(healed, rewritten, "every stale record must be re-derived");
+
+        // System records come from the template and name their own fee assets;
+        // the Petal table must not reach them.
+        let system_fee = refreshed
+            .records
+            .iter()
+            .flat_map(|record| &record.operation_classes)
+            .find(|class| class.operation_class.as_str() == "solana.native-transfer")
+            .and_then(|class| class.fee_asset.as_ref())
+            .expect("the shipped template names a fee asset for native transfers");
+        assert_eq!(system_fee.chain.as_str(), "solana");
+        assert_eq!(system_fee.asset, "native");
     }
 
     #[cfg(feature = "triad-dev-harness")]
