@@ -129,7 +129,9 @@ When preparation falls back to the person, `reason` says why:
 - `fields_unsupported`: card fields in an unexpected shape. Same as above.
 - `payment_action_ambiguous`: several payment buttons. The person chooses
   privately; never click Subscribe or Buy to test which one charges.
-- `charge_terms_unreadable`: unclear installments. The person reviews privately.
+- `charge_terms_unreadable`: unclear installments, or a subscription whose
+  later price, period or (when nothing is due today) start date the page does
+  not state once. The person reviews privately.
 - `receiving_origin_unreviewed`: the card would go to an unreviewed host.
   The person pays privately, or choose another seller.
 
@@ -145,8 +147,9 @@ If the same reason repeats on an unchanged page, use a take-over.
 
 `history.json` entries carry the stated `renewal_minor`, `renewal_period`
 and `renewal_starts_on`; use them to say what the person still pays and
-when. With several plans on the page Bloom claims no renewal price, so say
-which plan is selected. Bloom cannot cap later charges. To cancel, do it on
+when. Bloom pays a subscription only when the page states one later price
+and period (and the start date of a free trial); otherwise the person
+completes it privately. Bloom cannot cap later charges. To cancel, do it on
 the shop's site: the person does it in a take-over; it is never a payment
 request.
 

@@ -138,7 +138,8 @@ pub enum PreparationReason {
     /// More than one distinct payment action remains. Choose privately;
     /// trying buttons is not a safe discovery method.
     PaymentActionAmbiguous,
-    /// Installment choices do not identify one clear charge schedule.
+    /// Installment choices, or a subscription's later price, period or first
+    /// charge date, do not identify one clear charge schedule.
     ChargeTermsUnreadable,
     /// The card fields are missing, duplicated or in an unexpected shape.
     FieldsUnsupported,

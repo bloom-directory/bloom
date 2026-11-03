@@ -299,6 +299,10 @@
   // later: the renewal terms are what the person would be approving. Without
   // them there is no amount on this page to approve at all.
   if (!total && !renewal.renewal_minor) { totalRefusal = 'total_not_found'; return {refusal: totalRefusal}; }
+  // A subscription is approved for what it charges later. Without one clear
+  // ongoing price and period, and the start date when nothing is due today,
+  // the signed facts could not bind it; the person completes it privately.
+  if (recurring && (!renewal.renewal_minor || (!total && !renewal.renewal_starts_on))) return {refusal: 'renewal_terms'};
   globalThis.__bloomPayButton = pay[0];
   return {origin:location.origin,payment_frame_origins:[],total_minor:total,currency,installments,recurring,...renewal};
 })()
