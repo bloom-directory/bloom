@@ -839,9 +839,13 @@ impl WalletsHandler {
         chain: &str,
         rest: &[String],
     ) -> Result<Entry, HandlerError> {
-        self.chains
+        let client = self
+            .chains
             .get(chain)
             .ok_or_else(|| HandlerError::not_found(format!("chain '{chain}'")))?;
+        if let [leaf] = rest {
+            crate::handlers::balances::require_native_asset(client.spec(), leaf)?;
+        }
         match rest {
             [] => Ok(Entry::dir(chain)),
             [leaf]
@@ -874,6 +878,9 @@ impl WalletsHandler {
             .get(chain)
             .ok_or_else(|| HandlerError::not_found(format!("chain '{chain}'")))?;
         let address = Self::evm_address(family)?;
+        if let [leaf] = rest {
+            crate::handlers::balances::require_native_asset(client.spec(), leaf)?;
+        }
         match rest {
             [leaf] if leaf == "balance" => {
                 let balance = client.balance(address).await.map_err(err_be)?;
@@ -925,19 +932,19 @@ impl WalletsHandler {
         chain: &str,
         rest: &[String],
     ) -> Result<Vec<Entry>, HandlerError> {
-        self.chains
+        let client = self
+            .chains
             .get(chain)
             .ok_or_else(|| HandlerError::not_found(format!("chain '{chain}'")))?;
         match rest {
-            [] => Ok(vec![
-                Entry::file("balance"),
-                Entry::file("balance.raw"),
-                Entry::file("balance.json"),
-                Entry::file("nonce"),
-                Entry::file("pending_external.jsonl"),
-                Entry::file("nonce_conflicts.json"),
-                Entry::dir("outbox"),
-            ]),
+            [] => Ok(
+                crate::handlers::balances::native_balance_leaves(client.spec())
+                    .iter()
+                    .chain(&["nonce", "pending_external.jsonl", "nonce_conflicts.json"])
+                    .map(|leaf| Entry::file(leaf))
+                    .chain([Entry::dir("outbox")])
+                    .collect(),
+            ),
             [dir] if dir == "outbox" => self.evm_outbox_list(wallet, family, chain, &[]).await,
             [dir, outbox_rest @ ..] if dir == "outbox" => {
                 self.evm_outbox_list(wallet, family, chain, outbox_rest)

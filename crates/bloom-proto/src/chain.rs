@@ -121,7 +121,17 @@ fn default_native_decimals() -> u8 {
     18
 }
 
+/// Tempo mainnet. Fees are paid in stablecoins: it has no native token, and
+/// `eth_getBalance` returns the same placeholder for every address.
+pub const TEMPO_MAINNET_CHAIN_ID: u64 = 4217;
+
 impl ChainSpec {
+    /// False when the chain has no native token, so `eth_getBalance` is not a
+    /// balance. Keyed by chain id so existing configs are covered.
+    pub fn has_native_asset(&self) -> bool {
+        self.chain_id != TEMPO_MAINNET_CHAIN_ID
+    }
+
     /// A safe default Anvil chain spec for local development.
     pub fn anvil_default() -> Self {
         ChainSpec {
