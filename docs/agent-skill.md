@@ -6,7 +6,9 @@ The entrypoint connects an existing Bloom session or routes new installations to
 Operating procedures belong in the installed VFS, not in marketplace copies.
 
 Installing the skill does not install Bloom or create a wallet. Check both
-existing-session use and new-install guidance when changing it. Keep setup's
+existing-session use and new-install guidance when changing it. The
+[skill evals](../evals/skills/README.md) grade new-install responses; CI runs
+their deterministic `check`, and model runs are manual. Keep setup's
 signature checks and platform-specific privileged handoff intact.
 
 ## Website
@@ -45,10 +47,12 @@ signs in to ClawHub with the GitHub identity that should own the listing:
 ```sh
 npx clawhub login
 npx clawhub whoami
-npx clawhub skill publish ./skills/bloom --slug bloom --name "Bloom" --version 0.5.0 --changelog "Connect to Bloom and follow its filesystem guidance" --dry-run
+git checkout vX.Y.Z
+npx clawhub skill publish ./skills/bloom --slug bloom --name "Bloom" --version X.Y.Z --changelog "Bloom vX.Y.Z" --dry-run
 ```
 
-After the Bloom PR lands, check the account and slug ownership, review the dry
+Publish from the release tag, with the release version (the skill's
+`metadata.version`). Check the account and slug ownership, review the dry
 run, and repeat the publish command without `--dry-run`. If the slug is owned
 by someone else, resolve ownership or choose an agreed alternative; do not
 publish under a misleading identity. Check the resulting listing's scan state
@@ -58,3 +62,17 @@ Keep credentials out of the repository. Do not create a publishing workflow or
 store an API token until recurring releases justify automation. See
 <https://docs.openclaw.ai/clawhub/quickstart> for the current authentication and
 publishing flow.
+
+## Releases
+
+The skill's `metadata.version` is the Bloom release version; the Propose
+Release workflow bumps it with `Cargo.toml`. After tagging `vX.Y.Z`:
+
+1. Publish to ClawHub from the tag, as above.
+2. Repin the website to the tag's commit.
+3. Test the upgrade in a clean `HOME` that has the previous release's skill
+   installed: `npx skills update -g -y` and `npx clawhub update bloom` must
+   leave `metadata.version: "X.Y.Z"` in the installed `SKILL.md`, and the
+   Connect command must still work against an upgraded Bloom. v0.4.2 is the
+   first skill release, so it gets a fresh-install check instead; upgrade
+   tests start at v0.5.0.
