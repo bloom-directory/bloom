@@ -294,6 +294,9 @@ class DisposableTriad:
             '"https://polygon-bor-rpc.publicnode.com", '
             '"https://tenderly.rpc.polygon.community"]\n'
             'display_name = "Polygon"\nnative_symbol = "POL"\nnative_decimals = 18\n'
+            '[chains.anvil]\nname = "anvil"\nchain_id = 31337\n'
+            'rpc_urls = ["http://127.0.0.1:8545"]\n'
+            'display_name = "Anvil"\nnative_symbol = "ETH"\nnative_decimals = 18\n'
         )
         if solana:
             port = free_port()
