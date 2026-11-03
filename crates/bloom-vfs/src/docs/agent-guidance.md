@@ -21,9 +21,10 @@ use `docs/petals.md` to discover installed packages, then read that package's
 
 To find where an account's funds are, read
 `wallets/<wallet>/<n>/holdings.json`. It lists the account's non-zero native
-and well-known token balances on every configured chain; a chain that could
-not be read appears under `errors` instead. Tokens outside
-`chains/<chain>/addresses/<address>/tokens/known.json` are not checked, and on
+and major token balances (USDC, USDT, DAI, WETH, WBTC and their common
+variants) on every configured chain. Anything it could not read is named
+under `errors` for that chain; the rows it did read are still listed. Read
+any other token at `chains/<chain>/addresses/<address>/tokens/<token>/`. On
 Solana chains it shows SOL only, not SPL tokens.
 
 ## When the request leaves something out
