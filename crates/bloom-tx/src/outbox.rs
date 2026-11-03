@@ -111,6 +111,12 @@ pub enum SigningEvidence {
     UnreadableBatch,
 }
 
+/// Make a directory's entry list durable: a created or renamed child survives
+/// power loss only once its parent directory is synced.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+
 /// Whether anything is at `path`. Only a clean "not found" proves absence.
 fn may_exist(path: &Path) -> bool {
     !matches!(fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
@@ -636,7 +642,7 @@ impl Outbox {
         let dir = self
             .state_dir(&staged.wallet, &staged.chain, OutboxState::Pending)?
             .join(&staged.id);
-        fs::create_dir_all(&dir)?;
+        self.create_dir_durable(&dir)?;
         self.write_artefact(&dir, "plan.md", plan_md.as_bytes())?;
         self.write_artefact(
             &dir,
@@ -993,7 +999,7 @@ impl Outbox {
             return Ok(entry.dir.clone());
         }
         let target_parent = self.state_dir(&entry.staged.wallet, &entry.staged.chain, new_state)?;
-        fs::create_dir_all(&target_parent)?;
+        self.create_dir_durable(&target_parent)?;
         let target = target_parent.join(&entry.staged.id);
         // Preserve the previous attempt until both stores have transitioned.
         // Successful retries retain its files outside the live state scans.
@@ -1010,6 +1016,7 @@ impl Outbox {
                 .keep();
             let backup = attempt.join("entry");
             fs::rename(&target, &backup)?;
+            sync_dir(&attempt)?;
             Some(backup)
         } else {
             None
@@ -1021,6 +1028,10 @@ impl Outbox {
                 )))?;
             }
             return Err(error.into());
+        }
+        sync_dir(&target_parent)?;
+        if let Some(source_parent) = entry.dir.parent() {
+            sync_dir(source_parent)?;
         }
 
         // Project transition to central outbox.
@@ -1143,6 +1154,19 @@ impl Outbox {
         let dir = self.sent_dir(&entry.wallet, &entry.chain, &entry.id)?;
         fs::create_dir_all(&dir)?;
         self.write_artefact(&dir, name, bytes)?;
+        Ok(())
+    }
+
+    /// `create_dir_all`, then sync every parent up to the outbox root so the
+    /// new directories survive power loss.
+    fn create_dir_durable(&self, dir: &Path) -> Result<(), OutboxError> {
+        fs::create_dir_all(dir)?;
+        for parent in dir.ancestors().skip(1) {
+            sync_dir(parent)?;
+            if parent == self.inner.root {
+                break;
+            }
+        }
         Ok(())
     }
 
