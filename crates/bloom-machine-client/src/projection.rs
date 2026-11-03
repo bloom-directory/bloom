@@ -191,6 +191,11 @@ pub trait WalletProjectionReader: Send + Sync {
     ) -> Result<WalletProjection, ProtocolError> {
         self.get_wallet(wallet_id).await
     }
+    /// Forget that `wallet_id` was observed recently, so the next read
+    /// observes Broker instead of reusing a superseded projection.
+    fn invalidate_wallet(&self, _wallet_id: &Token) -> Result<(), ProtocolError> {
+        Ok(())
+    }
     async fn begin_legacy_migration(
         &self,
         _operation_id: &OperationId,
@@ -829,6 +834,16 @@ impl WalletProjectionReader for CachedWalletProjectionReader {
             return Ok(projection);
         }
         self.get_wallet(wallet_id).await
+    }
+
+    fn invalidate_wallet(&self, wallet_id: &Token) -> Result<(), ProtocolError> {
+        self.wallet_refreshed_ms
+            .lock()
+            .map_err(|_| unavailable("Machine projection freshness mutex poisoned"))?
+            .remove(wallet_id.as_str());
+        // A full refresh also counts as this wallet's observation.
+        self.last_live_refresh_ms.store(0, Ordering::SeqCst);
+        Ok(())
     }
 
     async fn begin_legacy_migration(
