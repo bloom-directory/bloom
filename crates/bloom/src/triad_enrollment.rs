@@ -361,9 +361,7 @@ fn refresh_developer_provenance_catalog(
                 if derived != class.fee_asset {
                     // The whole value, not just the asset: the guard above
                     // compares chain and asset, so printing the asset alone
-                    // reports a chain-only change as "usdc to usdc" — and the
-                    // chain is what Broker matches against the Petal's
-                    // DeclaredFee before answering FEE_ASSET_MISMATCH.
+                    // reported a chain-only change as "usdc to usdc".
                     eprintln!(
                         "note: re-derived fee asset for {} from {:?} to {:?}",
                         class.operation_class.as_str(),
@@ -647,17 +645,21 @@ const POLYMARKET_BUILDER_CODE_ORDER_CLASS: &str = "polymarket.builder_code_order
 /// asset makes the claim authorizable; it does not make the operation
 /// reviewed.
 ///
-/// Those tables are on Broker's master, not the revision pinned in
-/// `Cargo.toml`, which has neither them nor the review they gate — so against
-/// the pin the class is unreviewed for the simpler reason that nothing is.
+/// Those tables, and the witness named below, are on Broker's master, not the
+/// revision pinned in `Cargo.toml`: `message_review.rs` does not exist in that
+/// tree and `agent_action` appears nowhere in it, so against the pin the class
+/// is unreviewed for the simpler reason that nothing is. Acting on any of this
+/// needs a pin bump.
 ///
 /// Registering a fee-bearing class there is NOT the remedy. Polymarket's
-/// `validate_petal_profile` rejects any claim in a reviewed class that
-/// declares a fee, so listing the builder-code class would deny every claim it
-/// exists to permit; and `message_review_requires_exact` makes Broker refuse a
-/// reusable Petal approval whose scope contains a reviewed class, so listing
-/// the Hyperliquid one would make a builder-bound session scope unpreparable
-/// and take plain session signing with it. See "Operation-class granularity
+/// `validate_petal_profile` rejects any claim in a
+/// `POLYMARKET_REVIEW_OPERATION_CLASSES` class that declares debits,
+/// destinations or a fee, so listing the builder-code class would deny every
+/// claim it exists to permit; and `message_review_requires_exact` makes Broker
+/// refuse a reusable Petal approval whose scope contains a reviewed class, so
+/// listing the Hyperliquid one would make *every* session scope unpreparable —
+/// the Petal's derived-key scope requests both classes unconditionally — and
+/// take plain session signing with it. See "Operation-class granularity
 /// and `fee_asset`" in `docs/architecture/Sealed Approvals.md`.
 const FEE_BEARING_OPERATION_CLASSES: &[CataloguedFeeAsset] = &[
     CataloguedFeeAsset {
