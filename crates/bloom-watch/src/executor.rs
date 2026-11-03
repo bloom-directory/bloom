@@ -840,8 +840,13 @@ impl WatchExecutor {
                 // Pick the wallet's "first" chain - this watch kind in the
                 // current spec doesn't carry a chain ref, so we sample
                 // every configured chain. To keep behaviour deterministic
-                // we pick the first chain by registered name order.
-                let chain_name = match self.chains.list_names().into_iter().next() {
+                // we pick the first chain by registered name order. A chain
+                // with no native token (Tempo) has no balance to watch.
+                let chain_name = match self.chains.list_names().into_iter().find(|name| {
+                    self.chains
+                        .get(name)
+                        .is_some_and(|client| client.spec().has_native_asset())
+                }) {
                     Some(n) => n,
                     None => {
                         debug!(wallet = %spec.wallet, id = %spec.id, "watch.balance.no_chains");
@@ -1310,6 +1315,38 @@ mod tests {
             note: None,
         };
         (executor, spec)
+    }
+
+    /// Tempo has no native balance, so a balance watch skips it instead of
+    /// failing the same read on every poll.
+    #[tokio::test]
+    async fn balance_watch_skips_a_chain_without_a_native_token() {
+        let directory = tempdir().unwrap();
+        let home = HomeDir::at(directory.path());
+        home.ensure().unwrap();
+        let registry = Arc::new(WatchRegistry::new(home.watch_dir()).unwrap());
+        let chains = ChainRegistry::default();
+        let mut tempo = bloom_proto::ChainSpec::anvil_default();
+        tempo.name = "tempo".into();
+        tempo.chain_id = bloom_proto::chain::TEMPO_MAINNET_CHAIN_ID;
+        tempo.rpc_urls = vec!["http://127.0.0.1:1".into()];
+        chains.add(bloom_evm::ChainClient::new(tempo).unwrap());
+        let executor = WatchExecutor::new(chains, registry, home);
+        let spec = WatchSpec {
+            id: "tempo-balance".into(),
+            wallet: "alice".into(),
+            created_ms: 1,
+            kind: WatchKind::Balance {
+                address: "0x1111111111111111111111111111111111111111".into(),
+                threshold_wei: "1".into(),
+                comparator: "<".into(),
+            },
+            note: None,
+        };
+        executor
+            .process_spec(&spec, &mut ExecutorState::default())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

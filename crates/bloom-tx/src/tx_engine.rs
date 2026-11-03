@@ -7161,7 +7161,7 @@ mod tests {
             let url = spawn_stage_rpc(true).await;
             let (engine, _dir, permit, chain) = stage_fixture(&url, RecordingOracle::default());
             let mut spec = chain.spec().clone();
-            spec.chain_id = bloom_proto::chain::TEMPO_MAINNET_CHAIN_ID;
+            spec.chain_id = bloom_proto::chain::TEMPO_MODERATO_CHAIN_ID;
             let tempo = ChainClient::new(spec).unwrap();
             let error = engine
                 .stage(
