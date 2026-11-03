@@ -26,7 +26,7 @@
 //! - `wallets/<wallet>/<n>/address.sol`                             — the account's Solana address, if it has a Solana key
 //! - `wallets/<wallet>/<n>/address.sol.qr.{svg,png}`                — scannable QR images of that address
 //! - `wallets/<wallet>/<n>/public_key`                              — canonical public key hex (EVM key, else Solana)
-//! - `wallets/<wallet>/<n>/holdings.json`                           — non-zero native and known-token balances on every chain
+//! - `wallets/<wallet>/<n>/holdings.json`                           — non-zero native and major-token balances on every chain
 //! - `wallets/<wallet>/<n>/chains/<chain>/{balance,balance.raw,balance.json}` — native balance of account n
 //! - `wallets/<wallet>/<n>/chains/<evm-chain>/nonce`
 //! - `wallets/<wallet>/<n>/chains/<evm-chain>/{pending_external.jsonl,nonce_conflicts.json}` — mempool views of account n's address
@@ -11402,24 +11402,49 @@ value = "0""#,
     }
 
     /// An EVM node for chain id 1 holding no ETH and 2.5 USDC, whose DAI
-    /// `balanceOf` fails. With `multicall`, it answers Multicall3
-    /// `aggregate3`; without it, Multicall3 has no code there. Returns its URL
-    /// and a count of requests served.
-    async fn spawn_usdc_only_evm_node(
-        multicall: bool,
+    /// `balanceOf` fails. Returns its URL and a count of requests served.
+    async fn spawn_usdc_only_evm_node() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        spawn_holdings_node(
+            1,
+            0,
+            |symbol| match symbol {
+                "USDC" => Some(2_500_000),
+                "DAI" => None,
+                _ => Some(0),
+            },
+            std::time::Duration::ZERO,
+        )
+        .await
+    }
+
+    /// An EVM node for `chain_id` whose native balance is `native` and whose
+    /// holdings-token balances come from `held` by symbol (`None` reverts).
+    /// Every balance read waits `delay`. Returns its URL and a request count.
+    async fn spawn_holdings_node(
+        chain_id: u64,
+        native: u64,
+        held: fn(&str) -> Option<u64>,
+        delay: std::time::Duration,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        spawn_holdings_node_with(chain_id, native, held, Arc::new(move |_| delay)).await
+    }
+
+    type HoldingsDelay = dyn Fn(Option<&str>) -> std::time::Duration + Send + Sync;
+
+    /// `delay` gets the token symbol a call reads, or `None` for other calls.
+    async fn spawn_holdings_node_with(
+        chain_id: u64,
+        native: u64,
+        held: fn(&str) -> Option<u64>,
+        delay: Arc<HoldingsDelay>,
     ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let usdc = bloom_proto::tokens::for_chain(1)
-            .iter()
-            .find(|token| token.symbol == "USDC")
-            .unwrap()
-            .address
-            .to_ascii_lowercase();
-        let dai = bloom_proto::tokens::for_chain(1)
-            .iter()
-            .find(|token| token.symbol == "DAI")
-            .unwrap()
-            .address;
+        let tokens: Arc<Vec<(String, Option<u64>, String)>> = Arc::new(
+            accounts::holdings_tokens(chain_id)
+                .into_iter()
+                .map(|(address, symbol, _)| (format!("{address:#x}"), held(&symbol), symbol))
+                .collect(),
+        );
         let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = served.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -11427,7 +11452,8 @@ value = "0""#,
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let usdc = usdc.clone();
+                let tokens = tokens.clone();
+                let delay = delay.clone();
                 tokio::spawn(async move {
                     let mut bytes = Vec::new();
                     let mut chunk = [0; 4096];
@@ -11446,63 +11472,26 @@ value = "0""#,
                     };
                     let word = |value: u64| format!("0x{value:064x}");
                     let to = request["params"][0]["to"].as_str().unwrap_or_default();
-                    let held = |token: &str| {
-                        if token.eq_ignore_ascii_case(&usdc) {
-                            2_500_000
-                        } else {
-                            0
-                        }
-                    };
-                    let multicall3 = format!("{:#x}", bloom_evm::MULTICALL3);
-                    let result = match request["method"].as_str().unwrap_or_default() {
-                        "eth_chainId" => serde_json::json!("0x1"),
-                        "eth_getBalance" => serde_json::json!("0x0"),
-                        "eth_call" if to.eq_ignore_ascii_case(&multicall3) && !multicall => {
-                            serde_json::json!("0x")
-                        }
-                        "eth_call" if to.eq_ignore_ascii_case(&multicall3) => {
-                            use alloy::sol_types::SolCall;
-                            use bloom_evm::IMulticall3::{Call3Result, aggregate3Call};
-                            let params = &request["params"][0];
-                            let input = params["input"].as_str().or(params["data"].as_str());
-                            let input = hex::decode(input.unwrap().trim_start_matches("0x"));
-                            let calls = aggregate3Call::abi_decode(&input.unwrap()).unwrap().calls;
-                            let results: Vec<Call3Result> = calls
-                                .iter()
-                                .map(|call| {
-                                    let target = format!("{:#x}", call.target);
-                                    let failed = target.eq_ignore_ascii_case(dai);
-                                    let value = if target == multicall3 {
-                                        0
-                                    } else {
-                                        held(&target)
-                                    };
-                                    Call3Result {
-                                        success: !failed,
-                                        returnData: if failed {
-                                            Default::default()
-                                        } else {
-                                            alloy::primitives::U256::from(value)
-                                                .to_be_bytes::<32>()
-                                                .to_vec()
-                                                .into()
-                                        },
-                                    }
-                                })
-                                .collect();
-                            serde_json::json!(format!(
-                                "0x{}",
-                                hex::encode(aggregate3Call::abi_encode_returns(&results))
-                            ))
-                        }
-                        "eth_call" if to.eq_ignore_ascii_case(dai) => {
+                    let method = request["method"].as_str().unwrap_or_default();
+                    let token = tokens.iter().find(|(a, ..)| a.eq_ignore_ascii_case(to));
+                    if method != "eth_chainId" {
+                        tokio::time::sleep(delay(token.map(|(.., symbol)| symbol.as_str()))).await;
+                    }
+                    let result = match method {
+                        "eth_chainId" => serde_json::json!(format!("{chain_id:#x}")),
+                        "eth_getBalance" => serde_json::json!(format!("{native:#x}")),
+                        "eth_call" if token.is_some_and(|(_, held, _)| held.is_none()) => {
                             let body = serde_json::json!({"jsonrpc":"2.0","id":request["id"],
                                 "error":{"code":3,"message":"execution reverted"}})
                             .to_string();
                             let _ = socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
                             return;
                         }
-                        "eth_call" => serde_json::json!(word(held(to))),
+                        "eth_call" => {
+                            serde_json::json!(word(
+                                token.and_then(|(_, held, _)| *held).unwrap_or(0)
+                            ))
+                        }
                         method => panic!("unexpected holdings RPC {method}"),
                     };
                     let body =
@@ -11521,15 +11510,6 @@ value = "0""#,
     /// whole read.
     #[tokio::test]
     async fn holdings_list_nonzero_balances_and_record_unreachable_chains() {
-        // Without Multicall3, ethereum costs one request for ETH plus one per
-        // known token; with it, one request in all.
-        let tokens = bloom_proto::tokens::for_chain(1).len();
-        for (multicall, requests) in [(false, 1 + tokens), (true, 1)] {
-            holdings_read(multicall, requests).await;
-        }
-    }
-
-    async fn holdings_read(multicall: bool, requests: usize) {
         let f = make_handler();
         let chain = |name: &str, chain_id: u64, url: String| {
             bloom_evm::ChainClient::new(bloom_proto::ChainSpec {
@@ -11546,7 +11526,7 @@ value = "0""#,
             })
             .unwrap()
         };
-        let (ethereum, served) = spawn_usdc_only_evm_node(multicall).await;
+        let (ethereum, served) = spawn_usdc_only_evm_node().await;
         f.handler.chains.add(chain("ethereum", 1, ethereum));
         f.handler
             .chains
@@ -11606,19 +11586,132 @@ value = "0""#,
             ],
             "zero ETH and zero tokens must be omitted: {v}"
         );
-        // The unreachable chain fails as a whole; the failed DAI read keeps
-        // the rest of ethereum's holdings.
+        // The unreachable chain names its unread native asset; the failed DAI
+        // read keeps the rest of ethereum's holdings.
         let errors = v["errors"].as_object().unwrap();
         assert_eq!(
             errors.keys().collect::<Vec<_>>(),
             ["arc", "ethereum"],
             "{v}"
         );
+        assert_eq!(errors["arc"], "could not read ETH", "{v}");
         assert_eq!(errors["ethereum"], "could not read DAI", "{v}");
-        let served = served.load(std::sync::atomic::Ordering::SeqCst);
-        // A fallback also sends the one Multicall3 probe first.
-        let probe = usize::from(!multicall);
-        assert_eq!(served, requests + probe, "multicall={multicall}");
+    }
+
+    fn holdings_chain(name: &str, chain_id: u64, url: String) -> bloom_evm::ChainClient {
+        bloom_evm::ChainClient::new(bloom_proto::ChainSpec {
+            name: name.into(),
+            chain_id,
+            rpc_urls: vec![url],
+            rpc_endpoints: Vec::new(),
+            etherscan_api_url: None,
+            display_name: None,
+            native_symbol: "ETH".into(),
+            native_decimals: 18,
+            legacy_tx: false,
+            op_stack: false,
+        })
+        .unwrap()
+    }
+
+    async fn read_holdings(f: &Fixture) -> serde_json::Value {
+        let handler = f.handler.clone().with_projection_reader(bip39_projection(
+            f.wallet_addr,
+            vec![derived_account(
+                bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+                "m/44'/60'/0'/0/0",
+                0xaa,
+                &format!("{:#x}", f.wallet_addr),
+            )],
+        ));
+        let body = handler
+            .read(&vfs(format!("/{}/0/holdings.json", f.wallet_name)))
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// The token reads hold at most `HOLDINGS_CONCURRENCY` calls in flight
+    /// and stop at the chain deadline: rows read by then are kept and the
+    /// rest are named, rather than the whole chain being dropped.
+    #[tokio::test]
+    async fn slow_holdings_keep_completed_rows_and_name_the_rest() {
+        let f = make_handler();
+        // 2 s per read: native at 2 s, four tokens at 4 s, the rest past 5 s.
+        let (url, _) =
+            spawn_holdings_node(1, 1, |_| Some(1), std::time::Duration::from_secs(2)).await;
+        f.handler.chains.add(holdings_chain("ethereum", 1, url));
+        let tokens = accounts::holdings_tokens(1);
+        assert!(tokens.len() > 4, "{} tokens", tokens.len());
+        let v = read_holdings(&f).await;
+        let symbols: Vec<&str> = v["holdings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["symbol"].as_str().unwrap())
+            .collect();
+        let read: Vec<&str> = tokens[..4].iter().map(|(_, s, _)| s.as_str()).collect();
+        assert_eq!(symbols, [&["ETH"][..], &read].concat(), "{v}");
+        let unread: Vec<&str> = tokens[4..].iter().map(|(_, s, _)| s.as_str()).collect();
+        assert_eq!(
+            v["errors"]["ethereum"],
+            format!("timed out; could not read {}", unread.join(", ")),
+            "{v}"
+        );
+    }
+
+    /// A slow first token must not hide later tokens that finished in time.
+    #[tokio::test]
+    async fn a_slow_token_does_not_hide_later_completed_tokens() {
+        let f = make_handler();
+        let tokens = accounts::holdings_tokens(1);
+        let slow = tokens[0].1.clone();
+        let delay = Arc::new(move |symbol: Option<&str>| {
+            if symbol == Some(slow.as_str()) {
+                std::time::Duration::from_secs(30)
+            } else {
+                std::time::Duration::ZERO
+            }
+        });
+        let (url, _) = spawn_holdings_node_with(1, 1, |_| Some(1), delay).await;
+        f.handler.chains.add(holdings_chain("ethereum", 1, url));
+        let v = read_holdings(&f).await;
+        let symbols: Vec<&str> = v["holdings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["symbol"].as_str().unwrap())
+            .collect();
+        let rest: Vec<&str> = tokens[1..].iter().map(|(_, s, _)| s.as_str()).collect();
+        assert_eq!(symbols, [&["ETH"][..], &rest].concat(), "{v}");
+        assert_eq!(
+            v["errors"]["ethereum"],
+            format!("timed out; could not read {}", tokens[0].1),
+            "{v}"
+        );
+    }
+
+    /// Tempo has no native token: holdings skip the native read rather than
+    /// failing the chain, and still list its token balances.
+    #[tokio::test]
+    async fn tempo_holdings_list_tokens_without_a_native_row() {
+        let tempo = bloom_proto::chain::TEMPO_MAINNET_CHAIN_ID;
+        let tokens = accounts::holdings_tokens(tempo);
+        let f = make_handler();
+        // eth_getBalance would answer a nonzero placeholder if it were read.
+        let (url, _) =
+            spawn_holdings_node(tempo, u64::MAX, |_| Some(3_000_000), Default::default()).await;
+        f.handler.chains.add(holdings_chain("tempo", tempo, url));
+        let v = read_holdings(&f).await;
+        let symbols: Vec<&str> = v["holdings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["symbol"].as_str().unwrap())
+            .collect();
+        let expected: Vec<&str> = tokens.iter().map(|(_, s, _)| s.as_str()).collect();
+        assert_eq!(symbols, expected, "{v}");
+        assert!(v["errors"].as_object().unwrap().is_empty(), "{v}");
     }
 
     // ---- errno semantics -------------------------------------------------
