@@ -1,0 +1,78 @@
+# Distributing the Bloom skill
+
+`skills/bloom/` is the canonical package for the website and marketplaces.
+The entrypoint connects an existing Bloom session or routes new installations to
+`references/install.md`. The reviewed installer lives in `scripts/setup.sh`.
+Operating procedures belong in the installed VFS, not in marketplace copies.
+
+Installing the skill does not install Bloom or create a wallet. Check both
+existing-session use and new-install guidance when changing it. The
+[skill evals](../evals/skills/README.md) grade new-install responses; CI runs
+their deterministic `check`, and model runs are manual. Keep setup's
+signature checks and platform-specific privileged handoff intact.
+
+## Website
+
+The private `bloom-directory/website` repository consumes this public package at
+an exact commit. Advance its skill revision after the Bloom PR lands, using the
+landed commit rather than the PR head. Its build publishes `SKILL.md`, the install
+reference, and `scripts/setup.sh`, which the skill fetches; `/setup.sh` remains a
+copy for existing links.
+Do not edit generated website copies.
+
+## skills.sh
+
+The public repository is sufficient; no marketplace login or separate repository
+is needed. Check discovery before sharing the command:
+
+```sh
+npx skills add bloom-directory/bloom --skill bloom --list
+npx skills add bloom-directory/bloom --skill bloom
+```
+
+The directory lists skills through installation telemetry; listing and ranking
+are not an endorsement. See <https://skills.sh/docs/faq>.
+
+Hermes users can also install the package directly:
+
+```sh
+hermes skills install bloom-directory/bloom/skills/bloom
+```
+
+## ClawHub
+
+Publish this same folder, not the website output or the repository root. A human
+signs in to ClawHub with the GitHub identity that should own the listing:
+
+```sh
+npx clawhub login
+npx clawhub whoami
+git checkout vX.Y.Z
+npx clawhub skill publish ./skills/bloom --slug bloom --name "Bloom" --version X.Y.Z --changelog "Bloom vX.Y.Z" --dry-run
+```
+
+Publish from the release tag, with the release version (the skill's
+`metadata.version`). Check the account and slug ownership, review the dry
+run, and repeat the publish command without `--dry-run`. If the slug is owned
+by someone else, resolve ownership or choose an agreed alternative; do not
+publish under a misleading identity. Check the resulting listing's scan state
+and installation before announcing it.
+
+Keep credentials out of the repository. Do not create a publishing workflow or
+store an API token until recurring releases justify automation. See
+<https://docs.openclaw.ai/clawhub/quickstart> for the current authentication and
+publishing flow.
+
+## Releases
+
+The skill's `metadata.version` is the Bloom release version; the Propose
+Release workflow bumps it with `Cargo.toml`. After tagging `vX.Y.Z`:
+
+1. Publish to ClawHub from the tag, as above.
+2. Repin the website to the tag's commit.
+3. Test the upgrade in a clean `HOME` that has the previous release's skill
+   installed: `npx skills update -g -y` and `npx clawhub update bloom` must
+   leave `metadata.version: "X.Y.Z"` in the installed `SKILL.md`, and the
+   Connect command must still work against an upgraded Bloom. v0.4.2 is the
+   first skill release, so it gets a fresh-install check instead; upgrade
+   tests start at v0.5.0.

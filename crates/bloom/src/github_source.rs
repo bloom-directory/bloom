@@ -17,8 +17,8 @@ use url::Url;
 const TRUSTED_GITHUB_OWNER: &str = "bloom-directory";
 // Retain a bounded diagnostic tail for reconciliation after streamed output.
 const SOURCE_BUILD_STREAM_LIMIT: usize = 256 * 1024;
-const NEAR_INTENTS_RELEASE_COMMIT: &str = "4dc28dbe7a6d48435ff16dab7e24b33bd3d0b413";
-const ENSO_RELEASE_COMMIT: &str = "7bbe03770721c7cfdbe6c7c34a9b1665ae2eec9f";
+const NEAR_INTENTS_RELEASE_COMMIT: &str = "b847d31373cbc847f6ccddb1175a44c5aa0d263d";
+const ENSO_RELEASE_COMMIT: &str = "7b4039f7943011d6af7adfc5c8ac151ddcf88392";
 
 /// Canonical defaults for every Bloom home, independent of persisted config.
 pub(crate) const DEFAULT_PETALS: &[&str] = &[
@@ -234,60 +234,112 @@ const HYPERLIQUID_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
     },
 ];
 
+/// A release a pinned Petal may replace. Each install writes the catalog
+/// afresh, so every predecessor a pin lists needs a row here: otherwise an
+/// upgrade from that release fails before activation.
 pub(crate) struct ReleaseLineagePredecessor {
     pub hash: &'static str,
+    pub release_sequence: u64,
+    pub predecessor_package_hashes: &'static [&'static str],
     pub authority_routes: &'static [PetalAuthorityRoute],
 }
 
-pub(crate) fn release_lineage_predecessor(name: &str) -> Option<ReleaseLineagePredecessor> {
-    let (hash, authority_routes) = match name {
-        "polymarket" => (
+const fn baseline(
+    hash: &'static str,
+    authority_routes: &'static [PetalAuthorityRoute],
+) -> ReleaseLineagePredecessor {
+    ReleaseLineagePredecessor {
+        hash,
+        release_sequence: 1,
+        predecessor_package_hashes: &[],
+        authority_routes,
+    }
+}
+
+/// Past releases of a bundled Petal, baseline (sequence 1) first.
+pub(crate) fn release_lineage_predecessors(name: &str) -> &'static [ReleaseLineagePredecessor] {
+    const POLYMARKET: &[ReleaseLineagePredecessor] = &[
+        baseline(
             "5df5a1377dc4d70c71e47ffe6827e691e1f5868543b752dc8d19a500284e5fa6",
             BASELINE_POLYMARKET_AUTHORITY_ROUTES,
         ),
-        "hyperliquid" => (
-            "b29c7afb88ec9d2df774b18dad2699ec169100eeeedbcefca02ea0cc3712a188",
-            BASELINE_HYPERLIQUID_AUTHORITY_ROUTES,
-        ),
-        "enso" => (
+        // v0.1.6, pinned by Bloom v0.4.0.
+        ReleaseLineagePredecessor {
+            hash: "0f365cd7f613129f73ce66fb07256c8a42c4e70abbb77721804dbd6df85b96b5",
+            release_sequence: 2,
+            predecessor_package_hashes: &[
+                "5df5a1377dc4d70c71e47ffe6827e691e1f5868543b752dc8d19a500284e5fa6",
+            ],
+            authority_routes: POLYMARKET_AUTHORITY_ROUTES,
+        },
+    ];
+    const HYPERLIQUID: &[ReleaseLineagePredecessor] = &[baseline(
+        "b29c7afb88ec9d2df774b18dad2699ec169100eeeedbcefca02ea0cc3712a188",
+        BASELINE_HYPERLIQUID_AUTHORITY_ROUTES,
+    )];
+    const ENSO: &[ReleaseLineagePredecessor] = &[
+        baseline(
             "97650f327691f01bc4591cde25253d1e20010643e700674cc9759cd1366876b9",
-            &[][..],
+            &[],
         ),
-        "near-intents" => (
+        ReleaseLineagePredecessor {
+            hash: "e6ffbfdc96c5fa9b5fe5b62dc0c373b2522fb31d216a5a33ea2e1dab21c082a0",
+            release_sequence: 2,
+            predecessor_package_hashes: &[
+                "97650f327691f01bc4591cde25253d1e20010643e700674cc9759cd1366876b9",
+            ],
+            authority_routes: &[],
+        },
+    ];
+    const NEAR_INTENTS: &[ReleaseLineagePredecessor] = &[
+        baseline(
             "ac2ccab59f36ee863843f92aaf0c975c00dbf32b246df5ccbb79757093785921",
-            &[][..],
+            &[],
         ),
-        "feedback" => (
-            "5f26e7bbf7f507cfcf4c13645cf9f4f0c903d769c201e3e9d1f5c914b14fa2a3",
-            &[][..],
-        ),
-        "tolly" => (
-            "f50f9f6f55eca103c11ed40d424311c6e5863ff5046231f57f58822d1aac6709",
-            &[][..],
-        ),
-        _ => return None,
-    };
-    Some(ReleaseLineagePredecessor {
-        hash,
-        authority_routes,
-    })
+        ReleaseLineagePredecessor {
+            hash: "a498727c1e9ba6f4385ca7514c2ef59236b6234b234b6e1920cb21358ea3b057",
+            release_sequence: 2,
+            predecessor_package_hashes: &[
+                "ac2ccab59f36ee863843f92aaf0c975c00dbf32b246df5ccbb79757093785921",
+            ],
+            authority_routes: &[],
+        },
+    ];
+    const FEEDBACK: &[ReleaseLineagePredecessor] = &[baseline(
+        "5f26e7bbf7f507cfcf4c13645cf9f4f0c903d769c201e3e9d1f5c914b14fa2a3",
+        &[],
+    )];
+    const TOLLY: &[ReleaseLineagePredecessor] = &[baseline(
+        "f50f9f6f55eca103c11ed40d424311c6e5863ff5046231f57f58822d1aac6709",
+        &[],
+    )];
+    match name {
+        "polymarket" => POLYMARKET,
+        "hyperliquid" => HYPERLIQUID,
+        "enso" => ENSO,
+        "near-intents" => NEAR_INTENTS,
+        "feedback" => FEEDBACK,
+        "tolly" => TOLLY,
+        _ => &[],
+    }
 }
 
 const PREINSTALLED_POLYMARKET: PreinstalledPetal = PreinstalledPetal {
     name: "polymarket",
     repository: "https://github.com/bloom-directory/bloom-petal-polymarket",
-    commit: "a0177ae4e68f4a043df4db727fb3212e23ab7395",
-    release_tag: "v0.1.6",
-    archive: "polymarket-v0.1.6.petal.tar.gz",
-    expected_hash: Some("0f365cd7f613129f73ce66fb07256c8a42c4e70abbb77721804dbd6df85b96b5"),
-    archive_sha256: "e02d300af67875a625eb633299f7782ce30a02be79dde3c813cda1db5a116d9f",
+    commit: "74f1f928313916b332d9059f2e4363eac8f147af",
+    release_tag: "v0.1.8",
+    archive: "polymarket-v0.1.8.petal.tar.gz",
+    expected_hash: Some("6eb2065e8558f3761399fcb0516731a600fdb0b49974c8ed0808abd38fde7db4"),
+    archive_sha256: "312f945ecf0b6a29d574a0497e369234c5a584cb539b61f09056844e7e3586ae",
     tooling_commit: "2beed2ff344ce2b0c112e07096027e1ae0404007",
     petal_abi: "bloom.petal-host/payload-signing-v1",
     default_eligible: true,
     lineage_id: Some("pln1_6etojfshqyk6bzm257kzv7noj3perfz4siioiuhj74xosznyzhka"),
-    release_sequence: 2,
+    release_sequence: 3,
     predecessor_package_hashes: &[
         "5df5a1377dc4d70c71e47ffe6827e691e1f5868543b752dc8d19a500284e5fa6",
+        "0f365cd7f613129f73ce66fb07256c8a42c4e70abbb77721804dbd6df85b96b5",
     ],
     authority_routes: POLYMARKET_AUTHORITY_ROUTES,
 };
@@ -315,17 +367,18 @@ const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
     name: "near-intents",
     repository: "https://github.com/bloom-directory/bloom-petal-near",
     commit: NEAR_INTENTS_RELEASE_COMMIT,
-    release_tag: "v0.1.4",
-    archive: "near-intents-v0.1.4.petal.tar.gz",
-    expected_hash: Some("a498727c1e9ba6f4385ca7514c2ef59236b6234b234b6e1920cb21358ea3b057"),
-    archive_sha256: "b7724456cf96331900bd2667e0dc7bfc0bb7eb639ae6123833bcfd1c501719e8",
+    release_tag: "v0.1.5",
+    archive: "near-intents-v0.1.5.petal.tar.gz",
+    expected_hash: Some("80f26b1b6c4eda85f2870e2baac9f6366f1f35e861ebb855bf234550e591ad21"),
+    archive_sha256: "a6327a2738f4c9967c33bbebd25337fa924736e41f22299c812de540c59b3d4a",
     tooling_commit: "2beed2ff344ce2b0c112e07096027e1ae0404007",
     petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
     default_eligible: true,
     lineage_id: None,
-    release_sequence: 2,
+    release_sequence: 3,
     predecessor_package_hashes: &[
         "ac2ccab59f36ee863843f92aaf0c975c00dbf32b246df5ccbb79757093785921",
+        "a498727c1e9ba6f4385ca7514c2ef59236b6234b234b6e1920cb21358ea3b057",
     ],
     authority_routes: &[],
 };
@@ -351,17 +404,18 @@ const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
     name: "enso",
     repository: "https://github.com/bloom-directory/bloom-petal-enso",
     commit: ENSO_RELEASE_COMMIT,
-    release_tag: "v0.1.6",
-    archive: "enso-v0.1.6.petal.tar.gz",
-    expected_hash: Some("e6ffbfdc96c5fa9b5fe5b62dc0c373b2522fb31d216a5a33ea2e1dab21c082a0"),
-    archive_sha256: "1dfe18aeb3646b3edbed56e80a33da205aed36b9651b95f4fc0fb12da1a10f4e",
+    release_tag: "v0.1.7",
+    archive: "enso-v0.1.7.petal.tar.gz",
+    expected_hash: Some("14d25e95d7fdede23320e0a17e786bb16d530547ecb67e73d0f4bbc974964b20"),
+    archive_sha256: "eee216baf4b5215dfe42d28b7b09e70bccac824f17d901260fe9a4335b89cfef",
     tooling_commit: "2beed2ff344ce2b0c112e07096027e1ae0404007",
     petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
     default_eligible: true,
     lineage_id: None,
-    release_sequence: 2,
+    release_sequence: 3,
     predecessor_package_hashes: &[
         "97650f327691f01bc4591cde25253d1e20010643e700674cc9759cd1366876b9",
+        "e6ffbfdc96c5fa9b5fe5b62dc0c373b2522fb31d216a5a33ea2e1dab21c082a0",
     ],
     authority_routes: &[],
 };
@@ -777,10 +831,12 @@ fn install_github_source_with_expectation(
 ///
 /// Anything that is neither of these two states is a refusal: Bloom only ever
 /// replaces a Petal it can prove it installed itself from the same trusted
-/// catalog repository.
+/// catalog repository. An install without source provenance whose package hash
+/// is the pinned hash is reused as `Current`, but never replaced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PreinstalledState {
-    /// The installed owner is exactly the pinned commit and package hash.
+    /// The installed package is the pinned release: same commit and hash, or,
+    /// without source provenance, the pinned release's package hash.
     Current,
     /// Same Petal name, same trusted catalog repository, older pinned commit.
     Outdated { installed_commit: String },
@@ -994,8 +1050,14 @@ fn curl_download(
             "--location",
             "--connect-timeout",
             "10",
+            // Abort a stalled transfer, not a slow one: a 46 MB release archive
+            // took longer than a fixed 120 s on a slow GitHub day (bloom#393).
+            "--speed-limit",
+            "1024",
+            "--speed-time",
+            "60",
             "--max-time",
-            "120",
+            "900",
         ])
         .arg(url)
         .arg("--output")
@@ -1003,7 +1065,7 @@ fn curl_download(
     let result = run_bounded_command(
         &mut command,
         Some(context),
-        std::time::Duration::from_secs(125),
+        std::time::Duration::from_secs(905),
     )
     .context("download pre-installed Petal release with curl")?;
     if !result.status.success() {
@@ -1320,9 +1382,12 @@ fn validate_release_authority(
 ///
 /// Returns `Current` when the installation is already the pinned commit and
 /// hash, and `Outdated` when it is the same Petal from the same trusted catalog
-/// repository at a different commit. Every other shape — missing provenance, a
-/// different repository, or an identity that contradicts itself — is refused so
-/// that manually sourced or untrusted ownership is never overwritten.
+/// repository at a different commit. An installation without source
+/// provenance is `Current` when its package hash is the pinned hash. Every
+/// other shape — missing provenance with any other hash (including an older
+/// release, which may be a deliberate rollback), a different repository, or an identity
+/// that contradicts itself — is refused so that manually sourced or untrusted
+/// ownership is never overwritten.
 pub(crate) fn classify_existing_preinstalled(
     expected: &PreinstalledPetal,
     meta: &bloom_petals::meta::PetalMeta,
@@ -1338,12 +1403,20 @@ pub(crate) fn classify_existing_preinstalled(
             package.name
         );
     }
-    let source = meta.source.as_ref().ok_or_else(|| {
-        anyhow!(
+    // A local install of a pinned release archive records no source, but the
+    // package hash is content-derived: matching a catalogued release hash
+    // identifies the same bytes as that release.
+    let Some(source) = meta.source.as_ref() else {
+        if expected.expected_hash == Some(meta.hash.as_str()) {
+            return Ok(PreinstalledState::Current);
+        }
+        // Matching bytes do not mean Bloom may replace them: an older release
+        // installed by hand may be a deliberate rollback.
+        bail!(
             "pre-installed Petal {} is already owned by an installation without source provenance; uninstall it before retrying",
             expected.name
-        )
-    })?;
+        );
+    };
     let expected_repo = expected
         .repository
         .strip_prefix("https://github.com/")
@@ -1934,9 +2007,21 @@ mod tests {
     #[ignore = "requires downloaded release assets in BLOOM_PETAL_RELEASE_ASSETS"]
     fn published_release_assets_match_pins_and_authority() {
         let root = PathBuf::from(std::env::var_os("BLOOM_PETAL_RELEASE_ASSETS").unwrap());
+        let selected = std::env::var("BLOOM_PETAL_RELEASE_NAME").ok();
+        assert!(
+            selected
+                .as_deref()
+                .is_none_or(|name| DEFAULT_PETALS.contains(&name))
+        );
         let home = tempfile::tempdir().unwrap();
         let daemon = Daemon::from_home(HomeDir::at(home.path())).unwrap();
         for name in DEFAULT_PETALS {
+            if selected
+                .as_deref()
+                .is_some_and(|selected| selected != *name)
+            {
+                continue;
+            }
             let entry = preinstalled_petal(name).unwrap();
             let dir = root.join(name);
             let manifest: PetalReleaseManifest =
@@ -1957,14 +2042,14 @@ mod tests {
     #[test]
     fn built_in_entries_are_immutable_and_incompatible_petals_are_absent() {
         let near = preinstalled_petal("near-intents").unwrap();
-        assert_eq!(near.release_tag, "v0.1.4");
+        assert_eq!(near.release_tag, "v0.1.5");
         assert_eq!(near.commit.len(), 40);
-        assert_eq!(near.archive, "near-intents-v0.1.4.petal.tar.gz");
+        assert_eq!(near.archive, "near-intents-v0.1.5.petal.tar.gz");
         assert!(near.repository.ends_with("/bloom-petal-near"));
         let enso = preinstalled_petal("enso").unwrap();
-        assert_eq!(enso.release_tag, "v0.1.6");
+        assert_eq!(enso.release_tag, "v0.1.7");
         assert_eq!(enso.commit, ENSO_RELEASE_COMMIT);
-        assert_eq!(enso.archive, "enso-v0.1.6.petal.tar.gz");
+        assert_eq!(enso.archive, "enso-v0.1.7.petal.tar.gz");
         assert!(enso.repository.ends_with("/bloom-petal-enso"));
         for name in [
             "polymarket",
@@ -2066,9 +2151,16 @@ mod tests {
             .to_string();
         assert!(err.contains("does not match expected hash"), "{err}");
 
-        // Provenance-free ownership is refused outright.
+        // Provenance-free ownership of the pinned bytes is the pinned release.
         meta.hash = entry.expected_hash.unwrap().into();
         meta.source = None;
+        assert_eq!(
+            classify_existing_preinstalled(entry, &meta).unwrap(),
+            PreinstalledState::Current
+        );
+
+        // Provenance-free ownership of any other package is refused outright.
+        meta.hash = "c".repeat(64);
         let err = classify_existing_preinstalled(entry, &meta)
             .unwrap_err()
             .to_string();
@@ -2638,6 +2730,49 @@ mod tests {
             installed_owner(&manual_daemon).as_deref(),
             Some(&*old.package.hash)
         );
+    }
+
+    #[test]
+    fn provenance_free_install_is_reused_only_at_the_pinned_hash() {
+        let old = build_near_release("v0.1.0");
+        let old_hash: &'static str = Box::leak(old.package.hash.clone().into_boxed_str());
+        let home = tempfile::tempdir().unwrap();
+        let home_dir = HomeDir::at(home.path());
+        home_dir.ensure().unwrap();
+        bloom_proto::Config::local_default()
+            .save(&home_dir.config_path())
+            .unwrap();
+        let daemon = Daemon::from_home(home_dir).unwrap();
+        daemon
+            .petals
+            .store()
+            .install_prepared_petal_package(old.package.clone())
+            .unwrap();
+        let meta = daemon.petals.store().load_meta(old_hash).unwrap();
+        assert!(meta.source.is_none());
+
+        let pinned = near_catalog_entry(NEAR_OLD_COMMIT, "v0.1.0", "near.tar.gz", Some(old_hash));
+        let ready = ensure_preinstalled_petals_with(
+            &daemon,
+            &["near-intents"],
+            |_| Some(pinned),
+            |_, _| panic!("the pinned package is already installed"),
+        )
+        .unwrap();
+        assert_eq!(ready, ["near-intents"]);
+
+        let mut successor = near_catalog_entry(
+            NEAR_NEW_COMMIT,
+            "v0.1.1",
+            "near.tar.gz",
+            Some("1111111111111111111111111111111111111111111111111111111111111111"),
+        );
+        // A listed predecessor is still never replaced without provenance.
+        successor.predecessor_package_hashes = Box::leak(Box::new([old_hash]));
+        let err = classify_existing_preinstalled(&successor, &meta)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("without source provenance"), "{err}");
     }
 
     #[test]

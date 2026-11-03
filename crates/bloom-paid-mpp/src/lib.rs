@@ -15,7 +15,7 @@ use bloom_proto::Policy;
 use mpp::client::tempo::charge::{SignOptions, TempoCharge};
 use mpp::client::tempo::session::channel_ops::{
     OpenPayloadOptions, build_credential, create_open_payload, create_voucher_payload,
-    resolve_chain_id, resolve_escrow, try_recover_channel,
+    default_escrow_contract, resolve_chain_id, try_recover_channel,
 };
 use mpp::client::tempo::signing::TempoSigningMode;
 use mpp::protocol::intents::SessionRequest;
@@ -203,13 +203,6 @@ fn validate_persisted_draft_binding(
     Ok(authorization.to_owned())
 }
 
-alloy::sol! {
-    struct BloomMppVoucher {
-        bytes32 channelId;
-        uint128 cumulativeAmount;
-    }
-}
-
 async fn exactize_credential(
     mut credential: mpp::PaymentCredential,
     challenge: &mpp::PaymentChallenge,
@@ -234,8 +227,7 @@ async fn exactize_credential(
     let payload: SessionCredentialPayload = credential
         .payload_as()
         .map_err(|error| format!("parse MPP session draft: {error}"))?;
-    let escrow = resolve_escrow(challenge, chain_id, None)
-        .map_err(|error| format!("resolve MPP session escrow: {error}"))?;
+    let escrow = known_escrow(challenge, chain_id)?;
     let payload = match payload {
         SessionCredentialPayload::Open {
             payload_type,
@@ -395,7 +387,9 @@ async fn exactize_voucher(
         chain_id: chain_id,
         verifying_contract: escrow,
     };
-    let voucher = BloomMppVoucher {
+    // The escrow verifies `Voucher(bytes32 channelId,uint128 cumulativeAmount)`;
+    // use mpp's struct so the EIP-712 type name cannot drift.
+    let voucher = mpp::protocol::methods::tempo::voucher::Voucher {
         channelId: channel_id
             .parse::<B256>()
             .map_err(|error| format!("parse MPP channel id: {error}"))?,
@@ -577,7 +571,8 @@ async fn prepare_session_credential(
 ) -> Result<mpp::PaymentCredential, mpp::MppError> {
     challenge.validate_for_session(mpp::protocol::methods::tempo::METHOD_NAME)?;
     let chain_id = resolve_chain_id(challenge);
-    let escrow_contract = resolve_escrow(challenge, chain_id, None)?;
+    let escrow_contract =
+        known_escrow(challenge, chain_id).map_err(mpp::MppError::InvalidConfig)?;
     let session_req: SessionRequest = challenge.request.decode()?;
     let payee: Address = session_req
         .recipient
@@ -645,6 +640,31 @@ async fn prepare_session_credential(
     Ok(build_credential(challenge, payload, chain_id, payer))
 }
 
+/// The session escrow Bloom approves the deposit to and names in vouchers.
+/// It is always the known escrow for the chain, never one the merchant picks:
+/// a merchant-chosen contract could pull the whole approved deposit.
+fn known_escrow(challenge: &mpp::PaymentChallenge, chain_id: u64) -> Result<Address, String> {
+    let known = default_escrow_contract(chain_id).ok_or_else(|| {
+        format!(
+            "Bloom refused this MPP session: it knows no escrow contract for Tempo chain {chain_id}"
+        )
+    })?;
+    let named = challenge
+        .request
+        .decode::<SessionRequest>()
+        .ok()
+        .and_then(|request| request.escrow_contract().ok());
+    if let Some(named) = named
+        && named.parse::<Address>().ok() != Some(known)
+    {
+        return Err(format!(
+            "Bloom refused this MPP session: the merchant asked Bloom to use an unknown escrow \
+             contract {named} on Tempo chain {chain_id}; the known escrow is {known}"
+        ));
+    }
+    Ok(known)
+}
+
 fn resolve_session_deposit(
     suggested_deposit: Option<&str>,
     max_deposit: Option<u128>,
@@ -680,10 +700,12 @@ fn parse_stored_mpp_challenge(
 #[cfg(test)]
 mod tests {
     use super::{
-        DraftMppSigner, MPP_SIGN_INTENT, exactize_tempo_transaction,
-        persist_draft_binding_atomically, validate_persisted_draft_binding,
+        DraftMppSigner, MPP_SIGN_INTENT, SessionCredentialPayload, build_credential,
+        exactize_credential, exactize_tempo_transaction, known_escrow,
+        persist_draft_binding_atomically, prepare_session_credential,
+        validate_persisted_draft_binding,
     };
-    use alloy::primitives::{Address, Bytes, TxKind, U256};
+    use alloy::primitives::{Address, B256, Bytes, TxKind, U256};
     use async_trait::async_trait;
     use bloom_paid_http::{PaidHttpHostSigner, PaidHttpSigningFacts};
     use mpp::client::tempo::charge::tx_builder::{TempoTxOptions, build_tempo_tx};
@@ -763,6 +785,84 @@ mod tests {
         assert!(!preimages[0].is_empty());
     }
 
+    /// Records the hash mpp's own voucher signer asks to sign.
+    struct HashRecorder(Mutex<Vec<alloy::primitives::B256>>);
+
+    #[async_trait]
+    impl alloy::signers::Signer for HashRecorder {
+        async fn sign_hash(
+            &self,
+            hash: &alloy::primitives::B256,
+        ) -> alloy::signers::Result<alloy::primitives::Signature> {
+            self.0.lock().unwrap().push(*hash);
+            Ok(alloy::primitives::Signature::from_raw(&[1_u8; 65]).unwrap())
+        }
+        fn address(&self) -> Address {
+            Address::ZERO
+        }
+        fn chain_id(&self) -> Option<u64> {
+            None
+        }
+        fn set_chain_id(&mut self, _chain_id: Option<u64>) {}
+    }
+
+    #[tokio::test]
+    async fn voucher_signing_hash_matches_mpp_and_the_escrow_type() {
+        use alloy::primitives::{B256, keccak256};
+        use alloy::sol_types::SolStruct;
+        use mpp::protocol::methods::tempo::voucher::{Voucher, sign_voucher};
+
+        let channel = B256::repeat_byte(0x44);
+        let escrow: Address = "0x33b901018174DDabE4841042ab76ba85D4e24f25"
+            .parse()
+            .unwrap();
+        let host = ExactHost::default();
+        super::exactize_voucher(
+            &format!("{channel:#x}"),
+            "5000",
+            escrow,
+            4217,
+            "session-voucher",
+            &host,
+            &PaidHttpSigningFacts::default(),
+        )
+        .await
+        .unwrap();
+        let bloom_hash = keccak256(&host.0.lock().unwrap()[0]);
+
+        let recorder = HashRecorder(Mutex::new(Vec::new()));
+        sign_voucher(&recorder, channel, 5000, escrow, 4217)
+            .await
+            .unwrap();
+        assert_eq!(bloom_hash, recorder.0.lock().unwrap()[0]);
+        assert_eq!(
+            Voucher::eip712_type_hash(&Voucher {
+                channelId: channel,
+                cumulativeAmount: 5000,
+            }),
+            keccak256("Voucher(bytes32 channelId,uint128 cumulativeAmount)")
+        );
+
+        // The struct name Bloom used before signs a different hash.
+        alloy::sol! {
+            struct BloomMppVoucher {
+                bytes32 channelId;
+                uint128 cumulativeAmount;
+            }
+        }
+        let domain = alloy::sol_types::eip712_domain! {
+            name: mpp::protocol::methods::tempo::voucher::DOMAIN_NAME,
+            version: mpp::protocol::methods::tempo::voucher::DOMAIN_VERSION,
+            chain_id: 4217,
+            verifying_contract: escrow,
+        };
+        let old = BloomMppVoucher {
+            channelId: channel,
+            cumulativeAmount: 5000,
+        };
+        assert_ne!(bloom_hash, old.eip712_signing_hash(&domain));
+    }
+
     #[tokio::test]
     async fn altered_persisted_transaction_is_rejected_by_canonical_binding() {
         let challenge = mpp::PaymentChallenge::new(
@@ -801,5 +901,104 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
         let error = validate_persisted_draft_binding(&path, &challenge, 42431, wallet).unwrap_err();
         assert!(error.contains("canonical identity"));
+    }
+
+    const MAINNET_ESCROW: &str = "0x33b901018174DDabE4841042ab76ba85D4e24f25";
+
+    fn session_challenge(chain_id: u64, escrow: Option<&str>) -> mpp::PaymentChallenge {
+        let mut details = serde_json::json!({ "chainId": chain_id });
+        if let Some(escrow) = escrow {
+            details["escrowContract"] = escrow.into();
+        }
+        mpp::PaymentChallenge::new(
+            "session-escrow",
+            "merchant.test",
+            "tempo",
+            "session",
+            mpp::Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "1",
+                "currency": format!("{:#x}", Address::repeat_byte(0x33)),
+                "recipient": format!("{:#x}", Address::repeat_byte(0x22)),
+                "suggestedDeposit": "1000000",
+                "methodDetails": details
+            }))
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn session_escrow_is_always_the_known_contract() {
+        let known: Address = MAINNET_ESCROW.parse().unwrap();
+        for named in [
+            None,
+            Some(MAINNET_ESCROW),
+            Some(&MAINNET_ESCROW.to_lowercase()),
+        ] {
+            assert_eq!(
+                known_escrow(&session_challenge(4217, named), 4217),
+                Ok(known)
+            );
+        }
+        let moderato = session_challenge(42431, None);
+        assert_eq!(
+            known_escrow(&moderato, 42431).unwrap(),
+            "0xe1c4d3dce17bc111181ddf716f75bae49e61a336"
+                .parse::<Address>()
+                .unwrap()
+        );
+
+        let foreign = format!("{:#x}", Address::repeat_byte(0x66));
+        for named in [foreign.as_str(), "not-an-address"] {
+            let error = known_escrow(&session_challenge(4217, Some(named)), 4217).unwrap_err();
+            assert!(error.contains("unknown escrow contract"), "{error}");
+        }
+        let error = known_escrow(&session_challenge(1, None), 1).unwrap_err();
+        assert!(error.contains("knows no escrow contract"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn foreign_escrow_is_refused_before_anything_is_signed() {
+        let wallet = Address::repeat_byte(0x11);
+        let foreign = format!("{:#x}", Address::repeat_byte(0x66));
+        let challenge = session_challenge(4217, Some(&foreign));
+
+        let signer = DraftMppSigner::new(wallet, Some(4217));
+        let error = prepare_session_credential(&challenge, &signer, "http://127.0.0.1:1", None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("unknown escrow contract"),
+            "{error}"
+        );
+
+        let voucher = SessionCredentialPayload::Voucher {
+            channel_id: format!("{:#x}", B256::repeat_byte(0x44)),
+            cumulative_amount: "5".into(),
+            signature: "0x00".into(),
+        };
+        let host = ExactHost::default();
+        let error = exactize_credential(
+            build_credential(&challenge, voucher.clone(), 4217, wallet),
+            &challenge,
+            4217,
+            &host,
+            &PaidHttpSigningFacts::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("unknown escrow contract"), "{error}");
+        assert!(host.0.lock().unwrap().is_empty());
+
+        let honest = session_challenge(4217, Some(MAINNET_ESCROW));
+        exactize_credential(
+            build_credential(&honest, voucher, 4217, wallet),
+            &honest,
+            4217,
+            &host,
+            &PaidHttpSigningFacts::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(host.0.lock().unwrap().len(), 1);
     }
 }

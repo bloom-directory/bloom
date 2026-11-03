@@ -431,7 +431,10 @@ sudo -H -u "$login_user" env \
   BLOOM_EDGE_MANIFEST="$edge_manifest" \
   "$machine_binary" --home "$clean_home" --connect "unix:$machine_socket" \
     wallet commit-policy "$policy_operation_id" \
-  >"$work/policy-commit-live.log" 2>&1
+  >"$work/policy-commit-live.log" 2>"$work/policy-commit-live.stderr" || {
+  cat "$work/policy-commit-live.stderr" >&2
+  exit 1
+}
 
 broker_log="/private/var/log/bloom/$login_uid/broker.jsonl"
 signer_log="/private/var/log/bloom/$login_uid/signer.jsonl"
@@ -503,13 +506,35 @@ for service_log in "$broker_log" "$signer_log"; do
   sudo -u "$login_user" test -r "$service_log"
   if sudo -u "$login_user" test -w "$service_log"; then exit 1; fi
 done
-sudo -H -u "$login_user" env \
-  BLOOM_HOME="$clean_home" \
-  BLOOM_MACHINE_IDENTITY="$machine_identity" \
-  BLOOM_EDGE_MANIFEST="$edge_manifest" \
-  "$machine_binary" --home "$clean_home" --connect "unix:$machine_socket" \
-    wallet projection "$wallet_id" \
-  >"$work/live-projection.log" 2>"$work/live-projection.stderr"
+# Display projections may reuse the pre-commit observation within their
+# configured freshness window. Wait for the exact signed commit, not a delay
+# or merely a successful read, before testing its destination and caching it.
+deadline=$((SECONDS + 15))
+while [[ $SECONDS -lt $deadline ]]; do
+  if sudo -H -u "$login_user" env \
+    BLOOM_HOME="$clean_home" \
+    BLOOM_MACHINE_IDENTITY="$machine_identity" \
+    BLOOM_EDGE_MANIFEST="$edge_manifest" \
+    "$machine_binary" --home "$clean_home" --connect "unix:$machine_socket" \
+      wallet projection "$wallet_id" \
+    >"$work/live-projection.log" 2>"$work/live-projection.stderr" &&
+    jq -e --slurpfile receipt "$work/policy-commit-live.log" \
+      '.policy.version == $receipt[0].committed.version and
+       .policy.policy_digest == $receipt[0].committed.policy_digest' \
+      "$work/live-projection.log" >/dev/null
+  then
+    break
+  fi
+  sleep 0.1
+done
+jq -e --slurpfile receipt "$work/policy-commit-live.log" \
+  '.policy.version == $receipt[0].committed.version and
+   .policy.policy_digest == $receipt[0].committed.policy_digest' \
+  "$work/live-projection.log" >/dev/null || {
+  cat "$work/live-projection.stderr" >&2
+  echo "authenticated projection did not observe the committed policy within 15s" >&2
+  exit 1
+}
 jq -e \
   --arg address "$wallet_address" \
   --arg wallet "$wallet_id" \
@@ -528,7 +553,10 @@ encoded += "=" * (-len(encoded) % 4)
 policy = json.loads(base64.urlsafe_b64decode(encoded))
 expected = {"chain": "anvil", "destination": sys.argv[2]}
 if expected not in policy["allowed_destinations"]:
-    raise SystemExit("authenticated policy projection omitted the MA-05 destination")
+    raise SystemExit(
+        f"authenticated policy v{projection['policy']['version']} omitted the MA-05 destination: "
+        f"expected {expected}, observed {policy['allowed_destinations']}"
+    )
 PY
 [[ -s "$clean_home/cache/wallet-projections.json" ]]
 kill "$machine_service_pid"
@@ -1029,9 +1057,103 @@ assert_mounted_effect_denied \
   "/wallets/$wallet_id/sealed-approvals/new.json" \
   "$approval_request" \
   "$approval_audit_start"
-run_login_with_deadline \
-  "$work/approval-after.log" \
-  /bin/cat "$mount_dir/wallets/$wallet_id/sealed-approvals/new.json"
+if (
+  umask 077
+  run_login_with_deadline \
+    "$work/approval-after.log" \
+    /bin/cat "$mount_dir/wallets/$wallet_id/sealed-approvals/new.json"
+)
+then
+  :
+else
+  approval_read_status=$?
+  echo "sealed approval mounted read status=$approval_read_status" >&2
+  # Compare transports for diagnosis only. Never turn a failed mounted read
+  # into acceptance, and never print mixed projection/error output.
+  if (
+    umask 077
+    run_machine_with_deadline \
+      "$work/approval-after-ipc.log" \
+      vfs cat "/wallets/$wallet_id/sealed-approvals/new.json"
+  )
+  then
+    approval_ipc_status=0
+  else
+    approval_ipc_status=$?
+  fi
+  echo "sealed approval IPC read status=$approval_ipc_status" >&2
+  /usr/bin/python3 - \
+    "$work/approval-after.log" \
+    "$work/approval-after-ipc.log" \
+    "$mount_dir/wallets/$wallet_id/sealed-approvals/new.json" \
+    "$approval_ipc_status" <<'PY' || \
+    echo "sealed approval read diagnostic helper failed" >&2
+import errno
+import json
+import os
+import pathlib
+import re
+import shutil
+import sys
+import tempfile
+
+mounted_output, ipc_output = map(pathlib.Path, sys.argv[1:3])
+prefix = f"cat: {sys.argv[3]}: "
+standard_errors = {os.strerror(code) for code in errno.errorcode}
+try:
+    errors = {
+        line[len(prefix):]
+        for line in mounted_output.read_text(errors="replace").splitlines()
+        if line.startswith(prefix) and line[len(prefix):] in standard_errors
+    }
+except OSError:
+    errors = set()
+for error in sorted(errors):
+    print(f"/bin/cat: sealed approval template: {error}", file=sys.stderr)
+print(f"sealed approval standard cat error found={bool(errors)}", file=sys.stderr)
+ipc_text = ""
+try:
+    ipc_text = ipc_output.read_text()
+    matches = json.loads(ipc_text) == {
+        "schema": "bloom.approval_prepare_request.v1",
+        "write": "complete ApprovalPrepareRequest JSON",
+    }
+except (OSError, UnicodeError, ValueError):
+    matches = False
+print(f"sealed approval IPC template matches={matches}", file=sys.stderr)
+if not matches:
+    category = "unclassified"
+    if sys.argv[4] == "124":
+        category = "timeout"
+    elif sys.argv[4] == "0":
+        category = "invalid-projection"
+    else:
+        for pattern, label in (
+            (r"\bservice[ _-]?unavailable\b", "SERVICE_UNAVAILABLE"),
+            (r"\bpermission[ _-]?denied\b", "permission-denied"),
+            (r"\bnot[ _-]?found\b", "not-found"),
+            (r"\binvalid[ _-]?projection\b", "invalid-projection"),
+            (r"\b(?:timeout|timed out)\b", "timeout"),
+        ):
+            if re.search(pattern, ipc_text, re.IGNORECASE):
+                category = label
+                break
+    print(f"sealed approval IPC error category={category}", file=sys.stderr)
+
+# Keep only these two private outputs beyond the fixture's normal cleanup.
+# They may contain unexpected capability fields and must not be uploaded.
+try:
+    os.umask(0o077)
+    retained = pathlib.Path(tempfile.mkdtemp(prefix="bloom-approval-read.", dir="/private/tmp"))
+    for source in (mounted_output, ipc_output):
+        shutil.copyfile(source, retained / source.name)
+    private_outputs_retained = True
+except OSError:
+    private_outputs_retained = False
+print(f"sealed approval private outputs retained={private_outputs_retained}", file=sys.stderr)
+PY
+  exit "$approval_read_status"
+fi
 /usr/bin/python3 - "$work/approval-after.log" <<'PY'
 import json
 import pathlib

@@ -64,7 +64,7 @@ use bloom_machine_client::{MachineBrokerClient, WalletProjectionReader};
 use bloom_proto::{AddressBook, HomeWritePermit, Policy, RawIntent};
 use bloom_tx::{
     intent_parser,
-    outbox::OutboxState,
+    outbox::{OutboxError, OutboxState, SigningEvidence},
     tx_engine::{TxEngine, TxEngineError},
 };
 use qrcode::QrCode;
@@ -2683,8 +2683,7 @@ fn newest_pending_target(mut pending: Vec<(u128, String)>) -> Option<String> {
 /// `StateMismatch` maps to `NotFound` deliberately: the caller named an id in a
 /// state it is not in, so the path it asked for does not exist. It lives
 /// somewhere else, which is what a lookup should report.
-fn outbox_err(e: bloom_tx::outbox::OutboxError) -> HandlerError {
-    use bloom_tx::outbox::OutboxError;
+fn outbox_err(e: OutboxError) -> HandlerError {
     match e {
         OutboxError::NotFound(what) => HandlerError::not_found(what),
         OutboxError::StateMismatch { id, .. } => HandlerError::not_found(id),
@@ -2880,11 +2879,46 @@ fn clear_confirm_error(entry_dir: &Path) {
 
 /// Best effort, and never recreates an entry directory that has moved on:
 /// the temporary file is created inside the existing directory only.
-fn record_confirm_error(entry_dir: &Path, wallet: &str, id: &str, error: &HandlerError) {
+/// How to reconcile an entry that `cancel` kept because it may be signed.
+fn possibly_signed_next(error: &TxEngineError, chain: &str) -> Option<String> {
+    let TxEngineError::Outbox(OutboxError::PossiblySigned {
+        wallet,
+        id,
+        tx_hash,
+        evidence,
+        ..
+    }) = error
+    else {
+        return None;
+    };
+    Some(match (tx_hash, evidence) {
+        (Some(_), _) => "This entry may already be signed or broadcast, so `cancel` kept it. Do not reuse its nonce. Reconcile it by its recorded hash first; if it is still unmined, replace it with `bloom wallet cancel`, which needs its own owner approval.".to_owned(),
+        (None, SigningEvidence::Entry) => "A signing request for this entry may have reached the Broker without its reply being recorded, so `cancel` kept the entry; no transaction hash is recorded yet. Do not reuse its nonce. Write the same confirm again: Bloom asks the Broker for the recorded signing operation's result and broadcasts or reconciles it. If it is still unmined afterwards, replace it with `bloom wallet cancel`, which needs its own owner approval.".to_owned(),
+        (None, SigningEvidence::Cancel) => format!(
+            "A cancellation of this entry may have been signed without its reply being recorded, so `cancel` kept the entry; no transaction hash is recorded yet. Do not reuse its nonce. Writing confirm here cannot reconcile a cancellation. Run `bloom wallet cancel {wallet} {chain} {id}` again: Bloom asks the Broker for the recorded cancellation's result and broadcasts or reconciles it."
+        ),
+        (None, SigningEvidence::Batch { ordered_refs }) => format!(
+            "A batch signing request covering this entry may have reached the Broker without its reply being recorded, so `cancel` kept the entry. Do not reuse its nonce. Writing confirm here cannot reconcile a batch. Run `bloom wallet confirm-batch {wallet} {}` with the refs in exactly this order: Bloom asks the Broker for that batch's result and broadcasts or reconciles each entry.",
+            ordered_refs.join(" ")
+        ),
+        (None, SigningEvidence::UnreadableBatch) => "Bloom could not read a batch signing record, and that record could cover any entry, so `cancel` kept this one. Confirm still works. An operator must repair the record named by `outbox.batch_state_unreadable` in the Machine log, or remove it only after the Broker shows that batch never signed; then write cancel again.".to_owned(),
+    })
+}
+
+/// `possibly_signed` is the guidance from [`possibly_signed_next`], if any.
+fn record_confirm_error(
+    entry_dir: &Path,
+    wallet: &str,
+    id: &str,
+    error: &HandlerError,
+    possibly_signed: Option<String>,
+) {
     use std::io::Write as _;
 
     let message = error.to_string();
-    let (kind, next) = if message.contains("POLICY_APPROVAL_REQUIRED") {
+    let (kind, next) = if let Some(next) = possibly_signed {
+        ("possibly_signed", next)
+    } else if message.contains("POLICY_APPROVAL_REQUIRED") {
         (
             "policy_approval_required",
             format!(
@@ -2966,6 +3000,7 @@ const PUBLIC_SOLANA_OUTBOX_ARTIFACTS: &[&str] = &[
     "approval_challenge.json",
     "restage_advice.json",
     "restage.md",
+    bloom_solana_tx::types::UNRESOLVED_FILE,
 ];
 
 /// A Solana child account as projected by the Broker.
@@ -3365,12 +3400,15 @@ impl Handler for WalletsHandler {
     /// that bypasses the mode check still cannot trigger a sign or
     /// broadcast just by stat'ing.
     fn is_read_side_effecting(&self, path: &VfsPath) -> bool {
-        pending_outbox_control(path.segments()).is_some_and(|target| {
-            matches!(
-                target.control,
-                "confirm" | "confirm.override" | "replace" | "cancel" | "restage"
-            )
-        })
+        // An expired entry's `failed/<id>/restage` is a write-only sink too;
+        // rendering it fails NotFound and GETATTR reports the route missing.
+        is_failed_outbox_restage(path.segments())
+            || pending_outbox_control(path.segments()).is_some_and(|target| {
+                matches!(
+                    target.control,
+                    "confirm" | "confirm.override" | "replace" | "cancel" | "restage"
+                )
+            })
     }
 }
 
@@ -3381,6 +3419,18 @@ struct PendingOutboxControl<'a> {
     chain: &'a str,
     id: &'a str,
     control: &'a str,
+}
+
+/// Match `<w>/<n>/chains/<c>/outbox/failed/<id>/restage`.
+fn is_failed_outbox_restage(segs: &[String]) -> bool {
+    matches!(
+        segs,
+        [_wallet, _number, chains, _chain, outbox, failed, _id, restage]
+            if chains == "chains"
+                && outbox == "outbox"
+                && failed == "failed"
+                && restage == "restage"
+    )
 }
 
 /// Match `<w>/<n>/chains/<c>/outbox/pending/<id>/<control>`.
@@ -3687,10 +3737,16 @@ impl WalletsHandler {
             "sealed-approvals" if segs.len() == 4 && segs[3] == "limits.json" => {
                 self.sealed_approval_limits_json(wallet, &segs[2]).await
             }
-            "sealed-approvals" if segs.len() == 4 && segs[3] == "renew" => self
-                .approval_ceremony_projection_json(wallet, Some(&segs[2]))
-                .await?
-                .ok_or_else(|| HandlerError::not_found(path.to_string_path())),
+            "sealed-approvals" if segs.len() == 4 && segs[3] == "renew" => {
+                self.approval_status_for_wallet(wallet, &segs[2]).await?;
+                match self
+                    .approval_ceremony_projection_json(wallet, Some(&segs[2]))
+                    .await?
+                {
+                    Some(projection) => Ok(projection),
+                    None => Ok(b"{\"schema\":\"bloom.approval_renew_request.v1\",\"write\":\"complete ApprovalRenewRequest JSON\"}\n".to_vec()),
+                }
+            }
             "policy-updates" if segs.len() == 4 && segs[2] == "latest" => {
                 let action_id = self
                     .policy_update_latest_pending_id(wallet)
@@ -4445,12 +4501,26 @@ impl WalletsHandler {
                     ));
                 }
                 if confirm_text.eq_ignore_ascii_case("cancel") {
-                    self.write_permit()?;
-                    self.tx_engine
+                    // Check the permit before clearing the last refusal, so a
+                    // refused write leaves its recovery guidance in place.
+                    let permit = self.write_permit()?;
+                    let entry_dir = self
+                        .tx_engine
                         .outbox
-                        .cancel(wallet, chain, id)
-                        .map_err(err_be)?;
-                    return Ok(());
+                        .read(wallet, chain, id)
+                        .map_err(err_be)?
+                        .dir;
+                    clear_confirm_error(&entry_dir);
+                    return self
+                        .tx_engine
+                        .discard_unsigned(permit, wallet, chain, id)
+                        .await
+                        .map_err(|error| {
+                            let next = possibly_signed_next(&error, chain);
+                            let error = err_be(error);
+                            record_confirm_error(&entry_dir, wallet, id, &error, next);
+                            error
+                        });
                 }
                 let confirm_text = if fname == "confirm.override" {
                     policy.override_sentinel()
@@ -4490,7 +4560,7 @@ impl WalletsHandler {
                     // approval_challenge.json; anything else is recorded.
                     Err(HandlerError::PermissionDenied) => Err(HandlerError::PermissionDenied),
                     Err(error) => {
-                        record_confirm_error(&entry_dir, wallet, id, &error);
+                        record_confirm_error(&entry_dir, wallet, id, &error, None);
                         Err(error)
                     }
                 }
@@ -4516,44 +4586,43 @@ impl WalletsHandler {
                     .map_err(err_be)?;
                 Ok(())
             }
-            // outbox/pending/<id>/replace — restage with bumped fees from
-            // the same intent body the user provides (fix #10). Body is a
-            // RawIntent (TOML/JSON/shell). The original is left in place so
-            // diff against the bumped tx is visible; the engine writes
-            // `replacement_intent.json` alongside.
+            // outbox/pending/<id>/replace accepts only an exact EIP-1559 fee
+            // pair. Any other body is refused before anything is recorded.
             [state, id, fname] if state == "pending" && fname == "replace" => {
                 self.require_staged_by(wallet, chain, id, &scope)?;
-                let body = std::str::from_utf8(data)
-                    .map_err(|_| HandlerError::invalid("non-utf8 replace intent"))?;
-                if body.trim().is_empty() {
-                    return Err(HandlerError::invalid(
-                        "replace requires a non-empty intent body",
-                    ));
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct FeeRepair {
+                    max_fee_per_gas: String,
+                    max_priority_fee_per_gas: String,
                 }
-                let intent: RawIntent = intent_parser::parse(body).map_err(err_be)?;
-                // Bump at >= 10% (mempool floor) and substitute the
-                // calldata derived from the new intent — same nonce,
-                // possibly different to / value / data. Use the
-                // address book the handler holds so name lookups in
-                // the body resolve identically to a fresh stage.
+                let request: FeeRepair =
+                    serde_json::from_slice(data).map_err(|_| HandlerError::PermissionDenied)?;
+                let fees = bloom_tx::Eip1559FeeOverrides::from_decimal_pair(
+                    Some(&request.max_fee_per_gas),
+                    Some(&request.max_priority_fee_per_gas),
+                    client.spec().legacy_tx,
+                )
+                .map_err(err_be)?
+                .expect("complete fee pair");
                 self.require_outbox_petal_eligibility_for_action(wallet, chain, id, true)
                     .await?;
-                let _ = self
-                    .tx_engine
-                    .replace_with_intent(
+                self.tx_engine
+                    .replace_fees(
                         self.write_permit()?,
                         wallet,
                         chain,
                         id,
                         &client,
-                        10,
-                        Some(intent),
-                        Some(self.address_book.as_ref()),
+                        fees,
                         policy,
                     )
                     .await
-                    .map_err(err_be)?;
-                Ok(())
+                    .map(|_| ())
+                    .map_err(|error| match error {
+                        TxEngineError::ApprovalRequired(_) => HandlerError::PermissionDenied,
+                        other => err_be(other),
+                    })
             }
             _ => Err(HandlerError::PermissionDenied),
         }
@@ -5256,6 +5325,35 @@ mod tests {
                 }
             })
         }
+    }
+
+    #[tokio::test]
+    async fn account_creation_never_uses_a_display_only_policy() {
+        let f = make_handler();
+        let service = Arc::new(CreationBroker {
+            prepared: std::sync::Mutex::new(None),
+            state: std::sync::Mutex::new(bloom_broker_api::CeremonyState::AwaitingUser),
+        });
+        let mut handler = f
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(service.clone())));
+        handler.wallet_projections = Some(Arc::new(NavigationOnlyProjection(
+            bip39_projection_value(f.wallet_addr, vec![]),
+        )));
+        let error = handler
+            .write(
+                &vfs(format!("/{}/new", f.wallet_name)),
+                br#"{"request_id":"fresh-policy"}"#,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("live account authority unavailable"),
+            "{error}"
+        );
+        assert!(service.prepared.lock().unwrap().is_none());
     }
 
     #[tokio::test]
@@ -6189,6 +6287,85 @@ value = "0""#
                 .unwrap();
             assert_eq!(sink.mode, 0o644, "{path}/restage must be writable");
         }
+    }
+
+    /// A crash after the move to `failed/` but before the intent rewrite
+    /// leaves `pending` on disk. The mounted `intent.json` must report the
+    /// same `expired` status the outbox uses to offer `restage`.
+    #[tokio::test]
+    async fn interrupted_solana_failure_serves_the_projected_status() {
+        use bloom_solana_tx::outbox::SolanaOutboxState;
+        use bloom_solana_tx::types::{SolanaTxStatus, StagedSolanaTransfer};
+        let f = make_handler_with_chain(true);
+        let (projection, _evm0, _evm1) = two_account_projection(&f);
+        use sha2::Digest as _;
+        let mut spki = vec![
+            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+        ];
+        spki.extend_from_slice(&[0x20; 32]);
+        let fp0 = bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(&spki).into())
+            .as_str()
+            .to_owned();
+        let (engine, outbox) = solana_engine_fixture(&f._tmp);
+        seed_solana_entry(
+            &outbox,
+            "sol-crash",
+            &fp0,
+            &bs58::encode([0x20; 32]).into_string(),
+            false,
+        );
+        let mut entry = outbox
+            .read_in_state(
+                "alice",
+                "solana-devnet",
+                "sol-crash",
+                SolanaOutboxState::Pending,
+            )
+            .unwrap();
+        entry.staged.status = SolanaTxStatus::Expired;
+        // Move without the follow-up rewrite_intent, as a crash would.
+        let failed_dir = outbox
+            .transition(&entry, SolanaOutboxState::Failed)
+            .unwrap();
+        let on_disk: StagedSolanaTransfer =
+            serde_json::from_slice(&std::fs::read(failed_dir.join("intent.json")).unwrap())
+                .unwrap();
+        assert_eq!(on_disk.status, SolanaTxStatus::Pending);
+
+        let mut handler = f.handler.clone();
+        handler.wallet_projections = Some(projection);
+        handler.broker = Some(MachineBrokerClient::new(Arc::new(StubBroker)));
+        handler = handler.with_solana(std::collections::BTreeMap::from([(
+            "solana-devnet".to_string(),
+            std::sync::Arc::new(engine),
+        )]));
+        let w = &f.wallet_name;
+        let served: StagedSolanaTransfer = serde_json::from_slice(
+            &handler
+                .read(&vfs(format!(
+                    "/{w}/0/chains/solana-devnet/outbox/failed/sol-crash/intent.json"
+                )))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(served.status, SolanaTxStatus::Expired);
+        assert_eq!(served.signature, None);
+    }
+
+    /// GETATTR must never render an expired entry's write-only `restage`
+    /// sink: the read fails NotFound and mounted agents see it as missing.
+    #[test]
+    fn failed_restage_sink_is_never_rendered() {
+        let f = make_handler_with_chain(true);
+        let w = &f.wallet_name;
+        for chain in ["anvil", "solana-local"] {
+            let p = vfs(format!("/{w}/0/chains/{chain}/outbox/failed/e1/restage"));
+            assert!(f.handler.is_read_side_effecting(&p), "{chain}");
+            assert!(!f.handler.is_async_write_command(&p), "{chain}");
+        }
+        let doc = vfs(format!("/{w}/0/chains/anvil/outbox/failed/e1/restage.md"));
+        assert!(!f.handler.is_read_side_effecting(&doc));
     }
 
     /// Account 0's Solana `new.tx` is pinned to account 0: a body
@@ -8807,6 +8984,7 @@ value = "0""#,
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            safe_review_payloads: Vec::new(),
             evm_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
@@ -8856,6 +9034,7 @@ value = "0""#,
                 .with_broker(Some(MachineBrokerClient::new(broker.clone())));
             let request = ApprovalPrepareRequest {
                 surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+                safe_review_payloads: Vec::new(),
                 evm_review_payloads: Vec::new(),
                 operation_id: OperationId::from_bytes([30; 32]),
                 terms: approval_terms("alice", None),
@@ -8890,6 +9069,7 @@ value = "0""#,
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            safe_review_payloads: Vec::new(),
             evm_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
@@ -8923,6 +9103,7 @@ value = "0""#,
             .with_broker(Some(MachineBrokerClient::new(broker)));
         let request = ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            safe_review_payloads: Vec::new(),
             evm_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
@@ -8971,6 +9152,14 @@ value = "0""#,
             old_id.as_str()
         ))
         .unwrap();
+        let initial: serde_json::Value =
+            serde_json::from_slice(&f.handler.read(&renew_path).await.unwrap()).unwrap();
+        assert_eq!(initial["schema"], "bloom.approval_renew_request.v1");
+        assert!(
+            !f.handler
+                .approval_projection_path("alice", Some(old_id.as_str()))
+                .exists()
+        );
         f.handler
             .write(&renew_path, &serde_json::to_vec(&renewal).unwrap())
             .await
@@ -9914,6 +10103,7 @@ value = "0""#,
             &HandlerError::backend(
                 "POLICY_APPROVAL_REQUIRED: complete the owner ceremony at https://example.invalid/c then retry this operation; status: /wallets/alice/policy-updates/pending/x/status.json",
             ),
+            None,
         );
         let record: serde_json::Value = serde_json::from_slice(
             &std::fs::read(directory.path().join(CONFIRM_ERROR_FILE)).unwrap(),
@@ -9940,20 +10130,42 @@ value = "0""#,
         assert_eq!(leftovers.len(), 1, "{leftovers:?}");
 
         let moved = directory.path().join("moved-to-sent");
-        record_confirm_error(&moved, "alice", "0001-test", &HandlerError::backend("late"));
+        record_confirm_error(
+            &moved,
+            "alice",
+            "0001-test",
+            &HandlerError::backend("late"),
+            None,
+        );
         assert!(!moved.exists());
+    }
+
+    /// A handler whose write permit matches its outbox home, with one
+    /// pending entry `0001-test`.
+    fn cancel_fixture() -> Fixture {
+        let mut f = make_handler_with_chain(true);
+        f.handler.home_write_permit = Some(Arc::new(
+            HomeWritePermit::acquire(&bloom_proto::HomeDir::at(f._tmp.path())).unwrap(),
+        ));
+        seed_pending(&f, "0001-test");
+        f
+    }
+
+    fn write_cancel_path(f: &Fixture, control: &str) -> VfsPath {
+        VfsPath::parse(&format!(
+            "/{}/0/chains/anvil/outbox/pending/0001-test/{control}",
+            f.wallet_name
+        ))
+        .unwrap()
     }
 
     #[tokio::test]
     async fn confirm_cancel_discards_pending_locally() {
-        let f = make_handler_with_chain(true);
-        seed_pending(&f, "0001-test");
-        let p = VfsPath::parse(&format!(
-            "/{}/0/chains/anvil/outbox/pending/0001-test/confirm",
-            f.wallet_name
-        ))
-        .unwrap();
-        f.handler.write(&p, b"cancel").await.unwrap();
+        let f = cancel_fixture();
+        f.handler
+            .write(&write_cancel_path(&f, "confirm"), b"cancel")
+            .await
+            .unwrap();
 
         let entry = f
             .handler
@@ -9964,6 +10176,203 @@ value = "0""#,
         assert_eq!(entry.state, OutboxState::Failed);
         assert!(!entry.dir.join("broadcast_attempted.json").exists());
         assert!(!entry.dir.join("raw_tx").exists());
+    }
+
+    /// `cancel` written to `confirm` only discards an entry that is provably
+    /// unsigned: any hash, broadcast attempt, signed raw bytes, or signing
+    /// request (single or batch, or unreadable state) keeps it, because the
+    /// transaction may still land and its nonce must not be reused.
+    #[tokio::test]
+    async fn confirm_cancel_preserves_possible_signatures() {
+        let ceremony = |sign_dispatched: bool, action_id: &str| {
+            let digest = "11".repeat(32);
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "bloom.machine-evm-signing.1", "action_id": action_id,
+                "payload_digest": digest, "claimed_hash": digest,
+                "provenance_digest": digest, "canonical_plan_facts_digest": digest,
+                "approval_operation_id": "22".repeat(32), "signing_operation_id": "33".repeat(32),
+                "request_nonce": "11".repeat(16), "issued_at_ms": "1", "expires_at_ms": "2",
+                "approval_id": digest, "sign_dispatched": sign_dispatched
+            }))
+            .unwrap()
+        };
+        let attempt = |entry: &bloom_tx::outbox::OutboxEntry| {
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "bloom.broadcast_attempted.v1", "tx_hash": "0xsigned",
+                "raw_tx_blake3": "digest", "raw_tx_path": "raw_tx",
+                "from": entry.staged.from, "to": null, "nonce": 0,
+                "chain_id": 31337, "created_ms": 0, "transport": "public_rpc"
+            }))
+            .unwrap()
+        };
+        let markers = [
+            "none",
+            "approved",
+            "hash",
+            "broadcast_attempted.json",
+            "replacement_broadcast_attempted.json",
+            "cancel_broadcast_attempted.json",
+            "raw_tx",
+            "replacement_raw_tx",
+            "cancel_raw_tx",
+            "dispatched",
+            "cancel_dispatched",
+            "malformed",
+            "batch",
+            "unreadable_batch",
+        ];
+        for marker in markers {
+            for control in ["confirm", "confirm.override"] {
+                let f = cancel_fixture();
+                let outbox = &f.handler.tx_engine.outbox;
+                let entry = outbox.read(&f.wallet_name, "anvil", "0001-test").unwrap();
+                match marker {
+                    "none" => {}
+                    "approved" => {
+                        std::fs::write(entry.dir.join("ceremony.json"), ceremony(false, "test"))
+                            .unwrap()
+                    }
+                    "hash" => {
+                        let mut staged = entry.staged.clone();
+                        staged.tx_hash = Some(format!("0x{}", "11".repeat(32)));
+                        std::fs::write(
+                            entry.dir.join("intent.json"),
+                            serde_json::to_vec(&staged).unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    "dispatched" => {
+                        std::fs::write(entry.dir.join("ceremony.json"), ceremony(true, "test"))
+                            .unwrap()
+                    }
+                    "cancel_dispatched" => std::fs::write(
+                        entry.dir.join("ceremony.json"),
+                        ceremony(true, "31337:0001-test:cancel"),
+                    )
+                    .unwrap(),
+                    "malformed" => {
+                        std::fs::write(entry.dir.join("ceremony.json"), b"invalid").unwrap()
+                    }
+                    "batch" => {
+                        let batch = outbox.root().join(".batch-signing/digest");
+                        std::fs::create_dir_all(&batch).unwrap();
+                        std::fs::write(
+                            batch.join("ceremony.json"),
+                            serde_json::to_vec(&serde_json::json!({
+                                "wallet": f.wallet_name, "sign_dispatched": true,
+                                "ordered_refs": [{"chain": "anvil", "id": "0001-test"}]
+                            }))
+                            .unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    "unreadable_batch" => {
+                        let batch = outbox.root().join(".batch-signing/unreadable");
+                        std::fs::create_dir_all(&batch).unwrap();
+                        std::fs::write(batch.join("ceremony.json"), b"invalid").unwrap();
+                    }
+                    name if name.ends_with(".json") => {
+                        std::fs::write(entry.dir.join(name), attempt(&entry)).unwrap()
+                    }
+                    raw => std::fs::write(entry.dir.join(raw), b"signed").unwrap(),
+                }
+                let result = f
+                    .handler
+                    .write(&write_cancel_path(&f, control), b"cancel")
+                    .await;
+                let retained = outbox.read(&f.wallet_name, "anvil", "0001-test").unwrap();
+                if matches!(marker, "none" | "approved") {
+                    result.unwrap();
+                    assert_eq!(retained.state, OutboxState::Failed, "{marker}/{control}");
+                    assert!(retained.dir.join("cancel.txt").exists());
+                    continue;
+                }
+                let error = result.unwrap_err();
+                assert_eq!(retained.state, OutboxState::Pending, "{marker}/{control}");
+                assert!(!retained.dir.join("cancel.txt").exists());
+                assert!(
+                    error.to_string().contains("cannot discard"),
+                    "{marker}: {error}"
+                );
+                let record: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(retained.dir.join(CONFIRM_ERROR_FILE)).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(record["kind"], "possibly_signed", "{marker}");
+                let next = record["next"].as_str().unwrap();
+                if marker == "unreadable_batch" {
+                    // No signing operation of this entry's own is recorded, so
+                    // retrying confirm cannot reconcile it; an operator must.
+                    assert!(
+                        next.contains("could not read a batch signing record"),
+                        "{next}"
+                    );
+                    assert!(!next.contains("Write the same confirm again"), "{next}");
+                    continue;
+                }
+                if marker == "batch" {
+                    // Single confirm reads only the entry's own state; only
+                    // the exact ordered batch reconciles a batch signature.
+                    let command = format!(
+                        "bloom wallet confirm-batch {} anvil:0001-test",
+                        f.wallet_name
+                    );
+                    assert!(next.contains(&command), "{next}");
+                    assert!(!next.contains("Write the same confirm again"), "{next}");
+                    continue;
+                }
+                if matches!(marker, "cancel_raw_tx" | "cancel_dispatched") {
+                    // The cancellation holds the evidence; only rerunning it
+                    // reconciles it, and confirm would refuse.
+                    let command = format!("bloom wallet cancel {} anvil 0001-test", f.wallet_name);
+                    assert!(next.contains(&command), "{marker}: {next}");
+                    assert!(!next.contains("Write the same confirm again"), "{next}");
+                    continue;
+                }
+                assert!(next.contains("bloom wallet cancel"), "{marker}: {next}");
+                // Without a recorded hash, the next step is to reconcile the
+                // recorded signing operation, not to use a hash.
+                let hashless = !matches!(marker, "hash") && !marker.ends_with(".json");
+                assert_eq!(
+                    next.contains("Write the same confirm again"),
+                    hashless,
+                    "{marker}: {next}"
+                );
+                assert_eq!(
+                    next.contains("recorded hash"),
+                    !hashless,
+                    "{marker}: {next}"
+                );
+            }
+        }
+    }
+
+    /// A `cancel` the write permit refuses changes nothing, including the
+    /// recovery guidance from the last refusal.
+    #[tokio::test]
+    async fn refused_confirm_cancel_preserves_last_error() {
+        let mut f = cancel_fixture();
+        let entry = f
+            .handler
+            .tx_engine
+            .outbox
+            .read(&f.wallet_name, "anvil", "0001-test")
+            .unwrap();
+        std::fs::write(
+            entry.dir.join(CONFIRM_ERROR_FILE),
+            b"{\"kind\":\"possibly_signed\"}",
+        )
+        .unwrap();
+        f.handler.home_write_permit = None;
+        f.handler
+            .write(&write_cancel_path(&f, "confirm"), b"cancel")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            std::fs::read(entry.dir.join(CONFIRM_ERROR_FILE)).unwrap(),
+            b"{\"kind\":\"possibly_signed\"}"
+        );
+        assert!(entry.dir.join("intent.json").exists());
     }
 
     #[tokio::test]
@@ -10043,9 +10452,10 @@ value = "0""#,
         assert!(matches!(r, Err(HandlerError::Invalid(_))), "got: {r:?}");
     }
 
-    /// Fix #10: replace route exists and demands a non-empty body.
+    /// `replace` accepts only the exact fee pair; every other body is
+    /// permission denied and records nothing.
     #[tokio::test]
-    async fn replace_route_demands_body() {
+    async fn replace_refuses_any_body_but_the_fee_pair() {
         let f = make_handler_with_chain(true);
         seed_pending(&f, "0001-test");
         let p = VfsPath::parse(&format!(
@@ -10053,8 +10463,35 @@ value = "0""#,
             f.wallet_name
         ))
         .unwrap();
-        let r = f.handler.write(&p, b"").await;
-        assert!(matches!(r, Err(HandlerError::Invalid(_))), "got: {r:?}");
+        for body in [
+            &b""[..],
+            br#"{"max_fee_per_gas":"60000000000"}"#,
+            br#"{"max_fee_per_gas":"6","max_priority_fee_per_gas":"3","to":"0x00"}"#,
+            br#"to = "0x0000000000000000000000000000000000000002""#,
+        ] {
+            let r = f.handler.write(&p, body).await;
+            assert!(
+                matches!(r, Err(HandlerError::PermissionDenied)),
+                "got: {r:?}"
+            );
+        }
+        fn replacement_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    replacement_files(&path, out);
+                } else if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("replacement")
+                {
+                    out.push(path);
+                }
+            }
+        }
+        let mut recorded = Vec::new();
+        replacement_files(f._tmp.path(), &mut recorded);
+        assert!(recorded.is_empty(), "{recorded:?}");
     }
 
     /// Fix #10: list of `pending/<id>/` advertises the writable control

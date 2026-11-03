@@ -321,11 +321,18 @@ run_as_login test \
   -p bloom \
   --bin bloom \
   ac26_every_custody_kind
-broker_test_args=(--manifest-path "$broker_root/Cargo.toml" --workspace --locked)
+# This regression captures tracing's process-global callsite interest. Other
+# parallel Broker tests can register the same callsite without its subscriber.
+# Keep the assertion, but run it in a separate process before the full suite.
+tracing_test=signer_client::tests::signer_worker_preserves_trusted_service_span_and_dispatcher
+run_as_login test \
+  --manifest-path "$broker_root/Cargo.toml" \
+  --locked -p bloom-broker --lib -- --exact "$tracing_test"
+broker_test_args=(--manifest-path "$broker_root/Cargo.toml" --workspace --locked -- --skip "$tracing_test")
 if [[ "${BLOOM_MACOS_ACCEPTANCE_EXCLUSIVE_LISTENER_TESTED:-}" == 1 ]]; then
   # The complete suite ran before installation in the candidate job. Repeat
   # every other test while the installed Broker retains its canonical port.
-  broker_test_args+=(-- --skip paired_loopback_servers_validate_serve_both_families_and_shutdown)
+  broker_test_args+=(--skip paired_loopback_servers_validate_serve_both_families_and_shutdown)
 fi
 run_as_login test "${broker_test_args[@]}"
 run_as_login test \

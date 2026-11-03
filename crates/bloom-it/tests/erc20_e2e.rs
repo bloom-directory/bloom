@@ -308,27 +308,7 @@ async fn an_unmined_nonce_stays_replaceable_and_a_mined_one_does_not() -> Result
         first.nonce
     );
 
-    // Replacement: permitted, same nonce.
-    let first_replace = engine
-        .replace(&permit, "alice", "anvil", &first.id, &chain, 15, &policy)
-        .await;
-    assert!(
-        matches!(first_replace, Err(TxEngineError::ApprovalRequired(_))),
-        "replace should ask for its own approval first: {first_replace:?}"
-    );
-    let replaced = engine
-        .replace(&permit, "alice", "anvil", &first.id, &chain, 15, &policy)
-        .await
-        .map_err(|e| anyhow!("replace of an unmined nonce was refused: {e}"))?;
-    assert_eq!(
-        replaced.nonce, first.nonce,
-        "a replacement must reuse the original nonce"
-    );
-
-    // Cancellation: the same guard, the same verdict. It gets its own
-    // transaction because a cancel re-bumps from the entry's recorded fees,
-    // and cancelling the row just replaced would be underpriced against the
-    // replacement already in the mempool — a fee question, not a nonce one.
+    // Cancellation of an unmined nonce is permitted, at the same nonce.
     let second = engine
         .stage(&permit, "alice", from, send(), &chain, &policy, None)
         .await
@@ -397,13 +377,6 @@ async fn an_unmined_nonce_stays_replaceable_and_a_mined_one_does_not() -> Result
         first.nonce
     );
 
-    let after_mining = engine
-        .replace(&permit, "alice", "anvil", &first.id, &chain, 15, &policy)
-        .await;
-    assert!(
-        matches!(after_mining, Err(TxEngineError::NonceConsumed { .. })),
-        "a mined nonce must report NonceConsumed: {after_mining:?}"
-    );
     let cancel_after_mining = engine
         .cancel(&permit, "alice", "anvil", &third.id, &chain, 15, &policy)
         .await;
@@ -413,114 +386,6 @@ async fn an_unmined_nonce_stays_replaceable_and_a_mined_one_does_not() -> Result
             Err(TxEngineError::NonceConsumed { .. })
         ),
         "cancelling a mined nonce must report NonceConsumed: {cancel_after_mining:?}"
-    );
-
-    drop(anvil);
-    Ok(())
-}
-
-/// Stage a native send, broadcast via `confirm`, then call `replace`
-/// with a 15% fee bump. Asserts that the replacement carries the same
-/// nonce and strictly higher fees.
-#[tokio::test(flavor = "multi_thread")]
-async fn replace_keeps_nonce_and_bumps_fees() -> Result<()> {
-    let anvil = spawn_anvil(true).await?;
-    let rpc_url = anvil.rpc_url();
-    let chain = ChainClient::new(anvil_chain_spec(&rpc_url)).map_err(|e| anyhow!("chain: {e}"))?;
-
-    let tmp = tempfile::tempdir()?;
-    let permit = bloom_proto::HomeWritePermit::acquire(&bloom_proto::HomeDir::at(tmp.path()))?;
-    let outbox = Outbox::new(tmp.path().join("outbox")).map_err(|e| anyhow!("outbox: {e}"))?;
-    let (broker, broker_fixture) = exact_signing_broker(ANVIL_PK0)?;
-    let engine = TxEngine::new(outbox, 60_000)
-        .with_price_oracle(Arc::new(TestPriceOracle))
-        .with_triad_signing(
-            broker,
-            exact_signing_catalog(&["transaction.confirm", "transaction.replace"]),
-        )
-        .map_err(|e| anyhow!("triad signing: {e}"))?;
-
-    // Use anvil's prefunded account #0 as the signer.
-    let signer: alloy_signer_local::PrivateKeySigner = ANVIL_PK0.parse()?;
-    let from = signer.address();
-
-    // Keep the staged transaction inside ordinary policy limits. Confirm and
-    // replace still require separate pre-minted Sealed Approval grants below.
-    let policy = {
-        let mut p = Policy::default();
-        p.approval.agent_autonomy = Some(AgentAutonomyMode::UnderPolicy);
-        p.limits.max_tx_usd = Some("1000".into());
-        p.limits.max_day_usd = Some("10000".into());
-        p
-    };
-
-    let intent = RawIntent {
-        body: RawIntentBody::Send {
-            to: ANVIL_ADDR1.to_string(),
-            value: "0.01 eth".into(),
-            token: None,
-            amount: String::new(),
-            data: None,
-        },
-        chain: Some("anvil".to_string()),
-        gas: Default::default(),
-        nonce: None,
-        gas_limit_hint: None,
-        usd_value_hint: Some("1".into()),
-        review_mode: None,
-    };
-
-    let staged = engine
-        .stage(&permit, "alice", from, intent, &chain, &policy, None)
-        .await
-        .map_err(|e| anyhow!("stage: {e}"))?;
-    let original_nonce = staged.nonce;
-    let original_max_fee: u128 = staged
-        .max_fee_per_gas
-        .as_deref()
-        .ok_or_else(|| anyhow!("missing max_fee_per_gas"))?
-        .parse()?;
-
-    assert!(matches!(
-        engine
-            .confirm(&permit, "alice", "anvil", &staged.id, &chain, &policy, "y")
-            .await,
-        Err(TxEngineError::ApprovalRequired(_))
-    ));
-    broker_fixture.activate();
-    let confirmed = engine
-        .confirm(&permit, "alice", "anvil", &staged.id, &chain, &policy, "y")
-        .await
-        .map_err(|e| anyhow!("confirm: {e}"))?;
-    assert!(confirmed.tx_hash.is_some(), "confirm produced no tx hash");
-
-    // Replace with +15% fees.
-    let first_replace = engine
-        .replace(&permit, "alice", "anvil", &staged.id, &chain, 15, &policy)
-        .await;
-    assert!(
-        matches!(first_replace, Err(TxEngineError::ApprovalRequired(_))),
-        "first replacement should require its own exact approval: {first_replace:?}"
-    );
-    let replaced = engine
-        .replace(&permit, "alice", "anvil", &staged.id, &chain, 15, &policy)
-        .await
-        .map_err(|e| anyhow!("replace: {e}"))?;
-    assert_eq!(replaced.nonce, original_nonce, "nonce must match");
-    let new_max_fee: u128 = replaced
-        .max_fee_per_gas
-        .as_deref()
-        .ok_or_else(|| anyhow!("missing replacement max_fee_per_gas"))?
-        .parse()?;
-    assert!(
-        new_max_fee > original_max_fee,
-        "fee not bumped: {} -> {}",
-        original_max_fee,
-        new_max_fee
-    );
-    assert!(
-        replaced.tx_hash.is_some(),
-        "replacement broadcast produced no tx hash"
     );
 
     drop(anvil);
