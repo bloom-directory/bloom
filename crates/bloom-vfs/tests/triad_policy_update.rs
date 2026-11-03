@@ -780,6 +780,21 @@ async fn vfs_policy_commit_refresh_failure_does_not_leave_stale_policy_fresh() {
         .store(true, Ordering::SeqCst);
     handler.write(&write_path, &proposed).await.unwrap();
 
+    // While Broker stays unavailable, staging's reads must not fall back to
+    // the cached pre-commit policy.
+    for result in [
+        reader.get_wallet_navigation(&alice).await,
+        reader.get_wallet(&alice).await,
+    ] {
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("changed since its cached projection"),
+            "{error:?}"
+        );
+    }
+
     fixture
         .unavailable_after_commit
         .store(false, Ordering::SeqCst);

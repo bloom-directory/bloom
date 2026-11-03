@@ -191,8 +191,9 @@ pub trait WalletProjectionReader: Send + Sync {
     ) -> Result<WalletProjection, ProtocolError> {
         self.get_wallet(wallet_id).await
     }
-    /// Forget that `wallet_id` was observed recently, so the next read
-    /// observes Broker instead of reusing a superseded projection.
+    /// Mark `wallet_id`'s cached projection superseded: the next read
+    /// observes Broker, and fails rather than serve the cache if Broker is
+    /// unavailable.
     fn invalidate_wallet(&self, _wallet_id: &Token) -> Result<(), ProtocolError> {
         Ok(())
     }
@@ -348,6 +349,10 @@ pub struct CachedWalletProjectionReader {
     last_live_refresh_ms: Arc<AtomicU64>,
     /// When each wallet was last observed by a single-wallet refresh.
     wallet_refreshed_ms: Arc<Mutex<BTreeMap<String, u64>>>,
+    /// Wallets whose cached projection is known to be superseded, such as
+    /// by a committed policy update. Their cache is not served as a stale
+    /// fallback until a live observation replaces it.
+    superseded: Arc<Mutex<BTreeSet<String>>>,
     max_age_ms: u64,
 }
 
@@ -363,6 +368,7 @@ impl CachedWalletProjectionReader {
             cache: Arc::new(Mutex::new(cache)),
             last_live_refresh_ms: Arc::new(AtomicU64::new(0)),
             wallet_refreshed_ms: Arc::new(Mutex::new(BTreeMap::new())),
+            superseded: Arc::new(Mutex::new(BTreeSet::new())),
             max_age_ms: 0,
         })
     }
@@ -597,6 +603,7 @@ impl CachedWalletProjectionReader {
             .cache
             .lock()
             .map_err(|_| unavailable("Machine projection cache mutex poisoned"))? = updated;
+        self.superseded_set()?.clear();
         self.last_live_refresh_ms.store(now_ms()?, Ordering::SeqCst);
         Ok(projections)
     }
@@ -626,6 +633,12 @@ impl CachedWalletProjectionReader {
             .copied()
             .unwrap_or(0);
         Ok(single.max(self.last_live_refresh_ms.load(Ordering::SeqCst)))
+    }
+
+    fn superseded_set(&self) -> Result<std::sync::MutexGuard<'_, BTreeSet<String>>, ProtocolError> {
+        self.superseded
+            .lock()
+            .map_err(|_| unavailable("Machine projection superseded-set mutex poisoned"))
     }
 
     fn cached_live_wallet(
@@ -708,6 +721,7 @@ impl CachedWalletProjectionReader {
             .lock()
             .map_err(|_| unavailable("Machine projection freshness mutex poisoned"))?
             .insert(wallet_id.as_str().to_owned(), now_ms()?);
+        self.superseded_set()?.remove(wallet_id.as_str());
         Ok(observed)
     }
 
@@ -787,6 +801,13 @@ impl WalletProjectionReader for CachedWalletProjectionReader {
             wallet_id = %wallet_id.as_str(),
             "Machine authority edge unavailable; serving cached wallet projection"
         );
+        if self.superseded_set()?.contains(wallet_id.as_str()) {
+            return Err(unavailable(format!(
+                "{}; wallet {} changed since its cached projection",
+                broker_error.message,
+                wallet_id.as_str()
+            )));
+        }
         let cache = self
             .cache
             .lock()
@@ -841,6 +862,7 @@ impl WalletProjectionReader for CachedWalletProjectionReader {
             .lock()
             .map_err(|_| unavailable("Machine projection freshness mutex poisoned"))?
             .remove(wallet_id.as_str());
+        self.superseded_set()?.insert(wallet_id.as_str().to_owned());
         // A full refresh also counts as this wallet's observation.
         self.last_live_refresh_ms.store(0, Ordering::SeqCst);
         Ok(())
