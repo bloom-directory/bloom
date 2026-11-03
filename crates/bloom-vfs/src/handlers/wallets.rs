@@ -11426,11 +11426,21 @@ value = "0""#,
         held: fn(&str) -> Option<u64>,
         delay: std::time::Duration,
     ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        spawn_holdings_node_with(chain_id, native, held, Arc::new(move |_| delay)).await
+    }
+
+    /// `delay` gets the token symbol a call reads, or `None` for other calls.
+    async fn spawn_holdings_node_with(
+        chain_id: u64,
+        native: u64,
+        held: fn(&str) -> Option<u64>,
+        delay: Arc<dyn Fn(Option<&str>) -> std::time::Duration + Send + Sync>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let tokens: Arc<Vec<(String, Option<u64>)>> = Arc::new(
+        let tokens: Arc<Vec<(String, Option<u64>, String)>> = Arc::new(
             accounts::holdings_tokens(chain_id)
                 .into_iter()
-                .map(|(address, symbol, _)| (format!("{address:#x}"), held(&symbol)))
+                .map(|(address, symbol, _)| (format!("{address:#x}"), held(&symbol), symbol))
                 .collect(),
         );
         let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -11441,6 +11451,7 @@ value = "0""#,
             while let Ok((mut socket, _)) = listener.accept().await {
                 counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let tokens = tokens.clone();
+                let delay = delay.clone();
                 tokio::spawn(async move {
                     let mut bytes = Vec::new();
                     let mut chunk = [0; 4096];
@@ -11460,14 +11471,14 @@ value = "0""#,
                     let word = |value: u64| format!("0x{value:064x}");
                     let to = request["params"][0]["to"].as_str().unwrap_or_default();
                     let method = request["method"].as_str().unwrap_or_default();
+                    let token = tokens.iter().find(|(a, ..)| a.eq_ignore_ascii_case(to));
                     if method != "eth_chainId" {
-                        tokio::time::sleep(delay).await;
+                        tokio::time::sleep(delay(token.map(|(.., symbol)| symbol.as_str()))).await;
                     }
-                    let token = tokens.iter().find(|(a, _)| a.eq_ignore_ascii_case(to));
                     let result = match method {
                         "eth_chainId" => serde_json::json!(format!("{chain_id:#x}")),
                         "eth_getBalance" => serde_json::json!(format!("{native:#x}")),
-                        "eth_call" if token.is_some_and(|(_, held)| held.is_none()) => {
+                        "eth_call" if token.is_some_and(|(_, held, _)| held.is_none()) => {
                             let body = serde_json::json!({"jsonrpc":"2.0","id":request["id"],
                                 "error":{"code":3,"message":"execution reverted"}})
                             .to_string();
@@ -11475,7 +11486,9 @@ value = "0""#,
                             return;
                         }
                         "eth_call" => {
-                            serde_json::json!(word(token.and_then(|(_, held)| *held).unwrap_or(0)))
+                            serde_json::json!(word(
+                                token.and_then(|(_, held, _)| *held).unwrap_or(0)
+                            ))
                         }
                         method => panic!("unexpected holdings RPC {method}"),
                     };
@@ -11641,6 +11654,37 @@ value = "0""#,
         assert_eq!(
             v["errors"]["ethereum"],
             format!("timed out; could not read {}", unread.join(", ")),
+            "{v}"
+        );
+    }
+
+    /// A slow first token must not hide later tokens that finished in time.
+    #[tokio::test]
+    async fn a_slow_token_does_not_hide_later_completed_tokens() {
+        let f = make_handler();
+        let tokens = accounts::holdings_tokens(1);
+        let slow = tokens[0].1.clone();
+        let delay = Arc::new(move |symbol: Option<&str>| {
+            if symbol == Some(slow.as_str()) {
+                std::time::Duration::from_secs(30)
+            } else {
+                std::time::Duration::ZERO
+            }
+        });
+        let (url, _) = spawn_holdings_node_with(1, 1, |_| Some(1), delay).await;
+        f.handler.chains.add(holdings_chain("ethereum", 1, url));
+        let v = read_holdings(&f).await;
+        let symbols: Vec<&str> = v["holdings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["symbol"].as_str().unwrap())
+            .collect();
+        let rest: Vec<&str> = tokens[1..].iter().map(|(_, s, _)| s.as_str()).collect();
+        assert_eq!(symbols, [&["ETH"][..], &rest].concat(), "{v}");
+        assert_eq!(
+            v["errors"]["ethereum"],
+            format!("timed out; could not read {}", tokens[0].1),
             "{v}"
         );
     }

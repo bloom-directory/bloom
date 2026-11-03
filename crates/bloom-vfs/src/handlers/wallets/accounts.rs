@@ -602,31 +602,39 @@ impl WalletsHandler {
                 }
             }
             let tokens = holdings_tokens(spec.chain_id);
-            // Futures are lazy: `buffered` runs at most HOLDINGS_CONCURRENCY.
-            let reads: Vec<_> = tokens
-                .iter()
-                .map(|(contract, ..)| client.erc20_balance(*contract, holder))
-                .collect();
-            let mut balances = futures::stream::iter(reads).buffered(HOLDINGS_CONCURRENCY);
-            let mut done = 0;
-            while !read.timed_out {
+            // Futures are lazy: `buffer_unordered` runs at most
+            // HOLDINGS_CONCURRENCY, and yields each read as it finishes, so a
+            // slow token does not hide later ones that completed in time.
+            let client = &client;
+            // Owned (index, contract) pairs keep the futures free of borrowed
+            // closure arguments, which async-trait's Send bound rejects.
+            let contracts: Vec<_> = tokens.iter().map(|(contract, ..)| *contract).collect();
+            let reads = contracts
+                .into_iter()
+                .enumerate()
+                .map(|(index, contract)| async move {
+                    (index, client.erc20_balance(contract, holder).await)
+                });
+            let mut balances = futures::stream::iter(reads).buffer_unordered(HOLDINGS_CONCURRENCY);
+            let mut done = vec![None; tokens.len()];
+            loop {
                 let Ok(next) = tokio::time::timeout_at(deadline, balances.next()).await else {
                     read.timed_out = true;
                     break;
                 };
-                let Some(balance) = next else { break };
-                let (contract, symbol, decimals) = &tokens[done];
-                done += 1;
-                let Ok(Some(raw)) = balance else {
-                    read.unread.push(symbol.clone());
-                    continue;
-                };
-                let mut held = amount_fields(chain, "erc20", symbol, *decimals, raw);
-                held["address"] = bloom_proto::checksum_address(contract).into();
-                read.found.push(held);
+                let Some((index, balance)) = next else { break };
+                done[index] = Some(balance.ok().flatten());
             }
-            read.unread
-                .extend(tokens[done..].iter().map(|(_, symbol, _)| symbol.clone()));
+            for ((contract, symbol, decimals), balance) in tokens.iter().zip(done) {
+                match balance {
+                    Some(Some(raw)) => {
+                        let mut held = amount_fields(chain, "erc20", symbol, *decimals, raw);
+                        held["address"] = bloom_proto::checksum_address(contract).into();
+                        read.found.push(held);
+                    }
+                    _ => read.unread.push(symbol.clone()),
+                }
+            }
         }
         read.found.retain(|held| held["raw"] != "0");
         Ok(read)
