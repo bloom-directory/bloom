@@ -177,6 +177,14 @@ authenticated is ever handed to Machine. Takeover buys nothing and releases
 no card; saved-card and site payment need their separate approval for the
 exact merchant/total.
 
+Checkout's Chromium reaches the network only through an in-process proxy
+that resolves each host itself and connects to the checked address. Every
+navigation, redirect, popup, subresource and WebSocket therefore passes the
+same rule: loopback, private, link-local, carrier-grade NAT, multicast and
+other special-use addresses are refused, and a name with any refused address
+is refused whole, so DNS rebinding cannot pick one. Only test and
+`triad-dev-harness` builds also allow loopback, for fixture merchants.
+
 Every explicit open starts a new traveler-unlock context, even on the same
 origin. An approval returned for an earlier context is discarded. Private
 traveler actions recheck context and origin while holding the browsing lock.

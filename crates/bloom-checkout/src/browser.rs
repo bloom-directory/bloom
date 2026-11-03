@@ -65,6 +65,22 @@ impl Browser {
         profile: &Path,
         test_flags: &[String],
     ) -> Result<Arc<Self>> {
+        // Fixture merchants listen on loopback in tests and developer Triads.
+        Self::launch_with_egress(
+            executable,
+            profile,
+            test_flags,
+            crate::egress::policy(cfg!(any(test, feature = "triad-dev-harness"))),
+        )
+        .await
+    }
+
+    pub(crate) async fn launch_with_egress(
+        executable: &Path,
+        profile: &Path,
+        test_flags: &[String],
+        egress: crate::egress::Policy,
+    ) -> Result<Arc<Self>> {
         if profile.exists() {
             let metadata = std::fs::symlink_metadata(profile)?;
             if !metadata.is_dir()
@@ -97,7 +113,9 @@ impl Browser {
         let fixture_payment_hosts = test_flags
             .iter()
             .any(|f| f == "--ignore-certificate-errors");
-        let cdp = Cdp::launch(executable, profile, test_flags)?;
+        let mut flags = crate::egress::chromium_flags(crate::egress::start(egress).await?);
+        flags.extend_from_slice(test_flags);
+        let cdp = Cdp::launch(executable, profile, &flags)?;
         let tab = new_tab(&cdp, None, 1).await?;
         Ok(Arc::new(Self {
             cdp,
@@ -1051,6 +1069,83 @@ mod tests {
         assert_eq!(element["value"], "[saved family_name]");
         assert_eq!(element["options"][0]["label"], "[saved family_name]");
         assert_eq!(element["options"][0]["value"], "[saved family_name]");
+    }
+
+    /// Redirects, subresources and popups go through the same address check
+    /// as the first page, so a permitted page cannot reach a local service.
+    #[tokio::test]
+    async fn shopping_cannot_reach_a_refused_address_by_any_route() {
+        let local = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_url = format!("http://127.0.0.1:{}/", local.local_addr().unwrap().port());
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = hits.clone();
+        let local_server = tokio::spawn(async move {
+            axum::serve(
+                local,
+                Router::new().fallback(get(move || {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async { Html("<h1>local secret</h1>") }
+                })),
+            )
+            .await
+            .unwrap();
+        });
+        // The shop stands in for a public site: the only allowed address.
+        let shop = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let shop_address = shop.local_addr().unwrap();
+        let page = format!(
+            "<img src='{local_url}img'><script>fetch('{local_url}fetch').catch(()=>{{}});\
+             window.open('{local_url}popup')</script><a href='/redirect'>next</a>"
+        );
+        let target = local_url.clone();
+        let shop_server = tokio::spawn(async move {
+            axum::serve(
+                shop,
+                Router::new()
+                    .route("/", get(move || async move { Html(page) }))
+                    .route(
+                        "/redirect",
+                        get(move || async move { axum::response::Redirect::temporary(&target) }),
+                    ),
+            )
+            .await
+            .unwrap();
+        });
+        let root = tempfile::tempdir().unwrap();
+        let browser = Browser::launch_with_egress(
+            &crate::test_chromium(),
+            &root.path().join("profile"),
+            &["--no-sandbox".into()],
+            Arc::new(move |address| address == shop_address),
+        )
+        .await
+        .unwrap();
+        let shop_url = format!("http://{shop_address}/");
+        for url in [
+            local_url.clone(),
+            local_url.replace("127.0.0.1", "localhost"),
+            shop_url.clone(),
+            format!("{shop_url}redirect"),
+        ] {
+            browser
+                .browse(BrowseRequest::Open { url: url.clone() })
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            let text = browser
+                .browse(BrowseRequest::Snapshot)
+                .await
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            assert!(!text.contains("local secret"), "{url}: {text}");
+            if url == shop_url {
+                // The allowed shop itself loads, so the refusals are the policy's.
+                assert!(text.contains("next"), "{text}");
+            }
+        }
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        local_server.abort();
+        shop_server.abort();
     }
 
     #[tokio::test]
