@@ -473,6 +473,7 @@ class DisposableTriad:
             same_device = "-x" if sys.platform == "darwin" else "--one-file-system"
             result = subprocess.run(
                 ["rm", "-r", same_device, "--", str(self.root)],
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 timeout=45,
                 check=False,
