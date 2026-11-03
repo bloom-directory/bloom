@@ -359,11 +359,16 @@ fn refresh_developer_provenance_catalog(
             for class in &mut record.operation_classes {
                 let derived = catalogued_fee_asset(class.operation_class.as_str())?;
                 if derived != class.fee_asset {
+                    // The whole value, not just the asset: the guard above
+                    // compares chain and asset, so printing the asset alone
+                    // reports a chain-only change as "usdc to usdc" — and the
+                    // chain is what Broker matches against the Petal's
+                    // DeclaredFee before answering FEE_ASSET_MISMATCH.
                     eprintln!(
                         "note: re-derived fee asset for {} from {:?} to {:?}",
                         class.operation_class.as_str(),
-                        class.fee_asset.as_ref().map(|fee| fee.asset.as_str()),
-                        derived.as_ref().map(|fee| fee.asset.as_str()),
+                        class.fee_asset,
+                        derived,
                     );
                 }
                 class.fee_asset = derived;
@@ -645,6 +650,15 @@ const POLYMARKET_BUILDER_CODE_ORDER_CLASS: &str = "polymarket.builder_code_order
 /// Those tables are on Broker's master, not the revision pinned in
 /// `Cargo.toml`, which has neither them nor the review they gate — so against
 /// the pin the class is unreviewed for the simpler reason that nothing is.
+///
+/// Registering a fee-bearing class there is NOT the remedy. Polymarket's
+/// `validate_petal_profile` rejects any claim in a reviewed class that
+/// declares a fee, so listing the builder-code class would deny every claim it
+/// exists to permit; and `message_review_requires_exact` makes Broker refuse a
+/// reusable Petal approval whose scope contains a reviewed class, so listing
+/// the Hyperliquid one would make a builder-bound session scope unpreparable
+/// and take plain session signing with it. See "Operation-class granularity
+/// and `fee_asset`" in `docs/architecture/Sealed Approvals.md`.
 const FEE_BEARING_OPERATION_CLASSES: &[CataloguedFeeAsset] = &[
     CataloguedFeeAsset {
         operation_class: HYPERLIQUID_BUILDER_ORDER_CLASS,

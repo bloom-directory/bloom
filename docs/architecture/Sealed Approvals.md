@@ -157,23 +157,34 @@ makes the new class uniformly fee-bearing, and then the class on that Petal's
 `validate_release_authority` rejects the release for declaring a class the pin
 does not list.
 
-That makes the claim authorizable, not reviewed. Broker reviews a class only if
-it is registered in `MESSAGE_REVIEW_OPERATION_CLASSES` or
+That table governs Petal provenance only; System records come from the shipped
+catalog template and carry their own fee assets, as `solana.native-transfer`
+does. A row is inert until a Petal emits that exact class, and the catalogued
+chain and asset must match the Petal's `DeclaredFee::Fee` exactly or Broker
+answers `FEE_ASSET_MISMATCH`.
+
+Cataloguing makes the claim authorizable, not reviewed. Broker reviews a class
+only if it is registered in `MESSAGE_REVIEW_OPERATION_CLASSES` or
 `POLYMARKET_REVIEW_OPERATION_CLASSES`, and neither fee-bearing class is, so a
 builder order is not required to carry the decoded order review its fee-free
 sibling must. A session-signed one is further outside Broker's delegated-action
 witness, which matches `hyperliquid.agent_action` with no declared fee — and
 cannot be authorized at all today, because the reusable key-scope approval
-carries empty `value_limits` and a declared fee is the first value to reach
-it. Those review tables live on Broker's master; the revision this repository
-pins has neither them nor the review they gate, so the class is unreviewed
-there a fortiori.
+carries empty `value_limits` and a declared fee is the first value to reach it.
+Those tables live on Broker's master; the revision pinned here has neither them
+nor the review they gate.
 
-That table governs Petal provenance only; System records come
-from the shipped catalog template and carry their own fee assets, as
-`solana.native-transfer` does. The row is inert until a Petal
-emits that exact class, and the catalogued chain and asset must match the
-Petal's `DeclaredFee::Fee` exactly or Broker answers `FEE_ASSET_MISMATCH`.
+**Registering a fee-bearing class in those tables is not the remedy, and for
+Polymarket it is the opposite of one.** `validate_petal_profile` rejects any
+claim in a `POLYMARKET_REVIEW_OPERATION_CLASSES` class that declares debits,
+destinations or a fee, so listing the builder-code class would deny every claim
+it exists to permit. On the Hyperliquid side `message_review_requires_exact`
+makes prepare refuse a reusable Petal approval whose scope contains such a
+class, and a builder-bound session scope requests the builder class alongside
+`hyperliquid.agent_action` — so listing it would make that scope unpreparable
+and take plain session signing down with it. What the session path needs is a
+widening of the delegated-action witness to accept the builder class with a
+declared fee, and value limits on the key-scope approval, in that order.
 
 ## Ceremony and public projection
 
