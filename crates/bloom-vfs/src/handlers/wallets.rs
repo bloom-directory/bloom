@@ -11742,7 +11742,7 @@ value = "0""#,
     async fn holdings_read_tokens_in_one_multicall_request() {
         let f = make_handler();
         let tokens = accounts::holdings_tokens(1);
-        let failed = tokens[0].1.clone();
+        assert!(tokens.iter().any(|(_, s, _)| s == "USDC"), "{tokens:?}");
         let (url, served) = spawn_holdings_node_with(
             1,
             1,
@@ -11751,7 +11751,6 @@ value = "0""#,
             true,
         )
         .await;
-        assert_eq!(failed, "USDC", "first holdings token changed");
         f.handler.chains.add(holdings_chain("ethereum", 1, url));
         let before = served.load(std::sync::atomic::Ordering::SeqCst);
         let v = read_holdings(&f).await;
@@ -11761,7 +11760,11 @@ value = "0""#,
             .iter()
             .map(|h| h["symbol"].as_str().unwrap())
             .collect();
-        let rest: Vec<&str> = tokens[1..].iter().map(|(_, s, _)| s.as_str()).collect();
+        let rest: Vec<&str> = tokens
+            .iter()
+            .map(|(_, s, _)| s.as_str())
+            .filter(|s| *s != "USDC")
+            .collect();
         assert_eq!(symbols, [&["ETH"][..], &rest].concat(), "{v}");
         assert_eq!(v["errors"]["ethereum"], "could not read USDC", "{v}");
         // eth_chainId, eth_getBalance and one aggregate3.
