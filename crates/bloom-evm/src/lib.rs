@@ -1593,7 +1593,7 @@ mod mock_rpc_tests {
         // No eth_getBalance response: the read must not reach the RPC.
         let url = spawn_mock(responses()).await;
         let mut spec = ChainSpec::anvil_default();
-        spec.chain_id = bloom_proto::chain::TEMPO_MAINNET_CHAIN_ID;
+        spec.chain_id = bloom_proto::chain::TEMPO_MODERATO_CHAIN_ID;
         spec.rpc_urls = vec![url];
         let c = ChainClient::new(spec).unwrap();
         let addr = address!("0x1111111111111111111111111111111111111111");
