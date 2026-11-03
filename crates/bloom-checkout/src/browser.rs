@@ -275,26 +275,47 @@ impl Browser {
                 secret.to_uppercase(),
                 secret.to_lowercase(),
             ];
+            // A page can echo "A\u{200b}lice": invisible characters between
+            // letters must not hide a saved value.
             let alternatives = variants
                 .iter()
-                .map(|s| regex::escape(s))
+                .map(|s| {
+                    s.chars()
+                        .map(|c| regex::escape(c.encode_utf8(&mut [0; 4])))
+                        .collect::<Vec<_>>()
+                        .join(&format!("{INVISIBLE}*"))
+                })
                 .collect::<Vec<_>>()
                 .join("|");
             // Short ASCII names and year fragments are whole tokens, so Li
             // does not hide "airline" and 90 does not hide part of 1990.
-            let pattern = if secret.is_ascii() && secret.chars().count() < 3 {
-                format!(r"\b(?:{alternatives})\b")
-            } else {
-                format!("(?:{alternatives})")
+            let short = secret.is_ascii() && secret.chars().count() < 3;
+            let bounded = |alternatives: &str| {
+                if short {
+                    format!(r"\b(?:{alternatives})\b")
+                } else {
+                    format!("(?:{alternatives})")
+                }
             };
-            let pattern = regex::RegexBuilder::new(&pattern)
+            let pattern = regex::RegexBuilder::new(&bounded(&alternatives))
+                .case_insensitive(true)
+                .build()?;
+            // Anything still matching after compatibility normalization
+            // (full-width letters, ligatures) cannot be cut out precisely, so
+            // the whole string is withheld.
+            let residual = regex::RegexBuilder::new(&bounded(&regex::escape(&fold(secret))))
                 .case_insensitive(true)
                 .build()?;
             let replace = |value: &mut Value| {
                 if let Value::String(text) = value {
-                    *text = pattern
+                    let masked = pattern
                         .replace_all(text, regex::NoExpand(label))
                         .into_owned();
+                    *text = if residual.is_match(&fold(&LABEL.replace_all(&masked, " "))) {
+                        label.clone()
+                    } else {
+                        masked
+                    };
                 }
             };
             for key in ["url", "text"] {
@@ -870,6 +891,22 @@ async fn attach_tab(cdp: &Cdp, context: String, target: String, generation: u64)
     })
 }
 
+/// Characters a page can place inside a value without changing what a reader
+/// sees: soft hyphen, zero-width spaces and joiners, word joiner, BOM.
+const INVISIBLE: &str = r"[\p{Default_Ignorable_Code_Point}\p{Cf}]";
+static INVISIBLES: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(INVISIBLE).unwrap());
+static LABEL: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"\[saved [a-z_]+\]").unwrap());
+
+/// What a reader sees: compatibility forms folded, invisible characters gone.
+fn fold(text: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    INVISIBLES
+        .replace_all(&text.nfkc().collect::<String>(), "")
+        .to_lowercase()
+}
+
 fn shopping_url(url: &str) -> Result<url::Url> {
     let parsed = url::Url::parse(url).context("Invalid browsing URL")?;
     if !matches!(parsed.scheme(), "http" | "https")
@@ -1014,6 +1051,45 @@ mod tests {
         assert_eq!(element["value"], "[saved family_name]");
         assert_eq!(element["options"][0]["label"], "[saved family_name]");
         assert_eq!(element["options"][0]["value"], "[saved family_name]");
+    }
+
+    #[tokio::test]
+    async fn invisible_or_compatibility_characters_do_not_reveal_saved_values() {
+        let root = tempfile::tempdir().unwrap();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.path().join("profile"),
+            &["--no-sandbox".into()],
+        )
+        .await
+        .unwrap();
+        browser.redact([
+            ("Alice".into(), "[saved given_name]".into()),
+            ("ada@example.com".into(), "[saved email]".into()),
+        ]);
+        let snapshot = browser
+            .redacted(json!({
+                "url":"https://shop.example/?n=A\u{200b}lice",
+                "text":"Hello A\u{200b}l\u{00ad}ice, receipt to ada@exa\u{2060}mple.com",
+                "elements":[{
+                    "ref":"1:1", "role":"input", "type":"text",
+                    "label":"\u{ff21}\u{ff4c}\u{ff49}\u{ff43}\u{ff45}", "context":"For ALI\u{feff}CE",
+                    "value":"a\u{200d}lice", "options":[{"value":"x","label":"A\u{200c}lice"}]
+                }]
+            }))
+            .unwrap();
+        assert_eq!(
+            snapshot["text"],
+            "Hello [saved given_name], receipt to [saved email]"
+        );
+        assert_eq!(snapshot["url"], "https://shop.example/?n=[saved given_name]");
+        let element = &snapshot["elements"][0];
+        assert_eq!(element["label"], "[saved given_name]");
+        assert_eq!(element["context"], "For [saved given_name]");
+        assert_eq!(element["value"], "[saved given_name]");
+        assert_eq!(element["options"][0]["label"], "[saved given_name]");
+        let seen = fold(&snapshot.to_string());
+        assert!(!seen.contains("alice") && !seen.contains("ada@example"), "{seen}");
     }
 
     #[tokio::test]

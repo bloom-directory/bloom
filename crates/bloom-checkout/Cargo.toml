@@ -28,6 +28,7 @@ bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git"
 hpke = { version = "0.14", default-features = false, features = ["alloc", "getrandom", "x25519", "chacha"] }
 rusqlite.workspace = true
 phonenumber = "0.3"
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["process"] }
