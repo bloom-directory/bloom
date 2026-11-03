@@ -61,17 +61,16 @@ const HOLDINGS_CONCURRENCY: usize = 4;
 /// The catalog rows on `chain_id` whose symbol is in `HOLDINGS_SYMBOLS`.
 pub(super) fn holdings_tokens(chain_id: u64) -> Vec<(alloy::primitives::Address, String, u8)> {
     crate::handlers::well_known_tokens::for_chain(chain_id)
-        .into_iter()
+        .iter()
         .filter(|token| {
             HOLDINGS_SYMBOLS
                 .iter()
                 .any(|symbol| token.symbol.eq_ignore_ascii_case(symbol))
         })
         .filter_map(|token| {
-            let symbol: &str = &token.symbol;
             Some((
                 token.address.parse().ok()?,
-                symbol.to_string(),
+                token.symbol.to_string(),
                 token.decimals,
             ))
         })

@@ -11429,12 +11429,14 @@ value = "0""#,
         spawn_holdings_node_with(chain_id, native, held, Arc::new(move |_| delay)).await
     }
 
+    type HoldingsDelay = dyn Fn(Option<&str>) -> std::time::Duration + Send + Sync;
+
     /// `delay` gets the token symbol a call reads, or `None` for other calls.
     async fn spawn_holdings_node_with(
         chain_id: u64,
         native: u64,
         held: fn(&str) -> Option<u64>,
-        delay: Arc<dyn Fn(Option<&str>) -> std::time::Duration + Send + Sync>,
+        delay: Arc<HoldingsDelay>,
     ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let tokens: Arc<Vec<(String, Option<u64>, String)>> = Arc::new(
