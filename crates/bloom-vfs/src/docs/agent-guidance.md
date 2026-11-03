@@ -28,15 +28,15 @@ Solana chains it shows SOL only, not SPL tokens.
 
 ## When the request leaves something out
 
-Use live state to identify the wallet and account. Ask which chain to use
-when the user has not named one:
+Infer what Bloom state settles, and ask only for what it cannot:
 
 - If there is only one wallet or account, use it.
-- Use `holdings.json` and the Petal's documentation to explain the available
-  choices, not to select a chain or default to mainnet. Holdings can be
-  incomplete when a read fails or a token is outside the curated list.
-- If the wallet, account or network is ambiguous, ask one question that names
-  the remaining choices before staging work.
+- A read that names no chain covers every chain: read `holdings.json`.
+- For a write, use the only chain where `holdings.json` shows the asset, or
+  the network the Petal's documentation names as its default. If two or more
+  funded chains remain, ask one question that names them.
+- If `holdings.json` lists an `errors` entry for a chain that could hold the
+  asset, say so rather than treating that chain as empty.
 
 Report a failed or partially completed action as a failure, never as done.
 
