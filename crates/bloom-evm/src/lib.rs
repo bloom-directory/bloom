@@ -742,8 +742,10 @@ impl ChainClient {
             // An error reply that is not a revert (often a rate limit) and a
             // failed transport both mean: do not send more requests.
             Err(alloy::contract::Error::TransportError(e))
-                if e.as_error_resp()
-                    .is_none_or(|resp| !resp.message.contains("revert")) =>
+                if e.as_error_resp().is_none_or(|resp| {
+                    !resp.message.to_ascii_lowercase().contains("revert")
+                        && resp.as_revert_data().is_none()
+                }) =>
             {
                 return Err(e.into());
             }
@@ -1867,6 +1869,27 @@ mod mock_rpc_tests {
             "eth_call".into(),
             vec![
                 MockResponse::Err(3, "execution reverted".into(), None),
+                MockResponse::Ok(enc_uint256(U256::from(7u64))),
+            ],
+        );
+        r.insert("eth_getBalance".into(), vec![MockResponse::Ok(qty(5))]);
+        let c = client_at(&spawn_mock(r).await);
+        let token = address!("0x6666666666666666666666666666666666666666");
+        let holder = address!("0x7777777777777777777777777777777777777777");
+        let (native, tokens) = c.native_and_token_balances(holder, &[token]).await.unwrap();
+        assert_eq!(
+            (native, tokens),
+            (U256::from(5u64), vec![Some(U256::from(7u64))])
+        );
+    }
+
+    #[tokio::test]
+    async fn token_balances_fall_back_when_multicall_reverts_capitalized() {
+        let mut r = responses();
+        r.insert(
+            "eth_call".into(),
+            vec![
+                MockResponse::Err(3, "Execution Reverted".into(), None),
                 MockResponse::Ok(enc_uint256(U256::from(7u64))),
             ],
         );
