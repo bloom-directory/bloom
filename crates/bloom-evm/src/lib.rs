@@ -109,6 +109,10 @@ pub enum ChainError {
     Url(String),
     #[error("rpc: {0}")]
     Rpc(String),
+    /// The chain has no native token (Tempo), so there is no native balance
+    /// or native value to read or send. Deterministic, never retryable.
+    #[error("chain '{0}' has no native token; its fees are paid in tokens")]
+    NoNativeAsset(String),
 }
 
 impl From<TransportError> for ChainError {
@@ -123,16 +127,13 @@ impl From<bloom_rpc::BloomRpcError> for ChainError {
     }
 }
 
-/// Translate a `bloom_rpc::BloomRpcError` into the historical `ChainError`
-/// surface so existing matchers in the workspace keep working.
-/// The read refused on a chain whose `eth_getBalance` is not a balance.
+/// The refusal for a chain whose `eth_getBalance` is not a balance.
 pub fn no_native_asset(spec: &ChainSpec) -> ChainError {
-    ChainError::NotFound(format!(
-        "chain '{}' has no native token balance; its fees are paid in tokens",
-        spec.name
-    ))
+    ChainError::NoNativeAsset(spec.name.clone())
 }
 
+/// Translate a `bloom_rpc::BloomRpcError` into the historical `ChainError`
+/// surface so existing matchers in the workspace keep working.
 fn map_rpc_error(e: bloom_rpc::BloomRpcError) -> ChainError {
     use bloom_rpc::BloomRpcError;
     match e {
@@ -1515,7 +1516,7 @@ mod mock_rpc_tests {
         let c = ChainClient::new(spec).unwrap();
         let addr = address!("0x1111111111111111111111111111111111111111");
         let error = c.balance(addr).await.unwrap_err();
-        assert!(matches!(error, ChainError::NotFound(_)), "{error}");
+        assert!(matches!(error, ChainError::NoNativeAsset(_)), "{error}");
     }
 
     #[tokio::test]

@@ -1520,6 +1520,15 @@ impl TxEngine {
         ) = self
             .resolve_intent_body(&intent.body, chain, chain_id, address_book, from)
             .await?;
+        // Every send, call, raw, and deploy intent passes here. On a chain
+        // without a native token, a nonzero value names an asset that does
+        // not exist (Tempo's config still carries a display symbol).
+        if !spec.has_native_asset() && !value_wei.is_zero() {
+            return Err(TxEngineError::Amount(format!(
+                "{} has no native token; send a token with token and amount, and set no value",
+                spec.name
+            )));
+        }
 
         // Build a request to estimate gas; choose 1559 vs legacy fields.
         let data_bytes = decode_data(&data_hex)?;
@@ -6037,7 +6046,7 @@ mod tests {
         }
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Default)]
     struct RecordingOracle {
         calls: Arc<parking_lot::Mutex<Vec<(String, String)>>>,
         usd_micro: i128,
@@ -7133,6 +7142,46 @@ mod tests {
             calls.lock().as_slice(),
             &[("native:anvil".into(), "1000000000000000000".into())]
         );
+    }
+
+    #[tokio::test]
+    async fn stage_refuses_native_value_on_a_chain_without_a_native_token() {
+        let to = "0x2222222222222222222222222222222222222222";
+        for intent in [
+            native_intent("1 eth", None),
+            RawIntent {
+                body: crate::intent_parser::parse(&format!(
+                    r#"{{"kind":"send","to":"{to}","token":"ETH","amount":"1"}}"#
+                ))
+                .unwrap()
+                .body,
+                ..native_intent("0", None)
+            },
+        ] {
+            let url = spawn_stage_rpc(true).await;
+            let (engine, _dir, permit, chain) = stage_fixture(&url, RecordingOracle::default());
+            let mut spec = chain.spec().clone();
+            spec.chain_id = bloom_proto::chain::TEMPO_MAINNET_CHAIN_ID;
+            let tempo = ChainClient::new(spec).unwrap();
+            let error = engine
+                .stage(
+                    &permit,
+                    "alice",
+                    "0x1111111111111111111111111111111111111111"
+                        .parse()
+                        .unwrap(),
+                    intent,
+                    &tempo,
+                    &Policy::default(),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, TxEngineError::Amount(m) if m.contains("no native token")),
+                "{error}"
+            );
+        }
     }
 
     /// A payable constructor moves native value, and the valuation selector

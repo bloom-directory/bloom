@@ -15,17 +15,32 @@ use std::time::Duration;
 /// to cache briefly during agent bursts and mounted filesystem probes.
 pub(crate) const LIVE_BALANCE_TTL: Duration = Duration::from_secs(5);
 
-/// Refuse a native balance read on a chain without a native token (Tempo),
-/// whose RPC answers with a placeholder rather than a balance.
+/// The three native-balance leaves of an EVM address or account chain.
+pub(crate) const NATIVE_BALANCE_LEAVES: [&str; 3] = ["balance", "balance.raw", "balance.json"];
+
+/// Refuse a native balance leaf on a chain without a native token (Tempo),
+/// whose RPC answers with a placeholder rather than a balance. Other leaves
+/// pass through to normal path handling.
 pub(crate) fn require_native_asset(
     spec: &bloom_proto::ChainSpec,
+    leaf: &str,
 ) -> Result<(), crate::handler::HandlerError> {
-    if spec.has_native_asset() {
+    if spec.has_native_asset() || !NATIVE_BALANCE_LEAVES.contains(&leaf) {
         return Ok(());
     }
-    Err(crate::handler::HandlerError::not_found(
+    Err(crate::handler::HandlerError::Unsupported(
         bloom_evm::no_native_asset(spec).to_string(),
     ))
+}
+
+/// The native-balance leaves a listing shows: none on a chain without a
+/// native token.
+pub(crate) fn native_balance_leaves(spec: &bloom_proto::ChainSpec) -> &'static [&'static str] {
+    if spec.has_native_asset() {
+        &NATIVE_BALANCE_LEAVES
+    } else {
+        &[]
+    }
 }
 
 /// ERC-20 metadata is effectively static for normal tokens. Keep this separate

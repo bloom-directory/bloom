@@ -850,6 +850,7 @@ impl ChainsHandler {
                 3 => Ok(Entry::dir(&segs[2])),
                 4 => {
                     let f = segs[3].as_str();
+                    super::balances::require_native_asset(client.spec(), f)?;
                     if ADDRESS_FILES_CORE.contains(&f) {
                         Ok(Entry::file(f))
                     } else if ADDRESS_FILES_ETHERSCAN.contains(&f) {
@@ -984,9 +985,7 @@ impl ChainsHandler {
             "addresses" if segs.len() == 4 => {
                 let addr = parse_addr(&segs[2])?;
                 let spec = client.spec();
-                if segs[3].starts_with("balance") {
-                    super::balances::require_native_asset(spec)?;
-                }
+                super::balances::require_native_asset(spec, &segs[3])?;
                 match segs[3].as_str() {
                     "balance" => {
                         let bal = client.balance(addr).await.map_err(err_be)?;
@@ -1356,9 +1355,7 @@ impl ChainsHandler {
             "addresses" if segs.len() == 4 => {
                 let addr = parse_addr(&segs[2])?;
                 let spec = client.spec().clone();
-                if segs[3].starts_with("balance") {
-                    super::balances::require_native_asset(&spec)?;
-                }
+                super::balances::require_native_asset(&spec, &segs[3])?;
                 let session = client.open_session_at(block_number).await.map_err(err_be)?;
                 match segs[3].as_str() {
                     "balance" => {
@@ -1473,8 +1470,12 @@ impl ChainsHandler {
             2 if segs[1] == "gas" => Ok(vec![Entry::file("current.json")]),
             3 if segs[1] == "addresses" => {
                 // /chains/<chain>/addresses/<addr>
-                let mut entries: Vec<Entry> =
-                    ADDRESS_FILES_CORE.iter().map(|n| Entry::file(n)).collect();
+                let no_native = super::balances::native_balance_leaves(client.spec()).is_empty();
+                let mut entries: Vec<Entry> = ADDRESS_FILES_CORE
+                    .iter()
+                    .filter(|n| !(no_native && super::balances::NATIVE_BALANCE_LEAVES.contains(n)))
+                    .map(|n| Entry::file(n))
+                    .collect();
                 entries.push(Entry::dir("tokens"));
                 entries.push(Entry::dir("nfts"));
                 if self.address_history_ready() {
@@ -3615,12 +3616,32 @@ mod tests {
         for leaf in ["balance", "balance.raw", "balance.json"] {
             let path = VfsPath::parse(&format!("/test/addresses/{HOLDER_ADDR}/{leaf}")).unwrap();
             match h.read(&path).await {
-                Err(HandlerError::NotFound(message)) => {
+                Err(HandlerError::Unsupported(message)) => {
                     assert!(message.contains("no native token"), "{message}")
                 }
-                other => panic!("{leaf}: expected NotFound, got {other:?}"),
+                other => panic!("{leaf}: expected Unsupported, got {other:?}"),
             }
+            assert!(matches!(
+                h.lookup(&path).await,
+                Err(HandlerError::Unsupported(_))
+            ));
         }
+        // A typo is an ordinary missing path, not the native refusal.
+        let typo = VfsPath::parse(&format!("/test/addresses/{HOLDER_ADDR}/balance.bad")).unwrap();
+        assert!(matches!(
+            h.lookup(&typo).await,
+            Err(HandlerError::NotFound(_))
+        ));
+        let dir = VfsPath::parse(&format!("/test/addresses/{HOLDER_ADDR}")).unwrap();
+        let names: Vec<_> = h
+            .list(&dir)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.iter().any(|n| n == "nonce"), "{names:?}");
+        assert!(!names.iter().any(|n| n.starts_with("balance")), "{names:?}");
     }
 
     // ---- methods/ enumeration + EIP-1967 proxy resolution ----------------
