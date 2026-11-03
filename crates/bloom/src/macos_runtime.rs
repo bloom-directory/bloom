@@ -7,15 +7,28 @@ use std::{
     path::Path,
 };
 
-pub fn prepare(
-    root: &Path,
-    login_uid: u32,
-    broker_uid: u32,
-    signer_uid: u32,
-    machine_broker_gid: u32,
-    broker_signer_gid: u32,
-    revoke_gid: u32,
-) -> io::Result<()> {
+/// Principal IDs from the root-owned enrollment, including Signer's private
+/// group rather than an authority-edge group for its administrative socket.
+pub struct Principals {
+    pub login_uid: u32,
+    pub broker_uid: u32,
+    pub signer_uid: u32,
+    pub signer_gid: u32,
+    pub machine_broker_gid: u32,
+    pub broker_signer_gid: u32,
+    pub revoke_gid: u32,
+}
+
+pub fn prepare(root: &Path, principals: Principals) -> io::Result<()> {
+    let Principals {
+        login_uid,
+        broker_uid,
+        signer_uid,
+        signer_gid,
+        machine_broker_gid,
+        broker_signer_gid,
+        revoke_gid,
+    } = principals;
     // The installer leaves this parent root-owned with the inherited daemon
     // group. Its group is immaterial provided nobody else can replace entries.
     match fs::symlink_metadata(root) {
@@ -35,6 +48,7 @@ pub fn prepare(
         ("revoke", 0, 0, 0o711),
         ("machine-broker", broker_uid, machine_broker_gid, 0o710),
         ("broker-signer", signer_uid, broker_signer_gid, 0o710),
+        ("signer-admin", signer_uid, signer_gid, 0o700),
         ("revoke/broker", broker_uid, revoke_gid, 0o710),
         ("revoke/signer", signer_uid, revoke_gid, 0o710),
         ("session", login_uid, revoke_gid, 0o710),
@@ -103,6 +117,83 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    fn test_principals() -> Principals {
+        Principals {
+            login_uid: 250500,
+            broker_uid: 250501,
+            signer_uid: 250502,
+            signer_gid: 260500,
+            machine_broker_gid: 260501,
+            broker_signer_gid: 260502,
+            revoke_gid: 260503,
+        }
+    }
+
+    // Run explicitly as root in a disposable scratch directory. These exercise
+    // the same ownership checks used after /var/run is cleared by macOS.
+    #[test]
+    #[ignore = "requires root to create directories for isolated service principals"]
+    fn reboot_recreates_private_signer_admin_and_preserves_existing_contents() {
+        let fixture = Fixture::new();
+        let root = fixture.0.join("run");
+        prepare(&root, test_principals()).unwrap();
+        let admin = root.join("250500/signer-admin");
+        let metadata = fs::symlink_metadata(&admin).unwrap();
+        assert_eq!(metadata.uid(), 250502);
+        assert_eq!(metadata.gid(), 260500);
+        assert_eq!(metadata.mode() & 0o7777, 0o700);
+        fs::write(admin.join("sentinel"), b"preserve").unwrap();
+        prepare(&root, test_principals()).unwrap();
+        assert_eq!(fs::read(admin.join("sentinel")).unwrap(), b"preserve");
+        fs::remove_file(admin.join("sentinel")).unwrap();
+        fs::remove_dir(&admin).unwrap();
+        prepare(&root, test_principals()).unwrap();
+        let metadata = fs::symlink_metadata(&admin).unwrap();
+        assert_eq!((metadata.uid(), metadata.gid()), (250502, 260500));
+        assert_eq!(metadata.mode() & 0o7777, 0o700);
+    }
+
+    #[test]
+    #[ignore = "requires root to create directories for isolated service principals"]
+    fn signer_admin_rejects_substitution_and_incorrect_security_metadata() {
+        for case in ["symlink", "file", "owner", "group", "mode"] {
+            let fixture = Fixture::new();
+            let root = fixture.0.join("run");
+            prepare(&root, test_principals()).unwrap();
+            let admin = root.join("250500/signer-admin");
+            let substitute = fixture.0.join("substitute");
+            fs::create_dir(&substitute).unwrap();
+            fs::write(substitute.join("sentinel"), b"preserve").unwrap();
+            match case {
+                "symlink" => {
+                    fs::remove_dir(&admin).unwrap();
+                    symlink(&substitute, &admin).unwrap();
+                }
+                "file" => {
+                    fs::remove_dir(&admin).unwrap();
+                    fs::write(&admin, b"preserve").unwrap();
+                }
+                "owner" => chown(&admin, Some(250501), None).unwrap(),
+                "group" => chown(&admin, None, Some(260502)).unwrap(),
+                "mode" => fs::set_permissions(&admin, fs::Permissions::from_mode(0o710)).unwrap(),
+                _ => unreachable!(),
+            }
+            let before = fs::symlink_metadata(&admin).unwrap();
+            assert_eq!(
+                prepare(&root, test_principals()).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied,
+                "{case}"
+            );
+            let after = fs::symlink_metadata(&admin).unwrap();
+            assert_eq!(
+                (before.ino(), before.uid(), before.gid(), before.mode()),
+                (after.ino(), after.uid(), after.gid(), after.mode()),
+                "must not repair an unsafe {case}"
+            );
+            assert_eq!(fs::read(substitute.join("sentinel")).unwrap(), b"preserve");
         }
     }
 
