@@ -60,21 +60,18 @@ const HOLDINGS_CONCURRENCY: usize = 4;
 
 /// The catalog rows on `chain_id` whose symbol is in `HOLDINGS_SYMBOLS`.
 pub(super) fn holdings_tokens(chain_id: u64) -> Vec<(alloy::primitives::Address, String, u8)> {
-    crate::handlers::well_known_tokens::for_chain(chain_id)
-        .iter()
-        .filter(|token| {
-            HOLDINGS_SYMBOLS
-                .iter()
-                .any(|symbol| token.symbol.eq_ignore_ascii_case(symbol))
-        })
-        .filter_map(|token| {
-            Some((
-                token.address.parse().ok()?,
-                token.symbol.to_string(),
-                token.decimals,
-            ))
-        })
-        .collect()
+    // A loop, not slice methods: the catalog may be a slice or an iterator.
+    let mut rows = Vec::new();
+    for token in crate::handlers::well_known_tokens::for_chain(chain_id) {
+        if HOLDINGS_SYMBOLS
+            .iter()
+            .any(|symbol| token.symbol.eq_ignore_ascii_case(symbol))
+            && let Ok(address) = token.address.parse()
+        {
+            rows.push((address, token.symbol.to_string(), token.decimals));
+        }
+    }
+    rows
 }
 
 /// One chain's part of `holdings.json`.
