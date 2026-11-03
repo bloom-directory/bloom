@@ -641,6 +641,10 @@ const POLYMARKET_BUILDER_CODE_ORDER_CLASS: &str = "polymarket.builder_code_order
 /// matches `hyperliquid.agent_action` with no declared fee. Cataloguing a fee
 /// asset makes the claim authorizable; it does not make the operation
 /// reviewed.
+///
+/// Those tables are on Broker's master, not the revision pinned in
+/// `Cargo.toml`, which has neither them nor the review they gate — so against
+/// the pin the class is unreviewed for the simpler reason that nothing is.
 const FEE_BEARING_OPERATION_CLASSES: &[CataloguedFeeAsset] = &[
     CataloguedFeeAsset {
         operation_class: HYPERLIQUID_BUILDER_ORDER_CLASS,

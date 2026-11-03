@@ -164,7 +164,12 @@ builder order is not required to carry the decoded order review its fee-free
 sibling must. A session-signed one is further outside Broker's delegated-action
 witness, which matches `hyperliquid.agent_action` with no declared fee — and
 cannot be authorized at all today, because the reusable key-scope approval
-carries empty `value_limits` and a declared fee is the first value to reach it. That table governs Petal provenance only; System records come
+carries empty `value_limits` and a declared fee is the first value to reach
+it. Those review tables live on Broker's master; the revision this repository
+pins has neither them nor the review they gate, so the class is unreviewed
+there a fortiori.
+
+That table governs Petal provenance only; System records come
 from the shipped catalog template and carry their own fee assets, as
 `solana.native-transfer` does. The row is inert until a Petal
 emits that exact class, and the catalogued chain and asset must match the
