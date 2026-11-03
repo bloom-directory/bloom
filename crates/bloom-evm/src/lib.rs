@@ -90,7 +90,6 @@ sol! {
         struct Call3 { address target; bool allowFailure; bytes callData; }
         struct Call3Result { bool success; bytes returnData; }
         function aggregate3(Call3[] calldata calls) external payable returns (Call3Result[] memory returnData);
-        function getEthBalance(address addr) external view returns (uint256 balance);
     }
 }
 
@@ -145,6 +144,25 @@ impl From<bloom_rpc::BloomRpcError> for ChainError {
 /// The refusal for a chain whose `eth_getBalance` is not a balance.
 pub fn no_native_asset(spec: &ChainSpec) -> ChainError {
     ChainError::NoNativeAsset(spec.name.clone())
+}
+
+/// Whether a contract call failed at the node (transport, rate limit, or
+/// another error reply) rather than in the contract (a revert, or return data
+/// that does not decode). A node failure means: send no more requests.
+fn is_node_failure(error: &alloy::contract::Error) -> bool {
+    match error {
+        alloy::contract::Error::TransportError(e) => e.as_error_resp().is_none_or(|resp| {
+            !resp.message.to_ascii_lowercase().contains("revert") && resp.as_revert_data().is_none()
+        }),
+        _ => false,
+    }
+}
+
+fn node_failure(error: alloy::contract::Error) -> ChainError {
+    match error {
+        alloy::contract::Error::TransportError(e) => e.into(),
+        other => ChainError::Rpc(other.to_string()),
+    }
 }
 
 /// Translate a `bloom_rpc::BloomRpcError` into the historical `ChainError`
@@ -689,6 +707,7 @@ impl ChainClient {
         let contract = IERC20::new(token, self.primary.clone());
         match contract.balanceOf(holder).call().await {
             Ok(b) => Ok(Some(b)),
+            Err(e) if is_node_failure(&e) => Err(node_failure(e)),
             Err(e) => {
                 debug!(error = %e, "erc20_balance.call_failed");
                 Ok(None)
@@ -696,88 +715,52 @@ impl ChainClient {
         }
     }
 
-    /// `holder`'s native balance and its `balanceOf` for each token; a token
-    /// whose read fails is `None`. Uses one Multicall3 `eth_call` where the
-    /// contract exists, so a rate-limited free RPC sees one request instead
-    /// of one per token. Where it does not (a fresh local node, or a revert),
-    /// reads one by one. A transport failure is returned without retrying,
-    /// so an unreachable or throttling node is not asked again.
-    pub async fn native_and_token_balances(
+    /// `holder`'s `balanceOf` for each token in one Multicall3 `eth_call`, so
+    /// a rate-limited free RPC sees one request instead of one per token. A
+    /// token whose read fails is `None`. `Ok(None)` means Multicall3 is
+    /// unusable on this node (no code, or a revert), so the caller may read
+    /// tokens one by one; a throttled or failed node is an error instead.
+    pub async fn token_balances_by_multicall(
         &self,
         holder: Address,
         tokens: &[Address],
-    ) -> Result<(U256, Vec<Option<U256>>), ChainError> {
-        if !tokens.is_empty()
-            && let Some(read) = self.balances_by_multicall(holder, tokens).await?
-        {
-            return Ok(read);
-        }
-        let native = self.balance(holder).await?;
-        let mut balances = Vec::with_capacity(tokens.len());
-        for &token in tokens {
-            balances.push(self.erc20_balance(token, holder).await?);
-        }
-        Ok((native, balances))
-    }
-
-    /// The Multicall3 half of [`Self::native_and_token_balances`]. `Ok(None)`
-    /// means the node answered but Multicall3 is unusable there.
-    async fn balances_by_multicall(
-        &self,
-        holder: Address,
-        tokens: &[Address],
-    ) -> Result<Option<(U256, Vec<Option<U256>>)>, ChainError> {
+    ) -> Result<Option<Vec<Option<U256>>>, ChainError> {
         use alloy::sol_types::SolCall;
-        let call = |target, allow_failure, data: Vec<u8>| IMulticall3::Call3 {
-            target,
-            allowFailure: allow_failure,
-            callData: data.into(),
-        };
-        let mut calls = vec![call(
-            MULTICALL3,
-            false,
-            IMulticall3::getEthBalanceCall { addr: holder }.abi_encode(),
-        )];
-        calls.extend(tokens.iter().map(|&token| {
-            call(
-                token,
-                true,
-                IERC20::balanceOfCall { account: holder }.abi_encode(),
-            )
-        }));
+        let calls = tokens
+            .iter()
+            .map(|&token| IMulticall3::Call3 {
+                target: token,
+                allowFailure: true,
+                callData: IERC20::balanceOfCall { account: holder }
+                    .abi_encode()
+                    .into(),
+            })
+            .collect();
         let results = match IMulticall3::new(MULTICALL3, self.primary.clone())
             .aggregate3(calls)
             .call()
             .await
         {
             Ok(results) => results,
-            // An error reply that is not a revert (often a rate limit) and a
-            // failed transport both mean: do not send more requests.
-            Err(alloy::contract::Error::TransportError(e))
-                if e.as_error_resp().is_none_or(|resp| {
-                    !resp.message.to_ascii_lowercase().contains("revert")
-                        && resp.as_revert_data().is_none()
-                }) =>
-            {
-                return Err(e.into());
-            }
+            Err(e) if is_node_failure(&e) => return Err(node_failure(e)),
             Err(e) => {
                 debug!(error = %e, "multicall3.unavailable");
                 return Ok(None);
             }
         };
-        if results.len() != tokens.len() + 1 {
+        if results.len() != tokens.len() {
             return Ok(None);
         }
-        let value = |r: &IMulticall3::Call3Result| {
-            r.success
-                .then(|| IERC20::balanceOfCall::abi_decode_returns(&r.returnData).ok())
-                .flatten()
-        };
-        let Some(native) = value(&results[0]) else {
-            return Ok(None);
-        };
-        Ok(Some((native, results[1..].iter().map(value).collect())))
+        Ok(Some(
+            results
+                .iter()
+                .map(|r| {
+                    r.success
+                        .then(|| IERC20::balanceOfCall::abi_decode_returns(&r.returnData).ok())
+                        .flatten()
+                })
+                .collect(),
+        ))
     }
 
     /// Read an ERC-20 token's `allowance(owner, spender)`. Returns
@@ -1888,49 +1871,23 @@ mod mock_rpc_tests {
     }
 
     #[tokio::test]
-    async fn token_balances_fall_back_when_multicall_reverts() {
-        let mut r = responses();
-        r.insert(
-            "eth_call".into(),
-            vec![
-                MockResponse::Err(3, "execution reverted".into(), None),
-                MockResponse::Ok(enc_uint256(U256::from(7u64))),
-            ],
-        );
-        r.insert("eth_getBalance".into(), vec![MockResponse::Ok(qty(5))]);
-        let c = client_at(&spawn_mock(r).await);
-        let token = address!("0x6666666666666666666666666666666666666666");
-        let holder = address!("0x7777777777777777777777777777777777777777");
-        let (native, tokens) = c.native_and_token_balances(holder, &[token]).await.unwrap();
-        assert_eq!(
-            (native, tokens),
-            (U256::from(5u64), vec![Some(U256::from(7u64))])
-        );
+    async fn multicall_revert_means_unavailable_in_any_case() {
+        for message in ["execution reverted", "Execution Reverted"] {
+            let mut r = responses();
+            r.insert(
+                "eth_call".into(),
+                vec![MockResponse::Err(3, message.into(), None)],
+            );
+            let c = client_at(&spawn_mock(r).await);
+            let token = address!("0x6666666666666666666666666666666666666666");
+            let holder = address!("0x7777777777777777777777777777777777777777");
+            let read = c.token_balances_by_multicall(holder, &[token]).await;
+            assert!(matches!(read, Ok(None)), "{message}: {read:?}");
+        }
     }
 
     #[tokio::test]
-    async fn token_balances_fall_back_when_multicall_reverts_capitalized() {
-        let mut r = responses();
-        r.insert(
-            "eth_call".into(),
-            vec![
-                MockResponse::Err(3, "Execution Reverted".into(), None),
-                MockResponse::Ok(enc_uint256(U256::from(7u64))),
-            ],
-        );
-        r.insert("eth_getBalance".into(), vec![MockResponse::Ok(qty(5))]);
-        let c = client_at(&spawn_mock(r).await);
-        let token = address!("0x6666666666666666666666666666666666666666");
-        let holder = address!("0x7777777777777777777777777777777777777777");
-        let (native, tokens) = c.native_and_token_balances(holder, &[token]).await.unwrap();
-        assert_eq!(
-            (native, tokens),
-            (U256::from(5u64), vec![Some(U256::from(7u64))])
-        );
-    }
-
-    #[tokio::test]
-    async fn token_balances_stop_when_the_node_rate_limits() {
+    async fn multicall_rate_limit_is_an_error() {
         // Falling back here would send one more request per token to a node
         // that just refused one.
         let mut r = responses();
@@ -1942,11 +1899,31 @@ mod mock_rpc_tests {
                 None,
             )],
         );
-        r.insert("eth_getBalance".into(), vec![MockResponse::Ok(qty(5))]);
         let c = client_at(&spawn_mock(r).await);
         let token = address!("0x6666666666666666666666666666666666666666");
         let holder = address!("0x7777777777777777777777777777777777777777");
-        assert!(c.native_and_token_balances(holder, &[token]).await.is_err());
+        assert!(
+            c.token_balances_by_multicall(holder, &[token])
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn erc20_balance_reports_a_throttled_node_instead_of_no_balance() {
+        let mut r = responses();
+        r.insert(
+            "eth_call".into(),
+            vec![MockResponse::Err(
+                -32005,
+                "rate limit exceeded".into(),
+                None,
+            )],
+        );
+        let c = client_at(&spawn_mock(r).await);
+        let token = address!("0x6666666666666666666666666666666666666666");
+        let holder = address!("0x7777777777777777777777777777777777777777");
+        assert!(c.erc20_balance(token, holder).await.is_err());
     }
 
     #[tokio::test]

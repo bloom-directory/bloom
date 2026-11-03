@@ -601,28 +601,58 @@ impl WalletsHandler {
                 }
             }
             let tokens = holdings_tokens(spec.chain_id);
-            // Futures are lazy: `buffer_unordered` runs at most
-            // HOLDINGS_CONCURRENCY, and yields each read as it finishes, so a
-            // slow token does not hide later ones that completed in time.
             let client = &client;
-            // Owned (index, contract) pairs keep the futures free of borrowed
-            // closure arguments, which async-trait's Send bound rejects.
             let contracts: Vec<_> = tokens.iter().map(|(contract, ..)| *contract).collect();
-            let reads = contracts
-                .into_iter()
-                .enumerate()
-                .map(|(index, contract)| async move {
-                    (index, client.erc20_balance(contract, holder).await)
-                });
-            let mut balances = futures::stream::iter(reads).buffer_unordered(HOLDINGS_CONCURRENCY);
             let mut done = vec![None; tokens.len()];
-            loop {
-                let Ok(next) = tokio::time::timeout_at(deadline, balances.next()).await else {
-                    read.timed_out = true;
-                    break;
-                };
-                let Some((index, balance)) = next else { break };
-                done[index] = Some(balance.ok().flatten());
+            // One Multicall3 request where the node has it. If the batch is
+            // unavailable there, read tokens one by one; if the node failed or
+            // throttled, send it nothing more.
+            let batch = if contracts.is_empty() {
+                Ok(Ok(Some(Vec::new())))
+            } else {
+                tokio::time::timeout_at(
+                    deadline,
+                    client.token_balances_by_multicall(holder, &contracts),
+                )
+                .await
+            };
+            match batch {
+                Ok(Ok(Some(balances))) => {
+                    for (slot, balance) in done.iter_mut().zip(balances) {
+                        *slot = Some(balance);
+                    }
+                }
+                Ok(Ok(None)) => {
+                    // Owned (index, contract) pairs keep the futures free of
+                    // borrowed closure arguments, which async-trait's Send
+                    // bound rejects. `buffer_unordered` runs at most
+                    // HOLDINGS_CONCURRENCY and yields each read as it
+                    // finishes, so a slow token does not hide later ones.
+                    let reads =
+                        contracts
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, contract)| async move {
+                                (index, client.erc20_balance(contract, holder).await)
+                            });
+                    let mut balances =
+                        futures::stream::iter(reads).buffer_unordered(HOLDINGS_CONCURRENCY);
+                    loop {
+                        let Ok(next) = tokio::time::timeout_at(deadline, balances.next()).await
+                        else {
+                            read.timed_out = true;
+                            break;
+                        };
+                        let Some((index, balance)) = next else { break };
+                        match balance {
+                            Ok(balance) => done[index] = Some(balance),
+                            // The node failed or throttled: stop asking it.
+                            Err(_) => break,
+                        }
+                    }
+                }
+                Ok(Err(_)) => {}
+                Err(_) => read.timed_out = true,
             }
             for ((contract, symbol, decimals), balance) in tokens.iter().zip(done) {
                 match balance {
