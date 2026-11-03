@@ -168,16 +168,14 @@ active status includes a public `view_url` pointing to `/view`; it grants no
 access without that browser's existing origin-scoped session key. It is not reachable from another device.
 
 Takeover is for login, verification or an unsupported field, not routine
-passenger entry. On handback, checkout navigates the human-selected tab through
-`about:blank` into a fresh document at the selected URL, closes all other
-pages, and clears navigation history before enabling shopping. This retains
-the site's tab-scoped booking/session storage without handing the private DOM,
-form values or execution contexts to Machine. Storage is not exported through
-the VFS. Failure to replace the document leaves shopping paused.
-
-Card and site-payment completion still close every private page and resume
-shopping in a fresh blank tab. Takeover buys nothing and releases no card;
-saved-card payment needs its separate approval for the exact merchant/total.
+passenger entry. On handback, checkout discards the whole browsing context,
+including the login and any booking session, and resumes shopping in a fresh
+blank tab, as card and site-payment completion do. Machine's clicks are not
+an authorization boundary: page text cannot tell a harmless "Continue" from a
+control that charges a shop-saved payment method, so no session the person
+authenticated is ever handed to Machine. Takeover buys nothing and releases
+no card; saved-card and site payment need their separate approval for the
+exact merchant/total.
 
 Every explicit open starts a new traveler-unlock context, even on the same
 origin. An approval returned for an earlier context is discarded. Private
@@ -209,9 +207,10 @@ The operation store is written before every irreversible step:
   the reference plus a merchant-reported purchase/payment confirmation or
   issued-ticket evidence. This remains page-derived evidence, not independent
   bank settlement. An unresolved card or site payment blocks another payment
-  at its recorded shop origin, including a new operation ID. After the private
-  view closes, the person must check the merchant and bank before `resolve`
-  clears that block. This is a shop-wide safeguard, not independent settlement
+  at its recorded shop origin, including a new operation ID. Only the person
+  clears that block: a take-over request naming the earlier operation in
+  `resolves` gets its own passkey approval, and the person's Done in that
+  private view marks it `human_checked`. Machine cannot assert it. This is a shop-wide safeguard, not independent settlement
   or reconciliation of individual bookings.
 
 `checkout/history.json` lists the 50 latest requests with mode, shop origin,

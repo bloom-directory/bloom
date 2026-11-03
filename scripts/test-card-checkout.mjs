@@ -205,7 +205,6 @@ try {
   await privatePage.locator('#finish').click();
   await poll(`/checkout/requests/${manual}/status.json`, ['uncertain']);
   await returnedToShopping(); await privatePage.close();
-  await vfs('write',`/checkout/requests/${manual}/resolve`,{});
   checkpoint('manual fallback releases no card; lost private tab reopens; shopping returns');
 
   stage = 'Stripe sandbox checkout';
@@ -230,7 +229,7 @@ try {
 
   await browse({action:'open',url:merchant+'login'}); await delay(500);
   const takeOver = id();
-  await vfs('write',`/checkout/requests/${takeOver}/in.json`,{take_over:true,agent_description:'Log in to the synthetic fixture shop'});
+  await vfs('write',`/checkout/requests/${takeOver}/in.json`,{take_over:true,resolves:manual,agent_description:'Log in to the synthetic fixture shop'});
   const takeoverOpened = context.waitForEvent('page');
   await approve((await checkoutStatus(takeOver)).ceremony_url,'take-over');
   const takeoverPage = await takeoverOpened;
@@ -240,9 +239,10 @@ try {
   await takeoverPage.keyboard.type('ada',{delay:100}); await takeoverPage.keyboard.press('Enter'); await delay(800);
   await takeoverPage.locator('#finish').click();
   await poll(`/checkout/requests/${takeOver}/status.json`, ['returned']);
-  snapshot = await browse({action:'snapshot'}); assert.equal(snapshot.url,merchant+'account'); assert.match(snapshot.text,/Signed in as ada/);
+  await returnedToShopping();
+  assert.equal((await checkoutStatus(manual)).state,'resolved');
   await takeoverPage.close();
-  checkpoint('approved take-over returns the logged-in page');
+  checkpoint('approved take-over clears the unknown payment and never returns the login');
 
   // Keep Broker's production anonymous-ceremony admission limit intact.
   stage = 'waiting for ceremony quota';

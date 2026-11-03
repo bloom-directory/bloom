@@ -287,6 +287,8 @@ struct CheckoutInput {
     #[serde(default)]
     take_over: bool,
     #[serde(default)]
+    resolves: Option<String>,
+    #[serde(default)]
     traveler_id: Option<String>,
 }
 
@@ -312,10 +314,6 @@ impl Handler for CheckoutHandler {
             ["browse" | "requests", id, "in.json" | "cancel"] => {
                 operation(id)?;
                 Ok(Entry::writable_file(s[2]))
-            }
-            ["requests", id, "resolve"] => {
-                operation(id)?;
-                Ok(Entry::writable_file("resolve"))
             }
             ["browse" | "requests", id, "out.json" | "status.json"] => {
                 operation(id)?;
@@ -404,7 +402,7 @@ impl Handler for CheckoutHandler {
                 operation(id)?;
                 let request: CheckoutInput = input(bytes)?;
                 if let Some(traveler_id) = request.traveler_id {
-                    if request.card_id.is_some() || request.take_over {
+                    if request.card_id.is_some() || request.take_over || request.resolves.is_some() {
                         return Err(HandlerError::invalid(
                             "Traveler autofill does not accept payment or takeover options",
                         ));
@@ -425,6 +423,7 @@ impl Handler for CheckoutHandler {
                         card_id: request.card_id,
                         agent_description: request.agent_description,
                         take_over: request.take_over,
+                        resolves: request.resolves,
                     })
                     .await?;
                 let response: bloom_checkout_api::Status = serde_json::from_value(response)
@@ -434,14 +433,6 @@ impl Handler for CheckoutHandler {
             ["requests", id, "cancel"] => {
                 operation(id)?;
                 self.call(Request::Cancel {
-                    operation_id: (*id).into(),
-                })
-                .await?;
-                Ok(())
-            }
-            ["requests", id, "resolve"] => {
-                operation(id)?;
-                self.call(Request::Resolve {
                     operation_id: (*id).into(),
                 })
                 .await?;
@@ -478,7 +469,6 @@ impl Handler for CheckoutHandler {
                     Entry::writable_file("in.json"),
                     Entry::file("status.json"),
                     Entry::writable_file("cancel"),
-                    Entry::writable_file("resolve"),
                 ])
             }
             _ => Err(HandlerError::NotADir(path.to_string_path())),

@@ -55,6 +55,12 @@ pub enum Request {
         agent_description: String,
         #[serde(default)]
         take_over: bool,
+        /// With `take_over`, an earlier card or site checkout whose result is
+        /// unknown. The person checks the shop or bank in the private view;
+        /// only their Done there marks it checked and allows another payment
+        /// at that shop.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolves: Option<String>,
     },
     /// Unlock a saved traveler for the current website with one approval.
     /// Values stay in checkout; `FillTraveler` puts them on each page.
@@ -66,11 +72,6 @@ pub enum Request {
         operation_id: String,
     },
     Cancel {
-        operation_id: String,
-    },
-    /// The person checked an unresolved shop with the merchant or bank.
-    /// The body is ignored. Refused while approval is still open.
-    Resolve {
         operation_id: String,
     },
     /// The 50 most recent checkout requests, newest first.

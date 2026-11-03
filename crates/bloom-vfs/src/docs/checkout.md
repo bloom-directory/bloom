@@ -81,8 +81,9 @@ A new `open`, a handback or expiry ends the unlock. Writing the request's
    The person sees the shop, total, currency, installments, renewal terms and
    card read from the page, approves with their passkey and enters the CVC.
    Bloom fills and submits once. Shopping is paused meanwhile.
-4. If the person is logged in to the shop with its own saved payment method,
-   omit `card_id`; after approval Bloom clicks the pay button once.
+4. To pay with the shop's own saved payment method, omit `card_id`. When
+   Bloom can read the total and one pay button, it clicks it once after
+   approval; otherwise the person logs in and pays in the private view.
 
 Bloom fills cards only into known payment providers (Stripe, Shopify, Adyen,
 Braintree, Yuno and others) or a listed merchant's own page. Anything else,
@@ -98,10 +99,9 @@ take-over for that step; never bypass the guard.
 For a login, code, captcha or bot check, write a request with
 `"take_over": true` and an `agent_description` telling the person what to do.
 Send the ceremony URL. They work in Bloom's browser and click Done;
-`status.json` says `returned` and you continue on their page. Some sellers
-reset bags, seats or extras after handback: recheck them and the total.
-Closing a payment checkout clears the site's cookies, so a later purchase may
-need another login.
+`status.json` says `returned` and shopping restarts on a blank page without
+their login, cookies or the page they left: a logged-in shop could charge its
+saved payment method on any click. Reopen the shop and recheck the basket.
 
 ## Results and recovery
 
@@ -114,7 +114,7 @@ bank charge.
 | `declined` | Merchant declined. Tell the person; do not retry without asking. |
 | `filled` | Fields filled; not proof of payment. |
 | `needs_input` | The page wants more input; payment may already be submitted. The person finishes in the private view. Optional wallet signup can add fields: complete or decline it there. |
-| `partially_filled`, `disclosure_unknown`, `uncertain` | Unknown whether money moved. Ask the person to check the shop account or email, then write `checkout/requests/<id>/resolve`. Bloom refuses another checkout at that shop until then. |
+| `partially_filled`, `disclosure_unknown`, `uncertain` | Unknown whether money moved. Bloom refuses another checkout at that shop until the person checks it: write a new request with `"take_over": true` and `"resolves": "<id>"`. Their Done after checking the shop account, email or bank clears it; you cannot. |
 | `paused` | Checkout could not hand the browser back. Check status before anything else; for a request that never released a card, write its `cancel` again to retry cleanup. A restart clears `paused`, not an uncertain result. |
 
 Never buy again after a timeout, form error or closed view. Read
@@ -147,8 +147,8 @@ If the same reason repeats on an unchanged page, use a take-over.
 and `renewal_starts_on`; use them to say what the person still pays and
 when. With several plans on the page Bloom claims no renewal price, so say
 which plan is selected. Bloom cannot cap later charges. To cancel, do it on
-the shop's site in this browser (with a take-over for login); it is never a
-payment request.
+the shop's site: the person does it in a take-over; it is never a payment
+request.
 
 ## Flights
 
