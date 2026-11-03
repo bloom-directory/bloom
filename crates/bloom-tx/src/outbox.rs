@@ -470,6 +470,10 @@ impl Outbox {
     ) -> Result<Self, OutboxError> {
         let root = root.into();
         fs::create_dir_all(&root)?;
+        // Publish a newly created root itself, not only entries under it.
+        if let Some(parent) = root.parent() {
+            sync_dir(parent)?;
+        }
         Ok(Self {
             inner: Arc::new(OutboxInner {
                 root,
@@ -1009,21 +1013,25 @@ impl Outbox {
                 .unwrap()
                 .join("archive")
                 .join(&entry.staged.id);
-            fs::create_dir_all(&archive)?;
+            self.create_dir_durable(&archive)?;
             let attempt = tempfile::Builder::new()
                 .prefix("attempt-")
-                .tempdir_in(archive)?
+                .tempdir_in(&archive)?
                 .keep();
+            sync_dir(&archive)?;
             let backup = attempt.join("entry");
             fs::rename(&target, &backup)?;
             sync_dir(&attempt)?;
+            sync_dir(&target_parent)?;
             Some(backup)
         } else {
             None
         };
         if let Err(error) = fs::rename(&entry.dir, &target) {
             if let Some(backup) = &previous {
-                fs::rename(backup, &target).map_err(|restore| OutboxError::Other(format!(
+                fs::rename(backup, &target)
+                    .and_then(|()| sync_dir(&target_parent))
+                    .map_err(|restore| OutboxError::Other(format!(
                     "wallet transition failed: {error}; previous record remains at {}: {restore}", backup.display()
                 )))?;
             }
@@ -1047,10 +1055,15 @@ impl Outbox {
                 OutboxState::Failed => "failed",
             };
             if let Err(e) = proj.transition_action(action_id, from_str, to_str) {
-                let rollback = fs::rename(&target, &entry.dir);
+                // Sync both parents so the rolled-back location survives.
+                let rollback = fs::rename(&target, &entry.dir)
+                    .and_then(|()| sync_dir(&target_parent))
+                    .and_then(|()| entry.dir.parent().map_or(Ok(()), sync_dir));
                 let rollback_detail = match rollback {
                     Ok(()) => match &previous {
-                        Some(backup) => match fs::rename(backup, &target) {
+                        Some(backup) => match fs::rename(backup, &target)
+                            .and_then(|()| sync_dir(&target_parent))
+                        {
                             Ok(()) => {
                                 "wallet outbox transition and previous record restored".to_string()
                             }
