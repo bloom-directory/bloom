@@ -403,13 +403,17 @@ fn refresh_developer_provenance_catalog(
     if !conflicts.is_empty() {
         bail!(
             "this developer catalog is signed with fee assets that disagree with what this \
-             build derives, and refreshing would overwrite them and stop Broker authorizing \
-             those Petals' claims — FEE_NOT_ALLOWED where the value would be cleared, \
-             FEE_ASSET_MISMATCH where it would be replaced: {}. To keep those claims working, \
-             FEE_BEARING_OPERATION_CLASSES in this build has to agree with what the Petal \
-             declares — re-enrolling the Petal does NOT help, because enrolment derives the fee \
-             asset from the same table. Set {}=1 to overwrite them anyway and accept that those \
-             claims stop being authorized.",
+             build derives: {}. One of the two sides is stale and the refresh cannot tell \
+             which, so it refuses rather than re-sign a value the record already carries. \
+             Either this build's FEE_BEARING_OPERATION_CLASSES is wrong for that class or \
+             does not catalogue it, or the record is the stale side — a table row corrected \
+             since this root was enrolled, or a Petal that has changed since. Re-enrolling \
+             the Petal does NOT help either way, because enrolment derives the fee asset \
+             from the same table. If the record is right, make this build's table agree with \
+             what the Petal declares. If the table is right, set {}=1 to re-sign the records \
+             from it: the rewritten claims are then authorized under the new value, and a \
+             Petal still declaring the old one is denied — FEE_NOT_ALLOWED where the value \
+             was cleared, FEE_ASSET_MISMATCH where it was replaced.",
             conflicts.join("; "),
             REWRITE_EXISTING_FEE_ASSETS,
         );
@@ -628,6 +632,22 @@ fn developer_route_operation_classes(
         .collect()
 }
 
+/// Opt-in to let a developer catalog refresh overwrite a fee asset a record was
+/// already signed with — whether this build catalogues that class differently
+/// or not at all. Without it the refresh refuses, so the change is a choice the
+/// operator makes rather than a silent rewrite.
+#[cfg(feature = "triad-dev-harness")]
+const REWRITE_EXISTING_FEE_ASSETS: &str = "BLOOM_TRIAD_DEV_REWRITE_EXISTING_FEE_ASSETS";
+
+/// Only an exact `1` enables the overwrite. Testing for the variable's mere
+/// presence would make `=0` — the spelling an operator reaches for to turn
+/// something off — enable a destructive re-signing instead, and the refusal
+/// message tells them to set `1`.
+#[cfg(feature = "triad-dev-harness")]
+fn rewrite_existing_requested(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| value == std::ffi::OsStr::new("1"))
+}
+
 /// The one Hyperliquid operation class whose every claim declares a fee:
 /// builder-bearing orders sign under it and nothing else does
 /// (bloom-petal-hyperliquid's `BUILDER_ORDER_INTENT`).
@@ -639,22 +659,6 @@ fn developer_route_operation_classes(
 /// A builder fee is the first declared value ever to reach that approval —
 /// plain session actions declare nothing — so the session path is denied at
 /// use time until those limits are populated.
-/// Opt-in to let a developer catalog refresh overwrite a fee asset a record was
-/// already signed with — whether this build catalogues that class differently
-/// or not at all. Without it the refresh refuses, so the change is a choice the
-/// operator makes rather than a silent rewrite.
-#[cfg(feature = "triad-dev-harness")]
-const REWRITE_EXISTING_FEE_ASSETS: &str = "BLOOM_TRIAD_DEV_REWRITE_EXISTING_FEE_ASSETS";
-
-/// Only an exact `1` enables the clearing. Testing for the variable's mere
-/// presence would make `=0` — the spelling an operator reaches for to turn
-/// something off — enable a destructive re-signing instead, and the refusal
-/// message tells them to set `1`.
-#[cfg(feature = "triad-dev-harness")]
-fn rewrite_existing_requested(value: Option<&std::ffi::OsStr>) -> bool {
-    value.is_some_and(|value| value == std::ffi::OsStr::new("1"))
-}
-
 const HYPERLIQUID_BUILDER_ORDER_CLASS: &str = "hyperliquid.builder_order";
 
 /// Polymarket's fee-bearing CLOB order class, separate from the fee-free
@@ -1988,21 +1992,28 @@ mod tests {
         // A catalogued class, signed with a different asset than the table
         // derives for it.
         let builder_class = Token::new(HYPERLIQUID_BUILDER_ORDER_CLASS).unwrap();
-        let mut planted = 0;
+        let mut planted_routes = Vec::new();
         for record in &mut stale.records {
-            if matches!(record.subject, ProvenanceSubject::Petal { .. })
-                && record.publisher != Token::new("bloom-release-pins").unwrap()
-                && let Some(class) = record.operation_classes.first_mut()
-            {
+            let ProvenanceSubject::Petal { route, .. } = &record.subject else {
+                continue;
+            };
+            if record.publisher == Token::new("bloom-release-pins").unwrap() {
+                continue;
+            }
+            let route = route.clone();
+            if let Some(class) = record.operation_classes.first_mut() {
                 class.operation_class = builder_class.clone();
                 class.fee_asset = Some(ProvenanceFeeAsset {
                     chain: Token::new("polygon").unwrap(),
                     asset: "pusd".to_owned(),
                 });
-                planted += 1;
+                planted_routes.push(route);
             }
         }
-        assert!(planted > 0, "the fixture must enroll a developer record");
+        assert!(
+            !planted_routes.is_empty(),
+            "the fixture must enroll a developer record"
+        );
         let derived = catalogued_fee_asset(builder_class.as_str())
             .unwrap()
             .unwrap();
@@ -2017,7 +2028,32 @@ mod tests {
         let error = refresh_developer_provenance_catalog(&template, &output, owner)
             .expect_err("replacing a differing fee asset must be refused");
         let message = format!("{error:#}");
-        assert!(message.contains("FEE_ASSET_MISMATCH"), "{message}");
+        // The bail! names both symptom codes in one literal, so asserting
+        // either one discriminates nothing. What has to hold is the per-record
+        // diagnostic: the route and class to act on, and both values, so the
+        // operator can tell which side is stale.
+        let signed = format!(
+            "{:?}",
+            Some(ProvenanceFeeAsset {
+                chain: Token::new("polygon").unwrap(),
+                asset: "pusd".to_owned(),
+            })
+        );
+        let derives = format!(
+            "{:?}",
+            catalogued_fee_asset(builder_class.as_str()).unwrap()
+        );
+        for route in &planted_routes {
+            let expected = format!(
+                "route {route} class {} is signed with {signed} but this build derives {derives}",
+                builder_class.as_str(),
+            );
+            assert!(
+                message.contains(&expected),
+                "the refusal must name the record, the signed value and the derived one, \
+                 expected {expected:?} in: {message}"
+            );
+        }
         let after: ProvenanceCatalog =
             serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
         assert_eq!(after, stale, "a refused refresh must not touch the catalog");
@@ -2059,12 +2095,16 @@ mod tests {
 
         // A fee asset for a class the table does not know: what an older
         // binary, or a hand edit, could leave behind.
-        let mut planted = 0;
+        let mut planted = Vec::new();
         for record in &mut stale.records {
-            if matches!(record.subject, ProvenanceSubject::Petal { .. })
-                && record.publisher != Token::new("bloom-release-pins").unwrap()
-                && let Some(class) = record.operation_classes.first_mut()
-            {
+            let ProvenanceSubject::Petal { route, .. } = &record.subject else {
+                continue;
+            };
+            if record.publisher == Token::new("bloom-release-pins").unwrap() {
+                continue;
+            }
+            let route = route.clone();
+            if let Some(class) = record.operation_classes.first_mut() {
                 assert!(
                     catalogued_fee_asset(class.operation_class.as_str())
                         .unwrap()
@@ -2075,23 +2115,46 @@ mod tests {
                     chain: Token::new("hyperliquid").unwrap(),
                     asset: "usdc".to_owned(),
                 });
-                planted += 1;
+                planted.push((route, class.operation_class.clone()));
             }
         }
-        assert!(planted > 0, "the fixture must enroll a developer record");
+        assert!(
+            !planted.is_empty(),
+            "the fixture must enroll a developer record"
+        );
         rewrite_private_json(&catalog_path, &serde_json::to_value(&stale).unwrap()).unwrap();
 
         let template = template_dir().join("provenance-catalog.unsigned.json");
         let error = refresh_developer_provenance_catalog(&template, &output, owner)
             .expect_err("clearing an uncatalogued fee asset must be refused");
         let message = format!("{error:#}");
-        assert!(message.contains("FEE_NOT_ALLOWED"), "{message}");
+        // Both symptom codes live in one bail! literal, so neither one on its
+        // own says which conflict fired. The diagnostic does: a clear derives
+        // None, where a replace derives Some.
+        let signed = format!(
+            "{:?}",
+            Some(ProvenanceFeeAsset {
+                chain: Token::new("hyperliquid").unwrap(),
+                asset: "usdc".to_owned(),
+            })
+        );
+        for (route, class) in &planted {
+            let expected = format!(
+                "route {route} class {} is signed with {signed} but this build derives None",
+                class.as_str(),
+            );
+            assert!(
+                message.contains(&expected),
+                "the refusal must name the record and show the value being cleared, \
+                 expected {expected:?} in: {message}"
+            );
+        }
         assert!(
             message.contains("FEE_BEARING_OPERATION_CLASSES"),
-            "the refusal must name the only recovery that keeps the claims working: {message}"
+            "the refusal must name the recovery that keeps the claims working: {message}"
         );
         assert!(
-            message.contains("re-enrolling the Petal does NOT help"),
+            message.contains("Re-enrolling the Petal does NOT help"),
             "the refusal must not send the operator to a recovery that recreates the outage: \
              {message}"
         );

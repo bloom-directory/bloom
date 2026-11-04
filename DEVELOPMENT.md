@@ -534,6 +534,19 @@ The launcher's optional controls are:
 | `BLOOM_TRIAD_DEV_SOCKET_TIMEOUT_SECONDS` | Positive launcher socket timeout |
 | `BLOOM_TRIAD_DEV_CEREMONY_PORT` | Ceremony listener port when `--ceremony-port` is absent |
 | `BLOOM_TRIAD_DEV_REMOTE_UPSTREAM_PORT` | Hosted-relay loopback upstream port when `--remote-upstream-port` is absent |
+| `BLOOM_TRIAD_DEV_REWRITE_EXISTING_FEE_ASSETS` | Set to `1` to let a catalog refresh re-sign a fee asset a record already carries |
+
+Every launch refreshes the developer provenance catalog before enrolling, and
+that refresh re-derives each Petal operation class's `fee_asset` from
+`FEE_BEARING_OPERATION_CLASSES` in `crates/bloom/src/triad_enrollment.rs`. A
+class enrolled before the table catalogued it is healed silently. A class the
+record is *already* signed with a different value for is refused, and the launch
+stops: one of the record and the table is stale and the refresh cannot tell
+which, so it will not re-sign on its own. Correcting a row in that table is
+therefore a breaking change for every developer root enrolled against the old
+value — each one needs `BLOOM_TRIAD_DEV_REWRITE_EXISTING_FEE_ASSETS=1` once, or
+a fresh root. Adding a row is not: existing records carry no value for a new
+class, so they heal.
 
 The launcher also accepts `--ceremony-port PORT`. The selected port is the
 explicit flag, otherwise `BLOOM_TRIAD_DEV_CEREMONY_PORT` when set, otherwise
