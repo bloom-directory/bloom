@@ -2344,7 +2344,7 @@ dependencies = [
 [[package]]
 name = "bloom-broker-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=50a2aa8bebb65088d4a3175e0e2f37d5107ac7eb#50a2aa8bebb65088d4a3175e0e2f37d5107ac7eb"
+source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=afbec771860d7f172f1f54086200e5e553fb51b7#afbec771860d7f172f1f54086200e5e553fb51b7"
 dependencies = [
  "bech32",
  "bloom-rpc-wire",
@@ -2363,6 +2363,7 @@ name = "bloom-daemon"
 version = "0.4.2"
 dependencies = [
  "alloy 2.0.5",
+ "alloy-dyn-abi",
  "anyhow",
  "async-trait",
  "base64 0.22.1",
@@ -2647,7 +2648,7 @@ dependencies = [
 [[package]]
 name = "bloom-petal-contract"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/petal?rev=3e7ac46fcce2191aac6b0e41414d0eed9ec331b4#3e7ac46fcce2191aac6b0e41414d0eed9ec331b4"
+source = "git+https://github.com/bloom-directory/petal?rev=9e92e551c6a4ccc32704cef5b0e8ac4ed104e3b2#9e92e551c6a4ccc32704cef5b0e8ac4ed104e3b2"
 dependencies = [
  "hex",
  "serde",
@@ -2813,7 +2814,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=ce0fcba77ad0b8cb196748d74a761ad96c6c5edb#ce0fcba77ad0b8cb196748d74a761ad96c6c5edb"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=dd8717982812affc436bdc23a49fb381caa19039#dd8717982812affc436bdc23a49fb381caa19039"
 dependencies = [
  "bloom-rpc-wire",
  "ed25519-dalek",
@@ -2828,7 +2829,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-derive"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=ce0fcba77ad0b8cb196748d74a761ad96c6c5edb#ce0fcba77ad0b8cb196748d74a761ad96c6c5edb"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=dd8717982812affc436bdc23a49fb381caa19039#dd8717982812affc436bdc23a49fb381caa19039"
 dependencies = [
  "bip39",
  "ed25519-dalek",

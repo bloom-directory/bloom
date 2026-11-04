@@ -1,10 +1,10 @@
 schema = "bloom.triad-compatibility/1"
 
 [revisions]
-broker_commit = "50a2aa8bebb65088d4a3175e0e2f37d5107ac7eb"
-signer_commit = "ce0fcba77ad0b8cb196748d74a761ad96c6c5edb"
+broker_commit = "afbec771860d7f172f1f54086200e5e553fb51b7"
+signer_commit = "dd8717982812affc436bdc23a49fb381caa19039"
 service_runtime_commit = "48b83c54c1787b4aff2456bd3adbe18856902e45"
-petal_contract_commit = "3e7ac46fcce2191aac6b0e41414d0eed9ec331b4"
+petal_contract_commit = "9e92e551c6a4ccc32704cef5b0e8ac4ed104e3b2"
 
 # Persisted credential surfaces and registration selections are unreadable by
 # the released Machine reader; see docs/reviews/2026-09-23-schema-migration.md.
@@ -27,8 +27,8 @@ migration_floor = 1
 
 [protocols.machine_broker]
 major = 1
-minor_min = 10
-minor_max = 10
+minor_min = 11
+minor_max = 11
 
 [protocols.broker_signer]
 major = 1

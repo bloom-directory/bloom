@@ -1,6 +1,6 @@
 //! SDK component / Machine VM wire integration without a Broker or venue.
 //! Build `petal/fixtures/petal-build.toml`, then set BLOOM_PREPARED_FIXTURES
-//! to its output directory and run this test with `--ignored`.
+//! to its output directory. Dedicated CI builds and requires those fixtures.
 use std::{
     collections::BTreeSet,
     path::PathBuf,
@@ -150,8 +150,13 @@ async fn dispatch(
 }
 
 #[tokio::test]
-#[ignore = "requires separately built canonical SDK WASM fixtures; see module documentation"]
 async fn sdk_prepared_and_status_imports_enforce_capabilities_and_trusted_context() {
+    if std::env::var_os("BLOOM_PREPARED_FIXTURES").is_none() {
+        eprintln!(
+            "not exercised; use the dedicated prepared signing fixture job or set BLOOM_PREPARED_FIXTURES"
+        );
+        return;
+    }
     let (_temp, runner, package_hash) = runner();
     let host = Arc::new(FixtureHost::default());
     let sign = "prepared";

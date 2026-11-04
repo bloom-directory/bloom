@@ -324,6 +324,7 @@ async fn solana_full_stage_confirm_flow() -> Result<()> {
     // Mirror the shipped installer catalog
     // (packaging/triad/macos/config/provenance-catalog.unsigned.json).
     let record = |action: &str, op: &str, chain: &str| ProvenanceRecord {
+        package_display_name: None,
         subject: ProvenanceSubject::System {
             component_id: tok("bloom-machine"),
             operation_class: tok(action),
@@ -331,6 +332,7 @@ async fn solana_full_stage_confirm_flow() -> Result<()> {
         publisher: tok("bloom-installer"),
         petal_lineage: None,
         operation_classes: vec![ProvenanceOperationClass {
+            zero_spend: false,
             economic_effects_schema: None,
             operation_class: tok(op),
             fee_asset: Some(ProvenanceFeeAsset {

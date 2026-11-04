@@ -274,7 +274,7 @@ fn selector_matches(
                 }
         }
         (
-            ApprovalSelector::SystemSession { scope },
+            ApprovalSelector::NativeSession { scope },
             ProvenanceSubject::System { component_id, .. },
             None,
         ) => {
@@ -531,14 +531,22 @@ impl MachineBrokerClient {
             .ok_or_else(|| io_error("session store is not configured"))?;
         let _gate = self.persona_session_gate.lock().await;
         let _lock = store_lock(root)?;
-        let mut record = records(root)?
+        let mut matches = records(root)?
             .into_iter()
-            .find(|r| {
+            .filter(|r| {
                 !r.disabled
                     && &r.proposal.terms.wallet_id == wallet
                     && approval.is_none_or(|id| r.proposal.terms.approval_id().as_ref() == Ok(id))
             })
-            .ok_or_else(|| io_error("no matching standing persona permission"))?;
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(io_error(if matches.is_empty() {
+                "no matching standing persona permission"
+            } else {
+                "select an existing permission to rearm"
+            }));
+        }
+        let mut record = matches.remove(0);
         let status = self.persona_status_for(&record).await?;
         if status.authority.state != ApprovalLifecycleState::Active
             || record.proposal.terms.expires_at_ms.get() != u64::MAX
@@ -866,25 +874,11 @@ impl MachineBrokerClient {
             request.petal_use_claim.as_ref(),
             request.system_use_claim.as_ref(),
             request.session_use.as_ref(),
-            request
-                .message_review_payload
-                .as_deref()
-                .filter(|_| {
-                    request
-                        .petal_use_claim
-                        .as_ref()
-                        .is_some_and(|claim| claim.operation_class.as_str() == "gasless.relay")
-                })
-                .or(request.claim_assurance_evidence.as_deref()),
+            request.claim_assurance_evidence.as_deref(),
             &request.signing_operation_id,
             std::slice::from_ref(&request.preimage),
             false,
-            request.allow_persona
-                && request.expected_key_ref.is_some()
-                && request
-                    .petal_use_claim
-                    .as_ref()
-                    .is_some_and(|claim| claim.operation_class.as_str() == "gasless.relay"),
+            request.allow_persona && request.expected_key_ref.is_some(),
         )
         .await
     }
@@ -1029,17 +1023,34 @@ impl MachineBrokerClient {
                 {
                     continue;
                 }
-                if terms.session_budget.is_some()
-                    && claim.is_some_and(|claim| {
-                        !claim
-                            .declared_debits
-                            .iter()
-                            .any(|debit| debit.amount.as_str() != "0")
-                    })
-                {
-                    // Older monetary Petals omitted effects. They must take
-                    // exact step-up without pinning a doomed session attempt.
-                    continue;
+                if let Some(claim) = claim {
+                    let covered = claim.economic_effects.as_ref().is_some_and(|effects| {
+                        match effects.spend {
+                            bloom_broker_api::DeclaredSpendKind::Bounded => {
+                                !claim.declared_debits.is_empty()
+                                    && claim
+                                        .declared_debits
+                                        .iter()
+                                        .all(|debit| debit.amount.as_str() != "0")
+                            }
+                            bloom_broker_api::DeclaredSpendKind::None => {
+                                claim.declared_debits.is_empty()
+                                    && terms
+                                        .session_budget
+                                        .as_ref()
+                                        .and_then(|budget| budget.petal_policy.as_ref())
+                                        .is_some_and(|policy| {
+                                            policy
+                                                .zero_spend_classes
+                                                .contains(&claim.operation_class)
+                                                && policy.zero_spend_rate_limit.is_some()
+                                        })
+                            }
+                        }
+                    });
+                    if !covered {
+                        continue;
+                    }
                 }
                 // Do not convert quantities locally. An allowed token need not
                 // have a nominal conversion; only Broker can admit its value.
@@ -1195,21 +1206,24 @@ impl MachineBrokerClient {
                     && recovery_status
                         .as_ref()
                         .is_err_and(|status| status.code == ProtocolErrorCode::ApprovalNotFound);
-                // A valid EIP-3009 payment outside the reviewed gasless profile
-                // may request exact review, only after authenticated status
-                // proves this attempt has no retained operation or signature.
-                // Malformed payloads and mismatched claims never use this code.
-                let gasless_exact_stepup = allow_limit_stepup
+                let unsupported_stepup = allow_limit_stepup
                     && matches!(provenance, ProvenanceSubject::Petal { .. })
-                    && claim.is_some_and(|claim| claim.operation_class.as_str() == "gasless.relay")
                     && error.code == ProtocolErrorCode::EffectsUnsupported
                     && recovery_status
                         .as_ref()
                         .is_err_and(|status| status.code == ProtocolErrorCode::ApprovalNotFound);
                 let limit_stepup = allow_limit_stepup
                     && matches!(provenance, ProvenanceSubject::Petal { .. })
-                    && error.code == ProtocolErrorCode::LimitExceededValue
-                    && error.durable_effect == bloom_broker_api::DurableEffect::ReservationReleased
+                    && matches!(
+                        error.code,
+                        ProtocolErrorCode::LimitExceededValue
+                            | ProtocolErrorCode::LimitExceededRate
+                    )
+                    && matches!(
+                        error.durable_effect,
+                        bloom_broker_api::DurableEffect::None
+                            | bloom_broker_api::DurableEffect::ReservationReleased
+                    )
                     && error.has_valid_contract()
                     && match &recovery_status {
                         Err(status) => status.code == ProtocolErrorCode::ApprovalNotFound,
@@ -1226,8 +1240,8 @@ impl MachineBrokerClient {
                                 })
                         }
                     };
-                if native_exact_stepup || gasless_exact_stepup || limit_stepup {
-                    // Native and gasless step-up prove no retained operation exists.
+                if native_exact_stepup || unsupported_stepup || limit_stepup {
+                    // Unsupported actions step up only after they prove no retained operation exists.
                     // Retain source identity while making the fallback durable.
                     let mut attempt: SigningAttempt =
                         read_json(&path)?.ok_or_else(|| io_error("missing frozen attempt"))?;
@@ -1387,8 +1401,8 @@ mod tests {
     }
     fn proposal() -> PersonaSessionProposal {
         let asset = AssetId {
-            chain: token("polygon"),
-            asset: "pusd".into(),
+            chain: token("evm-137"),
+            asset: "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb".into(),
         };
         let terms = SealedApprovalTerms {
             session_budget: None,
@@ -1403,7 +1417,7 @@ mod tests {
             selector: ApprovalSelector::Petal {
                 package_hash: digest(4),
                 route: "trade/wallet/0/new".into(),
-                allowed_operation_classes: vec![token("polymarket.order.poly1271")],
+                allowed_operation_classes: vec![token("example.order")],
                 route_grants: vec![],
                 required_claim_assurance: bloom_broker_api::ClaimAssuranceLevel::MachineAsserted,
             },
@@ -1711,7 +1725,7 @@ mod tests {
         }
     }
     fn fixture() -> (tempfile::TempDir, MachineBrokerClient, Arc<Broker>) {
-        fixture_with_class("polymarket.order.poly1271")
+        fixture_with_class("example.order")
     }
     fn fixture_with_class(class: &str) -> (tempfile::TempDir, MachineBrokerClient, Arc<Broker>) {
         let directory = tempfile::tempdir().unwrap();
@@ -1757,12 +1771,17 @@ mod tests {
     }
     fn use_claim(payload: &[u8], chain: u64) -> PetalUseClaim {
         PetalUseClaim {
-            economic_effects: None,
-            package_hash: digest(4), route: "trade/wallet/0/new".into(), operation_class: token("polymarket.order.poly1271"),
+            economic_effects: Some(bloom_broker_api::EconomicEffectsV1 {
+                schema_version: 1,
+                spend: bloom_broker_api::DeclaredSpendKind::Bounded,
+                permission_effect: bloom_broker_api::SessionPermissionEffect::None,
+                payload_contexts: vec![bloom_broker_api::SessionPayloadContext {payload_index:0,network:token(if chain==1 {"evm-137"} else {"evm-1"}),spending_accounts:vec![key()]}],
+            }),
+            package_hash: digest(4), route: "trade/wallet/0/new".into(), operation_class: token("example.order"),
             crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
             payload_digest: petal_batch_payload_digest(&[payload.to_vec()]),
             ordered_hashes: vec![suite_hash(CryptoSuite::Secp256k1Keccak256Recoverable,payload)],
-            declared_debits: serde_json::from_value(serde_json::json!([{"asset":{"chain":if chain==1 {"polygon"} else {"ethereum"},"asset":"pusd"},"amount":"10"}])).unwrap(),
+            declared_debits: serde_json::from_value(serde_json::json!([{"asset":{"chain":if chain==1 {"evm-137"} else {"evm-1"},"asset":"0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"},"amount":"10"}])).unwrap(),
             declared_destinations:vec![], declared_fee:bloom_broker_api::DeclaredFee::None,
             nonce:RequestNonce::from_bytes([1;16]), claim_assurance:bloom_broker_api::ClaimAssurance::MachineAsserted,
         }
@@ -1812,7 +1831,7 @@ mod tests {
             component_id: token("bloom-machine"),
             operation_class: token("transaction.confirm"),
         };
-        record.proposal.terms.selector = ApprovalSelector::SystemSession {
+        record.proposal.terms.selector = ApprovalSelector::NativeSession {
             scope: SystemSessionScope {
                 any_erc20_recipient: false,
                 component_id: token("bloom-machine"),
@@ -1841,6 +1860,7 @@ mod tests {
             asset: "native".into(),
         };
         record.proposal.terms.session_budget = Some(SessionBudget {
+            petal_policy: None,
             token_policy: Some(SessionTokenPolicy {
                 schema_version: 3,
                 budget_nonce: RequestNonce::from_bytes([63; 16]),
@@ -2042,6 +2062,7 @@ mod tests {
         limits.max_operations = DecimalU64::new(limits.max_operations.get() * 2);
         limits.max_signatures = DecimalU64::new(limits.max_signatures.get() * 2);
         let mut budget = SessionBudget {
+            petal_policy: None,
             token_policy: Some(SessionTokenPolicy {
                 schema_version: 3,
                 budget_nonce: RequestNonce::from_bytes([55; 16]),
@@ -2117,6 +2138,7 @@ mod tests {
             claim.ordered_hashes = vec![suite_hash(suite, &payload)];
             claim.declared_debits[0].asset = assets[i].clone();
             claim.economic_effects = Some(EconomicEffectsV1 {
+                spend: bloom_broker_api::DeclaredSpendKind::Bounded,
                 schema_version: 1,
                 payload_contexts: vec![SessionPayloadContext {
                     payload_index: 0,
@@ -2231,7 +2253,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gasless_profile_stepup_requires_supported_refusal_and_definitive_absence() {
+    async fn generic_stepup_requires_supported_refusal_and_definitive_absence() {
         for (class, code, unavailable, retained, allowed, fallback) in [
             (
                 "gasless.relay",
@@ -2279,7 +2301,7 @@ mod tests {
                 false,
                 false,
                 true,
-                false,
+                true,
             ),
         ] {
             let (directory, client, broker) = fixture_with_class(class);

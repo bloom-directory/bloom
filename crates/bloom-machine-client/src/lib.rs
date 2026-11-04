@@ -2480,57 +2480,18 @@ pub fn is_signed_message(suite: CryptoSuite, payload: &[u8]) -> bool {
 
 impl ExactPayloadBatchSignRequest {
     fn validate(&self, reusable: bool) -> Result<(), ProtocolError> {
-        let polymarket = self.petal_use_claim.as_ref().is_some_and(|claim| {
-            bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES
-                .contains(&claim.operation_class.as_str())
-        });
-        let class = self
-            .petal_use_claim
-            .as_ref()
-            .map(|claim| claim.operation_class.as_str());
         if self
             .preimages
             .iter()
             .any(|bytes| is_signed_message(self.crypto_suite, bytes))
-            && !polymarket
-            && class != Some(bloom_broker_api::POLYMARKET_CLOB_AUTH_CLASS)
+            || self.message_review_payload.is_some()
         {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::ClaimInvalid,
-                "Signed-message batches require the single-payload exact path with a review envelope",
+                "Signed messages require the single-payload path with a review envelope",
             ));
         }
-        if class == Some(bloom_broker_api::POLYMARKET_CLOB_AUTH_CLASS)
-            && (!reusable
-                || self.preimages.len() != 1
-                || self.crypto_suite != CryptoSuite::Secp256k1Keccak256Recoverable)
-        {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::ClaimInvalid,
-                "CLOB authentication requires its one-signature versioned permission",
-            ));
-        }
-        if reusable
-            && (self.message_review_payload.is_some()
-                || class.is_some_and(bloom_broker_api::message_review_requires_exact))
-        {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::ClaimInvalid,
-                "Reviewed Petal messages require exact approval; reusable signing cannot carry an exact review envelope",
-            ));
-        }
-        if (!reusable && polymarket != self.message_review_payload.is_some())
-            || self.message_review_payload.as_ref().is_some_and(|payload| {
-                payload.len() > bloom_broker_api::SINGLE_PAYLOAD_MAX_BYTES
-                    || self.preimages.len() != 1
-                    || self.crypto_suite != CryptoSuite::Secp256k1Keccak256Recoverable
-            })
-        {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::ClaimInvalid,
-                "only Polymarket exact batches carry a review envelope, and each needs exactly one recoverable Keccak payload with its complete envelope",
-            ));
-        }
+        let _ = reusable;
         if self.expires_at_ms.get() <= self.issued_at_ms.get() {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::MalformedFrame,
@@ -2547,8 +2508,6 @@ impl ExactPayloadBatchSignRequest {
         // signed unreviewed. Broker also refuses it; this keeps the error local.
         if self.petal_use_claim.as_ref().is_some_and(|claim| {
             claim.operation_class.as_str() == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS
-                || bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES
-                    .contains(&claim.operation_class.as_str())
         }) {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::ClaimInvalid,
@@ -2605,21 +2564,13 @@ impl ExactPayloadSignRequest {
                 "Message review payload is too large",
             ));
         }
-        let message_required = self.petal_use_claim.as_ref().is_some_and(|claim| {
-            bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES
-                .contains(&claim.operation_class.as_str())
-                || bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES
-                    .contains(&claim.operation_class.as_str())
-        });
         // Machine builds System messages itself, so no Petal can label them.
         // Broker decodes the x402 and MPP payment envelopes for the owner.
         let system = matches!(self.provenance, ProvenanceSubject::System { .. });
         let system_payment = matches!(&self.provenance, ProvenanceSubject::System { operation_class, .. }
             if [bloom_broker_api::SYSTEM_X402_OPERATION_CLASS, bloom_broker_api::SYSTEM_MPP_OPERATION_CLASS]
                 .contains(&operation_class.as_str()));
-        if (message_required
-            || system_payment
-            || (!system && is_signed_message(self.crypto_suite, &self.preimage)))
+        if (system_payment || (!system && is_signed_message(self.crypto_suite, &self.preimage)))
             && self.message_review_payload.is_none()
             && !safe_operation
         {
@@ -3136,15 +3087,7 @@ impl TrustedPetalSignRequest {
         // envelope, rather than of one of the two.
         if self.claim.operation_class.as_str() == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS
             || self.operation_class.as_str() == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS
-            || bloom_broker_api::message_review_requires_exact(self.claim.operation_class.as_str())
-            || bloom_broker_api::message_review_requires_exact(self.operation_class.as_str())
-            || (is_signed_message(self.crypto_suite, &self.preimage)
-                && !(self.operation_class.as_str() == "hyperliquid.agent_action"
-                    && self.claim.operation_class == self.operation_class
-                    && self
-                        .claim_assurance_evidence
-                        .as_ref()
-                        .is_some_and(|bytes| !bytes.is_empty())))
+            || is_signed_message(self.crypto_suite, &self.preimage)
         {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::ClaimInvalid,
@@ -4608,7 +4551,7 @@ mod tests {
             ProtocolErrorCode::LimitExceededFrame
         );
         request.safe_review_payload = None;
-        for class in bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES {
+        for class in &["example.message", "another.login"] {
             request.petal_use_claim.as_mut().unwrap().operation_class = token(class);
             request.message_review_payload = None;
             assert_eq!(
@@ -4760,32 +4703,10 @@ mod tests {
         let mut ordinary = build("order.cancel");
         ordinary.preimage = vec![1];
         ordinary.validate().unwrap();
-        let mut delegated = build("hyperliquid.agent_action");
+        let mut delegated = build("unrelated.delegated-action");
+        delegated.claim_assurance_evidence =
+            Some(b"arbitrary evidence cannot replace a review".to_vec());
         assert!(delegated.validate().is_err());
-        delegated.claim_assurance_evidence = Some(b"full witness checked by Broker".to_vec());
-        delegated.validate().unwrap();
-
-        for class in bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES
-            .iter()
-            .copied()
-            .filter(|class| bloom_broker_api::message_review_requires_exact(class))
-        {
-            for (operation, claim) in [
-                (class, class),
-                (class, "order.cancel"),
-                ("order.cancel", class),
-            ] {
-                let mut request = build(operation);
-                request.claim.operation_class = token(claim);
-                let error = request.validate().unwrap_err();
-                assert_eq!(
-                    error.code,
-                    ProtocolErrorCode::ClaimInvalid,
-                    "{operation}/{claim}"
-                );
-                assert!(error.message.contains("single-payload exact path"));
-            }
-        }
 
         // The Safe class is refused before any wire call, on the claim and on
         // the request, so neither half can be the one that carries it.
@@ -4841,55 +4762,18 @@ mod tests {
     }
 
     #[test]
-    fn polymarket_exact_batch_requires_review_and_cannot_be_downgraded() {
-        let mut request = exact_batch_request(vec![vec![0x19, 0x01]], None);
-        request.petal_use_claim = Some(PetalUseClaim {
-            economic_effects: None,
-            package_hash: digest(70),
-            route: "orders/wallet/0/submit.json".into(),
-            operation_class: token("polymarket.order.poly1271"),
-            crypto_suite: request.crypto_suite,
-            payload_digest: digest(71),
-            ordered_hashes: request.claimed_hashes.clone(),
-            declared_debits: vec![],
-            declared_destinations: vec![],
-            declared_fee: DeclaredFee::None,
-            nonce: RequestNonce::from_bytes([72; 16]),
-            claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
-        });
-        for class in bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES {
-            request.petal_use_claim.as_mut().unwrap().operation_class = token(class);
-            request.message_review_payload = None;
+    fn signed_message_batches_cannot_bypass_the_generic_review_path() {
+        for payload in [
+            vec![0x19, 0x01],
+            b"\x19Ethereum Signed Message:\n4test".to_vec(),
+        ] {
+            let mut request = exact_batch_request(vec![payload], None);
             assert!(request.validate(false).is_err());
-            request.message_review_payload = Some(b"[{}]".to_vec());
-            request.validate(false).unwrap();
             assert!(request.validate(true).is_err());
-            request.preimages.push(vec![1]);
-            request.claimed_hashes.push(digest(90));
+            request.message_review_payload =
+                Some(br#"{"schema":"bloom.message.review.v1"}"#.to_vec());
             assert!(request.validate(false).is_err());
-            request.preimages.pop();
-            request.claimed_hashes.pop();
-            request.crypto_suite = CryptoSuite::Secp256k1Sha256Recoverable;
-            assert!(request.validate(false).is_err());
-            request.crypto_suite = CryptoSuite::Secp256k1Keccak256Recoverable;
-            request.message_review_payload = None;
-            let error = request.validate(true).unwrap_err();
-            assert_eq!(error.code, ProtocolErrorCode::ClaimInvalid);
         }
-        // The same refusal applies outside Polymarket, including callers that
-        // omit the envelope while requesting a reusable approval.
-        for class in bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES {
-            request.petal_use_claim.as_mut().unwrap().operation_class = token(class);
-            let error = request.validate(true).unwrap_err();
-            assert_eq!(error.code, ProtocolErrorCode::ClaimInvalid);
-        }
-        request.petal_use_claim.as_mut().unwrap().operation_class =
-            token(bloom_broker_api::POLYMARKET_CLOB_AUTH_CLASS);
-        request.validate(true).unwrap();
-        assert!(request.validate(false).is_err());
-        request.petal_use_claim = None;
-        request.message_review_payload = Some(b"[{}]".to_vec());
-        assert!(request.validate(false).is_err());
     }
 
     #[tokio::test]

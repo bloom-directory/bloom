@@ -1270,7 +1270,7 @@ pub(crate) async fn create_wallet_then_default_policy(
         .await?;
         if session.stdout.trim_start().starts_with('[') {
             println!(
-                "persona coverage: selected scopes use independent token allowances. Degen includes ERC20 transfers to any recipient on supported networks; selected Polymarket BUY uses pUSD. Approve each returned scope once, then repeat activation to reconcile it."
+                "persona coverage: selected scopes use independent token allowances. Complete the owner ceremonies in the onboarding browser; it reconciles activation automatically."
             );
         }
         crate::print_machine_command_output(&session)?;

@@ -6083,6 +6083,7 @@ mod tests {
 
     fn system_record(operation_class: &str, signature_byte: u8) -> ProvenanceRecord {
         ProvenanceRecord {
+            package_display_name: None,
             subject: ProvenanceSubject::System {
                 component_id: Token::new("bloom-machine").unwrap(),
                 operation_class: Token::new(operation_class).unwrap(),
@@ -6090,6 +6091,7 @@ mod tests {
             publisher: Token::new("bloom-installer").unwrap(),
             petal_lineage: None,
             operation_classes: vec![ProvenanceOperationClass {
+                zero_spend: false,
                 economic_effects_schema: None,
                 operation_class: Token::new(operation_class).unwrap(),
                 fee_asset: Some(ProvenanceFeeAsset {

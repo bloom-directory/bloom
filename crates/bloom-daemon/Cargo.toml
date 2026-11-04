@@ -59,6 +59,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 parking_lot.workspace = true
 alloy.workspace = true
+alloy-dyn-abi.workspace = true
 url.workspace = true
 base64.workspace = true
 blake3.workspace = true

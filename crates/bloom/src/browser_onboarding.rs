@@ -391,6 +391,7 @@ async fn state_snapshot(state: &AppState) -> Result<Value> {
     let discovered_catalog = observe(state, MachineCommand::OnboardingPetals).await;
     let catalog = discovered_catalog
         .get("data")
+        .and_then(|value| value.get("catalog"))
         .filter(|value| value.is_array())
         .cloned()
         .unwrap_or_else(|| {
@@ -402,7 +403,7 @@ async fn state_snapshot(state: &AppState) -> Result<Value> {
             )
         });
     Ok(
-        json!({"config":config, "machine":{"available":available,"persona_supported":persona_supported,"error":wallets.get("error")}, "wallets":wallets, "wallet_choices":choices,"selected_wallet":selected,"wallet_required":available && selected.is_none(), "policy":policy, "sessions":sessions, "catalog":catalog, "reusable_profiles":bloom_broker_api::reusable_signing_profiles().iter().map(|p|json!({"id":p.id,"display_name":p.display_name,"operation_class":p.operation_class})).collect::<Vec<_>>(), "ceremony_url":ceremony_url}),
+        json!({"config":config, "machine":{"available":available,"persona_supported":persona_supported,"error":wallets.get("error")}, "wallets":wallets, "wallet_choices":choices,"selected_wallet":selected,"wallet_required":available && selected.is_none(), "policy":policy, "sessions":sessions, "catalog":catalog, "display_data":discovered_catalog["data"]["display_data"], "ceremony_url":ceremony_url}),
     )
 }
 
@@ -532,10 +533,10 @@ async fn setup(State(state): State<App>, Json(request): Json<SetupRequest>) -> R
 }
 
 async fn action(State(state): State<App>, Json(request): Json<ActionRequest>) -> Response {
-    if matches!(request.action, Action::Rearm) != request.approval.is_some() {
+    if !matches!(request.action, Action::Rearm) && request.approval.is_some() {
         return api_error(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "rearm requires an exact approval; approval is only accepted by rearm",
+            "approval is only accepted by rearm",
         );
     }
     if !matches!(request.action, Action::Activate)
@@ -938,7 +939,6 @@ mod tests {
             r#"{"action":"wallet_import"}"#,
             r#"{"action":"refresh","wallet":"other"}"#,
             r#"{"action":"refresh","wallet":null}"#,
-            r#"{"action":"rearm"}"#,
             r#"{"action":"rearm","approval":null}"#,
             r#"{"action":"rearm","approval":"invalid"}"#,
             r#"{"action":"refresh","approval":"1111111111111111111111111111111111111111111111111111111111111111"}"#,

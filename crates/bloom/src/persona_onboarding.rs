@@ -11,9 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const U256_MAX: &str =
     "115792089237316195423570985008687907853269984665640564039457584007913129639935";
 
-/// Discover only profiles backed by a compiled Broker verifier and the exact
-/// installed package's signed route/effects declarations. Package names and
-/// UI preferences never stand in for provenance or authorize a signature.
+/// Discover routes from installer-certified declarations. Names and operation
+/// class spelling never decide eligibility; token policy and exact keys do.
 pub(super) fn certified_petal_selection(
     package_hash: &Digest32,
     catalog: &ProvenanceCatalog,
@@ -21,10 +20,15 @@ pub(super) fn certified_petal_selection(
     key_ref: &KeyRef,
     capability_schemas: &[Token],
 ) -> Result<Option<PersonaSessionSelection>> {
+    if !capability_schemas
+        .iter()
+        .any(|s| s.as_str() == DECLARED_EFFECTS_CAPABILITY)
+    {
+        return Ok(None);
+    }
     let mut route_grants = Vec::new();
     let mut classes = Vec::new();
-    let mut assets = Vec::new();
-    let mut suites = Vec::new();
+    let mut bounded = false;
     for record in &catalog.records {
         let ProvenanceSubject::Petal {
             package_hash: hash,
@@ -36,41 +40,21 @@ pub(super) fn certified_petal_selection(
         if hash != package_hash {
             continue;
         }
-        let mut route_classes = Vec::new();
-        for profile in reusable_signing_profiles() {
-            if !profile.is_advertised(capability_schemas) {
-                continue;
-            }
-            if !record
-                .operation_classes
-                .iter()
-                .any(|class| profile.matches_certified_class(class))
-            {
-                continue;
-            }
-            if profile.crypto_suite.key_spec() != key_ref.key_spec {
-                continue;
-            }
-            route_classes.push(Token::new(profile.operation_class)?);
-            if !suites.contains(&profile.crypto_suite) {
-                suites.push(profile.crypto_suite);
-            }
-            for asset in profile.token_assets() {
-                if !assets.contains(&asset) {
-                    assets.push(asset);
-                }
-            }
-        }
+        let mut route_classes = record
+            .operation_classes
+            .iter()
+            .filter(|class| class.economic_effects_schema == Some(1) && class.fee_asset.is_none())
+            .map(|class| {
+                bounded |= !class.zero_spend;
+                class.operation_class.clone()
+            })
+            .collect::<Vec<_>>();
         route_classes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         route_classes.dedup();
         if route_classes.is_empty() {
             continue;
         }
-        for class in &route_classes {
-            if !classes.contains(class) {
-                classes.push(class.clone());
-            }
-        }
+        classes.extend(route_classes.clone());
         route_grants.push(PetalRouteGrant {
             route: route.clone(),
             allowed_operation_classes: route_classes,
@@ -85,7 +69,29 @@ pub(super) fn certified_petal_selection(
         bail!("ambiguous certified Petal route");
     }
     classes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-    assets.sort_by(|a, b| (&a.chain, &a.asset).cmp(&(&b.chain, &b.asset)));
+    classes.dedup();
+    let assets = if bounded && key_ref.key_spec == KeySpec::Secp256k1 {
+        known_tokens()
+            .iter()
+            .filter(|token| {
+                bloom_proto::persona::PersonaConfig::suggested(PersonaPreset::Trader)
+                    .token_amounts(&token.symbol)
+                    .is_some()
+            })
+            .map(|token| {
+                Ok(AssetId {
+                    chain: Token::new(format!("evm-{}", token.chain_id))?,
+                    asset: token.address.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        vec![]
+    };
+    let suites = CryptoSuite::ALL
+        .into_iter()
+        .filter(|suite| suite.key_spec() == key_ref.key_spec)
+        .collect();
     let primary = &route_grants[0];
     Ok(Some(PersonaSessionSelection {
         token_allowances: vec![],
@@ -150,47 +156,41 @@ async fn compile_petal_proposals(
             continue;
         };
         let package_hash = Digest32::new(installed)?;
-        let mut selected = None;
+        let mut selections = Vec::new();
         let mut selected_key_specs = Vec::new();
         for suite in CryptoSuite::ALL {
             if selected_key_specs.contains(&suite.key_spec()) {
                 continue;
             }
-            let supported = reusable_signing_profiles().iter().any(|profile| {
-                profile.crypto_suite == suite
-                    && profile.is_advertised(&capabilities.schemas)
-                    && catalog.records.iter().any(|record| {
-                        matches!(&record.subject, ProvenanceSubject::Petal { package_hash: hash, .. } if hash == &package_hash)
-                            && record.operation_classes.iter().any(|class| profile.matches_certified_class(class))
-                    })
-            });
-            if !supported {
-                continue;
-            }
             selected_key_specs.push(suite.key_spec());
-            let key = selected_account_key(daemon, wallet, account, suite).await?;
-            if let Some(selection) = certified_petal_selection(
+            let Ok(key) = selected_account_key(daemon, wallet, account, suite).await else {
+                continue;
+            };
+            if let Some(mut selection) = certified_petal_selection(
                 &package_hash,
                 &catalog,
                 account,
                 &key,
                 &capabilities.schemas,
             )? {
-                if selected.is_some() {
-                    bail!(
-                        "multiple key profiles for one Petal require an explicit account selection"
-                    );
-                }
-                selected = Some(selection);
+                selection.assets.retain(|asset| {
+                    config
+                        .chains
+                        .values()
+                        .any(|chain| asset.chain.as_str() == format!("evm-{}", chain.chain_id))
+                });
+                selections.push(selection);
             }
         }
-        let Some(selection) = selected else {
+        if selections.is_empty() {
             continue;
-        };
+        }
         if !policy.allowed_petal_packages.contains(&package_hash) {
             bail!("selected Petal {name} is not allowed by the signed wallet policy");
         }
-        proposals.extend(compile_selection(daemon, wallet, selection).await?);
+        for selection in selections {
+            proposals.extend(compile_selection(daemon, wallet, selection).await?);
+        }
     }
     Ok(proposals)
 }
@@ -209,12 +209,9 @@ pub(crate) async fn compile_selection(
     if profile.preset == PersonaPreset::Custodian {
         bail!("Institutional retains individual owner approval");
     }
-    if selection.members.is_empty()
-        || selection.members.len() > 128
-        || selection.assets.is_empty()
-        || selection.assets.len() > 128
+    if selection.members.is_empty() || selection.members.len() > 128 || selection.assets.len() > 128
     {
-        bail!("select 1–128 members and tokens");
+        bail!("select 1–128 members and at most 128 tokens");
     }
     let broker = daemon.broker_client().context("Broker unavailable")?;
     let wallet_id = Token::new(wallet)?;
@@ -370,7 +367,7 @@ pub(crate) async fn compile_selection(
             bail!("member must select an existing exact key and reusable scope");
         }
         let mut selector = member.selector;
-        if let ApprovalSelector::SystemSession { scope } = &mut selector {
+        if let ApprovalSelector::NativeSession { scope } = &mut selector {
             // Reviewed recipients come from explicit selection. Raw caps use
             // the selected token quantities and are immutable after approval.
             if scope.per_action_value_limits.is_empty() {
@@ -419,7 +416,22 @@ pub(crate) async fn compile_selection(
         .into_iter()
         .map(|(account, mut terms)| {
             let scope = session_member_scope_digest(&terms)?;
+            let petal_policy = if let ApprovalSubject::Petal {package_hash,..} = &terms.subject {
+                let catalog = daemon.persona_provenance_catalog().context("installer provenance unavailable")?;
+                let selected_classes = match &terms.selector {ApprovalSelector::Petal {allowed_operation_classes,..} => allowed_operation_classes,_=>unreachable!()};
+                let mut zero_spend_classes = catalog.records.iter().filter(|record| matches!(&record.subject,ProvenanceSubject::Petal {package_hash:hash,..} if hash == package_hash))
+                    .flat_map(|record| &record.operation_classes)
+                    .filter(|class| class.zero_spend && class.economic_effects_schema == Some(1) && selected_classes.contains(&class.operation_class))
+                    .map(|class| class.operation_class.clone()).collect::<Vec<_>>();
+                zero_spend_classes.sort_by(|a,b|a.as_str().cmp(b.as_str()));zero_spend_classes.dedup();
+                Some(PetalSessionPolicy {
+                    persona:match profile.preset {PersonaPreset::Trader=>PetalSessionPersona::Trader,PersonaPreset::Degen=>PetalSessionPersona::Degen,PersonaPreset::Custodian=>unreachable!()},
+                    zero_spend_rate_limit:(!zero_spend_classes.is_empty()).then(||SlidingWindow {maximum:DecimalU64::new(profile.zero_spend_hourly_cap().expect("automatic persona")),duration_ms:DecimalU64::new(3_600_000)}),
+                    zero_spend_classes,
+                })
+            } else {None};
             let mut budget = SessionBudget {
+                petal_policy,
                 token_policy: Some(SessionTokenPolicy {
                     schema_version: 3,
                     budget_nonce: RequestNonce::from_bytes(rand::random()),
@@ -452,6 +464,57 @@ pub(crate) async fn compile_selection(
     Ok(proposals)
 }
 
+/// Public review data uses the same exact deployments and raw preset quantities
+/// as compilation. This is presentation only; installer provenance and grants
+/// still decide authority.
+pub(crate) fn onboarding_display_data(daemon: &Daemon) -> Result<serde_json::Value> {
+    let config = bloom_proto::Config::load(&daemon.home.config_path())?;
+    let catalog = daemon.persona_provenance_catalog();
+    let mut assets = Vec::new();
+    for token in known_tokens().iter().filter(|token| {
+        config
+            .chains
+            .values()
+            .any(|chain| chain.chain_id == token.chain_id)
+    }) {
+        let mut limits = serde_json::Map::new();
+        for preset in [PersonaPreset::Trader, PersonaPreset::Degen] {
+            let profile = bloom_proto::persona::PersonaConfig::suggested(preset);
+            if let Some((action, window)) = profile.token_amounts(&token.symbol) {
+                limits.insert(preset.as_str().into(),serde_json::json!({"per_action":token_units(action,token.decimals)?,"per_window":token_units(window,token.decimals)?,"window_secs":profile.window_secs.to_string()}));
+            }
+        }
+        if !limits.is_empty() {
+            assets.push(serde_json::json!({"chain":format!("evm-{}",token.chain_id),"asset":token.address,"symbol":token.symbol,"decimals":token.decimals,"limits":limits}));
+        }
+    }
+    let mut petals = Vec::new();
+    for name in crate::default_policy::onboarding_petals(daemon)? {
+        let hash = daemon.petals.store().resolve_petal_owner(&name)?;
+        let records=catalog.as_ref().map(|catalog|catalog.records.iter().filter(|record|matches!(&record.subject,ProvenanceSubject::Petal {package_hash,..} if Some(package_hash.as_str())==hash.as_deref())).collect::<Vec<_>>()).unwrap_or_default();
+        let mut zero_spend_classes = records
+            .iter()
+            .flat_map(|r| &r.operation_classes)
+            .filter(|class| class.zero_spend && class.economic_effects_schema == Some(1))
+            .map(|class| class.operation_class.clone())
+            .collect::<Vec<_>>();
+        zero_spend_classes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        zero_spend_classes.dedup();
+        let display_name = records
+            .iter()
+            .find_map(|r| r.package_display_name.as_deref())
+            .unwrap_or_else(|| crate::default_policy::petal_label(&name));
+        petals.push(serde_json::json!({"id":name,"package_hash":hash,"display_name":display_name,"assets":assets,"zero_spend_classes":zero_spend_classes}));
+    }
+    let rate = |preset| {
+        let profile = bloom_proto::persona::PersonaConfig::suggested(preset);
+        serde_json::json!({"maximum":profile.zero_spend_hourly_cap().unwrap().to_string(),"duration_ms":"3600000"})
+    };
+    Ok(
+        serde_json::json!({"petals":petals,"zero_spend_rate_limits":{"trader":rate(PersonaPreset::Trader),"degen":rate(PersonaPreset::Degen)}}),
+    )
+}
+
 fn token_units(value: &str, decimals: u8) -> Result<DecimalU256> {
     let mut parts = value.split('.');
     let whole = parts.next().unwrap_or("");
@@ -481,8 +544,8 @@ fn token_units(value: &str, decimals: u8) -> Result<DecimalU256> {
 fn selection_scope_matches(stored: &ApprovalSelector, selected: &ApprovalSelector) -> bool {
     match (stored, selected) {
         (
-            ApprovalSelector::SystemSession { scope: a },
-            ApprovalSelector::SystemSession { scope: b },
+            ApprovalSelector::NativeSession { scope: a },
+            ApprovalSelector::NativeSession { scope: b },
         ) if b.per_action_value_limits.is_empty() => {
             let mut a = a.clone();
             a.per_action_value_limits.clear();
@@ -705,7 +768,7 @@ async fn degen_transfer_selection(
                 component_id: Token::new("bloom-machine")?,
                 operation_class: Token::new("transaction.confirm")?,
             },
-            selector: ApprovalSelector::SystemSession {
+            selector: ApprovalSelector::NativeSession {
                 scope: SystemSessionScope {
                     component_id: Token::new("bloom-machine")?,
                     actions: vec![SystemSessionAction::Erc20Transfer],
@@ -789,96 +852,65 @@ mod tests {
         );
     }
     #[test]
-    fn discovery_uses_certified_profiles_not_package_names_or_schema_alone() {
+    fn discovery_is_generic_and_requires_signed_effects_metadata() {
         let explicit: PersonaSessionSelection = serde_json::from_str(include_str!(
             "../../../docs/examples/generic-session-selection.json"
         ))
         .unwrap();
         let key = explicit.members[0].key_ref.clone();
         let hash = Digest32::from_bytes([7; 32]);
-        for profile in reusable_signing_profiles() {
-            let advertised = vec![Token::new(profile.capability_schema()).unwrap()];
-            let record = |route: &str| ProvenanceRecord {
-                subject: ProvenanceSubject::Petal {
-                    package_hash: hash.clone(),
-                    route: route.into(),
-                },
-                publisher: Token::new("test-publisher").unwrap(),
-                petal_lineage: None,
-                operation_classes: vec![ProvenanceOperationClass {
-                    economic_effects_schema: Some(1),
-                    operation_class: Token::new(profile.operation_class).unwrap(),
-                    fee_asset: None,
-                }],
-                installer_key_id: Token::new("test-installer").unwrap(),
-                installer_signature: Base64UrlBytes::from_bytes(&[0; 64]),
-            };
-            let mut catalog = ProvenanceCatalog {
-                schema: PROVENANCE_CATALOG_SCHEMA.into(),
-                records: vec![record("r000002"), record("r000001")],
-            };
-            let selection = certified_petal_selection(&hash, &catalog, 3, &key, &advertised)
-                .unwrap()
-                .unwrap();
-            assert!(
-                certified_petal_selection(&hash, &catalog, 3, &key, &[])
-                    .unwrap()
-                    .is_none()
-            );
-            assert_eq!(selection.members.len(), 1);
-            assert_eq!(selection.members[0].account, 3);
-            let mut expected_assets = profile.token_assets();
-            expected_assets.sort_by(|a, b| (&a.chain, &a.asset).cmp(&(&b.chain, &b.asset)));
-            expected_assets.dedup();
-            assert_eq!(selection.assets, expected_assets);
-            let ApprovalSelector::Petal { route_grants, .. } = &selection.members[0].selector
-            else {
-                panic!("Petal scope expected")
-            };
-            assert_eq!(route_grants.len(), 2);
-            assert_eq!(route_grants[0].route, "r000001");
-            assert!(
-                certified_petal_selection(
-                    &Digest32::from_bytes([8; 32]),
-                    &catalog,
-                    3,
-                    &key,
-                    &advertised
-                )
+        let advertised = vec![Token::new(DECLARED_EFFECTS_CAPABILITY).unwrap()];
+        let record = |route: &str| ProvenanceRecord {
+            package_display_name: Some("An unrelated reviewed package".into()),
+            subject: ProvenanceSubject::Petal {
+                package_hash: hash.clone(),
+                route: route.into(),
+            },
+            publisher: Token::new("test-publisher").unwrap(),
+            petal_lineage: None,
+            operation_classes: vec![ProvenanceOperationClass {
+                zero_spend: false,
+                economic_effects_schema: Some(1),
+                operation_class: Token::new("unrelated.action").unwrap(),
+                fee_asset: None,
+            }],
+            installer_key_id: Token::new("test-installer").unwrap(),
+            installer_signature: Base64UrlBytes::from_bytes(&[0; 64]),
+        };
+        let mut catalog = ProvenanceCatalog {
+            schema: PROVENANCE_CATALOG_SCHEMA.into(),
+            records: vec![record("r2"), record("r1")],
+        };
+        let selected = certified_petal_selection(&hash, &catalog, 3, &key, &advertised)
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.members[0].account, 3);
+        assert!(!selected.assets.is_empty());
+        assert!(
+            certified_petal_selection(&hash, &catalog, 3, &key, &[])
                 .unwrap()
                 .is_none()
-            );
-            for r in &mut catalog.records {
-                r.operation_classes[0].operation_class = Token::new("example.unknown").unwrap();
-            }
-            assert!(
-                certified_petal_selection(&hash, &catalog, 3, &key, &advertised)
-                    .unwrap()
-                    .is_none()
-            );
-            catalog.records = vec![record("r000001")];
-            catalog.records[0].operation_classes[0].economic_effects_schema = None;
-            assert!(
-                certified_petal_selection(&hash, &catalog, 3, &key, &advertised)
-                    .unwrap()
-                    .is_none()
-            );
-            catalog.records[0].operation_classes[0].economic_effects_schema = Some(2);
-            assert!(
-                certified_petal_selection(&hash, &catalog, 3, &key, &advertised)
-                    .unwrap()
-                    .is_none()
-            );
-            catalog.records = vec![record("r000001"), record("r000001")];
-            assert!(certified_petal_selection(&hash, &catalog, 3, &key, &advertised).is_err());
-            catalog.records = vec![record("r000001")];
-            let wrong_key = explicit.members[1].key_ref.clone();
-            assert!(
-                certified_petal_selection(&hash, &catalog, 3, &wrong_key, &advertised)
-                    .unwrap()
-                    .is_none()
-            );
+        );
+        for record in &mut catalog.records {
+            record.operation_classes[0].zero_spend = true;
         }
+        assert!(
+            certified_petal_selection(&hash, &catalog, 3, &key, &advertised)
+                .unwrap()
+                .unwrap()
+                .assets
+                .is_empty()
+        );
+        for record in &mut catalog.records {
+            record.operation_classes[0].economic_effects_schema = None;
+        }
+        assert!(
+            certified_petal_selection(&hash, &catalog, 3, &key, &advertised)
+                .unwrap()
+                .is_none()
+        );
+        catalog.records = vec![record("r1"), record("r1")];
+        assert!(certified_petal_selection(&hash, &catalog, 3, &key, &advertised).is_err());
     }
 
     #[test]
@@ -891,7 +923,7 @@ mod tests {
         assert_eq!(selection.assets.len(), 4);
         assert!(matches!(
             selection.members[0].selector,
-            ApprovalSelector::SystemSession { .. }
+            ApprovalSelector::NativeSession { .. }
         ));
         assert!(matches!(
             selection.members[1].selector,

@@ -104,8 +104,8 @@ release gates still apply.
 The prepared-signing SDK host fixture requires the canonical SDK checkout at
 Machine's `bloom-petal-contract` revision. In that checkout, run
 `cargo run --locked -p bloom-petal-cli -- build --config fixtures/petal-build.toml`
-with `wasm32-wasip2` and `wasm-tools` installed. Then run from Machine:
-`BLOOM_PREPARED_FIXTURES=<sdk-checkout>/fixtures/components cargo test --locked -p bloom-petals --test prepared_actions -- --ignored`.
+with `wasm32-unknown-unknown`, `wasm32-wasip2` and `wasm-tools` installed. Then run from Machine:
+`BLOOM_PREPARED_FIXTURES=<sdk-checkout>/fixtures/components cargo test --locked -p bloom-petals --test prepared_actions`.
 The CI prepared-signing fixture job performs these steps against the pinned revision.
 
 The reusable-permission acceptance harness uses built Petal components and real

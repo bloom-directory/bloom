@@ -315,6 +315,7 @@ pub fn exact_signing_catalog(operation_classes: &[&str]) -> ProvenanceCatalog {
         records: operation_classes
             .iter()
             .map(|operation_class| ProvenanceRecord {
+                package_display_name: None,
                 subject: ProvenanceSubject::System {
                     component_id: Token::new("bloom-machine").unwrap(),
                     operation_class: Token::new(*operation_class).unwrap(),
@@ -322,6 +323,7 @@ pub fn exact_signing_catalog(operation_classes: &[&str]) -> ProvenanceCatalog {
                 publisher: Token::new("bloom-installer").unwrap(),
                 petal_lineage: None,
                 operation_classes: vec![ProvenanceOperationClass {
+                    zero_spend: false,
                     economic_effects_schema: None,
                     operation_class: Token::new(*operation_class).unwrap(),
                     fee_asset: Some(ProvenanceFeeAsset {

@@ -165,10 +165,31 @@ fn claim(
                 }
                 entries.push(serde_json::json!({"asset":{"chain":d.network,"asset":asset},"amount":d.amount}));
             }
-            let effects = (debits.iter().all(|d| d.amount != "0") && debits.iter().all(|d| d.network == debits[0].network)).then(|| serde_json::json!({"schema_version":1,"permission_effect":"none","payload_contexts":[{"payload_index":0,"network":debits[0].network,"spending_accounts":[]}]}));
+            let effects = (debits.iter().all(|d| d.amount != "0") && debits.iter().all(|d| d.network == debits[0].network)).then(|| serde_json::json!({"schema_version":1,"spend":"bounded","permission_effect":"none","payload_contexts":[{"payload_index":0,"network":debits[0].network,"spending_accounts":[]}]}));
             (entries, effects)
         }
-        _ => (Vec::new(), None),
+        prepared::Spend::None => {
+            let review: serde_json::Value = serde_json::from_slice(&action.review.bytes)
+                .map_err(|e| error(ErrorCode::Invalid, e))?;
+            let chain_id = &review["typed_data"]["domain"]["chainId"];
+            let chain = chain_id
+                .as_u64()
+                .map(|id| format!("evm-{id}"))
+                .or_else(|| {
+                    chain_id
+                        .as_str()
+                        .and_then(|id| id.parse::<u64>().ok())
+                        .map(|id| format!("evm-{id}"))
+                })
+                .unwrap_or_else(|| "message".into());
+            (
+                Vec::new(),
+                Some(
+                    serde_json::json!({"schema_version":1,"spend":"none","permission_effect":"none","payload_contexts":[{"payload_index":0,"network":chain,"spending_accounts":[]}]}),
+                ),
+            )
+        }
+        prepared::Spend::Unspecified => (Vec::new(), None),
     };
     let nonce = Sha256::digest(
         [
@@ -185,100 +206,61 @@ fn claim(
     serde_jcs::to_vec(&typed).map_err(|e| error(ErrorCode::Backend, e))
 }
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ClobReview {
-    operation: String,
-    intent: String,
-    owner: String,
-    signing_hash: String,
-    signing_preimage_hex: String,
-    preimage: ClobFields,
-}
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ClobFields {
-    timestamp: u64,
-    nonce: u64,
-    chain_id: u64,
-    review_intent_hash: String,
-}
-
-fn clob_validate(
-    action: &prepared::PreparedAction,
-    owner: alloy::primitives::Address,
-) -> Result<(), SigningError> {
-    use alloy::primitives::{U256, keccak256};
-    if action.operation_class != bloom_broker_api::POLYMARKET_CLOB_AUTH_CLASS
-        || action.payload.suite != prepared::CryptoSuite::Keccak256
-        || action.review.format != "polymarket.prepared-record"
-        || action.review.version != 1
-        || !matches!(
-            action.spend,
-            prepared::Spend::Unspecified | prepared::Spend::None
-        )
-    {
-        return Err(error(ErrorCode::Invalid, "invalid ClobAuth profile"));
+fn validate_message_review(action: &prepared::PreparedAction) -> Result<(), SigningError> {
+    if action.review.format != "bloom.message.review" || action.review.version != 1 {
+        return Err(error(
+            ErrorCode::Unsupported,
+            "review format is not supported",
+        ));
     }
-    let records: Vec<ClobReview> =
+    let value: serde_json::Value =
         serde_json::from_slice(&action.review.bytes).map_err(|e| error(ErrorCode::Invalid, e))?;
-    let [record] = records.as_slice() else {
+    if value["schema"] != "bloom.message.review.v1"
+        || !matches!(value["kind"].as_str(), Some("eip712" | "personal"))
+    {
+        return Err(error(ErrorCode::Invalid, "invalid message review envelope"));
+    }
+    if action.payload.suite != prepared::CryptoSuite::Keccak256 {
         return Err(error(
             ErrorCode::Invalid,
-            "ClobAuth requires one review record",
+            "message review requires recoverable Keccak signing",
         ));
+    }
+    let preimage = match value["kind"].as_str() {
+        Some("eip712") => {
+            let typed: alloy_dyn_abi::eip712::TypedData =
+                serde_json::from_value(value["typed_data"].clone())
+                    .map_err(|e| error(ErrorCode::Invalid, e))?;
+            let mut preimage = vec![0x19, 0x01];
+            preimage.extend_from_slice(typed.domain.separator().as_slice());
+            if typed.primary_type != "EIP712Domain" {
+                preimage.extend_from_slice(
+                    typed
+                        .hash_struct()
+                        .map_err(|e| error(ErrorCode::Invalid, e))?
+                        .as_slice(),
+                );
+            }
+            preimage
+        }
+        Some("personal") => {
+            let message = value["message"]
+                .as_str()
+                .ok_or_else(|| error(ErrorCode::Invalid, "personal review requires a message"))?;
+            let mut preimage =
+                format!("\x19Ethereum Signed Message:\n{}", message.len()).into_bytes();
+            preimage.extend_from_slice(message.as_bytes());
+            preimage
+        }
+        _ => unreachable!(),
     };
-    let parsed_owner: alloy::primitives::Address = record
-        .owner
-        .parse()
-        .map_err(|e| error(ErrorCode::Invalid, e))?;
-    if record.operation != "clob_auth"
-        || record.intent != action.operation_class
-        || parsed_owner != owner
-        || record.preimage.chain_id != 137
-        || record.preimage.nonce != 0
-        || record.signing_hash != format!("0x{}", hex::encode(action.payload.hash))
-        || record.signing_preimage_hex != hex::encode(&action.payload.preimage)
+    if action.payload.preimage != preimage
+        || action.payload.hash != alloy::primitives::keccak256(&preimage).0
     {
         return Err(error(
             ErrorCode::Invalid,
-            "ClobAuth review differs from selected owner or payload",
+            "message review differs from signing payload",
         ));
-    }
-    let mut domain = Vec::new();
-    domain.extend_from_slice(
-        keccak256("EIP712Domain(string name,string version,uint256 chainId)").as_slice(),
-    );
-    domain.extend_from_slice(keccak256("ClobAuthDomain").as_slice());
-    domain.extend_from_slice(keccak256("1").as_slice());
-    domain.extend_from_slice(&U256::from(137).to_be_bytes::<32>());
-    let mut message = Vec::new();
-    message.extend_from_slice(
-        keccak256("ClobAuth(address address,string timestamp,uint256 nonce,string message)")
-            .as_slice(),
-    );
-    message.extend_from_slice(&[0; 12]);
-    message.extend_from_slice(owner.as_slice());
-    message.extend_from_slice(keccak256(record.preimage.timestamp.to_string()).as_slice());
-    message.extend_from_slice(&[0; 32]);
-    message.extend_from_slice(
-        keccak256("This message attests that I control the given wallet").as_slice(),
-    );
-    let mut expected = vec![0x19, 0x01];
-    expected.extend_from_slice(keccak256(domain).as_slice());
-    expected.extend_from_slice(keccak256(message).as_slice());
-    if action.payload.preimage != expected {
-        return Err(error(
-            ErrorCode::Invalid,
-            "ClobAuth payload does not match its owner and timestamp",
-        ));
-    }
-    let intent = serde_json::json!({"operation":"clob_auth","owner":record.owner,"chain_id":137,"timestamp":record.preimage.timestamp,"nonce":0,"message":"This message attests that I control the given wallet","signing_hash":record.signing_hash});
-    // The guest serializes a sorted JSON map; Machine's serde_json build may
-    // enable preserve_order through other crates, so canonicalize explicitly.
-    let encoded = serde_jcs::to_vec(&intent).map_err(|e| error(ErrorCode::Invalid, e))?;
-    if record.preimage.review_intent_hash != blake3::hash(&encoded).to_hex().to_string() {
-        return Err(error(ErrorCode::Invalid, "ClobAuth review intent differs"));
     }
     Ok(())
 }
@@ -425,34 +407,6 @@ impl DaemonPetalHost {
         })
     }
 
-    async fn prepared_evm_owner(
-        &self,
-        key: &bloom_broker_api::KeyRef,
-    ) -> Result<alloy::primitives::Address, SigningError> {
-        use k256::pkcs8::DecodePublicKey as _;
-        let broker = self
-            .broker
-            .as_ref()
-            .ok_or_else(|| error(ErrorCode::Backend, "Broker unavailable"))?;
-        let public = broker
-            .key(bloom_broker_api::KeyRequest {
-                key_ref: key.clone(),
-            })
-            .await
-            .map_err(|e| error(ErrorCode::Backend, e))?;
-        if public.key_ref != *key {
-            return Err(error(ErrorCode::Denied, "selected public key differs"));
-        }
-        let public_bytes = public.canonical_public_key.decode();
-        if hex::encode(Sha256::digest(&public_bytes)) != key.public_key_fingerprint.as_str() {
-            return Err(error(ErrorCode::Backend, "public key fingerprint differs"));
-        }
-        let key = k256::PublicKey::from_public_key_der(&public_bytes)
-            .map_err(|e| error(ErrorCode::Backend, e))?;
-        let verifying_key = k256::ecdsa::VerifyingKey::from(key);
-        Ok(alloy::primitives::Address::from_public_key(&verifying_key))
-    }
-
     pub(super) async fn run_prepared(
         &self,
         request: prepared::Request,
@@ -468,45 +422,10 @@ impl DaemonPetalHost {
         if request.action.payload.preimage.is_empty() {
             return Err(error(ErrorCode::Invalid, "empty preimage"));
         }
-        if !matches!(
-            request.action.review.format.as_str(),
-            "polymarket.prepared-record" | "bloom.message.review"
-        ) || request.action.review.version != 1
-        {
-            return Err(error(
-                ErrorCode::Unsupported,
-                "review format is not supported",
-            ));
-        }
-        if request.action.review.format == "bloom.message.review"
-            && serde_json::from_slice::<serde_json::Value>(&request.action.review.bytes)
-                .ok()
-                .is_none_or(|value| value["schema"] != "bloom.message.review.v1")
-        {
-            return Err(error(ErrorCode::Invalid, "invalid message review envelope"));
-        }
-        if request.action.review.format == "polymarket.prepared-record"
-            && !bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES
-                .contains(&request.action.operation_class.as_str())
-            && request.action.operation_class != bloom_broker_api::POLYMARKET_CLOB_AUTH_CLASS
-        {
-            return Err(error(
-                ErrorCode::Unsupported,
-                "review format does not match operation class",
-            ));
-        }
-        let is_clob =
-            request.action.operation_class == bloom_broker_api::POLYMARKET_CLOB_AUTH_CLASS;
+        validate_message_review(&request.action)?;
         let key = self
             .prepared_key(&context, &request.wallet, request.action.payload.suite)
             .await?;
-        let clob_owner = if is_clob {
-            let owner = self.prepared_evm_owner(&key).await?;
-            clob_validate(&request.action, owner)?;
-            Some(owner)
-        } else {
-            None
-        };
         let root = self
             .petal_signing_state_root
             .as_ref()
@@ -552,20 +471,10 @@ impl DaemonPetalHost {
         }
         state.action.validate()?;
         if state.action != request.action {
-            if let Some(owner) = clob_owner {
-                clob_validate(&state.action, owner)?;
-                if matches!(state.outcome, Some(SigningOutcome::Signed { .. })) {
-                    return Ok(SigningOutcome::RecoveryRequired {
-                        status: "signed_payload_differs".into(),
-                    });
-                }
-                state.action = request.action.clone();
-            } else {
-                return Err(error(
-                    ErrorCode::Conflict,
-                    "operation key is bound to different action",
-                ));
-            }
+            return Err(error(
+                ErrorCode::Conflict,
+                "operation key is bound to different action",
+            ));
         }
         if let Some(SigningOutcome::Signed { signature }) = &state.outcome {
             self.prepared_verify(&key, &state.action, signature).await?;
@@ -589,16 +498,14 @@ impl DaemonPetalHost {
             "bloom.internal.prepared-operation".into(),
             request.operation_key.clone(),
         ));
-        let allow_persona = matches!(&action.spend, prepared::Spend::Bounded { debits } if debits.iter().all(|d| d.amount != "0") && debits.iter().all(|d| d.network == debits[0].network));
-        context.params.push((
-            "bloom.internal.prepared-persona".into(),
-            allow_persona.to_string(),
-        ));
+        context
+            .params
+            .push(("bloom.internal.prepared-persona".into(), "true".into()));
         context.params.push((
             "bloom.internal.prepared-key".into(),
             serde_json::to_string(&key).map_err(|e| error(ErrorCode::Backend, e))?,
         ));
-        if action.review.format == "bloom.message.review" {
+        {
             let single = bloom_petals::PayloadSignRequest {
                 wallet: request.wallet,
                 preimage: action.payload.preimage.clone(),
@@ -638,49 +545,6 @@ impl DaemonPetalHost {
             write_record(&state_path, &state)?;
             return Ok(outcome);
         }
-        let old_request = PayloadBatchSignRequest {
-            wallet: request.wallet,
-            payloads: vec![bloom_petals::PayloadSignItem {
-                preimage: action.payload.preimage.clone(),
-                claimed_hash: action.payload.hash,
-            }],
-            signature_algorithm: algorithm.into(),
-            operation_class: action.operation_class.clone(),
-            petal_use_claim_jcs: claim(&context, action)?,
-            claim_assurance_evidence: None,
-            approval_hint: None,
-            action: Some(action.review.bytes.clone()),
-            advisory: None,
-            selector: if is_clob {
-                bloom_broker_api::PetalSignSelector::Reusable
-            } else {
-                bloom_broker_api::PetalSignSelector::Exact
-            },
-            key_ref: None,
-            context: Some(context),
-        };
-        let result = match self.sign_payload_batch_outcome(old_request).await {
-            Ok(result) => result,
-            Err(err) => return prepared_signing_failure(err),
-        };
-        let outcome = match result {
-            PayloadBatchSignOutcome::ApprovalPending(pending) => SigningOutcome::ApprovalPending {
-                action_id: pending.action_id,
-                expires_ms: pending.expires_ms,
-            },
-            PayloadBatchSignOutcome::Signatures(signatures) => {
-                let [signature] = signatures.as_slice() else {
-                    return Err(error(ErrorCode::Backend, "invalid signature count"));
-                };
-                self.prepared_verify(&key, action, signature).await?;
-                SigningOutcome::Signed {
-                    signature: signature.clone(),
-                }
-            }
-        };
-        state.outcome = Some(outcome.clone());
-        write_record(&state_path, &state)?;
-        Ok(outcome)
     }
 
     pub(super) async fn status_prepared(
@@ -912,38 +776,6 @@ mod tests {
         .with_spend(spend)
     }
     #[test]
-    fn prepared_single_message_discovery_requires_the_reviewed_gasless_profile() {
-        let mut trusted = context();
-        assert!(!prepared_message_persona_eligible(
-            &trusted,
-            "gasless.relay"
-        ));
-        trusted
-            .params
-            .push(("bloom.internal.prepared-persona".into(), "true".into()));
-        let gasless_supported = bloom_broker_api::reusable_signing_profiles()
-            .iter()
-            .any(|profile| profile.id == "gasless.relay.eip3009.v1");
-        assert!(
-            gasless_supported,
-            "candidate Broker API must include the reviewed gasless adapter"
-        );
-        assert!(prepared_message_persona_eligible(&trusted, "gasless.relay"));
-        for class in [
-            "example.order",
-            "gasless.unknown",
-            "polymarket.order.poly1271",
-        ] {
-            assert!(!prepared_message_persona_eligible(&trusted, class));
-        }
-        trusted.params.last_mut().unwrap().1 = "false".into();
-        assert!(!prepared_message_persona_eligible(
-            &trusted,
-            "gasless.relay"
-        ));
-    }
-
-    #[test]
     fn debit_claim_binds_exact_chain_asset_and_payload() {
         let spend = prepared::Spend::erc20(
             "evm-137",
@@ -964,10 +796,9 @@ mod tests {
         assert_eq!(bytes, serde_jcs::to_vec(&claim).unwrap());
     }
     #[test]
-    fn zero_and_unspecified_declarations_cannot_create_reusable_effects() {
+    fn zero_bounded_and_unspecified_declarations_cannot_create_reusable_effects() {
         for spend in [
             prepared::Spend::Unspecified,
-            prepared::Spend::None,
             prepared::Spend::erc20("evm-137", "0x1111111111111111111111111111111111111111", "0")
                 .unwrap(),
         ] {
@@ -977,34 +808,33 @@ mod tests {
         }
     }
     #[test]
-    fn clob_profile_accepts_only_authoritative_owner_and_exact_payload() {
-        let owner: alloy::primitives::Address = "0x0000000000000000000000000000000000000007"
-            .parse()
-            .unwrap();
-        let preimage = hex::decode("1901cfc66be2a3b30464cb3b588324101f660c9a205fa76e8e5f83ee16a528e1c4cb50968619823f5177bd507b288d899a2d0d517f0dd56d62217210884afcd70217").unwrap();
-        let hash = "0x46cf12b7c0c5f516befb1439a288dc3f247bc23b80e48ca26e3fdebd5ad00f95";
-        let owner_text = format!("{owner:#x}");
-        let intent = serde_json::json!({"operation":"clob_auth", "owner":owner_text, "chain_id":137, "timestamp":1800000000u64, "nonce":0, "message":"This message attests that I control the given wallet", "signing_hash":hash});
-        let intent_hash = blake3::hash(&serde_jcs::to_vec(&intent).unwrap())
-            .to_hex()
-            .to_string();
-        let record = serde_json::json!([{"operation":"clob_auth", "intent":bloom_broker_api::POLYMARKET_CLOB_AUTH_CLASS, "owner":owner_text, "signing_hash":hash, "signing_preimage_hex":hex::encode(&preimage), "preimage":{"timestamp":1800000000u64,"nonce":0,"chain_id":137,"review_intent_hash":intent_hash}}]);
-        let action = prepared::PreparedAction::new(
-            bloom_broker_api::POLYMARKET_CLOB_AUTH_CLASS,
-            prepared::SigningPayload::keccak256(preimage).unwrap(),
-            prepared::ReviewArtifact::new(
-                "polymarket.prepared-record",
-                1,
-                serde_json::to_vec(&record).unwrap(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert!(clob_validate(&action, owner).is_ok());
-        assert!(clob_validate(&action, alloy::primitives::Address::with_last_byte(8)).is_err());
-        let mut changed = action;
-        changed.payload.preimage[40] ^= 1;
-        assert!(clob_validate(&changed, owner).is_err());
+    fn explicit_none_is_distinct_from_unspecified_and_binds_a_payload_context() {
+        let declaration: bloom_broker_api::PetalUseClaim =
+            serde_json::from_slice(&claim(&context(), &action(prepared::Spend::None)).unwrap())
+                .unwrap();
+        assert!(declaration.declared_debits.is_empty());
+        let effects = declaration.economic_effects.unwrap();
+        assert_eq!(effects.spend, bloom_broker_api::DeclaredSpendKind::None);
+        assert_eq!(effects.payload_contexts[0].network.as_str(), "message");
+    }
+
+    #[test]
+    fn generic_review_binds_the_exact_payload_independently_of_class_and_debit() {
+        let text = "An ordinary login";
+        let mut preimage = format!("\x19Ethereum Signed Message:\n{}", text.len()).into_bytes();
+        preimage.extend_from_slice(text.as_bytes());
+        let mut action=prepared::PreparedAction::new("unrelated.login",prepared::SigningPayload::keccak256(preimage).unwrap(),prepared::ReviewArtifact::new("bloom.message.review",1,serde_json::to_vec(&serde_json::json!({"schema":"bloom.message.review.v1","kind":"personal","message":text})).unwrap()).unwrap()).unwrap().with_spend(prepared::Spend::None);
+        validate_message_review(&action).unwrap();
+        action.review.bytes=serde_json::to_vec(&serde_json::json!({"schema":"bloom.message.review.v1","kind":"personal","message":"different"})).unwrap();
+        assert_eq!(
+            validate_message_review(&action).unwrap_err().code,
+            ErrorCode::Invalid
+        );
+        action.review.format = "unsupported.review".into();
+        assert_eq!(
+            validate_message_review(&action).unwrap_err().code,
+            ErrorCode::Unsupported
+        );
     }
 
     #[test]

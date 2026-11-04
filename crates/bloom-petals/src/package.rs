@@ -133,6 +133,8 @@ struct NetAllowToml {
 #[serde(deny_unknown_fields)]
 struct SignPolicy {
     #[serde(default)]
+    zero_spend_classes: Vec<String>,
+    #[serde(default)]
     economic_effects_schema: Option<u16>,
     #[serde(default)]
     allowed_intents: Vec<String>,
@@ -341,6 +343,8 @@ pub struct RouteIndex {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteIndexRecord {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub zero_spend_classes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub economic_effects_schema: Option<u16>,
     pub route_id: String,
@@ -520,6 +524,18 @@ impl PreparedPetalPackage {
         validate_sign_policy(&allowed_caps, &allowed_sign_intents)?;
         if manifest
             .sign
+            .zero_spend_classes
+            .iter()
+            .any(|class| !allowed_sign_intents.contains(class))
+            || (!manifest.sign.zero_spend_classes.is_empty()
+                && manifest.sign.economic_effects_schema != Some(1))
+        {
+            return Err(PetalError::InvalidWasm(
+                "zero-spend classes require effects schema 1 and must be allowed intents".into(),
+            ));
+        }
+        if manifest
+            .sign
             .economic_effects_schema
             .is_some_and(|version| version != 1)
         {
@@ -682,6 +698,7 @@ impl PreparedPetalPackage {
                 ops.push(RouteOp::Write);
             }
             route_index.routes.push(RouteIndexRecord {
+                zero_spend_classes: manifest.sign.zero_spend_classes.clone(),
                 economic_effects_schema: manifest.sign.economic_effects_schema,
                 route_id: route.route_id,
                 pattern: route.pattern,
@@ -6113,6 +6130,7 @@ name = "echo"
     #[test]
     fn petal_runtime_component_metadata_can_only_narrow_install_metadata() {
         let route = RouteIndexRecord {
+            zero_spend_classes: vec![],
             economic_effects_schema: None,
             route_id: "r000001".into(),
             pattern: "[name].txt".into(),
@@ -6159,6 +6177,7 @@ name = "echo"
     #[test]
     fn petal_runtime_component_metadata_rejects_widening() {
         let route = RouteIndexRecord {
+            zero_spend_classes: vec![],
             economic_effects_schema: None,
             route_id: "r000001".into(),
             pattern: "[name].txt".into(),
@@ -6440,6 +6459,7 @@ imports = ["components/helper.wasm"]
     #[test]
     fn petal_runtime_metadata_cache_ttl_is_unrestricted_only_for_parameterized_routes() {
         let record = |params: Vec<String>| RouteIndexRecord {
+            zero_spend_classes: vec![],
             economic_effects_schema: None,
             route_id: "r000001".into(),
             pattern: "[name].txt".into(),

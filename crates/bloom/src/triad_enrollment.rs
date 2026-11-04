@@ -489,6 +489,7 @@ fn enroll_developer_petal_provenance(
             continue;
         }
         additions.push(ProvenanceRecord {
+            package_display_name: Some(package.name.clone()),
             subject: ProvenanceSubject::Petal {
                 package_hash: package_hash.clone(),
                 route: route.route_id.clone(),
@@ -546,6 +547,7 @@ fn developer_route_operation_classes(
         .map(|operation_class| {
             Ok(ProvenanceOperationClass {
                 economic_effects_schema: route.economic_effects_schema,
+                zero_spend: route.zero_spend_classes.contains(&operation_class),
                 operation_class: Token::new(operation_class)?,
                 fee_asset: None,
             })
@@ -1216,6 +1218,7 @@ fn append_release_lineage_record(
     // Broker accepts their shape for lineage but rejects them for approvals.
     if authority_routes.is_empty() {
         catalog.records.push(ProvenanceRecord {
+            package_display_name: None,
             subject: ProvenanceSubject::Petal {
                 package_hash: package_hash.clone(),
                 route: "__lineage__".into(),
@@ -1233,6 +1236,7 @@ fn append_release_lineage_record(
                 .iter()
                 .map(|class| {
                     Ok(ProvenanceOperationClass {
+                        zero_spend: false,
                         economic_effects_schema: route.economic_effects_schema,
                         operation_class: Token::new(*class)?,
                         fee_asset: None,
@@ -1240,6 +1244,7 @@ fn append_release_lineage_record(
                 })
                 .collect::<Result<Vec<_>>>()?;
             catalog.records.push(ProvenanceRecord {
+                package_display_name: None,
                 subject: ProvenanceSubject::Petal {
                     package_hash: package_hash.clone(),
                     route: route.route_id.to_owned(),
@@ -1407,10 +1412,7 @@ mod tests {
             include_str!("../../../docs/examples/generic-session-selection.json"),
         )
         .unwrap();
-        let capabilities = bloom_broker_api::reusable_signing_profiles()
-            .iter()
-            .map(|profile| Token::new(profile.capability_schema()).unwrap())
-            .collect::<Vec<_>>();
+        let capabilities = vec![Token::new(bloom_broker_api::DECLARED_EFFECTS_CAPABILITY).unwrap()];
         for (hash, expected_routes) in [
             (
                 crate::github_source::preinstalled_petal("polymarket")
@@ -1480,6 +1482,7 @@ mod tests {
     #[test]
     fn developer_route_provenance_unions_only_immediate_and_explicit_classes() {
         let route = bloom_petals::package::RouteIndexRecord {
+            zero_spend_classes: vec![],
             economic_effects_schema: None,
             route_id: "r000001".into(),
             pattern: "session.json".into(),

@@ -39,7 +39,7 @@
         "operation_class": "transaction.confirm"
       },
       "selector": {
-        "kind": "system_session",
+        "kind": "native_session",
         "scope": {
           "component_id": "bloom-machine",
           "actions": [

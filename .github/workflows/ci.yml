@@ -132,7 +132,7 @@ jobs:
       - name: Install Rust toolchain and component target
         run: |
           rustup show
-          rustup target add wasm32-wasip2
+          rustup target add wasm32-wasip2 wasm32-unknown-unknown
       - name: Install wasm-tools
         uses: bytecodealliance/actions/wasm-tools/setup@v1
       - name: Install sccache
@@ -147,7 +147,12 @@ jobs:
       - name: Exercise prepared signing imports through PetalRunner
         env:
           BLOOM_PREPARED_FIXTURES: ${{ github.workspace }}/.ci/petal-sdk/fixtures/components
-        run: cargo test --locked -p bloom-petals --test prepared_actions -- --ignored
+        run: |
+          test -n "$BLOOM_PREPARED_FIXTURES"
+          test -f "$BLOOM_PREPARED_FIXTURES/prepared.wasm"
+          test -f "$BLOOM_PREPARED_FIXTURES/prepared-status.wasm"
+          cargo test --locked -p bloom-petals --test prepared_actions sdk_prepared_and_status_imports_enforce_capabilities_and_trusted_context -- --exact --nocapture | tee prepared-fixture.log
+          grep -F 'test sdk_prepared_and_status_imports_enforce_capabilities_and_trusted_context ... ok' prepared-fixture.log
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats
@@ -377,8 +382,8 @@ jobs:
       github.ref_name == 'triad-architecture'
     uses: ./.github/workflows/macos-unix-conformance.yml
     with:
-      broker_ref: 50a2aa8bebb65088d4a3175e0e2f37d5107ac7eb
-      signer_ref: ce0fcba77ad0b8cb196748d74a761ad96c6c5edb
+      broker_ref: afbec771860d7f172f1f54086200e5e553fb51b7
+      signer_ref: dd8717982812affc436bdc23a49fb381caa19039
 
   linux_w0_isolation:
     name: Linux W0 principal and socket isolation

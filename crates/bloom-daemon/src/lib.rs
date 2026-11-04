@@ -347,21 +347,6 @@ struct PetalTxOutbox {
     write_permit: Option<Arc<HomeWritePermit>>,
 }
 
-/// Prepared single-message discovery is limited to the reviewed EIP-3009
-/// adapter. Other message envelopes keep their existing exact-review flow.
-fn prepared_message_persona_eligible(context: &PetalRouteContext, operation_class: &str) -> bool {
-    context
-        .params
-        .iter()
-        .any(|(name, value)| name == "bloom.internal.prepared-persona" && value == "true")
-        && bloom_broker_api::reusable_signing_profiles()
-            .iter()
-            .any(|profile| {
-                profile.id == "gasless.relay.eip3009.v1"
-                    && profile.operation_class == operation_class
-            })
-}
-
 fn petal_review_payload<'a>(
     operation_class: &str,
     claimed_class: &str,
@@ -385,10 +370,7 @@ fn petal_review_payload<'a>(
                 .is_some_and(|value| value["schema"] == "bloom.message.review.v1")
         });
         let signed_message = bloom_machine_client::is_signed_message(crypto_suite, preimage);
-        if (bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES.contains(&operation_class)
-            || signed_message)
-            && message.is_none()
-        {
+        if signed_message && message.is_none() {
             return Err(HostError::Invalid(
                 "This signing operation requires a message review envelope".into(),
             ));
@@ -2178,9 +2160,7 @@ impl PetalHost for DaemonPetalHost {
             let signer = BrokerExactPayloadSigner::new(broker.clone(), catalog)
                 .with_account_key(account_key.clone())
                 .with_expected_key(expected_key)
-                .with_persona_discovery(
-                    !strict || prepared_message_persona_eligible(context, &req.operation_class),
-                )
+                .with_persona_discovery(true)
                 .with_strict_recovery(strict);
             let _guard = self.petal_signing_lock.lock().await;
             let outcome = signer
@@ -2354,69 +2334,14 @@ impl PetalHost for DaemonPetalHost {
 
     async fn sign_payload_batch_outcome(
         &self,
-        mut req: PayloadBatchSignRequest,
+        req: PayloadBatchSignRequest,
     ) -> Result<PayloadBatchSignOutcome, HostError> {
         if req.key_ref.is_some() {
             return Err(HostError::Denied(
                 "Petal payload batches require Machine-owned approval and root selection".into(),
             ));
         }
-        // A Petal's reusable preference is not session authority. Until Broker
-        // supports verified order sessions, step up to exact approval before
-        // choosing durable paths or interpreting approval hints. Keep CLOB auth
-        // on its distinct one-use scope; never downgrade an existing attempt.
-        let review_payload = if bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES
-            .contains(&req.operation_class.as_str())
-        {
-            req.selector = bloom_broker_api::PetalSignSelector::Exact;
-            let bytes = req.action.as_deref().ok_or_else(|| {
-                HostError::Invalid(
-                    "Polymarket exact signing requires its complete prepared record".into(),
-                )
-            })?;
-            if bytes.len() > bloom_broker_api::SINGLE_PAYLOAD_MAX_BYTES
-                || req.payloads.len() != 1
-                || req.signature_algorithm != "secp256k1-keccak256-recoverable"
-                || !serde_json::from_slice::<serde_json::Value>(bytes)
-                    .ok()
-                    .is_some_and(|value| value.as_array().is_some_and(|items| items.len() == 1))
-            {
-                return Err(HostError::Invalid("Polymarket exact signing requires one bounded prepared record and one recoverable Keccak payload".into()));
-            }
-            Some(bytes)
-        } else if req.operation_class != bloom_broker_api::POLYMARKET_CLOB_AUTH_CLASS
-            && req.context.as_ref().is_some_and(|context| {
-                context
-                    .params
-                    .iter()
-                    .any(|(name, _)| name == "bloom.internal.prepared-operation")
-            })
-        {
-            if req.payloads.len() != 1 {
-                return Err(HostError::Invalid(
-                    "prepared signing requires one payload".into(),
-                ));
-            }
-            let crypto = match req.signature_algorithm.as_str() {
-                "secp256k1-keccak256-recoverable" => {
-                    bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable
-                }
-                "secp256k1-sha256-recoverable" => {
-                    bloom_broker_api::CryptoSuite::Secp256k1Sha256Recoverable
-                }
-                "ed25519-message" => bloom_broker_api::CryptoSuite::Ed25519Message,
-                _ => return Err(HostError::Invalid("unsupported signature algorithm".into())),
-            };
-            petal_review_payload(
-                &req.operation_class,
-                &req.operation_class,
-                req.action.as_deref(),
-                crypto,
-                &req.payloads[0].preimage,
-            )?
-        } else {
-            None
-        };
+        let review_payload = None;
         let broker = self.broker.as_ref().ok_or_else(|| {
             HostError::Backend("SERVICE_UNAVAILABLE: Broker client is not configured".into())
         })?;
@@ -2441,7 +2366,6 @@ impl PetalHost for DaemonPetalHost {
             }
         };
         if review_payload.is_none()
-            && req.operation_class != bloom_broker_api::POLYMARKET_CLOB_AUTH_CLASS
             && req
                 .payloads
                 .iter()
@@ -6225,7 +6149,7 @@ mod tests {
         let envelope =
             br#"{"schema":"bloom.message.review.v1","kind":"personal","message":"exact text"}"#
                 .as_slice();
-        for class in bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES {
+        for class in &["example.message", "another.login"] {
             assert_eq!(
                 petal_review_payload(class, class, Some(envelope)).unwrap(),
                 Some(envelope)
@@ -7043,6 +6967,7 @@ mod tests {
         let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
         let fixture = Arc::new(PetalKeyBrokerFixture::new());
         let provenance_record = bloom_broker_api::ProvenanceRecord {
+            package_display_name: None,
             subject: bloom_broker_api::ProvenanceSubject::Petal {
                 package_hash: bloom_broker_api::Digest32::from_bytes([0xaa; 32]),
                 route: "r000007".into(),
@@ -7057,6 +6982,7 @@ mod tests {
                 active: true,
             }),
             operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                zero_spend: false,
                 economic_effects_schema: None,
                 operation_class: bloom_broker_api::Token::new("exchange-agent").unwrap(),
                 fee_asset: None,
@@ -7235,10 +7161,12 @@ mod tests {
         .with_provenance_catalog(Some(bloom_broker_api::ProvenanceCatalog {
             schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
             records: vec![bloom_broker_api::ProvenanceRecord {
+                package_display_name: None,
                 petal_lineage: None,
                 subject: subject.clone(),
                 publisher: bloom_broker_api::Token::new("fixture-publisher").unwrap(),
                 operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                    zero_spend: false,
                     economic_effects_schema: None,
                     operation_class: bloom_broker_api::Token::new("order.place").unwrap(),
                     fee_asset: None,
@@ -7412,6 +7340,7 @@ mod tests {
         .with_provenance_catalog(Some(bloom_broker_api::ProvenanceCatalog {
             schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
             records: vec![bloom_broker_api::ProvenanceRecord {
+                package_display_name: None,
                 petal_lineage: None,
                 subject: bloom_broker_api::ProvenanceSubject::Petal {
                     package_hash: bloom_broker_api::Digest32::from_bytes([0xbb; 32]),
@@ -7419,6 +7348,7 @@ mod tests {
                 },
                 publisher: bloom_broker_api::Token::new("fixture-publisher").unwrap(),
                 operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                    zero_spend: false,
                     economic_effects_schema: None,
                     operation_class: bloom_broker_api::Token::new(class).unwrap(),
                     fee_asset: None,
@@ -8336,6 +8266,7 @@ mod tests {
             schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
             records: vec![
                 bloom_broker_api::ProvenanceRecord {
+                    package_display_name: None,
                     subject: bloom_broker_api::ProvenanceSubject::System {
                         component_id: bloom_broker_api::Token::new("bloom-machine").unwrap(),
                         operation_class: bloom_broker_api::Token::new("transaction.confirm")
@@ -8344,6 +8275,7 @@ mod tests {
                     publisher: bloom_broker_api::Token::new("bloom-installer").unwrap(),
                     petal_lineage: None,
                     operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                        zero_spend: false,
                         economic_effects_schema: None,
                         operation_class: bloom_broker_api::Token::new("transaction.confirm")
                             .unwrap(),
@@ -8356,6 +8288,7 @@ mod tests {
                     installer_signature: bloom_broker_api::Base64UrlBytes::from_bytes(&[11; 64]),
                 },
                 bloom_broker_api::ProvenanceRecord {
+                    package_display_name: None,
                     subject: bloom_broker_api::ProvenanceSubject::System {
                         component_id: bloom_broker_api::Token::new("bloom-machine").unwrap(),
                         operation_class: bloom_broker_api::Token::new("solana.transfer.confirm")
@@ -8364,6 +8297,7 @@ mod tests {
                     publisher: bloom_broker_api::Token::new("bloom-installer").unwrap(),
                     petal_lineage: None,
                     operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                        zero_spend: false,
                         economic_effects_schema: None,
                         operation_class: bloom_broker_api::Token::new("solana.native-transfer")
                             .unwrap(),

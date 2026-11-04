@@ -6227,6 +6227,7 @@ mod tests {
                     bloom_broker_api::ProvenanceCatalog {
                         schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
                         records: vec![bloom_broker_api::ProvenanceRecord {
+                            package_display_name: None,
                             subject: bloom_broker_api::ProvenanceSubject::System {
                                 component_id: bloom_broker_api::Token::new("bloom-machine")
                                     .unwrap(),
@@ -6238,6 +6239,7 @@ mod tests {
                             publisher: bloom_broker_api::Token::new("bloom-installer").unwrap(),
                             petal_lineage: None,
                             operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                                zero_spend: false,
                                 economic_effects_schema: None,
                                 operation_class: bloom_broker_api::Token::new(
                                     "transaction.confirm",
@@ -7696,6 +7698,7 @@ value = "0""#,
         let catalog = bloom_broker_api::ProvenanceCatalog {
             schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
             records: vec![bloom_broker_api::ProvenanceRecord {
+                package_display_name: None,
                 subject: bloom_broker_api::ProvenanceSubject::System {
                     component_id: bloom_broker_api::Token::new("bloom-machine").unwrap(),
                     operation_class: bloom_broker_api::Token::new("solana.transfer.confirm")
@@ -7704,6 +7707,7 @@ value = "0""#,
                 publisher: bloom_broker_api::Token::new("bloom-installer").unwrap(),
                 petal_lineage: None,
                 operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                    zero_spend: false,
                     economic_effects_schema: None,
                     operation_class: bloom_broker_api::Token::new("solana.native-transfer")
                         .unwrap(),
@@ -7752,6 +7756,7 @@ value = "0""#,
         let catalog = bloom_broker_api::ProvenanceCatalog {
             schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
             records: vec![bloom_broker_api::ProvenanceRecord {
+                package_display_name: None,
                 subject: bloom_broker_api::ProvenanceSubject::System {
                     component_id: bloom_broker_api::Token::new("bloom-machine").unwrap(),
                     operation_class: bloom_broker_api::Token::new("solana.transfer.confirm")
@@ -7760,6 +7765,7 @@ value = "0""#,
                 publisher: bloom_broker_api::Token::new("bloom-installer").unwrap(),
                 petal_lineage: None,
                 operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                    zero_spend: false,
                     economic_effects_schema: None,
                     operation_class: bloom_broker_api::Token::new("solana.native-transfer")
                         .unwrap(),

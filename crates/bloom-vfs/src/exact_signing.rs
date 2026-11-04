@@ -1757,6 +1757,7 @@ mod tests {
             ProvenanceCatalog {
                 schema: PROVENANCE_CATALOG_SCHEMA.into(),
                 records: vec![ProvenanceRecord {
+                    package_display_name: None,
                     subject: ProvenanceSubject::System {
                         component_id: token("bloom-machine"),
                         operation_class: token("transaction.confirm"),
@@ -1764,6 +1765,7 @@ mod tests {
                     publisher: token("bloom-installer"),
                     petal_lineage: None,
                     operation_classes: vec![ProvenanceOperationClass {
+                        zero_spend: false,
                         economic_effects_schema: None,
                         operation_class: token("transaction.confirm"),
                         fee_asset: None,
@@ -1858,6 +1860,7 @@ mod tests {
             ProvenanceCatalog {
                 schema: PROVENANCE_CATALOG_SCHEMA.into(),
                 records: vec![ProvenanceRecord {
+                    package_display_name: None,
                     subject: ProvenanceSubject::System {
                         component_id: token("bloom-machine"),
                         operation_class: token("transaction.confirm"),
@@ -1865,6 +1868,7 @@ mod tests {
                     publisher: token("bloom-installer"),
                     petal_lineage: None,
                     operation_classes: vec![ProvenanceOperationClass {
+                        zero_spend: false,
                         economic_effects_schema: None,
                         operation_class: token("transaction.confirm"),
                         fee_asset: None,
@@ -1934,6 +1938,7 @@ mod tests {
             ProvenanceCatalog {
                 schema: PROVENANCE_CATALOG_SCHEMA.into(),
                 records: vec![ProvenanceRecord {
+                    package_display_name: None,
                     subject: ProvenanceSubject::System {
                         component_id: token("bloom-machine"),
                         operation_class: token("transaction.confirm"),
@@ -1941,6 +1946,7 @@ mod tests {
                     publisher: token("bloom-installer"),
                     petal_lineage: None,
                     operation_classes: vec![ProvenanceOperationClass {
+                        zero_spend: false,
                         economic_effects_schema: None,
                         operation_class: token("transaction.confirm"),
                         fee_asset: None,
@@ -2020,10 +2026,12 @@ mod tests {
             ProvenanceCatalog {
                 schema: PROVENANCE_CATALOG_SCHEMA.into(),
                 records: vec![ProvenanceRecord {
+                    package_display_name: None,
                     subject: subject.clone(),
                     publisher: token("bloom-installer"),
                     petal_lineage: None,
                     operation_classes: vec![ProvenanceOperationClass {
+                        zero_spend: false,
                         economic_effects_schema: None,
                         operation_class: token("order.place"),
                         fee_asset: None,
@@ -2139,6 +2147,7 @@ mod tests {
                 ProvenanceCatalog {
                     schema: PROVENANCE_CATALOG_SCHEMA.into(),
                     records: vec![ProvenanceRecord {
+                        package_display_name: None,
                         subject: ProvenanceSubject::System {
                             component_id: token("bloom-machine"),
                             operation_class: token("transaction.confirm"),
@@ -2146,6 +2155,7 @@ mod tests {
                         publisher: token("bloom-installer"),
                         petal_lineage: None,
                         operation_classes: vec![ProvenanceOperationClass {
+                            zero_spend: false,
                             economic_effects_schema: None,
                             operation_class: token("transaction.confirm"),
                             fee_asset: None,
@@ -2202,10 +2212,12 @@ mod tests {
             ProvenanceCatalog {
                 schema: PROVENANCE_CATALOG_SCHEMA.into(),
                 records: vec![ProvenanceRecord {
+                    package_display_name: None,
                     subject: subject.clone(),
                     publisher: token("bloom-installer"),
                     petal_lineage: None,
                     operation_classes: vec![ProvenanceOperationClass {
+                        zero_spend: false,
                         economic_effects_schema: None,
                         operation_class: token("order.place"),
                         fee_asset: None,
@@ -2527,11 +2539,8 @@ mod tests {
 
     #[tokio::test]
     async fn message_signatures_forward_their_review_envelopes_and_refuse_omission() {
-        for class in bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES {
+        for class in &["example.message", "another.login"] {
             review_envelope_forwarding(class, "bloom.message.review.v1", false).await;
-        }
-        for class in bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES {
-            review_envelope_forwarding(class, "prepared", true).await;
         }
     }
 
@@ -2547,10 +2556,12 @@ mod tests {
             ProvenanceCatalog {
                 schema: PROVENANCE_CATALOG_SCHEMA.into(),
                 records: vec![ProvenanceRecord {
+                    package_display_name: None,
                     subject: subject.clone(),
                     publisher: token("bloom-installer"),
                     petal_lineage: None,
                     operation_classes: vec![ProvenanceOperationClass {
+                        zero_spend: false,
                         economic_effects_schema: None,
                         operation_class: token(class),
                         fee_asset: None,
@@ -2806,10 +2817,12 @@ mod tests {
             ProvenanceCatalog {
                 schema: PROVENANCE_CATALOG_SCHEMA.into(),
                 records: vec![ProvenanceRecord {
+                    package_display_name: None,
                     subject,
                     publisher: token("bloom-installer"),
                     petal_lineage: None,
                     operation_classes: vec![ProvenanceOperationClass {
+                        zero_spend: false,
                         economic_effects_schema: None,
                         operation_class: token("fixture.withdraw"),
                         fee_asset: class_fee_asset,

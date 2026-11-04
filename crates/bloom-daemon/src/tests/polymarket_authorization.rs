@@ -279,13 +279,10 @@ impl PetalHost for VenueFixture {
         // Keep the component's original request for producer assertions, but
         // exercise a caller preferring reusable authority at the real boundary.
         // Machine must still obtain exact approval with the complete witness.
-        let mut forwarded = request.clone();
-        if bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES
-            .contains(&forwarded.operation_class.as_str())
-        {
-            forwarded.selector = bloom_broker_api::PetalSignSelector::Reusable;
-        }
-        let result = self.machine.sign_payload_batch_outcome(forwarded).await;
+        let result = self
+            .machine
+            .sign_payload_batch_outcome(request.clone())
+            .await;
         if let Ok(PayloadBatchSignOutcome::Signatures(signatures)) = &result {
             self.signed
                 .lock()
@@ -539,9 +536,10 @@ async fn installed_account_one_auth_and_exact_continuation_use_real_authority() 
         panic!("Broker capability response mismatch");
     };
     assert!(
-        bloom_broker_api::reusable_signing_profiles()
+        capabilities
+            .schemas
             .iter()
-            .all(|profile| profile.is_advertised(&capabilities.schemas))
+            .any(|schema| schema.as_str() == bloom_broker_api::DECLARED_EFFECTS_CAPABILITY)
     );
     let accounts = client.wallet_accounts(wallet.clone()).await.unwrap();
     let account_one = accounts
@@ -948,6 +946,7 @@ async fn activate_token_permission(
         }],
     }];
     terms.session_budget = Some(SessionBudget {
+        petal_policy: None,
         token_policy: Some(SessionTokenPolicy {
             schema_version: 3,
             budget_nonce: RequestNonce::from_bytes([0x92; 16]),

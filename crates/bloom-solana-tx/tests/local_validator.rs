@@ -153,6 +153,7 @@ fn catalog() -> ProvenanceCatalog {
     ProvenanceCatalog {
         schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
         records: vec![ProvenanceRecord {
+            package_display_name: None,
             subject: ProvenanceSubject::System {
                 component_id: token("bloom-machine"),
                 operation_class: token("solana.transfer.confirm"),
@@ -160,6 +161,7 @@ fn catalog() -> ProvenanceCatalog {
             publisher: token("bloom-installer"),
             petal_lineage: None,
             operation_classes: vec![ProvenanceOperationClass {
+                zero_spend: false,
                 economic_effects_schema: None,
                 operation_class: token("solana.native-transfer"),
                 fee_asset: Some(bloom_broker_api::ProvenanceFeeAsset {

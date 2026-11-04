@@ -70,6 +70,14 @@ impl PersonaConfig {
         }
         Ok(())
     }
+    /// Per-grant zero-spend actions per hour. Institutional has no automatic tier.
+    pub fn zero_spend_hourly_cap(&self) -> Option<u64> {
+        match self.preset {
+            PersonaPreset::Custodian => None,
+            PersonaPreset::Trader => Some(60),
+            PersonaPreset::Degen => Some(300),
+        }
+    }
     /// Fixed token quantities, not USD equivalents. Each token is independent.
     pub fn token_amounts(&self, symbol: &str) -> Option<(&'static str, &'static str)> {
         let (action, total) = match symbol {

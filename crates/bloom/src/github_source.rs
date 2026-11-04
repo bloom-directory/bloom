@@ -2570,6 +2570,7 @@ mod tests {
             ProvenanceOperationClass, ProvenanceRecord, ProvenanceSubject, Token,
         };
         let record = ProvenanceRecord {
+            package_display_name: None,
             subject: ProvenanceSubject::Petal {
                 package_hash: Digest32::new(hash.to_owned()).unwrap(),
                 route: "hello.txt".into(),
@@ -2584,6 +2585,7 @@ mod tests {
                 active: true,
             }),
             operation_classes: vec![ProvenanceOperationClass {
+                zero_spend: false,
                 economic_effects_schema: None,
                 operation_class: Token::new("petal.run").unwrap(),
                 fee_asset: None,

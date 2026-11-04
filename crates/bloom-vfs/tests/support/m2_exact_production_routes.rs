@@ -189,6 +189,7 @@ fn exact_signer(wallet: WalletPublic) -> (BrokerExactPayloadSigner, Arc<ExactBro
     let records = classes
         .into_iter()
         .map(|class| ProvenanceRecord {
+            package_display_name: None,
             subject: ProvenanceSubject::System {
                 component_id: token("bloom-machine"),
                 operation_class: token(class),
@@ -196,6 +197,7 @@ fn exact_signer(wallet: WalletPublic) -> (BrokerExactPayloadSigner, Arc<ExactBro
             publisher: token("bloom-installer"),
             petal_lineage: None,
             operation_classes: vec![ProvenanceOperationClass {
+                zero_spend: false,
                 economic_effects_schema: None,
                 operation_class: token(class),
                 fee_asset: None,

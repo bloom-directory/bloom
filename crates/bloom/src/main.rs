@@ -1850,11 +1850,17 @@ async fn execute_machine_command(
             format!("{}\n", serde_json::to_string(&status)?)
         }
         MachineCommand::OnboardingPetals => {
+            let display = persona_onboarding::onboarding_display_data(daemon)?;
             let catalog = default_policy::onboarding_petals(daemon)?
                 .into_iter()
                 .map(|id| serde_json::json!({"label":default_policy::petal_label(&id),"id":id}))
                 .collect::<Vec<_>>();
-            format!("{}\n", serde_json::to_string(&catalog)?)
+            format!(
+                "{}\n",
+                serde_json::to_string(
+                    &serde_json::json!({"catalog":catalog,"display_data":display})
+                )?
+            )
         }
         MachineCommand::OnboardingSetup {
             wallet,
