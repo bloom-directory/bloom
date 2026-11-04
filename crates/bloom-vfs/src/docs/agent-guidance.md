@@ -1,6 +1,6 @@
 # Transfer loop
 
-Wallet id comes from `ls /wallets`.
+Wallet id comes from `ls /wallets`. The chain is a directory under `wallets/<wallet>/0/chains`. Stage there, and do not read policy, status, balances, or anything below this loop first.
 `bloom --connect <endpoint> vfs ls /wallets`
 
 Native send, one line, to `wallets/<wallet>/0/chains/<chain>/outbox/new.tx`:
@@ -19,9 +19,9 @@ Write `y` to its `confirm`:
 `printf 'y\n' > wallets/<wallet>/0/chains/<chain>/outbox/pending/<id>/confirm`
 `bloom --connect <endpoint> vfs write /wallets/<wallet>/0/chains/<chain>/outbox/pending/<id>/confirm --data y`
 
-Ceremony response is `approval_challenge.json`: `state` `awaiting_ceremony`, a `ceremony_url`, and `retry_path`. Wait, then retry that exact `retry_path` with `retry_body`, or `y` when `retry_body` is omitted.
-`printf 'y\n' > <retry_path>`
-`bloom --connect <endpoint> vfs write /<retry_path> --data y`
+Ceremony response is `approval_challenge.json`: `state` `awaiting_ceremony`, a `ceremony_url`, and `retry_path`. Wait until `state` is `active`, then write `retry_body` to that exact `retry_path`. An omitted `retry_body` means the word `confirm`.
+`printf 'confirm\n' > <retry_path>`
+`bloom --connect <endpoint> vfs write /<retry_path> --data confirm`
 
 Result: `outbox/sent/<id>/tx_hash` or `outbox/failed/<id>/policy_check.json`.
 `cat wallets/<wallet>/0/chains/<chain>/outbox/sent/<id>/tx_hash`
@@ -37,7 +37,7 @@ file as the VFS root and keep all paths mount-relative.
 
 ## Start with discovery
 
-Do not assume a wallet, chain, Petal, or action exists. Inspect the live mount:
+The transfer loop above is enough for a send. This section is for anything else. Do not assume a wallet, chain, Petal, or action exists. Inspect the live mount:
 
 ```sh
 ls

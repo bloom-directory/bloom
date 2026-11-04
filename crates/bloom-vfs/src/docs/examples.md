@@ -15,12 +15,16 @@ Anvil instance.
 
 ## Native send
 
+The chain is the directory under `wallets/<wallet>/0/chains`. This write is the whole stage.
+
 ```sh
 printf 'send 0.01 ETH to 0x0000000000000000000000000000000000000001\n' \
   > "$BLOOM/wallets/alice/0/chains/anvil/outbox/new.tx"
 ```
 
 ## Token send
+
+Same path. Do not read policy, status, or balances before it.
 
 ```sh
 printf 'send 1000 USDC to 0x0000000000000000000000000000000000000001\n' \
