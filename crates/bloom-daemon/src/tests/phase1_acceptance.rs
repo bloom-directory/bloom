@@ -341,7 +341,7 @@ async fn pm_login(vfs: &Vfs, host: &VenueFixture, refresh: bool) {
         if refresh {
             br#"{"refresh":true}"#
         } else {
-            b"begin"
+            b"{}"
         },
     )
     .await
@@ -756,7 +756,11 @@ async fn installed_account_one_auth_and_exact_continuation_use_real_authority() 
     approve_package(&f.daemon, &f.client, &f.wallet, &hash, 3, false).await;
     let (host, vfs) = host(&f);
     let begin = VfsPath::parse(&format!("petals/polymarket/onboard/{WALLET}/1/begin")).unwrap();
-    assert!(vfs.write(&begin, b"begin").await.is_err());
+    let pending_error = vfs.write(&begin, b"{}").await.unwrap_err();
+    assert!(
+        !host.prepared_requests.lock().unwrap().is_empty(),
+        "login must reach prepared signing: {pending_error}"
+    );
     let request = host.prepared_requests.lock().unwrap()[0].0.clone();
     assert!(matches!(request.action.spend, Spend::None));
     let pending = host.prepared_outcomes.lock().unwrap()[0].1.clone().unwrap();
@@ -765,7 +769,7 @@ async fn installed_account_one_auth_and_exact_continuation_use_real_authority() 
     };
     complete(&exact_url(&f, &action_id).await, 4, None);
     host.timestamp.fetch_add(2, Ordering::SeqCst);
-    vfs.write(&begin, b"begin").await.unwrap();
+    vfs.write(&begin, b"{}").await.unwrap();
     assert_eq!(host.auth_posts.load(Ordering::SeqCst), 1);
     assert_eq!(
         host.prepared_signed.lock().unwrap()[0].0.action.payload,
