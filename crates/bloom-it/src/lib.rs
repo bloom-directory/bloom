@@ -26,7 +26,7 @@ use bloom_broker_api::{
 };
 use bloom_machine_client::MachineBrokerClient;
 use sha2::{Digest as _, Sha256};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
 
@@ -386,24 +386,47 @@ impl Drop for AnvilGuard {
 }
 
 /// Pick an OS-assigned free TCP port by binding to :0 and releasing it.
+///
+/// Prefer letting the child process bind `:0` itself. The port is free when
+/// this returns and can be taken before the child binds it, which is a race
+/// every concurrent test in this crate shares — see [`spawn_anvil`].
 pub fn pick_free_port() -> Result<u16> {
     let l = TcpListener::bind("127.0.0.1:0")?;
     Ok(l.local_addr()?.port())
 }
 
-/// Spawn anvil on a free port and wait until its stdout reports it is
-/// listening. Returns a guard that kills the child on drop.
+/// Spawn anvil and wait until its stdout reports the port it is listening on.
+/// Returns a guard that kills the child on drop.
 pub async fn spawn_anvil() -> Result<AnvilGuard> {
-    let port = pick_free_port()?;
+    spawn_anvil_inner(false).await
+}
+
+/// As [`spawn_anvil`], but with `--no-mining`, so a submitted transaction stays
+/// in the mempool until something mines it and can be replaced before it does.
+pub async fn spawn_anvil_no_mining() -> Result<AnvilGuard> {
+    spawn_anvil_inner(true).await
+}
+
+/// The port comes from anvil itself, via `--port 0`, rather than from probing
+/// for a free one and passing it: probing leaves a window between releasing the
+/// port and anvil binding it, and a sibling test spawning its own anvil can take
+/// it in between. Anvil then exits at once with "Address already in use" on
+/// stderr, which nothing here reads, so the failure used to surface as a bare
+/// "exited before becoming ready" roughly 80ms into the test. Several tests in
+/// this crate spawn two anvils in a row, which makes the window easy to hit.
+async fn spawn_anvil_inner(no_mining: bool) -> Result<AnvilGuard> {
     let mut cmd = Command::new(anvil_bin());
     cmd.arg("--port")
-        .arg(port.to_string())
+        .arg("0")
         .arg("--host")
         .arg("127.0.0.1")
         // Determinism: chain id 31337, default mnemonic.
         .arg("--chain-id")
-        .arg("31337")
-        .stdout(Stdio::piped())
+        .arg("31337");
+    if no_mining {
+        cmd.arg("--no-mining");
+    }
+    cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
@@ -413,28 +436,51 @@ pub async fn spawn_anvil() -> Result<AnvilGuard> {
         .take()
         .ok_or_else(|| anyhow!("anvil stdout missing"))?;
 
-    // Read lines until we see "Listening on" or hit a timeout.
+    // Read lines until anvil reports its port, it exits, or we hit a timeout.
     let mut reader = BufReader::new(stdout).lines();
     let wait = async {
         loop {
             match reader.next_line().await? {
                 Some(line) => {
-                    if line.contains("Listening on") {
-                        return Ok::<(), anyhow::Error>(());
+                    if let Some(port) = listening_port(&line) {
+                        return Ok::<Option<u16>, anyhow::Error>(Some(port));
                     }
                 }
-                None => return Err(anyhow!("anvil exited before becoming ready")),
+                None => return Ok(None),
             }
         }
     };
-    timeout(Duration::from_secs(15), wait)
+    let listening = timeout(Duration::from_secs(15), wait)
         .await
         .map_err(|_| anyhow!("timed out waiting for anvil to start"))??;
+
+    let Some(port) = listening else {
+        // anvil closed stdout, so it is gone. Its reason is on stderr, which
+        // stays unread on the success path to leave the pipe open for the
+        // child's lifetime.
+        let mut reason = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            stderr.read_to_string(&mut reason).await.ok();
+        }
+        let reason = reason.trim();
+        return Err(if reason.is_empty() {
+            anyhow!("anvil exited before becoming ready")
+        } else {
+            anyhow!("anvil exited before becoming ready: {reason}")
+        });
+    };
 
     Ok(AnvilGuard {
         child: Some(child),
         port,
     })
+}
+
+/// The port out of anvil's `Listening on 127.0.0.1:PORT` line.
+fn listening_port(line: &str) -> Option<u16> {
+    let (_, rest) = line.split_once("Listening on")?;
+    let (_, port) = rest.trim().rsplit_once(':')?;
+    port.trim().parse().ok()
 }
 
 /// Send a raw transaction with `cast send` from the prefunded funder
