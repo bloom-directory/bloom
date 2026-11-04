@@ -1,6 +1,6 @@
 # Persona-ready Petals: verified effect profiles and a minimal Petal surface
 
-**Status:** proposal, not implemented
+**Status:** bounded first delivery implemented in draft PRs; release acceptance tracked below
 **Date:** 2026-11-02
 **Revised:** 2026-11-03 — narrow delivery scope and clarify trust guarantees
 **Builds on:** Machine #377, Broker #112, Signer #81, SDK #52, Polymarket #26 (all open drafts)
@@ -30,6 +30,30 @@ The eventual goal is a small Petal surface and catalog-driven eligibility.
 New operations within an existing supported format/verifier should need only
 Petal and reviewed catalog changes. New protocol semantics may require a small
 Broker verifier; do not promise arbitrary protocols with no Broker changes.
+
+## First-delivery implementation (2026-11-04)
+
+Machine #377, Broker #112 and Signer #81 carry the coordinated changes;
+Gasless #4 is the additional consumer. Existing SDK #52 and Polymarket #26
+already provide the required prepared API and BUY consumer. Signer #81 now
+tracks master by a merge, preserving its reviewed history. PRs remain unmerged.
+
+Delivered: typed Polymarket economics, a narrowly verified USDC EIP-3009 Relay
+profile, explicit browser rearm, independent-budget review copy, safe exact
+continuation, and canonical-archive enrollment and profile discovery. The
+release catalog patch preserves old Polymarket lineage records and treats
+Gasless as an optional install. Publishing the candidate artifacts is a separate
+release step; do not treat draft assets as publicly installable releases.
+
+Compatibility choice: retain the existing Polymarket witness/declaration wire
+and equality checks; accounting no longer derives amounts from display labels.
+No new shared SDK abstraction was needed for the second consumer.
+
+Follow-ups outside this bounded pass: fully catalog-driven persona text,
+per-Petal stop controls, and showing the separate Polymarket venue ceiling in
+the browser (the terminal explains it). The broad profile/evaluator sketches
+below remain proposals. Software-WebAuthn acceptance is not a replacement for
+physical-passkey UX or platform installer qualification.
 
 ## Current-state observations from the original proposal
 
