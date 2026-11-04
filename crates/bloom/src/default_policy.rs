@@ -2588,8 +2588,8 @@ mod tests {
         let entry = github_source::preinstalled_petal("polymarket").unwrap();
         assert_eq!(
             entry.expected_hash,
-            // v0.1.8: same petal 2beed2ff and `venue_config_key` as v0.1.6.
-            Some("6eb2065e8558f3761399fcb0516731a600fdb0b49974c8ed0808abd38fde7db4"),
+            // v0.2.0: same `venue_config_key` as v0.1.6 and v0.1.8.
+            Some("17a50dda0894b7b7e5757033806f8ec31523575438419ea1330b731a2c6c5d14"),
             "re-check store_key against the new release, then update both"
         );
         let template = setup_template("polymarket").unwrap();
@@ -2600,6 +2600,7 @@ mod tests {
                 // while it updates.
                 "0f365cd7f613129f73ce66fb07256c8a42c4e70abbb77721804dbd6df85b96b5",
                 "6eb2065e8558f3761399fcb0516731a600fdb0b49974c8ed0808abd38fde7db4",
+                "17a50dda0894b7b7e5757033806f8ec31523575438419ea1330b731a2c6c5d14",
             ],
             "list a release only once its key is checked"
         );
@@ -3303,7 +3304,7 @@ mod tests {
         let (home, vfs) = queued_polymarket(&route);
         let outcome = apply_queued_settings(&vfs, home.path(), &petals, "polymarket", older).await;
         assert!(
-            matches!(&outcome, QueuedWrite::Waiting(reason) if reason.contains("once Bloom updates it to v0.1.8")),
+            matches!(&outcome, QueuedWrite::Waiting(reason) if reason.contains("once Bloom updates it to v0.2.0")),
             "{outcome:?}"
         );
         assert_eq!(*route.stored.lock().await, None);
@@ -3548,7 +3549,20 @@ mod tests {
                 apply_queued_settings(&vfs, &home, &petals, "polymarket", release()).await
             })
         };
-        route.read_started.notified().await;
+        // Bounded: if the release gate refuses before the settings read, this
+        // rendezvous is never reached and an unbounded wait deadlocks the test
+        // for the job's whole budget. A pin that disagrees with
+        // POLYMARKET_SETUP.releases must fail, and say which.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            route.read_started.notified(),
+        )
+        .await
+        .expect(
+            "the queued write never reached the settings read: the release this catalog pins is \
+             most likely missing from POLYMARKET_SETUP.releases, so write_petal_settings refused \
+             before reading",
+        );
         let owner = {
             let vfs = vfs.clone();
             tokio::spawn(async move {

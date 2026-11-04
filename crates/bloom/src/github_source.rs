@@ -98,11 +98,17 @@ const POLYMARKET_SETUP: PetalSetupTemplate = PetalSetupTemplate {
     // `venue_config_key` in these releases, under the Petal SDK's `state`
     // namespace, which its `store_get` and `store_put` add to every key.
     store_key: "state/settings/{wallet}/venue.toml",
-    // v0.1.6 (pinned by Bloom v0.4.0) and v0.1.8, both built on petal
-    // 2beed2ff with the same `venue_config_key`.
+    // v0.1.6 (pinned by Bloom v0.4.0), v0.1.8, and v0.2.0, the release this
+    // catalog pins. `venue_config_key` is byte-identical across all three, so
+    // one `store_key` covers them. v0.2.0 landed on master while this branch
+    // still pinned v0.1.8, and the two edits are far enough apart in this file
+    // that git merged both without a conflict: the catalog moved to v0.2.0
+    // while this list did not, so `write_petal_settings` refused the only
+    // release Bloom installs. Keep this list and `expected_hash` in step.
     releases: &[
         "0f365cd7f613129f73ce66fb07256c8a42c4e70abbb77721804dbd6df85b96b5",
         "6eb2065e8558f3761399fcb0516731a600fdb0b49974c8ed0808abd38fde7db4",
+        "17a50dda0894b7b7e5757033806f8ec31523575438419ea1330b731a2c6c5d14",
     ],
 };
 
