@@ -38,38 +38,20 @@ async fn cli(home: &HomeDir, endpoint: &str, arguments: &[&str]) -> serde_json::
 
 /// This starts the exact candidate executable, not an in-process compiler seam.
 async fn onboard(
-    fixture: AuthorizationFixture,
+    home: HomeDir,
+    client: MachineBrokerClient,
+    catalog: ProvenanceCatalog,
+    wallet: Token,
     name: &str,
     hash: &str,
     counter: &mut u64,
 ) -> AuthorizationFixture {
-    let AuthorizationFixture {
-        home,
-        client,
-        catalog,
-        daemon,
-        wallet,
-    } = fixture;
     let mut config = bloom_proto::Config::load(&home.config_path()).unwrap();
     config.petals.setup.insert(
         name.into(),
         bloom_proto::config::PetalSetupConfig::default(),
     );
     config.save(&home.config_path()).unwrap();
-    daemon.shutdown().await;
-    drop(daemon);
-    let mut released = false;
-    for _ in 0..200 {
-        if HomeWritePermit::acquire(&home).is_ok() {
-            released = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert!(
-        released,
-        "in-process fixture must release its own home before CLI ownership"
-    );
     let socket = setting("BLOOM_TRIAD_DEVELOPER_ROOT").join("phase1-machine.sock");
     let endpoint = format!("unix:{}", socket.display());
     let log = std::fs::OpenOptions::new()
@@ -247,45 +229,91 @@ fn assert_accounting_unchanged(before: &ApprovalLimitState, after: &ApprovalLimi
     assert_eq!(before.committed_signatures, after.committed_signatures);
 }
 
+/// Separate process lifetime releases every fixture VFS owner before the CLI.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "internal isolated bootstrap; invoked by the phase1 acceptance parent"]
+async fn bootstrap_installed_package() {
+    let name = std::env::var("BLOOM_PHASE1_BOOTSTRAP_PETAL").unwrap();
+    let variable = if name == "polymarket" {
+        "BLOOM_PM80_POLYMARKET_ROOT"
+    } else {
+        "BLOOM_PM80_GASLESS_ROOT"
+    };
+    let f = account_one_fixture().await;
+    let package = integration_package(variable);
+    let hash = package.hash.clone();
+    let staged = f
+        .daemon
+        .petals
+        .store()
+        .stage_petal_package(package)
+        .unwrap();
+    f.daemon
+        .petals
+        .install_staged_petal_package(staged, None, || Ok(()))
+        .unwrap();
+    if name == "polymarket" {
+        let store = bloom_petals::PrivateStore::open_account(
+            f.daemon.petals.store().private_account_data_root(),
+            WALLET,
+            1,
+        )
+        .unwrap();
+        store
+            .put(
+                &hash,
+                "state/settings/pm80-authorization/venue.toml",
+                b"enabled = true\n",
+                false,
+            )
+            .unwrap();
+    }
+    f.daemon.shutdown().await;
+}
+
 async fn setup(name: &str, variable: &str) -> (AuthorizationFixture, String, u64) {
     let mut counter = 2;
     let first = std::env::var("BLOOM_PM80_BUY_PHASE").as_deref() != Ok("restart");
-    let f = if first {
-        account_one_fixture().await
-    } else {
-        existing_authorization_fixture().await
-    };
-    let package = integration_package(variable);
-    let hash = package.hash.clone();
+    let hash = integration_package(variable).hash;
     if first {
-        let staged = f
-            .daemon
-            .petals
-            .store()
-            .stage_petal_package(package)
+        let bootstrap = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "polymarket_authorization::phase1_acceptance::bootstrap_installed_package",
+            ])
+            .env("BLOOM_PHASE1_BOOTSTRAP_PETAL", name)
+            .output()
+            .await
             .unwrap();
-        f.daemon
-            .petals
-            .install_staged_petal_package(staged, None, || Ok(()))
-            .unwrap();
-        if name == "polymarket" {
-            let store = bloom_petals::PrivateStore::open_account(
-                f.daemon.petals.store().private_account_data_root(),
-                WALLET,
-                1,
-            )
-            .unwrap();
-            store
-                .put(
-                    &hash,
-                    "state/settings/pm80-authorization/venue.toml",
-                    b"enabled = true\n",
-                    false,
-                )
+        assert!(
+            bootstrap.status.success(),
+            "bootstrap failed: {} {}",
+            String::from_utf8_lossy(&bootstrap.stdout),
+            String::from_utf8_lossy(&bootstrap.stderr)
+        );
+        let root = setting("BLOOM_TRIAD_DEVELOPER_ROOT");
+        let home = HomeDir::at(setting("BLOOM_HOME"));
+        let client = MachineBrokerClient::connect_unix_from_developer_files(
+            &root,
+            setting("BLOOM_BROKER_SOCKET"),
+            setting("BLOOM_MACHINE_IDENTITY"),
+            setting("BLOOM_EDGE_MANIFEST"),
+        )
+        .unwrap();
+        let catalog: ProvenanceCatalog =
+            serde_json::from_slice(&std::fs::read(setting("BLOOM_PROVENANCE_CATALOG")).unwrap())
                 .unwrap();
-        }
-
-        let f = onboard(f, name, &hash, &mut counter).await;
+        let f = onboard(
+            home,
+            client,
+            catalog,
+            Token::new(WALLET).unwrap(),
+            name,
+            &hash,
+            &mut counter,
+        )
+        .await;
         (f, hash, counter)
     } else {
         let prior: serde_json::Value = serde_json::from_slice(
@@ -294,7 +322,7 @@ async fn setup(name: &str, variable: &str) -> (AuthorizationFixture, String, u64
         )
         .unwrap();
         counter = prior["owner_sign_count"].as_u64().unwrap();
-        (f, hash, counter)
+        (existing_authorization_fixture().await, hash, counter)
     }
 }
 
