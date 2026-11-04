@@ -19,6 +19,28 @@ in `docs/examples.md` before using an unfamiliar write surface. For Petal work,
 use `docs/petals.md` to discover installed packages, then read that package's
 `README.md` and `AGENTS.md` before using its routes.
 
+To find where an account's funds are, read
+`wallets/<wallet>/<n>/holdings.json`. It lists the account's non-zero native
+and major token balances (USDC, USDT, DAI, WETH, WBTC and their common
+variants) on every configured chain. Anything it could not read is named
+under `errors` for that chain; the rows it did read are still listed. Read
+any other token at `chains/<chain>/addresses/<address>/tokens/<token>/`. On
+Solana chains it shows SOL only, not SPL tokens.
+
+## When the request leaves something out
+
+Infer what Bloom state settles, and ask only for what it cannot:
+
+- If there is only one wallet or account, use it.
+- A read that names no chain covers every chain: read `holdings.json`.
+- For a write, use the only chain where `holdings.json` shows the asset, or
+  the network the Petal's documentation names as its default. If two or more
+  funded chains remain, ask one question that names them.
+- If `holdings.json` lists an `errors` entry for a chain that could hold the
+  asset, say so rather than treating that chain as empty.
+
+Report a failed or partially completed action as a failure, never as done.
+
 ## Authority and safety
 
 Machine exposes this VFS; Broker controls approval ceremonies and policy;
