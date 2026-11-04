@@ -89,7 +89,7 @@ pub(super) fn certified_petal_selection(
         .filter(|suite| suite.key_spec() == key_ref.key_spec)
         .collect();
     let primary = &route_grants[0];
-    Ok(Some(PersonaSessionSelection {
+    let selection = PersonaSessionSelection {
         token_allowances: vec![],
         assets,
         members: vec![PersonaSessionMember {
@@ -110,7 +110,19 @@ pub(super) fn certified_petal_selection(
             provenance_digest: primary.provenance_digest.clone(),
             allowed_crypto_suites: suites,
         }],
-    }))
+    };
+    Ok(selection_has_coverage(catalog, package_hash, &selection).then_some(selection))
+}
+
+fn selection_has_coverage(
+    catalog: &ProvenanceCatalog,
+    package_hash: &Digest32,
+    selection: &PersonaSessionSelection,
+) -> bool {
+    !selection.assets.is_empty()
+        || selection.members.iter().any(|member| {
+            !certified_zero_spend_classes(catalog, package_hash, &member.selector).is_empty()
+        })
 }
 
 fn certified_zero_spend_classes(
@@ -215,7 +227,9 @@ async fn compile_petal_proposals(
                         .values()
                         .any(|chain| asset.chain.as_str() == format!("evm-{}", chain.chain_id))
                 });
-                selections.push(selection);
+                if selection_has_coverage(&catalog, &package_hash, &selection) {
+                    selections.push(selection);
+                }
             }
         }
         if selections.is_empty() {
@@ -949,7 +963,21 @@ mod tests {
             [Token::new("r2.action").unwrap()]
         );
         assert!(!selected.assets.is_empty());
+        let mut unsupported_key = key.clone();
+        unsupported_key.key_spec = KeySpec::Ed25519;
+        assert!(
+            certified_petal_selection(&hash, &catalog, 3, &unsupported_key, &advertised)
+                .unwrap()
+                .is_none(),
+            "no token or zero-spend coverage must not propose an empty grant"
+        );
         catalog.records[0].operation_classes[0].zero_spend = true; // r2 is secondary.
+        assert!(
+            certified_petal_selection(&hash, &catalog, 3, &unsupported_key, &advertised)
+                .unwrap()
+                .is_some(),
+            "certified zero-only coverage remains eligible"
+        );
         assert_eq!(
             certified_zero_spend_classes(&catalog, &hash, &selected.members[0].selector),
             [Token::new("r2.action").unwrap()]
