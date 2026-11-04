@@ -730,6 +730,15 @@ impl Outbox {
         Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
     }
 
+    pub fn has_broadcast_attempt(&self, entry: &OutboxEntry) -> Result<bool, OutboxError> {
+        for kind in BroadcastAttemptKind::ALL {
+            if self.read_broadcast_attempt(entry, kind)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn write_broadcast_raw_tx(
         &self,
         entry: &OutboxEntry,
@@ -1750,7 +1759,6 @@ mod tests {
             expires_ms: 0,
             status: TxStatus::Pending,
             action_kind: bloom_proto::TxActionKind::Unknown,
-            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,
