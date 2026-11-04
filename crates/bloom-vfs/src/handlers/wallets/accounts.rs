@@ -42,6 +42,47 @@ pub const ACCOUNT_KEY_FILES: [&str; 7] = [
 /// only with outbox entries that account's EVM key staged.
 const EVM_MEMPOOL_LEAVES: [&str; 2] = ["pending_external.jsonl", "nonce_conflicts.json"];
 
+/// How long `holdings.json` waits for each chain. Chains are read
+/// concurrently, so this bounds the whole read; reads finished by then are
+/// kept and the rest are named under `errors`.
+const HOLDINGS_CHAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The token symbols `holdings.json` checks on each EVM chain. The token
+/// catalog lists hundreds of tokens on major chains, far too many reads for
+/// one file; this keeps each chain to a handful of `balanceOf` calls. Other
+/// tokens are read one at a time under `chains/<chain>/addresses/<a>/tokens/`.
+const HOLDINGS_SYMBOLS: [&str; 11] = [
+    "USDC", "USDC.e", "USDT", "USDT0", "DAI", "USDS", "pathUSD", "WETH", "wstETH", "WBTC", "cbBTC",
+];
+
+/// Token balance reads in flight per chain.
+const HOLDINGS_CONCURRENCY: usize = 4;
+
+/// The catalog rows on `chain_id` whose symbol is in `HOLDINGS_SYMBOLS`.
+pub(super) fn holdings_tokens(chain_id: u64) -> Vec<(alloy::primitives::Address, String, u8)> {
+    // A loop, not slice methods: the catalog may be a slice or an iterator.
+    let mut rows = Vec::new();
+    for token in crate::handlers::well_known_tokens::for_chain(chain_id) {
+        if HOLDINGS_SYMBOLS
+            .iter()
+            .any(|symbol| token.symbol.eq_ignore_ascii_case(symbol))
+            && let Ok(address) = token.address.parse()
+        {
+            rows.push((address, token.symbol.to_string(), token.decimals));
+        }
+    }
+    rows
+}
+
+/// One chain's part of `holdings.json`.
+#[derive(Default)]
+struct ChainHoldings {
+    found: Vec<serde_json::Value>,
+    /// Symbols whose balance could not be read.
+    unread: Vec<String>,
+    timed_out: bool,
+}
+
 /// Sorted account-owned nonces and the transaction hashes grouped by nonce.
 type EvmOutboxNonces = (Vec<u64>, std::collections::BTreeMap<u64, Vec<String>>);
 
@@ -364,7 +405,7 @@ impl WalletsHandler {
     }
 
     fn account_dir_entries(view: &AccountView) -> Vec<Entry> {
-        let mut entries = vec![Entry::file("account.json")];
+        let mut entries = vec![Entry::file("account.json"), Entry::file("holdings.json")];
         entries.extend(
             ACCOUNT_KEY_FILES
                 .into_iter()
@@ -446,6 +487,13 @@ impl WalletsHandler {
     }
 
     fn chain_name_entries(&self, view: &AccountView) -> Vec<Entry> {
+        self.chain_names(view)
+            .into_iter()
+            .map(|name| Entry::dir(&name))
+            .collect()
+    }
+
+    fn chain_names(&self, view: &AccountView) -> std::collections::BTreeSet<String> {
         let mut names = std::collections::BTreeSet::new();
         if view.evm.as_ref().and_then(FamilyKey::address).is_some() {
             names.extend(self.chains.list_names());
@@ -456,7 +504,136 @@ impl WalletsHandler {
                 names.extend(solana.keys().cloned());
             }
         }
-        names.into_iter().map(|name| Entry::dir(&name)).collect()
+        names
+    }
+
+    /// `holdings.json`: the account's non-zero native and major token
+    /// balances on every chain it lists. Chains are read concurrently, each
+    /// under one deadline; a chain keeps the rows it read and lists what it
+    /// could not read under `errors`.
+    async fn holdings_json(&self, view: &AccountView) -> Result<Vec<u8>, HandlerError> {
+        let names = self.chain_names(view);
+        let deadline = tokio::time::Instant::now() + HOLDINGS_CHAIN_TIMEOUT;
+        let reads =
+            futures::future::join_all(names.iter().map(|chain| async move {
+                (chain, self.chain_holdings(view, chain, deadline).await)
+            }))
+            .await;
+        let mut holdings = Vec::new();
+        let mut errors = serde_json::Map::new();
+        for (chain, read) in reads {
+            match read {
+                Ok(read) => {
+                    holdings.extend(read.found);
+                    if !read.unread.is_empty() {
+                        let prefix = if read.timed_out { "timed out; " } else { "" };
+                        let message = format!("{prefix}could not read {}", read.unread.join(", "));
+                        errors.insert(chain.clone(), message.into());
+                    }
+                }
+                Err(error) => {
+                    errors.insert(chain.clone(), error.to_string().into());
+                }
+            }
+        }
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "holdings": holdings,
+            "errors": errors,
+        }))
+        .map_err(err_be)
+    }
+
+    /// One chain's non-zero balances for `holdings.json`: the native asset
+    /// (none on a chain without one) and, on EVM chains, the major tokens of
+    /// `HOLDINGS_SYMBOLS`. Reads that fail or miss `deadline` are named in
+    /// `unread`; completed rows are kept.
+    async fn chain_holdings(
+        &self,
+        view: &AccountView,
+        chain: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<ChainHoldings, HandlerError> {
+        use crate::handlers::balances::{SOL_DECIMALS, SOL_SYMBOL, amount_fields};
+        use alloy::primitives::U256;
+        use futures::StreamExt;
+        let mut read = ChainHoldings::default();
+        if self.is_solana_chain(chain) {
+            let (_, account) = Self::solana_family(view, chain)?;
+            match tokio::time::timeout_at(deadline, self.solana_balance(chain, &account.address))
+                .await
+            {
+                Ok(lamports) => read.found.push(amount_fields(
+                    chain,
+                    "native",
+                    SOL_SYMBOL,
+                    SOL_DECIMALS,
+                    U256::from(lamports?),
+                )),
+                Err(_) => {
+                    read.timed_out = true;
+                    read.unread.push(SOL_SYMBOL.into());
+                }
+            }
+        } else {
+            let client = self
+                .chains
+                .get(chain)
+                .ok_or_else(|| HandlerError::not_found(format!("chain '{chain}'")))?;
+            let holder = Self::evm_address(Self::evm_family(view, chain)?)?;
+            let spec = client.spec();
+            if spec.has_native_asset() {
+                match tokio::time::timeout_at(deadline, client.balance(holder)).await {
+                    Ok(Ok(native)) => read.found.push(amount_fields(
+                        chain,
+                        "native",
+                        &spec.native_symbol,
+                        spec.native_decimals,
+                        native,
+                    )),
+                    Ok(Err(_)) => read.unread.push(spec.native_symbol.clone()),
+                    Err(_) => {
+                        read.timed_out = true;
+                        read.unread.push(spec.native_symbol.clone());
+                    }
+                }
+            }
+            let tokens = holdings_tokens(spec.chain_id);
+            // Futures are lazy: `buffer_unordered` runs at most
+            // HOLDINGS_CONCURRENCY, and yields each read as it finishes, so a
+            // slow token does not hide later ones that completed in time.
+            let client = &client;
+            // Owned (index, contract) pairs keep the futures free of borrowed
+            // closure arguments, which async-trait's Send bound rejects.
+            let contracts: Vec<_> = tokens.iter().map(|(contract, ..)| *contract).collect();
+            let reads = contracts
+                .into_iter()
+                .enumerate()
+                .map(|(index, contract)| async move {
+                    (index, client.erc20_balance(contract, holder).await)
+                });
+            let mut balances = futures::stream::iter(reads).buffer_unordered(HOLDINGS_CONCURRENCY);
+            let mut done = vec![None; tokens.len()];
+            loop {
+                let Ok(next) = tokio::time::timeout_at(deadline, balances.next()).await else {
+                    read.timed_out = true;
+                    break;
+                };
+                let Some((index, balance)) = next else { break };
+                done[index] = Some(balance.ok().flatten());
+            }
+            for ((contract, symbol, decimals), balance) in tokens.iter().zip(done) {
+                match balance {
+                    Some(Some(raw)) => {
+                        let mut held = amount_fields(chain, "erc20", symbol, *decimals, raw);
+                        held["address"] = bloom_proto::checksum_address(contract).into();
+                        read.found.push(held);
+                    }
+                    _ => read.unread.push(symbol.clone()),
+                }
+            }
+        }
+        read.found.retain(|held| held["raw"] != "0");
+        Ok(read)
     }
 
     pub(super) async fn lookup_account(
@@ -473,7 +650,11 @@ impl WalletsHandler {
                 let sessions = self.account_sessions(wallet, &view)?;
                 Self::lookup_account_session(&sessions, sessions_rest)
             }
-            [leaf] if leaf == "account.json" || Self::key_file_key(&view, leaf).is_some() => {
+            [leaf]
+                if leaf == "account.json"
+                    || leaf == "holdings.json"
+                    || Self::key_file_key(&view, leaf).is_some() =>
+            {
                 Ok(Entry::file(leaf))
             }
             [dir] if dir == "chains" => Ok(Entry::dir("chains")),
@@ -509,6 +690,7 @@ impl WalletsHandler {
         };
         match rest {
             [leaf] if leaf == "account.json" => self.account_json(wallet, &view),
+            [leaf] if leaf == "holdings.json" => self.holdings_json(&view).await,
             [leaf] if ACCOUNT_KEY_FILES.contains(&leaf.as_str()) => {
                 Self::read_account_key_file(&view, leaf)
             }
@@ -732,9 +914,13 @@ impl WalletsHandler {
         chain: &str,
         rest: &[String],
     ) -> Result<Entry, HandlerError> {
-        self.chains
+        let client = self
+            .chains
             .get(chain)
             .ok_or_else(|| HandlerError::not_found(format!("chain '{chain}'")))?;
+        if let [leaf] = rest {
+            crate::handlers::balances::require_native_asset(client.spec(), leaf)?;
+        }
         match rest {
             [] => Ok(Entry::dir(chain)),
             [leaf]
@@ -767,6 +953,9 @@ impl WalletsHandler {
             .get(chain)
             .ok_or_else(|| HandlerError::not_found(format!("chain '{chain}'")))?;
         let address = Self::evm_address(family)?;
+        if let [leaf] = rest {
+            crate::handlers::balances::require_native_asset(client.spec(), leaf)?;
+        }
         match rest {
             [leaf] if leaf == "balance" => {
                 let balance = client.balance(address).await.map_err(err_be)?;
@@ -818,19 +1007,19 @@ impl WalletsHandler {
         chain: &str,
         rest: &[String],
     ) -> Result<Vec<Entry>, HandlerError> {
-        self.chains
+        let client = self
+            .chains
             .get(chain)
             .ok_or_else(|| HandlerError::not_found(format!("chain '{chain}'")))?;
         match rest {
-            [] => Ok(vec![
-                Entry::file("balance"),
-                Entry::file("balance.raw"),
-                Entry::file("balance.json"),
-                Entry::file("nonce"),
-                Entry::file("pending_external.jsonl"),
-                Entry::file("nonce_conflicts.json"),
-                Entry::dir("outbox"),
-            ]),
+            [] => Ok(
+                crate::handlers::balances::native_balance_leaves(client.spec())
+                    .iter()
+                    .chain(&["nonce", "pending_external.jsonl", "nonce_conflicts.json"])
+                    .map(|leaf| Entry::file(leaf))
+                    .chain([Entry::dir("outbox")])
+                    .collect(),
+            ),
             [dir] if dir == "outbox" => self.evm_outbox_list(wallet, family, chain, &[]).await,
             [dir, outbox_rest @ ..] if dir == "outbox" => {
                 self.evm_outbox_list(wallet, family, chain, outbox_rest)

@@ -3007,10 +3007,11 @@ async fn daemon_petal_chain_read(
         "eth_getBalance" if matches!(params.len(), 1 | 2) => {
             require_latest_block_param(&params, 1)?;
             let address = parse_petal_address(&params[0], "eth_getBalance address")?;
-            let balance = chain
-                .balance(address)
-                .await
-                .map_err(|e| HostError::Backend(format!("native balance: {e}")))?;
+            let balance = chain.balance(address).await.map_err(|e| match e {
+                // Deterministic, not an outage: do not invite a retry.
+                bloom_evm::ChainError::NoNativeAsset(_) => HostError::Invalid(e.to_string()),
+                e => HostError::Backend(format!("native balance: {e}")),
+            })?;
             format!("{balance:#x}")
         }
         "eth_getCode" if matches!(params.len(), 1 | 2) => {
