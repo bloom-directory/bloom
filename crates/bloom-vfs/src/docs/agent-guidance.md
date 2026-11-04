@@ -69,22 +69,37 @@ policy allowance does not activate signing authority. A covered confirm may
 consume a live owner-approved session without a new ceremony; use the same
 staging, review and outcome-reconciliation surfaces as usual.
 
-Automatic profiles support fee-free Polymarket BUY orders on
-the selected wallet/account, with positive pUSD debit claims from the updated package.
+Trader and Degen can use owner-approved permissions for an installed package's
+supported declared effects on the selected account. Bounded spending consumes
+that permission's exact token allowance. Explicit zero-spend actions consume no
+token allowance, but require a certified operation class. All listed zero-spend
+classes within one permission share its rate cap: 60 per hour for Trader,
+300 per hour for Degen. Institutional keeps individual approval. An unspecified
+spend, an unsupported asset or an exceeded allowance needs separate review once
+Bloom has ruled out an unresolved signing attempt. These permissions trust the
+installed package's declared effects; they do not prove venue execution or
+settlement.
+
 Degen also supports owner-approved native-wallet ERC20 transfer sessions to any
 recipient on Ethereum and Polygon. Selected tokens and maximum native gas have
-independent per-action and rolling seven-day limits; matching sends need no new
-passkey prompt. Native currency sends, arbitrary calls and token approvals are
-not included in that permission.
-Other apps, SELL shares, builder fees and unsupported assets require separate
-review. Explicit native transfer sessions currently support Ethereum, Polygon
-and local chain 31337 with reviewed asset and fee unit limits. Supported mainnet SOL transfers use live cluster/blockhash/fee checks; other native formats retain exact approval. Venue settings may impose tighter limits.
+independent per-action and rolling seven-day limits. Native currency sends,
+arbitrary calls and token approvals are not included in that permission.
+Explicit native transfer sessions also support local chain 31337 with reviewed
+asset and fee unit limits. Supported mainnet SOL transfers use live
+cluster/blockhash/fee checks; other native formats retain exact approval.
+Venue settings may impose tighter limits.
 
 Owner onboarding opens through `bloom init` or `bloom onboard` after install.
 The local browser delegates wallet and permission review to Broker ceremonies.
 If the CLI is available, `bloom wallet persona status main` reports grants,
-permission validity and per-Petal/account exact-asset rolling usage. Owner-requested changes use `bloom wallet persona set`
-and `activate`; `stop` disables local discovery before remote revocation.
+permission validity and per-Petal/account exact-asset rolling usage. Owner-requested
+changes use `bloom wallet persona set <wallet> <preset>`, then
+`bloom wallet default-policy <wallet>` and
+`bloom wallet persona activate <wallet> --account <n>`.
+Browser onboarding continues through each owner ceremony automatically. Rearm
+unlocks an unchanged permission while preserving its token usage and zero-spend
+rate usage; it does not create more capacity. `stop` disables local discovery
+before remote revocation.
 Never change a profile, revoke Broker authority, reset a budget or rotate an operation ID
 merely to work around a denial. A consumed, expired or unavailable grant is not
 authority for a replacement signature. Reconcile the original operation first;
@@ -592,11 +607,13 @@ approves.
 - **Enso:** same-chain swaps carry an on-chain minimum output, stated in the
   intent's `plan.md`. Cross-chain swaps report `destination_unverified` after
   the source transaction succeeds; Bloom does not track the destination.
-- **Polymarket:** `begin` asks for a login approval that can only create
-  exchange credentials; it cannot sign payments, orders or wallet batches.
-  `continue` sets up the deposit wallet with its own exact approval. Read
-  `status.json` and follow `next_action`. Each order currently needs exact
-  approval; selecting Trader or Degen does not itself authorize automatic orders.
+- **Polymarket:** `begin` can use a covered zero-spend login permission to
+  create exchange credentials. Under Institutional it requires exact approval.
+  Pending retries retain the original login payload. `continue` sets up the
+  deposit wallet with its own exact approval. Read `status.json` and follow
+  `next_action`; eligible BUY orders may use an active token allowance, while
+  SELL and unsupported actions retain exact review. A persona choice alone
+  activates no authority.
 - **Hyperliquid:** delegated trading sessions sign later actions without a
   new prompt. The Petal's own session limits are local; the exchange does not
   enforce them.
