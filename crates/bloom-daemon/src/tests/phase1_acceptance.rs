@@ -115,15 +115,6 @@ async fn onboard(
         "policy CLI failed: {}",
         String::from_utf8_lossy(&policy_output.stderr)
     );
-    let snapshot = client.policy(wallet.clone()).await.unwrap();
-    let policy: CanonicalWalletPolicy =
-        serde_json::from_slice(&snapshot.canonical_policy.decode()).unwrap();
-    assert!(
-        policy
-            .allowed_destinations
-            .iter()
-            .any(|d| d.chain.as_str() == "evm-137" && d.destination == ERC20_ANY_RECIPIENT)
-    );
     let mut finished = false;
     for _ in 0..16 {
         let value = cli(
@@ -166,6 +157,15 @@ async fn onboard(
         catalog.clone(),
     )
     .unwrap();
+    let snapshot = client.policy(wallet.clone()).await.unwrap();
+    let policy: CanonicalWalletPolicy =
+        serde_json::from_slice(&snapshot.canonical_policy.decode()).unwrap();
+    assert!(
+        policy
+            .allowed_destinations
+            .iter()
+            .any(|d| d.chain.as_str() == "evm-137" && d.destination == ERC20_ANY_RECIPIENT)
+    );
     AuthorizationFixture {
         home,
         client,
