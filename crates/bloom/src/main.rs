@@ -1697,7 +1697,7 @@ async fn execute_machine_command(
             if matches!(
                 kind,
                 MachineCustodyKind::Import | MachineCustodyKind::ImportRawPrivateKey
-            ) && bloom_vfs::handlers::wallets::RESERVED_WALLET_ENTRIES.contains(&name.as_str())
+            ) && bloom_vfs::handlers::wallets::is_wallet_control_entry(name.as_str())
             {
                 return Err(machine_error(
                     MachineErrorKind::InvalidParams,

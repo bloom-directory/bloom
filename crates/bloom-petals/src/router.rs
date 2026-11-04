@@ -494,7 +494,7 @@ impl PetalRouter {
 
 /// Core lists control entries such as `recoveries` beside the wallets.
 fn is_reserved_wallet_entry(name: &str) -> bool {
-    bloom_vfs::handlers::wallets::RESERVED_WALLET_ENTRIES.contains(&name)
+    bloom_vfs::handlers::wallets::is_wallet_control_entry(name)
 }
 
 fn canonical_account(segment: &str) -> Option<u32> {
@@ -1031,11 +1031,13 @@ mod tests {
         async fn vfs_list(&self, path: &str) -> Result<Vec<HostVfsEntry>, HostError> {
             let names = match path {
                 // Core lists its control entries beside the wallets.
-                "wallets" => [
-                    &["alice"][..],
-                    &bloom_vfs::handlers::wallets::RESERVED_WALLET_ENTRIES,
-                ]
-                .concat(),
+                "wallets" => std::iter::once("alice")
+                    .chain(
+                        bloom_vfs::handlers::wallets::WALLET_CONTROL_ENTRIES
+                            .iter()
+                            .map(|(name, _)| *name),
+                    )
+                    .collect(),
                 "wallets/alice" => vec!["0", "1"],
                 _ => return Err(HostError::NotFound(path.into())),
             };

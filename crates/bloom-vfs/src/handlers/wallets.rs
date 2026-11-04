@@ -55,9 +55,22 @@ pub use accounts::{
     ACCOUNT_KEY_FILES, accounts_json_with_numbers, derivation_path_number, parse_account_segment,
 };
 
-/// Control entries `/wallets` lists beside the wallets. No wallet takes these
-/// names, and wallet inventories must skip them.
-pub const RESERVED_WALLET_ENTRIES: [&str; 4] = ["new", "registrations", "recover", "recoveries"];
+/// Control entries `/wallets` lists beside the wallets, and whether each is a
+/// directory. The root listing is built from this table, so no wallet may
+/// take these names and wallet inventories skip exactly these.
+pub const WALLET_CONTROL_ENTRIES: [(&str, bool); 4] = [
+    ("new", false),
+    ("registrations", true),
+    ("recover", false),
+    ("recoveries", true),
+];
+
+/// Whether `name` is one of `WALLET_CONTROL_ENTRIES` rather than a wallet.
+pub fn is_wallet_control_entry(name: &str) -> bool {
+    WALLET_CONTROL_ENTRIES
+        .iter()
+        .any(|(entry, _)| *entry == name)
+}
 
 use async_trait::async_trait;
 use bloom_broker_api::ProtocolErrorCode;
@@ -754,7 +767,7 @@ impl WalletsHandler {
             }
         };
         let requested_name = request.name.as_str();
-        if RESERVED_WALLET_ENTRIES.contains(&requested_name)
+        if is_wallet_control_entry(requested_name)
             || requested_name.is_empty()
             || requested_name.len() > 64
             || !requested_name.chars().all(|character| {
@@ -1146,7 +1159,7 @@ impl WalletsHandler {
             }
         };
         let requested_name = request.name.as_str();
-        if RESERVED_WALLET_ENTRIES.contains(&requested_name)
+        if is_wallet_control_entry(requested_name)
             || requested_name.is_empty()
             || requested_name.len() > 64
             || !requested_name.chars().all(|character| {
@@ -3907,10 +3920,13 @@ impl WalletsHandler {
                 .into_iter()
                 .map(|projection| Entry::dir(projection.wallet.wallet_id.as_str()))
                 .collect();
-            out.push(Entry::writable_file("new"));
-            out.push(Entry::dir("registrations"));
-            out.push(Entry::writable_file("recover"));
-            out.push(Entry::dir("recoveries"));
+            out.extend(WALLET_CONTROL_ENTRIES.iter().map(|(name, is_dir)| {
+                if *is_dir {
+                    Entry::dir(name)
+                } else {
+                    Entry::writable_file(name)
+                }
+            }));
             return Ok(out);
         }
         if segs[0] == "recoveries" {
