@@ -1,0 +1,6 @@
+{
+  "name": "bloom-directory",
+  "owner": { "name": "Bloom Directory", "url": "https://bloom.directory" },
+  "description": "The Bloom agent skill: balances, payments, trades, and wallets with passkey approval.",
+  "plugins": [{ "name": "bloom", "source": "./" }]
+}

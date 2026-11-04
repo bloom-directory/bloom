@@ -1,0 +1,22 @@
+{
+  "name": "bloom",
+  "version": "0.4.2",
+  "description": "Balances, payments, trades, and wallets for AI agents on EVM chains and Solana. Every transaction needs the user's passkey.",
+  "author": { "name": "Bloom Directory", "url": "https://bloom.directory" },
+  "homepage": "https://bloom.directory",
+  "repository": "https://github.com/bloom-directory/bloom",
+  "license": "MIT",
+  "keywords": ["wallet", "payments", "trading", "x402", "evm", "solana"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Bloom",
+    "shortDescription": "Finance harness for agents",
+    "longDescription": "Bloom gives agents balances, payments, trades, and wallets on EVM chains and Solana through ordinary files. Agents stage actions; policy, the user's passkey approval, and key custody are enforced outside the agent. Installing the skill does not install Bloom or create a wallet.",
+    "developerName": "Bloom Directory",
+    "category": "Finance",
+    "capabilities": [],
+    "websiteURL": "https://bloom.directory",
+    "composerIcon": "./docs/assets/bloom-icon.svg",
+    "logo": "./docs/assets/bloom-icon.svg"
+  }
+}

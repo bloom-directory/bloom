@@ -39,39 +39,46 @@ Hermes users can also install the package directly:
 hermes skills install bloom-directory/bloom/skills/bloom
 ```
 
+## Claude, Codex, and Gemini
+
+The repository root is also a plugin for each agent, so all three ship the
+same `skills/bloom/` folder. Each manifest's `version` is the release version.
+
+- **Claude Code:** `.claude-plugin/plugin.json` and `marketplace.json`. Users run
+  `/plugin install bloom --marketplace bloom-directory/bloom`. Check with
+  `claude plugin validate --strict .`. Anthropic's directory listing is
+  submitted from <https://claude.ai/directory/manage> (paid plan) and reviewed
+  there; see <https://code.claude.com/docs/en/plugins/publish.md>.
+- **Codex:** `.codex-plugin/plugin.json`. OpenAI's directory takes a ZIP, not a
+  repository URL, uploaded at <https://platform.openai.com/plugins> by a
+  verified organization. Build it from the tag:
+
+  ```sh
+  git archive --format=zip -o bloom-codex-vX.Y.Z.zip vX.Y.Z \
+    .codex-plugin skills/bloom docs/assets/bloom-icon.svg
+  ```
+
+  See <https://developers.openai.com/plugins/deploy/submission>.
+- **Gemini CLI:** `gemini-extension.json`. The gallery at
+  <https://geminicli.com/extensions> crawls tagged public repositories with the
+  `gemini-cli-extension` topic daily. Users run
+  `gemini extensions install https://github.com/bloom-directory/bloom`.
+
 ## ClawHub
 
-Publish this same folder, not the website output or the repository root. A human
-signs in to ClawHub with the GitHub identity that should own the listing:
-
-```sh
-npx clawhub login
-npx clawhub whoami
-git checkout vX.Y.Z
-npx clawhub skill publish ./skills/bloom --slug bloom --name "Bloom" --version X.Y.Z --changelog "Bloom vX.Y.Z" --dry-run
-```
-
-Publish from the release tag, with the release version (the skill's
-`metadata.version`). Check the account and slug ownership, review the dry
-run, and repeat the publish command without `--dry-run`. If the slug is owned
-by someone else, resolve ownership or choose an agreed alternative; do not
-publish under a misleading identity. Check the resulting listing's scan state
-and installation before announcing it.
-
-Keep credentials out of the repository. Do not create a publishing workflow or
-store an API token until recurring releases justify automation. See
-<https://docs.openclaw.ai/clawhub/quickstart> for the current authentication and
-publishing flow.
+Not published. The `bloom` slug belongs to an unrelated skill, and publishing
+requires a GitHub sign-in. Revisit only if users ask for it.
 
 ## Releases
 
 The skill's `metadata.version` is the Bloom release version; the Propose
-Release workflow bumps it with `Cargo.toml`. After tagging `vX.Y.Z`:
+Release workflow bumps it, and the three plugin manifests, with `Cargo.toml`. After tagging `vX.Y.Z`:
 
-1. Publish to ClawHub from the tag, as above.
-2. Repin the website to the tag's commit.
+1. Repin the website to the tag's commit.
+2. Upload the Codex ZIP from the tag and submit the Claude directory update,
+   as above. Gemini picks up the tag on its own.
 3. Test the upgrade in a clean `HOME` that has the previous release's skill
-   installed: `npx skills update -g -y` and `npx clawhub update bloom` must
+   installed: `npx skills update -g -y` must
    leave `metadata.version: "X.Y.Z"` in the installed `SKILL.md`, and the
    Connect command must still work against an upgraded Bloom. v0.4.2 is the
    first skill release, so it gets a fresh-install check instead; upgrade
