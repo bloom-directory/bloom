@@ -222,8 +222,9 @@ jobs:
           cargo build --locked -p bloom --no-default-features --features mount,triad-dev-harness
       - name: Create canonical prepared signing archives
         run: |
+          revision="${{ steps.candidate_sdk.outputs.ref }}"
           for name in polymarket gasless; do
-            target/debug/bloom petals build ".phase1-packages/$name" --out "$RUNNER_TEMP/phase1-$name.petal.tar"
+            "$RUNNER_TEMP/petal-$revision/bin/petal" package --root ".phase1-packages/$name" --out "$RUNNER_TEMP/phase1-$name.petal.tar.gz" --no-build
           done
       - name: Exercise installed generic prepared signing through real authority
         env:
@@ -233,8 +234,8 @@ jobs:
           BLOOM_INTEGRATION_SIGNER_BIN: ${{ github.workspace }}/.pm80-packages/signer/target/debug/bloom-signer
           BLOOM_INTEGRATION_BROKER_COMMIT: ${{ steps.release_broker.outputs.ref }}
           BLOOM_INTEGRATION_SIGNER_COMMIT: ${{ steps.release_signer.outputs.ref }}
-          BLOOM_PM80_POLYMARKET_ROOT: ${{ runner.temp }}/phase1-polymarket.petal.tar
-          BLOOM_PM80_GASLESS_ROOT: ${{ runner.temp }}/phase1-gasless.petal.tar
+          BLOOM_PM80_POLYMARKET_ROOT: ${{ runner.temp }}/phase1-polymarket.petal.tar.gz
+          BLOOM_PM80_GASLESS_ROOT: ${{ runner.temp }}/phase1-gasless.petal.tar.gz
         run: |
           for mode in login prepared-buy prepared-gasless; do
             run_root="$(mktemp -d /tmp/pm80-auth.XXXXXX)"
