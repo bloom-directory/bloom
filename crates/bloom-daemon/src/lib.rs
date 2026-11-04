@@ -1864,7 +1864,7 @@ impl PetalHost for DaemonPetalHost {
                 builder = builder.header(name.as_str(), value.as_str());
             }
             let resp = builder.body(body.clone()).send().await.map_err(|e| {
-                let err = HostError::Backend(format!("http_fetch send: {e}"));
+                let err = petal_http_transport_error("send", &method, &url, e);
                 self.audited_http_error(&correlation_id, &method, &url, "error", None, None, err)
             })?;
             let status = resp.status().as_u16();
@@ -1980,7 +1980,7 @@ impl PetalHost for DaemonPetalHost {
             let mut stream = resp.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|e| {
-                    let err = HostError::Backend(format!("http_fetch body: {e}"));
+                    let err = petal_http_transport_error("body", &method, &url, e);
                     self.audited_http_error(
                         &correlation_id,
                         &method,
@@ -2215,7 +2215,7 @@ impl PetalHost for DaemonPetalHost {
                         reason = %reason,
                         "petal.sign_payload_denied"
                     );
-                    HostError::Denied(reason)
+                    exact_signing_host_error(reason)
                 })?;
             return match outcome {
                 bloom_vfs::ExactPayloadOutcome::ApprovalRequired {
@@ -2310,7 +2310,7 @@ impl PetalHost for DaemonPetalHost {
                 protocol_error_code = error.code.as_str(),
                 "petal.sign_payload_denied"
             );
-            HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
+            exact_signing_host_error(bloom_vfs::ExactSigningError::from_broker(error, true))
         })?;
         let [signature] = result.signatures.as_slice() else {
             return Err(HostError::Backend(
@@ -2377,9 +2377,9 @@ impl PetalHost for DaemonPetalHost {
             if bytes.len() > bloom_broker_api::SINGLE_PAYLOAD_MAX_BYTES
                 || req.payloads.len() != 1
                 || req.signature_algorithm != "secp256k1-keccak256-recoverable"
-                || serde_json::from_slice::<serde_json::Value>(bytes)
+                || !serde_json::from_slice::<serde_json::Value>(bytes)
                     .ok()
-                    .is_none_or(|value| value.as_array().is_none_or(|items| items.len() != 1))
+                    .is_some_and(|value| value.as_array().is_some_and(|items| items.len() == 1))
             {
                 return Err(HostError::Invalid("Polymarket exact signing requires one bounded prepared record and one recoverable Keccak payload".into()));
             }
@@ -2680,7 +2680,7 @@ impl PetalHost for DaemonPetalHost {
                 )
                 .await
         }
-        .map_err(HostError::Denied)?;
+        .map_err(exact_signing_host_error)?;
         match outcome {
             bloom_vfs::ExactPayloadBatchOutcome::ApprovalRequired {
                 approval_id,
@@ -3044,42 +3044,47 @@ impl PetalHost for DaemonPetalHost {
             .outbox
             .read_receipt(&wallet, &chain_name, &outbox_id)
             .map_err(|e| HostError::Backend(format!("read EVM outbox receipt: {e}")))?;
-        let state = receipt
-            .as_ref()
-            .map(|receipt| receipt.outcome.clone())
-            .unwrap_or_else(|| entry.staged.status.to_string());
-        // Older hard-policy refusals moved the entry but did not persist its
-        // failed status. Report that terminal outcome so a Petal can retry.
-        // A signed or broadcast attempt must keep its reconciliation path.
-        let state = if entry.state == bloom_tx::outbox::OutboxState::Failed
-            && state == "pending"
-            && entry.staged.tx_hash.is_none()
-            && entry
-                .staged
-                .policy_checks
-                .iter()
-                .any(|check| check.is_hard_violation())
-            && service
-                .tx_engine
-                .outbox
-                .read_broadcast_attempt(&entry, bloom_tx::outbox::BroadcastAttemptKind::Confirm)
-                .map_err(|error| {
-                    HostError::Backend(format!("read EVM broadcast attempt: {error}"))
-                })?
-                .is_none()
-        {
-            "failed".to_owned()
-        } else {
-            state
+        // A same-nonce cancellation that may be signed or broadcast is not
+        // visible in the status; report it, or the Petal sees an untouched
+        // pending or sent entry.
+        let state = match &receipt {
+            Some(receipt) => receipt.outcome.clone(),
+            None if entry.state != bloom_tx::outbox::OutboxState::Failed
+                && bloom_tx::outbox::cancel_attempted(&entry) =>
+            {
+                "cancelling".to_owned()
+            }
+            // An older Bloom released this entry although it may be signed;
+            // "failed" would invite a second payment.
+            None if entry.state == bloom_tx::outbox::OutboxState::Failed
+                && entry
+                    .dir
+                    .join(bloom_tx::outbox::SIGNING_UNKNOWN_FILE)
+                    .exists() =>
+            {
+                "signing_unknown".to_owned()
+            }
+            None => entry.staged.status.to_string(),
         };
         let receipt_json = receipt
             .map(|receipt| serde_json::to_string(&receipt))
             .transpose()
             .map_err(|e| HostError::Backend(format!("encode EVM outbox receipt: {e}")))?;
+        // A broadcast whose RPC reply was lost records its hash only in the
+        // attempt marker; report it so the caller can still track the tx.
+        let tx_hash = match entry.staged.tx_hash.clone() {
+            Some(hash) => Some(hash),
+            None => service
+                .tx_engine
+                .outbox
+                .read_broadcast_attempt(&entry, bloom_tx::outbox::BroadcastAttemptKind::Confirm)
+                .map_err(|e| HostError::Backend(format!("read EVM broadcast attempt: {e}")))?
+                .map(|attempt| attempt.tx_hash),
+        };
         Ok(EvmOutboxInspection {
             outbox_id,
             state,
-            tx_hash: entry.staged.tx_hash,
+            tx_hash,
             receipt_json,
         })
     }
@@ -3134,10 +3139,11 @@ async fn daemon_petal_chain_read(
         "eth_getBalance" if matches!(params.len(), 1 | 2) => {
             require_latest_block_param(&params, 1)?;
             let address = parse_petal_address(&params[0], "eth_getBalance address")?;
-            let balance = chain
-                .balance(address)
-                .await
-                .map_err(|e| HostError::Backend(format!("native balance: {e}")))?;
+            let balance = chain.balance(address).await.map_err(|e| match e {
+                // Deterministic, not an outage: do not invite a retry.
+                bloom_evm::ChainError::NoNativeAsset(_) => HostError::Invalid(e.to_string()),
+                e => HostError::Backend(format!("native balance: {e}")),
+            })?;
             format!("{balance:#x}")
         }
         "eth_getCode" if matches!(params.len(), 1 | 2) => {
@@ -3344,6 +3350,31 @@ fn petal_outbox_outcome(
     })
 }
 
+fn petal_http_transport_error(
+    phase: &str,
+    method: &str,
+    url: &str,
+    error: reqwest::Error,
+) -> HostError {
+    // URL userinfo, paths and queries can hold credentials, so the message
+    // names only method and host. reqwest prints the URL from its own field,
+    // which without_url() clears; the source chain (DNS, connect, TLS,
+    // timeout) is appended as is and, in the pinned reqwest, carries no URL.
+    let host = url::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "<invalid url>".into());
+    let error = error.without_url();
+    let mut message = format!("http_fetch {phase}: {method} {host}: {error}");
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    HostError::Backend(message)
+}
+
 fn resolve_redirect_target(current_url: &str, location: &str) -> Result<String, HostError> {
     let base = url::Url::parse(current_url).map_err(|e| HostError::Invalid(format!("url: {e}")))?;
     base.join(location)
@@ -3397,7 +3428,6 @@ fn audit_http_target(raw: &str) -> serde_json::Value {
             "scheme": url.scheme(),
             "host": url.host_str(),
             "port": url.port(),
-            "path": url.path(),
         }),
         Err(_) => serde_json::json!({ "invalid": true }),
     }
@@ -4138,6 +4168,19 @@ fn ceremony_projection_records(root: &Path) -> Result<Vec<PathBuf>, DaemonError>
     }
     records.sort();
     Ok(records)
+}
+
+/// Only a refusal proves no signature exists; a Petal may rebuild after
+/// `Denied` but must keep its payload after `Backend`. The unknown outcome
+/// carries no Broker text: Petal SDKs classify host errors by words such as
+/// "denied" or "invalid", and it must never read as a refusal.
+fn exact_signing_host_error(error: bloom_vfs::ExactSigningError) -> HostError {
+    match error {
+        bloom_vfs::ExactSigningError::Refused(reason) => HostError::Denied(reason),
+        bloom_vfs::ExactSigningError::OutcomeUnknown(_) => {
+            HostError::Backend("signing outcome unknown; it may already be signed".into())
+        }
+    }
 }
 
 /// Stop every durable Petal ceremony projection from advertising an owner
@@ -5469,6 +5512,19 @@ impl Daemon {
         let interval = Duration::from_secs(60);
         let background_span = tracing::Span::current();
         let handle = tokio::spawn(async move {
+            // Once per start: an older Bloom may have moved possibly signed
+            // entries to failed/; mark them so nobody retries them blindly.
+            let marking = outbox.clone();
+            match tokio::task::spawn_blocking(move || marking.mark_possibly_signed_failed()).await {
+                Ok(Ok(marked)) => {
+                    for entry in marked {
+                        let staged = entry.staged;
+                        warn!(id = %staged.id, wallet = %staged.wallet, chain = %staged.chain, nonce = staged.nonce, "outbox.failed_entry_signing_unknown");
+                    }
+                }
+                Ok(Err(error)) => warn!(%error, "outbox.signing_unknown_scan_failed"),
+                Err(error) => warn!(%error, "outbox.signing_unknown_scan_failed"),
+            }
             // Tick at `interval`, but exit promptly when the cancel
             // channel flips. We use `tokio::select!` so a long sleep
             // doesn't delay shutdown.
@@ -5481,7 +5537,15 @@ impl Daemon {
                             .duration_since(UNIX_EPOCH)
                             .map(|d| d.as_millis())
                             .unwrap_or(0);
-                        match run_expiry_sweep_once(&outbox, &audit, now_ms) {
+                        // The sweep waits for the outbox lifecycle file lock;
+                        // keep that wait off the async worker.
+                        let (sweep_outbox, sweep_audit) = (outbox.clone(), audit.clone());
+                        let swept = tokio::task::spawn_blocking(move || {
+                            run_expiry_sweep_once(&sweep_outbox, &sweep_audit, now_ms)
+                        })
+                        .await
+                        .unwrap_or_else(|error| Err(error.to_string()));
+                        match swept {
                             Ok(0) => tracing::trace!("outbox.sweep_expired.empty"),
                             Ok(n) => info!(swept = n, "outbox.sweep_expired"),
                             Err(error) => {
@@ -5490,26 +5554,26 @@ impl Daemon {
                             },
                         }
                         if let Some(solana_outbox) = &solana_outbox {
-                            // Live heights first: a Solana entry may only be
-                            // terminally expired when the cluster itself has
-                            // moved past the blockhash window. Chains whose
-                            // height cannot be observed are retained this
-                            // tick rather than judged by the wall estimate.
-                            let mut live_heights = std::collections::HashMap::new();
-                            for name in solana_chains.list_names() {
-                                let Some(client) = solana_chains.get(&name) else {
-                                    continue;
-                                };
-                                match client.get_block_height().await {
-                                    Ok(height) => {
-                                        live_heights.insert(name, height);
+                            let live_heights = solana_sweep_heights(&solana_chains).await;
+                            let mut observed = std::collections::HashSet::new();
+                            match solana_outbox.expired_pending(now_ms, &live_heights) {
+                                Ok(entries) => for entry in entries {
+                                    let Ok(Some(signature)) = solana_outbox.recorded_signature(&entry) else {
+                                        continue;
+                                    };
+                                    let Some(client) = solana_chains.get(&entry.staged.chain) else {
+                                        continue;
+                                    };
+                                    // Each probe searches transaction history. Only an
+                                    // observation counts; absence never retires a signature.
+                                    let probes = client.probe_signature_status_all_endpoints(&signature).await;
+                                    if probes.iter().any(|probe| matches!(&probe.status, Ok(Some(_)))) {
+                                        observed.insert((entry.staged.chain, signature));
                                     }
-                                    Err(error) => {
-                                        warn!(chain = %name, error = %error, "solana_outbox.sweep_height_unavailable")
-                                    }
-                                }
+                                },
+                                Err(error) => warn!(error = %error, "solana_outbox.sweep_signature_scan_failed"),
                             }
-                            match run_solana_expiry_sweep_once(solana_outbox, &audit, now_ms, &live_heights) {
+                            match run_solana_expiry_sweep_once(solana_outbox, &audit, now_ms, &live_heights, &observed) {
                                 Ok(0) => tracing::trace!("solana_outbox.sweep_expired.empty"),
                                 Ok(n) => info!(swept = n, "solana_outbox.sweep_expired"),
                                 Err(e) => warn!(error = %e, "solana_outbox.sweep_expired_failed"),
@@ -5700,6 +5764,31 @@ fn run_expiry_sweep_once(
     swept.map_err(|error| error.to_string())
 }
 
+/// Live heights for the expiry sweep: a Solana entry may only be terminally
+/// expired when every configured endpoint has finalized past the blockhash
+/// window. Chains where any endpoint lags or cannot answer report their
+/// lowest height or none, so their entries are retained this tick rather
+/// than judged by the wall estimate.
+async fn solana_sweep_heights(
+    chains: &bloom_solana::SolanaChainRegistry,
+) -> std::collections::HashMap<String, u64> {
+    let mut live_heights = std::collections::HashMap::new();
+    for name in chains.list_names() {
+        let Some(client) = chains.get(&name) else {
+            continue;
+        };
+        match client.finalized_block_height_all_endpoints().await {
+            Ok(height) => {
+                live_heights.insert(name, height);
+            }
+            Err(error) => {
+                warn!(chain = %name, error = %error, "solana_outbox.sweep_height_unavailable")
+            }
+        }
+    }
+    live_heights
+}
+
 /// Solana sibling of [`run_expiry_sweep_once`]: same audit-wrapped shape,
 /// over `bloom_solana_tx::outbox::SolanaOutbox` instead of EVM's
 /// `bloom_tx::outbox::Outbox` (Fix D, PLAN-SOLANA-PR-FIXES.md).
@@ -5708,10 +5797,11 @@ fn run_solana_expiry_sweep_once(
     audit: &AuditLog,
     now_ms: u128,
     live_block_heights: &std::collections::HashMap<String, u64>,
+    observed: &std::collections::HashSet<(String, String)>,
 ) -> Result<usize, String> {
     // As for EVM: an idle tick changes nothing and is not journaled.
     if outbox
-        .expired_pending(now_ms, live_block_heights)
+        .sweep_targets(now_ms, live_block_heights, observed)
         .map_err(|error| error.to_string())?
         .is_empty()
     {
@@ -5743,7 +5833,7 @@ fn run_solana_expiry_sweep_once(
         .map_err(|error| {
             format!("Machine audit unavailable before Solana expiry sweep: {error}")
         })?;
-    let swept = outbox.sweep_expired(now_ms, live_block_heights);
+    let swept = outbox.sweep_expired_with_statuses(now_ms, live_block_heights, observed);
     let result = match &swept {
         Ok(count) => serde_json::json!({"outcome": "completed", "swept": count}),
         Err(error) => serde_json::json!({"outcome": "error", "error": error.to_string()}),
@@ -6066,6 +6156,21 @@ fn render_petal_discovery_markdown(installed: &[bloom_petals::package::PetalDisc
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn http_audit_target_omits_credentials_and_path() {
+        let target = super::audit_http_target(
+            "https://user:password@example.com/path-secret?key=query-secret",
+        );
+        assert_eq!(
+            target,
+            serde_json::json!({"scheme":"https", "host":"example.com", "port":null})
+        );
+        assert_eq!(
+            super::audit_http_target("invalid-secret"),
+            serde_json::json!({"invalid":true})
+        );
+    }
+
     use super::*;
     use bloom_broker_api::{MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService};
     use bloom_vfs::VfsPath;
@@ -7932,6 +8037,110 @@ mod tests {
         .await
         .unwrap();
 
+        // A broadcast whose RPC reply was lost has no hash in intent.json;
+        // inspection reports the hash recorded in its attempt marker.
+        let mut unacknowledged = staged.clone();
+        unacknowledged.id = "petal-inspect-lost-reply".into();
+        unacknowledged.tx_hash = None;
+        daemon
+            .tx_engine
+            .outbox
+            .write_pending(&unacknowledged, "# plan")
+            .unwrap();
+        let entry = daemon
+            .tx_engine
+            .outbox
+            .read("w", "anvil", &unacknowledged.id)
+            .unwrap();
+        daemon
+            .tx_engine
+            .outbox
+            .write_broadcast_attempt(
+                &entry,
+                bloom_tx::outbox::BroadcastAttemptKind::Confirm,
+                &bloom_tx::outbox::BroadcastAttempt {
+                    schema: "bloom.broadcast_attempted.v1".into(),
+                    tx_hash: tx_hash.clone(),
+                    raw_tx_blake3: String::new(),
+                    raw_tx_path: "raw_tx".into(),
+                    from: unacknowledged.from.clone(),
+                    to: unacknowledged.to.clone(),
+                    nonce: unacknowledged.nonce,
+                    chain_id: unacknowledged.chain_id,
+                    created_ms: 1,
+                    transport: bloom_tx::outbox::BroadcastTransport::PublicRpc,
+                    private_provider: None,
+                },
+            )
+            .unwrap();
+        let inspection = host
+            .evm_tx_inspect(
+                "w".into(),
+                "anvil".into(),
+                unacknowledged.id.clone(),
+                Some(context.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inspection.state, "pending");
+        assert_eq!(inspection.tx_hash.as_deref(), Some(tx_hash.as_str()));
+
+        // A dispatched cancellation is reported, not hidden behind the
+        // unchanged status; the hash stays the original transaction's.
+        daemon
+            .tx_engine
+            .outbox
+            .write_artefact(
+                &entry.dir,
+                bloom_tx::outbox::SIGNING_STATE_FILE,
+                br#"{"sign_dispatched":true,"action_id":"31337:petal-inspect-lost-reply:cancel"}"#,
+            )
+            .unwrap();
+        let inspection = host
+            .evm_tx_inspect(
+                "w".into(),
+                "anvil".into(),
+                unacknowledged.id.clone(),
+                Some(context.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inspection.state, "cancelling");
+        assert_eq!(inspection.tx_hash.as_deref(), Some(tx_hash.as_str()));
+
+        // An entry an older Bloom moved to failed/ although it may be signed
+        // is not reported as a retryable failure.
+        let entry = daemon
+            .tx_engine
+            .outbox
+            .read("w", "anvil", &unacknowledged.id)
+            .unwrap();
+        daemon
+            .tx_engine
+            .outbox
+            .transition(&entry, bloom_tx::outbox::OutboxState::Failed)
+            .unwrap();
+        assert_eq!(
+            daemon
+                .tx_engine
+                .outbox
+                .mark_possibly_signed_failed()
+                .unwrap()
+                .len(),
+            1
+        );
+        let inspection = host
+            .evm_tx_inspect(
+                "w".into(),
+                "anvil".into(),
+                unacknowledged.id.clone(),
+                Some(context.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inspection.state, "signing_unknown");
+        assert_eq!(inspection.tx_hash.as_deref(), Some(tx_hash.as_str()));
+
         let mut other_app = context.clone();
         other_app.petal_root = "other".into();
         let denied = host
@@ -7945,72 +8154,52 @@ mod tests {
             .unwrap_err();
         assert!(matches!(denied, HostError::Denied(_)));
 
-        // Legacy failed entries can still persist status=pending. Only an
-        // unbroadcast hard-policy refusal is safe to expose as retryable.
-        for (id, known_hash, broadcast, expected) in [
-            ("legacy-refusal", None, false, "failed"),
-            ("legacy-hashed", Some(tx_hash.clone()), false, "pending"),
-            ("legacy-broadcast", None, true, "pending"),
-        ] {
-            let mut legacy = staged.clone();
-            legacy.id = id.into();
-            legacy.tx_hash = known_hash;
-            legacy.policy_checks = vec![bloom_proto::policy::PolicyCheck::hard(
-                "recipient",
-                bloom_proto::policy::PolicyOutcome::Deny,
-                "Safe is not an allowed destination",
-            )];
-            daemon
-                .tx_engine
-                .outbox
-                .write_pending(&legacy, "plan")
-                .unwrap();
-            let entry = daemon.tx_engine.outbox.read("w", "anvil", id).unwrap();
-            if broadcast {
-                daemon
-                    .tx_engine
-                    .outbox
-                    .write_broadcast_attempt(
-                        &entry,
-                        bloom_tx::outbox::BroadcastAttemptKind::Confirm,
-                        &bloom_tx::outbox::BroadcastAttempt {
-                            schema: "bloom.evm.broadcast-attempt.v1".into(),
-                            tx_hash: tx_hash.clone(),
-                            raw_tx_blake3: "ab".repeat(32),
-                            raw_tx_path: "raw_tx".into(),
-                            from: legacy.from.clone(),
-                            to: legacy.to.clone(),
-                            nonce: legacy.nonce,
-                            chain_id: legacy.chain_id,
-                            created_ms: 1,
-                            transport: bloom_tx::outbox::BroadcastTransport::PublicRpc,
-                            private_provider: None,
-                        },
-                    )
-                    .unwrap();
-            }
-            daemon
-                .tx_engine
-                .outbox
-                .transition(&entry, bloom_tx::outbox::OutboxState::Failed)
-                .unwrap();
-            let inspection = host
-                .evm_tx_inspect("w".into(), "anvil".into(), id.into(), Some(context.clone()))
-                .await
-                .unwrap();
-            assert_eq!(inspection.state, expected, "{id}");
-            assert_eq!(
-                daemon
-                    .tx_engine
-                    .outbox
-                    .read("w", "anvil", id)
-                    .unwrap()
-                    .staged
-                    .status,
-                bloom_proto::TxStatus::Pending,
-                "inspection must be read-only"
-            );
-        }
+        // A legacy hard-policy refusal moved to failed/ without persisting its
+        // status. Outbox reads report it failed, so a Petal can retry, and
+        // inspection does not rewrite it.
+        let mut legacy = staged.clone();
+        legacy.id = "legacy-refusal".into();
+        legacy.policy_checks = vec![bloom_proto::policy::PolicyCheck::hard(
+            "recipient",
+            bloom_proto::policy::PolicyOutcome::Deny,
+            "Safe is not an allowed destination",
+        )];
+        daemon
+            .tx_engine
+            .outbox
+            .write_pending(&legacy, "plan")
+            .unwrap();
+        let entry = daemon
+            .tx_engine
+            .outbox
+            .read("w", "anvil", &legacy.id)
+            .unwrap();
+        daemon
+            .tx_engine
+            .outbox
+            .transition(&entry, bloom_tx::outbox::OutboxState::Failed)
+            .unwrap();
+        let entry = daemon
+            .tx_engine
+            .outbox
+            .read("w", "anvil", &legacy.id)
+            .unwrap();
+        let intent = std::fs::read(entry.dir.join("intent.json")).unwrap();
+        let inspection = host
+            .evm_tx_inspect(
+                "w".into(),
+                "anvil".into(),
+                legacy.id.clone(),
+                Some(context.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inspection.state, "failed");
+        assert_eq!(
+            std::fs::read(entry.dir.join("intent.json")).unwrap(),
+            intent,
+            "inspection must be read-only"
+        );
 
         let mut other_context = context;
         other_context.package_hash = "c".repeat(64);
@@ -8823,6 +9012,7 @@ ws_url = "wss://example.invalid"
                     &d.audit,
                     now_ms,
                     &std::collections::HashMap::new(),
+                    &std::collections::HashSet::new(),
                 )
                 .unwrap(),
                 0
@@ -8843,6 +9033,59 @@ ws_url = "wss://example.invalid"
     // above: call the sweep function directly rather than waiting on the
     // real 60s tick, but exercise the exact outbox root
     // `spawn_background_tasks` itself constructs (`home.outbox_dir()`).
+    /// A loopback Solana RPC answering `getBlockHeight` with `height`, or
+    /// failing every request when `height` is `None`.
+    async fn spawn_solana_height_stub(height: Option<u64>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let _ = socket.read(&mut [0u8; 8192]).await;
+                let body = match height {
+                    Some(h) => format!(r#"{{"jsonrpc":"2.0","id":1,"result":{h}}}"#),
+                    None => r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"down"}}"#
+                        .to_string(),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    /// Every configured endpoint must be past the window before the sweep
+    /// may retire even an unsigned entry.
+    #[tokio::test]
+    async fn solana_sweep_height_requires_every_endpoint() {
+        let fast = spawn_solana_height_stub(Some(200)).await;
+        for slow in [Some(50), None] {
+            let slow = spawn_solana_height_stub(slow).await;
+            let registry = bloom_solana::SolanaChainRegistry::new();
+            registry.add(
+                bloom_solana::SolanaClient::build(&bloom_solana::SolanaSpec {
+                    name: "solana-devnet".into(),
+                    endpoints: [&fast, &slow]
+                        .map(|url| bloom_solana::EndpointSpec {
+                            url: url.to_string(),
+                            weight: 100,
+                            cu_per_sec: None,
+                            max_rps: None,
+                            http_only: false,
+                        })
+                        .to_vec(),
+                    expected_genesis_base58: None,
+                })
+                .unwrap(),
+            );
+            let heights = solana_sweep_heights(&registry).await;
+            assert!(heights.get("solana-devnet").is_none_or(|h| *h <= 50));
+        }
+    }
+
     #[tokio::test]
     async fn solana_sweep_reaps_an_expired_staged_transfer() {
         let dir = tempfile::tempdir().unwrap();
@@ -8878,6 +9121,7 @@ ws_url = "wss://example.invalid"
             &d.audit,
             2,
             &std::collections::HashMap::from([("solana-devnet".to_string(), 101_u64)]),
+            &std::collections::HashSet::new(),
         )
         .unwrap();
         assert_eq!(n, 1, "an abandoned, expired Solana stage must be reaped");
@@ -10669,6 +10913,39 @@ allowed = ["bloom:vfs.read"]
         assert!(
             names.contains(&"unknown-eeeeeeeeeeee"),
             "an unmounted session renders under unknown-<hash prefix>: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn petal_http_transport_errors_name_method_host_and_cause_but_no_url_data() {
+        // A closed port: Linux and macOS both refuse the connect at once.
+        // (A bound socket that never listens times out on macOS instead.)
+        let port = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let url = format!(
+            "http://fixture-user:fixture-password@127.0.0.1:{port}/fixture-path-token?key=fixture-query-token"
+        );
+        let original = reqwest::Client::new().get(&url).send().await.unwrap_err();
+        let message = petal_http_transport_error("send", "GET", &url, original).to_string();
+        for value in [
+            "fixture-user",
+            "fixture-password",
+            "fixture-path-token",
+            "fixture-query-token",
+        ] {
+            assert!(!message.contains(value), "URL data leaked: {message}");
+        }
+        assert!(
+            message.contains("http_fetch send: GET 127.0.0.1: "),
+            "method and host were dropped: {message}"
+        );
+        assert!(
+            message.contains("tcp connect error"),
+            "transport cause was dropped: {message}"
         );
     }
 }

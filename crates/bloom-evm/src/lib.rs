@@ -109,6 +109,10 @@ pub enum ChainError {
     Url(String),
     #[error("rpc: {0}")]
     Rpc(String),
+    /// The chain has no native token (Tempo), so there is no native balance
+    /// or native value to read or send. Deterministic, never retryable.
+    #[error("chain '{0}' has no native token; its fees are paid in tokens")]
+    NoNativeAsset(String),
 }
 
 impl From<TransportError> for ChainError {
@@ -121,6 +125,11 @@ impl From<bloom_rpc::BloomRpcError> for ChainError {
     fn from(e: bloom_rpc::BloomRpcError) -> Self {
         map_rpc_error(e)
     }
+}
+
+/// The refusal for a chain whose `eth_getBalance` is not a balance.
+pub fn no_native_asset(spec: &ChainSpec) -> ChainError {
+    ChainError::NoNativeAsset(spec.name.clone())
 }
 
 /// Translate a `bloom_rpc::BloomRpcError` into the historical `ChainError`
@@ -348,6 +357,9 @@ impl ChainClient {
     }
 
     pub async fn balance(&self, addr: Address) -> Result<U256, ChainError> {
+        if !self.spec.has_native_asset() {
+            return Err(no_native_asset(&self.spec));
+        }
         Ok(self.primary.get_balance(addr).await?)
     }
 
@@ -591,6 +603,24 @@ impl ChainClient {
 
     pub async fn gas_price(&self) -> Result<u128, ChainError> {
         Ok(self.primary.get_gas_price().await?)
+    }
+
+    pub async fn max_priority_fee_per_gas(&self) -> Result<u128, ChainError> {
+        Ok(self.primary.get_max_priority_fee_per_gas().await?)
+    }
+
+    /// Fee caps from a known gas-price quote and the node's priority quote.
+    pub async fn eip1559_fees(&self, gas_price: u128) -> (u128, u128) {
+        let priority = match self.max_priority_fee_per_gas().await {
+            Ok(priority) => priority.max(1),
+            Err(error) => {
+                // A fraction of gasPrice can fall below a chain's minimum
+                // tip. Its full quote is the conservative fallback.
+                warn!(%error, chain = %self.spec.name, "tx.priority_fee_fallback");
+                gas_price.max(1)
+            }
+        };
+        (gas_price.max(priority).saturating_mul(2), priority)
     }
 
     pub async fn estimate_gas(
@@ -1474,6 +1504,19 @@ mod mock_rpc_tests {
         let c = client_at(&url);
         let addr = address!("0x1111111111111111111111111111111111111111");
         assert_eq!(c.balance(addr).await.unwrap(), want);
+    }
+
+    #[tokio::test]
+    async fn balance_is_refused_on_a_chain_without_a_native_token() {
+        // No eth_getBalance response: the read must not reach the RPC.
+        let url = spawn_mock(responses()).await;
+        let mut spec = ChainSpec::anvil_default();
+        spec.chain_id = bloom_proto::chain::TEMPO_MODERATO_CHAIN_ID;
+        spec.rpc_urls = vec![url];
+        let c = ChainClient::new(spec).unwrap();
+        let addr = address!("0x1111111111111111111111111111111111111111");
+        let error = c.balance(addr).await.unwrap_err();
+        assert!(matches!(error, ChainError::NoNativeAsset(_)), "{error}");
     }
 
     #[tokio::test]

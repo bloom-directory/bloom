@@ -214,9 +214,11 @@ envelope on retry fails without changing the saved approval or calling Broker.
 Older states without a digest remain usable for requests without an envelope;
 reviewed legacy states migrate in place only when their saved facts digest
 matches the current facts and those facts contain the envelope's `action_digest`.
-This preserves approval and signing operation IDs, including lost-response
-recovery. Missing or inconsistent evidence fails closed and is retained for
-reconciliation; never delete or reset it to retry a potentially signed operation.
+A migrated state drops its saved approval and operation IDs, because Broker
+cannot show that the earlier ceremony displayed the review. The owner approves
+again. The bytes are unchanged, so a second signature cannot create a second
+action. Missing or inconsistent evidence fails closed and is retained for
+reconciliation.
 
 Bounded persona trading is a separate integration; exact approval does not
 require it. Implementation dependencies and future session acceptance criteria
@@ -324,8 +326,35 @@ combination. Do not require #224 to merge before publishing its package inputs;
 that creates a circular release dependency. Older installations retain their
 pinned packages; upgraded wallets still require owner approval of new identities.
 Bloom #224 must remain unmergeable until the default Polymarket and Hyperliquid
-catalog pins select compatible published packages. Broker #103 has landed and
-this branch pins its landed commit `e2f55a7e291eff32d3d544f0f94dc770945bafd7`.
+catalog pins select compatible published packages. Broker #103 landed as
+`e2f55a7e291eff32d3d544f0f94dc770945bafd7`. This branch pins Broker
+`50a2aa8bebb65088d4a3175e0e2f37d5107ac7eb`, which merges landed Broker master
+`b6c273397ca0f24f85e7279390fd59f502f290e4` and its Machine x402 and MPP payment
+review (bloom-broker #125) with generic sessions. It includes
+`e2f55a7`, the trusted clock rollback fix that Bloom v0.4.1 ships (#119), and the
+native SOL fee check (#127).
+
+Machine's own paid-HTTP payments (System subjects `paid-http.x402` and
+`paid-http.mpp`) send a message review envelope with every signature. Broker
+rebuilds or decodes the signed preimage from it, refuses an approval without it
+or with one that differs, and shows the owner what the signature pays
+(bloom-directory/pm#89):
+
+- x402 sends EIP-712 typed data: EIP-3009 `TransferWithAuthorization`, or
+  Permit2 `PermitWitnessTransferFrom` whose spender is the x402 exact proxy,
+  which pays only `witness.to`. The owner sees the token, amount, recipient and
+  validity window.
+- A Tempo MPP charge or session-open transaction sends its exact signing
+  preimage (`tempo_transaction`). The owner sees each recipient and amount, or
+  the channel's payee, token and deposit.
+- A Tempo MPP voucher (session open, voucher or close) sends `tempo_voucher`:
+  chain, escrow, channel ID and cumulative amount. When Machine opened the
+  channel it reads the payee, token, salt and authorized signer from the open
+  call and records them in Machine-private state (`requests/private/mpp-channels`,
+  keyed by channel ID). Later vouchers include them, and Broker checks they hash
+  to the channel ID. A channel opened before Machine recorded it has no
+  parameters, so the owner sees only the channel ID and amount with a warning.
+  Machine refuses MPP topUp, which it never builds.
 Polymarket v0.1.6 and Hyperliquid v0.1.7 do not satisfy the package contract.
 
 When combining Bloom #322 and #293 with the compiled token catalog, policy

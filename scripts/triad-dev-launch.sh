@@ -220,7 +220,9 @@ if [ -n "$mount_dir" ]; then
     umount_bin="$(command -v umount || true)"
     [ -n "$mount_nfs_bin" ] || die "Linux developer mounts require mount.nfs4"
     [ -n "$umount_bin" ] || die "Linux developer mounts require umount"
-    mount_probe_opts="actimeo=0,vers=4.1,proto=tcp,port=1,rsize=65536,wsize=65536,timeo=10"
+    # Same options the daemon mounts with, so the probe tests the privilege
+    # the real mount needs. See build_mount_opts in crates/bloom-mount/src/lib.rs.
+    mount_probe_opts="actimeo=0,sync,vers=4.1,proto=tcp,port=1,rsize=65536,wsize=65536,timeo=10"
     sudo -n -l -- "$mount_nfs_bin" -o "$mount_probe_opts" \
       "127.0.0.1:/" "$mount_dir" >/dev/null 2>&1 ||
       die "Linux developer mount privilege is not installed for $mount_dir"

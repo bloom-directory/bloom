@@ -611,10 +611,17 @@ impl MachineBrokerClient {
         let expected = ExpectedSigningResult::from_request(&request);
         match self
             .request(MachineBrokerRequest::SigningSign(request))
-            .await?
+            .await
+            .map_err(uncertain_signing_response)?
         {
-            MachineBrokerResponse::SigningSign(result) => expected.validate(result),
-            _ => Err(response_mismatch("signing.sign")),
+            MachineBrokerResponse::SigningSign(result) => expected.validate(result).map_err(|_| {
+                service_unavailable(
+                    "Broker signing response could not be verified; retain the operation identity",
+                )
+            }),
+            _ => Err(service_unavailable(
+                "Broker returned a mismatched signing response; retain the operation identity",
+            )),
         }
     }
 
@@ -625,10 +632,46 @@ impl MachineBrokerClient {
         let expected = ExpectedSigningResult::from_request(&request);
         match self
             .request(MachineBrokerRequest::SigningSignBatch(request))
-            .await?
+            .await.map_err(uncertain_signing_response)?
         {
-            MachineBrokerResponse::SigningSignBatch(result) => expected.validate(result),
-            _ => Err(response_mismatch("signing.sign_batch")),
+            MachineBrokerResponse::SigningSignBatch(result) => expected.validate(result)
+                .map_err(|_| service_unavailable("Broker batch signing response could not be verified; retain the operation identity")),
+            _ => Err(service_unavailable("Broker returned a mismatched batch signing response; retain the operation identity")),
+        }
+    }
+
+    /// A completed signing operation is replay-protected by Broker, so a
+    /// retry may receive `OPERATION_ID_CONFLICT` even when the original result
+    /// was durably committed. Recover that authenticated retained result by
+    /// operation id, but only when its complete operation digest still matches
+    /// this exact request. Without `recover`, the sign error is returned as is.
+    async fn sign_recovering_result(
+        &self,
+        recover: bool,
+        request: MachineSignRequest,
+    ) -> Result<SigningResult, ProtocolError> {
+        let expected = ExpectedSigningResult::from_request(&request);
+        let signed = match request.payloads {
+            SigningPayloads::Single { .. } => self.sign(request).await,
+            SigningPayloads::Batch { .. } => self.sign_batch(request).await,
+        };
+        match signed {
+            Ok(result) => Ok(result),
+            Err(sign_error) if !recover => Err(sign_error),
+            Err(sign_error) => {
+                let Ok(status) = self.operation_status(expected.operation_id.clone()).await else {
+                    return Err(sign_error);
+                };
+                if status.operation_id != expected.operation_id
+                    || status.operation_digest != expected.operation_digest
+                {
+                    return Err(sign_error);
+                }
+                match status.result {
+                    Some(result) => expected.validate(result),
+                    None => Err(status.error.unwrap_or(sign_error)),
+                }
+            }
         }
     }
 
@@ -867,7 +910,25 @@ impl MachineBrokerClient {
     /// the approval and sign operation.
     pub async fn sign_exact_payload(
         &self,
+        request: ExactPayloadSignRequest,
+    ) -> Result<ExactPayloadSignOutcome, ProtocolError> {
+        self.exact_payload(request, false).await
+    }
+
+    /// `sign_exact_payload` for a caller without its own reconciliation: a
+    /// lost signing response, or a retry Broker refuses as a replay, recovers
+    /// the retained result by operation status.
+    pub async fn sign_exact_payload_recovering(
+        &self,
+        request: ExactPayloadSignRequest,
+    ) -> Result<ExactPayloadSignOutcome, ProtocolError> {
+        self.exact_payload(request, true).await
+    }
+
+    async fn exact_payload(
+        &self,
         mut request: ExactPayloadSignRequest,
+        recover: bool,
     ) -> Result<ExactPayloadSignOutcome, ProtocolError> {
         request.validate()?;
         if request
@@ -1031,24 +1092,27 @@ impl MachineBrokerClient {
             }
             .digest()?;
             return self
-                .sign(MachineSignRequest {
-                    session_use: None,
-                    operation_id: request.signing_operation_id,
-                    operation_digest,
-                    approval_id,
-                    key_ref,
-                    crypto_suite: request.crypto_suite,
-                    payloads: SigningPayloads::Single {
-                        payload: Base64UrlBytes::from_bytes(&request.preimage),
+                .sign_recovering_result(
+                    recover,
+                    MachineSignRequest {
+                        session_use: None,
+                        operation_id: request.signing_operation_id,
+                        operation_digest,
+                        approval_id,
+                        key_ref,
+                        crypto_suite: request.crypto_suite,
+                        payloads: SigningPayloads::Single {
+                            payload: Base64UrlBytes::from_bytes(&request.preimage),
+                        },
+                        petal_use_claim: request.petal_use_claim,
+                        system_use_claim: request.system_use_claim,
+                        claim_assurance_evidence: request
+                            .claim_assurance_evidence
+                            .as_deref()
+                            .map(Base64UrlBytes::from_bytes),
+                        provenance: request.provenance,
                     },
-                    petal_use_claim: request.petal_use_claim,
-                    system_use_claim: request.system_use_claim,
-                    claim_assurance_evidence: request
-                        .claim_assurance_evidence
-                        .as_deref()
-                        .map(Base64UrlBytes::from_bytes),
-                    provenance: request.provenance,
-                })
+                )
                 .await
                 .map(ExactPayloadSignOutcome::Signed);
         }
@@ -1121,7 +1185,24 @@ impl MachineBrokerClient {
     /// operation digest.
     pub async fn sign_exact_payload_batch(
         &self,
+        request: ExactPayloadBatchSignRequest,
+    ) -> Result<ExactPayloadSignOutcome, ProtocolError> {
+        self.exact_payload_batch(request, false).await
+    }
+
+    /// `sign_exact_payload_batch` with `sign_exact_payload_recovering`'s
+    /// result recovery.
+    pub async fn sign_exact_payload_batch_recovering(
+        &self,
+        request: ExactPayloadBatchSignRequest,
+    ) -> Result<ExactPayloadSignOutcome, ProtocolError> {
+        self.exact_payload_batch(request, true).await
+    }
+
+    async fn exact_payload_batch(
+        &self,
         mut request: ExactPayloadBatchSignRequest,
+        recover: bool,
     ) -> Result<ExactPayloadSignOutcome, ProtocolError> {
         request.validate(false)?;
         if request
@@ -1259,28 +1340,31 @@ impl MachineBrokerClient {
             }
             .digest()?;
             return self
-                .sign_batch(MachineSignRequest {
-                    session_use: None,
-                    operation_id: request.signing_operation_id,
-                    operation_digest,
-                    approval_id,
-                    key_ref,
-                    crypto_suite: request.crypto_suite,
-                    payloads: SigningPayloads::Batch {
-                        children: request
-                            .preimages
-                            .iter()
-                            .map(|payload| Base64UrlBytes::from_bytes(payload))
-                            .collect(),
+                .sign_recovering_result(
+                    recover,
+                    MachineSignRequest {
+                        session_use: None,
+                        operation_id: request.signing_operation_id,
+                        operation_digest,
+                        approval_id,
+                        key_ref,
+                        crypto_suite: request.crypto_suite,
+                        payloads: SigningPayloads::Batch {
+                            children: request
+                                .preimages
+                                .iter()
+                                .map(|payload| Base64UrlBytes::from_bytes(payload))
+                                .collect(),
+                        },
+                        petal_use_claim: request.petal_use_claim,
+                        system_use_claim: None,
+                        claim_assurance_evidence: request
+                            .claim_assurance_evidence
+                            .as_deref()
+                            .map(Base64UrlBytes::from_bytes),
+                        provenance: request.provenance,
                     },
-                    petal_use_claim: request.petal_use_claim,
-                    system_use_claim: None,
-                    claim_assurance_evidence: request
-                        .claim_assurance_evidence
-                        .as_deref()
-                        .map(Base64UrlBytes::from_bytes),
-                    provenance: request.provenance,
-                })
+                )
                 .await
                 .map(ExactPayloadSignOutcome::Signed);
         }
@@ -1462,28 +1546,31 @@ impl MachineBrokerClient {
             }
             .digest()?;
             return self
-                .sign_batch(MachineSignRequest {
-                    session_use: None,
-                    operation_id: request.signing_operation_id,
-                    operation_digest,
-                    approval_id,
-                    key_ref,
-                    crypto_suite: request.crypto_suite,
-                    payloads: SigningPayloads::Batch {
-                        children: request
-                            .preimages
-                            .iter()
-                            .map(|payload| Base64UrlBytes::from_bytes(payload))
-                            .collect(),
+                .sign_recovering_result(
+                    true,
+                    MachineSignRequest {
+                        session_use: None,
+                        operation_id: request.signing_operation_id,
+                        operation_digest,
+                        approval_id,
+                        key_ref,
+                        crypto_suite: request.crypto_suite,
+                        payloads: SigningPayloads::Batch {
+                            children: request
+                                .preimages
+                                .iter()
+                                .map(|payload| Base64UrlBytes::from_bytes(payload))
+                                .collect(),
+                        },
+                        petal_use_claim: Some(claim.clone()),
+                        system_use_claim: None,
+                        claim_assurance_evidence: request
+                            .claim_assurance_evidence
+                            .as_deref()
+                            .map(Base64UrlBytes::from_bytes),
+                        provenance: request.provenance,
                     },
-                    petal_use_claim: Some(claim.clone()),
-                    system_use_claim: None,
-                    claim_assurance_evidence: request
-                        .claim_assurance_evidence
-                        .as_deref()
-                        .map(Base64UrlBytes::from_bytes),
-                    provenance: request.provenance,
-                })
+                )
                 .await
                 .map(ExactPayloadSignOutcome::Signed);
         }
@@ -2441,7 +2528,7 @@ impl ExactPayloadBatchSignRequest {
         {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::ClaimInvalid,
-                "Polymarket exact batches require one recoverable Keccak payload and its complete review envelope",
+                "only Polymarket exact batches carry a review envelope, and each needs exactly one recoverable Keccak payload with its complete envelope",
             ));
         }
         if self.expires_at_ms.get() <= self.issued_at_ms.get() {
@@ -2524,23 +2611,17 @@ impl ExactPayloadSignRequest {
                 || bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES
                     .contains(&claim.operation_class.as_str())
         });
-        // Paid HTTP has an installer-certified System exact-approval path.
-        // Its EIP-712 payment payload is not a Petal message and cannot carry
-        // a Petal review envelope. Keep this exception tied to those two
-        // existing classes; it never authorizes reusable or native sessions.
-        let exact_paid_http = self.petal_use_claim.is_none()
-            && self.system_use_claim.is_none()
-            && self.session_use.is_none()
-            && matches!(
-                &self.provenance,
-                ProvenanceSubject::System { component_id, operation_class }
-                    if component_id.as_str() == "bloom-machine"
-                        && matches!(operation_class.as_str(), "paid-http.x402" | "paid-http.mpp")
-            );
-        if (message_required || is_signed_message(self.crypto_suite, &self.preimage))
+        // Machine builds System messages itself, so no Petal can label them.
+        // Broker decodes the x402 and MPP payment envelopes for the owner.
+        let system = matches!(self.provenance, ProvenanceSubject::System { .. });
+        let system_payment = matches!(&self.provenance, ProvenanceSubject::System { operation_class, .. }
+            if [bloom_broker_api::SYSTEM_X402_OPERATION_CLASS, bloom_broker_api::SYSTEM_MPP_OPERATION_CLASS]
+                .contains(&operation_class.as_str()));
+        if (message_required
+            || system_payment
+            || (!system && is_signed_message(self.crypto_suite, &self.preimage)))
             && self.message_review_payload.is_none()
             && !safe_operation
-            && !exact_paid_http
         {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::ClaimInvalid,
@@ -2549,12 +2630,12 @@ impl ExactPayloadSignRequest {
         }
         if self.message_review_payload.is_some()
             && (safe_operation
-                || self.petal_use_claim.is_none()
+                || (self.petal_use_claim.is_none() && !system_payment)
                 || self.crypto_suite != CryptoSuite::Secp256k1Keccak256Recoverable)
         {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::ClaimInvalid,
-                "Message review requires an independent recoverable secp256k1 Petal signature",
+                "Message review requires an independent recoverable secp256k1 Petal or paid-HTTP signature",
             ));
         }
         SigningPayloads::Single {
@@ -3351,6 +3432,26 @@ fn response_mismatch(method: &str) -> ProtocolError {
     )
 }
 
+// The service API flattens local frame errors and Broker refusals. A frame
+// failure after dispatch cannot prove the Broker did not sign. Conservatively
+// retain the operation even when the same code could be a remote refusal.
+// `UnknownField` is raised by strict decoding of the response frame, which
+// happens only after the request was written.
+fn uncertain_signing_response(error: ProtocolError) -> ProtocolError {
+    if matches!(
+        error.code,
+        ProtocolErrorCode::MalformedFrame
+            | ProtocolErrorCode::LimitExceededFrame
+            | ProtocolErrorCode::UnknownField
+    ) {
+        service_unavailable(
+            "Broker signing response frame unavailable; retain the operation identity",
+        )
+    } else {
+        error
+    }
+}
+
 fn response_identity_mismatch(method: &str) -> ProtocolError {
     ProtocolError::new(
         ProtocolErrorCode::OperationIdConflict,
@@ -3400,6 +3501,24 @@ pub fn ceremony_repair(status: &bloom_broker_api::CeremonyExposureStatus) -> ser
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn post_dispatch_frame_failures_remain_uncertain() {
+        for code in [
+            ProtocolErrorCode::MalformedFrame,
+            ProtocolErrorCode::LimitExceededFrame,
+            ProtocolErrorCode::UnknownField,
+        ] {
+            assert_eq!(
+                super::uncertain_signing_response(ProtocolError::new(code, "reply lost")).code,
+                ProtocolErrorCode::ServiceUnavailable,
+            );
+        }
+        let refusal = super::uncertain_signing_response(ProtocolError::new(
+            ProtocolErrorCode::LimitExceededValue,
+            "definitive refusal",
+        ));
+        assert_eq!(refusal.code, ProtocolErrorCode::LimitExceededValue);
+    }
     use super::*;
 
     #[test]
@@ -4461,46 +4580,6 @@ mod tests {
     }
 
     #[test]
-    fn only_existing_paid_http_system_exact_routes_skip_petal_message_envelopes() {
-        let mut request = exact_request(vec![0x19, 0x01], None);
-        assert_eq!(
-            request.validate().unwrap_err().code,
-            ProtocolErrorCode::ClaimInvalid
-        );
-        request.provenance = ProvenanceSubject::Petal {
-            package_hash: digest(70),
-            route: "generic/opaque-signature".into(),
-        };
-        assert_eq!(
-            request.validate().unwrap_err().code,
-            ProtocolErrorCode::ClaimInvalid
-        );
-        for class in ["paid-http.x402", "paid-http.mpp"] {
-            request.provenance = ProvenanceSubject::System {
-                component_id: token("bloom-machine"),
-                operation_class: token(class),
-            };
-            request.validate().unwrap();
-        }
-        request.provenance = ProvenanceSubject::System {
-            component_id: token("bloom-machine"),
-            operation_class: token("arbitrary.message"),
-        };
-        assert_eq!(
-            request.validate().unwrap_err().code,
-            ProtocolErrorCode::ClaimInvalid
-        );
-        request.provenance = ProvenanceSubject::System {
-            component_id: token("other-component"),
-            operation_class: token("paid-http.x402"),
-        };
-        assert_eq!(
-            request.validate().unwrap_err().code,
-            ProtocolErrorCode::ClaimInvalid
-        );
-    }
-
-    #[test]
     fn safe_exact_request_requires_a_bounded_semantic_review_envelope() {
         let mut request = exact_request(vec![0x19, 0x01], None);
         request.petal_use_claim = Some(PetalUseClaim {
@@ -4597,15 +4676,37 @@ mod tests {
     }
 
     #[test]
-    fn system_signed_message_needs_no_envelope_and_cannot_carry_one() {
+    fn only_system_payment_messages_carry_and_require_an_envelope() {
+        let envelope = br#"{"schema":"bloom.message.review.v1"}"#.to_vec();
+        for class in [
+            bloom_broker_api::SYSTEM_X402_OPERATION_CLASS,
+            bloom_broker_api::SYSTEM_MPP_OPERATION_CLASS,
+        ] {
+            // A Tempo transaction preimage is not an EIP-191/712 message, so
+            // the envelope requirement must come from the subject.
+            for preimage in [vec![0x19, 0x01], vec![0x76, 0xc0]] {
+                let mut request = exact_request(preimage, None);
+                request.provenance = ProvenanceSubject::System {
+                    component_id: token("bloom-machine"),
+                    operation_class: token(class),
+                };
+                assert_eq!(
+                    request.validate().unwrap_err().code,
+                    ProtocolErrorCode::ClaimInvalid,
+                    "{class} without an envelope"
+                );
+                request.message_review_payload = Some(envelope.clone());
+                request.validate().unwrap();
+            }
+        }
+        // Other System subjects have no envelope Broker reads.
         let mut request = exact_request(vec![0x19, 0x01], None);
         request.provenance = ProvenanceSubject::System {
             component_id: token("bloom-machine"),
-            operation_class: token("paid-http.x402"),
+            operation_class: token("paid-http.other"),
         };
         request.validate().unwrap();
-        // Broker refuses message envelopes on non-Petal subjects.
-        request.message_review_payload = Some(br#"{"schema":"bloom.message.review.v1"}"#.to_vec());
+        request.message_review_payload = Some(envelope);
         assert_eq!(
             request.validate().unwrap_err().code,
             ProtocolErrorCode::ClaimInvalid
@@ -5568,7 +5669,7 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert_eq!(error.code, ProtocolErrorCode::OperationIdConflict);
+        assert_eq!(error.code, ProtocolErrorCode::ServiceUnavailable);
     }
 
     #[tokio::test]
@@ -6536,5 +6637,63 @@ mod tests {
             .await
             .expect_err("a root-signing wallet has no derived account to select");
         assert_eq!(error.code, ProtocolErrorCode::KeyrefMismatch);
+    }
+
+    /// A response that fails strict decoding after `signing.sign` or
+    /// `signing.sign_batch` was written cannot prove the Broker did not sign,
+    /// so both must surface as retryable `ServiceUnavailable`, which keeps the
+    /// operation identity and dispatch marker for reconciliation.
+    struct UndecodableSigningResponseBroker;
+
+    impl MachineBrokerService for UndecodableSigningResponseBroker {
+        fn dispatch<'a>(
+            &'a self,
+            _request: MachineBrokerRequest,
+        ) -> ServiceFuture<'a, MachineBrokerResponse> {
+            Box::pin(async {
+                Err(ProtocolError::new(
+                    ProtocolErrorCode::UnknownField,
+                    "response frame carried an unknown field",
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn undecodable_signing_response_keeps_single_and_batch_identity() {
+        let client = MachineBrokerClient::new(Arc::new(UndecodableSigningResponseBroker));
+        let request = |payloads| MachineSignRequest {
+            session_use: None,
+            operation_id: OperationId::from_bytes([94; 32]),
+            operation_digest: digest(95),
+            approval_id: digest(96),
+            key_ref: key_ref(),
+            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+            payloads,
+            petal_use_claim: None,
+            system_use_claim: None,
+            claim_assurance_evidence: None,
+            provenance: ProvenanceSubject::System {
+                component_id: token("bloom-machine"),
+                operation_class: token("evm.transaction"),
+            },
+        };
+        let single = client
+            .sign(request(SigningPayloads::Single {
+                payload: Base64UrlBytes::from_bytes(b"payload"),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(single.code, ProtocolErrorCode::ServiceUnavailable);
+        let batch = client
+            .sign_batch(request(SigningPayloads::Batch {
+                children: vec![
+                    Base64UrlBytes::from_bytes(b"first"),
+                    Base64UrlBytes::from_bytes(b"second"),
+                ],
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(batch.code, ProtocolErrorCode::ServiceUnavailable);
     }
 }

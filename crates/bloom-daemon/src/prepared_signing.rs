@@ -33,6 +33,35 @@ fn host_error(e: HostError) -> SigningError {
     };
     error(code, e)
 }
+/// Preserve the prepared API's explicit reconciliation outcome across the
+/// legacy single-message and batch signing transports.
+fn prepared_signing_failure(e: HostError) -> Result<SigningOutcome, SigningError> {
+    match e {
+        HostError::Denied(message) if message.contains("APPROVAL_EXPIRED") => {
+            Err(error(ErrorCode::Expired, message))
+        }
+        HostError::Denied(message)
+            if message.contains("APPROVAL_REVOKED") || message.contains("CANCELLED") =>
+        {
+            Err(error(ErrorCode::Cancelled, message))
+        }
+        HostError::Denied(message)
+            if message.contains("OperationIdConflict")
+                || message.contains("OPERATION_ID_CONFLICT")
+                || message.contains("RECOVERY_REQUIRED") =>
+        {
+            Ok(SigningOutcome::RecoveryRequired {
+                status: "signing_outcome_ambiguous".into(),
+            })
+        }
+        HostError::Backend(message) if message.contains("signing outcome unknown") => {
+            Ok(SigningOutcome::RecoveryRequired {
+                status: "signing_outcome_ambiguous".into(),
+            })
+        }
+        other => Err(host_error(other)),
+    }
+}
 fn suite(s: prepared::CryptoSuite) -> bloom_broker_api::CryptoSuite {
     match s {
         prepared::CryptoSuite::Keccak256 => {
@@ -587,23 +616,7 @@ impl DaemonPetalHost {
             };
             let result = match self.sign_payload_outcome(single).await {
                 Ok(result) => result,
-                Err(HostError::Denied(message)) if message.contains("APPROVAL_EXPIRED") => {
-                    return Err(error(ErrorCode::Expired, message));
-                }
-                Err(HostError::Denied(message))
-                    if message.contains("APPROVAL_REVOKED") || message.contains("CANCELLED") =>
-                {
-                    return Err(error(ErrorCode::Cancelled, message));
-                }
-                Err(HostError::Denied(message))
-                    if message.contains("OPERATION_ID_CONFLICT")
-                        || message.contains("RECOVERY_REQUIRED") =>
-                {
-                    return Ok(SigningOutcome::RecoveryRequired {
-                        status: "signing_outcome_ambiguous".into(),
-                    });
-                }
-                Err(err) => return Err(host_error(err)),
+                Err(err) => return prepared_signing_failure(err),
             };
             let outcome = match result {
                 SignOutcome::Signature(signature) => {
@@ -648,24 +661,7 @@ impl DaemonPetalHost {
         };
         let result = match self.sign_payload_batch_outcome(old_request).await {
             Ok(result) => result,
-            Err(HostError::Denied(message)) if message.contains("APPROVAL_EXPIRED") => {
-                return Err(error(ErrorCode::Expired, message));
-            }
-            Err(HostError::Denied(message))
-                if message.contains("APPROVAL_REVOKED") || message.contains("CANCELLED") =>
-            {
-                return Err(error(ErrorCode::Cancelled, message));
-            }
-            Err(HostError::Denied(message))
-                if message.contains("OperationIdConflict")
-                    || message.contains("OPERATION_ID_CONFLICT")
-                    || message.contains("RECOVERY_REQUIRED") =>
-            {
-                return Ok(SigningOutcome::RecoveryRequired {
-                    status: "signing_outcome_ambiguous".into(),
-                });
-            }
-            Err(error) => return Err(host_error(error)),
+            Err(err) => return prepared_signing_failure(err),
         };
         let outcome = match result {
             PayloadBatchSignOutcome::ApprovalPending(pending) => SigningOutcome::ApprovalPending {
@@ -868,6 +864,32 @@ impl DaemonPetalHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_signing_outcomes_require_recovery_while_refusals_remain_errors() {
+        // Both prepared signing transports receive the same sanitized host
+        // error from exact signing; it must not look safe to rebuild or retry.
+        let unknown = super::super::exact_signing_host_error(
+            bloom_vfs::ExactSigningError::OutcomeUnknown("lost response".into()),
+        );
+        assert!(matches!(
+            prepared_signing_failure(unknown),
+            Ok(SigningOutcome::RecoveryRequired { .. })
+        ));
+        let refused = super::super::exact_signing_host_error(
+            bloom_vfs::ExactSigningError::Refused("policy denied".into()),
+        );
+        assert_eq!(
+            prepared_signing_failure(refused).unwrap_err().code,
+            ErrorCode::Denied
+        );
+        assert_eq!(
+            prepared_signing_failure(HostError::Backend("Broker unavailable".into()))
+                .unwrap_err()
+                .code,
+            ErrorCode::Backend,
+        );
+    }
 
     fn context() -> PetalRouteContext {
         PetalRouteContext {

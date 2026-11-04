@@ -806,7 +806,11 @@ impl WalletProjectionReader for CachedWalletProjectionReader {
         &self,
         wallet_id: &Token,
     ) -> Result<WalletProjection, ProtocolError> {
-        self.refresh_wallet(wallet_id)
+        // An earlier observation may share this request's millisecond. Even
+        // timestamp-based refresh sharing must be disabled for authority.
+        self.clone()
+            .with_max_age(Duration::ZERO)
+            .refresh_wallet(wallet_id)
             .await?
             .ok_or_else(|| invalid_projection(format!("wallet {} not found", wallet_id.as_str())))
     }
@@ -1436,6 +1440,15 @@ mod tests {
         keys: Vec<KeyPublic>,
         credentials: Vec<CredentialPublic>,
         policy: SignedPolicySnapshot,
+    }
+
+    #[derive(Debug, serde::Deserialize, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct Schema1CredentialPublic {
+        credential_id: String,
+        wallet_id: String,
+        created_at_ms: String,
+        state: String,
     }
 
     struct FakeBroker {
@@ -2089,6 +2102,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_policy_commit_can_outpace_display_cache_but_not_authority_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let broker = Arc::new(FakeBroker::new(fixture(1)));
+        let reader = CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(broker.clone())),
+            FileProjectionStore::new(directory.path().join("wallets.json")),
+        )
+        .unwrap()
+        .with_max_age(Duration::from_secs(60));
+        let wallet = token("alice");
+        let initial = reader.get_wallet(&wallet).await.unwrap();
+        assert_eq!(initial.policy.version.get(), 1);
+
+        broker
+            .wallets
+            .lock()
+            .unwrap()
+            .insert("alice".into(), fixture(2));
+        let cached = reader.get_wallet(&wallet).await.unwrap();
+        assert_eq!(cached.policy.version.get(), 1);
+        // Force the refresh-sharing condition without relying on the test
+        // completing within one wall-clock millisecond. Authority must bypass
+        // it even if the clock moved backwards after the cached observation.
+        reader
+            .wallet_refreshed_ms
+            .lock()
+            .unwrap()
+            .insert("alice".into(), u64::MAX);
+        let authoritative = reader.get_wallet_authority(&wallet).await.unwrap();
+        assert_eq!(authoritative.policy.version.get(), 2);
+        let refreshed = reader.get_wallet(&wallet).await.unwrap();
+        assert_eq!(refreshed.policy.version.get(), 2);
+    }
+
+    #[tokio::test]
     async fn mounted_reads_reuse_a_refresh_within_the_configured_age() {
         let directory = tempfile::tempdir().unwrap();
         let store = FileProjectionStore::new(directory.path().join("wallets.json"));
@@ -2480,17 +2528,11 @@ mod tests {
 
     #[test]
     fn schema1_credentials_load_but_surface_projections_require_schema2_reader() {
-        // Serialize with the actual released API, not a current object with
-        // its version marker changed. The surrounding cache format is stable.
-        let old: schema1_broker_api::CredentialPublic = serde_json::from_value(serde_json::json!({
-            "credential_id": "CwsLCwsLCwsLCwsLCwsLCw",
-            "wallet_id": "alice",
-            "created_at_ms": "1",
-            "state": "ACTIVE"
-        }))
-        .unwrap();
-        let legacy_bytes = serde_json::to_vec(&old).unwrap();
-        let credential: CredentialPublic = serde_json::from_slice(&legacy_bytes).unwrap();
+        // Frozen output from Broker dd2add2b's released schema-1 API. Keep the
+        // reader local so a compatibility fixture cannot enter release pins.
+        let legacy_bytes = br#"{"credential_id":"CwsLCwsLCwsLCwsLCwsLCw","wallet_id":"alice","created_at_ms":"1","state":"ACTIVE"}"#;
+        serde_json::from_slice::<Schema1CredentialPublic>(legacy_bytes).unwrap();
+        let credential: CredentialPublic = serde_json::from_slice(legacy_bytes).unwrap();
         assert!(credential.surface.is_none());
         let mut fixture = migrated_fixture();
         fixture.credentials = vec![credential];
@@ -2524,8 +2566,7 @@ mod tests {
         )
         .unwrap();
         let updated = serde_json::to_vec(&projection.credentials[0]).unwrap();
-        let error =
-            serde_json::from_slice::<schema1_broker_api::CredentialPublic>(&updated).unwrap_err();
+        let error = serde_json::from_slice::<Schema1CredentialPublic>(&updated).unwrap_err();
         assert!(error.to_string().contains("unknown field `surface`"));
         cache
             .wallets

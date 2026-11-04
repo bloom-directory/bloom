@@ -3028,7 +3028,7 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         return;
     }
     // Exercise source installation of the current pinned Polymarket release.
-    let petal_ref = "a0177ae4e68f4a043df4db727fb3212e23ab7395";
+    let petal_ref = "7c83978b99a10b5f5617863a461291781bda6f54";
     let home = fresh_home();
     let home_dir = bloom_proto::HomeDir::at(home.path());
     let config = bloom_proto::Config::local_default();
@@ -3058,8 +3058,8 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         )))
         .stdout(predicate::str::contains("Building source package..."))
         .stdout(predicate::str::contains("Validating Petal package..."))
-        .stdout(predicate::str::contains("\"routes\": 109"))
-        .stdout(predicate::str::contains("routes: 109"));
+        .stdout(predicate::str::contains("\"routes\": 110"))
+        .stdout(predicate::str::contains("routes: 110"));
 
     bloom_cmd(home.path())
         .args(["petals", "ls"])
