@@ -985,24 +985,28 @@ fn init_runs_setup_once_even_when_the_config_already_exists() {
     let mut config = bloom_proto::Config::load(&home_dir.config_path()).unwrap();
     assert!(config.setup.complete);
     assert!(
-        config.setup.petals.contains_key("hyperliquid"),
+        config.setup.main().petals.contains_key("hyperliquid"),
         "non-interactive setup records the catalog's suggestions: {:?}",
-        config.setup.petals
+        config.setup.main().petals
     );
 
     // The owner's choice was "none of them"; a later run must keep it.
-    config.setup.petals.clear();
+    config.setup.main_mut().petals.clear();
     config.save(&home_dir.config_path()).unwrap();
     init(home.path());
     let config = bloom_proto::Config::load(&home_dir.config_path()).unwrap();
     assert!(config.setup.complete);
-    assert!(config.setup.petals.is_empty(), "{:?}", config.setup.petals);
+    assert!(
+        config.setup.main().petals.is_empty(),
+        "{:?}",
+        config.setup.main().petals
+    );
 }
 
-/// `bloom init` records a persona before the Petal setup it suggests values
-/// for. Without a terminal, first setup records Institutional; `--persona`
-/// chooses one, and on an existing home replaces the saved one without
-/// rerunning setup.
+/// `bloom init` records main's persona before the Petal setup it suggests
+/// values for. Without a terminal, first setup records Institutional, and
+/// `--persona` chooses one. On a home whose setup already ran it changes
+/// nothing: a switch is a fresh start that `bloom wallet persona` makes.
 #[test]
 fn init_records_the_chosen_persona_before_petal_setup() {
     use bloom_proto::persona::PersonaPreset;
@@ -1034,44 +1038,42 @@ fn init_records_the_chosen_persona_before_petal_setup() {
         )
     };
     let polymarket_limit = |config: &bloom_proto::Config| {
-        config.setup.petals["polymarket"].values["max_daily_usd"].clone()
+        config.setup.main().petals["polymarket"].values["max_daily_usd"].clone()
     };
 
     let degen_home = fresh_home();
     let (degen, stdout) = init(degen_home.path(), Some("degen"));
-    assert_eq!(degen.persona.as_ref().unwrap().preset, PersonaPreset::Degen);
+    assert_eq!(
+        degen.setup.main().persona.as_ref().unwrap().preset,
+        PersonaPreset::Degen
+    );
     assert_eq!(polymarket_limit(&degen), "10000");
     assert!(!stdout.contains("persona_note:"), "first setup: {stdout}");
 
     let home = fresh_home();
     let (first, _) = init(home.path(), None);
     assert_eq!(
-        first.persona.as_ref().unwrap().preset,
+        first.setup.main().persona.as_ref().unwrap().preset,
         PersonaPreset::Custodian
     );
     assert_eq!(polymarket_limit(&first), "100");
-    let (changed, stdout) = init(home.path(), Some("trader"));
+    let (later, stdout) = init(home.path(), Some("trader"));
     assert_eq!(
-        changed.persona.as_ref().unwrap().preset,
-        PersonaPreset::Trader
-    );
-    assert_eq!(
-        polymarket_limit(&changed),
-        "100",
-        "an existing home keeps its setup choices"
+        later.setup.wallets, first.setup.wallets,
+        "a later --persona changes nothing"
     );
     assert!(
-        stdout.contains("persona_note: trader is saved")
-            && stdout.contains("Petal limits chosen during setup are unchanged"),
+        stdout.contains("persona_note: setup already ran, so nothing changed")
+            && stdout.contains("run `bloom wallet persona main trader` while Bloom is running"),
         "{stdout}"
     );
 }
 
 /// A home set up before personas keeps having none until the owner chooses
-/// one, and a saved persona that is no longer usable can be replaced with
-/// `bloom init --persona` rather than stopping every command.
+/// one, and a saved persona that is no longer usable is set aside rather
+/// than stopping every command; `bloom init --persona` then names the switch.
 #[test]
-fn init_leaves_a_legacy_home_alone_and_replaces_an_unusable_persona() {
+fn init_leaves_a_legacy_home_alone_and_sets_an_unusable_persona_aside() {
     use bloom_proto::persona::PersonaPreset;
 
     let home = fresh_home();
@@ -1097,22 +1099,22 @@ fn init_leaves_a_legacy_home_alone_and_replaces_an_unusable_persona() {
         bloom_proto::Config::load(&home_dir.config_path()).unwrap()
     };
 
-    assert_eq!(init(None).persona, None, "a legacy home keeps no persona");
+    assert_eq!(
+        init(None).setup.main().persona,
+        None,
+        "a legacy home keeps no persona"
+    );
 
     // A hand-edited persona that no longer validates.
     let mut degen = legacy.clone();
-    degen.persona = Some(bloom_proto::persona::PersonaConfig::suggested(
+    degen.setup.main_mut().persona = Some(bloom_proto::persona::PersonaConfig::suggested(
         PersonaPreset::Degen,
     ));
     let edited = toml::to_string(&degen)
         .unwrap()
         .replace("window_secs = 604800", "window_secs = 3600");
     std::fs::write(home_dir.config_path(), edited).unwrap();
-    let replaced = init(Some("trader"));
-    assert_eq!(
-        replaced.persona.as_ref().unwrap().preset,
-        PersonaPreset::Trader
-    );
+    assert_eq!(init(Some("trader")).setup.main().persona, None);
 }
 
 /// Setup queues the chosen settings before provisioning. Here provisioning
@@ -1152,7 +1154,7 @@ fn init_setup_on_an_existing_config_keeps_earlier_choices() {
     let home_dir = bloom_proto::HomeDir::at(home.path());
     home_dir.ensure().unwrap();
     let mut config = bloom_proto::Config::local_default();
-    config.setup.petals.insert(
+    config.setup.main_mut().petals.insert(
         "polymarket".into(),
         bloom_proto::config::PetalSetupConfig {
             values: std::collections::BTreeMap::from([("max_daily_usd".into(), "42.5".into())]),
@@ -1177,13 +1179,13 @@ fn init_setup_on_an_existing_config_keeps_earlier_choices() {
     let config = bloom_proto::Config::load(&home_dir.config_path()).unwrap();
     assert!(config.setup.complete);
     assert_eq!(
-        config.setup.petals.keys().collect::<Vec<_>>(),
+        config.setup.main().petals.keys().collect::<Vec<_>>(),
         ["polymarket"],
         "declined Petals were added back: {:?}",
-        config.setup.petals
+        config.setup.main().petals
     );
     assert_eq!(
-        config.setup.petals["polymarket"].values["max_daily_usd"],
+        config.setup.main().petals["polymarket"].values["max_daily_usd"],
         "42.5"
     );
 }
@@ -1196,21 +1198,21 @@ fn init_moves_setup_choices_out_of_the_petals_table() {
     let home = fresh_home();
     let home_dir = bloom_proto::HomeDir::at(home.path());
     home_dir.ensure().unwrap();
-    let mut config = bloom_proto::Config::local_default();
-    config.setup.complete = true;
-    config.setup.petals.insert(
-        "polymarket".into(),
-        bloom_proto::config::PetalSetupConfig {
-            values: std::collections::BTreeMap::from([("max_daily_usd".into(), "42.5".into())]),
-        },
+    // The layout an earlier build wrote: setup's choices under `[petals]`.
+    let mut legacy = toml::Value::try_from(bloom_proto::Config::local_default()).unwrap();
+    let petals = legacy["petals"].as_table_mut().unwrap();
+    petals.insert("setup_complete".into(), true.into());
+    petals.insert(
+        "setup".into(),
+        toml::Value::try_from(std::collections::BTreeMap::from([(
+            "polymarket",
+            bloom_proto::config::PetalSetupConfig {
+                values: std::collections::BTreeMap::from([("max_daily_usd".into(), "42.5".into())]),
+            },
+        )]))
+        .unwrap(),
     );
-    let current = toml::to_string_pretty(&config).unwrap();
-    let legacy = current
-        .replace(
-            "[setup]\ncomplete = true",
-            "[petals]\nsetup_complete = true",
-        )
-        .replace("[setup.petals.", "[petals.setup.");
+    let legacy = toml::to_string_pretty(&legacy).unwrap();
     assert!(
         legacy.contains("[petals.setup.polymarket.values]"),
         "{legacy}"
@@ -1244,7 +1246,7 @@ fn init_moves_setup_choices_out_of_the_petals_table() {
     let config = bloom_proto::Config::load(&home_dir.config_path()).unwrap();
     assert!(config.setup.complete);
     assert_eq!(
-        config.setup.petals["polymarket"].values["max_daily_usd"],
+        config.setup.main().petals["polymarket"].values["max_daily_usd"],
         "42.5"
     );
     assert!(!config.holds_legacy_setup_keys());

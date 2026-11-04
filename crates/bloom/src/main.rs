@@ -1290,6 +1290,9 @@ fn machine_command_event_fields(
         MachineCommand::WalletDefaultPolicy { .. } => {
             ("default_policy", None, MachineCommandEventClass::Prepared)
         }
+        MachineCommand::WalletPersona { .. } => {
+            ("wallet_persona", None, MachineCommandEventClass::Prepared)
+        }
         MachineCommand::WalletOutboxCancel { id, .. } => (
             "wallet_outbox_cancel",
             Some(id.clone()),
@@ -1774,6 +1777,7 @@ async fn execute_machine_command(
         MachineCommand::WalletDefaultPolicy {
             name,
             owner_just_chose,
+            replace,
         } => {
             validate_wallet_name(&name).map_err(|error| {
                 machine_error(
@@ -1781,9 +1785,27 @@ async fn execute_machine_command(
                     format!("wallet name must be a safe single path segment: {error:#}"),
                 )
             })?;
-            let status =
-                default_policy::advance_default_policy(daemon, &name, owner_just_chose).await?;
+            let status = default_policy::advance_default_policy(
+                daemon,
+                &name,
+                default_policy::DefaultPolicyMode::of_command(owner_just_chose, replace),
+            )
+            .await?;
             format!("{}\n", serde_json::to_string(&status)?)
+        }
+        MachineCommand::WalletPersona {
+            name,
+            persona,
+            petals,
+        } => {
+            validate_wallet_name(&name).map_err(|error| {
+                machine_error(
+                    MachineErrorKind::InvalidParams,
+                    format!("wallet name must be a safe single path segment: {error:#}"),
+                )
+            })?;
+            let switch = default_policy::switch_persona(daemon, &name, persona, petals).await?;
+            format!("{}\n", serde_json::to_string(&switch)?)
         }
         MachineCommand::WalletOutboxCancel {
             wallet,
@@ -2918,6 +2940,14 @@ enum WalletCmd {
     /// Approve the default policy for a wallet: one policy ceremony that allows
     /// the Petals chosen during setup. `new` and `import` run it for `main`.
     DefaultPolicy { name: String },
+    /// Choose or switch a wallet's persona: a fresh start for that wallet.
+    /// Choose its Petals again, reset their limits to the persona's, and
+    /// approve one ceremony that replaces the wallet's policy.
+    Persona {
+        name: String,
+        #[arg(value_parser = persona_cli_values())]
+        persona: String,
+    },
     /// Convert a staged v1 passkey wallet into Signer-owned Triad custody.
     /// The receipt contains public binding data only; Machine never opens the
     /// legacy wallet directory.
@@ -3786,41 +3816,54 @@ async fn run(cli: Cli) -> Result<()> {
             // `bloom serve` does the same, so the file's presence says nothing
             // about setup. The marker is saved only together with the choices.
             let first_setup = !d.config.setup.complete;
-            // `--persona` replaces any saved persona. Otherwise only first
-            // setup asks, and an existing home keeps what it has.
-            let previous_persona = d.config.persona.clone();
             let requested_persona = persona
                 .as_deref()
                 .map(str::parse::<bloom_proto::persona::PersonaPreset>)
                 .transpose()
                 .map_err(anyhow::Error::msg)?;
-            default_policy::select_persona(&mut d.config.persona, requested_persona)?;
             let any_recipient_chains = default_policy::any_recipient_chain_names(&d.config.chains);
-            if requested_persona.is_none() && first_setup && d.config.persona.is_none() {
-                if !structured_service_output() && default_policy::interactive_setup_available() {
-                    default_policy::run_persona_menu(
-                        &mut d.config.persona,
-                        &any_recipient_chains,
-                        &mut std::io::stdin().lock(),
-                        &mut std::io::stdout(),
-                    )?;
-                } else {
-                    d.config.persona = Some(bloom_proto::persona::PersonaConfig::default());
+            // At first setup `--persona` chooses main's persona without asking.
+            // Afterwards a switch is a fresh start for the wallet, which
+            // Machine makes while it runs, so this changes nothing and says how.
+            if first_setup {
+                let main = d.config.setup.main_mut();
+                default_policy::select_persona(&mut main.persona, requested_persona)?;
+                if requested_persona.is_none() && main.persona.is_none() {
+                    if !structured_service_output() && default_policy::interactive_setup_available()
+                    {
+                        default_policy::run_persona_menu(
+                            &mut main.persona,
+                            &any_recipient_chains,
+                            &mut std::io::stdin().lock(),
+                            &mut std::io::stdout(),
+                        )?;
+                    } else {
+                        main.persona = Some(bloom_proto::persona::PersonaConfig::default());
+                    }
                 }
+            } else if let Some(preset) = requested_persona {
+                println!(
+                    "{}",
+                    default_policy::persona_switch_note(
+                        bloom_proto::config::DEFAULT_POLICY_WALLET,
+                        preset
+                    )
+                );
             }
             let owners_before = default_policy::petal_owners(&d)?;
             if first_setup {
+                let persona = d.config.setup.main().persona.clone();
                 if !structured_service_output() && default_policy::interactive_setup_available() {
                     default_policy::run_setup_menu(
-                        &mut d.config.setup,
-                        d.config.persona.as_ref(),
+                        d.config.setup.main_mut(),
+                        persona.as_ref(),
                         &mut std::io::stdin().lock(),
                         &mut std::io::stdout(),
                     )?;
                 } else {
                     default_policy::accept_setup_suggestions(
-                        &mut d.config.setup,
-                        d.config.persona.as_ref(),
+                        d.config.setup.main_mut(),
+                        persona.as_ref(),
                     );
                 }
                 // Queue the settings this run will write before anything is
@@ -3832,20 +3875,6 @@ async fn run(cli: Cli) -> Result<()> {
                 d.config
                     .save(&d.home.config_path())
                     .context("save setup choices")?;
-            } else if d.config.persona != previous_persona {
-                d.config
-                    .save(&d.home.config_path())
-                    .context("save persona choice")?;
-                // Setup already ran, so the new persona does not reach back
-                // into its choices or the wallet's current policy. Say so
-                // before anything else can fail.
-                for note in default_policy::persona_change_notes(
-                    bloom_proto::config::DEFAULT_POLICY_WALLET,
-                    previous_persona.as_ref(),
-                    d.config.persona.as_ref(),
-                ) {
-                    println!("{note}");
-                }
             } else if d.config.holds_legacy_setup_keys() {
                 // An earlier build kept setup's choices under `[petals]`,
                 // where a Bloom release refuses them; move them to `[setup]`.
@@ -3867,7 +3896,10 @@ async fn run(cli: Cli) -> Result<()> {
             println!("preinstalled_petals: {preinstalled:?}");
             println!(
                 "{}",
-                default_policy::persona_message(d.config.persona.as_ref(), &any_recipient_chains)
+                default_policy::persona_message(
+                    d.config.setup.main().persona.as_ref(),
+                    &any_recipient_chains
+                )
             );
             println!("next: bloom wallet new main");
             println!("then: bloom wallet address main --qr");
@@ -4075,6 +4107,17 @@ async fn run(cli: Cli) -> Result<()> {
                 local,
             )
             .await
+        }
+        Cmd::Wallet(WalletCmd::Persona { name, persona }) => {
+            validate_wallet_name(&name)?;
+            let preset = persona
+                .parse::<bloom_proto::persona::PersonaPreset>()
+                .map_err(anyhow::Error::msg)?;
+            // Only to name the chains Degen opens; Machine reads its own copy.
+            let chains = bloom_proto::Config::load(&home.config_path())
+                .map(|config| config.chains)
+                .unwrap_or_default();
+            default_policy::run_persona_switch(&client_endpoint, &chains, &name, preset).await
         }
         Cmd::Wallet(WalletCmd::DefaultPolicy { name }) => {
             // Wait out a policy lock another command holds; a ceremony this
@@ -6048,6 +6091,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `bloom wallet persona` names a wallet and one of the three personas,
+    /// Institutional also by its stored name.
+    #[test]
+    fn wallet_persona_takes_a_wallet_and_a_persona() {
+        for (given, stored) in [
+            ("institutional", "institutional"),
+            ("custodian", "custodian"),
+            ("trader", "trader"),
+            ("degen", "degen"),
+        ] {
+            let parsed = Cli::try_parse_from(["bloom", "wallet", "persona", "trading", given])
+                .unwrap_or_else(|error| panic!("{given}: {error}"));
+            assert!(
+                matches!(
+                    &parsed.cmd,
+                    Some(Cmd::Wallet(WalletCmd::Persona { name, persona }))
+                        if name == "trading" && persona == stored
+                ),
+                "{given}"
+            );
+        }
+        assert!(Cli::try_parse_from(["bloom", "wallet", "persona", "trading", "whale"]).is_err());
+        assert!(Cli::try_parse_from(["bloom", "wallet", "persona", "trading"]).is_err());
     }
 
     #[test]

@@ -745,6 +745,22 @@ pub enum MachineCommand {
         /// owner removed.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         owner_just_chose: bool,
+        /// Set only while a persona switch waits for its ceremony: propose
+        /// the wallet's setup as a replacement for what its policy allows,
+        /// whatever the policy's version. Omitted when false, so an older
+        /// Machine, which rejects unknown fields, still accepts the request.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        replace: bool,
+    },
+    /// Switch a wallet's persona: a fresh start for that wallet. Machine saves
+    /// its new setup, resets each chosen Petal's limits to the persona's, and
+    /// proposes the setup as a replacement for the wallet's policy.
+    WalletPersona {
+        name: String,
+        persona: bloom_proto::persona::PersonaPreset,
+        /// The Petals the owner chose for the wallet, with their values.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        petals: BTreeMap<String, bloom_proto::config::PetalSetupConfig>,
     },
     WalletOutboxCancel {
         wallet: String,

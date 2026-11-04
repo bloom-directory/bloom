@@ -319,43 +319,49 @@ Agreed on 2026-11-03 with the author of bloom#352 and bloom#377:
 
 Bloom installs its canonical Petals (`DEFAULT_PETALS` in
 `crates/bloom/src/github_source.rs`) for every home and ignores the legacy
-`[petals] preinstalled` setting. Setup records each chosen Petal under
-`[setup.petals]`, with the values the menu asked about, and the default
-policy proposes exactly these Petals. Canonical setup does not add runtime
+`[petals] preinstalled` setting. Setup records each chosen Petal in the
+wallet's setup, `[setup.wallets.main.petals]` for `bloom init`, with the
+values the menu asked about, and the default policy proposes exactly these
+Petals. Canonical setup does not add runtime
 write switches. Saving the choices rewrites `config.toml` in full: comments
 and keys this build does not know are dropped, and anything it migrates on
 load, such as the Polygon RPC defaults, is written out. The
-persona is recorded under `[persona]`; Institutional is
+persona is recorded beside them (decision 17); Institutional is
 stored by its legacy name, `custodian`:
 
 ```toml
-[persona]
+[setup]
+complete = true
+
+[setup.wallets.main.persona]
 schema_version = 2
 preset = "custodian"
 window_secs = 0
 
-[setup]
-complete = true
+[setup.wallets.main.petals.enso]
 
-[setup.petals.enso]
+[setup.wallets.main.petals.hyperliquid]
 
-[setup.petals.hyperliquid]
+[setup.wallets.main.petals.near-intents]
 
-[setup.petals.near-intents]
-
-[setup.petals.polymarket.values]
+[setup.wallets.main.petals.polymarket.values]
 max_daily_usd = "100"
 
-[setup.petals.feedback]
+[setup.wallets.main.petals.feedback]
 ```
+
+`bloom wallet persona <wallet> <persona>` writes another wallet's setup the
+same way, under `[setup.wallets.<wallet>]` (decision 18).
 
 `[setup]` is a top-level table, not part of `[petals]`: a Bloom release
 refuses unknown keys under `[petals]` but ignores an unknown top-level table,
 so a home this setup ran on still starts if its owner goes back to a release.
 A release never rewrites an existing config, so `[setup]` survives the
-downgrade, and nothing runs setup again after it. An earlier build of this
-design saved the choices under `[petals]`; they still load, and the next
-`bloom init` moves them to `[setup]`, so a release can then start too.
+downgrade, and nothing runs setup again after it. Earlier builds of this
+design saved `main`'s choices under `[petals]`, then in `[setup] petals` with
+a top-level `[persona]`; each still loads as `main`'s setup, and the next
+`bloom init` moves it to `[setup.wallets.main]`, so a release can then start
+too.
 
 The policy uses the installed package hash for each chosen name, so a Petal
 installed another way, such as the local builds the developer triad installs,
@@ -372,7 +378,7 @@ The menu runs only on first-time setup and only in a terminal. Setup is
 recorded by `complete = true` under `[setup]`, saved together with the
 choices once the menu finishes; a config file on its own proves nothing,
 because `bloom serve` creates one too, and an interrupted menu saves nothing.
-An empty `[setup.petals]` is not the marker either: declining every Petal is
+An empty `[setup.wallets.main]` is not the marker either: declining every Petal is
 a valid choice. Scripts and packaged installs record the catalog's
 suggestions instead of asking. Later runs of `bloom init` see the marker and
 use the config as it is, with the catalog's suggestions for any value not
@@ -611,8 +617,10 @@ depend on them: section 4 holds until they land.
   bloom-broker#112, a Degen session also covers the any-recipient ERC-20
   transfers in decision 15.
 
-This design follows bloom#377: its persona names, config (`[persona]` and
-`bloom_proto::persona`, schema 2) and Degen policy entry. bloom#352 calls
+This design follows bloom#377: its persona names, persona type
+(`bloom_proto::persona`, schema 2) and Degen policy entry, stored per wallet
+(decision 17) rather than in bloom#377's top-level `[persona]`, which still
+loads as `main`'s. bloom#352 calls
 Institutional "Custodian": `--persona custodian` also works, and the config
 saves `preset = "custodian"` either way. bloom#352 saves `[persona]` as
 schema 1, with configurable dollar limits, and the two schemas cannot share a
@@ -630,15 +638,14 @@ this design and those stacks:
   policy, so the default policy is applied first. Choosing a persona grants
   nothing on its own. bloom#377's recurring allowances also need the
   policy's maximum approval lifetime at its standing value
-  (`STANDING_APPROVAL_POLICY_LIFETIME_MS`), which this design never
-  proposes. bloom#377 adds it to the same default-policy proposal for Trader
-  and Degen (`standing`), so it stays one ceremony. Rebased, that check and
-  proposal belong to the default-policy path only, never the Petal gate's
-  setup, or every Petal use on such a wallet opens a ceremony for the
-  lifetime. The default-policy report must also name a missing lifetime: its
-  list of what the policy does not allow covers only Petals and the persona's
-  entry. Only a wallet whose default policy committed without the lifetime
-  needs another ceremony, which onboarding proposes with `owner_just_chose`.
+  (`STANDING_APPROVAL_POLICY_LIFETIME_MS`), which this design now proposes
+  for Trader and Degen in the same ceremony as the rest of the persona's
+  policy (decision 19), so bloom#377's `standing` argument is no longer
+  needed. The first proposal carries it, including one a Petal's own use
+  opens, but only the default-policy path requires it, so a Petal's use
+  never opens a ceremony just for the lifetime. The default-policy report
+  names a missing lifetime ("approvals last until revoked") beside missing
+  Petals and the persona's entry.
 - **A policy change ends persona sessions.** A session and its budget are
   bound to the policy version and digest they were approved under. Any later
   policy commit stops them signing:
@@ -649,29 +656,31 @@ this design and those stacks:
   The owner then re-activates. Re-activation is a new reviewed approval with a
   fresh budget, so a daily limit restarts after each policy change and
   re-review.
-- **A fresh choice is proposed explicitly.** Browser onboarding saves the
-  owner's Petal selection and then applies it through `wallet_default_policy`.
+- **A persona choice is a fresh start.** Browser onboarding sends the
+  wallet, the persona and the owner's Petal selection in one
+  `wallet_persona` command. Machine saves that wallet's setup, resets the
+  chosen Petals' limits, and proposes the replacement policy (decision 18);
+  waiting for its ceremony is `wallet_default_policy` with `replace` set.
+- **A fresh choice is proposed explicitly.** A flow that only adds to the
+  policy, without switching persona, applies the owner's Petal selection
+  through `wallet_default_policy`.
   Once the wallet's policy has changed since creation, that command proposes
   only with `owner_just_chose` set. Without it the owner sees which Petals
   are not allowed, and nothing is proposed. bloom#352 and bloom#377 predate
   this rule and propose at any policy version. Rebased, their
   `WalletDefaultPolicy { name }` no longer compiles: onboarding must set
   `owner_just_chose` only right after it saves the selection. It should
-  preselect from `[setup.petals]` while the policy is still the one creation
+  preselect from the wallet's `[setup.wallets.<wallet>.petals]` while the policy is still the one creation
   installed, and from what the current policy allows after that. Inside Machine
   this is `AfterPolicyChange::Propose` rather than a `bool`, so another flag
   passed in its place, such as bloom#377's `standing`, does not compile;
   `standing` stays a separate argument.
-- **The persona's entry is for `main`.** Onboarding can pick any existing
-  wallet. For a wallet other than `main`, the command proposes the chosen
-  Petals but not Degen's `erc20:any-recipient` entry, so a Degen session on
-  that wallet cannot cover those transfers until the owner adds the entry.
-  bloom#377 proposes the entry for whichever wallet onboarding picks;
-  rebased on this design, that narrows to `main`.
-- **The persona is read when it is used.** Machine reads `[persona]` from the
-  config each time it proposes a default policy, not once at startup, so a
-  persona that browser onboarding saves on a running Machine is the one
-  proposed.
+- **The persona's entry is for its wallet.** Onboarding can pick any
+  existing wallet, and the persona, Degen's `erc20:any-recipient` entry and
+  the lifetime are proposed for the wallet it was chosen for (decision 17).
+- **A setup is read when it is used.** Machine reads a wallet's setup from
+  the config each time it proposes that wallet's policy, not once at
+  startup, so a setup saved on a running Machine is the one proposed.
 - **Two limits; the lower applies.** Polymarket's `max_daily_usd`, written by
   setup, is enforced by the Petal before it asks for a signature. A persona
   session's token allowance is enforced by Broker and Signer. They are
@@ -698,7 +707,7 @@ this design and those stacks:
   setup obligation has no frozen package/config revision"), so they must
   migrate or reconcile these markers. A build of this design on a home
   bloom#352 used treats their entry as its own marker. A queued retry writes
-  `[setup.petals]`'s values while nothing is stored under the settings key,
+  `main`'s chosen values while nothing is stored under the settings key,
   and deletes the entry. It deletes it without writing when settings are
   already stored or the installed release is one setup does not know. It
   leaves it when the retry fails, and while the installed release is an
@@ -844,6 +853,14 @@ changes come next.
   question and `--persona`, Polymarket's suggested limit, Degen's
   `erc20:any-recipient` entry and staging exemption, and the report of a
   missing or leftover entry.
+- **Per-wallet personas and the switch** (`crates/bloom-proto`:
+  `config.rs`, `persona.rs`, `policy.rs`; `crates/bloom`,
+  `crates/bloom-daemon`, `crates/bloom-vfs`): each wallet's setup under
+  `[setup.wallets.<wallet>]`, read from disk on each proposal; the
+  `wallet_persona` Machine command and `bloom wallet persona`, which save a
+  wallet's new setup, reset its Petals' limits and propose the replacement
+  policy (`ensure_policy_replaced`); and Trader's and Degen's standing
+  lifetime in their first proposal (decisions 17 to 19).
 
 **Next**
 
@@ -916,9 +933,20 @@ Automated:
 - A Petal's VFS write to a wallet's `outbox/new.tx` is refused before it
   reaches the VFS, while its reads and other writes are not
   (`crates/bloom-petals/src/runner.rs`).
+- Each wallet keeps its own setup, and the three layouts earlier builds
+  wrote load as `main`'s and move on save (`crates/bloom-proto/src/config.rs`).
+- A persona switch proposes exactly the new setup's packages, destinations
+  and lifetime at any policy version, keeps the required verifiers, commits
+  in one ceremony, and proposes nothing for a policy that already matches; a
+  Trader or Degen first proposal carries the standing lifetime, which the
+  default-policy path requires (`crates/bloom-vfs/tests/triad_policy_update.rs`).
+- A switch accepts only canonical Petals with valid values, resets their
+  limits over stored settings, drops `main`'s queued writes, and reports a
+  failed write with its command; `bloom init --persona` on a set-up home
+  changes nothing and names `bloom wallet persona`.
 - Each persona's menu choice, `--persona` and Polymarket suggestion; Degen's
-  entry on configured chains and for `main` only; an unusable saved persona
-  set aside; staging that passes only the wallet's own curated ERC-20
+  entry on configured chains and for the wallet it was chosen for; an
+  unusable saved persona set aside; staging that passes only the wallet's own curated ERC-20
   transfer with the entry; and the planner honouring, and the leftover
   report counting, the entry only under `evm-<chain id>`.
 

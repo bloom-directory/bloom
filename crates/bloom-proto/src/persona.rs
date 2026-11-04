@@ -70,6 +70,17 @@ impl PersonaConfig {
         }
         Ok(())
     }
+    /// The maximum approval lifetime this persona's wallet policy asks for:
+    /// Trader's and Degen's reusable permissions last until revoked, and
+    /// Institutional keeps what wallet creation installs.
+    pub fn approval_lifetime_ms(&self) -> u64 {
+        match self.preset {
+            PersonaPreset::Custodian => crate::policy::CREATION_APPROVAL_LIFETIME_MS,
+            PersonaPreset::Trader | PersonaPreset::Degen => {
+                crate::policy::STANDING_APPROVAL_POLICY_LIFETIME_MS
+            }
+        }
+    }
     /// Fixed token quantities, not USD equivalents. Each token is independent.
     pub fn token_amounts(&self, symbol: &str) -> Option<(&'static str, &'static str)> {
         let (action, total) = match symbol {

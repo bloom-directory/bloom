@@ -117,9 +117,9 @@ op_stack = false
 [setup]
 complete = true
 
-[setup.petals.hyperliquid]
+[setup.wallets.main.petals.hyperliquid]
 
-[setup.petals.polymarket.values]
+[setup.wallets.main.petals.polymarket.values]
 max_daily_usd = "73"
 EOF
 chmod 0600 "$machine_config"
@@ -144,7 +144,7 @@ done
 source "$log_dir/triad.env"
 say "triad ready"
 
-grep -q '^\[setup.petals.polymarket.values\]' "$machine_home/config.toml" ||
+grep -q '^\[setup.wallets.main.petals.polymarket.values\]' "$machine_home/config.toml" ||
   die "launcher dropped the [setup] tables"
 
 # Machine installs the catalog Petals in the background once it is ready.

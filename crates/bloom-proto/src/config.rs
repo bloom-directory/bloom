@@ -47,15 +47,16 @@ pub struct Config {
         with = "humantime_serde"
     )]
     pub wallet_projection_max_age: std::time::Duration,
-    /// Optional onboarding suggestion. Absent on legacy homes; never grants authority.
-    /// A saved persona that does not parse or validate is set aside on load
-    /// (see [`lenient_persona`]) rather than failing the whole config.
+    /// Where an earlier build kept `main`'s persona. Read so such a home
+    /// still loads, and moved to `main`'s [`WalletSetup`] on load; never
+    /// written.
     #[serde(
         default,
-        skip_serializing_if = "Option::is_none",
+        skip_serializing,
+        rename = "persona",
         deserialize_with = "lenient_persona"
     )]
-    pub persona: Option<crate::persona::PersonaConfig>,
+    legacy_persona: Option<crate::persona::PersonaConfig>,
     /// Map of chain name -> spec.
     #[serde(default)]
     pub chains: BTreeMap<String, ChainSpec>,
@@ -124,29 +125,82 @@ pub struct PetalsConfig {
     legacy_setup_loaded: bool,
 }
 
-/// What `bloom init` setup chose, as the top-level `[setup]` table. It is
-/// not part of `[petals]`: a Bloom release refuses unknown keys there, but
-/// ignores an unknown top-level table, so a home this setup ran on still
-/// starts with an older Bloom. Unknown keys are ignored here for the same
-/// reason, so a later Bloom's additions never stop this one from starting.
+/// What setup chose, as the top-level `[setup]` table. It is not part of
+/// `[petals]`: a Bloom release refuses unknown keys there, but ignores an
+/// unknown top-level table, so a home this setup ran on still starts with an
+/// older Bloom. Unknown keys are ignored here for the same reason, so a later
+/// Bloom's additions never stop this one from starting.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SetupConfig {
-    /// Written when `bloom init` finished. This, not an empty `petals`, is
-    /// what tells a later run that setup already happened: declining every
-    /// Petal is a valid choice, and `bloom serve` or an interrupted menu can
-    /// leave a config with no choices in it.
+    /// Written when `bloom init` finished. This, not an empty `main`, is what
+    /// tells a later run that setup already happened: declining every Petal
+    /// is a valid choice, and `bloom serve` or an interrupted menu can leave a
+    /// config with no choices in it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub complete: bool,
-    /// Petals chosen during setup, with the values each one's settings need.
-    /// Bloom provisions its canonical Petals regardless; the default wallet
-    /// policy proposes exactly these. They grant no authority.
+    /// Each wallet's setup, by wallet name: `bloom init` writes `main`'s, and
+    /// `bloom wallet persona` any wallet's.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub wallets: BTreeMap<String, WalletSetup>,
+    /// Where an earlier build kept `main`'s Petal choices. Read so such a home
+    /// still loads, and moved to `main` on load; never written.
+    #[serde(default, skip_serializing, rename = "petals")]
+    legacy_petals: BTreeMap<String, PetalSetupConfig>,
+}
+
+/// One wallet's setup: its persona, and the Petals its policy allows with
+/// the values their settings need. Bloom provisions its canonical Petals
+/// regardless; the wallet's default policy proposes exactly these. Nothing
+/// here grants authority.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalletSetup {
+    /// A persona that does not parse or validate is set aside on load
+    /// (see [`lenient_persona`]) rather than failing the whole config.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_persona"
+    )]
+    pub persona: Option<crate::persona::PersonaConfig>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub petals: BTreeMap<String, PetalSetupConfig>,
 }
 
+impl WalletSetup {
+    fn is_empty(&self) -> bool {
+        self.persona.is_none() && self.petals.is_empty()
+    }
+}
+
+/// The setup of a wallet that has none.
+static NO_WALLET_SETUP: WalletSetup = WalletSetup {
+    persona: None,
+    petals: BTreeMap::new(),
+};
+
 impl SetupConfig {
     fn is_empty(&self) -> bool {
-        !self.complete && self.petals.is_empty()
+        !self.complete && self.wallets.is_empty()
+    }
+
+    /// `wallet`'s setup, empty when it has none.
+    pub fn wallet(&self, wallet: &str) -> &WalletSetup {
+        self.wallets.get(wallet).unwrap_or(&NO_WALLET_SETUP)
+    }
+
+    /// `wallet`'s setup, to change.
+    pub fn wallet_mut(&mut self, wallet: &str) -> &mut WalletSetup {
+        self.wallets.entry(wallet.to_owned()).or_default()
+    }
+
+    /// The default wallet's setup, which `bloom init` chooses.
+    pub fn main(&self) -> &WalletSetup {
+        self.wallet(DEFAULT_POLICY_WALLET)
+    }
+
+    /// The default wallet's setup, to change.
+    pub fn main_mut(&mut self) -> &mut WalletSetup {
+        self.wallet_mut(DEFAULT_POLICY_WALLET)
     }
 }
 
@@ -317,11 +371,11 @@ fn default_proxy_detection_backend() -> Backend {
     Backend::Rpc
 }
 
-/// Read `[persona]` without letting it fail the whole config. A persona that
+/// Read a saved persona without letting it fail the whole config. A persona that
 /// does not parse (a missing or unknown field, a newer schema) or does not
 /// validate is set aside with a warning and the home behaves as Institutional,
 /// which grants the least. Every other setting still loads, so Machine starts
-/// and `bloom init --persona` can choose one again. Writing a persona stays
+/// and `bloom wallet persona` can choose one again. Writing a persona stays
 /// strict: [`Config::validate`] refuses an invalid one.
 fn lenient_persona<'de, D>(
     deserializer: D,
@@ -341,7 +395,7 @@ where
         Err(reason) => {
             tracing::warn!(
                 %reason,
-                "config.persona_ignored: the saved [persona] is not usable and is treated as institutional; choose one again with `bloom init --persona <institutional|trader|degen>`"
+                "config.persona_ignored: a saved persona is not usable and is treated as institutional; choose one again with `bloom wallet persona <wallet> <institutional|trader|degen>`"
             );
             Ok(None)
         }
@@ -532,7 +586,7 @@ impl Config {
             default_chain: default_chain_name(),
             stage_ttl: default_stage_ttl(),
             wallet_projection_max_age: default_wallet_projection_max_age(),
-            persona: None,
+            legacy_persona: None,
             chains,
             solana_chains: BTreeMap::from([(
                 "solana-mainnet".into(),
@@ -568,8 +622,9 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Whether the file this config was loaded from keeps setup's choices
-    /// under `[petals]`, where a Bloom release refuses them, until it is saved.
+    /// Whether the file this config was loaded from keeps `main`'s setup in a
+    /// layout an earlier build wrote, such as under `[petals]`, where a Bloom
+    /// release refuses it, until the file is saved.
     pub fn holds_legacy_setup_keys(&self) -> bool {
         self.petals.legacy_setup_loaded
     }
@@ -599,16 +654,35 @@ impl Config {
     /// and swap retired default endpoints that a saved config still holds verbatim.
     /// Like other load migrations, this updates the effective config; save persists it.
     fn migrate(&mut self) {
-        self.petals.legacy_setup_loaded =
-            self.petals.legacy_setup_complete || !self.petals.legacy_setup.is_empty();
-        if self.setup.is_empty() {
-            self.setup = SetupConfig {
-                complete: self.petals.legacy_setup_complete,
-                petals: std::mem::take(&mut self.petals.legacy_setup),
-            };
+        // Earlier builds kept `main`'s setup under `[petals]`, then in
+        // `[setup] petals` and a top-level `[persona]`. Each moves to
+        // `[setup.wallets.main]` unless that already holds it.
+        self.petals.legacy_setup_loaded = self.petals.legacy_setup_complete
+            || !self.petals.legacy_setup.is_empty()
+            || !self.setup.legacy_petals.is_empty()
+            || self.legacy_persona.is_some();
+        if self.petals.legacy_setup_complete {
+            self.setup.complete = true;
+        }
+        let legacy_petals = if self.setup.legacy_petals.is_empty() {
+            std::mem::take(&mut self.petals.legacy_setup)
+        } else {
+            std::mem::take(&mut self.setup.legacy_petals)
+        };
+        let legacy_persona = self.legacy_persona.take();
+        let main = self.setup.main_mut();
+        if main.petals.is_empty() {
+            main.petals = legacy_petals;
+        }
+        if main.persona.is_none() {
+            main.persona = legacy_persona;
+        }
+        if main.is_empty() {
+            self.setup.wallets.remove(DEFAULT_POLICY_WALLET);
         }
         self.petals.legacy_setup.clear();
         self.petals.legacy_setup_complete = false;
+        self.setup.legacy_petals.clear();
         let mut defaults = Self::local_default();
         // Respect names already assigned to either family; never create a collision.
         if !self.chains.contains_key("arc") && !self.solana_chains.contains_key("arc") {
@@ -632,8 +706,10 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if let Some(persona) = &self.persona {
-            persona.validate().map_err(ConfigError::Invalid)?;
+        for setup in self.setup.wallets.values() {
+            if let Some(persona) = &setup.persona {
+                persona.validate().map_err(ConfigError::Invalid)?;
+            }
         }
         if self.chains.is_empty() {
             return Err(ConfigError::Invalid(
@@ -1259,10 +1335,11 @@ rpc_urls = ["https://ethereum-rpc.publicnode.com"]
 
         // Petal tables alone do not mean setup finished.
         cfg.setup
+            .main_mut()
             .petals
             .insert("hyperliquid".into(), PetalSetupConfig::default());
         let decoded: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
-        assert!(decoded.setup.petals.contains_key("hyperliquid"));
+        assert!(decoded.setup.main().petals.contains_key("hyperliquid"));
         assert!(!decoded.setup.complete);
 
         cfg.setup.complete = true;
@@ -1270,20 +1347,56 @@ rpc_urls = ["https://ethereum-rpc.publicnode.com"]
         assert!(decoded.setup.complete);
     }
 
+    /// Each wallet keeps its own setup: a persona and the Petals its policy
+    /// allows. A wallet without one reads as empty.
+    #[test]
+    fn each_wallet_keeps_its_own_setup() {
+        use crate::persona::{PersonaConfig, PersonaPreset};
+
+        let mut cfg = Config::local_default();
+        cfg.setup.complete = true;
+        cfg.setup.main_mut().persona = Some(PersonaConfig::suggested(PersonaPreset::Trader));
+        let trading = cfg.setup.wallet_mut("trading");
+        trading.persona = Some(PersonaConfig::suggested(PersonaPreset::Degen));
+        trading.petals.insert(
+            "polymarket".into(),
+            PetalSetupConfig {
+                values: BTreeMap::from([("max_daily_usd".into(), "10000".into())]),
+            },
+        );
+        let td = tempdir().unwrap();
+        let path = td.path().join("config.toml");
+        cfg.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.setup.wallets, cfg.setup.wallets);
+        assert!(!loaded.holds_legacy_setup_keys());
+        assert_eq!(
+            loaded.setup.main().persona.as_ref().unwrap().preset,
+            PersonaPreset::Trader
+        );
+        assert!(loaded.setup.main().petals.is_empty());
+        assert_eq!(
+            loaded.setup.wallet("trading"),
+            &cfg.setup.wallets["trading"]
+        );
+        assert_eq!(loaded.setup.wallet("savings"), &WalletSetup::default());
+    }
+
     /// Setup's choices sit outside `[petals]`, whose unknown keys a Bloom
     /// release refuses, so going back to a release still loads the config.
-    /// The `[petals]` keys an earlier build of setup wrote still load, and
-    /// move to `[setup]` when the config is next saved.
     #[test]
     fn setup_choices_stay_out_of_the_table_releases_refuse_unknown_keys_in() {
         let mut cfg = Config::local_default();
         cfg.setup.complete = true;
-        cfg.setup.petals.insert(
+        cfg.setup.main_mut().petals.insert(
             "polymarket".into(),
             PetalSetupConfig {
                 values: BTreeMap::from([("max_daily_usd".into(), "100".into())]),
             },
         );
+        cfg.setup.main_mut().persona = Some(crate::persona::PersonaConfig::suggested(
+            crate::persona::PersonaPreset::Degen,
+        ));
         let encoded = toml::to_string_pretty(&cfg).unwrap();
         let document: toml::Value = toml::from_str(&encoded).unwrap();
         assert_eq!(
@@ -1295,6 +1408,7 @@ rpc_urls = ["https://ethereum-rpc.publicnode.com"]
             ["runtime"],
             "{encoded}"
         );
+        assert!(document.get("persona").is_none(), "{encoded}");
         // A release's `[petals]` table: only these keys, unknown ones refused.
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -1309,53 +1423,82 @@ rpc_urls = ["https://ethereum-rpc.publicnode.com"]
             .clone()
             .try_into::<ReleasePetals>()
             .unwrap();
+    }
+
+    /// Earlier builds kept `main`'s setup under `[petals]`, then in `[setup]
+    /// petals` and a top-level `[persona]`. Each still loads into `main`'s
+    /// setup and moves to `[setup.wallets.main]` when the config is saved.
+    #[test]
+    fn earlier_setup_layouts_load_into_main() {
+        use crate::persona::{PersonaConfig, PersonaPreset};
 
         let td = tempdir().unwrap();
         let path = td.path().join("config.toml");
-        let legacy = encoded
-            .replace(
-                "[setup]\ncomplete = true",
-                "[petals]\nsetup_complete = true",
-            )
-            .replace("[setup.petals.", "[petals.setup.");
-        assert!(
-            legacy.contains("[petals.setup.polymarket.values]"),
-            "{legacy}"
+        let polymarket = BTreeMap::from([(
+            "polymarket".to_owned(),
+            PetalSetupConfig {
+                values: BTreeMap::from([("max_daily_usd".into(), "100".into())]),
+            },
+        )]);
+        let base = || toml::Value::try_from(Config::local_default()).unwrap();
+        let polymarket_table = || toml::Value::try_from(&polymarket).unwrap();
+        let degen = toml::Value::try_from(PersonaConfig::suggested(PersonaPreset::Degen)).unwrap();
+
+        // Under `[petals]`.
+        let mut under_petals = base();
+        let petals = under_petals["petals"].as_table_mut().unwrap();
+        petals.insert("setup_complete".into(), true.into());
+        petals.insert("setup".into(), polymarket_table());
+        // In `[setup] petals`, with the persona at the top level.
+        let mut in_setup = base();
+        let table = in_setup.as_table_mut().unwrap();
+        table.insert(
+            "setup".into(),
+            toml::Value::Table(toml::map::Map::from_iter([
+                ("complete".to_owned(), true.into()),
+                ("petals".to_owned(), polymarket_table()),
+            ])),
         );
-        std::fs::write(&path, &legacy).unwrap();
-        let loaded = Config::load(&path).unwrap();
-        assert!(loaded.holds_legacy_setup_keys());
+        table.insert("persona".into(), degen.clone());
+
+        for (legacy, persona) in [(under_petals, None), (in_setup, Some(PersonaPreset::Degen))] {
+            std::fs::write(&path, toml::to_string_pretty(&legacy).unwrap()).unwrap();
+            let loaded = Config::load(&path).unwrap();
+            assert!(loaded.holds_legacy_setup_keys());
+            assert!(loaded.setup.complete);
+            assert_eq!(loaded.setup.main().petals, polymarket);
+            assert_eq!(
+                loaded
+                    .setup
+                    .main()
+                    .persona
+                    .as_ref()
+                    .map(|persona| persona.preset),
+                persona
+            );
+            loaded.save(&path).unwrap();
+            let saved = std::fs::read_to_string(&path).unwrap();
+            let document: toml::Value = toml::from_str(&saved).unwrap();
+            assert_eq!(
+                document["petals"]
+                    .as_table()
+                    .unwrap()
+                    .keys()
+                    .collect::<Vec<_>>(),
+                ["runtime"],
+                "{saved}"
+            );
+            assert!(document.get("persona").is_none(), "{saved}");
+            assert!(document["setup"].get("petals").is_none(), "{saved}");
+            let reloaded = Config::load(&path).unwrap();
+            assert!(!reloaded.holds_legacy_setup_keys());
+            assert_eq!(reloaded.setup.wallets, loaded.setup.wallets);
+        }
         assert!(
             !Config::load_or_init(&td.path().join("fresh.toml"))
                 .unwrap()
                 .holds_legacy_setup_keys()
         );
-        assert!(loaded.setup.complete);
-        assert_eq!(loaded.setup.petals, cfg.setup.petals);
-        loaded.save(&path).unwrap();
-        let saved = std::fs::read_to_string(&path).unwrap();
-        assert!(!saved.contains("[petals.setup"), "{saved}");
-        assert!(!saved.contains("setup_complete"), "{saved}");
-        let reloaded = Config::load(&path).unwrap();
-        assert!(reloaded.setup.complete);
-        assert!(!reloaded.holds_legacy_setup_keys());
-    }
-
-    #[test]
-    fn persona_migration_keeps_legacy_absent_and_independent_of_petal_setup() {
-        let mut cfg = Config::local_default();
-        cfg.setup.complete = true;
-        let legacy = toml::to_string(&cfg).unwrap();
-        assert!(!legacy.contains("[persona]"));
-        let mut decoded: Config = toml::from_str(&legacy).unwrap();
-        assert!(decoded.persona.is_none());
-        decoded.persona = Some(crate::persona::PersonaConfig::suggested(
-            crate::persona::PersonaPreset::Trader,
-        ));
-        let encoded = toml::to_string(&decoded).unwrap();
-        let reloaded: Config = toml::from_str(&encoded).unwrap();
-        assert_eq!(reloaded.persona, decoded.persona);
-        assert!(reloaded.setup.complete);
     }
 
     /// A saved persona that is not usable is set aside on load instead of
@@ -1366,7 +1509,7 @@ rpc_urls = ["https://ethereum-rpc.publicnode.com"]
         let td = tempdir().unwrap();
         let path = td.path().join("config.toml");
         let mut cfg = Config::local_default();
-        cfg.persona = Some(crate::persona::PersonaConfig::suggested(
+        cfg.setup.main_mut().persona = Some(crate::persona::PersonaConfig::suggested(
             crate::persona::PersonaPreset::Degen,
         ));
         let valid = toml::to_string(&cfg).unwrap();
@@ -1381,20 +1524,25 @@ rpc_urls = ["https://ethereum-rpc.publicnode.com"]
             assert_ne!(edited, valid);
             std::fs::write(&path, &edited).unwrap();
             let loaded = Config::load(&path).unwrap_or_else(|error| panic!("{error}: {edited}"));
-            assert_eq!(loaded.persona, None, "{edited}");
+            assert_eq!(loaded.setup.main().persona, None, "{edited}");
             assert_eq!(loaded.chains, cfg.chains, "every other setting still loads");
             loaded.save(&path).unwrap();
-            assert!(
-                !std::fs::read_to_string(&path)
-                    .unwrap()
-                    .contains("[persona]")
-            );
+            assert!(!std::fs::read_to_string(&path).unwrap().contains("preset"));
         }
         std::fs::write(&path, &valid).unwrap();
-        assert_eq!(Config::load(&path).unwrap().persona, cfg.persona);
+        assert_eq!(
+            Config::load(&path).unwrap().setup.main().persona,
+            cfg.setup.main().persona
+        );
 
         let mut invalid = cfg.clone();
-        invalid.persona.as_mut().unwrap().window_secs = 3600;
+        invalid
+            .setup
+            .main_mut()
+            .persona
+            .as_mut()
+            .unwrap()
+            .window_secs = 3600;
         assert!(
             invalid.validate().is_err(),
             "writing an invalid persona is refused"
