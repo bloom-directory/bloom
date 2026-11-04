@@ -19,6 +19,28 @@ in `docs/examples.md` before using an unfamiliar write surface. For Petal work,
 use `docs/petals.md` to discover installed packages, then read that package's
 `README.md` and `AGENTS.md` before using its routes.
 
+To find where an account's funds are, read
+`wallets/<wallet>/<n>/holdings.json`. It lists the account's non-zero native
+and major token balances (USDC, USDT, DAI, WETH, WBTC and their common
+variants) on every configured chain. Anything it could not read is named
+under `errors` for that chain; the rows it did read are still listed. Read
+any other token at `chains/<chain>/addresses/<address>/tokens/<token>/`. On
+Solana chains it shows SOL only, not SPL tokens.
+
+## When the request leaves something out
+
+Infer what Bloom state settles, and ask only for what it cannot:
+
+- If there is only one wallet or account, use it.
+- A read that names no chain covers every chain: read `holdings.json`.
+- For a write, use the only chain where `holdings.json` shows the asset, or
+  the network the Petal's documentation names as its default. If two or more
+  funded chains remain, ask one question that names them.
+- If `holdings.json` lists an `errors` entry for a chain that could hold the
+  asset, say so rather than treating that chain as empty.
+
+Report a failed or partially completed action as a failure, never as done.
+
 ## Authority and safety
 
 Machine exposes this VFS; Broker controls approval ceremonies and policy;
@@ -369,7 +391,9 @@ project into the central outbox:
 5. Confirm only the exact inspected action.
 6. If approval is required, validate the challenge and hand its ceremony URL to
    the human.
-7. After the ceremony completes, retry only the exact documented `retry_path`.
+7. After the ceremony completes, write the challenge's `retry_body` to its
+   exact `retry_path`. An omitted `retry_body` means `confirm`; serialize an
+   object as JSON. Keep a fee-repair body unchanged through approval and retry.
 8. Read the sent, failed, or receipt projection before reporting success.
 
 A confirm write may return permission denied while projecting
@@ -382,7 +406,8 @@ presenting its ceremony URL. This is a waiting state, not a reason to restage.
 Reading the challenge asks Bloom for the approval's current state, so poll it
 while the human approves. `state` is `awaiting_ceremony` until they finish,
 then `active`, and `next` says what to do. As soon as `state` is `active`,
-write `confirm` to `retry_path`; the approval does not broadcast on its own.
+write the exact `retry_body` to `retry_path`; the approval does not broadcast
+on its own.
 Retrying `retry_path` before then is also safe: it starts no new ceremony and
 returns permission denied again. Once the ceremony can no longer be used,
 `ceremony_url` is withdrawn. For `expired`, `cancelled` or `refused`, tell the
@@ -390,10 +415,24 @@ human rather than retrying on your own.
 
 `bloom wallet confirm` exits 3 when owner approval is pending and 4 when
 confirmation has no recorded result yet. Exit 0 reports a recorded broadcast
-or a completed local discard. Use `--text cancel` to discard an unsigned
-pending entry; an already broadcast transaction needs `bloom wallet cancel`
-and its own approval. Dropping a reservation does not renumber later rows:
-restage with an explicit nonce to fill a gap.
+or a completed local discard. Use `--text cancel` to discard a pending entry
+that was never sent for signing; through the mount, write `cancel` to the
+entry's `confirm` file. This works for Petal-staged entries too. Writing the
+entry's own `cancel` file returns permission denied and records nothing,
+because that control signs a new same-nonce transaction. "Never broadcast" or
+an `active` approval does not prove an entry is unsigned: if a signature may
+exist, even with no hash recorded yet, Bloom keeps the entry and its
+`last_error.json` says how to reconcile it; an expired entry stays pending for
+the same reason. Discard is also refused while another operation is active. An
+unreadable signing record is not proof that nothing signed: preserve it,
+inspect Broker operation status and the chain nonce, and restore the record
+from backup before retrying. Never delete it to force a fresh attempt. A
+`failed/` entry with `signing_unknown.json` was released by an older Bloom
+although it may be signed: follow its `next` before staging that payment
+again or reusing its nonce; Petal outbox inspection reports it as
+`signing_unknown`, not `failed`. An already broadcast transaction needs `bloom
+wallet cancel` and its own approval. Dropping a reservation does not renumber
+later rows: restage with an explicit nonce to fill a gap.
 
 `confirm.override` is not a general escape hatch. Use it only when the
 inspected policy projection explicitly permits that control and the human has
@@ -405,7 +444,11 @@ signature in `broadcast_attempted.json` with `receipt.json` and inspect the
 outcome and confirmation status. Receipts have no account fingerprint and
 private signing sidecars are not mounted. Genesis checks must pass before
 broadcast; ambiguous sends reconcile by signature, never blind retry or
-endpoint failover. See the Solana walkthrough in `docs/examples.md`.
+endpoint failover. A `sent` entry with `unresolved.md` and no receipt is one
+no RPC reports after its blockhash expired; that does not prove it failed. Show
+the owner its signature to check in an explorer, and stage a new transfer only
+if they confirm it did not land. See the Solana walkthrough in
+`docs/examples.md`.
 
 ## Sealed Approvals
 
@@ -479,7 +522,54 @@ ceremony expires unapproved, retry the operation: Machine cancels the expired
 ceremony and answers with a new `ceremony_url`. Never give the owner an
 expired URL.
 
+## What the owner sees when approving
+
+The approval page shows Broker's own reading of the exact bytes to be signed:
+the action, account, assets and amounts, recipient and any limits it sets.
+Bloom does not take a Petal's description for this. Before forwarding the
+link, tell the human in one or two sentences what you asked for, so they can
+compare, and to cancel if the page shows anything else. Point out these if
+they appear:
+
+- **No output protection**: a swap with no enforced minimum output.
+- **Spending limit: Unlimited**: the spender can take any amount of that
+  token.
+- **Contract call Bloom cannot read**: the page shows exact bytes instead of
+  a reading. Approve only if the human expected exactly that call.
+
+An unknown token is shown by its address and raw units; never name it from a
+ticker you guessed. An approval proves what was signed, not that a quote was
+met, an order filled or funds arrived. Report outcomes from receipts and the
+Petal's status files.
+
 ## Petals and paid requests
+
+Petals send Broker the complete transaction or message to sign, bound to the
+account in the route path. If a Petal write fails with a bare "permission
+denied" and no ceremony link, stop and report the route and the error; do not
+reinstall the Petal or retry. Do not work around the refusal by changing
+accounts, removing fields, or switching to a reusable or batch path. When a
+write returns a ceremony link, retry the same request after the owner
+approves.
+
+- **Enso:** same-chain swaps carry an on-chain minimum output, stated in the
+  intent's `plan.md`. Cross-chain swaps report `destination_unverified` after
+  the source transaction succeeds; Bloom does not track the destination.
+- **Polymarket:** `begin` asks for a login approval that can only create
+  exchange credentials; it cannot sign payments, orders or wallet batches.
+  `continue` sets up the deposit wallet with its own exact approval. Read
+  `status.json` and follow `next_action`. Each order currently needs exact
+  approval; selecting Trader or Degen does not itself authorize automatic orders.
+- **Hyperliquid:** delegated trading sessions sign later actions without a
+  new prompt. The Petal's own session limits are local; the exchange does not
+  enforce them.
+- **Pump:** a refreshed recent blockhash keeps the existing approval; any
+  other change to the transaction needs a new one. Retry through the same Pump
+  operation. The approval permits one signature only. After signing, recover
+  that result and reconcile submission; do not request another signature with
+  a refreshed blockhash while the first transaction may still land.
+- **Venice:** a login approval grants no payment authority, and each later
+  request uses a fresh login proof.
 
 Installed application documents and public routes live under `petals/<name>/`.
 Account-dependent routes explicitly select a wallet and index, for example

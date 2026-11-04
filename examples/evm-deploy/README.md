@@ -41,8 +41,7 @@ Keep `rpc.json` private and out of Git. The URL stops working when the adapter
 exits; starting it again creates a new URL while durable submissions remain in
 Machine's outbox. With a nondefault Machine endpoint, add `--connect unix:/path`
 before the subcommand on all Bloom commands: `bloom --connect unix:/path deploy ...`.
-The bridge uses the wallet's primary key (account 0). For calls on a wallet
-requiring clear signing, start it with `bloom deploy --wallet <wallet> --chain <chain> --review-mode clear rpc`.
+The bridge uses the wallet's primary key (account 0).
 
 ## Foundry
 

@@ -83,20 +83,49 @@ reports only the blockhash/dwell trigger.
 
 ### Implemented freshness and restaging behavior
 
-`SolanaOutbox::sweep_expired` moves pending entries past `expires_ms` to
-`failed` with status `expired`, signed or not, once the cluster's block height
-has passed the blockhash window. Broadcast moves an entry to `sent` before it
-submits, so a pending entry was never sent; only one with a broadcast marker
-is left in place. Signing and broadcast also query the current blockheight
-and refuse an expired message.
+Bloom never treats a missing signature status as proof that a signed
+transfer failed. `getSignatureStatuses` with history search can return `null`
+for a landed transaction: a BigTable lookup error reads as `null`, pruned
+ledgers drop old blocks, and a ledger stored with transaction history disabled
+holds blocks without statuses. Only an observed status changes a signed
+transfer's state.
+
+Expiry cleanup acts on pending entries only after every configured endpoint's
+finalized height passes the blockhash window; a lagging or unavailable
+endpoint retains them. Then:
+
+- An unsigned entry moves to `failed/expired`.
+- An entry with a broadcast marker moves to `sent`. Its bytes may be on-chain
+  (an older binary could crash between the marker and the move), so
+  reconciliation owns it.
+- A signed entry that some endpoint reports moves to `sent`.
+- Any other signed entry stays `pending`. The operator can `cancel` it or
+  `restage` it.
+
+Simulation exposes signed bytes to an RPC, so broadcast writes its marker and
+moves the entry to `sent` before simulating. Cancel and restage refuse any
+entry with a broadcast marker, in `pending` or `failed`. A state move fsyncs
+both the source and destination directories. A broadcast attempt's signature
+stays readable in `broadcast_attempted.json` after retirement; a signature
+that was never broadcast stays private, and raw signed transactions are
+removed. The mounted `intent.json` reports the outbox's current status,
+including after an interrupted move. Signing and broadcast also refuse
+expired messages.
 
 For an expired pending entry, writing non-empty content to `restage` creates a
 new immutable stage with the same destination and lamports but a fresh
 blockhash and fee quote. The old entry becomes `failed/expired` and links to
 the replacement through `restage_advice.json`; approval and signature state
-are not reused. A sent-but-unobserved signature is reconciled to a terminal
-failed receipt once current height exceeds `lastValidBlockHeight`, rather than
-remaining unreconciled forever.
+are not reused.
+
+A `sent` transfer gets a receipt only from a finalized observation, from the
+failover endpoint or from any configured endpoint asked directly. If no
+endpoint reports it after the blockhash window closes, it stays in `sent`
+without a receipt, and Bloom writes `unresolved.md` beside it. The notice
+names the signature and tells the operator to look it up in a block explorer
+or archival RPC. If it landed, the payment is done. If it did not, it can no
+longer land, and the operator stages a new transfer; the old entry stays in
+`sent` as a record.
 
 ## Trigger thresholds (frozen defaults, operator-tunable)
 

@@ -308,6 +308,11 @@ distinct developer root, Machine home, socket, log directory, ready file,
 mountpoint, and ceremony port. Suffixing each path with a candidate name is
 sufficient for state isolation.
 
+For disposable authorization tests, `--retain-temporary-files` keeps the
+launcher's generated template and runtime directories for diagnosis. Shutdown
+still stops only that candidate's services and removes its ready file and
+Machine socket. The test runner uses this option without recursive cleanup.
+
 Each candidate also needs its own ceremony port so two complete development
 triads, including passkey ceremonies, can run side by side while the installed
 custody triad keeps `18734`. Pass the port explicitly; the launcher uses
@@ -490,7 +495,8 @@ developer launcher does the same on every launch
 records such as locally enrolled Petals. A long-lived developer root therefore
 picks up new pinned releases on its next launch. An installation without
 source provenance (a manual local install of a default Petal) is never
-replaced: uninstall it first, then relaunch.
+replaced: uninstall it first, then relaunch. It is reused while its package
+hash equals the pinned release's hash.
 
 ## General local operation
 

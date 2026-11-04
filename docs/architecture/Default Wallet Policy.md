@@ -201,29 +201,25 @@ Agreed on 2026-09-14:
       name, such as `ethereum`, opts in to nothing. It is required like a
       chosen Petal's destinations, and is the only addition here that does not
       come from a Petal. Machine then stages the wallet's own canonical
-      ERC-20 transfer of a token in Bloom's curated table
-      (`bloom_proto::tokens`) to any recipient on those chains. That table
-      stands in until Petals declare their tokens (decision 20). An
-      owner-written entry works the same way on any other chain with a
-      curated table, such as `evm-8453` for Base, although bloom-broker#112's
-      sessions cover only chains 1, 137 and 31337. Only the
+      ERC-20 transfer of a token in Bloom's curated policy list
+      (`bloom_proto::policy::ANY_RECIPIENT_TOKENS`) to any recipient on those
+      chains. That list stands in until Petals declare their tokens
+      (decision 20). It covers chains 1, 10, 137, 8453 and 42161, so an
+      owner-written entry works the same way on the other three, such as
+      `evm-8453` for Base, although bloom-broker#112's sessions cover only
+      chains 1, 137 and 31337. Only the
       exact-transaction path uses it, never a Petal, and a token outside the
-      table still needs its recipient listed, because any contract can answer
+      list still needs its recipient listed, because any contract can answer
       `decimals()` and run its own code under the `transfer` selector. A
       Petal cannot pass its transfer off as the wallet's own: Bloom refuses a
       Petal's VFS write to a wallet's `outbox/new.tx`, so a Petal stages only
       with its own staging call, which records it as the origin. Broker
       checks no destination on the wallet's own exact EVM approval, which
       carries no claim, so the owner's approval of each transfer is the only
-      recipient check. On the pinned Broker that check is hard to make: a
-      wallet whose owner has not turned clear signing on, as on every new
-      wallet, sees such a transfer as "Approve a call Bloom cannot read". The
-      page names the token contract, and the recipient appears only inside
-      the raw calldata. Broker master
-      (bloom-broker#103) decodes the transfer and shows its recipient, and
-      this design assumes that Broker ships with it (decision 21). Until
-      bloom-broker#112 is pinned, the policy ceremony shows the entry as
-      written.
+      recipient check. The pinned Broker includes bloom-broker#103, so the
+      approval page decodes the transfer and names its recipient
+      (decision 21). Until bloom-broker#112 is pinned, the policy ceremony
+      shows the entry as written.
 
     A persona chosen later is a fresh start for that wallet (decision 18):
     its setup runs again, its limits reset and its policy is replaced. Machine
@@ -261,8 +257,8 @@ Agreed on 2026-11-03 with the author of bloom#352 and bloom#377:
       recipients the owner added by hand, and the ceremony shows what
       changes. The policy's required verifiers and clear-signing setting
       are kept, since setup never chooses them, except the legacy
-      clear-signing rules a Broker with bloom-broker#103 refuses to sign
-      under: Machine built for such a Broker (Machine–Broker 1.8) drops
+      clear-signing rules the pinned Broker (bloom-broker#103,
+      Machine–Broker 1.8) refuses to sign under: the replacement drops
       them, as that Broker requires;
     - once the owner approves that ceremony, the new setup is saved and
       every chosen Petal's limits reset to the new persona's values,
@@ -282,24 +278,27 @@ Agreed on 2026-11-03 with the author of bloom#352 and bloom#377:
     Degen policy asks for it in the same ceremony as the rest of the
     persona's policy: the first policy of a new wallet, or the replacement in
     decision 18. An Institutional policy keeps the 30 days wallet creation
-    installs. On the pinned Broker the lifetime only lifts Broker's cap: the
-    pinned Signer still refuses a Sealed Approval longer than 90 days, and a
-    Petal-scoped key may last as long as its own scope asks (Hyperliquid's
-    asks for one day). The pinned Broker's ceremony shows the lifetime as a
-    very large number of hours; bloom-broker#112 shows it as until revoked.
+    installs. On the pinned Broker and Signer the lifetime only lifts
+    Broker's cap: the pinned Signer still refuses a Sealed Approval longer
+    than 90 days, and a Petal-scoped key may last as long as its own scope
+    asks (Hyperliquid's asks for one day). The pinned Broker's ceremony shows
+    the lifetime as a very large number of hours; bloom-broker#112 shows it
+    as until revoked.
 20. **Degen's tokens are the ERC-20s its Petals declare.** Degen's
     any-recipient rule covers only ERC-20s that the wallet's Petals declare.
     The owner can still list specific recipients, such as their own external
     wallet. How a Petal declares its tokens, in its package or per
     transaction as petal#52 does, is still open; until it is settled,
-    Bloom's curated table (`bloom_proto::tokens`) stands in.
+    Bloom's curated policy list (`bloom_proto::policy::ANY_RECIPIENT_TOKENS`)
+    stands in. It is deliberately not Broker's much longer shared list, which
+    Machine resolves symbols from: any contract can answer `decimals()` and run
+    its own code under the `transfer` selector, so only a token reviewed for
+    this counts as a standard transfer.
 21. **The owner always sees the recipient.** Degen's entry needs a Broker
-    that decodes an ERC-20 transfer and shows its recipient: Broker master
-    (bloom-broker#103). This design assumes the release pins that Broker.
-    Neither the Broker this branch pins nor master's v0.4.2 pin
-    (`release/0.4.1`, Machine–Broker 1.7) includes it, so meeting this needs
-    a Broker pin and protocol bump to 1.8; until then a Degen transfer shows
-    as an unreadable call (decision 15).
+    that decodes an ERC-20 transfer and shows its recipient
+    (bloom-broker#103). The pinned Broker, `b6c27339` at Machine–Broker 1.8,
+    includes it, so a Degen transfer's approval page names the recipient
+    (decision 15).
 
 ## Why it does not work today
 
@@ -735,10 +734,10 @@ this design and those stacks:
 - **Versions.** The sessions need Broker and Signer changes that are not
   merged, and each accepts exactly one protocol minor: bloom-signer#68 only
   Broker–Signer 1.7, and bloom-broker#100 only Machine–Broker 1.8. The pinned
-  Broker and Signer speak Machine–Broker 1.7 and Broker–Signer 1.6, so
-  bloom#352's stack ships bloom-signer#68, bloom-broker#100 (which pins it)
-  and Machine as one Triad release. Broker master has since moved on: it
-  already uses Machine–Broker 1.8 for bloom-broker#103, which
+  Broker (`b6c27339`) and Signer (`3f880d7`) speak Machine–Broker 1.8 and
+  Broker–Signer 1.6, so bloom#352's stack ships bloom-signer#68,
+  bloom-broker#100 (which pins it) and Machine as one Triad release. The
+  pinned Broker uses Machine–Broker 1.8 for bloom-broker#103, which
   bloom-broker#100 does not contain. It also requires exact approval for
   every Polymarket class it rebuilds (orders, relayer batches, onboarding)
   and refuses any declared debit, destination or fee on them. Rebased,
@@ -803,9 +802,9 @@ owner signs.
   `erc20:any-recipient` (decision 15). The second lifts Machine's recipient
   check for the wallet's own curated ERC-20 transfers. Broker checks no
   destination on that exact EVM approval, which carries no claim, so the
-  owner's approval of each transfer is the only recipient check. On the
-  pinned Broker the approval page does not name the recipient; it appears
-  only inside the raw calldata (decision 15).
+  owner's approval of each transfer is the only recipient check. The pinned
+  Broker's approval page decodes the transfer and names the recipient
+  (decision 21).
 - A Petal cannot stage a transaction as the wallet's own. Bloom refuses a
   Petal's VFS write to a wallet's `outbox/new.tx`; a Petal stages with its
   own staging call, which records it as the origin, so a rule for the
