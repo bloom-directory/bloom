@@ -358,7 +358,8 @@ fn refresh_developer_provenance_catalog(
     // choose, which is why `CLEAR_UNCATALOGUED_FEE_ASSETS` exists — without an
     // opt-in this would be a lockout, because the launcher runs this refresh
     // before the enrolment that would heal the record and aborts on failure.
-    let clear_uncatalogued = std::env::var_os(CLEAR_UNCATALOGUED_FEE_ASSETS).is_some();
+    let clear_requested = std::env::var_os(CLEAR_UNCATALOGUED_FEE_ASSETS);
+    let clear_uncatalogued = clear_uncatalogued_requested(clear_requested.as_deref());
     let mut developer_records = developer_records;
     let mut uncatalogued = Vec::new();
     for record in &mut developer_records {
@@ -396,10 +397,12 @@ fn refresh_developer_provenance_catalog(
     if !uncatalogued.is_empty() {
         bail!(
             "this developer catalog carries fee assets for operation classes this build does \
-             not catalogue, and refreshing would clear them and deny those Petals' claims: {}. \
-             Re-enroll the Petal (`bloom init triad-enroll-developer-petal-provenance <config> \
-             <package>`) so its records are rebuilt from the package, or restore the class to \
-             FEE_BEARING_OPERATION_CLASSES. Set {}=1 to clear them anyway.",
+             not catalogue, and refreshing would clear them and deny those Petals' claims with \
+             FEE_NOT_ALLOWED: {}. To keep those claims working, this build has to catalogue the \
+             class in FEE_BEARING_OPERATION_CLASSES — re-enrolling the Petal does NOT help, \
+             because enrolment derives the fee asset from the same table and would write null \
+             too. Set {}=1 to clear them anyway and accept that those claims stop being \
+             authorized.",
             uncatalogued.join("; "),
             CLEAR_UNCATALOGUED_FEE_ASSETS,
         );
@@ -633,6 +636,14 @@ fn developer_route_operation_classes(
 /// class this build does not catalogue. Without it the refresh refuses, so the
 /// removal is a choice the operator makes rather than a silent rewrite.
 const CLEAR_UNCATALOGUED_FEE_ASSETS: &str = "BLOOM_TRIAD_DEV_CLEAR_UNCATALOGUED_FEE_ASSETS";
+
+/// Only an exact `1` enables the clearing. Testing for the variable's mere
+/// presence would make `=0` — the spelling an operator reaches for to turn
+/// something off — enable a destructive re-signing instead, and the refusal
+/// message tells them to set `1`.
+fn clear_uncatalogued_requested(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| value == std::ffi::OsStr::new("1"))
+}
 
 const HYPERLIQUID_BUILDER_ORDER_CLASS: &str = "hyperliquid.builder_order";
 
@@ -1908,6 +1919,26 @@ mod tests {
         assert_eq!(fee.asset, "usdc");
     }
 
+    /// `=0` is the spelling an operator reaches for to turn something off, so
+    /// presence alone must not enable a destructive re-signing. Tested through
+    /// the parser rather than the process environment, which would race the
+    /// other tests in this module.
+    #[test]
+    fn only_an_explicit_one_permits_clearing_an_uncatalogued_fee_asset() {
+        use std::ffi::OsStr;
+        assert!(clear_uncatalogued_requested(Some(OsStr::new("1"))));
+        for refused in ["0", "", "true", "yes", "01", " 1"] {
+            assert!(
+                !clear_uncatalogued_requested(Some(OsStr::new(refused))),
+                "{refused:?} must not enable clearing"
+            );
+        }
+        assert!(
+            !clear_uncatalogued_requested(None),
+            "unset must not enable it"
+        );
+    }
+
     /// Clearing a fee asset for a class this build does not catalogue would
     /// deny that Petal's claims with FEE_NOT_ALLOWED, so the refresh refuses
     /// and names the recovery rather than rewriting the record.
@@ -1972,8 +2003,13 @@ mod tests {
         let message = format!("{error:#}");
         assert!(message.contains("would clear them"), "{message}");
         assert!(
-            message.contains("triad-enroll-developer-petal-provenance"),
-            "the refusal must name the recovery: {message}"
+            message.contains("FEE_BEARING_OPERATION_CLASSES"),
+            "the refusal must name the only recovery that keeps the claims working: {message}"
+        );
+        assert!(
+            message.contains("re-enrolling the Petal does NOT help"),
+            "the refusal must not send the operator to a recovery that recreates the outage: \
+             {message}"
         );
         assert!(
             message.contains(CLEAR_UNCATALOGUED_FEE_ASSETS),
