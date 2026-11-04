@@ -1349,6 +1349,47 @@ mod tests {
             .unwrap();
     }
 
+    /// Chains are tried in name order; a Tempo chain sorting first must not
+    /// hide the EVM chain after it.
+    #[tokio::test]
+    async fn balance_watch_reads_the_evm_chain_after_a_tempo_chain() {
+        let directory = tempdir().unwrap();
+        let home = HomeDir::at(directory.path());
+        home.ensure().unwrap();
+        let registry = Arc::new(WatchRegistry::new(home.watch_dir()).unwrap());
+        let chains = ChainRegistry::default();
+        for (name, chain_id) in [
+            ("a-tempo", bloom_proto::chain::TEMPO_MAINNET_CHAIN_ID),
+            ("z-evm", 1),
+        ] {
+            let mut spec = bloom_proto::ChainSpec::anvil_default();
+            spec.name = name.into();
+            spec.chain_id = chain_id;
+            spec.rpc_urls = vec!["http://127.0.0.1:1".into()];
+            chains.add(bloom_evm::ChainClient::new(spec).unwrap());
+        }
+        let executor = WatchExecutor::new(chains, registry, home);
+        let spec = WatchSpec {
+            id: "evm-after-tempo".into(),
+            wallet: "alice".into(),
+            created_ms: 1,
+            kind: WatchKind::Balance {
+                address: "0x1111111111111111111111111111111111111111".into(),
+                threshold_wei: "1".into(),
+                comparator: "<".into(),
+            },
+            note: None,
+        };
+        // The EVM RPC is unreachable, so reaching it fails with a transport
+        // error rather than Tempo's missing-native-token refusal.
+        let error = executor
+            .process_spec(&spec, &mut ExecutorState::default())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("no native token"), "{error}");
+    }
+
     #[tokio::test]
     async fn watch_audit_prewrite_failure_blocks_network_effect() {
         let directory = tempdir().unwrap();
