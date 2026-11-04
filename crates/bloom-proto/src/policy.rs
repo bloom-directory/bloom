@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 pub const ERC20_ANY_RECIPIENT: &str = "erc20:any-recipient";
 
 /// The ERC-20 tokens [`ERC20_ANY_RECIPIENT`] covers, by chain id: the majors
-/// Bloom curated (USDC, USDT, WETH, DAI, WBTC). They stand in until Petals
+/// Bloom curated (USDC, USDT, WETH and DAI, plus WBTC on Ethereum only).
+/// Review, not implementation shape, is the criterion — several of these are
+/// upgradeable proxies, including every USDC. They stand in until Petals
 /// declare the tokens they use (Default Wallet Policy decision 20). Broker's
 /// shared list (`bloom_broker_api::known_tokens`), which Machine resolves
 /// symbols from, is far longer; it is not used here because any contract can

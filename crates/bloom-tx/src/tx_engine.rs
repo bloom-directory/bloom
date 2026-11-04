@@ -11298,8 +11298,10 @@ mod tests {
             "resolving a symbol must not confer the any-recipient permission"
         );
 
-        // AAVE is an upgradeable proxy, the case ANY_RECIPIENT_TOKENS' own
-        // comment gives for why Broker's list does not govern policy.
+        // AAVE is refused because Bloom has not reviewed it for this, not
+        // because it is an upgradeable proxy: 7 of the 21 curated entries are
+        // proxies by Broker's own `upgradeable` flag, every USDC among them.
+        // Being reviewed is the criterion; proxy-ness is not a filter.
         let (aave, _) = TxEngine::resolve_token_address("AAVE", 1).unwrap();
         assert!(!is_curated_token(1, aave));
 
