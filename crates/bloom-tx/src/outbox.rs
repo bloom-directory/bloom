@@ -111,6 +111,12 @@ pub enum SigningEvidence {
     UnreadableBatch,
 }
 
+/// Make a directory's entry list durable: a created or renamed child survives
+/// power loss only once its parent directory is synced.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+
 /// Whether anything is at `path`. Only a clean "not found" proves absence.
 fn may_exist(path: &Path) -> bool {
     !matches!(fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
@@ -464,6 +470,10 @@ impl Outbox {
     ) -> Result<Self, OutboxError> {
         let root = root.into();
         fs::create_dir_all(&root)?;
+        // Publish a newly created root itself, not only entries under it.
+        if let Some(parent) = root.parent() {
+            sync_dir(parent)?;
+        }
         Ok(Self {
             inner: Arc::new(OutboxInner {
                 root,
@@ -636,7 +646,7 @@ impl Outbox {
         let dir = self
             .state_dir(&staged.wallet, &staged.chain, OutboxState::Pending)?
             .join(&staged.id);
-        fs::create_dir_all(&dir)?;
+        self.create_dir_durable(&dir)?;
         self.write_artefact(&dir, "plan.md", plan_md.as_bytes())?;
         self.write_artefact(
             &dir,
@@ -665,9 +675,12 @@ impl Outbox {
             .state_dir(wallet, chain, OutboxState::Pending)?
             .join(id);
         fs::create_dir_all(&dir)?;
-        let path = dir.join("nonce_conflict.json");
-        fs::write(&path, serde_json::to_vec_pretty(body)?)?;
-        Ok(path)
+        self.write_artefact(
+            &dir,
+            "nonce_conflict.json",
+            &serde_json::to_vec_pretty(body)?,
+        )?;
+        Ok(dir.join("nonce_conflict.json"))
     }
 
     /// Write a `mev_risk.json` artefact next to a pending tx with the
@@ -686,9 +699,8 @@ impl Outbox {
             .state_dir(wallet, chain, OutboxState::Pending)?
             .join(id);
         fs::create_dir_all(&dir)?;
-        let path = dir.join("mev_risk.json");
-        fs::write(&path, serde_json::to_vec_pretty(report)?)?;
-        Ok(path)
+        self.write_artefact(&dir, "mev_risk.json", &serde_json::to_vec_pretty(report)?)?;
+        Ok(dir.join("mev_risk.json"))
     }
 
     pub fn write_broadcast_attempt(
@@ -1000,7 +1012,7 @@ impl Outbox {
             return Ok(entry.dir.clone());
         }
         let target_parent = self.state_dir(&entry.staged.wallet, &entry.staged.chain, new_state)?;
-        fs::create_dir_all(&target_parent)?;
+        self.create_dir_durable(&target_parent)?;
         let target = target_parent.join(&entry.staged.id);
         // Preserve the previous attempt until both stores have transitioned.
         // Successful retries retain its files outside the live state scans.
@@ -1010,24 +1022,33 @@ impl Outbox {
                 .unwrap()
                 .join("archive")
                 .join(&entry.staged.id);
-            fs::create_dir_all(&archive)?;
+            self.create_dir_durable(&archive)?;
             let attempt = tempfile::Builder::new()
                 .prefix("attempt-")
-                .tempdir_in(archive)?
+                .tempdir_in(&archive)?
                 .keep();
+            sync_dir(&archive)?;
             let backup = attempt.join("entry");
             fs::rename(&target, &backup)?;
+            sync_dir(&attempt)?;
+            sync_dir(&target_parent)?;
             Some(backup)
         } else {
             None
         };
         if let Err(error) = fs::rename(&entry.dir, &target) {
             if let Some(backup) = &previous {
-                fs::rename(backup, &target).map_err(|restore| OutboxError::Other(format!(
+                fs::rename(backup, &target)
+                    .and_then(|()| sync_dir(&target_parent))
+                    .map_err(|restore| OutboxError::Other(format!(
                     "wallet transition failed: {error}; previous record remains at {}: {restore}", backup.display()
                 )))?;
             }
             return Err(error.into());
+        }
+        sync_dir(&target_parent)?;
+        if let Some(source_parent) = entry.dir.parent() {
+            sync_dir(source_parent)?;
         }
 
         // Project transition to central outbox.
@@ -1043,10 +1064,15 @@ impl Outbox {
                 OutboxState::Failed => "failed",
             };
             if let Err(e) = proj.transition_action(action_id, from_str, to_str) {
-                let rollback = fs::rename(&target, &entry.dir);
+                // Sync both parents so the rolled-back location survives.
+                let rollback = fs::rename(&target, &entry.dir)
+                    .and_then(|()| sync_dir(&target_parent))
+                    .and_then(|()| entry.dir.parent().map_or(Ok(()), sync_dir));
                 let rollback_detail = match rollback {
                     Ok(()) => match &previous {
-                        Some(backup) => match fs::rename(backup, &target) {
+                        Some(backup) => match fs::rename(backup, &target)
+                            .and_then(|()| sync_dir(&target_parent))
+                        {
                             Ok(()) => {
                                 "wallet outbox transition and previous record restored".to_string()
                             }
@@ -1153,6 +1179,19 @@ impl Outbox {
         Ok(())
     }
 
+    /// `create_dir_all`, then sync every parent up to the outbox root so the
+    /// new directories survive power loss.
+    fn create_dir_durable(&self, dir: &Path) -> Result<(), OutboxError> {
+        fs::create_dir_all(dir)?;
+        for parent in dir.ancestors().skip(1) {
+            sync_dir(parent)?;
+            if parent == self.inner.root {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     pub fn write_artefact(&self, dir: &Path, name: &str, body: &[u8]) -> Result<(), OutboxError> {
         if name.contains('/') || name.contains('\\') {
             return Err(OutboxError::InvalidId(name.into()));
@@ -1178,9 +1217,11 @@ impl Outbox {
         let entry = self.read_in_state(wallet, chain, id, OutboxState::Pending)?;
         let mut staged = entry.staged;
         staged.depends_on = Some(dep_id.to_string());
-        fs::write(
-            entry.dir.join("intent.json"),
-            serde_json::to_vec_pretty(&staged)?,
+        // intent.json holds the staged nonce: a torn rewrite would strand the entry.
+        self.write_artefact(
+            &entry.dir,
+            "intent.json",
+            &serde_json::to_vec_pretty(&staged)?,
         )?;
         Ok(())
     }

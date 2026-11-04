@@ -2671,19 +2671,21 @@ impl TxEngine {
         staged.status = TxStatus::Sent;
         staged.tx_hash = Some(format!("{:#x}", tx_hash));
 
-        let new_dir = self
-            .outbox
-            .transition(&entry, crate::outbox::OutboxState::Sent)?;
+        // Record the hash before leaving pending, as `finalize_sent` does. The
+        // sent scanner needs `intent.tx_hash`; a crash after the move but
+        // before this write would leave no pending retry and no sent row.
         self.outbox.write_artefact(
-            &new_dir,
+            &entry.dir,
             "intent.json",
             &serde_json::to_vec_pretty(&staged).unwrap(),
         )?;
         self.outbox.write_artefact(
-            &new_dir,
+            &entry.dir,
             "tx_hash",
             staged.tx_hash.as_ref().unwrap().as_bytes(),
         )?;
+        self.outbox
+            .transition(&entry, crate::outbox::OutboxState::Sent)?;
         if let Some(action_id) = staged.action_id.as_deref() {
             self.write_central_evm_result(EvmCentralResult {
                 action_id,
@@ -8220,6 +8222,26 @@ mod tests {
         let sent = f.outbox.read("alice", "anvil", "fee-repair").unwrap();
         assert_eq!(sent.state, OutboxState::Sent);
         assert_eq!(sent.staged.tx_hash, repaired.tx_hash);
+    }
+
+    /// The hash is recorded before the entry leaves pending. If the move to
+    /// sent fails after the broadcast, the pending entry still names the
+    /// transaction, so a restart reconciles it instead of losing it.
+    #[tokio::test]
+    async fn broadcast_hash_survives_a_failed_move_to_sent() {
+        let url = spawn_batch_rpc(None).await;
+        let f = fee_repair_fixture(&url, |_| {});
+        let _ = f.confirm().await;
+        f.fixture.active.store(true, Ordering::SeqCst);
+        let pending = f.outbox.read("alice", "anvil", "fee-repair").unwrap();
+        // A file where the sent directory goes makes the move fail.
+        let chain_dir = pending.dir.parent().unwrap().parent().unwrap();
+        std::fs::write(chain_dir.join("sent"), b"").unwrap();
+        assert!(f.confirm().await.is_err());
+        let kept = f.outbox.read("alice", "anvil", "fee-repair").unwrap();
+        assert_eq!(kept.state, OutboxState::Pending);
+        assert!(kept.staged.tx_hash.is_some(), "{:?}", kept.staged);
+        assert_eq!(kept.staged.status, TxStatus::Sent);
     }
 
     /// A different action may not supersede a dispatched signing operation
