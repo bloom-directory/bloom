@@ -153,7 +153,7 @@ impl PetalHost for VenueFixture {
                 .unwrap_or_else(|| timestamp.to_string());
             assert!(header("POLY_TIMESTAMP") == timestamp);
 
-            assert!(header("POLY_SIGNATURE") == format!("0x{}", hex::encode(signature_bytes)));
+            assert!(header("POLY_SIGNATURE") == signature.to_string());
             self.auth_posts.fetch_add(1, Ordering::SeqCst);
             include_bytes!("../../tests/fixtures/polymarket-credentials.json").to_vec()
         } else if request.url == "https://gamma-api.polymarket.com/markets/slug/test"
