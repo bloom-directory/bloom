@@ -44,8 +44,10 @@ If the user gave a mount path, read from that path instead.
 
 ## Rules
 
-- If an action needs a chain and the user did not name one, ask which chain.
-  Do not pick a default network.
+- If the user did not name a chain, use what Bloom state settles: a read
+  covers every chain (`wallets/<wallet>/<n>/holdings.json`); a write uses the
+  only chain that holds the asset. Ask only when two or more funded chains
+  remain, and name them.
 - Do what the user asked without asking them to confirm it again. Their
   passkey approval, or a valid Sealed Approval, is the authorization.
 - Installing Bloom or this skill does not authorize creating a wallet, adding
