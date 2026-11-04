@@ -327,6 +327,9 @@ registration_url="$(sed -n 's/^ceremony_url: //p' "$work/registration.log")"
   cat "$work/registration.log" >&2
   exit 1
 }
+# This custody-only probe does not drive the optional onboarding UI. Preserve
+# the Broker capability while validating/removing only its known setup bridge.
+registration_url="$(printf '%s' "$registration_url" | python3 "$script_dir/custody-launch-url.py")"
 if ! sudo -H -u "$login_user" \
   "$debug_driver" complete "$registration_url" "$authenticator_seed" \
   >"$work/registration-complete.log" 2>&1
