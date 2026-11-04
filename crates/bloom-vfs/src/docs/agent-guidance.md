@@ -1,3 +1,34 @@
+# Transfer loop
+
+Wallet id comes from `ls /wallets`.
+`bloom --connect <endpoint> vfs ls /wallets`
+
+Native send, one line, to `wallets/<wallet>/0/chains/<chain>/outbox/new.tx`:
+`printf 'send 0.01 ETH to 0x0000000000000000000000000000000000000001\n' > wallets/<wallet>/0/chains/<chain>/outbox/new.tx`
+`bloom --connect <endpoint> vfs write /wallets/<wallet>/0/chains/<chain>/outbox/new.tx --data 'send 0.01 ETH to 0x0000000000000000000000000000000000000001'`
+
+Token send, same path:
+`printf 'send 1000 USDC to 0x0000000000000000000000000000000000000001\n' > wallets/<wallet>/0/chains/<chain>/outbox/new.tx`
+`bloom --connect <endpoint> vfs write /wallets/<wallet>/0/chains/<chain>/outbox/new.tx --data 'send 1000 USDC to 0x0000000000000000000000000000000000000001'`
+
+The staged entry is under `outbox/pending/<id>/`. Match the one you just staged:
+`ls wallets/<wallet>/0/chains/<chain>/outbox/pending/`
+`bloom --connect <endpoint> vfs ls /wallets/<wallet>/0/chains/<chain>/outbox/pending/`
+
+Write `y` to its `confirm`:
+`printf 'y\n' > wallets/<wallet>/0/chains/<chain>/outbox/pending/<id>/confirm`
+`bloom --connect <endpoint> vfs write /wallets/<wallet>/0/chains/<chain>/outbox/pending/<id>/confirm --data y`
+
+Ceremony response is `approval_challenge.json`: `state` `awaiting_ceremony`, a `ceremony_url`, and `retry_path`. Wait, then retry that exact `retry_path` with `retry_body`, or `y` when `retry_body` is omitted.
+`printf 'y\n' > <retry_path>`
+`bloom --connect <endpoint> vfs write /<retry_path> --data y`
+
+Result: `outbox/sent/<id>/tx_hash` or `outbox/failed/<id>/policy_check.json`.
+`cat wallets/<wallet>/0/chains/<chain>/outbox/sent/<id>/tx_hash`
+`bloom --connect <endpoint> vfs cat /wallets/<wallet>/0/chains/<chain>/outbox/sent/<id>/tx_hash`
+`cat wallets/<wallet>/0/chains/<chain>/outbox/failed/<id>/policy_check.json`
+`bloom --connect <endpoint> vfs cat /wallets/<wallet>/0/chains/<chain>/outbox/failed/<id>/policy_check.json`
+
 # Working with Bloom
 
 This file is the operating contract for agents using the mounted Bloom virtual
@@ -18,22 +49,6 @@ cat docs/README.md
 in `docs/examples.md` before using an unfamiliar write surface. For Petal work,
 use `docs/petals.md` to discover installed packages, then read that package's
 `README.md` and `AGENTS.md` before using its routes.
-
-## Staging transactions
-
-Stage transfers by writing a single line to the selected account's `new.tx`:
-
-```sh
-# Native transfer:
-printf 'send 0.01 ETH to 0x0000000000000000000000000000000000000001\n' \
-  > wallets/<wallet>/0/chains/<chain>/outbox/new.tx
-
-# Token transfer (ERC-20):
-printf 'send 1000 USDC to 0x0000000000000000000000000000000000000001\n' \
-  > wallets/<wallet>/0/chains/<chain>/outbox/new.tx
-```
-
-Then identify the staged entry under `.../outbox/pending/<id>/` and write `y` to its `confirm` file. See `docs/examples.md` for complete procedures.
 
 ## Authority and safety
 

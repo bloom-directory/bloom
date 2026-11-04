@@ -13,6 +13,20 @@ chain were discovered on this mount. Native transfers also need a funded source
 account and the configured node; the Anvil example requires a running local
 Anvil instance.
 
+## Native send
+
+```sh
+printf 'send 0.01 ETH to 0x0000000000000000000000000000000000000001\n' \
+  > "$BLOOM/wallets/alice/0/chains/anvil/outbox/new.tx"
+```
+
+## Token send
+
+```sh
+printf 'send 1000 USDC to 0x0000000000000000000000000000000000000001\n' \
+  > "$BLOOM/wallets/alice/0/chains/anvil/outbox/new.tx"
+```
+
 ## Local Anvil transaction
 
 ```sh
@@ -22,15 +36,10 @@ ls "$BLOOM/wallets/"
 cat "$BLOOM/chains/anvil/chain_id"
 cat "$BLOOM/wallets/alice/projection.json"
 
-# 2. Stage once through an explicit account path. Account 0 is the initial
-#    account; any other numbered path (wallets/alice/1/chains/...) spends
-#    from that account's key and sees only its own outbox entries.
-#    Native asset:
-printf 'send 0.01 ETH to 0x0000000000000000000000000000000000000001\n' \
-  > "$BLOOM/wallets/alice/0/chains/anvil/outbox/new.tx"
-#    Token transfer (ERC-20):
-printf 'send 1000 USDC to 0x0000000000000000000000000000000000000001\n' \
-  > "$BLOOM/wallets/alice/0/chains/anvil/outbox/new.tx"
+# 2. Stage once through an explicit account path, using the native send or
+#    the token send above. Account 0 is the initial account; any other
+#    numbered path (wallets/alice/1/chains/...) spends from that account's
+#    key and sees only its own outbox entries.
 
 # 3. List pending actions. Set ID to the exact entry created by this staging
 #    operation after matching its intent; do not choose by ordering.
