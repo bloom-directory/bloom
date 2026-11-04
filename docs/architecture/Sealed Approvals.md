@@ -183,9 +183,11 @@ envelope on retry fails without changing the saved approval or calling Broker.
 Older states without a digest remain usable for requests without an envelope;
 reviewed legacy states migrate in place only when their saved facts digest
 matches the current facts and those facts contain the envelope's `action_digest`.
-This preserves approval and signing operation IDs, including lost-response
-recovery. Missing or inconsistent evidence fails closed and is retained for
-reconciliation; never delete or reset it to retry a potentially signed operation.
+A migrated state drops its saved approval and operation IDs, because Broker
+cannot show that the earlier ceremony displayed the review. The owner approves
+again. The bytes are unchanged, so a second signature cannot create a second
+action. Missing or inconsistent evidence fails closed and is retained for
+reconciliation.
 
 Bounded persona trading is a separate integration; exact approval does not
 require it. Implementation dependencies and future session acceptance criteria

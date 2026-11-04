@@ -28,14 +28,16 @@ const APPROVAL_TTL_MS: u64 = 5 * 60 * 1000;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 // Old daemon facts already committed to the exact action bytes. Backfill only
-// that authenticated local identity, never invent a new approval or sign ID.
+// that authenticated local identity. An approval granted before the review
+// existed never showed it, so the caller drops it and asks the owner again.
+// Returns whether it backfilled.
 fn migrate_review_digest(
     saved: &mut Option<Digest32>,
     current: &Option<Digest32>,
     saved_facts: &Digest32,
     current_facts: &Digest32,
     facts: &serde_json::Value,
-) {
+) -> bool {
     if saved.is_none()
         && saved_facts == current_facts
         && let Some(digest) = current
@@ -45,7 +47,9 @@ fn migrate_review_digest(
             == Some(digest.as_str())
     {
         *saved = Some(digest.clone());
+        return true;
     }
+    false
 }
 
 fn exact_claim_value_limits(claim: &PetalUseClaim) -> Result<Vec<ValueLimit>, String> {
@@ -494,13 +498,17 @@ impl BrokerExactPayloadSigner {
             }
             Err(error) => return Err(format!("read exact signing state: {error}").into()),
         };
-        migrate_review_digest(
+        if migrate_review_digest(
             &mut state.review_payload_digest,
             &review_payload_digest,
             &state.canonical_plan_facts_digest,
             &canonical_plan_facts_digest,
             canonical_plan_facts,
-        );
+        ) {
+            // Expire it so the reset below starts a fresh ceremony.
+            state.approval_id = None;
+            state.expires_at_ms = DecimalU64::new(0);
+        }
         if state.schema != STATE_SCHEMA
             || state.action_id != action_id
             || state.wallet_id != wallet_id
@@ -1040,13 +1048,17 @@ impl BrokerExactPayloadSigner {
             }
             Err(error) => return Err(format!("read exact batch signing state: {error}").into()),
         };
-        migrate_review_digest(
+        if migrate_review_digest(
             &mut state.review_payload_digest,
             &review_payload_digest,
             &state.canonical_plan_facts_digest,
             &canonical_plan_facts_digest,
             canonical_plan_facts,
-        );
+        ) {
+            // Expire it so the reset below starts a fresh ceremony.
+            state.approval_id = None;
+            state.expires_at_ms = DecimalU64::new(0);
+        }
         if state.schema != STATE_SCHEMA
             || state.action_id != action_id
             || state.wallet_id != wallet_id
@@ -2467,13 +2479,18 @@ mod tests {
                 let migrated: serde_json::Value =
                     serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
                 let original: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+                // The saved approval never showed the review, so a fresh
+                // ceremony replaces it.
+                assert_eq!(
+                    migrated["review_payload_digest"],
+                    original["review_payload_digest"]
+                );
                 for field in [
                     "approval_id",
                     "approval_operation_id",
                     "signing_operation_id",
-                    "review_payload_digest",
                 ] {
-                    assert_eq!(migrated[field], original[field], "{field}");
+                    assert_ne!(migrated[field], original[field], "{field}");
                 }
             } else {
                 let error = result.unwrap_err();
