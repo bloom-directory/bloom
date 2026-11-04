@@ -520,55 +520,29 @@ pub(crate) async fn compile_selection(
     Ok(proposals)
 }
 
-/// Public review data uses the same exact deployments and raw preset quantities
-/// as compilation. This is presentation only; installer provenance and grants
-/// still decide authority.
+/// Advisory package labels only. Permission amounts and asset metadata come
+/// from the exact proposed terms, never a parallel presentation calculation.
 pub(crate) fn onboarding_display_data(daemon: &Daemon) -> Result<serde_json::Value> {
-    let config = bloom_proto::Config::load(&daemon.home.config_path())?;
     let catalog = daemon.persona_provenance_catalog();
-    let mut assets = Vec::new();
-    for token in known_tokens().iter().filter(|token| {
-        config
-            .chains
-            .values()
-            .any(|chain| chain.chain_id == token.chain_id)
-    }) {
-        let mut limits = serde_json::Map::new();
-        for preset in [PersonaPreset::Trader, PersonaPreset::Degen] {
-            let profile = bloom_proto::persona::PersonaConfig::suggested(preset);
-            if let Some((action, window)) = profile.token_amounts(&token.symbol) {
-                limits.insert(preset.as_str().into(),serde_json::json!({"per_action":token_units(action,token.decimals)?,"per_window":token_units(window,token.decimals)?,"window_secs":profile.window_secs.to_string()}));
-            }
-        }
-        if !limits.is_empty() {
-            assets.push(serde_json::json!({"chain":format!("evm-{}",token.chain_id),"asset":token.address,"symbol":token.symbol,"decimals":token.decimals,"limits":limits}));
-        }
-    }
     let mut petals = Vec::new();
     for name in crate::default_policy::onboarding_petals(daemon)? {
         let hash = daemon.petals.store().resolve_petal_owner(&name)?;
-        let records=catalog.as_ref().map(|catalog|catalog.records.iter().filter(|record|matches!(&record.subject,ProvenanceSubject::Petal {package_hash,..} if Some(package_hash.as_str())==hash.as_deref())).collect::<Vec<_>>()).unwrap_or_default();
-        let mut zero_spend_classes = records
-            .iter()
-            .flat_map(|r| &r.operation_classes)
-            .filter(|class| class.zero_spend && class.economic_effects_schema == Some(1))
-            .map(|class| class.operation_class.clone())
-            .collect::<Vec<_>>();
-        zero_spend_classes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        zero_spend_classes.dedup();
-        let display_name = records
-            .iter()
-            .find_map(|r| r.package_display_name.as_deref())
+        let display_name = catalog
+            .as_ref()
+            .and_then(|catalog| {
+                catalog
+                    .records
+                    .iter()
+                    .filter(|record| {
+                        matches!(&record.subject, ProvenanceSubject::Petal {package_hash,..}
+                if Some(package_hash.as_str()) == hash.as_deref())
+                    })
+                    .find_map(|record| record.package_display_name.as_deref())
+            })
             .unwrap_or_else(|| crate::default_policy::petal_label(&name));
-        petals.push(serde_json::json!({"id":name,"package_hash":hash,"display_name":display_name,"assets":assets,"zero_spend_classes":zero_spend_classes}));
+        petals.push(serde_json::json!({"id":name,"package_hash":hash,"display_name":display_name}));
     }
-    let rate = |preset| {
-        let profile = bloom_proto::persona::PersonaConfig::suggested(preset);
-        serde_json::json!({"maximum":profile.zero_spend_hourly_cap().unwrap().to_string(),"duration_ms":"3600000"})
-    };
-    Ok(
-        serde_json::json!({"petals":petals,"zero_spend_rate_limits":{"trader":rate(PersonaPreset::Trader),"degen":rate(PersonaPreset::Degen)}}),
-    )
+    Ok(serde_json::json!({"petals":petals}))
 }
 
 fn token_units(value: &str, decimals: u8) -> Result<DecimalU256> {
