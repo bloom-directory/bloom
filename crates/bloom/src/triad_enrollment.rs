@@ -16,7 +16,7 @@ use bloom_broker_api::{
     ProvenanceSubject, Token,
 };
 #[cfg(feature = "triad-dev-harness")]
-use bloom_petals::package::build_petal_package_dir;
+use bloom_petals::package::{PreparedPetalPackage, build_petal_package_dir};
 use ed25519_dalek::{Signer as _, SigningKey};
 use rand::{RngCore as _, rngs::OsRng};
 use serde::{Deserialize, Serialize};
@@ -155,7 +155,7 @@ pub fn run_developer_petal_provenance(config_dir: &Path, petal_dir: &Path) -> Re
     let config_dir =
         fs::canonicalize(config_dir).context("canonicalize developer triad config directory")?;
     let petal_dir =
-        fs::canonicalize(petal_dir).context("canonicalize developer Petal package directory")?;
+        fs::canonicalize(petal_dir).context("canonicalize developer Petal package input")?;
     enroll_developer_petal_provenance(&config_dir, &petal_dir, uid)
 }
 
@@ -354,6 +354,20 @@ fn refresh_developer_provenance_catalog(
 }
 
 #[cfg(feature = "triad-dev-harness")]
+fn load_developer_petal_package(input: &Path) -> Result<PreparedPetalPackage> {
+    if input.is_file() {
+        // Published candidates bind the canonical archive's exact content.
+        // Rebuilding a source directory adds generated Machine artifacts.
+        PreparedPetalPackage::from_petal_tar(input)
+            .map_err(|error| anyhow::anyhow!("read developer Petal archive: {error}"))
+    } else {
+        // Refresh generated artifacts only for the existing source-tree mode.
+        build_petal_package_dir(input)
+            .map_err(|error| anyhow::anyhow!("build developer Petal package: {error}"))
+    }
+}
+
+#[cfg(feature = "triad-dev-harness")]
 fn enroll_developer_petal_provenance(
     config_dir: &Path,
     petal_dir: &Path,
@@ -372,12 +386,7 @@ fn enroll_developer_petal_provenance(
 
     let (signing_key, installer_key_id) = load_developer_installer(config_dir)?;
 
-    // The Petal's source build may have changed its generated route components
-    // since a previous developer run left ignored package artifacts behind.
-    // Refresh those artifacts before signing provenance so enrollment, install,
-    // and subsequent cold-start runs all bind the same package bytes.
-    let package = build_petal_package_dir(petal_dir)
-        .map_err(|error| anyhow::anyhow!("build developer Petal package: {error}"))?;
+    let package = load_developer_petal_package(petal_dir)?;
     let publisher = Token::new("bloom-developer-local-package")?;
     let package_hash = Digest32::new(package.hash.clone())?;
     let lineage_id = developer_petal_lineage_id(&publisher, &package.name);
@@ -1486,6 +1495,92 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(classes, ["fixture.delegated", "fixture.immediate"]);
         assert!(!classes.contains(&"fixture.package_wide".to_string()));
+    }
+
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
+    fn developer_archive_enrollment_preserves_canonical_package_identity() {
+        let _fixture = FIXTURE_PETAL
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("config");
+        fs::create_dir(&output).unwrap();
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o700)).unwrap();
+        let owner = rustix::process::geteuid().as_raw();
+        generate_for_owner(
+            &EnrollmentPlan {
+                template_dir: template_dir(),
+                output_dir: output.clone(),
+                login_uid: 1001,
+                broker_uid: 1002,
+                signer_uid: 1003,
+                session_socket_gid: 1004,
+                release_digest: "44".repeat(32),
+            },
+            owner,
+        )
+        .unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join("tests/fixtures/triad-authority-petal");
+        let canonical = PreparedPetalPackage::from_dir(fixture).unwrap();
+        let archive = directory.path().join("canonical.petal.tar.gz");
+        let mut compressed = flate2::write::GzEncoder::new(
+            fs::File::create(&archive).unwrap(),
+            flate2::Compression::default(),
+        );
+        canonical.write_petal_tar(&mut compressed).unwrap();
+        compressed.finish().unwrap();
+        let loaded = load_developer_petal_package(&archive).unwrap();
+        assert_eq!(loaded.hash, canonical.hash);
+        assert_eq!(loaded.route_index, canonical.route_index);
+        enroll_developer_petal_provenance(&output, &archive, owner).unwrap();
+        let catalog: ProvenanceCatalog =
+            serde_json::from_slice(&fs::read(output.join("provenance-catalog.json")).unwrap())
+                .unwrap();
+        let records = catalog
+            .records
+            .iter()
+            .filter(|record| {
+                matches!(&record.subject,
+            ProvenanceSubject::Petal {package_hash, ..} if package_hash.as_str() == canonical.hash)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !records.is_empty(),
+            "enrollment must certify the archive's exact package identity"
+        );
+        for record in records {
+            if let ProvenanceSubject::Petal { route, .. } = &record.subject {
+                assert!(
+                    canonical
+                        .route_index
+                        .routes
+                        .iter()
+                        .any(|entry| &entry.route_id == route)
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
+    #[ignore = "requires canonical archive, expected package hash and metadata output paths"]
+    fn canonical_archive_identity_and_route_metadata() {
+        let archive = std::env::var_os("BLOOM_CANONICAL_PETAL_ARCHIVE").unwrap();
+        let package = load_developer_petal_package(Path::new(&archive)).unwrap();
+        assert_eq!(
+            package.hash,
+            std::env::var("BLOOM_CANONICAL_PETAL_HASH").unwrap()
+        );
+        fs::write(
+            std::env::var_os("BLOOM_CANONICAL_PETAL_INDEX").unwrap(),
+            serde_json::to_vec_pretty(&package.route_index).unwrap(),
+        )
+        .unwrap();
     }
 
     #[cfg(feature = "triad-dev-harness")]

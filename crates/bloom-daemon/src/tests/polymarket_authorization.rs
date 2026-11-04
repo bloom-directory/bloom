@@ -301,6 +301,15 @@ impl PetalHost for VenueFixture {
     }
 }
 
+fn integration_package(name: &str) -> bloom_petals::package::PreparedPetalPackage {
+    let input = setting(name);
+    if input.is_file() {
+        bloom_petals::package::PreparedPetalPackage::from_petal_tar(input).unwrap()
+    } else {
+        bloom_petals::package::build_petal_package_dir(input).unwrap()
+    }
+}
+
 fn setting(name: &str) -> PathBuf {
     std::env::var_os(name)
         .unwrap_or_else(|| panic!("set {name} through scripts/test-polymarket-authorization.sh"))
@@ -550,9 +559,7 @@ async fn installed_account_one_auth_and_exact_continuation_use_real_authority() 
     .parse()
     .unwrap();
 
-    let package =
-        bloom_petals::package::build_petal_package_dir(setting("BLOOM_PM80_POLYMARKET_ROOT"))
-            .unwrap();
+    let package = integration_package("BLOOM_PM80_POLYMARKET_ROOT");
     let hash = package.hash.clone();
     let auth_route = package
         .route_index
@@ -1039,9 +1046,7 @@ async fn prepared_buy_uses_real_bounded_permission() {
     .trim()
     .parse()
     .unwrap();
-    let package =
-        bloom_petals::package::build_petal_package_dir(setting("BLOOM_PM80_POLYMARKET_ROOT"))
-            .unwrap();
+    let package = integration_package("BLOOM_PM80_POLYMARKET_ROOT");
     let hash = package.hash.clone();
     let route = package
         .route_index

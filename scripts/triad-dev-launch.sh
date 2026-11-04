@@ -382,9 +382,9 @@ for integration_petal in \
   "${BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE:-}"
 do
   [ -n "$integration_petal" ] || continue
-  [ -d "$integration_petal" ] ||
+  [ -d "$integration_petal" ] || [ -f "$integration_petal" ] ||
     die "integration Petal package is missing: $integration_petal"
-  if [ "$build_integration_petals" -eq 1 ]; then
+  if [ "$build_integration_petals" -eq 1 ] && [ -d "$integration_petal" ]; then
     [ -x "${integration_petal}/scripts/build.sh" ] ||
       die "integration Petal build script is missing: ${integration_petal}/scripts/build.sh"
     (cd "$integration_petal" && scripts/build.sh)
@@ -870,7 +870,7 @@ for integration_petal in \
   "${BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE:-}"
 do
   [ -n "$integration_petal" ] || continue
-  [ -d "$integration_petal" ] || die "integration Petal package is missing: $integration_petal"
+  [ -d "$integration_petal" ] || [ -f "$integration_petal" ] || die "integration Petal package is missing: $integration_petal"
   package_name="$(basename "$integration_petal")"
   machine_cli petals install "$integration_petal" >"${log_dir}/${package_name}-install.log" 2>&1
 done

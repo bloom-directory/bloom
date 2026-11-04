@@ -112,15 +112,19 @@ The reusable-permission acceptance harness uses built Petal components and real
 isolated Machine, Broker and Signer services. Set the four exact executable paths
 `BLOOM_INTEGRATION_MACHINE_BIN`, `BLOOM_INTEGRATION_BROKER_BIN`,
 `BLOOM_INTEGRATION_SIGNER_BIN` and `BLOOM_INTEGRATION_DEBUG_DRIVER_BIN` as in the
-development guide. Then select a built source-package tree and a fresh empty
+development guide. Then select a canonical package archive (or a built source-package tree) and a fresh empty
 `/tmp/pm80-auth.*` directory:
 
 ```sh
-BLOOM_PM80_POLYMARKET_ROOT=/path/to/built/polymarket \
+BLOOM_PM80_POLYMARKET_ROOT=/path/to/polymarket.petal.tar.gz \
   scripts/test-polymarket-authorization.sh /tmp/pm80-auth.example prepared-buy
-BLOOM_PM80_GASLESS_ROOT=/path/to/built/gasless \
+BLOOM_PM80_GASLESS_ROOT=/path/to/gasless.petal.tar.gz \
   scripts/test-polymarket-authorization.sh /tmp/pm80-auth.gasless prepared-gasless
 ```
+
+Archive mode enrolls, installs and tests the exact archive package hash. Source
+mode regenerates Machine's build artifacts and therefore has a different package
+identity; source-mode evidence does not certify the canonical release archive.
 
 Each mode restarts the services, rearms the retained permission and checks exact
 account/budget identity, signed-volume charges, retries and exact step-up. The

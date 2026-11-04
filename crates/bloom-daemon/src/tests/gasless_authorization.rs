@@ -57,6 +57,9 @@ pub(super) fn quote_response(request: &HttpRequest, serial: u64) -> Vec<u8> {
             ),
         ],
     );
+    let request_id = quote["steps"][0]["requestId"].as_str().unwrap().to_owned();
+    quote["steps"][0]["items"][0]["check"]["endpoint"] =
+        serde_json::json!(format!("/intents/status/v3?requestId={request_id}"));
     quote["steps"][0]["items"][0]["data"]["sign"]["value"]["validBefore"] = serde_json::json!(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -65,6 +68,40 @@ pub(super) fn quote_response(request: &HttpRequest, serial: u64) -> Vec<u8> {
             + 300
     );
     serde_json::to_vec(&quote).unwrap()
+}
+
+#[test]
+fn mock_quote_keeps_the_status_endpoint_bound_to_the_distinct_request() {
+    let request = HttpRequest {
+        method: "POST".into(),
+        url: "https://api.relay.link/quote/v2".into(),
+        headers: vec![],
+        body: serde_json::to_vec(&serde_json::json!({
+            "originChainId":8453, "originCurrency":USDC, "amount":"1000000",
+            "user":"0x1111111111111111111111111111111111111111"
+        }))
+        .unwrap(),
+    };
+    let first: serde_json::Value = serde_json::from_slice(&quote_response(&request, 0)).unwrap();
+    let second: serde_json::Value = serde_json::from_slice(&quote_response(&request, 1)).unwrap();
+    assert_ne!(
+        first["steps"][0]["requestId"],
+        second["steps"][0]["requestId"]
+    );
+    assert_ne!(
+        first["steps"][0]["items"][0]["data"]["sign"]["value"]["nonce"],
+        second["steps"][0]["items"][0]["data"]["sign"]["value"]["nonce"]
+    );
+    for quote in [first, second] {
+        let id = quote["steps"][0]["requestId"].as_str().unwrap();
+        let item = &quote["steps"][0]["items"][0];
+        assert_eq!(item["data"]["post"]["body"]["requestId"], id);
+        assert_eq!(
+            item["check"]["endpoint"],
+            format!("/intents/status/v3?requestId={id}")
+        );
+        assert_eq!(item["data"]["sign"]["value"]["value"], "1000000");
+    }
 }
 
 fn body(amount: &str) -> Vec<u8> {
@@ -107,8 +144,7 @@ async fn prepared_gasless_uses_real_bounded_permission() {
         .get_wallet_authority(&wallet)
         .await
         .unwrap();
-    let package =
-        bloom_petals::package::build_petal_package_dir(setting("BLOOM_PM80_GASLESS_ROOT")).unwrap();
+    let package = integration_package("BLOOM_PM80_GASLESS_ROOT");
     let hash = package.hash.clone();
     let route = package
         .route_index

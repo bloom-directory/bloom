@@ -18,11 +18,11 @@ for variable in BLOOM_INTEGRATION_MACHINE_BIN BLOOM_INTEGRATION_BROKER_BIN BLOOM
   [ -x "${!variable:?set exact candidate binaries}" ] || exit 1
 done
 if [ "${2:-login}" = prepared-gasless ]; then
-  package_root="${BLOOM_PM80_GASLESS_ROOT:?set the built gasless source package}"
+  package_root="${BLOOM_PM80_GASLESS_ROOT:?set the built gasless directory or canonical archive}"
 else
-  package_root="${BLOOM_PM80_POLYMARKET_ROOT:?set the built source package}"
+  package_root="${BLOOM_PM80_POLYMARKET_ROOT:?set the built directory or canonical archive}"
 fi
-[ -d "$package_root" ] || exit 1
+[ -d "$package_root" ] || [ -f "$package_root" ] || exit 1
 free_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'; }
 cat > "$run_root/machine.toml" <<'EOF'
 default_chain = "polygon"

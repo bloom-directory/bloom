@@ -2179,7 +2179,7 @@ impl PetalHost for DaemonPetalHost {
                 .with_account_key(account_key.clone())
                 .with_expected_key(expected_key)
                 .with_persona_discovery(
-                    !strict || prepared_message_persona_eligible(&context, &req.operation_class),
+                    !strict || prepared_message_persona_eligible(context, &req.operation_class),
                 )
                 .with_strict_recovery(strict);
             let _guard = self.petal_signing_lock.lock().await;
