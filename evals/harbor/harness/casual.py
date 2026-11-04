@@ -26,6 +26,10 @@ class CasualEval(EvalDefinition):
         )
         self.trial = f"{self.name}-{secrets.token_hex(8)}"
         self.witness: Path | None = None
+        # Configure an anvil chain on a port nothing listens on, so it is offline.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            self.triad.anvil_port = probe.getsockname()[1]
 
     def preflight(self) -> None:
         self.triad.preflight()
@@ -42,10 +46,6 @@ class CasualEval(EvalDefinition):
         shutil.copy2(
             self.repo / "evals/harbor/projection.py", task_tests / "projection.py"
         )
-        agents_source = self.repo / "evals/harbor/tasks/AGENTS.md"
-        if not agents_source.exists():
-            agents_source = self.repo / "AGENTS.md"
-        shutil.copy2(agents_source, task / "AGENTS.md")
         return task
 
     def context(self, task: Path, verifier_env: dict[str, str]) -> EvalRunContext:
@@ -90,11 +90,7 @@ class CasualWalletBalancesEval(CasualEval):
         task = self.task()
         return self.context(
             task,
-            {
-                "BLOOM_EVAL_EXPECTED_BALANCES": json.dumps(
-                    {"harbor": "0.05", "savings": "1.25"}
-                ),
-            },
+            {},
         )
 
     def smoke(self) -> None:
@@ -126,11 +122,7 @@ class CasualEthInMainEval(CasualEval):
         task = self.task()
         return self.context(
             task,
-            {
-                "BLOOM_EVAL_WALLET": "main",
-                "BLOOM_EVAL_CHAIN": "ethereum",
-                "BLOOM_EVAL_EXPECTED_BALANCE": "2.5",
-            },
+            {},
         )
 
     def smoke(self) -> None:
@@ -159,11 +151,7 @@ class CasualSupportedChainsEval(CasualEval):
         task = self.task()
         return self.context(
             task,
-            {
-                "BLOOM_EVAL_CONFIGURED_CHAINS": json.dumps(
-                    ["ethereum", "polygon", "anvil"]
-                ),
-            },
+            {},
         )
 
     def smoke(self) -> None:
@@ -204,9 +192,7 @@ class CasualSentHistoryEval(CasualEval):
         task = self.task()
         return self.context(
             task,
-            {
-                "BLOOM_EVAL_EXPECTED_RECIPIENT": recipient,
-            },
+            {},
         )
 
     def smoke(self) -> None:
@@ -231,22 +217,12 @@ class CasualSentHistoryEval(CasualEval):
 class CasualAnvilStatusEval(CasualEval):
     name = "casual-anvil-status"
 
-    def __init__(self, repo: Path, environ: dict[str, str] | None = None) -> None:
-        super().__init__(repo, environ)
-        self.offline_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.offline_sock.bind(("127.0.0.1", 0))
-        self.anvil_port = self.offline_sock.getsockname()[1]
-        self.triad.anvil_port = self.anvil_port
-        self.offline_sock.close()
-
     def provision(self, agent_name: str) -> EvalRunContext:
         self.triad.start(solana=self.needs_solana)
         task = self.task()
         return self.context(
             task,
-            {
-                "BLOOM_EVAL_ANVIL_PORT": str(self.anvil_port),
-            },
+            {},
         )
 
     def smoke(self) -> None:
