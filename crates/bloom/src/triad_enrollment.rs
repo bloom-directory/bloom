@@ -349,15 +349,18 @@ fn refresh_developer_provenance_catalog(
     // `fee_asset` literal is re-derived here like any other, so that literal
     // has to stay null unless its class joins the table.
     //
-    // Healing a stale `None` is the point of the loop and happens silently.
-    // Clearing a value the table does not know is the opposite, and it is
-    // refused rather than performed: that record was signed with a fee asset
-    // for a class this build does not catalogue, so rewriting it would deny
-    // the Petal's claims with `FEE_NOT_ALLOWED` and leave Broker's refusal at
-    // claim time as the only symptom. Refusing instead makes the operator
-    // choose, which is why `REWRITE_EXISTING_FEE_ASSETS` exists — without an
-    // opt-in this would be a lockout, because the launcher runs this refresh
-    // before the enrolment that would heal the record and aborts on failure.
+    // Healing a stale `None` is the point of the loop, and it proceeds with a
+    // note on stderr. Overwriting a value the record was already signed with
+    // is the opposite and is refused rather than performed, whether this build
+    // catalogues that class differently or not at all: one of the record and
+    // the table is stale, the refresh cannot tell which, and re-signing on a
+    // guess denies the Petal's claims — `FEE_NOT_ALLOWED` where the value was
+    // cleared, `FEE_ASSET_MISMATCH` where it was replaced — leaving Broker's
+    // refusal at claim time as the only symptom. Refusing makes the operator
+    // choose, which is why `REWRITE_EXISTING_FEE_ASSETS` exists: without an
+    // opt-in, correcting a row in the table would lock out every root enrolled
+    // against the old value, because the launcher runs this refresh before the
+    // enrolment that would heal the record and aborts on failure.
     let rewrite_requested = std::env::var_os(REWRITE_EXISTING_FEE_ASSETS);
     let rewrite_existing = rewrite_existing_requested(rewrite_requested.as_deref());
     let mut developer_records = developer_records;

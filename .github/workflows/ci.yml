@@ -91,6 +91,14 @@ jobs:
           cache-targets: false
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # Default features lint none of the `triad-dev-harness` code, which is how
+      # a dead-code error on a gated constant reached this job red: every local
+      # check had been run with `--all-features`, where the gated consumer
+      # compiles and the lint cannot fire. `dev_harness_tests` runs the gated
+      # tests but lints nothing, and `locked release build` compiles
+      # `--all-features` without `-D warnings` or `cfg(test)`. So lint it here.
+      - name: Run clippy with the dev harness enabled
+        run: cargo clippy --workspace --all-targets --features triad-dev-harness -- -D warnings
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats
