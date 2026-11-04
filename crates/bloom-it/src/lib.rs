@@ -442,9 +442,20 @@ async fn spawn_anvil_inner(no_mining: bool) -> Result<AnvilGuard> {
         loop {
             match reader.next_line().await? {
                 Some(line) => {
-                    if let Some(port) = listening_port(&line) {
-                        return Ok::<Option<u16>, anyhow::Error>(Some(port));
+                    if !line.contains("Listening on") {
+                        continue;
                     }
+                    // The wording is anvil's own, and CI pins a version this
+                    // was not developed against, so a line we cannot parse
+                    // fails here with the line in hand rather than running the
+                    // readiness deadline out and reporting a timeout.
+                    let Some(port) = listening_port(&line) else {
+                        return Err(anyhow!(
+                            "anvil reported it is listening, but no port could be \
+                             parsed from {line:?}"
+                        ));
+                    };
+                    return Ok::<Option<u16>, anyhow::Error>(Some(port));
                 }
                 None => return Ok(None),
             }
@@ -455,9 +466,10 @@ async fn spawn_anvil_inner(no_mining: bool) -> Result<AnvilGuard> {
         .map_err(|_| anyhow!("timed out waiting for anvil to start"))??;
 
     let Some(port) = listening else {
-        // anvil closed stdout, so it is gone. Its reason is on stderr, which
-        // stays unread on the success path to leave the pipe open for the
-        // child's lifetime.
+        // anvil closed stdout, so it is gone and its stderr cannot grow any
+        // further. Draining it is safe only here: anvil logs to stdout and
+        // writes nothing to stderr in the ordinary case, so reading that pipe
+        // while the child is alive would block until it exited anyway.
         let mut reason = String::new();
         if let Some(mut stderr) = child.stderr.take() {
             stderr.read_to_string(&mut reason).await.ok();
@@ -477,10 +489,15 @@ async fn spawn_anvil_inner(no_mining: bool) -> Result<AnvilGuard> {
 }
 
 /// The port out of anvil's `Listening on 127.0.0.1:PORT` line.
+///
+/// Takes the first whitespace-delimited token after the text and the last
+/// `:`-separated field of it, so a trailing suffix such as `(http)` and an
+/// IPv6 host such as `[::1]:8545` both parse.
 fn listening_port(line: &str) -> Option<u16> {
     let (_, rest) = line.split_once("Listening on")?;
-    let (_, port) = rest.trim().rsplit_once(':')?;
-    port.trim().parse().ok()
+    let host_port = rest.split_whitespace().next()?;
+    let (_, port) = host_port.rsplit_once(':')?;
+    port.parse().ok()
 }
 
 /// Send a raw transaction with `cast send` from the prefunded funder
@@ -504,4 +521,36 @@ pub async fn cast_send(rpc_url: &str, args: &[&str]) -> Result<String> {
         ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+#[cfg(test)]
+mod listening_port_tests {
+    use super::listening_port;
+
+    #[test]
+    fn a_port_is_read_out_of_the_shapes_anvil_prints() {
+        assert_eq!(listening_port("Listening on 127.0.0.1:8545"), Some(8545));
+        // Trailing text: the parse must not be coupled to the line ending at
+        // the port, which is the regression this guards.
+        assert_eq!(
+            listening_port("Listening on 127.0.0.1:8545 (http)"),
+            Some(8545)
+        );
+        assert_eq!(listening_port("Listening on [::1]:8545"), Some(8545));
+        assert_eq!(
+            listening_port("    Listening on 127.0.0.1:61186"),
+            Some(61186)
+        );
+        assert_eq!(listening_port("Listening on 127.0.0.1:0"), Some(0));
+    }
+
+    #[test]
+    fn anything_without_a_port_is_not_mistaken_for_one() {
+        assert_eq!(listening_port("Available Accounts"), None);
+        assert_eq!(listening_port("Listening on"), None);
+        assert_eq!(listening_port("Listening on 127.0.0.1"), None);
+        assert_eq!(listening_port("Listening on 127.0.0.1:wat"), None);
+        // Above u16: parses as a number but not a port.
+        assert_eq!(listening_port("Listening on 127.0.0.1:99999"), None);
+    }
 }

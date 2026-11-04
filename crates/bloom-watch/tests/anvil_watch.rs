@@ -5,7 +5,6 @@
 //! Requires Foundry's `anvil` and `cast` on `$PATH` (or `BLOOM_ANVIL_BIN` /
 //! `BLOOM_CAST_BIN`).
 
-use std::net::TcpListener;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,7 +13,7 @@ use anyhow::{Context, Result, anyhow};
 use bloom_evm::{ChainClient, ChainRegistry};
 use bloom_proto::{ChainSpec, HomeDir};
 use bloom_watch::{WatchExecutor, WatchKind, WatchRegistry, WatchSpec};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::{sleep, timeout};
 
@@ -41,11 +40,6 @@ impl Drop for AnvilGuard {
     }
 }
 
-fn pick_free_port() -> Result<u16> {
-    let l = TcpListener::bind("127.0.0.1:0")?;
-    Ok(l.local_addr()?.port())
-}
-
 fn anvil_bin() -> String {
     std::env::var("BLOOM_ANVIL_BIN").unwrap_or_else(|_| "anvil".to_string())
 }
@@ -54,11 +48,26 @@ fn cast_bin() -> String {
     std::env::var("BLOOM_CAST_BIN").unwrap_or_else(|_| "cast".to_string())
 }
 
+/// The port out of anvil's `Listening on 127.0.0.1:PORT` line. Tolerates a
+/// trailing suffix and an IPv6 host.
+fn listening_port(line: &str) -> Option<u16> {
+    let (_, rest) = line.split_once("Listening on")?;
+    let host_port = rest.split_whitespace().next()?;
+    let (_, port) = host_port.rsplit_once(':')?;
+    port.parse().ok()
+}
+
+/// The port comes from anvil itself, via `--port 0`, rather than from probing
+/// for a free one and passing it: probing leaves a window between releasing the
+/// port and anvil binding it, and this test binary shares a nextest lane with
+/// `bloom-it`'s anvils (`.github/workflows/ci.yml`), so a sibling can take the
+/// port in between. Anvil then exits at once with "Address already in use" on
+/// stderr, which is piped and would otherwise go unread, leaving only a bare
+/// "exited before becoming ready" to debug.
 async fn spawn_anvil() -> Result<AnvilGuard> {
-    let port = pick_free_port()?;
     let mut cmd = Command::new(anvil_bin());
     cmd.arg("--port")
-        .arg(port.to_string())
+        .arg("0")
         .arg("--host")
         .arg("127.0.0.1")
         .arg("--chain-id")
@@ -76,15 +85,42 @@ async fn spawn_anvil() -> Result<AnvilGuard> {
     let wait = async {
         loop {
             match reader.next_line().await? {
-                Some(line) if line.contains("Listening on") => return Ok::<(), anyhow::Error>(()),
-                Some(_) => continue,
-                None => return Err(anyhow!("anvil exited before becoming ready")),
+                Some(line) => {
+                    if !line.contains("Listening on") {
+                        continue;
+                    }
+                    let Some(port) = listening_port(&line) else {
+                        return Err(anyhow!(
+                            "anvil reported it is listening, but no port could be \
+                             parsed from {line:?}"
+                        ));
+                    };
+                    return Ok::<Option<u16>, anyhow::Error>(Some(port));
+                }
+                None => return Ok(None),
             }
         }
     };
-    timeout(Duration::from_secs(15), wait)
+    let listening = timeout(Duration::from_secs(15), wait)
         .await
         .map_err(|_| anyhow!("timed out waiting for anvil to start"))??;
+
+    let Some(port) = listening else {
+        // anvil closed stdout, so it is gone and its stderr cannot grow any
+        // further. Draining it is safe only here: anvil logs to stdout, so
+        // reading that pipe while the child is alive would block.
+        let mut reason = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            stderr.read_to_string(&mut reason).await.ok();
+        }
+        let reason = reason.trim();
+        return Err(if reason.is_empty() {
+            anyhow!("anvil exited before becoming ready")
+        } else {
+            anyhow!("anvil exited before becoming ready: {reason}")
+        });
+    };
+
     Ok(AnvilGuard {
         child: Some(child),
         port,

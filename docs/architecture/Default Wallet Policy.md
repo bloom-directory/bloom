@@ -795,6 +795,17 @@ owner signs.
   Petal's VFS write to a wallet's `outbox/new.tx`; a Petal stages with its
   own staging call, which records it as the origin, so a rule for the
   wallet's own transfers, such as Degen's entry, never applies to it.
+- The Petal identity that a `petal:` entry matches is asserted by the daemon
+  and is not re-verified at the policy layer. `ExecutionOrigin::petal_id` is
+  built in bloom-daemon as `petal:` followed by the route's `petal_root`,
+  carried into `AddressContext::staged_by_petal`, and `petal_destination_entry`
+  in bloom-tx's policy engine compares it against the allowlist without
+  rechecking where it came from. Whoever controls how Bloom builds a route's
+  `PetalRouteContext` therefore owns that claim. Two things bound it: the name
+  is validated when the package is read (`validate_petal_name`, ASCII
+  alphanumeric plus `-` and `_`), and the comparison is exact rather than
+  case-insensitive, so an unexpected name is denied rather than over-matched.
+  Every transfer still needs the owner's ceremony.
 - A persona switch removes entries, but only when the owner runs it, and
   only through a ceremony that shows the replacement policy (decision 18).
 - On the pinned Broker, a Trader or Degen policy lifts the cap on how long
