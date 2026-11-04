@@ -164,7 +164,60 @@ state. Their installed package documentation defines their mounted routes.
 ## Examples
 
 - EVM transactions stage unsigned bytes, obtain approval when policy requires
-  it, and use Broker/Signer for the final payload signature.
+  it, and use Broker/Signer for the final payload signature. For Petal-originated
+  canonical ERC-20 `transfer(address,uint256)` calls with zero native value,
+  addressed to a token in Machine's curated registry, Machine decodes the
+  recipient and amount, and reconstructs the calldata through the typed send
+  path. Machine's staged plan then names the token, amount and recipient, and
+  Machine checks the wallet's allowed destinations against the decoded
+  recipient rather than the token contract. Broker's approval ceremony decodes
+  the same bytes independently and is unchanged: without clear signing it shows
+  a call to the token contract.
+  Other calldata remains a generic contract call — including a transfer-shaped
+  call to a contract the registry does not list. The selector proves the call's
+  shape, not the contract's behaviour; only the registry establishes that the
+  target is a token, so it is the condition for vouching that the call is one.
+  The registry is read for the chain the node reports, and only when that is
+  the configured chain: a node reporting another id leaves every call generic,
+  since a transfer typed for one chain would otherwise be signed for another.
+
+  Petal staging and confirmation evaluate only the advisory policy that
+  Machine derives from Broker's canonical policy, which carries the allowed
+  destinations and no agent autonomy, spending limits or token rules. Machine
+  runs that destination check once, at staging, and confirmation uses its
+  result. It is the only automated check of where a Petal's EVM call sends
+  value: Broker does not re-check allowed destinations for an EVM call, because
+  Machine's outbox signing carries no Petal or system claim for it to check.
+  What Broker enforces before signing is an exact Sealed Approval that the
+  owner activates in the ceremony for these bytes, made under the wallet's
+  current policy version. That is why every Petal-staged transaction, typed or
+  generic, needs fresh owner approval. Typed treatment also marks the calldata
+  as verified, which matters only where a policy with `under_policy` autonomy
+  is evaluated; Petal staging evaluates none today.
+
+  Because Machine rebuilds the calldata from the decoded fields rather than
+  forwarding the supplied bytes, that shape is held to an exact encoding.
+  Calldata that is already ERC-20 transfer shaped — the `transfer` selector,
+  exactly 68 bytes, zero native value — must re-encode to the bytes supplied.
+  Calldata carrying noncanonical padding in the address word, where the twelve
+  high-order bytes of that word are not zero, is **rejected at staging** rather
+  than staged. Tolerating it would stage a different transaction than the Petal
+  handed over: the decoder discards those bytes, and the re-encoded call would
+  no longer be the call that was submitted.
+
+  The length is held exactly as well. A zero-value call to a registered token
+  under the `transfer` selector that is not exactly 68 bytes is **rejected at
+  staging**, not left generic. The token ignores trailing calldata and still
+  executes the transfer, but a generic call is checked against the token
+  contract rather than the recipient, so leaving it generic would let one extra
+  byte step around the recipient policy the canonical call meets.
+
+  This applies only to that shape. A call the classifier does not recognise is
+  untouched and still stages as a generic contract call with its bytes intact,
+  including one carrying nonzero native value, one bearing another selector,
+  and one addressed to a contract outside the registry — even when such a call
+  contains the same noncanonical padding or any other length. Those never
+  reach the decoder, because Machine never rebuilds their calldata.
 - Paid HTTP stages the selected challenge and payment payload, then obtains any
   required signature through Broker/Signer.
 - Installed Polymarket or Hyperliquid Petals use their package-defined mounted
