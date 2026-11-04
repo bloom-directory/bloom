@@ -235,7 +235,7 @@ fn assert_accounting_unchanged(before: &ApprovalLimitState, after: &ApprovalLimi
 }
 
 async fn setup(name: &str, variable: &str) -> (AuthorizationFixture, String, u64) {
-    let mut counter = 3;
+    let mut counter = 2;
     let first = std::env::var("BLOOM_PM80_BUY_PHASE").as_deref() != Ok("restart");
     let f = if first {
         account_one_fixture().await
@@ -255,7 +255,6 @@ async fn setup(name: &str, variable: &str) -> (AuthorizationFixture, String, u64
             .petals
             .install_staged_petal_package(staged, None, || Ok(()))
             .unwrap();
-        approve_package(&f.daemon, &f.client, &f.wallet, &hash, counter, true).await;
         if name == "polymarket" {
             let store = bloom_petals::PrivateStore::open_account(
                 f.daemon.petals.store().private_account_data_root(),
