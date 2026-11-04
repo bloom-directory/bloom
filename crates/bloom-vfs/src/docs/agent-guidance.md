@@ -2,7 +2,9 @@
 
 This file is the operating contract for agents using the mounted Bloom virtual
 filesystem. It is not a development guide. Treat the directory containing this
-file as the VFS root and keep all paths mount-relative.
+file as the VFS root and keep all paths mount-relative. When Bloom is mounted at
+`/bloom` (or `$BLOOM`), paths like `wallets`, `chains`, and `status` are accessed
+under that mount (for example `/bloom/wallets`, `/bloom/chains`), or via `bloom vfs`.
 
 ## Start with discovery
 
