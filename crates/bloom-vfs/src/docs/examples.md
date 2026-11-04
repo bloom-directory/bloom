@@ -9,9 +9,10 @@ cat "$BLOOM/AGENTS.md"
 ```
 
 Replace every angle-bracketed value. The examples assume the named wallet and
-chain were discovered on this mount. Native transfers also need a funded source
-account and the configured node; the Anvil example requires a running local
-Anvil instance.
+chain were discovered on this mount. Task inputs, contacts, and transaction
+history live in the host workspace (e.g. `/workspace`) outside the Bloom VFS.
+Native transfers also need a funded source account and the configured node; the
+Anvil example requires a running local Anvil instance.
 
 ## Local Anvil transaction
 
