@@ -2344,7 +2344,7 @@ dependencies = [
 [[package]]
 name = "bloom-broker-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=afbec771860d7f172f1f54086200e5e553fb51b7#afbec771860d7f172f1f54086200e5e553fb51b7"
+source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=4f0c88d33ee3117dfde72694560365e55c9af50e#4f0c88d33ee3117dfde72694560365e55c9af50e"
 dependencies = [
  "bech32",
  "bloom-rpc-wire",
@@ -2648,7 +2648,7 @@ dependencies = [
 [[package]]
 name = "bloom-petal-contract"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/petal?rev=9e92e551c6a4ccc32704cef5b0e8ac4ed104e3b2#9e92e551c6a4ccc32704cef5b0e8ac4ed104e3b2"
+source = "git+https://github.com/bloom-directory/petal?rev=ba13a90f7f10de955d868d01085f34134d8aed3e#ba13a90f7f10de955d868d01085f34134d8aed3e"
 dependencies = [
  "hex",
  "serde",

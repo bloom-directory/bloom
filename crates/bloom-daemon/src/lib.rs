@@ -16,6 +16,10 @@ mod price_oracle;
 #[path = "tests/polymarket_authorization.rs"]
 mod polymarket_authorization;
 
+#[cfg(all(test, feature = "triad-dev-harness"))]
+#[path = "tests/phase1_native_acceptance.rs"]
+mod phase1_native_acceptance;
+
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -6136,37 +6140,34 @@ mod tests {
     }
 
     #[test]
-    fn message_review_mapping_keeps_full_envelopes_and_refuses_downgrades() {
-        let petal_review_payload = |operation, claim, action| {
-            super::petal_review_payload(
-                operation,
-                claim,
-                action,
-                bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable,
-                b"message",
-            )
-        };
+    fn message_review_mapping_is_independent_of_class_spelling() {
         let envelope =
             br#"{"schema":"bloom.message.review.v1","kind":"personal","message":"exact text"}"#
                 .as_slice();
-        for class in &["example.message", "another.login"] {
-            assert_eq!(
-                petal_review_payload(class, class, Some(envelope)).unwrap(),
-                Some(envelope)
+        for class in ["unrelated.message", "another.login"] {
+            let map = |action| {
+                super::petal_review_payload(
+                    class,
+                    class,
+                    action,
+                    bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable,
+                    b"\x19Ethereum Signed Message:\n10exact text",
+                )
+            };
+            assert_eq!(map(Some(envelope)).unwrap(), Some(envelope));
+            assert!(map(None).is_err());
+            assert!(map(Some(b"raw action")).is_err());
+            assert!(
+                super::petal_review_payload(
+                    class,
+                    "mismatched.class",
+                    Some(envelope),
+                    bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable,
+                    b"\x19Ethereum Signed Message:\n10exact text",
+                )
+                .is_err()
             );
-            assert!(petal_review_payload(class, class, None).is_err());
-            assert!(petal_review_payload(class, class, Some(b"raw action")).is_err());
-            assert!(petal_review_payload(class, "another.class", Some(envelope)).is_err());
         }
-        assert_eq!(
-            petal_review_payload("custom.message", "custom.message", Some(envelope)).unwrap(),
-            Some(envelope)
-        );
-        assert_eq!(
-            petal_review_payload("custom.message", "custom.message", Some(b"legacy action"))
-                .unwrap(),
-            None
-        );
     }
 
     #[test]
@@ -7309,25 +7310,12 @@ mod tests {
 
     #[tokio::test]
     async fn exact_petal_batch_is_atomic_and_rejects_an_old_hint_after_reorder() {
-        petal_batch_approval(false).await;
+        petal_batch_approval().await;
     }
 
-    #[tokio::test]
-    async fn reusable_polymarket_order_steps_up_to_exact_and_binds_review_on_retry() {
-        petal_batch_approval(true).await;
-    }
-
-    async fn petal_batch_approval(reviewed: bool) {
-        let class = if reviewed {
-            "polymarket.order.poly1271"
-        } else {
-            "order.batch"
-        };
-        let suite = if reviewed {
-            bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable
-        } else {
-            bloom_broker_api::CryptoSuite::Secp256k1Sha256Recoverable
-        };
+    async fn petal_batch_approval() {
+        let class = "order.batch";
+        let suite = bloom_broker_api::CryptoSuite::Secp256k1Sha256Recoverable;
         let directory = tempfile::tempdir().unwrap();
         let state_root = directory.path().join("petal-signing-requests");
         let broker = Arc::new(PetalExactBrokerFixture::new());
@@ -7370,19 +7358,11 @@ mod tests {
             ],
             actor: None,
         };
-        let preimages = if reviewed {
-            vec![b"\x19\x01order".to_vec()]
-        } else {
-            vec![b"first exact payload".to_vec(), b"second".to_vec()]
-        };
+        let preimages = vec![b"first exact payload".to_vec(), b"second".to_vec()];
         let hashes = preimages
             .iter()
             .map(|payload| {
-                bloom_broker_api::Digest32::from_bytes(if reviewed {
-                    alloy::primitives::keccak256(payload).into()
-                } else {
-                    sha2::Sha256::digest(payload).into()
-                })
+                bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(payload).into())
             })
             .collect::<Vec<_>>();
         let batch_digest = |payloads: &[Vec<u8>]| {
@@ -7419,27 +7399,14 @@ mod tests {
                     claimed_hash: hash.to_bytes(),
                 })
                 .collect(),
-            signature_algorithm: if reviewed {
-                "secp256k1-keccak256-recoverable"
-            } else {
-                "secp256k1-sha256-recoverable"
-            }
-            .into(),
+            signature_algorithm: "secp256k1-sha256-recoverable".into(),
             operation_class: class.into(),
             petal_use_claim_jcs: serde_jcs::to_vec(&claim).unwrap(),
             claim_assurance_evidence: None,
             approval_hint: None,
-            action: Some(if reviewed {
-                br#"[{"order":"original"}]"#.to_vec()
-            } else {
-                b"two exact orders".to_vec()
-            }),
+            action: Some(b"two exact orders".to_vec()),
             advisory: None,
-            selector: if reviewed {
-                bloom_broker_api::PetalSignSelector::Reusable
-            } else {
-                bloom_broker_api::PetalSignSelector::Exact
-            },
+            selector: bloom_broker_api::PetalSignSelector::Exact,
             key_ref: None,
             context: Some(context),
         };
@@ -7453,86 +7420,26 @@ mod tests {
         };
         assert!(!pending.action_id.contains("ceremony"));
         request.approval_hint = Some(pending.action_id.clone());
-        if reviewed {
-            let mut old_scope = request.clone();
-            old_scope.approval_hint = Some("old-reusable-approval".into());
-            assert!(
-                host.sign_payload_batch_outcome(old_scope)
-                    .await
-                    .unwrap_err()
-                    .to_string()
-                    .contains("approval artifact does not match")
-            );
-            let mut missing = request.clone();
-            missing.action = None;
-            assert!(
-                host.sign_payload_batch_outcome(missing)
-                    .await
-                    .unwrap_err()
-                    .to_string()
-                    .contains("complete prepared record")
-            );
-            let mut changed = request.clone();
-            changed.action = Some(br#"[{"order":"changed"}]"#.to_vec());
-            assert!(
-                host.sign_payload_batch_outcome(changed)
-                    .await
-                    .unwrap_err()
-                    .to_string()
-                    .contains("persisted operation identity")
-            );
-            let mut wrong_hash = request.clone();
-            wrong_hash.payloads[0].preimage.push(0);
-            assert!(
-                host.sign_payload_batch_outcome(wrong_hash)
-                    .await
-                    .unwrap_err()
-                    .to_string()
-                    .contains("claimed hashes")
-            );
-            let requests = broker.requests.lock().unwrap();
-            let prepared = requests
-                .iter()
-                .find_map(|request| match request {
-                    MachineBrokerRequest::SealedApprovalPrepare(request) => Some(request),
-                    _ => None,
-                })
-                .unwrap();
-            assert!(matches!(
-                prepared.terms.selector,
-                bloom_broker_api::ApprovalSelector::Exact { .. }
-            ));
-            assert_eq!(
-                prepared.message_review_payloads[0].decode(),
-                request.action.clone().unwrap()
-            );
-            assert!(
-                !requests
-                    .iter()
-                    .any(|request| matches!(request, MachineBrokerRequest::SigningSignBatch(_)))
-            );
-        } else {
-            let mut reordered = request.clone();
-            reordered.payloads.swap(0, 1);
-            let reordered_preimages = reordered
-                .payloads
-                .iter()
-                .map(|item| item.preimage.clone())
-                .collect::<Vec<_>>();
-            let mut reordered_claim = claim;
-            reordered_claim.payload_digest = batch_digest(&reordered_preimages);
-            reordered_claim.ordered_hashes.reverse();
-            reordered.petal_use_claim_jcs = serde_jcs::to_vec(&reordered_claim).unwrap();
-            let error = host
-                .sign_payload_batch_outcome(reordered)
-                .await
-                .unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("approval artifact does not match")
-            );
-        }
+        let mut reordered = request.clone();
+        reordered.payloads.swap(0, 1);
+        let reordered_preimages = reordered
+            .payloads
+            .iter()
+            .map(|item| item.preimage.clone())
+            .collect::<Vec<_>>();
+        let mut reordered_claim = claim;
+        reordered_claim.payload_digest = batch_digest(&reordered_preimages);
+        reordered_claim.ordered_hashes.reverse();
+        reordered.petal_use_claim_jcs = serde_jcs::to_vec(&reordered_claim).unwrap();
+        let error = host
+            .sign_payload_batch_outcome(reordered)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("approval artifact does not match")
+        );
 
         broker
             .active
@@ -7542,14 +7449,7 @@ mod tests {
         else {
             panic!("approved retry must return the complete signature batch");
         };
-        assert_eq!(
-            signatures,
-            if reviewed {
-                vec![vec![0x40; 65]]
-            } else {
-                vec![vec![0x40; 65], vec![0x41; 65]]
-            }
-        );
+        assert_eq!(signatures, vec![vec![0x40; 65], vec![0x41; 65]]);
         let requests = broker.requests.lock().unwrap();
         let signed = requests.iter().find_map(|request| match request {
             MachineBrokerRequest::SigningSignBatch(request) => Some(request),

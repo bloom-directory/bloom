@@ -543,7 +543,7 @@ impl DaemonPetalHost {
             };
             state.outcome = Some(outcome.clone());
             write_record(&state_path, &state)?;
-            return Ok(outcome);
+            Ok(outcome)
         }
     }
 
@@ -796,16 +796,21 @@ mod tests {
         assert_eq!(bytes, serde_jcs::to_vec(&claim).unwrap());
     }
     #[test]
-    fn zero_bounded_and_unspecified_declarations_cannot_create_reusable_effects() {
-        for spend in [
-            prepared::Spend::Unspecified,
+    fn unspecified_remains_exact_and_zero_or_empty_bounded_is_malformed() {
+        let claim: bloom_broker_api::PetalUseClaim = serde_json::from_slice(
+            &claim(&context(), &action(prepared::Spend::Unspecified)).unwrap(),
+        )
+        .unwrap();
+        assert!(claim.economic_effects.is_none());
+        assert!(
             prepared::Spend::erc20("evm-137", "0x1111111111111111111111111111111111111111", "0")
-                .unwrap(),
-        ] {
-            let claim: bloom_broker_api::PetalUseClaim =
-                serde_json::from_slice(&claim(&context(), &action(spend)).unwrap()).unwrap();
-            assert!(claim.economic_effects.is_none());
-        }
+                .is_err()
+        );
+        assert!(
+            prepared::Spend::Bounded { debits: vec![] }
+                .validate()
+                .is_err()
+        );
     }
     #[test]
     fn explicit_none_is_distinct_from_unspecified_and_binds_a_payload_context() {

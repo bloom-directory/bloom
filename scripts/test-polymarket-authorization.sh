@@ -6,9 +6,9 @@ umask 077
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 run_root="${1:?usage: test-polymarket-authorization.sh FRESH_EMPTY_RUN_ROOT}"
 case "${2:-login}" in
-  login) test_name=installed_account_one_auth_and_exact_continuation_use_real_authority ;;
-  prepared-buy) test_name=prepared_buy_uses_real_bounded_permission ;;
-  prepared-gasless) test_name=gasless_authorization::prepared_gasless_uses_real_bounded_permission ;;
+  login) test_name=phase1_acceptance::installed_account_one_auth_and_exact_continuation_use_real_authority ;;
+  prepared-buy) test_name=phase1_acceptance::prepared_buy_uses_real_bounded_permission ;;
+  prepared-gasless) test_name=phase1_acceptance::prepared_gasless_uses_real_bounded_permission ;;
   *) echo "Expected login, prepared-buy or prepared-gasless" >&2; exit 1 ;;
 esac
 [[ "$run_root" == /tmp/pm80-auth.* ]] || { echo 'Expected a fresh /tmp/pm80-auth.* root' >&2; exit 1; }
@@ -23,12 +23,34 @@ else
   package_root="${BLOOM_PM80_POLYMARKET_ROOT:?set the built directory or canonical archive}"
 fi
 [ -d "$package_root" ] || [ -f "$package_root" ] || exit 1
+# Record immutable candidate inputs alongside retained public acceptance evidence.
+export BLOOM_ACCEPTANCE_PACKAGE="$package_root"
+export BLOOM_ACCEPTANCE_SOURCE_COMMIT="$(git -C "$repo_root" rev-parse HEAD)"
+python3 - "$run_root/candidate-inputs.json" <<'PYMETA'
+import hashlib,json,os,pathlib,sys
+binaries={}
+for component in ["MACHINE","BROKER","SIGNER","DEBUG_DRIVER"]:
+    path=pathlib.Path(os.environ[f"BLOOM_INTEGRATION_{component}_BIN"])
+    binaries[component.lower()]={"path":str(path),"sha256":hashlib.sha256(path.read_bytes()).hexdigest()}
+for component in ["BROKER","SIGNER"]:
+    binaries[component.lower()]["commit"]=os.environ[f"BLOOM_INTEGRATION_{component}_COMMIT"]
+binaries["machine"]["commit"]=os.environ["BLOOM_ACCEPTANCE_SOURCE_COMMIT"]
+package=pathlib.Path(os.environ["BLOOM_ACCEPTANCE_PACKAGE"])
+artifact={"path":str(package)}
+if package.is_file():artifact["sha256"]=hashlib.sha256(package.read_bytes()).hexdigest()
+pathlib.Path(sys.argv[1]).write_text(json.dumps({"schema":"bloom.phase1.inputs.v1","binaries":binaries,"package":artifact},indent=2)+"\n")
+PYMETA
 free_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'; }
 cat > "$run_root/machine.toml" <<'EOF'
 default_chain = "polygon"
 [chains.polygon]
 name = "polygon"
 chain_id = 137
+rpc_urls = ["http://127.0.0.1:1"]
+allow_broadcast = false
+[chains.base]
+name = "base"
+chain_id = 8453
 rpc_urls = ["http://127.0.0.1:1"]
 allow_broadcast = false
 EOF

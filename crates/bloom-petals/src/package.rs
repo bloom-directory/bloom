@@ -526,7 +526,11 @@ impl PreparedPetalPackage {
             .sign
             .zero_spend_classes
             .iter()
-            .any(|class| !allowed_sign_intents.contains(class))
+            .enumerate()
+            .any(|(index, class)| {
+                !allowed_sign_intents.contains(class)
+                    || manifest.sign.zero_spend_classes[..index].contains(class)
+            })
             || (!manifest.sign.zero_spend_classes.is_empty()
                 && manifest.sign.economic_effects_schema != Some(1))
         {
@@ -5174,6 +5178,44 @@ name = "echo"
                 .iter()
                 .all(|r| r.economic_effects_schema.is_none())
         );
+    }
+
+    #[test]
+    fn zero_spend_metadata_requires_certified_allowed_classes() {
+        let root = tempfile::tempdir().unwrap();
+        let manifest = "schema = \"bloom.petal.package.v1\"\nname = \"echo\"\n[caps]\nallowed = [\"bloom:sign\"]\n[sign]\nallowed_intents = [\"example.login\"]\neconomic_effects_schema = 1\nzero_spend_classes = [\"example.login\"]\n";
+        write_petal_package_with_manifest_and_route(
+            root.path(),
+            manifest.as_bytes(),
+            route_component_no_imports(),
+        );
+        let package = PreparedPetalPackage::from_dir(root.path()).unwrap();
+        assert!(
+            package
+                .route_index
+                .routes
+                .iter()
+                .all(|route| route.zero_spend_classes == ["example.login"])
+        );
+        for invalid in [
+            manifest.replace(
+                "zero_spend_classes = [\"example.login\"]",
+                "zero_spend_classes = [\"another.login\"]",
+            ),
+            manifest.replace("economic_effects_schema = 1\n", ""),
+            manifest.replace(
+                "zero_spend_classes = [\"example.login\"]",
+                "zero_spend_classes = [\"example.login\",\"example.login\"]",
+            ),
+        ] {
+            write_package_file(root.path(), "petal.toml", invalid.as_bytes());
+            assert!(
+                PreparedPetalPackage::from_dir(root.path())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("zero-spend")
+            );
+        }
     }
 
     #[test]

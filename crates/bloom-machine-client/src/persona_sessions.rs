@@ -946,8 +946,8 @@ impl MachineBrokerClient {
         batch: bool,
         allow_limit_stepup: bool,
     ) -> Result<Option<SigningResult>, ProtocolError> {
-        // Selection is structural. Broker owns profile-specific verification,
-        // economic admission; unrelated Petals need no global
+        // Selection is structural. Broker admits the pinned package's declared
+        // effects against owner-reviewed budgets; unrelated Petals need no global
         // application-name gate or fabricated witness.
         if !matches!(
             (provenance, claim, system_use),
@@ -2062,7 +2062,11 @@ mod tests {
         limits.max_operations = DecimalU64::new(limits.max_operations.get() * 2);
         limits.max_signatures = DecimalU64::new(limits.max_signatures.get() * 2);
         let mut budget = SessionBudget {
-            petal_policy: None,
+            petal_policy: Some(PetalSessionPolicy {
+                persona: PetalSessionPersona::Degen,
+                zero_spend_classes: vec![],
+                zero_spend_rate_limit: None,
+            }),
             token_policy: Some(SessionTokenPolicy {
                 schema_version: 3,
                 budget_nonce: RequestNonce::from_bytes([55; 16]),

@@ -367,7 +367,7 @@ session endpoints above;
 static ingress addresses alone do not cover CA renewal endpoints.
 
 The shipped v0.4.0 bundle used Machine–Broker API 1.7 and Machine and Broker
-state/floor 2. This generic-session candidate negotiates Machine–Broker API 1.10
+state/floor 2. This generic-session candidate negotiates Machine–Broker API 1.11
 and moves both Machine and Broker to state/floor 3: Machine state 3 adds
 `review_payload_digest` to pending exact-signing state, which Machine 0.4.x
 rejects. Broker–Signer uses 1.8 and Signer state/floor remains 2. This is the

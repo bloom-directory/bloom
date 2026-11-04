@@ -2723,8 +2723,9 @@ D-065 widens the candidate to generic trusted EVM/SVM Petals declaring
 versioned complete effects and exact-account payload contexts. Native single
 EVM currency/ERC-20 and mainnet SOL transfers use explicit System identity,
 recipient allowlists, immutable raw-unit caps and independent supported-byte
-verification. Polymarket BUY retains its mandatory order/debit verifier;
-automatic outcome-token SELL valuation and native SPL remain deferred.
+verification. Petal automatic coverage trusts the installer-certified declared effects;
+protocol-specific order/debit verifiers are not part of this path. Native SPL
+and automatic permission-changing calls remain deferred.
 
 Broker owns all USD prices, conversion, gross-spend reservations, shared usage
 and recovery. CoinGecko keyless is primary; DefiLlama keyless is fallback;
@@ -2736,7 +2737,7 @@ and every member review commits to that same descriptor. Generic claims are
 trusted quantities; the economic guarantee does not independently contain a
 dishonest Petal, Machine or Broker.
 
-The north edge negotiates 1.10 and the south edge 1.8. The south System selector
+The north edge negotiates 1.11 and the south edge 1.8. The south System selector
 contains component/class identity only; narrower economic/native scope stays
 in Broker. Existing no-budget approval identity/replay meanings remain intact.
 This is candidate behavior, not a deployment claim. See the detailed

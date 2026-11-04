@@ -245,56 +245,48 @@ Solana artifacts also pin the full account fingerprint. Confirming, replacing, c
 session changes and Petal account context still require fresh Broker authority;
 cached membership never authorizes a signature.
 
-## Discoverable reusable operation profiles
+## Declared-effect persona permissions
 
-Persona onboarding discovers supported signing profiles from the Broker API's
-compiled `reusable_signing_profiles()` catalog. Each profile specifies its
-operation class, effects schema, crypto suite, exact budget assets and Broker
-verifier. Machine first requires the running Broker to advertise the specific
-`bloom.reusable-profile/<id>` capability, then intersects that catalog with
-selected installed packages and their installer-certified route records. Unknown classes, absent/wrong schema
-versions and fee-bearing classes are not automatically selected. Preferences
-and capability metadata do not activate authority.
+Persona discovery requires the generic `bloom.declared-effects.v1` Broker
+capability and the exact installed package's installer-signed route provenance.
+Only routes with `economic_effects_schema = 1` participate. Operation class
+spelling and package names do not determine automatic eligibility. Machine
+binds the selected account's exact `KeyRef`; the owner reviews an independent
+raw-token allowance for each package and key. The configured networks' reviewed
+token catalog and persona presets supply suggested limits; explicit selections
+may choose a narrower exact token policy.
 
-All eligible routes for one exact package/account share one member and its
-independent allowance. Package names are display/configuration choices, not
-signing authority. Exact KeyRefs, immutable package/route provenance, wallet
-policy and existing approval/usage bindings remain mandatory. Changed routes,
-assets or policy require the existing explicit review/revocation flow; discovery
-never resets a consumed allowance. Native-wallet transfer scopes remain
-independent of Petal scopes.
+Broker trusts the reviewed package's declared effects. It checks provenance,
+ordered payload contexts, exact spending accounts, positive raw quantities,
+permission effects, token policy and limits. It does not verify a Petal's
+reported debit against its signing bytes. This trust boundary is explicit in
+owner review; declared amounts are not independently verified economics.
 
-The typed effects builder remains available to existing callers. Migrated
-Polymarket uses prepared actions: Machine constructs the accounting claim and
-supplies the authenticated spending account; Broker retains its protocol-specific
-signed-byte checks. SELL shares, builder fees, credentials and continuing
-permissions retain separate approval. Hyperliquid, Enso, NEAR Intents and
-Feedback have not been migrated or granted new automatic actions.
-
-No WIT, custody or signing wire shape changes are introduced by this discovery
-catalog. Claim assurance remains explicit; supported checks do not imply proof
-of arbitrary contract effects or successful venue settlement.
-
+`Spend::None` is distinct from an omitted declaration. Trader and Degen may
+cover only zero-spend classes certified by provenance and listed in the grant.
+Their aggregate per-grant limits are 60 and 300 uses per hour respectively;
+adding classes does not multiply that capacity. Institutional has no automatic
+tier. Undeclared actions and actions outside the grant use exact review.
+Cancels do not refund signed usage, and restart or rearm never replenishes it.
 
 ## Prepared Petal signing
 
-The canonical SDK prepared-action API supplies one signing payload, a versioned
-review artifact and optional raw-unit spending declarations. Polymarket derives
-these from its persisted typed order; it does not rebuild an order from review
-JSON to calculate debits. The SDK computes hashes and serializes the request.
-Machine independently validates it and supplies trusted package, route and
-exact account identity. Declarations alone do not activate a reusable permission.
+The canonical prepared-action API supplies one exact signing payload, a
+`bloom.message.review` version 1 artifact, and an explicit spending declaration.
+Machine accepts EIP-712 typed data and EIP-191 personal messages generically.
+It reconstructs the standard signing preimage and rejects a mismatched payload
+or hash before discovering a reusable grant. No protocol-specific prepared
+record, login verifier or timestamp refresh exception exists.
 
-Machine retains a frozen operation keyed by exact package, signing route,
-wallet/account KeyRef and Petal domain operation key. Pending approvals,
-validated signature results and ambiguous recovery are core state. A changed
-exact action conflicts rather than creating replacement authority. Status is
-read-only and uses a distinct capability; it may resolve a unique operation
-across routes of the same exact package and account without authorizing signing.
+Machine retains a frozen operation keyed by exact package, route, wallet,
+account `KeyRef` and the Petal's operation key. A changed action conflicts;
+a retry recovers the original result without another charge. A terminal key
+remains terminal: a fresh action or reviewed attempt requires a new domain
+operation key. Status is read-only and separately capability-gated.
 
-Supported generic message review uses the existing single-payload exact path.
-Polymarket keeps its existing signed-byte BUY verifier and narrowly scoped
-one-use login timestamp refresh. Unknown review artifact formats are rejected;
-the API does not infer arbitrary signature economics or upgrade claim assurance.
-See [Prepared Petal actions](../specs/2026-10-29-prepared-petal-actions.md) for the
-migration requirements and acceptance criteria.
+`Spend::Bounded` requires positive, nonduplicate debits. `Spend::None` supplies
+an explicit zero-spend marker and an exact account context. `Spend::Unspecified`
+never obtains automatic authority. Supported declared effects are admitted
+under the existing owner-reviewed terms; they do not upgrade claim assurance.
+See [Persona-ready Petals revision 3](../specs/2026-11-02-persona-ready-petals.md)
+for the current delivery contract.

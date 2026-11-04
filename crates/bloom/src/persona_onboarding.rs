@@ -43,7 +43,7 @@ pub(super) fn certified_petal_selection(
         let mut route_classes = record
             .operation_classes
             .iter()
-            .filter(|class| class.economic_effects_schema == Some(1) && class.fee_asset.is_none())
+            .filter(|class| class.economic_effects_schema == Some(1))
             .map(|class| {
                 bounded |= !class.zero_spend;
                 class.operation_class.clone()
@@ -886,6 +886,18 @@ mod tests {
             .unwrap();
         assert_eq!(selected.members[0].account, 3);
         assert!(!selected.assets.is_empty());
+        // Fee metadata is a generic policy input, never a route eligibility ban.
+        for record in &mut catalog.records {
+            record.operation_classes[0].fee_asset = Some(ProvenanceFeeAsset {
+                chain: Token::new("evm-137").unwrap(),
+                asset: "native".into(),
+            });
+        }
+        assert!(
+            certified_petal_selection(&hash, &catalog, 3, &key, &advertised)
+                .unwrap()
+                .is_some()
+        );
         assert!(
             certified_petal_selection(&hash, &catalog, 3, &key, &[])
                 .unwrap()
