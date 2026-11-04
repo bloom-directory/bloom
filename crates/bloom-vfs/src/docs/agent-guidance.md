@@ -19,8 +19,6 @@ in `docs/examples.md` before using an unfamiliar write surface. For Petal work,
 use `docs/petals.md` to discover installed packages, then read that package's
 `README.md` and `AGENTS.md` before using its routes.
 
-Host workspace files (such as `/workspace/contacts.json`, notes, or transaction history) live in the host workspace outside the Bloom VFS mount. Inspect them with standard shell tools.
-
 ## Staging transactions
 
 Stage transfers by writing a single line to the selected account's `new.tx`:
