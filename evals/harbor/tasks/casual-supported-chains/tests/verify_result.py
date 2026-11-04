@@ -6,65 +6,78 @@ import os
 import sys
 from pathlib import Path
 
+# Add tests directory, tasks directory, or harbor directory to path for activity and projection
+tests_dir = Path(__file__).resolve().parent
+tasks_dir = tests_dir.parent.parent
+harbor_dir = tasks_dir.parent
+for p in (tests_dir, tasks_dir, harbor_dir):
+    if str(p) not in sys.path:
+        sys.path.insert(0, str(p))
 
-def get_agent_activity(logs_dir: Path | None = None) -> tuple[int, str]:
-    if logs_dir is None:
-        logs_dir = Path(os.environ.get("AGENT_LOGS_DIR", "/logs/agent"))
-
-    num_commands = 0
-    messages = []
-
-    traj_path = logs_dir / "trajectory.json"
-    if traj_path.exists():
-        try:
-            data = json.loads(traj_path.read_text())
-            for step in data.get("steps", []):
-                if step.get("source") == "agent":
-                    num_commands += len(step.get("tool_calls") or [])
-                    msg = step.get("message")
-                    if msg:
-                        messages.append(msg)
-            return num_commands, " ".join(messages)
-        except Exception:
-            pass
-
-    codex_path = logs_dir / "codex.txt"
-    if codex_path.exists():
-        try:
-            for line in codex_path.read_text().splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    ev = json.loads(line)
-                except Exception:
-                    continue
-                if ev.get("type") == "item.completed":
-                    item = ev.get("item", {})
-                    itype = item.get("type")
-                    if itype == "agent_message":
-                        messages.append(item.get("text", ""))
-                    elif itype in ("command_execution", "mcp_tool_call"):
-                        num_commands += 1
-            return num_commands, " ".join(messages)
-        except Exception:
-            pass
-
-    return 0, ""
+from activity import get_agent_activity
+from projection import ProjectionReader
 
 
-def verify() -> bool:
+def verify(root=None) -> bool:
     commands, text = get_agent_activity()
     if commands == 0:
         print("Agent executed 0 commands; read is required to list supported chains", file=sys.stderr)
         return False
     lower = text.lower()
-    if any(q in lower for q in ["do you mean blockchain networks", "what are you trying to do"]):
+    if any(q in lower for q in ["do you mean blockchain networks", "what are you trying to do", "which chain"]):
         print("Agent asked clarifying questions instead of listing supported chains", file=sys.stderr)
         return False
-    if not ("ethereum" in lower and ("arbitrum" in lower or "optimism" in lower or "base" in lower or "polygon" in lower or "solana" in lower)):
-        print("Agent did not list supported chains", file=sys.stderr)
+    if any(
+        err in lower
+        for err in [
+            "cannot determine",
+            "could not determine",
+            "unable to determine",
+            "failed to list",
+        ]
+    ):
+        print("Agent failed to determine supported chains", file=sys.stderr)
         return False
+
+    reader = ProjectionReader(root)
+    configured_env = os.environ.get("BLOOM_EVAL_CONFIGURED_CHAINS")
+    configured = []
+    if configured_env:
+        try:
+            configured = json.loads(configured_env)
+        except Exception:
+            pass
+
+    if not configured:
+        try:
+            configured = reader.directories("chains")
+        except Exception:
+            pass
+
+    if not configured:
+        configured = ["ethereum", "polygon", "anvil"]
+
+    # All configured chains must be mentioned
+    for c in configured:
+        if c.lower() not in lower:
+            print(f"Agent did not list configured chain {c}", file=sys.stderr)
+            return False
+
+    # Unconfigured popular chains should not be falsely claimed
+    unconfigured_candidates = [
+        "base",
+        "arbitrum",
+        "optimism",
+        "solana",
+        "avalanche",
+        "bsc",
+        "polygon-zkevm",
+    ]
+    for unconf in unconfigured_candidates:
+        if unconf not in configured and unconf in lower:
+            print(f"Agent listed unconfigured chain {unconf}", file=sys.stderr)
+            return False
+
     return True
 
 

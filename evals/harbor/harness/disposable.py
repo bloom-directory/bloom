@@ -283,6 +283,7 @@ class DisposableTriad:
             ethereum_rpc = self.ethereum_rpc_url
         config = f'nfs_listen_addr = "127.0.0.1:{free_port()}"\n'
         # Use an explicit public chain set, never copy an operator config.
+        self.anvil_port = getattr(self, "anvil_port", None) or free_port()
         config += (
             'default_chain = "ethereum"\n[chains.ethereum]\nname = "ethereum"\n'
             f'chain_id = 1\nrpc_urls = ["{ethereum_rpc}"]\n'
@@ -295,7 +296,7 @@ class DisposableTriad:
             '"https://tenderly.rpc.polygon.community"]\n'
             'display_name = "Polygon"\nnative_symbol = "POL"\nnative_decimals = 18\n'
             '[chains.anvil]\nname = "anvil"\nchain_id = 31337\n'
-            'rpc_urls = ["http://127.0.0.1:8545"]\n'
+            f'rpc_urls = ["http://127.0.0.1:{self.anvil_port}"]\n'
             'display_name = "Anvil"\nnative_symbol = "ETH"\nnative_decimals = 18\n'
         )
         if solana:
@@ -385,6 +386,27 @@ class DisposableTriad:
             "wallet projection",
             timeout=60,
         )
+
+    def enroll_wallet(self, name: str) -> str:
+        new_seed = self.root / f"auth-{name}.seed"
+        new_seed.write_text(secrets.token_hex(32))
+        new_seed.chmod(0o600)
+        driver = CeremonyDriver(
+            Path(self.env["BLOOM_INTEGRATION_DEBUG_DRIVER_BIN"]), new_seed, self.origin
+        )
+        launch = self.cli("wallet", "new", name)
+        url = CEREMONY.search(launch)
+        if url is None:
+            raise EvalError(f"wallet enrollment for {name} returned no ceremony")
+        result = driver.complete(url.group())
+        wallet_id = result["wallet_id"]
+        self._wait(
+            lambda: self.read(f"/wallets/{wallet_id}/accounts.json")["accounts"],
+            self.launcher,
+            f"wallet projection {name}",
+            timeout=60,
+        )
+        return wallet_id
         if ethereum_fork:
             # Bloom must read the fork, never mainnet, before the agent starts.
             selected = self.cli("vfs", "cat", "/status/chains/ethereum/rpc_url").strip()
