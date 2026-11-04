@@ -254,28 +254,39 @@ Agreed on 2026-11-03 with the author of bloom#352 and bloom#377:
     over, in one command:
     - the owner chooses the wallet's Petals again, starting from the new
       persona's suggestions rather than earlier choices;
-    - every chosen Petal's limits reset to the new persona's values,
-      replacing what the owner saved, since the owner asked to start over;
     - the wallet's policy is replaced, in one ceremony, by exactly what the
       new setup allows: the chosen Petals, their destinations, the
       persona's entries, and its approval lifetime (decision 19). Anything
       else is removed, including Degen's entry when leaving Degen and
       recipients the owner added by hand, and the ceremony shows what
       changes. The policy's required verifiers and clear-signing setting
-      are kept, since setup never chooses them.
+      are kept, since setup never chooses them, except the legacy
+      clear-signing rules a Broker with bloom-broker#103 refuses to sign
+      under: Machine built for such a Broker (Machine–Broker 1.8) drops
+      them, as that Broker requires;
+    - once the owner approves that ceremony, the new setup is saved and
+      every chosen Petal's limits reset to the new persona's values,
+      replacing what the owner saved, since the owner asked to start over.
 
-    Setup's other rules do not apply to a switch: it is proposed whatever
-    the policy's version, it removes entries, and it writes limits over
-    stored settings.
+    Nothing changes before the owner approves: Machine holds the new setup
+    as a waiting switch (`pending-persona/<wallet>.toml`). A switch the owner
+    refuses, or that expires, ends with nothing changed and is not proposed
+    again; `bloom wallet default-policy <wallet>` resumes one still waiting.
+    Starting another switch cancels the earlier one's ceremony, so only the
+    latest choice can commit. Setup's other rules do not apply to a switch:
+    it is proposed whatever the policy's version, it removes entries, and it
+    writes limits over stored settings.
 19. **Trader and Degen approvals can last until revoked.** bloom#377's
     reusable permissions need the policy's maximum approval lifetime at
     bloom-broker#112's `STANDING_APPROVAL_POLICY_LIFETIME_MS`. A Trader or
     Degen policy asks for it in the same ceremony as the rest of the
     persona's policy: the first policy of a new wallet, or the replacement in
     decision 18. An Institutional policy keeps the 30 days wallet creation
-    installs. On the pinned Broker the lifetime only bounds how long one
-    approval may last, so there it lets an approval the owner signs last
-    indefinitely.
+    installs. On the pinned Broker the lifetime only lifts Broker's cap: the
+    pinned Signer still refuses a Sealed Approval longer than 90 days, and a
+    Petal-scoped key may last as long as its own scope asks (Hyperliquid's
+    asks for one day). The pinned Broker's ceremony shows the lifetime as a
+    very large number of hours; bloom-broker#112 shows it as until revoked.
 20. **Degen's tokens are the ERC-20s its Petals declare.** Degen's
     any-recipient rule covers only ERC-20s that the wallet's Petals declare.
     The owner can still list specific recipients, such as their own external
@@ -284,8 +295,11 @@ Agreed on 2026-11-03 with the author of bloom#352 and bloom#377:
     Bloom's curated table (`bloom_proto::tokens`) stands in.
 21. **The owner always sees the recipient.** Degen's entry needs a Broker
     that decodes an ERC-20 transfer and shows its recipient: Broker master
-    (bloom-broker#103). This design assumes the release pins that Broker; the
-    one pinned when this was written does not (decision 15).
+    (bloom-broker#103). This design assumes the release pins that Broker.
+    Neither the Broker this branch pins nor master's v0.4.2 pin
+    (`release/0.4.1`, Machine–Broker 1.7) includes it, so meeting this needs
+    a Broker pin and protocol bump to 1.8; until then a Degen transfer shows
+    as an unreadable call (decision 15).
 
 ## Why it does not work today
 
@@ -658,9 +672,12 @@ this design and those stacks:
   re-review.
 - **A persona choice is a fresh start.** Browser onboarding sends the
   wallet, the persona and the owner's Petal selection in one
-  `wallet_persona` command. Machine saves that wallet's setup, resets the
-  chosen Petals' limits, and proposes the replacement policy (decision 18);
-  waiting for its ceremony is `wallet_default_policy` with `replace` set.
+  `wallet_persona` command. Machine holds that setup as a waiting switch
+  and proposes it as the wallet's replacement policy; once the owner
+  approves, Machine saves the setup and resets the chosen Petals' limits
+  (decision 18). Waiting for that ceremony is an ordinary
+  `wallet_default_policy`, which reports `switch_ended` if the owner refused
+  it or it expired.
 - **A fresh choice is proposed explicitly.** A flow that only adds to the
   policy, without switching persona, applies the owner's Petal selection
   through `wallet_default_policy`.
@@ -673,8 +690,7 @@ this design and those stacks:
   preselect from the wallet's `[setup.wallets.<wallet>.petals]` while the policy is still the one creation
   installed, and from what the current policy allows after that. Inside Machine
   this is `AfterPolicyChange::Propose` rather than a `bool`, so another flag
-  passed in its place, such as bloom#377's `standing`, does not compile;
-  `standing` stays a separate argument.
+  passed in its place does not compile.
 - **The persona's entry is for its wallet.** Onboarding can pick any
   existing wallet, and the persona, Degen's `erc20:any-recipient` entry and
   the lifetime are proposed for the wallet it was chosen for (decision 17).
@@ -688,11 +704,10 @@ this design and those stacks:
   limit from the persona (decision 15), so it starts at Trader's or Degen's
   pUSD quantity rather than 100. These are the daily values bloom#352 writes,
   with no per-action cap. Under bloom#377, Degen's 10,000 pUSD is a seven-day
-  allowance, so the session's limit is the stricter one. A persona chosen
-  after setup leaves the saved limit alone, so a Trader session activated
-  later is still capped by the limit setup wrote: 100 pUSD under
-  Institutional, if Polymarket was chosen. If it was not, setup wrote nothing
-  and Polymarket refuses buys until its settings exist.
+  allowance, so the session's limit is the stricter one. A persona switch
+  resets the limit to the new persona's once its policy is approved
+  (decision 18). If Polymarket was not chosen, setup wrote nothing and
+  Polymarket refuses buys until its settings exist.
 - **Destination chain names differ.** This policy names a Petal's destinations
   by Bloom chain name, such as `polygon`. Typed persona sessions for native and
   ERC-20 transfers match destinations named `evm-<chain id>`, such as
@@ -806,11 +821,13 @@ owner signs.
   alphanumeric plus `-` and `_`), and the comparison is exact rather than
   case-insensitive, so an unexpected name is denied rather than over-matched.
   Every transfer still needs the owner's ceremony.
-- A persona switch removes entries, but only when the owner runs it, and
-  only through a ceremony that shows the replacement policy (decision 18).
-- On the pinned Broker, a Trader or Degen policy lifts the cap on how long
-  one approval may last (decision 19). Each approval is still one the owner
-  signs.
+- A persona switch removes entries only through a ceremony that shows the
+  replacement policy, and nothing of it, its limits included, applies until
+  the owner approves (decision 18). Like any policy proposal, a local
+  client could request one; the ceremony is the gate.
+- On the pinned Broker, a Trader or Degen policy lifts Broker's cap on how
+  long one approval may last (decision 19). Signer still caps each Sealed
+  Approval at 90 days, and each is still one the owner signs.
 - Signing the policy grants no signing authority. Every signature still
   needs an approval the owner gave for that transaction.
 - Petal limits live in each Petal's settings, not the signed policy. Any
@@ -868,10 +885,11 @@ changes come next.
   `config.rs`, `persona.rs`, `policy.rs`; `crates/bloom`,
   `crates/bloom-daemon`, `crates/bloom-vfs`): each wallet's setup under
   `[setup.wallets.<wallet>]`, read from disk on each proposal; the
-  `wallet_persona` Machine command and `bloom wallet persona`, which save a
-  wallet's new setup, reset its Petals' limits and propose the replacement
-  policy (`ensure_policy_replaced`); and Trader's and Degen's standing
-  lifetime in their first proposal (decisions 17 to 19).
+  `wallet_persona` Machine command and `bloom wallet persona`, which hold a
+  wallet's new setup as a waiting switch, propose the replacement policy
+  (`ensure_policy_replaced`) once, and on approval save the setup and reset
+  its Petals' limits; Machine's atomic config writes; and Trader's and
+  Degen's standing lifetime in their first proposal (decisions 17 to 19).
 
 **Next**
 
@@ -951,10 +969,18 @@ Automated:
   in one ceremony, and proposes nothing for a policy that already matches; a
   Trader or Degen first proposal carries the standing lifetime, which the
   default-policy path requires (`crates/bloom-vfs/tests/triad_policy_update.rs`).
-- A switch accepts only canonical Petals with valid values, resets their
-  limits over stored settings, drops `main`'s queued writes, and reports a
-  failed write with its command; `bloom init --persona` on a set-up home
-  changes nothing and names `bloom wallet persona`.
+- A switch accepts only canonical Petals with valid values and known
+  settings; on approval it resets their limits over stored settings, drops
+  `main`'s queued write for each Petal whose reset went in, and reports a
+  failed write with its command. A waiting switch is kept apart from the
+  config; concurrent setup saves keep every wallet; a config save is atomic
+  and keeps its permissions; and the wait reports a switch applied or ended.
+  A switch is proposed once, not again after it is refused or expires, and
+  a later switch cancels the earlier one's ceremony; the legacy
+  clear-signing rules are dropped only for a Broker with bloom-broker#103.
+  The first proposal reads the wallet's setup from disk each time.
+  `bloom init --persona` on a set-up home changes nothing and names
+  `bloom wallet persona`.
 - Each persona's menu choice, `--persona` and Polymarket suggestion; Degen's
   entry on configured chains and for the wallet it was chosen for; an
   unusable saved persona set aside; staging that passes only the wallet's own curated ERC-20

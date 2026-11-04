@@ -1777,7 +1777,6 @@ async fn execute_machine_command(
         MachineCommand::WalletDefaultPolicy {
             name,
             owner_just_chose,
-            replace,
         } => {
             validate_wallet_name(&name).map_err(|error| {
                 machine_error(
@@ -1788,7 +1787,7 @@ async fn execute_machine_command(
             let status = default_policy::advance_default_policy(
                 daemon,
                 &name,
-                default_policy::DefaultPolicyMode::of_command(owner_just_chose, replace),
+                default_policy::DefaultPolicyMode::of_command(owner_just_chose),
             )
             .await?;
             format!("{}\n", serde_json::to_string(&status)?)
@@ -1804,8 +1803,8 @@ async fn execute_machine_command(
                     format!("wallet name must be a safe single path segment: {error:#}"),
                 )
             })?;
-            let switch = default_policy::switch_persona(daemon, &name, persona, petals).await?;
-            format!("{}\n", serde_json::to_string(&switch)?)
+            let status = default_policy::switch_persona(daemon, &name, persona, petals).await?;
+            format!("{}\n", serde_json::to_string(&status)?)
         }
         MachineCommand::WalletOutboxCancel {
             wallet,

@@ -629,13 +629,44 @@ impl Config {
         self.petals.legacy_setup_loaded
     }
 
+    /// Write the config atomically: a sibling file is written, synced and
+    /// renamed over `path`, so a reader never sees a partly written config
+    /// and a crash leaves the old one. The file keeps the config's
+    /// permissions.
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SAVES: AtomicU64 = AtomicU64::new(0);
+
         let s = toml::to_string_pretty(self)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, s)?;
-        Ok(())
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("config.toml");
+        let temporary = path.with_file_name(format!(
+            ".{name}.{}.{}.tmp",
+            std::process::id(),
+            SAVES.fetch_add(1, Ordering::Relaxed)
+        ));
+        let written = (|| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(s.as_bytes())?;
+            file.sync_all()?;
+            if let Ok(existing) = std::fs::metadata(path) {
+                std::fs::set_permissions(&temporary, existing.permissions())?;
+            }
+            std::fs::rename(&temporary, path)
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        Ok(written?)
     }
 
     pub fn load_or_init(path: &Path) -> Result<Self, ConfigError> {
@@ -1324,6 +1355,46 @@ rpc_urls = ["https://ethereum-rpc.publicnode.com"]
         assert!(cfg.solana_chains.contains_key("solana-mainnet"));
         let cfg2 = Config::load_or_init(&path).unwrap();
         assert_configs_equivalent(&cfg, &cfg2);
+    }
+
+    /// Saving replaces the config in one step: no partly written file is
+    /// ever visible, no temporary file is left, and the config keeps its
+    /// permissions.
+    #[cfg(unix)]
+    #[test]
+    fn saving_replaces_the_config_atomically_and_keeps_its_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let td = tempdir().unwrap();
+        let path = td.path().join("config.toml");
+        let mut cfg = Config::local_default();
+        cfg.save(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        cfg.setup.complete = true;
+        cfg.save(&path).unwrap();
+        assert!(Config::load(&path).unwrap().setup.complete);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let names: Vec<String> = std::fs::read_dir(td.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, ["config.toml"]);
+
+        // Readers racing saves always see a whole config.
+        let reader_path = path.clone();
+        let reader = std::thread::spawn(move || {
+            for _ in 0..500 {
+                Config::load(&reader_path).unwrap();
+            }
+        });
+        for round in 0..200 {
+            cfg.setup.complete = round % 2 == 0;
+            cfg.save(&path).unwrap();
+        }
+        reader.join().unwrap();
     }
 
     #[test]

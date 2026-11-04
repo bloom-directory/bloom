@@ -1613,7 +1613,7 @@ async fn a_persona_switch_replaces_what_setup_chose() {
     };
     let handler = eligibility_handler(temp.path(), fixture.clone());
     let PetalEligibility::AwaitingPolicyApproval(pending) = handler
-        .ensure_policy_replaced("alice", &replacement)
+        .ensure_policy_replaced("alice", &replacement, true)
         .await
         .unwrap()
     else {
@@ -1636,7 +1636,7 @@ async fn a_persona_switch_replaces_what_setup_chose() {
     fixture.complete.store(true, Ordering::SeqCst);
     assert!(matches!(
         handler
-            .ensure_policy_replaced("alice", &replacement)
+            .ensure_policy_replaced("alice", &replacement, true)
             .await
             .unwrap(),
         PetalEligibility::Allowed(_)
@@ -1661,12 +1661,80 @@ async fn a_matching_policy_needs_no_replacement() {
     };
     assert!(matches!(
         handler
-            .ensure_policy_replaced("alice", &replacement)
+            .ensure_policy_replaced("alice", &replacement, true)
             .await
             .unwrap(),
         PetalEligibility::Allowed(_)
     ));
     assert!(fixture.state.lock().proposed_policy.is_none());
+
+    // The same entries with another lifetime do not match: leaving Trader
+    // or Degen gives up the standing lifetime too.
+    let institutional = bloom_vfs::handlers::PolicyReplacement {
+        maximum_approval_lifetime_ms: bloom_proto::policy::CREATION_APPROVAL_LIFETIME_MS,
+        ..replacement
+    };
+    let PetalEligibility::AwaitingPolicyApproval(pending) = handler
+        .ensure_policy_replaced("alice", &institutional, true)
+        .await
+        .unwrap()
+    else {
+        panic!("a different lifetime is proposed");
+    };
+    assert!(pending.includes_requested);
+}
+
+/// Once a switch's own proposal was refused or expired, Machine proposes
+/// nothing new: a policy that does not match is reported, not replaced, and
+/// one that matches is applied. A switch's earlier proposal can be cancelled.
+#[tokio::test]
+async fn a_switch_is_proposed_once_and_can_be_cancelled() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture_with_policy(false, policy(60_000), 2);
+    let handler = eligibility_handler(temp.path(), fixture.clone());
+    let replacement = bloom_vfs::handlers::PolicyReplacement {
+        packages: vec![Digest32::from_bytes([3; 32])],
+        destinations: vec![setup_destination()],
+        maximum_approval_lifetime_ms: bloom_proto::policy::CREATION_APPROVAL_LIFETIME_MS,
+    };
+    assert!(matches!(
+        handler
+            .ensure_policy_replaced("alice", &replacement, false)
+            .await
+            .unwrap(),
+        PetalEligibility::ChangedSinceCreation(_)
+    ));
+    assert!(fixture.state.lock().proposed_policy.is_none());
+
+    let PetalEligibility::AwaitingPolicyApproval(pending) = handler
+        .ensure_policy_replaced("alice", &replacement, true)
+        .await
+        .unwrap()
+    else {
+        panic!("the switch is proposed");
+    };
+    handler
+        .cancel_policy_proposal("alice", pending.operation_id.as_str())
+        .await
+        .unwrap();
+    assert!(fixture.requests.lock().iter().any(|request| matches!(
+        request,
+        MachineBrokerRequest::CeremonyCancel(cancel)
+            if cancel.id.as_str() == pending.operation_id.as_str()
+    )));
+    // Cancelled, it is not proposed again.
+    assert!(matches!(
+        handler
+            .ensure_policy_replaced("alice", &replacement, false)
+            .await
+            .unwrap(),
+        PetalEligibility::ChangedSinceCreation(_)
+    ));
+    // Cancelling what is no longer pending needs nothing.
+    handler
+        .cancel_policy_proposal("alice", pending.operation_id.as_str())
+        .await
+        .unwrap();
 }
 
 /// A Trader or Degen wallet's first proposal asks for the standing approval

@@ -3830,6 +3830,24 @@ fn default_policy_setup(
     Ok(setup)
 }
 
+/// [`default_policy_setup`] for `wallet`, from the config on disk now, not a
+/// copy taken when Machine started: an approved persona switch saves a
+/// wallet's setup while Machine runs. A config that cannot be read stops the
+/// proposal.
+fn saved_default_policy_setup(
+    store: &PetalStore,
+    config_path: &std::path::Path,
+    wallet: &str,
+) -> Result<bloom_vfs::handlers::DefaultPolicySetup, bloom_vfs::HandlerError> {
+    let config = Config::load(config_path).map_err(|error| {
+        bloom_vfs::HandlerError::backend(format!(
+            "read {wallet}'s setup before proposing its policy: {error}"
+        ))
+    })?;
+    let persona_destinations = persona_policy_destinations(&config, wallet);
+    default_policy_setup(store, config.setup.wallet(wallet), &persona_destinations)
+}
+
 /// The chain ids on which Degen allows curated ERC-20 transfers to any
 /// recipient: Ethereum and Polygon, the EVM networks Broker's reviewed
 /// sessions support (bloom-broker#112).
@@ -3850,16 +3868,23 @@ pub fn any_recipient_chains(
 /// ERC-20 transfers to any recipient: [`any_recipient_chains`] for Degen, and
 /// none for any other persona.
 pub fn persona_any_recipient_chains<'a>(config: &'a Config, wallet: &str) -> Vec<&'a ChainSpec> {
-    if !config
-        .setup
-        .wallet(wallet)
+    setup_any_recipient_chains(&config.chains, config.setup.wallet(wallet))
+}
+
+/// [`persona_any_recipient_chains`] for `setup`, which may not be saved yet,
+/// such as a persona switch waiting for its ceremony.
+pub fn setup_any_recipient_chains<'a>(
+    chains: &'a std::collections::BTreeMap<String, ChainSpec>,
+    setup: &bloom_proto::config::WalletSetup,
+) -> Vec<&'a ChainSpec> {
+    if !setup
         .persona
         .as_ref()
         .is_some_and(|persona| persona.preset == bloom_proto::persona::PersonaPreset::Degen)
     {
         return Vec::new();
     }
-    any_recipient_chains(&config.chains)
+    any_recipient_chains(chains)
 }
 
 /// What `wallet`'s saved persona adds to its policy:
@@ -3871,7 +3896,15 @@ pub fn persona_policy_destinations(
     config: &Config,
     wallet: &str,
 ) -> Vec<bloom_broker_api::PolicyDestination> {
-    persona_any_recipient_chains(config, wallet)
+    setup_policy_destinations(&config.chains, config.setup.wallet(wallet))
+}
+
+/// [`persona_policy_destinations`] for `setup`, which may not be saved yet.
+pub fn setup_policy_destinations(
+    chains: &std::collections::BTreeMap<String, ChainSpec>,
+    setup: &bloom_proto::config::WalletSetup,
+) -> Vec<bloom_broker_api::PolicyDestination> {
+    setup_any_recipient_chains(chains, setup)
         .into_iter()
         .filter_map(|chain| {
             Some(bloom_broker_api::PolicyDestination {
@@ -4715,15 +4748,7 @@ impl Daemon {
             // read stops the proposal.
             let config_path = home.config_path();
             let store = petal_store.clone();
-            Arc::new(move |wallet: &str| {
-                let config = Config::load(&config_path).map_err(|error| {
-                    bloom_vfs::HandlerError::backend(format!(
-                        "read {wallet}'s setup before proposing its policy: {error}"
-                    ))
-                })?;
-                let persona_destinations = persona_policy_destinations(&config, wallet);
-                default_policy_setup(&store, config.setup.wallet(wallet), &persona_destinations)
-            })
+            Arc::new(move |wallet: &str| saved_default_policy_setup(&store, &config_path, wallet))
         };
         let wallets_handler = Arc::new(
             WalletsHandler::new(
@@ -5145,14 +5170,27 @@ impl Daemon {
 
     /// Replace what setup chose in `wallet`'s policy with `replacement`,
     /// after the owner switched its persona. `Allowed` means the policy
-    /// already matches it.
+    /// already matches it. Without `may_propose`, nothing new is proposed.
     pub async fn ensure_policy_replaced(
         &self,
         wallet: &str,
         replacement: &bloom_vfs::handlers::PolicyReplacement,
+        may_propose: bool,
     ) -> Result<bloom_machine_client::PetalEligibility, bloom_vfs::HandlerError> {
         self.wallets
-            .ensure_policy_replaced(wallet, replacement)
+            .ensure_policy_replaced(wallet, replacement, may_propose)
+            .await
+    }
+
+    /// Cancel a policy proposal Machine made for `wallet`, such as an earlier
+    /// persona switch the owner has not approved.
+    pub async fn cancel_policy_proposal(
+        &self,
+        wallet: &str,
+        operation_id: &str,
+    ) -> Result<(), bloom_vfs::HandlerError> {
+        self.wallets
+            .cancel_policy_proposal(wallet, operation_id)
             .await
     }
 
@@ -5999,6 +6037,43 @@ mod tests {
             setup.maximum_approval_lifetime_ms,
             Some(bloom_proto::policy::STANDING_APPROVAL_POLICY_LIFETIME_MS)
         );
+    }
+
+    /// A wallet's first proposal reads its setup from the config on disk each
+    /// time, so a setup saved after Machine started is the one proposed, and
+    /// an unreadable config stops the proposal.
+    #[test]
+    fn the_first_proposal_reads_the_saved_setup_each_time() {
+        use bloom_proto::persona::{PersonaConfig, PersonaPreset};
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = PetalStore::open(temp.path().join("store")).unwrap();
+        let path = temp.path().join("config.toml");
+        let mut config = Config::local_default();
+        config.save(&path).unwrap();
+        assert_eq!(
+            saved_default_policy_setup(&store, &path, "trading").unwrap(),
+            bloom_vfs::handlers::DefaultPolicySetup::default()
+        );
+        config.setup.wallet_mut("trading").persona =
+            Some(PersonaConfig::suggested(PersonaPreset::Degen));
+        config.save(&path).unwrap();
+        let setup = saved_default_policy_setup(&store, &path, "trading").unwrap();
+        assert_eq!(
+            setup.destinations,
+            persona_policy_destinations(&config, "trading")
+        );
+        assert_eq!(
+            setup.maximum_approval_lifetime_ms,
+            Some(bloom_proto::policy::STANDING_APPROVAL_POLICY_LIFETIME_MS)
+        );
+        assert_eq!(
+            saved_default_policy_setup(&store, &path, "main").unwrap(),
+            bloom_vfs::handlers::DefaultPolicySetup::default(),
+            "another wallet's persona is not main's"
+        );
+        std::fs::write(&path, "not toml").unwrap();
+        assert!(saved_default_policy_setup(&store, &path, "trading").is_err());
     }
 
     #[test]

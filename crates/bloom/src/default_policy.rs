@@ -1155,8 +1155,15 @@ pub(crate) fn apply_provisioned_settings(
     use crate::petal_provisioning::ProvisioningOutcome;
 
     let runtime = tokio::runtime::Handle::current();
+    // Read `main`'s setup now, not the copy Machine loaded at startup: an
+    // approved persona switch may have saved it since.
+    let config = bloom_proto::Config::load(&daemon.home.config_path()).unwrap_or_else(|error| {
+        tracing::warn!(error = %error, "petal.setup_settings_config_unreadable");
+        daemon.config.clone()
+    });
+    let setup = config.setup.main();
     for result in results {
-        if !daemon.config.setup.main().petals.contains_key(&result.name) {
+        if !setup.petals.contains_key(&result.name) {
             continue;
         }
         let updated = match result.outcome {
@@ -1173,7 +1180,7 @@ pub(crate) fn apply_provisioned_settings(
                 match runtime.block_on(queued_write_after_update(
                     &daemon.vfs,
                     daemon.home.root(),
-                    daemon.config.setup.main(),
+                    setup,
                     &result.name,
                     installed.as_deref(),
                     &account,
@@ -1204,7 +1211,7 @@ pub(crate) fn apply_provisioned_settings(
         let write = match installed {
             Ok(installed) => runtime.block_on(write_petal_settings(
                 &daemon.vfs,
-                daemon.config.setup.main(),
+                setup,
                 &result.name,
                 &installed,
             )),
@@ -1262,7 +1269,7 @@ pub(crate) fn apply_provisioned_settings(
                 Err(marker_error) => tracing::warn!(
                     petal = %result.name,
                     message = %retry_not_recorded(
-                        daemon.config.setup.main(),
+                        setup,
                         &result.name,
                         &error,
                         &marker_error
@@ -1428,6 +1435,9 @@ pub(crate) enum DefaultPolicyStatus {
         /// Setup writes that wait for their Petal's update.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         settings_waiting: Vec<String>,
+        /// The limits an approved persona switch reset, one message each.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        settings_reset: Vec<String>,
         /// What the policy still allows that the saved persona does not
         /// propose, such as Degen's transfers after the owner chose another
         /// persona. Bloom never removes it; the owner can.
@@ -1450,6 +1460,10 @@ pub(crate) enum DefaultPolicyStatus {
     },
     /// Another command holds the wallet's policy lock; ask again shortly.
     Busy,
+    /// A persona switch to `persona` ended without the owner's approval: its
+    /// ceremony was refused, expired, or replaced by a later switch. Nothing
+    /// of it was applied.
+    SwitchEnded { persona: String },
 }
 
 /// What a default-policy request does with the wallet's setup.
@@ -1460,16 +1474,12 @@ pub(crate) enum DefaultPolicyMode {
     Resume,
     /// Propose it whatever the policy's version: the owner has just chosen it.
     OwnerJustChose,
-    /// Replace what setup chose with it: a persona switch (decision 18).
-    Replace,
 }
 
 impl DefaultPolicyMode {
     /// The mode a `WalletDefaultPolicy` Machine command asks for.
-    pub(crate) fn of_command(owner_just_chose: bool, replace: bool) -> Self {
-        if replace {
-            Self::Replace
-        } else if owner_just_chose {
+    pub(crate) fn of_command(owner_just_chose: bool) -> Self {
+        if owner_just_chose {
             Self::OwnerJustChose
         } else {
             Self::Resume
@@ -1477,22 +1487,93 @@ impl DefaultPolicyMode {
     }
 }
 
-/// Propose `wallet`'s setup through its existing policy operation, committing
-/// a completed ceremony, and report the result. The setup is read from the
-/// config on disk, not the copy Machine loaded at startup, since a persona
-/// switch saves it while Machine runs. `mode` says what to do once the policy
-/// has changed since creation.
-pub(crate) async fn advance_default_policy(
-    daemon: &Daemon,
+/// A persona switch waiting for the owner to approve its policy
+/// (decision 18): the wallet's new setup, and the policy operation that
+/// proposes it once Machine has proposed it. None of it applies until that
+/// policy commits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingSwitch {
+    setup: WalletSetup,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operation_id: Option<String>,
+}
+
+fn pending_switch_path(home: &std::path::Path, wallet: &str) -> std::path::PathBuf {
+    home.join("pending-persona").join(format!("{wallet}.toml"))
+}
+
+fn read_pending_switch(home: &std::path::Path, wallet: &str) -> Result<Option<PendingSwitch>> {
+    let path = pending_switch_path(home, wallet);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(Some(toml::from_str(&text).with_context(|| {
+            format!(
+                "read {wallet}'s waiting persona switch at {}",
+                path.display()
+            )
+        })?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "read {wallet}'s waiting persona switch at {}",
+                path.display()
+            )
+        }),
+    }
+}
+
+/// Save `switch` whole: a sibling file renamed over the old one.
+fn write_pending_switch(
+    home: &std::path::Path,
     wallet: &str,
-    mode: DefaultPolicyMode,
-) -> Result<DefaultPolicyStatus> {
-    let config = bloom_proto::Config::load(&daemon.home.config_path())
-        .with_context(|| format!("read {wallet}'s setup"))?;
-    let setup = config.setup.wallet(wallet);
+    switch: &PendingSwitch,
+) -> Result<()> {
+    let path = pending_switch_path(home, wallet);
+    let dir = path.parent().context("pending persona directory")?;
+    std::fs::create_dir_all(dir).context("create the pending persona directory")?;
+    let temporary = dir.join(format!(".{wallet}.{}.tmp", std::process::id()));
+    std::fs::write(&temporary, toml::to_string(switch)?)
+        .and_then(|()| std::fs::rename(&temporary, &path))
+        .with_context(|| format!("save {wallet}'s waiting persona switch"))
+}
+
+fn remove_pending_switch(home: &std::path::Path, wallet: &str) -> Result<()> {
+    match std::fs::remove_file(pending_switch_path(home, wallet)) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            Err(error).with_context(|| format!("clear {wallet}'s persona switch"))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Serialises Machine's own config writes, each a load, change and save.
+static CONFIG_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Save `setup` as `wallet`'s in the config at `path`, leaving the rest of
+/// the file as it is.
+fn save_wallet_setup(path: &std::path::Path, wallet: &str, setup: &WalletSetup) -> Result<()> {
+    let _held = CONFIG_WRITE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut config = bloom_proto::Config::load(path).context("read Bloom's config")?;
+    *config.setup.wallet_mut(wallet) = setup.clone();
+    config.validate().map_err(anyhow::Error::msg)?;
+    config
+        .save(path)
+        .with_context(|| format!("save {wallet}'s new setup"))
+}
+
+/// What a request asks of `wallet`'s policy, from `setup`: each chosen,
+/// installed Petal's package and destinations, and the persona's entries and
+/// lifetime.
+fn default_policy_request(
+    daemon: &Daemon,
+    chains: &BTreeMap<String, bloom_proto::ChainSpec>,
+    setup: &WalletSetup,
+) -> Result<DefaultPolicyRequest> {
     let mut request = DefaultPolicyRequest {
         persona_applies: *setup != WalletSetup::default(),
-        persona_destinations: bloom_daemon::persona_policy_destinations(&config, wallet),
+        persona_destinations: bloom_daemon::setup_policy_destinations(chains, setup),
         lifetime: bloom_daemon::persona_policy_lifetime(setup),
         ..DefaultPolicyRequest::default()
     };
@@ -1514,9 +1595,31 @@ pub(crate) async fn advance_default_policy(
             .extend(policy_destinations(name)?);
         request.petals.push(name.clone());
     }
+    Ok(request)
+}
+
+/// Propose `wallet`'s setup through its existing policy operation, committing
+/// a completed ceremony, and report the result. The setup is read from the
+/// config on disk, not the copy Machine loaded at startup. A persona switch
+/// waiting for the owner takes precedence (decision 18): its replacement is
+/// resumed, applied once its policy commits, and reported as ended if the
+/// owner refused it or it expired. `mode` says what to do once the policy has
+/// changed since creation.
+pub(crate) async fn advance_default_policy(
+    daemon: &Daemon,
+    wallet: &str,
+    mode: DefaultPolicyMode,
+) -> Result<DefaultPolicyStatus> {
+    let config = bloom_proto::Config::load(&daemon.home.config_path())
+        .with_context(|| format!("read {wallet}'s setup"))?;
+    let switch = read_pending_switch(daemon.home.root(), wallet)?;
+    let setup = switch
+        .as_ref()
+        .map_or_else(|| config.setup.wallet(wallet), |switch| &switch.setup);
+    let request = default_policy_request(daemon, &config.chains, setup)?;
     // A switch to a setup that allows nothing still replaces what the policy
     // allowed before.
-    if request.is_empty() && mode != DefaultPolicyMode::Replace {
+    if request.is_empty() && switch.is_none() {
         return Ok(DefaultPolicyStatus::NothingToAllow);
     }
     let destinations = request.destinations();
@@ -1528,7 +1631,7 @@ pub(crate) async fn advance_default_policy(
     }
     let mut settings_pending = Vec::new();
     let mut settings_waiting = Vec::new();
-    if wallet == DEFAULT_POLICY_WALLET {
+    if wallet == DEFAULT_POLICY_WALLET && switch.is_none() {
         let pending = apply_pending_settings(daemon, config.setup.main()).await;
         for message in pending.written {
             tracing::info!(%message, "petal.setup_settings_written");
@@ -1536,13 +1639,18 @@ pub(crate) async fn advance_default_policy(
         settings_pending = pending.still_queued;
         settings_waiting = pending.waiting;
     }
-    let proposal = match mode {
-        DefaultPolicyMode::Replace => {
+    let proposal = match &switch {
+        // Proposed once; a refused or expired proposal is not proposed again.
+        Some(switch) => {
             daemon
-                .ensure_policy_replaced(wallet, &request.replacement())
+                .ensure_policy_replaced(
+                    wallet,
+                    &request.replacement(),
+                    switch.operation_id.is_none(),
+                )
                 .await
         }
-        DefaultPolicyMode::Resume | DefaultPolicyMode::OwnerJustChose => {
+        None => {
             daemon
                 .ensure_default_policy(
                     wallet,
@@ -1563,21 +1671,55 @@ pub(crate) async fn advance_default_policy(
         ControlFlow::Break(status) => return Ok(status),
     };
     Ok(match eligibility {
-        bloom_machine_client::PetalEligibility::Allowed(current) => DefaultPolicyStatus::Applied {
-            petals: request.allowed(),
-            settings_pending,
-            settings_waiting,
-            beyond_persona: request.beyond_persona(&current)?,
-        },
-        bloom_machine_client::PetalEligibility::ChangedSinceCreation(current) => {
-            DefaultPolicyStatus::ChangedSinceCreation {
+        bloom_machine_client::PetalEligibility::Allowed(current) => {
+            let settings_reset = match &switch {
+                Some(switch) => promote_switch(daemon, wallet, switch).await?,
+                None => Vec::new(),
+            };
+            DefaultPolicyStatus::Applied {
+                petals: request.allowed(),
+                settings_pending,
+                settings_waiting,
+                settings_reset,
+                beyond_persona: request.beyond_persona(&current)?,
+            }
+        }
+        bloom_machine_client::PetalEligibility::ChangedSinceCreation(current) => match &switch {
+            // The switch's own proposal no longer waits and never committed.
+            Some(switch) => {
+                remove_pending_switch(daemon.home.root(), wallet)?;
+                DefaultPolicyStatus::SwitchEnded {
+                    persona: persona_name(
+                        switch
+                            .setup
+                            .persona
+                            .as_ref()
+                            .map_or(PersonaPreset::Custodian, |persona| persona.preset),
+                    )
+                    .to_owned(),
+                }
+            }
+            None => DefaultPolicyStatus::ChangedSinceCreation {
                 missing: request.missing(&current)?,
                 settings_pending,
                 settings_waiting,
                 beyond_persona: request.beyond_persona(&current)?,
-            }
-        }
+            },
+        },
         bloom_machine_client::PetalEligibility::AwaitingPolicyApproval(pending) => {
+            if let Some(switch) = &switch
+                && pending.includes_requested
+                && switch.operation_id.as_deref() != Some(pending.operation_id.as_str())
+            {
+                write_pending_switch(
+                    daemon.home.root(),
+                    wallet,
+                    &PendingSwitch {
+                        setup: switch.setup.clone(),
+                        operation_id: Some(pending.operation_id.as_str().to_owned()),
+                    },
+                )?;
+            }
             DefaultPolicyStatus::AwaitingOwner {
                 operation_id: pending.operation_id.as_str().to_owned(),
                 ceremony_url: pending
@@ -1595,28 +1737,35 @@ pub(crate) async fn advance_default_policy(
     })
 }
 
-/// What a persona switch did: a message for each Petal whose settings it
-/// reset, and where the replacement policy stands.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PersonaSwitch {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) settings: Vec<String>,
-    pub(crate) status: DefaultPolicyStatus,
+/// Apply an approved persona switch: save the wallet's new setup, reset its
+/// Petals' limits, and clear the switch. Each step can run again, so a
+/// switch interrupted part-way is finished by the next check.
+async fn promote_switch(
+    daemon: &Daemon,
+    wallet: &str,
+    switch: &PendingSwitch,
+) -> Result<Vec<String>> {
+    save_wallet_setup(&daemon.home.config_path(), wallet, &switch.setup)?;
+    let messages =
+        reset_persona_settings(&daemon.vfs, daemon.home.root(), wallet, &switch.setup).await;
+    remove_pending_switch(daemon.home.root(), wallet)?;
+    Ok(messages)
 }
 
 /// Switch `wallet` to `preset` with the Petals the owner chose for it: a
-/// fresh start for that wallet (decision 18). Machine saves the wallet's new
-/// setup, resets each chosen Petal's limits to it over whatever the Petal
-/// stores, and proposes the setup as a replacement for the wallet's policy.
-/// Nothing is changed for a wallet that does not exist, or whose existence
-/// Broker cannot confirm, or for a choice that is not valid.
+/// fresh start for that wallet (decision 18). Machine holds the new setup as
+/// a waiting switch and proposes it as a replacement for the wallet's policy;
+/// nothing else changes until the owner approves that policy, which saves the
+/// setup and resets its Petals' limits. A switch the owner has not approved
+/// is cancelled, so it can never commit behind this one. Nothing is changed
+/// for a wallet that does not exist, or whose existence Broker cannot
+/// confirm, or for a choice that is not valid.
 pub(crate) async fn switch_persona(
     daemon: &Daemon,
     wallet: &str,
     preset: PersonaPreset,
     petals: BTreeMap<String, PetalSetupConfig>,
-) -> Result<PersonaSwitch> {
+) -> Result<DefaultPolicyStatus> {
     let setup = WalletSetup {
         persona: Some(PersonaConfig::suggested(preset)),
         petals,
@@ -1631,16 +1780,25 @@ pub(crate) async fn switch_persona(
             "Bloom could not check whether wallet {wallet} exists ({error}), so nothing was changed"
         ),
     }
-    let path = daemon.home.config_path();
-    let mut config = bloom_proto::Config::load(&path).context("read Bloom's config")?;
-    *config.setup.wallet_mut(wallet) = setup.clone();
-    config.validate().map_err(anyhow::Error::msg)?;
-    config
-        .save(&path)
-        .with_context(|| format!("save {wallet}'s new setup"))?;
-    let settings = reset_persona_settings(&daemon.vfs, daemon.home.root(), wallet, &setup).await;
-    let status = advance_default_policy(daemon, wallet, DefaultPolicyMode::Replace).await?;
-    Ok(PersonaSwitch { settings, status })
+    let home = daemon.home.root();
+    if let Some(earlier) = read_pending_switch(home, wallet)? {
+        if let Some(operation_id) = &earlier.operation_id {
+            daemon
+                .cancel_policy_proposal(wallet, operation_id)
+                .await
+                .map_err(|error| anyhow!("{error}"))?;
+        }
+        remove_pending_switch(home, wallet)?;
+    }
+    write_pending_switch(
+        home,
+        wallet,
+        &PendingSwitch {
+            setup,
+            operation_id: None,
+        },
+    )?;
+    advance_default_policy(daemon, wallet, DefaultPolicyMode::Resume).await
 }
 
 /// A persona switch chooses only Bloom's canonical Petals, with values each
@@ -1653,32 +1811,51 @@ fn validate_persona_choice(setup: &WalletSetup, wallet: &str) -> Result<()> {
             "{name} is not one of Bloom's canonical Petals ({})",
             canonical.join(", ")
         );
+        let known: Vec<&str> = setup_template(name)
+            .map(|template| template.values.iter().map(|value| value.name).collect())
+            .unwrap_or_default();
+        if let Some(unknown) = setup.petals[name]
+            .values
+            .keys()
+            .find(|value| !known.contains(&value.as_str()))
+        {
+            bail!("{} has no setup value {unknown}", petal_label(name));
+        }
         render_petal_settings(setup, name, wallet)?;
     }
     Ok(())
 }
 
 /// Write each chosen Petal's settings for `wallet` over whatever the Petal
-/// stores: a persona switch resets its limits, since the owner asked to
-/// start over. For `main`, setup's queued writes are dropped, since this
-/// replaces them. A failed write is reported with the command that applies
-/// it, and the rest continue.
+/// stores: an approved persona switch resets its limits, since the owner
+/// asked to start over. For `main`, a setup write still queued is dropped
+/// once its Petal's reset went in, and dropped for a Petal the new setup does
+/// not choose. A failed write is reported with the command that applies it,
+/// and the rest continue.
 async fn reset_persona_settings(
     vfs: &bloom_vfs::Vfs,
     home: &std::path::Path,
     wallet: &str,
     setup: &WalletSetup,
 ) -> Vec<String> {
-    if wallet == DEFAULT_POLICY_WALLET {
+    let main = wallet == DEFAULT_POLICY_WALLET;
+    if main {
         for name in menu_petals() {
-            clear_settings_pending(home, &name);
+            if !setup.petals.contains_key(&name) {
+                clear_settings_pending(home, &name);
+            }
         }
     }
     let mut messages = Vec::new();
     for name in setup.petals.keys() {
         let settings = match render_petal_settings(setup, name, wallet) {
             Ok(Some(settings)) => settings,
-            Ok(None) => continue,
+            Ok(None) => {
+                if main {
+                    clear_settings_pending(home, name);
+                }
+                continue;
+            }
             Err(error) => {
                 messages.push(format!("petal_settings_failed: {error:#}"));
                 continue;
@@ -1691,11 +1868,16 @@ async fn reset_persona_settings(
             Err(error) => Err(anyhow!("{error}")),
         };
         messages.push(match written {
-            Ok(()) => format!(
-                "petal_settings: {} reset to {}",
-                petal_label(name),
-                settings.summary
-            ),
+            Ok(()) => {
+                if main {
+                    clear_settings_pending(home, name);
+                }
+                format!(
+                    "petal_settings: {} reset to {}",
+                    petal_label(name),
+                    settings.summary
+                )
+            }
             Err(error) => {
                 settings_not_written(name, &settings, &format!("writing them failed ({error:#})"))
             }
@@ -1976,6 +2158,9 @@ pub(crate) struct DefaultPolicyWait {
     announced_unrelated: Option<String>,
     /// Whether a Broker refusal being waited out has been reported.
     announced_wait: bool,
+    /// Whether this waits for one persona switch, which is proposed once: a
+    /// different ceremony means a later switch replaced it.
+    one_switch: bool,
 }
 
 impl DefaultPolicyWait {
@@ -1989,13 +2174,13 @@ impl DefaultPolicyWait {
             announced: None,
             announced_unrelated: None,
             announced_wait: false,
+            one_switch: false,
         }
     }
 
-    /// Name `resume` as the command that picks the wait up again, as a
-    /// persona switch does.
-    pub(crate) fn resuming_with(mut self, resume: String) -> Self {
-        self.resume = resume;
+    /// Wait for one persona switch, which Machine proposes once.
+    pub(crate) fn for_switch(mut self) -> Self {
+        self.one_switch = true;
         self
     }
 
@@ -2068,8 +2253,12 @@ impl DefaultPolicyWait {
                 petals,
                 settings_pending,
                 settings_waiting,
+                settings_reset,
                 beyond_persona,
             } => {
+                for message in settings_reset {
+                    writeln!(output, "{message}")?;
+                }
                 writeln!(
                     output,
                     "default_policy: {wallet} allows {}; each transaction still needs your approval",
@@ -2103,6 +2292,13 @@ impl DefaultPolicyWait {
                 report_beyond_persona(output, wallet, beyond_persona)?;
                 report_settings_pending(output, wallet, settings_pending)?;
                 report_settings_waiting(output, settings_waiting)?;
+                Ok(WaitStep::Stop)
+            }
+            DefaultPolicyStatus::SwitchEnded { persona } => {
+                writeln!(
+                    output,
+                    "default_policy: switching {wallet} to {persona} ended without your approval, so nothing changed; to try again, run `bloom wallet persona {wallet} {persona}`"
+                )?;
                 Ok(WaitStep::Stop)
             }
             DefaultPolicyStatus::WaitingForWallet { reason } => {
@@ -2162,6 +2358,13 @@ impl DefaultPolicyWait {
                 }
                 if self.announced.as_deref() == Some(operation_id.as_str()) {
                     return Ok(WaitStep::Poll);
+                }
+                if self.one_switch && self.announced.is_some() {
+                    writeln!(
+                        output,
+                        "default_policy: a later persona switch for {wallet} replaced this one, so nothing of it applies; approve that switch where it was started"
+                    )?;
+                    return Ok(WaitStep::Stop);
                 }
                 // Machine cancels a ceremony past its expiry on the next poll and
                 // proposes a replacement; never hand out a dead link.
@@ -2236,19 +2439,16 @@ pub(crate) async fn wait_for_default_policy(
         endpoint,
         wallet,
         DefaultPolicyWait::new(wallet, deadline_ms),
-        false,
     )
     .await
 }
 
-/// Poll Machine with `wait` until it stops. `replace` keeps proposing the
-/// wallet's setup as a replacement, while a persona switch waits for its
-/// ceremony.
+/// Poll Machine with `wait` until it stops. A persona switch waiting for its
+/// ceremony is resumed the same way.
 async fn poll_default_policy(
     endpoint: &crate::ResolvedEndpoint,
     wallet: &str,
     mut wait: DefaultPolicyWait,
-    replace: bool,
 ) -> Result<()> {
     loop {
         let output = crate::machine_command(
@@ -2257,7 +2457,6 @@ async fn poll_default_policy(
             bloom_daemon::ipc::MachineCommand::WalletDefaultPolicy {
                 name: wallet.to_owned(),
                 owner_just_chose: false,
-                replace,
             },
         )
         .await?;
@@ -2298,7 +2497,7 @@ pub(crate) async fn run_persona_switch(
         persona_message(Some(&persona), &any_recipient_chain_names(chains))
     );
     println!(
-        "persona_note: switching {wallet} to {name} starts its setup again: its Petal limits reset to the persona's, and its policy is replaced by what you choose now, in one ceremony that shows what changes"
+        "persona_note: switching {wallet} to {name} starts its setup again: once you approve the one ceremony that replaces its policy with what you choose now, its Petal limits reset to the persona's; until then nothing changes"
     );
     let mut setup = WalletSetup::default();
     if !crate::structured_service_output() && interactive_setup_available() {
@@ -2324,26 +2523,19 @@ pub(crate) async fn run_persona_switch(
     if output.exit_code != 0 {
         return crate::print_machine_command_output(&output);
     }
-    let switch: PersonaSwitch = serde_json::from_str(output.stdout.trim())
+    let status: DefaultPolicyStatus = serde_json::from_str(output.stdout.trim())
         .context("decode the persona switch from Machine")?;
-    for message in &switch.settings {
-        println!("{message}");
-    }
+    // `bloom wallet default-policy` resumes a switch waiting for its ceremony.
     let mut wait = DefaultPolicyWait::new(
         wallet,
         crate::current_unix_ms().saturating_add(POLICY_LOCK_GRACE_MS),
     )
-    .resuming_with(format!("bloom wallet persona {wallet} {name}"));
-    if wait.observe(
-        &switch.status,
-        crate::current_unix_ms(),
-        &mut std::io::stdout(),
-    )? == WaitStep::Stop
-    {
+    .for_switch();
+    if wait.observe(&status, crate::current_unix_ms(), &mut std::io::stdout())? == WaitStep::Stop {
         return Ok(());
     }
     tokio::time::sleep(POLL_INTERVAL).await;
-    poll_default_policy(endpoint, wallet, wait, true).await
+    poll_default_policy(endpoint, wallet, wait).await
 }
 
 /// Read the wallet ceremony expiry from custody command output.
@@ -2718,6 +2910,7 @@ mod tests {
                 petals: vec!["polymarket".into()],
                 settings_pending: outcome.still_queued.clone(),
                 settings_waiting: outcome.waiting.clone(),
+                settings_reset: Vec::new(),
                 beyond_persona: Vec::new(),
             },
             DefaultPolicyStatus::ChangedSinceCreation {
@@ -3660,9 +3853,146 @@ mod tests {
         assert!(request.missing(&snapshot_of(&policy)).unwrap().is_empty());
     }
 
-    /// A switch takes only Bloom's canonical Petals, with values their
-    /// settings accept, so a client cannot store anything else.
-    /// A persona switch resets each chosen Petal's limits over what the
+    /// A waiting switch is kept whole in its own file, apart from the config,
+    /// until its policy commits or it ends.
+    #[test]
+    fn a_waiting_switch_is_kept_apart_until_it_ends() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(read_pending_switch(home.path(), "trading").unwrap(), None);
+        let mut switch = PendingSwitch {
+            setup: chosen_setup(&["polymarket"]),
+            operation_id: None,
+        };
+        switch.setup.persona = Some(PersonaConfig::suggested(PersonaPreset::Degen));
+        write_pending_switch(home.path(), "trading", &switch).unwrap();
+        assert_eq!(
+            read_pending_switch(home.path(), "trading").unwrap(),
+            Some(switch.clone())
+        );
+        switch.operation_id = Some("ab".repeat(32));
+        write_pending_switch(home.path(), "trading", &switch).unwrap();
+        assert_eq!(
+            read_pending_switch(home.path(), "trading").unwrap(),
+            Some(switch)
+        );
+        assert_eq!(read_pending_switch(home.path(), "main").unwrap(), None);
+        remove_pending_switch(home.path(), "trading").unwrap();
+        remove_pending_switch(home.path(), "trading").unwrap();
+        assert_eq!(read_pending_switch(home.path(), "trading").unwrap(), None);
+        let names: Vec<_> = std::fs::read_dir(home.path().join("pending-persona"))
+            .unwrap()
+            .collect();
+        assert!(names.is_empty(), "no temporary file is left");
+        std::fs::write(pending_switch_path(home.path(), "trading"), "not toml").unwrap();
+        assert!(read_pending_switch(home.path(), "trading").is_err());
+    }
+
+    /// Machine's config writes for different wallets never lose each other's
+    /// setup, and leave the rest of the config as it was.
+    #[test]
+    fn concurrent_setup_saves_keep_every_wallet() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("config.toml");
+        let mut config = bloom_proto::Config::local_default();
+        config.setup.complete = true;
+        config.save(&path).unwrap();
+        let wallets: Vec<String> = (0..8).map(|n| format!("wallet{n}")).collect();
+        std::thread::scope(|scope| {
+            for wallet in &wallets {
+                let path = &path;
+                scope.spawn(move || {
+                    for _ in 0..5 {
+                        save_wallet_setup(path, wallet, &chosen_setup(&["polymarket"])).unwrap();
+                    }
+                });
+            }
+        });
+        let saved = bloom_proto::Config::load(&path).unwrap();
+        assert!(saved.setup.complete);
+        for wallet in &wallets {
+            assert_eq!(
+                saved.setup.wallet(wallet),
+                &chosen_setup(&["polymarket"]),
+                "{wallet}"
+            );
+        }
+    }
+
+    /// The wait reports what an approved switch reset, and a switch that
+    /// ended without approval as nothing changed.
+    #[test]
+    fn the_wait_reports_a_switch_applied_or_ended() {
+        let observe = |status: DefaultPolicyStatus| {
+            let mut wait = DefaultPolicyWait::new("trading", 30_000);
+            let mut output = Vec::new();
+            assert_eq!(
+                wait.observe(&status, 10, &mut output).unwrap(),
+                WaitStep::Stop
+            );
+            String::from_utf8(output).unwrap()
+        };
+        let output = observe(DefaultPolicyStatus::Applied {
+            petals: vec!["polymarket".into()],
+            settings_pending: Vec::new(),
+            settings_waiting: Vec::new(),
+            settings_reset: vec!["petal_settings: Polymarket reset to max_daily_usd = 1000".into()],
+            beyond_persona: Vec::new(),
+        });
+        assert!(
+            output.starts_with("petal_settings: Polymarket reset to max_daily_usd = 1000\n"),
+            "{output}"
+        );
+        assert!(
+            output.contains("default_policy: trading allows Polymarket"),
+            "{output}"
+        );
+        // A switch's wait stops when a later switch's ceremony replaces it.
+        let pending = |operation_id: &str| DefaultPolicyStatus::AwaitingOwner {
+            operation_id: operation_id.into(),
+            ceremony_url: Some(format!("https://example.test/{operation_id}")),
+            ceremony_expires_at_ms: Some(u64::MAX),
+            petals: vec!["polymarket".into()],
+            proposes_chosen_petals: true,
+        };
+        let mut wait = DefaultPolicyWait::new("trading", 30_000).for_switch();
+        let mut output = Vec::new();
+        assert_eq!(
+            wait.observe(&pending("first"), 10, &mut output).unwrap(),
+            WaitStep::Poll
+        );
+        assert_eq!(
+            wait.observe(&pending("second"), 20, &mut output).unwrap(),
+            WaitStep::Stop
+        );
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.contains("a later persona switch for trading replaced this one"),
+            "{output}"
+        );
+        assert_eq!(
+            output.matches("default_policy_url: ").count(),
+            1,
+            "{output}"
+        );
+        let output = observe(DefaultPolicyStatus::SwitchEnded {
+            persona: "trader".into(),
+        });
+        assert!(
+            output.contains(
+                "switching trading to trader ended without your approval, so nothing changed"
+            ) && output.contains("run `bloom wallet persona trading trader`"),
+            "{output}"
+        );
+        assert_eq!(
+            serde_json::to_value(DefaultPolicyStatus::SwitchEnded {
+                persona: "trader".into()
+            })
+            .unwrap(),
+            serde_json::json!({"state": "switch_ended", "persona": "trader"})
+        );
+    }
+
+    /// An approved persona switch resets each chosen Petal's limits over what the
     /// owner stored, since the owner asked to start over, and drops `main`'s
     /// queued setup writes. A failed write is reported with the command that
     /// applies it.
@@ -3688,10 +4018,14 @@ mod tests {
         );
         assert!(pending_settings(home.path(), &setup).is_empty());
 
+        // On main a failed reset keeps the queued write.
         let route = SettingsRoute::holding(None);
         let vfs = bloom_vfs::Vfs::builder()
             .mount("petals", route.clone())
             .build();
+        mark_settings_pending(home.path(), "polymarket").unwrap();
+        reset_persona_settings(&vfs, home.path(), "main", &setup).await;
+        assert_eq!(pending_settings(home.path(), &setup), ["polymarket"]);
         let messages = reset_persona_settings(&vfs, home.path(), "trading", &setup).await;
         assert_eq!(messages.len(), 1, "{messages:?}");
         assert!(
@@ -3705,6 +4039,9 @@ mod tests {
         );
     }
 
+    /// A switch takes only Bloom's canonical Petals, with values their
+    /// settings accept and no setting a Petal does not have, so a client
+    /// cannot store anything else.
     #[test]
     fn a_persona_switch_takes_only_canonical_petals_with_valid_values() {
         let choose = |petals: &[(&str, &str)]| {
@@ -3731,6 +4068,20 @@ mod tests {
         let error = choose(&[("polymarket", "-5")]).unwrap_err().to_string();
         assert!(
             error.contains("[setup.wallets.trading.petals.polymarket.values]"),
+            "{error}"
+        );
+        let mut extra = WalletSetup::default();
+        extra.petals.insert(
+            "hyperliquid".into(),
+            PetalSetupConfig {
+                values: BTreeMap::from([("tolly_writes".to_owned(), "enabled".to_owned())]),
+            },
+        );
+        let error = validate_persona_choice(&extra, "trading")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Hyperliquid has no setup value tolly_writes"),
             "{error}"
         );
     }
@@ -3897,6 +4248,7 @@ mod tests {
             petals: vec!["polymarket".into()],
             settings_pending: Vec::new(),
             settings_waiting: Vec::new(),
+            settings_reset: Vec::new(),
             beyond_persona: vec![PERSONA_TRANSFERS.into()],
         });
         assert!(output.contains("main allows Polymarket"), "{output}");
@@ -3949,6 +4301,7 @@ mod tests {
                 petals: Vec::new(),
                 settings_pending: Vec::new(),
                 settings_waiting: Vec::new(),
+                settings_reset: Vec::new(),
                 beyond_persona: Vec::new(),
             })
             .unwrap(),
@@ -4407,6 +4760,7 @@ mod tests {
             petals: vec!["polymarket".into()],
             settings_pending: vec!["Polymarket (busy)".into()],
             settings_waiting: vec!["Polymarket (older release)".into()],
+            settings_reset: Vec::new(),
             beyond_persona: Vec::new(),
         };
         let value = serde_json::to_value(&applied).unwrap();
@@ -4432,7 +4786,6 @@ mod tests {
         let resume = MachineCommand::WalletDefaultPolicy {
             name: "main".into(),
             owner_just_chose: false,
-            replace: false,
         };
         assert_eq!(
             serde_json::to_value(&resume).unwrap(),
@@ -4449,7 +4802,6 @@ mod tests {
             serde_json::to_value(MachineCommand::WalletDefaultPolicy {
                 name: "main".into(),
                 owner_just_chose: true,
-                replace: false,
             })
             .unwrap(),
             serde_json::json!({
@@ -4458,31 +4810,13 @@ mod tests {
                 "owner_just_chose": true
             })
         );
-        // A persona switch's wait asks for a replacement, and only it does.
         assert_eq!(
-            serde_json::to_value(MachineCommand::WalletDefaultPolicy {
-                name: "trading".into(),
-                owner_just_chose: false,
-                replace: true,
-            })
-            .unwrap(),
-            serde_json::json!({
-                "command": "wallet_default_policy",
-                "name": "trading",
-                "replace": true
-            })
-        );
-        assert_eq!(
-            DefaultPolicyMode::of_command(false, false),
+            DefaultPolicyMode::of_command(false),
             DefaultPolicyMode::Resume
         );
         assert_eq!(
-            DefaultPolicyMode::of_command(true, false),
+            DefaultPolicyMode::of_command(true),
             DefaultPolicyMode::OwnerJustChose
-        );
-        assert_eq!(
-            DefaultPolicyMode::of_command(true, true),
-            DefaultPolicyMode::Replace
         );
         // The switch itself names the persona, and the Petals only when any
         // are chosen.
@@ -4575,6 +4909,7 @@ mod tests {
             petals: vec!["polymarket".into(), "near-intents".into()],
             settings_pending: Vec::new(),
             settings_waiting: Vec::new(),
+            settings_reset: Vec::new(),
             beyond_persona: Vec::new(),
         };
         assert_eq!(

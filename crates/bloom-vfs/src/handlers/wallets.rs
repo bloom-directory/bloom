@@ -349,7 +349,8 @@ pub struct DefaultPolicySetup {
 /// What a persona switch replaces a wallet's policy with: exactly these
 /// packages and destinations, and this maximum approval lifetime. The
 /// policy's required verifiers and clear-signing setting stay as they are,
-/// since setup never chooses them.
+/// since setup never chooses them, except the legacy clear-signing rules a
+/// Broker built with bloom-broker#103 refuses ([`BROKER_REFUSES_LEGACY_CLEAR_SIGNING`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PolicyReplacement {
     pub packages: Vec<bloom_broker_api::Digest32>,
@@ -357,9 +358,36 @@ pub struct PolicyReplacement {
     pub maximum_approval_lifetime_ms: u64,
 }
 
+/// Whether the Broker this Machine is built for refuses a policy that keeps
+/// the legacy clear-signing rules: bloom-broker#103 and later, which speak
+/// Machine–Broker 1.8, decode transfers themselves and refuse to sign under
+/// a policy that still carries those rules until a replacement removes them.
+pub const BROKER_REFUSES_LEGACY_CLEAR_SIGNING: bool = bloom_broker_api::BROKER_API_MINOR_MIN >= 8;
+
+/// The verifier through which a policy requires the legacy clear-signing
+/// rules.
+const LEGACY_CLEAR_SIGNING_VERIFIER: &str = "evm-clear-signing-v1";
+
+/// Whether `policy` carries the legacy clear-signing rules.
+fn has_legacy_clear_signing(policy: &bloom_broker_api::CanonicalWalletPolicy) -> bool {
+    policy.clear_signing.is_some()
+        || policy
+            .required_verifiers
+            .iter()
+            .any(|required| required.verifier_id.as_str() == LEGACY_CLEAR_SIGNING_VERIFIER)
+}
+
 impl PolicyReplacement {
     /// Whether `policy` already allows exactly this, in any order.
     fn matches(&self, policy: &bloom_broker_api::CanonicalWalletPolicy) -> bool {
+        self.matches_for(policy, BROKER_REFUSES_LEGACY_CLEAR_SIGNING)
+    }
+
+    fn matches_for(
+        &self,
+        policy: &bloom_broker_api::CanonicalWalletPolicy,
+        drop_legacy_clear_signing: bool,
+    ) -> bool {
         fn same<T: PartialEq>(left: &[T], right: &[T]) -> bool {
             left.iter().all(|item| right.contains(item))
                 && right.iter().all(|item| left.contains(item))
@@ -367,6 +395,7 @@ impl PolicyReplacement {
         same(&policy.allowed_petal_packages, &self.packages)
             && same(&policy.allowed_destinations, &self.destinations)
             && policy.maximum_approval_lifetime_ms == self.maximum_approval_lifetime_ms
+            && !(drop_legacy_clear_signing && has_legacy_clear_signing(policy))
     }
 
     /// `current` with its setup-chosen parts replaced, each entry once.
@@ -374,10 +403,24 @@ impl PolicyReplacement {
         &self,
         current: &bloom_broker_api::CanonicalWalletPolicy,
     ) -> bloom_broker_api::CanonicalWalletPolicy {
+        self.applied_to_for(current, BROKER_REFUSES_LEGACY_CLEAR_SIGNING)
+    }
+
+    fn applied_to_for(
+        &self,
+        current: &bloom_broker_api::CanonicalWalletPolicy,
+        drop_legacy_clear_signing: bool,
+    ) -> bloom_broker_api::CanonicalWalletPolicy {
         let mut proposed = current.clone();
         proposed.allowed_petal_packages.clear();
         proposed.allowed_destinations.clear();
         proposed.maximum_approval_lifetime_ms = self.maximum_approval_lifetime_ms;
+        if drop_legacy_clear_signing {
+            proposed.clear_signing = None;
+            proposed
+                .required_verifiers
+                .retain(|required| required.verifier_id.as_str() != LEGACY_CLEAR_SIGNING_VERIFIER);
+        }
         bloom_machine_client::policy_with_destinations(
             &bloom_machine_client::policy_with_packages(&proposed, &self.packages),
             &self.destinations,
@@ -2073,11 +2116,15 @@ impl WalletsHandler {
     /// Replace what setup chose in a wallet's policy, after the owner switched
     /// its persona: propose exactly `replacement`'s packages, destinations and
     /// lifetime, whatever the policy's version, removing anything else setup
-    /// could have chosen. `Allowed` means the policy already matches it.
+    /// could have chosen. `Allowed` means the policy already matches it. With
+    /// `may_propose` false, as once a switch's own proposal was refused or
+    /// expired, nothing new is proposed, and a policy that does not match is
+    /// returned as `ChangedSinceCreation`.
     pub async fn ensure_policy_replaced(
         &self,
         wallet: &str,
         replacement: &PolicyReplacement,
+        may_propose: bool,
     ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
         self.write_permit()?;
         let _lock = self.lock_wallet_policy_update(wallet)?;
@@ -2090,9 +2137,44 @@ impl WalletsHandler {
         if replacement.matches(&policy) {
             return Ok(bloom_machine_client::PetalEligibility::Allowed(current));
         }
+        if !may_propose {
+            return Ok(bloom_machine_client::PetalEligibility::ChangedSinceCreation(current));
+        }
         self.propose_policy_locked(wallet, &replacement.applied_to(&policy), &current)
             .await?
             .pending_view_where(|proposed| replacement.matches(proposed))
+    }
+
+    /// Cancel a policy proposal Machine made, such as an earlier persona
+    /// switch the owner has not approved, so it can no longer commit. A
+    /// proposal that is no longer pending, because it committed or ended
+    /// meanwhile, needs nothing.
+    pub async fn cancel_policy_proposal(
+        &self,
+        wallet: &str,
+        operation_id: &str,
+    ) -> Result<(), HandlerError> {
+        self.write_permit()?;
+        let _lock = self.lock_wallet_policy_update(wallet)?;
+        let dir = self.policy_update_action_dir(wallet, "pending", operation_id);
+        if !dir.is_dir() {
+            return Ok(());
+        }
+        let projection: TriadPolicyUpdateProjection = read_json(dir.join(APPROVAL_CHALLENGE_FILE))?;
+        let cancelled = self
+            .broker()?
+            .cancel_ceremony(projection.operation_id)
+            .await;
+        // Let the retained proposal settle either way: a cancelled one leaves
+        // `pending`, and one the owner approved just now commits.
+        self.reconcile_policy_updates_locked(wallet).await?;
+        match cancelled {
+            Ok(_) => Ok(()),
+            Err(_) if !dir.is_dir() => Ok(()),
+            Err(error) => Err(HandlerError::backend(format!(
+                "cancel the earlier policy proposal for wallet {wallet}: {error}"
+            ))),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4914,6 +4996,49 @@ impl WalletsHandler {
 }
 #[cfg(test)]
 mod tests {
+    /// A replacement keeps the policy's clear-signing rules for a Broker that
+    /// accepts them, and drops the legacy ones for a Broker built with
+    /// bloom-broker#103, which refuses to sign under them; a policy that still
+    /// carries them then does not match.
+    #[test]
+    fn a_replacement_drops_legacy_clear_signing_only_where_broker_refuses_it() {
+        let verifier = |id: &str| bloom_broker_api::RequiredVerifier {
+            verifier_id: bloom_broker_api::Token::new(id).unwrap(),
+            verifier_digest: bloom_broker_api::Digest32::from_bytes([4; 32]),
+        };
+        let current = bloom_broker_api::CanonicalWalletPolicy {
+            wallet_id: bloom_broker_api::Token::new("alice").unwrap(),
+            allowed_petal_packages: Vec::new(),
+            allowed_destinations: Vec::new(),
+            maximum_approval_lifetime_ms: 60_000,
+            required_verifiers: vec![verifier("human"), verifier(LEGACY_CLEAR_SIGNING_VERIFIER)],
+            clear_signing: Some(bloom_broker_api::ClearSigningPolicy {
+                catalog_id: bloom_broker_api::Token::new("bloom").unwrap(),
+                trusted_keys: Vec::new(),
+                signature_threshold: 1,
+                maximum_observation_age_ms: 60_000,
+                opaque_exact_allowed: false,
+                unlimited_allowance_allowed: false,
+                verifier: verifier(LEGACY_CLEAR_SIGNING_VERIFIER),
+            }),
+        };
+        let replacement = PolicyReplacement {
+            maximum_approval_lifetime_ms: 60_000,
+            ..PolicyReplacement::default()
+        };
+
+        let kept = replacement.applied_to_for(&current, false);
+        assert_eq!(kept.clear_signing, current.clear_signing);
+        assert_eq!(kept.required_verifiers, current.required_verifiers);
+        assert!(replacement.matches_for(&current, false));
+
+        let dropped = replacement.applied_to_for(&current, true);
+        assert_eq!(dropped.clear_signing, None);
+        assert_eq!(dropped.required_verifiers, vec![verifier("human")]);
+        assert!(!replacement.matches_for(&current, true));
+        assert!(replacement.matches_for(&dropped, true));
+    }
+
     use super::*;
     use alloy::primitives::Address;
     use bloom_broker_api::{
