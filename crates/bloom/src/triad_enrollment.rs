@@ -367,9 +367,12 @@ fn refresh_developer_provenance_catalog(
     let mut conflicts = Vec::new();
     for record in &mut developer_records {
         if matches!(record.subject, ProvenanceSubject::Petal { .. }) {
-            let route = match &record.subject {
-                ProvenanceSubject::Petal { route, .. } => route.clone(),
-                _ => String::new(),
+            let (package_hash, route) = match &record.subject {
+                ProvenanceSubject::Petal {
+                    package_hash,
+                    route,
+                } => (package_hash.as_str().to_owned(), route.clone()),
+                _ => (String::new(), String::new()),
             };
             for class in &mut record.operation_classes {
                 let derived = catalogued_fee_asset(class.operation_class.as_str())?;
@@ -383,7 +386,8 @@ fn refresh_developer_provenance_catalog(
                 // with a different chain or asset) the Petal is equally broken.
                 if class.fee_asset.is_some() && !rewrite_existing {
                     conflicts.push(format!(
-                        "route {route} class {} is signed with {:?} but this build derives {:?}",
+                        "route {route} of package {package_hash} class {} is signed with \
+                         {:?} but this build derives {:?}",
                         class.operation_class.as_str(),
                         class.fee_asset,
                         derived,
@@ -410,13 +414,17 @@ fn refresh_developer_provenance_catalog(
              which, so it refuses rather than re-sign a value the record already carries. \
              Either this build's FEE_BEARING_OPERATION_CLASSES is wrong for that class or \
              does not catalogue it, or the record is the stale side — a table row corrected \
-             since this root was enrolled, or a Petal that has changed since. Re-enrolling \
-             the Petal does NOT help either way, because enrolment derives the fee asset \
-             from the same table. If the record is right, make this build's table agree with \
-             what the Petal declares. If the table is right, set {}=1 to re-sign the records \
-             from it: the rewritten claims are then authorized under the new value, and a \
-             Petal still declaring the old one is denied — FEE_NOT_ALLOWED where the value \
-             was cleared, FEE_ASSET_MISMATCH where it was replaced.",
+             since this root was enrolled, or a Petal that has changed since. If the record \
+             is right, make this build's table agree with what the Petal declares. If the \
+             table is right, re-enrolling that Petal re-derives its records from the table \
+             and needs no override, though only for the package hash on disk, and not from \
+             inside the launcher, which stops here before it reaches enrolment. Otherwise \
+             {}=1 rewrites every conflicting record in one pass, in both directions at once, \
+             so read the per-record notes above to see what it changed: a claim declaring \
+             the rewritten value is then authorized where its approval's value limits cover \
+             that asset, and a Petal still declaring the old value is denied — \
+             FEE_NOT_ALLOWED where the value was cleared, FEE_ASSET_MISMATCH where it was \
+             replaced.",
             conflicts.join("; "),
             REWRITE_EXISTING_FEE_ASSETS,
         );
@@ -1967,6 +1975,11 @@ mod tests {
         let _fixture = FIXTURE_PETAL
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        assert!(
+            std::env::var_os(REWRITE_EXISTING_FEE_ASSETS).is_none(),
+            "{REWRITE_EXISTING_FEE_ASSETS} is exported in this environment, which turns \
+             the refusal this test asserts into a rewrite"
+        );
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("config");
         fs::create_dir(&output).unwrap();
@@ -1995,26 +2008,30 @@ mod tests {
         // A catalogued class, signed with a different asset than the table
         // derives for it.
         let builder_class = Token::new(HYPERLIQUID_BUILDER_ORDER_CLASS).unwrap();
-        let mut planted_routes = Vec::new();
+        let mut planted = Vec::new();
         for record in &mut stale.records {
-            let ProvenanceSubject::Petal { route, .. } = &record.subject else {
+            let ProvenanceSubject::Petal {
+                package_hash,
+                route,
+            } = &record.subject
+            else {
                 continue;
             };
             if record.publisher == Token::new("bloom-release-pins").unwrap() {
                 continue;
             }
-            let route = route.clone();
+            let (package_hash, route) = (package_hash.as_str().to_owned(), route.clone());
             if let Some(class) = record.operation_classes.first_mut() {
                 class.operation_class = builder_class.clone();
                 class.fee_asset = Some(ProvenanceFeeAsset {
                     chain: Token::new("polygon").unwrap(),
                     asset: "pusd".to_owned(),
                 });
-                planted_routes.push(route);
+                planted.push((package_hash, route));
             }
         }
         assert!(
-            !planted_routes.is_empty(),
+            !planted.is_empty(),
             "the fixture must enroll a developer record"
         );
         let derived = catalogued_fee_asset(builder_class.as_str())
@@ -2046,9 +2063,10 @@ mod tests {
             "{:?}",
             catalogued_fee_asset(builder_class.as_str()).unwrap()
         );
-        for route in &planted_routes {
+        for (package_hash, route) in &planted {
             let expected = format!(
-                "route {route} class {} is signed with {signed} but this build derives {derives}",
+                "route {route} of package {package_hash} class {} is signed with {signed} \
+                 but this build derives {derives}",
                 builder_class.as_str(),
             );
             assert!(
@@ -2071,6 +2089,11 @@ mod tests {
         let _fixture = FIXTURE_PETAL
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        assert!(
+            std::env::var_os(REWRITE_EXISTING_FEE_ASSETS).is_none(),
+            "{REWRITE_EXISTING_FEE_ASSETS} is exported in this environment, which turns \
+             the refusal this test asserts into a rewrite"
+        );
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("config");
         fs::create_dir(&output).unwrap();
@@ -2100,13 +2123,17 @@ mod tests {
         // binary, or a hand edit, could leave behind.
         let mut planted = Vec::new();
         for record in &mut stale.records {
-            let ProvenanceSubject::Petal { route, .. } = &record.subject else {
+            let ProvenanceSubject::Petal {
+                package_hash,
+                route,
+            } = &record.subject
+            else {
                 continue;
             };
             if record.publisher == Token::new("bloom-release-pins").unwrap() {
                 continue;
             }
-            let route = route.clone();
+            let (package_hash, route) = (package_hash.as_str().to_owned(), route.clone());
             if let Some(class) = record.operation_classes.first_mut() {
                 assert!(
                     catalogued_fee_asset(class.operation_class.as_str())
@@ -2118,7 +2145,7 @@ mod tests {
                     chain: Token::new("hyperliquid").unwrap(),
                     asset: "usdc".to_owned(),
                 });
-                planted.push((route, class.operation_class.clone()));
+                planted.push((package_hash, route, class.operation_class.clone()));
             }
         }
         assert!(
@@ -2141,9 +2168,10 @@ mod tests {
                 asset: "usdc".to_owned(),
             })
         );
-        for (route, class) in &planted {
+        for (package_hash, route, class) in &planted {
             let expected = format!(
-                "route {route} class {} is signed with {signed} but this build derives None",
+                "route {route} of package {package_hash} class {} is signed with {signed} \
+                 but this build derives None",
                 class.as_str(),
             );
             assert!(
@@ -2157,8 +2185,8 @@ mod tests {
             "the refusal must name the recovery that keeps the claims working: {message}"
         );
         assert!(
-            message.contains("Re-enrolling the Petal does NOT help"),
-            "the refusal must not send the operator to a recovery that recreates the outage: \
+            message.contains("re-enrolling that Petal re-derives its records from the table"),
+            "the refusal must name the targeted recovery, which does re-derive the record: \
              {message}"
         );
         assert!(
