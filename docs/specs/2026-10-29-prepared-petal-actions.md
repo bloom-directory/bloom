@@ -42,3 +42,8 @@ Phase 2 adds shared SDK orchestration and catalog-driven presentation. It does
 not add protocol-specific authority branches. Existing custody and process
 boundaries remain unchanged: Machine talks only to Broker, and only Broker
 asks Signer to sign.
+
+Phase 1 discovery proposes only recoverable secp256k1/Keccak grants, matching
+the supported EIP-712 and EIP-191 generic review formats. It does not propose
+unused Ed25519 grants or selections with neither token nor certified zero-spend
+coverage. Other key families need a supported generic review format first.

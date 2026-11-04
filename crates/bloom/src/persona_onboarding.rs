@@ -20,9 +20,12 @@ pub(super) fn certified_petal_selection(
     key_ref: &KeyRef,
     capability_schemas: &[Token],
 ) -> Result<Option<PersonaSessionSelection>> {
-    if !capability_schemas
-        .iter()
-        .any(|s| s.as_str() == DECLARED_EFFECTS_CAPABILITY)
+    // Phase 1 generic review admits EIP-712/EIP-191 only; both require this
+    // suite. Other key families wait for a supported generic review format.
+    if key_ref.key_spec != KeySpec::Secp256k1
+        || !capability_schemas
+            .iter()
+            .any(|s| s.as_str() == DECLARED_EFFECTS_CAPABILITY)
     {
         return Ok(None);
     }
@@ -84,10 +87,7 @@ pub(super) fn certified_petal_selection(
     } else {
         vec![]
     };
-    let suites = CryptoSuite::ALL
-        .into_iter()
-        .filter(|suite| suite.key_spec() == key_ref.key_spec)
-        .collect();
+    let suites = vec![CryptoSuite::Secp256k1Keccak256Recoverable];
     let primary = &route_grants[0];
     let selection = PersonaSessionSelection {
         token_allowances: vec![],
@@ -205,12 +205,7 @@ async fn compile_petal_proposals(
         };
         let package_hash = Digest32::new(installed)?;
         let mut selections = Vec::new();
-        let mut selected_key_specs = Vec::new();
-        for suite in CryptoSuite::ALL {
-            if selected_key_specs.contains(&suite.key_spec()) {
-                continue;
-            }
-            selected_key_specs.push(suite.key_spec());
+        for suite in [CryptoSuite::Secp256k1Keccak256Recoverable] {
             let Ok(key) = selected_account_key(daemon, wallet, account, suite).await else {
                 continue;
             };
@@ -946,6 +941,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(selected.members[0].account, 3);
+        assert_eq!(
+            selected.members[0].allowed_crypto_suites,
+            [CryptoSuite::Secp256k1Keccak256Recoverable]
+        );
         let ApprovalSelector::Petal {
             allowed_operation_classes,
             route_grants,
@@ -963,20 +962,24 @@ mod tests {
             [Token::new("r2.action").unwrap()]
         );
         assert!(!selected.assets.is_empty());
+        let mut uncovered = selected.clone();
+        uncovered.assets.clear();
+        assert!(!selection_has_coverage(&catalog, &hash, &uncovered));
         let mut unsupported_key = key.clone();
         unsupported_key.key_spec = KeySpec::Ed25519;
         assert!(
             certified_petal_selection(&hash, &catalog, 3, &unsupported_key, &advertised)
                 .unwrap()
                 .is_none(),
-            "no token or zero-spend coverage must not propose an empty grant"
+            "unsupported review suites must not propose an automatic grant"
         );
         catalog.records[0].operation_classes[0].zero_spend = true; // r2 is secondary.
+        assert!(selection_has_coverage(&catalog, &hash, &uncovered));
         assert!(
             certified_petal_selection(&hash, &catalog, 3, &unsupported_key, &advertised)
                 .unwrap()
-                .is_some(),
-            "certified zero-only coverage remains eligible"
+                .is_none(),
+            "Ed25519 waits for a supported generic prepared review format"
         );
         assert_eq!(
             certified_zero_spend_classes(&catalog, &hash, &selected.members[0].selector),
