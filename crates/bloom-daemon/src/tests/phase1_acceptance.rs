@@ -56,7 +56,20 @@ async fn onboard(
         bloom_proto::config::PetalSetupConfig::default(),
     );
     config.save(&home.config_path()).unwrap();
+    daemon.shutdown().await;
     drop(daemon);
+    let mut released = false;
+    for _ in 0..200 {
+        if HomeWritePermit::acquire(&home).is_ok() {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        released,
+        "in-process fixture must release its own home before CLI ownership"
+    );
     let socket = setting("BLOOM_TRIAD_DEVELOPER_ROOT").join("phase1-machine.sock");
     let endpoint = format!("unix:{}", socket.display());
     let log = std::fs::OpenOptions::new()
