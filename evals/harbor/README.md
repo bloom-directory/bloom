@@ -139,8 +139,21 @@ the baseline. It
 runs on `release-proposal/*` PRs and by dispatch.
 Model credentials are repository secrets, OAuth where the agent supports it:
 `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) or `ANTHROPIC_API_KEY`;
-`CODEX_AUTH_JSON` (the contents of `~/.codex/auth.json` after `codex login`) or
-`OPENAI_API_KEY`; `DEEPSEEK_API_KEY`. The agent container sees them, so use
-dedicated credentials. A selected agent without one fails the run.
+`CODEX_AUTH_JSON` (the contents of `auth.json` after `codex login`) or
+`OPENAI_API_KEY`; `OPENCODE_AUTH_JSON` (OpenCode's `auth.json` after
+`opencode auth login` with Kimi). Log in to a throwaway home, so refreshing the
+CI session cannot sign out your own:
+
+```
+d=$(mktemp -d); CODEX_HOME=$d codex login
+gh secret set CODEX_AUTH_JSON -R bloom-directory/bloom < $d/auth.json
+d=$(mktemp -d); XDG_DATA_HOME=$d opencode auth login
+gh secret set OPENCODE_AUTH_JSON -R bloom-directory/bloom < $d/opencode/auth.json
+```
+
+Codex runs `gpt-5.6-sol` and OpenCode `kimi-code-plan-global/k3`, not the
+strongest model either offers. Locally, OpenCode reads `OPENCODE_AUTH_JSON_PATH`
+or its usual `auth.json`. The agent container sees them, so use dedicated
+credentials. A selected agent without one fails the run.
 `requirements.txt` is the full resolved dependency set; edit `requirements.in`
 and regenerate it with the command in its header.

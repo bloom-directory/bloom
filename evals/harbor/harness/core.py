@@ -42,8 +42,10 @@ AGENTS: dict[str, AgentSpec] = {
     # weaker instrument that exposes missing docs a stronger model reads past.
     "claude-opus": AgentSpec("claude-code", "claude-opus-5-5"),
     "claude-sonnet": AgentSpec("claude-code", "claude-sonnet-5-5"),
-    "codex": AgentSpec("codex", "gpt-5.6-terra"),
-    "opencode": AgentSpec("opencode", "deepseek/deepseek-v4-flash"),
+    # Codex and OpenCode run mid-tier models on subscription logins, not the
+    # strongest each offers.
+    "codex": AgentSpec("codex", "gpt-5.6-sol"),
+    "opencode": AgentSpec("opencode", "kimi-code-plan-global/k3"),
 }
 
 AGENT_VERSIONS = {"claude-code": "2.1.245", "codex": "0.149.1", "opencode": "1.18.26"}
@@ -212,6 +214,17 @@ def _agent_spec(name: str) -> AgentSpec:
         # occurrence in artifacts. A flag of "1" corrupts numeric JSON fields.
         return AgentSpec(
             spec.harbor_name, spec.model, {"CODEX_AUTH_JSON_PATH": str(auth_file)}
+        )
+    if name == "opencode":
+        auth_file = Path(
+            os.getenv("OPENCODE_AUTH_JSON_PATH")
+            or Path(os.getenv("XDG_DATA_HOME") or Path.home() / ".local/share")
+            / "opencode/auth.json"
+        )
+        if not auth_file.is_file():
+            raise EvalError("OpenCode auth is missing")
+        return AgentSpec(
+            spec.harbor_name, spec.model, {"OPENCODE_AUTH_JSON_PATH": str(auth_file)}
         )
     return spec
 

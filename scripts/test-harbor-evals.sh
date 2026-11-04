@@ -53,7 +53,7 @@ assert type(verifier).__name__ == "HostProjectionVerifier"
 agent = AgentFactory.create_agent_from_config(
     AgentConfig(
         import_path="harness.image_opencode:ImageOpenCode",
-        model_name="deepseek/deepseek-v4-flash",
+        model_name="kimi-code-plan-global/k3",
         kwargs={"version": "1.18.26"},
     ),
     logs_dir=jobs / "agent",

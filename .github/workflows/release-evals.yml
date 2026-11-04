@@ -11,9 +11,11 @@ name: Release evals
 # and on dispatch. Model credentials are repository secrets, OAuth where the
 # agent supports it: CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`) or
 # ANTHROPIC_API_KEY for Claude Code; CODEX_AUTH_JSON (the contents of
-# ~/.codex/auth.json from `codex login`) or OPENAI_API_KEY for Codex;
-# DEEPSEEK_API_KEY for OpenCode. The agent container sees them, so use
-# dedicated revocable credentials. A selected agent without one fails the run
+# auth.json from `codex login`) or OPENAI_API_KEY for Codex;
+# OPENCODE_AUTH_JSON (OpenCode's auth.json after `opencode auth login` with
+# Kimi) for OpenCode. Log in under a throwaway CODEX_HOME or XDG_DATA_HOME so
+# CI refreshing the session cannot sign out your own. The agent container
+# sees them, so use dedicated revocable credentials. A selected agent without one fails the run
 # and the report says so.
 
 on:
@@ -169,15 +171,19 @@ jobs:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          OPENCODE_AUTH_JSON: ${{ secrets.OPENCODE_AUTH_JSON }}
         run: |
           if [ -n "$CODEX_AUTH_JSON" ] && [ -z "$OPENAI_API_KEY" ]; then
             (umask 077 && mkdir -p ~/.codex && printf '%s' "$CODEX_AUTH_JSON" > ~/.codex/auth.json)
           fi
+          if [ -n "$OPENCODE_AUTH_JSON" ]; then
+            export OPENCODE_AUTH_JSON_PATH="$RUNNER_TEMP/opencode-auth.json"
+            (umask 077 && printf '%s' "$OPENCODE_AUTH_JSON" > "$OPENCODE_AUTH_JSON_PATH")
+          fi
           case "$AGENT" in
             claude-*) key="${ANTHROPIC_API_KEY}${CLAUDE_CODE_OAUTH_TOKEN}" ;;
             codex) key="${OPENAI_API_KEY}${CODEX_AUTH_JSON}" ;;
-            opencode) key="$DEEPSEEK_API_KEY" ;;
+            opencode) key="$OPENCODE_AUTH_JSON" ;;
           esac
           if [ -z "$key" ]; then
             echo "::error::no model credential for $AGENT"
@@ -188,6 +194,10 @@ jobs:
               scripts/evals/run-harbor.sh "$task" "$AGENT" ||
               echo "::warning::$task with $AGENT failed twice"
           done
+      # The harness removes its login link; drop any login file a run left.
+      - name: Remove agent logins from the trial logs
+        if: always()
+        run: find "$GITHUB_WORKSPACE/harbor-jobs" -name auth.json -delete 2>/dev/null || true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
