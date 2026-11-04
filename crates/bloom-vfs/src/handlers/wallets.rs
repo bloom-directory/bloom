@@ -11911,6 +11911,10 @@ value = "0""#,
     async fn tempo_holdings_list_tokens_without_a_native_row() {
         let tempo = bloom_proto::chain::TEMPO_MAINNET_CHAIN_ID;
         let tokens = accounts::holdings_tokens(tempo);
+        assert!(
+            tokens.iter().any(|(_, symbol, _)| symbol == "pathUSD"),
+            "{tokens:?}"
+        );
         let f = make_handler();
         // eth_getBalance would answer a nonzero placeholder if it were read.
         let (url, _) =
@@ -11926,6 +11930,28 @@ value = "0""#,
         let expected: Vec<&str> = tokens.iter().map(|(_, s, _)| s.as_str()).collect();
         assert_eq!(symbols, expected, "{v}");
         assert!(v["errors"].as_object().unwrap().is_empty(), "{v}");
+    }
+
+    /// A chain with nothing Bloom knows to read reports that instead of
+    /// looking checked and empty.
+    #[tokio::test]
+    async fn holdings_name_a_chain_with_nothing_to_read() {
+        let testnet = bloom_proto::chain::TEMPO_MODERATO_CHAIN_ID;
+        assert!(accounts::holdings_tokens(testnet).is_empty());
+        let f = make_handler();
+        let (url, _) = spawn_holdings_node(testnet, u64::MAX, |_| None, Default::default()).await;
+        f.handler
+            .chains
+            .add(holdings_chain("tempo-testnet", testnet, url));
+        let v = read_holdings(&f).await;
+        assert!(v["holdings"].as_array().unwrap().is_empty(), "{v}");
+        assert!(
+            v["errors"]["tempo-testnet"]
+                .as_str()
+                .unwrap()
+                .contains("no balances checked"),
+            "{v}"
+        );
     }
 
     // ---- errno semantics -------------------------------------------------
