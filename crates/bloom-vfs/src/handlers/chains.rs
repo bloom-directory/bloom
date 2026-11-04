@@ -267,7 +267,7 @@ impl ChainsHandler {
         Ok((decimals, symbol))
     }
 
-    /// Build the `tokens/known.json` payload: curated majors for this
+    /// Build the `tokens/known.json` payload: Bloom's token list for this
     /// chain plus, when an address-history backend is available, tokens
     /// the holder has recently transferred. `discovery_backend` tells the
     /// agent whether history-based discovery actually ran.
@@ -282,12 +282,11 @@ impl ChainsHandler {
         let chain_id = client.spec().chain_id;
 
         let known: Vec<KnownEntry> = wkt::for_chain(chain_id)
-            .iter()
             .filter_map(|t| {
                 let addr = t.address.parse::<alloy::primitives::Address>().ok()?;
                 Some(KnownEntry {
                     address: checksum_address(&addr),
-                    symbol: t.symbol.to_string(),
+                    symbol: t.symbol.clone(),
                     decimals: t.decimals,
                     source: "well-known",
                 })
@@ -313,10 +312,10 @@ impl ChainsHandler {
             };
 
         let note = if discovery_backend == "etherscan" {
-            "known = curated majors; discovered = tokens this address recently \
+            "known = Bloom's token list; discovered = tokens this address recently \
              transferred. Read tokens/<address>/balance.json for any token."
         } else {
-            "known = curated majors. History-based discovery is unavailable on \
+            "known = Bloom's token list. History-based discovery is unavailable on \
              this chain/backend; read tokens/<address>/balance.json for any token \
              you know."
         }

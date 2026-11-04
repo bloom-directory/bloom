@@ -2678,12 +2678,12 @@ mod tests {
     fn migrated_fixture() -> ProjectionFixture {
         let mut fixture = fixture(1);
         let policy = CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: token("alice"),
             maximum_approval_lifetime_ms: 30 * 24 * 60 * 60 * 1_000,
             allowed_petal_packages: Vec::new(),
             allowed_destinations: Vec::new(),
             required_verifiers: Vec::new(),
-            clear_signing: None,
         };
         let policy_bytes = serde_jcs::to_vec(&policy).unwrap();
         let policy_digest = Digest32::from_bytes(Sha256::digest(&policy_bytes).into());

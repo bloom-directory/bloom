@@ -11,7 +11,8 @@
 //! challenge.json, approval_challenge.json, status.json, result.json
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use bloom_proto::petal_identity::label_petal_digest;
@@ -73,6 +74,19 @@ impl CentralOutbox {
         self.state_dir(state).join(action_id)
     }
 
+    /// Create `dir` and sync each new entry's parent up to the store root's
+    /// parent, so a crash cannot lose the directory once this returns.
+    fn create_dir_durable(&self, dir: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        for parent in dir.ancestors().skip(1) {
+            sync_dir(parent)?;
+            if Some(parent) == self.root.parent() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Create a new pending action with the provided projection files.
     ///
     /// Backwards-compatible thin wrapper around [`CentralOutbox::stage_with_identity`]
@@ -128,11 +142,14 @@ impl CentralOutbox {
         identity: &StagedPetalIdentity,
     ) -> std::io::Result<()> {
         let dir = self.action_dir("pending", action_id);
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join("intent.json"), intent_json)?;
-        std::fs::write(dir.join("intent_hash"), format!("{intent_hash}\n"))?;
-        std::fs::write(dir.join("plan.md"), plan_md)?;
-        std::fs::write(dir.join("policy_check.json"), policy_check_json)?;
+        self.create_dir_durable(&dir)?;
+        write_durable(&dir.join("intent.json"), intent_json)?;
+        write_durable(
+            &dir.join("intent_hash"),
+            format!("{intent_hash}\n").as_bytes(),
+        )?;
+        write_durable(&dir.join("plan.md"), plan_md.as_bytes())?;
+        write_durable(&dir.join("policy_check.json"), policy_check_json)?;
 
         let status_json = if identity.is_present() {
             serde_json::json!({
@@ -157,9 +174,9 @@ impl CentralOutbox {
             })
         };
 
-        std::fs::write(
-            dir.join("status.json"),
-            serde_json::to_vec_pretty(&status_json).unwrap_or_default(),
+        write_durable(
+            &dir.join("status.json"),
+            &serde_json::to_vec_pretty(&status_json).unwrap_or_default(),
         )?;
         Ok(())
     }
@@ -174,8 +191,10 @@ impl CentralOutbox {
                 format!("action {action_id} not found in {from}"),
             ));
         }
-        std::fs::create_dir_all(self.state_dir(to))?;
+        self.create_dir_durable(&self.state_dir(to))?;
         std::fs::rename(&from_dir, &to_dir)?;
+        sync_dir(&self.state_dir(to))?;
+        sync_dir(&self.state_dir(from))?;
         self.write_status_state(action_id, to)?;
         Ok(())
     }
@@ -194,7 +213,10 @@ impl CentralOutbox {
         let obj = status.as_object_mut().expect("status is object");
         obj.insert("action_id".to_string(), serde_json::json!(action_id));
         obj.insert("state".to_string(), serde_json::json!(state));
-        std::fs::write(path, serde_json::to_vec_pretty(&status).unwrap_or_default())
+        write_durable(
+            &path,
+            &serde_json::to_vec_pretty(&status).unwrap_or_default(),
+        )
     }
 
     /// Write a result file for an action.
@@ -205,7 +227,7 @@ impl CentralOutbox {
         result_json: &[u8],
     ) -> std::io::Result<()> {
         let dir = self.action_dir(state, action_id);
-        std::fs::write(dir.join("result.json"), result_json)
+        write_durable(&dir.join("result.json"), result_json)
     }
 
     /// Write a runtime-generated artifact into an existing central action
@@ -236,7 +258,7 @@ impl CentralOutbox {
                 format!("action {action_id} not found in {state}"),
             ));
         }
-        std::fs::write(dir.join(file), data)
+        write_durable(&dir.join(file), data)
     }
 
     /// Read a runtime-generated artifact from an existing central action
@@ -510,6 +532,40 @@ impl Handler for OutboxHandler {
             _ => Err(HandlerError::NotADir(path.to_string_path())),
         }
     }
+}
+
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// Replace `path` with `bytes` so a crash leaves the old or new file whole,
+/// and the replacement survives once this returns.
+fn write_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("central outbox file has no parent"))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    let temporary = dir.join(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        use std::io::Write as _;
+        let mut file = std::fs::File::create_new(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        sync_dir(dir)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 #[cfg(test)]
