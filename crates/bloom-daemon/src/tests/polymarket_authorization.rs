@@ -159,7 +159,7 @@ impl PetalHost for VenueFixture {
         } else if request.url == "https://gamma-api.polymarket.com/markets/slug/test"
             && request.method == "GET"
         {
-            br#"{"slug":"test","question":"test","conditionId":"condition","clobTokenIds":["42","43"],"outcomes":["Yes","No"],"active":true,"closed":false,"enableOrderBook":true,"negRisk":false}"#.to_vec()
+            br#"{"slug":"test","question":"test","conditionId":"condition","clobTokenIds":["42","43"],"outcomes":["Yes","No"],"active":true,"closed":false,"enableOrderBook":true,"negRisk":false,"feesEnabled":false}"#.to_vec()
         } else if request.url.starts_with("https://clob.polymarket.com/book?")
             && request.method == "GET"
         {

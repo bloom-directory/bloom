@@ -699,7 +699,7 @@ async fn prepared_gasless_uses_real_bounded_permission() {
     let (f, hash, mut counter) = setup("gasless", "BLOOM_PM80_GASLESS_ROOT").await;
     let first = std::env::var("BLOOM_PM80_BUY_PHASE").as_deref() != Ok("restart");
     let grant = grant_for(&f.daemon.persona_sessions(WALLET).await.unwrap(), &hash);
-    let (_host, vfs) = host(&f);
+    let (host, vfs) = host(&f);
     if !first {
         let before = usage(&f, &grant.approval_id).await;
         let rearm = f
@@ -761,6 +761,22 @@ async fn prepared_gasless_uses_real_bounded_permission() {
         ),
         if first { "2000000" } else { "3000000" }
     );
+    if first {
+        let before_exact = usage(&f, &grant.approval_id).await;
+        let (mut request, context) = host
+            .prepared_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(request, _)| matches!(request.action.spend, Spend::Bounded { .. }))
+            .unwrap()
+            .clone();
+        request.operation_key = "gasless-token-over-limit".into();
+        request.action.spend =
+            Spend::erc20("evm-8453", gasless_authorization::USDC, "1001000000").unwrap();
+        expect_exact(&f, &host, request, context, &mut counter, true).await;
+        assert_accounting_unchanged(&before_exact, &usage(&f, &grant.approval_id).await);
+    }
     let result = serde_json::json!({"schema":"bloom.phase1.gasless.v1","actual_cli_compiler_onboarding":true,"owner_sign_count":counter,"approval_id":grant.approval_id,"phase":if first {"first"} else {"restart"},"retry_no_double_charge":true,"rearm_retains_usage":!first});
     std::fs::write(
         setting("BLOOM_PM80_AUTHORIZATION_RESULT").with_extension(if first {
