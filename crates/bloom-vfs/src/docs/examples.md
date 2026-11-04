@@ -25,8 +25,11 @@ cat "$BLOOM/wallets/alice/projection.json"
 # 2. Stage once through an explicit account path. Account 0 is the initial
 #    account; any other numbered path (wallets/alice/1/chains/...) spends
 #    from that account's key and sees only its own outbox entries.
-#    Name the chain's native asset: ETH here, POL on polygon, BNB on bsc.
+#    Native asset:
 printf 'send 0.01 ETH to 0x0000000000000000000000000000000000000001\n' \
+  > "$BLOOM/wallets/alice/0/chains/anvil/outbox/new.tx"
+#    Token transfer (ERC-20):
+printf 'send 1000 USDC to 0x0000000000000000000000000000000000000001\n' \
   > "$BLOOM/wallets/alice/0/chains/anvil/outbox/new.tx"
 
 # 3. List pending actions. Set ID to the exact entry created by this staging

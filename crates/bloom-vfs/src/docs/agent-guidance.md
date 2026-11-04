@@ -19,6 +19,22 @@ in `docs/examples.md` before using an unfamiliar write surface. For Petal work,
 use `docs/petals.md` to discover installed packages, then read that package's
 `README.md` and `AGENTS.md` before using its routes.
 
+## Staging transactions
+
+Stage transfers by writing a single line to the selected account's `new.tx`:
+
+```sh
+# Native transfer:
+printf 'send 0.01 ETH to 0x0000000000000000000000000000000000000001\n' \
+  > wallets/<wallet>/0/chains/<chain>/outbox/new.tx
+
+# Token transfer (ERC-20):
+printf 'send 1000 USDC to 0x0000000000000000000000000000000000000001\n' \
+  > wallets/<wallet>/0/chains/<chain>/outbox/new.tx
+```
+
+Then identify the staged entry under `.../outbox/pending/<id>/` and write `y` to its `confirm` file. See `docs/examples.md` for complete procedures.
+
 ## Authority and safety
 
 Machine exposes this VFS; Broker controls approval ceremonies and policy;
