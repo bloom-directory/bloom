@@ -582,44 +582,12 @@ async fn prepared_buy_uses_real_bounded_permission() {
             );
         }
         assert_accounting_unchanged(&before_rejections, &usage(&f, &grant.approval_id).await);
-        // Actual Degen cap, never a reduced test cap or journal edit. Batches
-        // respect the independent structural 120/minute signing backstop.
-        for serial in 2..300 {
-            if serial == 100 || serial == 200 {
-                tokio::time::sleep(Duration::from_secs(61)).await;
-            }
-            let mut next = login.0.clone();
-            next.operation_key = format!("zero-rate-{serial}");
-            assert!(matches!(
-                host.machine
-                    .prepared_sign(next, login.1.clone())
-                    .await
-                    .unwrap(),
-                SigningOutcome::Signed { .. }
-            ));
-        }
-        let mut over = login.0;
-        over.operation_key = "zero-rate-over-cap".into();
-        expect_exact(&f, &host, over, login.1, &mut counter, true).await;
-        let mut unspecified = order.clone();
-        unspecified.operation_key = "undeclared-exact".into();
-        unspecified.action.spend = Spend::Unspecified;
-        expect_exact(&f, &host, unspecified, context.clone(), &mut counter, true).await;
-        let mut outside = order.clone();
-        outside.operation_key = "outside-grant-asset".into();
-        outside.action.spend = Spend::erc20(
-            "evm-10",
-            "0x0b2c639c533813f4aa9d7837caf62653d097ff85",
-            "1000000",
-        )
-        .unwrap();
-        expect_exact(&f, &host, outside, context.clone(), &mut counter, true).await;
         // The principal fits Degen's per-action cap, but its real venue fee
         // makes the declared debit exceed it. This is distinct from R2's
         // deliberately understated declaration probe above.
         let before_fee_boundary = usage(&f, &grant.approval_id).await;
         pm_buy(&vfs, "0003", "1000").await;
-        let (boundary, context) = host
+        let (boundary, boundary_context) = host
             .prepared_requests
             .lock()
             .unwrap()
@@ -656,8 +624,40 @@ async fn prepared_buy_uses_real_bounded_permission() {
             .unwrap();
         assert_eq!(principal, alloy::primitives::U256::from(1_000_000_000u64));
         assert!(principal <= cap && alloy::primitives::U256::from(1_070_001_000u64) > cap);
-        expect_exact(&f, &host, boundary, context, &mut counter, true).await;
+        expect_exact(&f, &host, boundary, boundary_context, &mut counter, true).await;
         assert_accounting_unchanged(&before_fee_boundary, &usage(&f, &grant.approval_id).await);
+        // Actual Degen cap, never a reduced test cap or journal edit. Batches
+        // respect the independent structural 120/minute signing backstop.
+        for serial in 2..300 {
+            if serial == 100 || serial == 200 {
+                tokio::time::sleep(Duration::from_secs(61)).await;
+            }
+            let mut next = login.0.clone();
+            next.operation_key = format!("zero-rate-{serial}");
+            assert!(matches!(
+                host.machine
+                    .prepared_sign(next, login.1.clone())
+                    .await
+                    .unwrap(),
+                SigningOutcome::Signed { .. }
+            ));
+        }
+        let mut over = login.0;
+        over.operation_key = "zero-rate-over-cap".into();
+        expect_exact(&f, &host, over, login.1, &mut counter, true).await;
+        let mut unspecified = order.clone();
+        unspecified.operation_key = "undeclared-exact".into();
+        unspecified.action.spend = Spend::Unspecified;
+        expect_exact(&f, &host, unspecified, context.clone(), &mut counter, true).await;
+        let mut outside = order.clone();
+        outside.operation_key = "outside-grant-asset".into();
+        outside.action.spend = Spend::erc20(
+            "evm-10",
+            "0x0b2c639c533813f4aa9d7837caf62653d097ff85",
+            "1000000",
+        )
+        .unwrap();
+        expect_exact(&f, &host, outside, context.clone(), &mut counter, true).await;
         let charged = usage(&f, &grant.approval_id).await;
         assert_eq!(
             charged
