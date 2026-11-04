@@ -186,10 +186,13 @@ it exists to permit — in practice it would fail even earlier, since
 `polymarket::decode` rebuilds the order with a zero builder field and the
 preimage comparison runs before that check. On the Hyperliquid side
 `message_review_requires_exact` makes prepare refuse a reusable Petal approval
-whose scope contains such a class, and the Petal's derived-key scope requests
-the builder class alongside `hyperliquid.agent_action` *unconditionally* — so
-listing it would make every Hyperliquid session scope unpreparable and take
-plain session signing down with it.
+whose scope contains such a class. The Petal's manifest declares the builder
+class on its `[[key.derive]]` route, but each route grant's classes are
+filtered by the scope the Petal actually requests
+(`bloom-daemon`), and that request is conditional — only a session created with
+a builder bound asks for the builder class. So listing it would make
+builder-bound session scopes unpreparable; a plain session, which requests
+`hyperliquid.agent_action` alone, is unaffected.
 
 What the session path needs instead is a widening of the delegated-action
 witness — both the `operation_class == "hyperliquid.agent_action"` predicate

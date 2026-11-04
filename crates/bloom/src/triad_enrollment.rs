@@ -657,9 +657,10 @@ const POLYMARKET_BUILDER_CODE_ORDER_CLASS: &str = "polymarket.builder_code_order
 /// destinations or a fee, so listing the builder-code class would deny every
 /// claim it exists to permit; and `message_review_requires_exact` makes Broker
 /// refuse a reusable Petal approval whose scope contains a reviewed class, so
-/// listing the Hyperliquid one would make *every* session scope unpreparable —
-/// the Petal's derived-key scope requests both classes unconditionally — and
-/// take plain session signing with it. See "Operation-class granularity
+/// listing the Hyperliquid one would make a builder-bound session's scope
+/// unpreparable. A plain session is unaffected: the manifest declares both
+/// classes, but each route grant is filtered by the classes the Petal actually
+/// requests, and it asks for the builder class only when a builder is bound. See "Operation-class granularity
 /// and `fee_asset`" in `docs/architecture/Sealed Approvals.md`.
 const FEE_BEARING_OPERATION_CLASSES: &[CataloguedFeeAsset] = &[
     CataloguedFeeAsset {
