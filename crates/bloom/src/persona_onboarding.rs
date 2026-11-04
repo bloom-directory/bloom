@@ -27,7 +27,6 @@ pub(super) fn certified_petal_selection(
         return Ok(None);
     }
     let mut route_grants = Vec::new();
-    let mut classes = Vec::new();
     let mut bounded = false;
     for record in &catalog.records {
         let ProvenanceSubject::Petal {
@@ -54,7 +53,6 @@ pub(super) fn certified_petal_selection(
         if route_classes.is_empty() {
             continue;
         }
-        classes.extend(route_classes.clone());
         route_grants.push(PetalRouteGrant {
             route: route.clone(),
             allowed_operation_classes: route_classes,
@@ -68,8 +66,6 @@ pub(super) fn certified_petal_selection(
     if route_grants.windows(2).any(|w| w[0].route == w[1].route) {
         bail!("ambiguous certified Petal route");
     }
-    classes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-    classes.dedup();
     let assets = if bounded && key_ref.key_spec == KeySpec::Secp256k1 {
         known_tokens()
             .iter()
@@ -107,7 +103,7 @@ pub(super) fn certified_petal_selection(
             selector: ApprovalSelector::Petal {
                 package_hash: package_hash.clone(),
                 route: primary.route.clone(),
-                allowed_operation_classes: classes,
+                allowed_operation_classes: primary.allowed_operation_classes.clone(),
                 route_grants: route_grants.clone(),
                 required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
             },
@@ -115,6 +111,46 @@ pub(super) fn certified_petal_selection(
             allowed_crypto_suites: suites,
         }],
     }))
+}
+
+fn certified_zero_spend_classes(
+    catalog: &ProvenanceCatalog,
+    package_hash: &Digest32,
+    selector: &ApprovalSelector,
+) -> Vec<Token> {
+    let ApprovalSelector::Petal {
+        route,
+        allowed_operation_classes,
+        route_grants,
+        ..
+    } = selector
+    else {
+        return vec![];
+    };
+    let grants = if route_grants.is_empty() {
+        vec![(route.as_str(), allowed_operation_classes)]
+    } else {
+        route_grants
+            .iter()
+            .map(|grant| (grant.route.as_str(), &grant.allowed_operation_classes))
+            .collect()
+    };
+    let mut classes = grants
+        .iter()
+        .flat_map(|(_, classes)| classes.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    classes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    classes.dedup();
+    // Consent applies to exact selected routes. A shared class is zero-spend
+    // only when every selected occurrence has that installer certification.
+    classes.retain(|class| grants.iter().filter(|(_,classes)| classes.contains(class)).all(|(route,_)| {
+        catalog.records.iter().any(|record| matches!(&record.subject,
+            ProvenanceSubject::Petal {package_hash: hash, route: certified_route} if hash == package_hash && certified_route == route)
+            && record.operation_classes.iter().any(|entry| entry.operation_class == *class
+                && entry.zero_spend && entry.economic_effects_schema == Some(1)))
+    }));
+    classes
 }
 
 async fn compile_petal_proposals(
@@ -416,20 +452,31 @@ pub(crate) async fn compile_selection(
         .into_iter()
         .map(|(account, mut terms)| {
             let scope = session_member_scope_digest(&terms)?;
-            let petal_policy = if let ApprovalSubject::Petal {package_hash,..} = &terms.subject {
-                let catalog = daemon.persona_provenance_catalog().context("installer provenance unavailable")?;
-                let selected_classes = match &terms.selector {ApprovalSelector::Petal {allowed_operation_classes,..} => allowed_operation_classes,_=>unreachable!()};
-                let mut zero_spend_classes = catalog.records.iter().filter(|record| matches!(&record.subject,ProvenanceSubject::Petal {package_hash:hash,..} if hash == package_hash))
-                    .flat_map(|record| &record.operation_classes)
-                    .filter(|class| class.zero_spend && class.economic_effects_schema == Some(1) && selected_classes.contains(&class.operation_class))
-                    .map(|class| class.operation_class.clone()).collect::<Vec<_>>();
-                zero_spend_classes.sort_by(|a,b|a.as_str().cmp(b.as_str()));zero_spend_classes.dedup();
+            let petal_policy = if let ApprovalSubject::Petal { package_hash, .. } = &terms.subject {
+                let catalog = daemon
+                    .persona_provenance_catalog()
+                    .context("installer provenance unavailable")?;
+                let zero_spend_classes =
+                    certified_zero_spend_classes(&catalog, package_hash, &terms.selector);
                 Some(PetalSessionPolicy {
-                    persona:match profile.preset {PersonaPreset::Trader=>PetalSessionPersona::Trader,PersonaPreset::Degen=>PetalSessionPersona::Degen,PersonaPreset::Custodian=>unreachable!()},
-                    zero_spend_rate_limit:(!zero_spend_classes.is_empty()).then(||SlidingWindow {maximum:DecimalU64::new(profile.zero_spend_hourly_cap().expect("automatic persona")),duration_ms:DecimalU64::new(3_600_000)}),
+                    persona: match profile.preset {
+                        PersonaPreset::Trader => PetalSessionPersona::Trader,
+                        PersonaPreset::Degen => PetalSessionPersona::Degen,
+                        PersonaPreset::Custodian => unreachable!(),
+                    },
+                    zero_spend_rate_limit: (!zero_spend_classes.is_empty()).then(|| {
+                        SlidingWindow {
+                            maximum: DecimalU64::new(
+                                profile.zero_spend_hourly_cap().expect("automatic persona"),
+                            ),
+                            duration_ms: DecimalU64::new(3_600_000),
+                        }
+                    }),
                     zero_spend_classes,
                 })
-            } else {None};
+            } else {
+                None
+            };
             let mut budget = SessionBudget {
                 petal_policy,
                 token_policy: Some(SessionTokenPolicy {
@@ -871,7 +918,7 @@ mod tests {
             operation_classes: vec![ProvenanceOperationClass {
                 zero_spend: false,
                 economic_effects_schema: Some(1),
-                operation_class: Token::new("unrelated.action").unwrap(),
+                operation_class: Token::new(format!("{route}.action")).unwrap(),
                 fee_asset: None,
             }],
             installer_key_id: Token::new("test-installer").unwrap(),
@@ -885,7 +932,37 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(selected.members[0].account, 3);
+        let ApprovalSelector::Petal {
+            allowed_operation_classes,
+            route_grants,
+            ..
+        } = &selected.members[0].selector
+        else {
+            panic!("Petal selection")
+        };
+        assert_eq!(
+            allowed_operation_classes,
+            &[Token::new("r1.action").unwrap()]
+        );
+        assert_eq!(
+            route_grants[1].allowed_operation_classes,
+            [Token::new("r2.action").unwrap()]
+        );
         assert!(!selected.assets.is_empty());
+        catalog.records[0].operation_classes[0].zero_spend = true; // r2 is secondary.
+        assert_eq!(
+            certified_zero_spend_classes(&catalog, &hash, &selected.members[0].selector),
+            [Token::new("r2.action").unwrap()]
+        );
+        let mut unrelated = record("unselected");
+        unrelated.operation_classes[0].operation_class = Token::new("r1.action").unwrap();
+        unrelated.operation_classes[0].zero_spend = true;
+        catalog.records.push(unrelated);
+        assert_eq!(
+            certified_zero_spend_classes(&catalog, &hash, &selected.members[0].selector),
+            [Token::new("r2.action").unwrap()],
+            "unselected route certification must not opt in another route"
+        );
         // Fee metadata is a generic policy input, never a route eligibility ban.
         for record in &mut catalog.records {
             record.operation_classes[0].fee_asset = Some(ProvenanceFeeAsset {
