@@ -763,7 +763,17 @@ fn triad_developer_launcher_accepts_explicit_prebuilt_petals() {
 
     assert!(launcher.contains("BLOOM_TRIAD_DEV_BUILD_PETALS:-1"));
     assert!(launcher.contains("BLOOM_TRIAD_DEV_BUILD_PETALS must be 0 or 1"));
-    assert!(launcher.contains("if [ \"$build_integration_petals\" -eq 1 ]; then"));
+    assert!(launcher.contains(
+        r#"if [ "$build_integration_petals" -eq 1 ] && [ -d "$integration_petal" ]; then"#
+    ));
+    // Both enrollment and installation accept an archive; only source
+    // directories may run a Petal build script.
+    assert_eq!(
+        launcher
+            .matches(r#"[ -d "$integration_petal" ] || [ -f "$integration_petal" ]"#)
+            .count(),
+        2
+    );
     assert!(launcher.contains("triad-enroll-developer-petal-provenance"));
     assert!(launcher.contains("machine_cli petals install"));
 }

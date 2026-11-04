@@ -425,5 +425,5 @@ async fn prepared_gasless_uses_real_bounded_permission() {
             "covered_without_additional_ceremony":true,"duplicate_signature_recovered":true,
             "negative_cases_rejected":true,"restart_rearm_preserves_usage":phase=="restart",
             "over_limit_exact_review":phase=="restart",
-            "limits":"disposable software owner; controlled Relay quote; no submission, funds or settlement"})).unwrap()).unwrap();
+            "limits":"disposable software owner; controlled Relay quote and mocked submission; no live funds or settlement"})).unwrap()).unwrap();
 }

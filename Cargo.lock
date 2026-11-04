@@ -2073,9 +2073,9 @@ dependencies = [
 
 [[package]]
 name = "bip39"
-version = "2.2.2"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90dbd31c98227229239363921e60fcf5e558e43ec69094d46fc4996f08d1d5bc"
+checksum = "4559bb9225f8401dcea601cf8dc9ed81ea0dadd9cf7755fdefdd93ef7961e19e"
 dependencies = [
  "bitcoin_hashes",
  "serde",
@@ -2732,21 +2732,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bloom-rpc-wire"
-version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=ad0072512bb97fb4eb68d249ce785ea3ea4a49ab#ad0072512bb97fb4eb68d249ce785ea3ea4a49ab"
-dependencies = [
- "base64 0.23.1",
- "ed25519-dalek",
- "hex",
- "serde",
- "serde_jcs",
- "serde_json",
- "sha2 0.11.0",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "bloom-service-activation"
 version = "0.1.3"
 source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=48b83c54c1787b4aff2456bd3adbe18856902e45#48b83c54c1787b4aff2456bd3adbe18856902e45"
@@ -2770,9 +2755,9 @@ dependencies = [
 [[package]]
 name = "bloom-signer-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=10b6c3f58fd03bd1746b72224299de2a9f77152f#10b6c3f58fd03bd1746b72224299de2a9f77152f"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=ce0fcba77ad0b8cb196748d74a761ad96c6c5edb#ce0fcba77ad0b8cb196748d74a761ad96c6c5edb"
 dependencies = [
- "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=ad0072512bb97fb4eb68d249ce785ea3ea4a49ab)",
+ "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=48b83c54c1787b4aff2456bd3adbe18856902e45)",
  "ed25519-dalek",
  "hex",
  "serde",
@@ -2785,7 +2770,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-derive"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=10b6c3f58fd03bd1746b72224299de2a9f77152f#10b6c3f58fd03bd1746b72224299de2a9f77152f"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=ce0fcba77ad0b8cb196748d74a761ad96c6c5edb#ce0fcba77ad0b8cb196748d74a761ad96c6c5edb"
 dependencies = [
  "bip39",
  "ed25519-dalek",
