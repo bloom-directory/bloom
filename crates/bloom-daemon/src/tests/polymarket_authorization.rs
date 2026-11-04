@@ -159,17 +159,17 @@ impl PetalHost for VenueFixture {
         } else if request.url == "https://gamma-api.polymarket.com/markets/slug/test"
             && request.method == "GET"
         {
-            br#"{"slug":"test","question":"test","conditionId":"condition","clobTokenIds":["42","43"],"outcomes":["Yes","No"],"active":true,"closed":false,"enableOrderBook":true,"negRisk":false,"feesEnabled":false}"#.to_vec()
+            br#"{"slug":"test","question":"test","conditionId":"condition","clobTokenIds":["42","43"],"outcomes":["Yes","No"],"active":true,"closed":false,"enableOrderBook":true,"negRisk":false,"feesEnabled":true,"feeType":"crypto_fees_v2","feeSchedule":{"exponent":1,"rate":0.07,"takerOnly":true,"rebateRate":0.2}}"#.to_vec()
         } else if request.url.starts_with("https://clob.polymarket.com/book?")
             && request.method == "GET"
         {
-            br#"{"market":"condition","asset_id":"42","tick_size":"0.01","min_order_size":"1","neg_risk":false,"asks":[{"price":"0.50","size":"100"}],"bids":[{"price":"0.49","size":"100"}]}"#.to_vec()
+            br#"{"market":"condition","asset_id":"42","tick_size":"0.01","min_order_size":"1","neg_risk":false,"asks":[{"price":"0.50","size":"100000"}],"bids":[{"price":"0.49","size":"100000"}]}"#.to_vec()
         } else if request
             .url
             .starts_with("https://clob.polymarket.com/balance-allowance?")
             && request.method == "GET"
         {
-            br#"{"balance":"100000000","allowance":"100000000"}"#.to_vec()
+            br#"{"balance":"1000000000000","allowance":"1000000000000"}"#.to_vec()
         } else if request
             .url
             .starts_with("https://relayer-v2.polymarket.com/nonce?")
@@ -203,7 +203,7 @@ impl PetalHost for VenueFixture {
                     selector => {
                         let word = match selector {
                             "0x5c60da1b" | "0x1f264778" => 3u64,
-                            "0x70a08231" | "0x00fdd58e" => 100_000_000,
+                            "0x70a08231" | "0x00fdd58e" => 1_000_000_000_000,
                             "0xe985e9c5" => u64::from(self.trading_ready),
                             _ => {
                                 return Err(HostError::Denied(

@@ -388,10 +388,10 @@ async fn pm_login(vfs: &Vfs, host: &VenueFixture, refresh: bool) {
     .await
     .unwrap();
 }
-async fn pm_buy(vfs: &Vfs, id: &str) {
+async fn pm_buy(vfs: &Vfs, id: &str, amount: &str) {
     vfs.write(
         &VfsPath::parse(&format!("petals/polymarket/trade/{WALLET}/1/new")).unwrap(),
-        br#"{"slug":"test","outcome":"YES","amount":"1","side":"buy","limit_price":"0.50"}"#,
+        &serde_json::to_vec(&serde_json::json!({"slug":"test","outcome":"YES","amount":amount,"side":"buy","limit_price":"0.50"})).unwrap(),
     )
     .await
     .unwrap();
@@ -498,7 +498,7 @@ async fn prepared_buy_uses_real_bounded_permission() {
         .unwrap();
         store.put(&hash,"state/onboard/pm80-authorization/status.json",&serde_json::to_vec(&serde_json::json!({"wallet":WALLET,"owner":owner,"stage":"complete","tradeable":true,"creds_present":true,"deposit_wallet":{"address":"0x1111111111111111111111111111111111111111","source":"live_factory_resolved","fundable":true}})).unwrap(),false).unwrap();
         for id in ["0001", "0002"] {
-            pm_buy(&vfs, id).await;
+            pm_buy(&vfs, id, "1").await;
         }
         assert_eq!(
             host.prepared_signed
@@ -518,6 +518,18 @@ async fn prepared_buy_uses_real_bounded_permission() {
             before,
             "covered installed WASM actions must not open ceremonies"
         );
+        for (request, _) in host
+            .prepared_signed
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(request, _)| matches!(request.action.spend, Spend::Bounded { .. }))
+        {
+            assert_eq!(
+                request.action.spend,
+                Spend::erc20("evm-137", PUSD, "1071000").unwrap()
+            );
+        }
         let (order, context) = host
             .prepared_requests
             .lock()
@@ -546,7 +558,7 @@ async fn prepared_buy_uses_real_bounded_permission() {
         ));
         assert_eq!(
             usage_amount(&usage(&f, &grant.approval_id).await, "evm-137", PUSD),
-            "2000001"
+            "2142001"
         );
         let before_rejections = usage(&f, &grant.approval_id).await;
         for kind in ["hash", "review", "provenance", "empty", "zero"] {
@@ -602,10 +614,50 @@ async fn prepared_buy_uses_real_bounded_permission() {
         )
         .unwrap();
         expect_exact(&f, &host, outside, context.clone(), &mut counter, true).await;
-        let mut over = order;
-        over.operation_key = "token-over-limit".into();
-        over.action.spend = Spend::erc20("evm-137", PUSD, "1001000000").unwrap();
-        expect_exact(&f, &host, over, context, &mut counter, true).await;
+        // The principal fits Degen's per-action cap, but its real venue fee
+        // makes the declared debit exceed it. This is distinct from R2's
+        // deliberately understated declaration probe above.
+        let before_fee_boundary = usage(&f, &grant.approval_id).await;
+        pm_buy(&vfs, "0003", "1000").await;
+        let (boundary, context) = host
+            .prepared_requests
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            boundary.action.spend,
+            Spend::erc20("evm-137", PUSD, "1070001000").unwrap()
+        );
+        let review: serde_json::Value =
+            serde_json::from_slice(&boundary.action.review.bytes).unwrap();
+        let raw = review["typed_data"]["message"]["contents"]["makerAmount"]
+            .as_str()
+            .unwrap();
+        let principal = alloy::primitives::U256::from_str_radix(
+            raw.trim_start_matches("0x"),
+            if raw.starts_with("0x") { 16 } else { 10 },
+        )
+        .unwrap();
+        let cap = grant
+            .terms
+            .session_budget
+            .as_ref()
+            .unwrap()
+            .per_action_value_limits
+            .iter()
+            .find(|limit| limit.asset.chain.as_str() == "evm-137" && limit.asset.asset == PUSD)
+            .unwrap();
+        let cap = cap
+            .maximum
+            .as_str()
+            .parse::<alloy::primitives::U256>()
+            .unwrap();
+        assert_eq!(principal, alloy::primitives::U256::from(1_000_000_000u64));
+        assert!(principal <= cap && alloy::primitives::U256::from(1_070_001_000u64) > cap);
+        expect_exact(&f, &host, boundary, context, &mut counter, true).await;
+        assert_accounting_unchanged(&before_fee_boundary, &usage(&f, &grant.approval_id).await);
         let charged = usage(&f, &grant.approval_id).await;
         assert_eq!(
             charged
@@ -625,10 +677,10 @@ async fn prepared_buy_uses_real_bounded_permission() {
                 .get(),
             303
         );
-        assert_eq!(usage_amount(&charged, "evm-137", PUSD), "2000001");
+        assert_eq!(usage_amount(&charged, "evm-137", PUSD), "2142001");
     } else {
         let before = usage(&f, &grant.approval_id).await;
-        assert_eq!(usage_amount(&before, "evm-137", PUSD), "2000001");
+        assert_eq!(usage_amount(&before, "evm-137", PUSD), "2142001");
         let rearm = f
             .daemon
             .broker_client()
@@ -660,10 +712,10 @@ async fn prepared_buy_uses_real_bounded_permission() {
                 .get(&hash, "state/settings/pm80-authorization/venue.toml")
                 .is_ok()
         );
-        pm_buy(&vfs, "0003").await;
+        pm_buy(&vfs, "0004", "1").await;
         assert_eq!(
             usage_amount(&usage(&f, &grant.approval_id).await, "evm-137", PUSD),
-            "3000001"
+            "3213001"
         );
         let begin = VfsPath::parse(&format!("petals/polymarket/onboard/{WALLET}/1/begin")).unwrap();
         host.timestamp.fetch_add(1, Ordering::SeqCst);
@@ -681,7 +733,7 @@ async fn prepared_buy_uses_real_bounded_permission() {
         assert!(matches!(request.action.spend, Spend::None));
         expect_exact(&f, &host, request, context, &mut counter, true).await;
     }
-    let result = serde_json::json!({"schema":"bloom.phase1.acceptance.v1","phase":if first {"first"} else {"restart"},"package_hash":hash,"approval_id":grant.approval_id,"budget_id":grant.terms.session_budget.as_ref().unwrap().budget_id().unwrap(),"owner_sign_count":counter,"actual_cli_compiler_onboarding":true,"zero_spend_preset_cap":300,"native":native,"r2_declared_amount_trusted":true,"rearm_retains_usage":!first});
+    let result = serde_json::json!({"schema":"bloom.phase1.acceptance.v1","phase":if first {"first"} else {"restart"},"package_hash":hash,"approval_id":grant.approval_id,"budget_id":grant.terms.session_budget.as_ref().unwrap().budget_id().unwrap(),"owner_sign_count":counter,"actual_cli_compiler_onboarding":true,"zero_spend_preset_cap":300,"native":native,"r2_declared_amount_trusted":true,"principal_plus_fee_raw":"1071000","fee_boundary_requires_exact":true,"rearm_retains_usage":!first});
     std::fs::write(
         setting("BLOOM_PM80_AUTHORIZATION_RESULT").with_extension(if first {
             "first.json"
