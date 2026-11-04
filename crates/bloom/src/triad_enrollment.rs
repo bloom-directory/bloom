@@ -1366,6 +1366,67 @@ mod tests {
     }
 
     #[test]
+    fn pinned_release_catalog_does_not_certify_old_polymarket_effects() {
+        let output = tempfile::tempdir().unwrap();
+        let catalog_path = output.path().join("catalog.json");
+        let installer = GeneratedKey::new();
+        sign_provenance_catalog(
+            &template_dir().join("provenance-catalog.unsigned.json"),
+            &catalog_path,
+            "test-installer",
+            &installer,
+        )
+        .unwrap();
+        let catalog: ProvenanceCatalog =
+            serde_json::from_slice(&fs::read(catalog_path).unwrap()).unwrap();
+        let selection: bloom_machine_client::PersonaSessionSelection = serde_json::from_str(
+            include_str!("../../../docs/examples/generic-session-selection.json"),
+        )
+        .unwrap();
+        let capabilities = bloom_broker_api::reusable_signing_profiles()
+            .iter()
+            .map(|profile| Token::new(profile.capability_schema()).unwrap())
+            .collect::<Vec<_>>();
+        for hash in [
+            crate::github_source::preinstalled_petal("polymarket")
+                .unwrap()
+                .expected_hash
+                .unwrap(),
+            crate::github_source::release_lineage_predecessor("polymarket")
+                .unwrap()
+                .hash,
+        ] {
+            let hash = Digest32::new(hash).unwrap();
+            let records = catalog.records.iter().filter(|record| matches!(
+                &record.subject, ProvenanceSubject::Petal {package_hash, ..} if package_hash == &hash
+            )).collect::<Vec<_>>();
+            assert_eq!(
+                records.len(),
+                5,
+                "all real release authority routes must be present"
+            );
+            assert!(records.iter().all(|record| {
+                record
+                    .operation_classes
+                    .iter()
+                    .all(|class| class.economic_effects_schema.is_none())
+            }));
+            assert!(
+                crate::persona_onboarding::certified_petal_selection(
+                    &hash,
+                    &catalog,
+                    0,
+                    &selection.members[0].key_ref,
+                    &capabilities,
+                )
+                .unwrap()
+                .is_none(),
+                "an advertised verifier cannot certify an unsupported release artifact"
+            );
+        }
+    }
+
+    #[test]
     fn developer_enrollment_platform_policy_accepts_non_root_linux_and_macos_only() {
         validate_developer_caller(1000, "linux").unwrap();
         validate_developer_caller(501, "macos").unwrap();

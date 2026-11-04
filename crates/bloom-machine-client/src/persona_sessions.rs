@@ -866,11 +866,25 @@ impl MachineBrokerClient {
             request.petal_use_claim.as_ref(),
             request.system_use_claim.as_ref(),
             request.session_use.as_ref(),
-            request.claim_assurance_evidence.as_deref(),
+            request
+                .message_review_payload
+                .as_deref()
+                .filter(|_| {
+                    request
+                        .petal_use_claim
+                        .as_ref()
+                        .is_some_and(|claim| claim.operation_class.as_str() == "gasless.relay")
+                })
+                .or(request.claim_assurance_evidence.as_deref()),
             &request.signing_operation_id,
             std::slice::from_ref(&request.preimage),
             false,
-            false,
+            request.allow_persona
+                && request.expected_key_ref.is_some()
+                && request
+                    .petal_use_claim
+                    .as_ref()
+                    .is_some_and(|claim| claim.operation_class.as_str() == "gasless.relay"),
         )
         .await
     }
@@ -1181,6 +1195,17 @@ impl MachineBrokerClient {
                     && recovery_status
                         .as_ref()
                         .is_err_and(|status| status.code == ProtocolErrorCode::ApprovalNotFound);
+                // A valid EIP-3009 payment outside the reviewed gasless profile
+                // may request exact review, only after authenticated status
+                // proves this attempt has no retained operation or signature.
+                // Malformed payloads and mismatched claims never use this code.
+                let gasless_exact_stepup = allow_limit_stepup
+                    && matches!(provenance, ProvenanceSubject::Petal { .. })
+                    && claim.is_some_and(|claim| claim.operation_class.as_str() == "gasless.relay")
+                    && error.code == ProtocolErrorCode::EffectsUnsupported
+                    && recovery_status
+                        .as_ref()
+                        .is_err_and(|status| status.code == ProtocolErrorCode::ApprovalNotFound);
                 let limit_stepup = allow_limit_stepup
                     && matches!(provenance, ProvenanceSubject::Petal { .. })
                     && error.code == ProtocolErrorCode::LimitExceededValue
@@ -1201,8 +1226,8 @@ impl MachineBrokerClient {
                                 })
                         }
                     };
-                if native_exact_stepup || limit_stepup {
-                    // Native step-up additionally proves no retained operation exists.
+                if native_exact_stepup || gasless_exact_stepup || limit_stepup {
+                    // Native and gasless step-up prove no retained operation exists.
                     // Retain source identity while making the fallback durable.
                     let mut attempt: SigningAttempt =
                         read_json(&path)?.ok_or_else(|| io_error("missing frozen attempt"))?;
@@ -1434,6 +1459,7 @@ mod tests {
         lose_next_response: bool,
         fail_wallet_reads: bool,
         reject_limit: bool,
+        profile_refusal: Option<ProtocolErrorCode>,
         native_refusal: bool,
         retain_native_refusal: bool,
         status_unavailable: bool,
@@ -1582,6 +1608,15 @@ mod tests {
                         ))
                     }
                     MachineBrokerRequest::SigningSign(request) => {
+                        if let Some(code) = state.profile_refusal {
+                            if state.retain_native_refusal {
+                                state.pending.insert(
+                                    request.operation_id.as_str().to_owned(),
+                                    request.operation_digest,
+                                );
+                            }
+                            return Err(ProtocolError::new(code, "profile refusal"));
+                        }
                         if state.native_refusal {
                             if state.retain_native_refusal {
                                 state.pending.insert(
@@ -1676,6 +1711,9 @@ mod tests {
         }
     }
     fn fixture() -> (tempfile::TempDir, MachineBrokerClient, Arc<Broker>) {
+        fixture_with_class("polymarket.order.poly1271")
+    }
+    fn fixture_with_class(class: &str) -> (tempfile::TempDir, MachineBrokerClient, Arc<Broker>) {
         let directory = tempfile::tempdir().unwrap();
         let broker = Arc::new(Broker(Mutex::new(State {
             wallet: wallet(),
@@ -1685,6 +1723,7 @@ mod tests {
             lose_next_response: false,
             fail_wallet_reads: false,
             reject_limit: false,
+            profile_refusal: None,
             native_refusal: false,
             retain_native_refusal: false,
             status_unavailable: false,
@@ -1694,7 +1733,14 @@ mod tests {
         })));
         let client =
             MachineBrokerClient::new(broker.clone()).with_persona_session_store(directory.path());
-        let proposal = proposal();
+        let mut proposal = proposal();
+        if let ApprovalSelector::Petal {
+            allowed_operation_classes,
+            ..
+        } = &mut proposal.terms.selector
+        {
+            *allowed_operation_classes = vec![token(class)];
+        }
         atomic_json(
             &grant_path(directory.path(), &proposal.terms.approval_id().unwrap()),
             &SessionRecord {
@@ -2182,6 +2228,102 @@ mod tests {
             .unwrap();
         assert!(result.is_some());
         assert_eq!(broker.0.lock().unwrap().signatures, 1);
+    }
+
+    #[tokio::test]
+    async fn gasless_profile_stepup_requires_supported_refusal_and_definitive_absence() {
+        for (class, code, unavailable, retained, allowed, fallback) in [
+            (
+                "gasless.relay",
+                ProtocolErrorCode::EffectsUnsupported,
+                false,
+                false,
+                true,
+                true,
+            ),
+            (
+                "gasless.relay",
+                ProtocolErrorCode::EffectsUnsupported,
+                true,
+                false,
+                true,
+                false,
+            ),
+            (
+                "gasless.relay",
+                ProtocolErrorCode::EffectsUnsupported,
+                false,
+                true,
+                true,
+                false,
+            ),
+            (
+                "gasless.relay",
+                ProtocolErrorCode::SelectorMismatch,
+                false,
+                false,
+                true,
+                false,
+            ),
+            (
+                "gasless.relay",
+                ProtocolErrorCode::EffectsUnsupported,
+                false,
+                false,
+                false,
+                false,
+            ),
+            (
+                "example.order",
+                ProtocolErrorCode::EffectsUnsupported,
+                false,
+                false,
+                true,
+                false,
+            ),
+        ] {
+            let (directory, client, broker) = fixture_with_class(class);
+            {
+                let mut state = broker.0.lock().unwrap();
+                state.profile_refusal = Some(code);
+                state.status_unavailable = unavailable;
+                state.retain_native_refusal = retained;
+            }
+            let payload = b"payment";
+            let mut claim = use_claim(payload, 1);
+            claim.operation_class = token(class);
+            let operation = OperationId::from_bytes([52; 32]);
+            let result = client
+                .try_persona_sign_payloads(
+                    &token("wallet"),
+                    &key(),
+                    claim.crypto_suite,
+                    &ProvenanceSubject::Petal {
+                        package_hash: digest(4),
+                        route: claim.route.clone(),
+                    },
+                    &digest(83),
+                    Some(&claim),
+                    None,
+                    None,
+                    None,
+                    &operation,
+                    &[payload.to_vec()],
+                    false,
+                    allowed,
+                )
+                .await;
+            if fallback {
+                assert!(result.unwrap().is_none());
+            } else {
+                assert_eq!(result.unwrap_err().code, code);
+            }
+            let attempt = read_json::<SigningAttempt>(&attempt_path(directory.path(), &operation))
+                .unwrap()
+                .unwrap();
+            assert_eq!(attempt.exact_fallback, fallback);
+            assert_eq!(broker.0.lock().unwrap().signatures, 0);
+        }
     }
 
     #[tokio::test]

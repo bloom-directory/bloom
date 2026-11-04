@@ -347,6 +347,21 @@ struct PetalTxOutbox {
     write_permit: Option<Arc<HomeWritePermit>>,
 }
 
+/// Prepared single-message discovery is limited to the reviewed EIP-3009
+/// adapter. Other message envelopes keep their existing exact-review flow.
+fn prepared_message_persona_eligible(context: &PetalRouteContext, operation_class: &str) -> bool {
+    context
+        .params
+        .iter()
+        .any(|(name, value)| name == "bloom.internal.prepared-persona" && value == "true")
+        && bloom_broker_api::reusable_signing_profiles()
+            .iter()
+            .any(|profile| {
+                profile.id == "gasless.relay.eip3009.v1"
+                    && profile.operation_class == operation_class
+            })
+}
+
 fn petal_review_payload<'a>(
     operation_class: &str,
     claimed_class: &str,
@@ -2163,7 +2178,9 @@ impl PetalHost for DaemonPetalHost {
             let signer = BrokerExactPayloadSigner::new(broker.clone(), catalog)
                 .with_account_key(account_key.clone())
                 .with_expected_key(expected_key)
-                .with_persona_discovery(!strict)
+                .with_persona_discovery(
+                    !strict || prepared_message_persona_eligible(&context, &req.operation_class),
+                )
                 .with_strict_recovery(strict);
             let _guard = self.petal_signing_lock.lock().await;
             let outcome = signer

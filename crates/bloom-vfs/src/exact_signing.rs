@@ -146,6 +146,8 @@ struct ExactSigningState {
     approval_id: Option<Digest32>,
     #[serde(default, skip_serializing_if = "is_false")]
     signing_attempted: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    exact_fallback: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -437,6 +439,7 @@ impl BrokerExactPayloadSigner {
                     canonical_plan_facts_digest: canonical_plan_facts_digest.clone(),
                     approval_id: None,
                     signing_attempted: false,
+                    exact_fallback: false,
                 }
             }
             Err(error) => return Err(format!("read exact signing state: {error}")),
@@ -509,7 +512,7 @@ impl BrokerExactPayloadSigner {
             approval_id: state.approval_id.clone(),
             account_key_ref: self.account_key_ref.clone(),
             expected_key_ref: self.expected_key_ref.clone(),
-            allow_persona: self.allow_persona,
+            allow_persona: self.allow_persona && !state.exact_fallback,
             petal_use_claim: petal_claim.map(|(claim, _)| claim.clone()),
             system_use_claim: None,
             claim_assurance_evidence: petal_claim
@@ -539,6 +542,16 @@ impl BrokerExactPayloadSigner {
         }
         match response {
             Ok(ExactPayloadSignOutcome::ApprovalRequired(prepared)) => {
+                if self.strict_recovery
+                    && !state.exact_fallback
+                    && self
+                        .broker
+                        .persona_exact_fallback(&state.signing_operation_id)
+                        .map_err(|error| error.to_string())?
+                {
+                    state.exact_fallback = true;
+                    state.signing_operation_id = random_operation_id();
+                }
                 state.approval_id = Some(prepared.approval_id.clone());
                 write_state(state_path, &state)?;
                 Ok(ExactPayloadOutcome::ApprovalRequired {
@@ -2274,6 +2287,7 @@ mod tests {
             canonical_plan_facts_digest: digest(4),
             approval_id: None,
             signing_attempted: false,
+            exact_fallback: false,
         };
         let batch = ExactBatchSigningState {
             schema: single.schema.clone(),

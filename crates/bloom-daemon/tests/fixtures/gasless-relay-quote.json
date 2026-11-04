@@ -1,0 +1,162 @@
+{
+  "steps": [
+    {
+      "id": "authorize1",
+      "kind": "signature",
+      "requestId": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "items": [
+        {
+          "data": {
+            "sign": {
+              "signatureKind": "eip712",
+              "types": {
+                "ReceiveWithAuthorization": [
+                  {
+                    "name": "from",
+                    "type": "address"
+                  },
+                  {
+                    "name": "to",
+                    "type": "address"
+                  },
+                  {
+                    "name": "value",
+                    "type": "uint256"
+                  },
+                  {
+                    "name": "validAfter",
+                    "type": "uint256"
+                  },
+                  {
+                    "name": "validBefore",
+                    "type": "uint256"
+                  },
+                  {
+                    "name": "nonce",
+                    "type": "bytes32"
+                  }
+                ]
+              },
+              "domain": {
+                "name": "USD Coin",
+                "version": "2",
+                "chainId": 8453,
+                "verifyingContract": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+              },
+              "primaryType": "ReceiveWithAuthorization",
+              "value": {
+                "from": "0x03508bb71268bba25ecacc8f620e01866650532c",
+                "to": "0xccc88a9d1b4ed6b0eaba998850414b24f1c315be",
+                "value": "100000000",
+                "validAfter": 0,
+                "validBefore": 1999999999,
+                "nonce": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+              }
+            },
+            "post": {
+              "endpoint": "/execute/permits",
+              "method": "POST",
+              "body": {
+                "kind": "eip3009",
+                "requestId": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "api": "swap"
+              }
+            }
+          },
+          "check": {
+            "endpoint": "/intents/status/v3?requestId=0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "method": "GET"
+          }
+        }
+      ]
+    }
+  ],
+  "details": {
+    "sender": "0x03508bb71268bba25ecacc8f620e01866650532c",
+    "recipient": "0x03508bb71268bba25ecacc8f620e01866650532c",
+    "currencyIn": {
+      "currency": {
+        "chainId": 8453,
+        "address": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+        "decimals": 6
+      },
+      "amount": "100000000",
+      "amountFormatted": "100.0"
+    },
+    "currencyOut": {
+      "currency": {
+        "chainId": 10,
+        "address": "0x0b2c639c533813f4aa9d7837caf62653d097ff85",
+        "decimals": 6
+      },
+      "amount": "98000000",
+      "amountFormatted": "98.0",
+      "minimumAmount": "97500000"
+    },
+    "refundCurrency": {
+      "currency": {
+        "chainId": 8453,
+        "address": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+        "decimals": 6
+      },
+      "amount": "100000000",
+      "amountFormatted": "100.0",
+      "minimumAmount": "100000000"
+    },
+    "totalImpact": {
+      "percent": "-2.0"
+    },
+    "expandedPriceImpact": {
+      "execution": {
+        "percent": "-1.0"
+      }
+    },
+    "timeEstimate": 3
+  },
+  "fees": {
+    "app": {
+      "amount": "0",
+      "minimumAmount": "0"
+    }
+  },
+  "protocol": {
+    "v2": {
+      "orderData": {
+        "inputs": [
+          {
+            "payment": {
+              "chainId": "base",
+              "currency": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+              "amount": "100000000"
+            },
+            "refunds": [
+              {
+                "chainId": "base",
+                "recipient": "0x03508bb71268bba25ecacc8f620e01866650532c",
+                "currency": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+              },
+              {
+                "chainId": "optimism",
+                "recipient": "0x03508bb71268bba25ecacc8f620e01866650532c",
+                "currency": "0x0b2c639c533813f4aa9d7837caf62653d097ff85"
+              }
+            ]
+          }
+        ],
+        "output": {
+          "chainId": "optimism",
+          "payments": [
+            {
+              "recipient": "0x03508bb71268bba25ecacc8f620e01866650532c",
+              "currency": "0x0b2c639c533813f4aa9d7837caf62653d097ff85",
+              "minimumAmount": "97500000",
+              "expectedAmount": "98000000"
+            }
+          ],
+          "calls": []
+        },
+        "fees": []
+      }
+    }
+  }
+}

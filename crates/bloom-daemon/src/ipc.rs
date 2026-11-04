@@ -740,6 +740,7 @@ pub enum MachineCommand {
         name: String,
     },
     /// Save browser onboarding choices through the sole Machine home owner.
+    OnboardingPetals,
     OnboardingSetup {
         wallet: String,
         preset: bloom_proto::persona::PersonaPreset,

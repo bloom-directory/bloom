@@ -40,6 +40,7 @@ pub(crate) fn petal_label(name: &str) -> &str {
         "enso" => "Enso",
         "near-intents" => "NEAR Intents",
         "feedback" => "Feedback",
+        "gasless" => "Gasless",
         other => other,
     }
 }
@@ -59,6 +60,21 @@ pub(crate) fn menu_petals() -> Vec<String> {
         .iter()
         .map(|name| (*name).to_owned())
         .collect()
+}
+
+/// Optional gasless is offered only after an owner installs it. This never
+/// expands the default install set or treats local ownership as certification.
+pub(crate) fn onboarding_petals(daemon: &Daemon) -> Result<Vec<String>> {
+    let mut names = menu_petals();
+    if daemon
+        .petals
+        .store()
+        .resolve_petal_owner("gasless")?
+        .is_some()
+    {
+        names.push("gasless".into());
+    }
+    Ok(names)
 }
 
 /// Whether `bloom init` can ask the setup questions.
@@ -145,7 +161,7 @@ pub(crate) fn persona_message(persona: Option<&PersonaConfig>) -> String {
         "persona: institutional; current transaction approval behavior retained".into()
     } else {
         format!(
-            "persona: {}; independent token allowances per rolling {} hours, until revoked; approve the exact accounts, apps and token amounts before automatic spending",
+            "persona: {}; independent token allowances per Petal/account per rolling {} hours, until revoked. Allowances add together across Petals and accounts. They limit signed volume; cancelling signed orders does not refund usage, and open orders are not limited by the window. Separate venue limits may be lower. Approve the exact accounts, apps and token amounts before automatic spending",
             persona.preset.as_str(),
             persona.window_secs / 3600
         )
@@ -164,7 +180,7 @@ pub(crate) fn persona_message(persona: Option<&PersonaConfig>) -> String {
 /// recorded in `setup`, which the default policy proposes.
 pub(crate) fn run_setup_menu(
     petals: &mut PetalsConfig,
-    persona: Option<&PersonaConfig>,
+    _persona: Option<&PersonaConfig>,
     input: &mut impl BufRead,
     output: &mut impl Write,
 ) -> Result<()> {
@@ -190,13 +206,12 @@ pub(crate) fn run_setup_menu(
         let mut values = BTreeMap::new();
         if let Some(template) = setup_template(name) {
             for value in template.values {
-                let persona_suggestion = suggested_venue_limit(persona, name, value.name);
                 let suggestion = earlier
                     .get(name)
                     .and_then(|setup| setup.values.get(value.name))
                     .map(String::as_str)
                     .filter(|saved| is_setup_amount(saved))
-                    .unwrap_or(persona_suggestion.as_deref().unwrap_or(value.default));
+                    .unwrap_or(value.default);
                 let answer = ask_amount(input, output, value.prompt, suggestion)?;
                 values.insert(value.name.to_owned(), answer);
             }
@@ -211,7 +226,10 @@ pub(crate) fn run_setup_menu(
 /// no earlier choices that records every canonical Petal with the catalog's
 /// values; earlier choices are kept as they are, so a declined Petal stays
 /// declined and a saved value stays saved.
-pub(crate) fn accept_setup_suggestions(petals: &mut PetalsConfig, persona: Option<&PersonaConfig>) {
+pub(crate) fn accept_setup_suggestions(
+    petals: &mut PetalsConfig,
+    _persona: Option<&PersonaConfig>,
+) {
     if !petals.setup.is_empty() {
         return;
     }
@@ -221,13 +239,7 @@ pub(crate) fn accept_setup_suggestions(petals: &mut PetalsConfig, persona: Optio
                 template
                     .values
                     .iter()
-                    .map(|value| {
-                        (
-                            value.name.to_owned(),
-                            suggested_venue_limit(persona, &name, value.name)
-                                .unwrap_or_else(|| value.default.to_owned()),
-                        )
-                    })
+                    .map(|value| (value.name.to_owned(), value.default.to_owned()))
                     .collect()
             })
             .unwrap_or_default();
@@ -236,24 +248,6 @@ pub(crate) fn accept_setup_suggestions(petals: &mut PetalsConfig, persona: Optio
             .entry(name.clone())
             .or_insert(PetalSetupConfig { values });
     }
-}
-
-fn suggested_venue_limit(
-    persona: Option<&PersonaConfig>,
-    petal: &str,
-    value: &str,
-) -> Option<String> {
-    if petal != "polymarket" || value != "max_daily_usd" {
-        return None;
-    }
-    // This existing venue setting is a pUSD order-cost ceiling despite its
-    // historic name. Seed fresh settings from the token quantity, never a
-    // price. For Degen the Broker's seven-day limit remains stricter; saved
-    // owner settings are still preserved by the setup merge.
-    let profile = persona?;
-    profile
-        .token_amounts("pUSD")
-        .map(|(_, total)| total.to_owned())
 }
 
 fn ask_yes_no(
@@ -1472,6 +1466,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn optional_gasless_requires_installation_and_is_never_a_default() {
+        let home = tempfile::tempdir().unwrap();
+        let mut daemon = Daemon::from_home(bloom_proto::HomeDir::at(home.path())).unwrap();
+        daemon
+            .config
+            .petals
+            .setup
+            .insert("gasless".into(), PetalSetupConfig::default());
+        assert!(
+            !onboarding_petals(&daemon)
+                .unwrap()
+                .iter()
+                .any(|name| name == "gasless"),
+            "an edited preference is not an installed owner"
+        );
+        assert!(!github_source::DEFAULT_PETALS.contains(&"gasless"));
+        assert_eq!(petal_label("gasless"), "Gasless");
+        assert!(
+            policy_destinations("gasless").unwrap().is_empty(),
+            "gasless signs permits rather than staging transfers; Broker pins its receiver"
+        );
+    }
+
+    #[test]
     fn persona_selection_preserves_unspecified_choices_and_uses_token_windows() {
         let mut saved = None;
         select_persona(&mut saved, None).unwrap();
@@ -1490,7 +1508,11 @@ mod tests {
         let trader = PersonaConfig::suggested(PersonaPreset::Trader);
         let mut fresh = PetalsConfig::default();
         accept_setup_suggestions(&mut fresh, Some(&trader));
-        assert_eq!(polymarket_limit(&fresh), Some("1000"));
+        assert_eq!(polymarket_limit(&fresh), Some("100"));
+        let degen = PersonaConfig::suggested(PersonaPreset::Degen);
+        let mut degen_setup = PetalsConfig::default();
+        accept_setup_suggestions(&mut degen_setup, Some(&degen));
+        assert_eq!(polymarket_limit(&degen_setup), Some("100"));
         fresh
             .setup
             .get_mut("polymarket")

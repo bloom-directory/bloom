@@ -8,7 +8,8 @@ run_root="${1:?usage: test-polymarket-authorization.sh FRESH_EMPTY_RUN_ROOT}"
 case "${2:-login}" in
   login) test_name=installed_account_one_auth_and_exact_continuation_use_real_authority ;;
   prepared-buy) test_name=prepared_buy_uses_real_bounded_permission ;;
-  *) echo "Expected login or prepared-buy" >&2; exit 1 ;;
+  prepared-gasless) test_name=gasless_authorization::prepared_gasless_uses_real_bounded_permission ;;
+  *) echo "Expected login, prepared-buy or prepared-gasless" >&2; exit 1 ;;
 esac
 [[ "$run_root" == /tmp/pm80-auth.* ]] || { echo 'Expected a fresh /tmp/pm80-auth.* root' >&2; exit 1; }
 [ -d "$run_root" ] && [ ! -L "$run_root" ] || exit 1
@@ -16,7 +17,12 @@ esac
 for variable in BLOOM_INTEGRATION_MACHINE_BIN BLOOM_INTEGRATION_BROKER_BIN BLOOM_INTEGRATION_SIGNER_BIN BLOOM_INTEGRATION_DEBUG_DRIVER_BIN; do
   [ -x "${!variable:?set exact candidate binaries}" ] || exit 1
 done
-[ -d "${BLOOM_PM80_POLYMARKET_ROOT:?set the built source package}" ] || exit 1
+if [ "${2:-login}" = prepared-gasless ]; then
+  package_root="${BLOOM_PM80_GASLESS_ROOT:?set the built gasless source package}"
+else
+  package_root="${BLOOM_PM80_POLYMARKET_ROOT:?set the built source package}"
+fi
+[ -d "$package_root" ] || exit 1
 free_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'; }
 cat > "$run_root/machine.toml" <<'EOF'
 default_chain = "polygon"
@@ -33,7 +39,7 @@ export BLOOM_TRIAD_DEV_MACHINE_CONFIG="$run_root/machine.toml"
 export BLOOM_TRIAD_DEV_BUILD_PETALS=0 BLOOM_TRIAD_DEV_AUTHORITY_FIXTURE=0
 # Reuse the launcher's existing source-package installer enrollment hook. Its
 # historical variable name does not constrain the generated package's name.
-export BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE="$BLOOM_PM80_POLYMARKET_ROOT"
+export BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE="$package_root"
 launcher_pid=""
 cleanup() {
   status=$?
@@ -64,12 +70,12 @@ start_services() {
   source "$run_root/logs/triad.env"
 }
 run_test() {
-  cargo test --locked -p bloom-daemon --features triad-dev-harness --lib \
+  cargo test --locked -j2 -p bloom-daemon --features triad-dev-harness --lib \
     "polymarket_authorization::$test_name" -- --ignored --exact
 }
 cd "$repo_root"
 start_services
-if [ "$test_name" = prepared_buy_uses_real_bounded_permission ]; then
+if [ "${2:-login}" = prepared-buy ] || [ "${2:-login}" = prepared-gasless ]; then
   export BLOOM_PM80_BUY_PHASE=first
   run_test
   kill "$launcher_pid"

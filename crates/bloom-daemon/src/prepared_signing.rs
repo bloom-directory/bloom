@@ -890,6 +890,38 @@ mod tests {
         .with_spend(spend)
     }
     #[test]
+    fn prepared_single_message_discovery_requires_the_reviewed_gasless_profile() {
+        let mut trusted = context();
+        assert!(!prepared_message_persona_eligible(
+            &trusted,
+            "gasless.relay"
+        ));
+        trusted
+            .params
+            .push(("bloom.internal.prepared-persona".into(), "true".into()));
+        let gasless_supported = bloom_broker_api::reusable_signing_profiles()
+            .iter()
+            .any(|profile| profile.id == "gasless.relay.eip3009.v1");
+        assert!(
+            gasless_supported,
+            "candidate Broker API must include the reviewed gasless adapter"
+        );
+        assert!(prepared_message_persona_eligible(&trusted, "gasless.relay"));
+        for class in [
+            "example.order",
+            "gasless.unknown",
+            "polymarket.order.poly1271",
+        ] {
+            assert!(!prepared_message_persona_eligible(&trusted, class));
+        }
+        trusted.params.last_mut().unwrap().1 = "false".into();
+        assert!(!prepared_message_persona_eligible(
+            &trusted,
+            "gasless.relay"
+        ));
+    }
+
+    #[test]
     fn debit_claim_binds_exact_chain_asset_and_payload() {
         let spend = prepared::Spend::erc20(
             "evm-137",

@@ -1376,6 +1376,15 @@ fn validate_release_authority(
                     .collect::<std::collections::BTreeSet<_>>()
             })
             .unwrap_or_default();
+        if let Some(declaration) = declared.get(route.route_id.as_str())
+            && route.economic_effects_schema != declaration.economic_effects_schema
+        {
+            bail!(
+                "pre-installed Petal {} route {} effects schema differs from the release declaration",
+                entry.name,
+                route.route_id
+            );
+        }
         if actual != expected {
             bail!(
                 "pre-installed Petal {} route {} authority differs from the release declaration",
@@ -2222,6 +2231,28 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("authority differs"), "{error}");
+    }
+
+    #[test]
+    fn release_authority_cannot_certify_an_unsupported_artifact_schema() {
+        let mut release = build_near_release("effects-check");
+        let route = &mut release.package.route_index.routes[0];
+        route.route_id = "r000001".into();
+        route.install_metadata.sign_intent = Some("example.sign".into());
+        let entry = PreinstalledPetal {
+            authority_routes: &[PetalAuthorityRoute {
+                economic_effects_schema: Some(1),
+                route_id: "r000001",
+                operation_classes: &["example.sign"],
+            }],
+            ..*preinstalled_petal("near-intents").unwrap()
+        };
+        let error = validate_release_authority(&entry, &release.package).unwrap_err();
+        assert!(error.to_string().contains("effects schema differs"));
+        release.package.route_index.routes[0].economic_effects_schema = Some(1);
+        validate_release_authority(&entry, &release.package).unwrap();
+        release.package.route_index.routes[0].economic_effects_schema = Some(2);
+        assert!(validate_release_authority(&entry, &release.package).is_err());
     }
 
     fn near_catalog_entry(

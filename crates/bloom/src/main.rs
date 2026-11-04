@@ -1324,6 +1324,9 @@ fn machine_command_event_fields(
             None,
             MachineCommandEventClass::DurableMutation,
         ),
+        MachineCommand::OnboardingPetals => {
+            ("onboarding_petals", None, MachineCommandEventClass::Read)
+        }
         MachineCommand::PersonaPreferencesSet { .. } => (
             "persona_preferences_set",
             None,
@@ -1845,6 +1848,13 @@ async fn execute_machine_command(
             })?;
             let status = default_policy::advance_default_policy(daemon, &name).await?;
             format!("{}\n", serde_json::to_string(&status)?)
+        }
+        MachineCommand::OnboardingPetals => {
+            let catalog = default_policy::onboarding_petals(daemon)?
+                .into_iter()
+                .map(|id| serde_json::json!({"label":default_policy::petal_label(&id),"id":id}))
+                .collect::<Vec<_>>();
+            format!("{}\n", serde_json::to_string(&catalog)?)
         }
         MachineCommand::OnboardingSetup {
             wallet,
@@ -3797,7 +3807,7 @@ async fn apply_browser_setup(
     let mut config = bloom_proto::Config::load(&daemon.home.config_path())?;
     let previous = config.clone();
     default_policy::select_persona(&mut config.persona, Some(preset))?;
-    let allowed = default_policy::menu_petals();
+    let allowed = default_policy::onboarding_petals(daemon)?;
     anyhow::ensure!(
         chosen_petals.len() <= allowed.len(),
         "too many selected Petals"
@@ -3818,10 +3828,11 @@ async fn apply_browser_setup(
         .setup
         .retain(|name, _| chosen_petals.contains(name));
     for name in chosen_petals {
-        if !config.petals.setup.contains_key(name)
-            && let Some(values) = suggestions.setup.remove(name)
-        {
-            config.petals.setup.insert(name.clone(), values);
+        if !config.petals.setup.contains_key(name) {
+            config.petals.setup.insert(
+                name.clone(),
+                suggestions.setup.remove(name).unwrap_or_default(),
+            );
         }
     }
     config.petals.setup_complete = previous.petals.setup_complete;
@@ -4519,7 +4530,7 @@ async fn run(cli: Cli) -> Result<()> {
                 })
                 .transpose()?;
             println!(
-                "persona coverage: independent token allowances per app/account, with recurring rolling windows. Approve each returned scope once; repeated activation resumes existing authority. Unsupported actions retain owner approval."
+                "persona coverage: independent token allowances per Petal/account, with recurring rolling windows. Allowances add together across Petals and accounts. They limit signed volume; cancelling signed orders does not refund usage, and open orders are not limited by the window. Separate venue limits may be lower. Approve each returned scope once; repeated activation resumes existing authority. Unsupported actions retain owner approval."
             );
             call_machine_command(
                 &client_endpoint,

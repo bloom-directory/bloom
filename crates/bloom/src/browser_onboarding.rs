@@ -44,6 +44,8 @@ struct ActionRequest {
     account: Option<u32>,
     #[serde(default)]
     selection: Option<bloom_machine_client::PersonaSessionSelection>,
+    #[serde(default, deserialize_with = "deserialize_approval_choice")]
+    approval: Option<bloom_broker_api::Digest32>,
     #[serde(default, deserialize_with = "deserialize_wallet_choice")]
     wallet: Option<String>,
 }
@@ -56,12 +58,19 @@ fn deserialize_wallet_choice<'de, D: serde::Deserializer<'de>>(
     String::deserialize(deserializer).map(Some)
 }
 
+fn deserialize_approval_choice<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<bloom_broker_api::Digest32>, D::Error> {
+    bloom_broker_api::Digest32::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Action {
     SelectWallet,
     Policy,
     Activate,
+    Rearm,
     Stop,
     Refresh,
 }
@@ -379,10 +388,19 @@ async fn state_snapshot(state: &AppState) -> Result<Value> {
     let ceremony_url = sessions
         .get("data")
         .and_then(|value| find_ceremony_url(value, &state.broker_origin));
-    let catalog = crate::default_policy::menu_petals()
-        .into_iter()
-        .map(|id| json!({"label":crate::default_policy::petal_label(&id),"id":id}))
-        .collect::<Vec<_>>();
+    let discovered_catalog = observe(state, MachineCommand::OnboardingPetals).await;
+    let catalog = discovered_catalog
+        .get("data")
+        .filter(|value| value.is_array())
+        .cloned()
+        .unwrap_or_else(|| {
+            json!(
+                crate::default_policy::menu_petals()
+                    .into_iter()
+                    .map(|id| json!({"label":crate::default_policy::petal_label(&id),"id":id}))
+                    .collect::<Vec<_>>()
+            )
+        });
     Ok(
         json!({"config":config, "machine":{"available":available,"persona_supported":persona_supported,"error":wallets.get("error")}, "wallets":wallets, "wallet_choices":choices,"selected_wallet":selected,"wallet_required":available && selected.is_none(), "policy":policy, "sessions":sessions, "catalog":catalog, "reusable_profiles":bloom_broker_api::reusable_signing_profiles().iter().map(|p|json!({"id":p.id,"display_name":p.display_name,"operation_class":p.operation_class})).collect::<Vec<_>>(), "ceremony_url":ceremony_url}),
     )
@@ -514,6 +532,12 @@ async fn setup(State(state): State<App>, Json(request): Json<SetupRequest>) -> R
 }
 
 async fn action(State(state): State<App>, Json(request): Json<ActionRequest>) -> Response {
+    if matches!(request.action, Action::Rearm) != request.approval.is_some() {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "rearm requires an exact approval; approval is only accepted by rearm",
+        );
+    }
     if !matches!(request.action, Action::Activate)
         && (request.account.is_some() || request.selection.is_some())
     {
@@ -561,22 +585,30 @@ async fn action(State(state): State<App>, Json(request): Json<ActionRequest>) ->
         Ok(wallet) => wallet,
         Err(response) => return *response,
     };
-    let command = match request.action {
+    let command = wallet_action_command(wallet, request);
+    match execute(&state, command).await {
+        Ok(output) => Json(command_result(output, &state.broker_origin)).into_response(),
+        Err(error) => api_error(StatusCode::BAD_GATEWAY, &format!("{error:#}")),
+    }
+}
+
+fn wallet_action_command(wallet: String, request: ActionRequest) -> MachineCommand {
+    match request.action {
         Action::Policy => MachineCommand::WalletDefaultPolicy { name: wallet },
         Action::Activate => MachineCommand::PersonaSessionActivateConfigured {
             wallet,
             account: request.account.unwrap_or(0),
             selection: request.selection,
         },
+        Action::Rearm => MachineCommand::PersonaSessionsRearm {
+            wallet,
+            approval: request.approval.map(|id| id.as_str().to_owned()),
+        },
         Action::Stop => MachineCommand::PersonaSessionsStop {
             wallet,
             reason: "owner stopped sessions from onboarding".into(),
         },
         Action::SelectWallet | Action::Refresh => unreachable!("handled above"),
-    };
-    match execute(&state, command).await {
-        Ok(output) => Json(command_result(output, &state.broker_origin)).into_response(),
-        Err(error) => api_error(StatusCode::BAD_GATEWAY, &format!("{error:#}")),
     }
 }
 
@@ -906,6 +938,11 @@ mod tests {
             r#"{"action":"wallet_import"}"#,
             r#"{"action":"refresh","wallet":"other"}"#,
             r#"{"action":"refresh","wallet":null}"#,
+            r#"{"action":"rearm"}"#,
+            r#"{"action":"rearm","approval":null}"#,
+            r#"{"action":"rearm","approval":"invalid"}"#,
+            r#"{"action":"refresh","approval":"1111111111111111111111111111111111111111111111111111111111111111"}"#,
+            r#"{"action":"rearm","approval":"1111111111111111111111111111111111111111111111111111111111111111","account":1}"#,
         ] {
             let denied = request(
                 &server,
@@ -982,6 +1019,25 @@ mod tests {
             assert!(valid_ceremony_url(rejected, origin).is_none());
         }
         assert!(valid_ceremony_url("http://127.0.0.1:28745/ceremony/token", origin).is_some());
+    }
+
+    #[test]
+    fn browser_rearm_dispatches_the_exact_existing_permission() {
+        let approval = "12".repeat(32);
+        let request: ActionRequest = serde_json::from_value(json!({
+            "action":"rearm", "approval":approval,
+        }))
+        .unwrap();
+        let command = wallet_action_command("selected-wallet".into(), request);
+        let MachineCommand::PersonaSessionsRearm {
+            wallet,
+            approval: selected,
+        } = command
+        else {
+            panic!("existing rearm command required");
+        };
+        assert_eq!(wallet, "selected-wallet");
+        assert_eq!(selected.as_deref(), Some(approval.as_str()));
     }
 
     #[test]

@@ -61,7 +61,7 @@ and local chain 31337 with reviewed asset and fee unit limits. Supported mainnet
 Owner onboarding opens through `bloom init` or `bloom onboard` after install.
 The local browser delegates wallet and permission review to Broker ceremonies.
 If the CLI is available, `bloom wallet persona status main` reports grants,
-permission validity and per-token rolling usage. Owner-requested changes use `bloom wallet persona set`
+permission validity and per-Petal/account exact-asset rolling usage. Owner-requested changes use `bloom wallet persona set`
 and `activate`; `stop` disables local discovery before remote revocation.
 Never change a profile, revoke Broker authority, reset a budget or rotate an operation ID
 merely to work around a denial. A consumed, expired or unavailable grant is not
@@ -432,13 +432,18 @@ the central action's `approval_challenge.json` and `retry_path`; do not
 invent a Petal-local approval flow.
 
 An owner-approved persona session can cover selected native transfers and
-certified Petal actions across EVM/SVM accounts. Every member must be active
-before the shared dollar pool is usable. Check the exact account, asset,
-recipient and raw-unit scope; a persona preference alone grants nothing.
-Broker charges gross spending and maximum wallet-paid costs using approved
-prices at most 15 minutes old. Unsupported or unpriced actions keep ordinary
-owner approval. Retry the same staged action after approval; never restage an
-uncertain signature to obtain another budget or bypass a stopped pool.
+certified Petal actions for exact EVM/SVM accounts. Each Petal/account has an
+independent allowance per exact asset; its reviewed routes share that allowance.
+These allowances add together across Petals and accounts. Check the active
+permission's exact account, asset, recipient and raw-unit scope; a persona
+preference alone grants nothing. Broker accounts for signed volume in raw asset
+units under per-action and rolling-window limits, without price conversions.
+Cancelling signed orders does not refund usage, and open orders are not limited
+by the window. Separate venue limits may be lower. Restart and owner-requested
+rearm preserve the existing allowance and its usage. Unsupported actions keep
+ordinary owner approval. Retry the same staged action after approval; never
+restage an uncertain signature to obtain new capacity or bypass a stopped
+permission.
 
 For a native Solana transfer, the challenge is projected beside the pending
 wallet transfer instead:

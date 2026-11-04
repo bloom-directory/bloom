@@ -5,6 +5,9 @@ use bloom_broker_api::{CustodyPrepareRequest, Digest32, OperationId, Token};
 use bloom_vfs::{Handler, VfsPath};
 use std::sync::{Mutex, atomic::AtomicU64};
 
+#[path = "gasless_authorization.rs"]
+mod gasless_authorization;
+
 struct VenueFixture {
     machine: Arc<DaemonPetalHost>,
     trading_ready: bool,
@@ -12,6 +15,7 @@ struct VenueFixture {
     requests: Mutex<Vec<PayloadBatchSignRequest>>,
     signed: Mutex<Vec<(PayloadBatchSignRequest, Vec<Vec<u8>>)>>,
     auth_posts: AtomicU64,
+    relay_submissions: AtomicU64,
     prepared_requests: Mutex<Vec<(bloom_petal_contract::prepared::Request, PetalRouteContext)>>,
     prepared_signed: Mutex<Vec<(bloom_petal_contract::prepared::Request, Vec<u8>)>>,
     prepared_outcomes: Mutex<
@@ -41,6 +45,7 @@ impl VenueFixture {
             requests: Mutex::new(vec![]),
             signed: Mutex::new(vec![]),
             auth_posts: AtomicU64::new(0),
+            relay_submissions: AtomicU64::new(0),
             prepared_requests: Mutex::new(vec![]),
             prepared_signed: Mutex::new(vec![]),
             prepared_outcomes: Mutex::new(vec![]),
@@ -74,7 +79,32 @@ impl PetalHost for VenueFixture {
         _max: usize,
     ) -> Result<HttpResponse, HostError> {
         policy.check(&request.method, &request.url)?;
-        let body = if request.url == "https://clob.polymarket.com/time" && request.method == "GET" {
+        let body = if request.url == "https://api.relay.link/quote/v2" && request.method == "POST" {
+            gasless_authorization::quote_response(
+                &request,
+                self.auth_posts.fetch_add(1, Ordering::SeqCst),
+            )
+        } else if let Some(signature) = request
+            .url
+            .strip_prefix("https://api.relay.link/execute/permits?signature=")
+        {
+            assert_eq!(request.method, "POST");
+            let signed = self.prepared_signed.lock().unwrap();
+            let (_, bytes) = signed
+                .last()
+                .expect("submission requires a completed real signature");
+            assert!(signature == format!("0x{}", hex::encode(bytes)));
+            let submitted: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(submitted["kind"], "eip3009");
+            self.relay_submissions.fetch_add(1, Ordering::SeqCst);
+            br#"{"accepted":true}"#.to_vec()
+        } else if request
+            .url
+            .starts_with("https://api.relay.link/intents/status/v3?")
+        {
+            assert_eq!(request.method, "GET");
+            br#"{"status":"success","originChainId":8453,"destinationChainId":10}"#.to_vec()
+        } else if request.url == "https://clob.polymarket.com/time" && request.method == "GET" {
             self.timestamp
                 .load(Ordering::SeqCst)
                 .to_string()
@@ -804,6 +834,35 @@ async fn activate_buy_permission(
     provenance_digest: Digest32,
     counter: u64,
 ) -> bloom_machine_client::PersonaSessionStatus {
+    activate_token_permission(
+        daemon,
+        wallet,
+        key_ref,
+        package_hash,
+        route,
+        provenance_digest,
+        counter,
+        "polymarket.order.poly1271",
+        bloom_broker_api::AssetId {
+            chain: Token::new("evm-137").unwrap(),
+            asset: "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb".into(),
+        },
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn activate_token_permission(
+    daemon: &Daemon,
+    wallet: &Token,
+    key_ref: bloom_broker_api::KeyRef,
+    package_hash: &str,
+    route: &str,
+    provenance_digest: Digest32,
+    counter: u64,
+    operation_class: &str,
+    asset: bloom_broker_api::AssetId,
+) -> bloom_machine_client::PersonaSessionStatus {
     use bloom_broker_api::*;
     use sha2::Digest as _;
     let client = daemon.broker_client().unwrap();
@@ -816,11 +875,7 @@ async fn activate_buy_permission(
     )
     .unwrap();
     let package = Digest32::new(package_hash.to_owned()).unwrap();
-    let class = Token::new("polymarket.order.poly1271").unwrap();
-    let asset = AssetId {
-        chain: Token::new("evm-137").unwrap(),
-        asset: "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb".into(),
-    };
+    let class = Token::new(operation_class).unwrap();
     let limits = ApprovalLimits {
         max_operations: DecimalU64::new(20),
         max_signatures: DecimalU64::new(20),
