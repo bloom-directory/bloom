@@ -93,7 +93,16 @@ impl PetalHost for VenueFixture {
             let (_, bytes) = signed
                 .last()
                 .expect("submission requires a completed real signature");
-            assert!(signature == format!("0x{}", hex::encode(bytes)));
+            // Relay receives Ethereum's 27/28 recovery byte; Broker returns
+            // the same recoverable signature with a 0/1 recovery ID.
+            assert_eq!(bytes.len(), 65);
+            let mut relay_signature = bytes.clone();
+            relay_signature[64] = match bytes[64] {
+                0 | 1 => bytes[64] + 27,
+                27 | 28 => bytes[64],
+                other => panic!("invalid real signature recovery ID: {other}"),
+            };
+            assert_eq!(signature, format!("0x{}", hex::encode(relay_signature)));
             let submitted: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
             assert_eq!(submitted["kind"], "eip3009");
             self.relay_submissions.fetch_add(1, Ordering::SeqCst);
