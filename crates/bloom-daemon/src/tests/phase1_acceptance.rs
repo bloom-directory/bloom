@@ -20,10 +20,20 @@ async fn cli(home: &HomeDir, endpoint: &str, arguments: &[&str]) -> serde_json::
         .unwrap();
     assert!(
         output.status.success(),
-        "candidate Machine CLI failed: {:?}",
-        output.status.code()
+        "candidate Machine CLI failed: {:?}: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
     );
-    serde_json::from_slice(&output.stdout).unwrap_or(serde_json::Value::Null)
+    let value = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str(line).ok());
+    if arguments.contains(&"activate") {
+        value.expect("activation CLI must emit its JSON status payload")
+    } else {
+        value.unwrap_or(serde_json::Value::Null)
+    }
 }
 
 /// This starts the exact candidate executable, not an in-process compiler seam.
@@ -79,6 +89,46 @@ async fn onboard(
         &["wallet", "persona", "set", WALLET, "degen"],
     )
     .await;
+    // Exercise the actual end-user policy compiler, including Degen's signed
+    // native recipient opt-in, before proposing any automatic session.
+    let mut policy_command = tokio::process::Command::new(setting("BLOOM_INTEGRATION_MACHINE_BIN"))
+        .arg("--home")
+        .arg(home.root())
+        .arg("--connect")
+        .arg(&endpoint)
+        .args(["wallet", "default-policy", WALLET])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    use tokio::io::AsyncBufReadExt as _;
+    let mut lines = tokio::io::BufReader::new(policy_command.stdout.take().unwrap()).lines();
+    while let Some(line) = tokio::time::timeout(Duration::from_secs(30), lines.next_line())
+        .await
+        .expect("policy CLI must advance")
+        .unwrap()
+    {
+        if let Some(url) = line.strip_prefix("default_policy_url: ") {
+            *counter += 1;
+            complete(url, *counter, None);
+        }
+    }
+    let policy_output = policy_command.wait_with_output().await.unwrap();
+    assert!(
+        policy_output.status.success(),
+        "policy CLI failed: {}",
+        String::from_utf8_lossy(&policy_output.stderr)
+    );
+    let snapshot = client.policy(wallet.clone()).await.unwrap();
+    let policy: CanonicalWalletPolicy =
+        serde_json::from_slice(&snapshot.canonical_policy.decode()).unwrap();
+    assert!(
+        policy
+            .allowed_destinations
+            .iter()
+            .any(|d| d.chain.as_str() == "evm-137" && d.destination == ERC20_ANY_RECIPIENT)
+    );
     let mut finished = false;
     for _ in 0..16 {
         let value = cli(
