@@ -874,7 +874,10 @@ impl MachineBrokerClient {
             request.petal_use_claim.as_ref(),
             request.system_use_claim.as_ref(),
             request.session_use.as_ref(),
-            request.claim_assurance_evidence.as_deref(),
+            request
+                .message_review_payload
+                .as_deref()
+                .or(request.claim_assurance_evidence.as_deref()),
             &request.signing_operation_id,
             std::slice::from_ref(&request.preimage),
             false,
@@ -1480,6 +1483,7 @@ mod tests {
         pending: BTreeMap<String, Digest32>,
         pool_stop_requests: Vec<bloom_broker_api::SessionStopRequest>,
         outcomes: BTreeMap<String, SigningResult>,
+        last_sign_evidence: Option<Base64UrlBytes>,
     }
     struct Broker(Mutex<State>);
     impl MachineBrokerService for Broker {
@@ -1622,6 +1626,7 @@ mod tests {
                         ))
                     }
                     MachineBrokerRequest::SigningSign(request) => {
+                        state.last_sign_evidence = request.claim_assurance_evidence.clone();
                         if let Some(code) = state.profile_refusal {
                             if state.retain_native_refusal {
                                 state.pending.insert(
@@ -1744,6 +1749,7 @@ mod tests {
             pending: BTreeMap::new(),
             pool_stop_requests: vec![],
             outcomes: BTreeMap::new(),
+            last_sign_evidence: None,
         })));
         let client =
             MachineBrokerClient::new(broker.clone()).with_persona_session_store(directory.path());
@@ -2561,7 +2567,7 @@ mod tests {
             approval_id: None,
             petal_use_claim: Some(use_claim(&payload, 1)),
             system_use_claim: None,
-            claim_assurance_evidence: Some(b"retained prepared order witness".to_vec()),
+            claim_assurance_evidence: None,
             approval_value_limits: vec![],
             account_key_ref: None,
             expected_key_ref: None,
@@ -2573,6 +2579,17 @@ mod tests {
             client.sign_exact_payload(request.clone()).await.unwrap(),
             ExactPayloadSignOutcome::Signed(_)
         ));
+        assert_eq!(
+            broker
+                .0
+                .lock()
+                .unwrap()
+                .last_sign_evidence
+                .as_ref()
+                .unwrap()
+                .decode(),
+            b"retained prepared order witness"
+        );
         broker.0.lock().unwrap().fail_wallet_reads = true;
         broker.0.lock().unwrap().active = false;
         assert!(matches!(
