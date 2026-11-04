@@ -1788,23 +1788,27 @@ mod tests {
         // beside it. Only the synthetic package carries the routes above.
         const SYNTHETIC_HASH: &str =
             "abababababababababababababababababababababababababababababababab";
-        // Master turned this into a list of predecessors (#399). Hyperliquid's
-        // holds exactly its baseline, and this destructuring fails loudly if a
-        // release is ever added, rather than silently testing the wrong one.
-        let [baseline] = crate::github_source::release_lineage_predecessors("hyperliquid") else {
-            panic!("hyperliquid's lineage holds exactly its baseline");
+        // Master's lineage grows whenever a release ships — #224 added
+        // hyperliquid v0.1.7 — so the synthetic successor is derived from
+        // whatever the lineage holds now instead of pinning its length or its
+        // hashes. An earlier version of this test destructured a single
+        // baseline and broke the moment that release landed.
+        let lineage = crate::github_source::release_lineage_predecessors("hyperliquid");
+        let (Some(baseline), Some(newest)) = (lineage.first(), lineage.last()) else {
+            panic!("hyperliquid's lineage must hold at least its baseline");
         };
+        let predecessors: &'static [&'static str] =
+            Vec::leak(lineage.iter().map(|past| past.hash).collect::<Vec<_>>());
         let current = crate::github_source::preinstalled_petal("hyperliquid").unwrap();
         let pin = PreinstalledPetal {
             expected_hash: Some(SYNTHETIC_HASH),
-            release_sequence: 2,
-            predecessor_package_hashes: &[
-                "b29c7afb88ec9d2df774b18dad2699ec169100eeeedbcefca02ea0cc3712a188",
-            ],
+            release_sequence: newest.release_sequence + 1,
+            predecessor_package_hashes: predecessors,
             authority_routes: ROUTES,
             ..*current
         };
-        assert_eq!(pin.predecessor_package_hashes, &[baseline.hash][..]);
+        assert_eq!(pin.predecessor_package_hashes.first(), Some(&baseline.hash));
+        assert_eq!(pin.predecessor_package_hashes.len(), lineage.len());
 
         let catalog = release_catalog_for(&[&pin]);
         let by_route = catalog
