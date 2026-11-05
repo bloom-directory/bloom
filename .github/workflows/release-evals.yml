@@ -41,7 +41,9 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   # The release matrix; the report fails any cell without a summary.
-  TASKS: ${{ inputs.tasks || 'solana-transfer evm-transfer evm-transfer-denied hyperliquid-order-proposal polymarket-limit-order-proposal near-intents-swap-proposal polymarket-clarification' }}
+  TASKS: solana-transfer evm-transfer evm-transfer-denied hyperliquid-order-proposal polymarket-limit-order-proposal near-intents-swap-proposal polymarket-clarification
+  # A dispatch may run a subset; empty means TASKS.
+  SELECTED_TASKS: ${{ inputs.tasks }}
 
 jobs:
   build:
@@ -198,7 +200,7 @@ jobs:
             echo "::error::no model credential for $AGENT"
             exit 1
           fi
-          for task in $TASKS; do
+          for task in ${SELECTED_TASKS:-$TASKS}; do
             scripts/evals/run-harbor.sh "$task" "$AGENT" ||
               scripts/evals/run-harbor.sh "$task" "$AGENT" ||
               echo "::warning::$task with $AGENT failed twice"
@@ -231,7 +233,7 @@ jobs:
           AGENTS: ${{ join(fromJSON(needs.build.outputs.agents), ',') }}
           ALLOW_SLOWER: ${{ inputs.allow_slower || contains(github.event.pull_request.labels.*.name, 'evals-allow-slower') }}
         run: |
-          python3 scripts/evals/release-report.py --agents "$AGENTS" --tasks "$TASKS" \
+          python3 scripts/evals/release-report.py --agents "$AGENTS" --tasks "${SELECTED_TASKS:-$TASKS}" \
             evals/harbor/baselines/README.md trials/*/summaries > report.md || echo "failed=true" >> "$GITHUB_OUTPUT"
           cat report.md >> "$GITHUB_STEP_SUMMARY"
       - name: Comment on the pull request
