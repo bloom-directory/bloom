@@ -2648,7 +2648,7 @@ dependencies = [
 [[package]]
 name = "bloom-petal-contract"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/petal?rev=ba13a90f7f10de955d868d01085f34134d8aed3e#ba13a90f7f10de955d868d01085f34134d8aed3e"
+source = "git+https://github.com/bloom-directory/petal?rev=0ee48c5e78f7776b7a72362d7612b0321e334085#0ee48c5e78f7776b7a72362d7612b0321e334085"
 dependencies = [
  "hex",
  "serde",

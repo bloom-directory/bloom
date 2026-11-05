@@ -98,6 +98,9 @@ fn lock(root: &Path) -> Result<std::fs::File, SigningError> {
 }
 fn write_record(path: &Path, record: &Record) -> Result<(), SigningError> {
     let bytes = serde_json::to_vec(record).map_err(|e| error(ErrorCode::Backend, e))?;
+    write_bytes(path, &bytes)
+}
+fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), SigningError> {
     let tmp = path.with_extension("tmp");
     let mut options = std::fs::OpenOptions::new();
     options.create(true).truncate(true).write(true);
@@ -109,7 +112,7 @@ fn write_record(path: &Path, record: &Record) -> Result<(), SigningError> {
     let mut file = options
         .open(&tmp)
         .map_err(|e| error(ErrorCode::Backend, e))?;
-    file.write_all(&bytes)
+    file.write_all(bytes)
         .and_then(|()| file.sync_all())
         .map_err(|e| error(ErrorCode::Backend, e))?;
     std::fs::rename(&tmp, path).map_err(|e| error(ErrorCode::Backend, e))?;
@@ -117,6 +120,146 @@ fn write_record(path: &Path, record: &Record) -> Result<(), SigningError> {
         .and_then(|f| f.sync_all())
         .map_err(|e| error(ErrorCode::Backend, e))
 }
+// All index operations hold the same .prepared/.lock as record writes. The
+// records remain authoritative; a missing index entry is repaired by a scan.
+fn index_root(root: &Path) -> Result<PathBuf, SigningError> {
+    let index = root.with_file_name(".prepared-index");
+    std::fs::create_dir_all(&index).map_err(|e| error(ErrorCode::Backend, e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&index, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| error(ErrorCode::Backend, e))?;
+    }
+    Ok(index)
+}
+fn index_path(
+    root: &Path,
+    package: &str,
+    wallet: &str,
+    operation: &str,
+) -> Result<PathBuf, SigningError> {
+    let identity = serde_jcs::to_vec(&(package, wallet, operation))
+        .map_err(|e| error(ErrorCode::Backend, e))?;
+    Ok(index_root(root)?.join(format!("{}.json", blake3::hash(&identity).to_hex())))
+}
+fn read_index(path: &Path) -> Result<Option<std::collections::BTreeSet<String>>, SigningError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(error(ErrorCode::Backend, e)),
+    };
+    let names: std::collections::BTreeSet<String> = serde_json::from_slice(&bytes)
+        .map_err(|e| error(ErrorCode::Backend, format!("invalid prepared index: {e}")))?;
+    // Never allow an index entry to redirect a status read outside .prepared.
+    if names.is_empty()
+        || names.iter().any(|name| {
+            !name
+                .strip_suffix(".json")
+                .is_some_and(bloom_petals::store::is_valid_hex_hash)
+        })
+    {
+        return Err(error(
+            ErrorCode::Backend,
+            "invalid prepared index record path",
+        ));
+    }
+    Ok(Some(names))
+}
+fn index_record(root: &Path, path: &Path, state: &Record) -> Result<(), SigningError> {
+    let entry = index_path(
+        root,
+        &state.package_hash,
+        &state.wallet,
+        &state.operation_key,
+    )?;
+    let mut names = read_index(&entry)?.unwrap_or_default();
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| error(ErrorCode::Backend, "invalid prepared record path"))?;
+    if names.insert(name.to_owned()) {
+        write_bytes(
+            &entry,
+            &serde_json::to_vec(&names).map_err(|e| error(ErrorCode::Backend, e))?,
+        )?;
+    }
+    Ok(())
+}
+fn scan_records(
+    root: &Path,
+    mut visit: impl FnMut(&Path, Record) -> Result<(), SigningError>,
+) -> Result<(), SigningError> {
+    for entry in std::fs::read_dir(root).map_err(|e| error(ErrorCode::Backend, e))? {
+        let path = entry.map_err(|e| error(ErrorCode::Backend, e))?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let record = serde_json::from_slice(
+            &std::fs::read(&path).map_err(|e| error(ErrorCode::Backend, e))?,
+        )
+        .map_err(|e| error(ErrorCode::Backend, e))?;
+        visit(&path, record)?;
+    }
+    Ok(())
+}
+fn indexed_records(
+    root: &Path,
+    package: &str,
+    wallet: &str,
+    operation: &str,
+) -> Result<Vec<Record>, SigningError> {
+    let marker = index_root(root)?.join(".complete");
+    if !marker
+        .try_exists()
+        .map_err(|e| error(ErrorCode::Backend, e))?
+    {
+        scan_records(root, |path, record| index_record(root, path, &record))?;
+        write_bytes(&marker, b"1")?;
+    }
+    let entry = index_path(root, package, wallet, operation)?;
+    let names = match read_index(&entry)? {
+        Some(names) => names,
+        None => {
+            // An absent entry may be a deleted index, not an absent operation.
+            // Repair from authoritative records before returning NotFound.
+            scan_records(root, |path, record| {
+                if record.package_hash == package
+                    && record.wallet == wallet
+                    && record.operation_key == operation
+                {
+                    index_record(root, path, &record)?;
+                }
+                Ok(())
+            })?;
+            read_index(&entry)?.unwrap_or_default()
+        }
+    };
+    let mut records = Vec::new();
+    for name in names {
+        let bytes = match std::fs::read(root.join(name)) {
+            Ok(bytes) => bytes,
+            // Index publication precedes record publication. A crash in
+            // between cannot have reached Broker and is safe to skip.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(error(ErrorCode::Backend, e)),
+        };
+        let state: Record =
+            serde_json::from_slice(&bytes).map_err(|e| error(ErrorCode::Backend, e))?;
+        if state.package_hash != package
+            || state.wallet != wallet
+            || state.operation_key != operation
+        {
+            return Err(error(
+                ErrorCode::Backend,
+                "prepared index identity mismatch",
+            ));
+        }
+        records.push(state);
+    }
+    Ok(records)
+}
+
 fn path(
     root: &Path,
     context: &PetalRouteContext,
@@ -476,6 +619,7 @@ impl DaemonPetalHost {
                 "operation key is bound to different action",
             ));
         }
+        index_record(&root, &state_path, &state)?;
         if let Some(SigningOutcome::Signed { signature }) = &state.outcome {
             self.prepared_verify(&key, &state.action, signature).await?;
             return Ok(state.outcome.unwrap());
@@ -569,31 +713,12 @@ impl DaemonPetalHost {
             .await
             .map_err(|e| error(ErrorCode::Backend, e))??;
         let mut found = None;
-        for (index, entry) in std::fs::read_dir(&root)
-            .map_err(|e| error(ErrorCode::Backend, e))?
-            .take(4097)
-            .enumerate()
-        {
-            if index == 4096 {
-                return Err(error(
-                    ErrorCode::Backend,
-                    "too many prepared signing records",
-                ));
-            }
-            let path = entry.map_err(|e| error(ErrorCode::Backend, e))?.path();
-            if path.extension().and_then(|x| x.to_str()) != Some("json") {
-                continue;
-            }
-            let state: Record = serde_json::from_slice(
-                &std::fs::read(path).map_err(|e| error(ErrorCode::Backend, e))?,
-            )
-            .map_err(|e| error(ErrorCode::Backend, e))?;
-            if state.package_hash != context.package_hash
-                || state.wallet != request.wallet
-                || state.operation_key != request.operation_key
-            {
-                continue;
-            }
+        for state in indexed_records(
+            &root,
+            &context.package_hash,
+            &request.wallet,
+            &request.operation_key,
+        )? {
             if self
                 .prepared_key(&context, &request.wallet, state.action.payload.suite)
                 .await?
@@ -606,7 +731,7 @@ impl DaemonPetalHost {
             }
             found = Some(state);
         }
-        let state = found.ok_or_else(|| error(ErrorCode::Invalid, "operation not found"))?;
+        let state = found.ok_or_else(|| error(ErrorCode::NotFound, "operation not found"))?;
         state.action.validate()?;
         if let Some(terminal) = self
             .prepared_ceremony_terminal(&root, &state.outcome)
@@ -728,6 +853,199 @@ impl DaemonPetalHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn index_key() -> bloom_broker_api::KeyRef {
+        bloom_broker_api::KeyRef {
+            backend: bloom_broker_api::Token::new("local").unwrap(),
+            backend_instance: bloom_broker_api::Token::new("primary").unwrap(),
+            locator: "wallet/primary/root".into(),
+            key_spec: bloom_broker_api::KeySpec::Secp256k1,
+            public_key_fingerprint: bloom_broker_api::Digest32::from_bytes([0x31; 32]),
+            derivation: None,
+        }
+    }
+    struct IndexBroker;
+    impl bloom_broker_api::MachineBrokerService for IndexBroker {
+        fn dispatch<'a>(
+            &'a self,
+            request: bloom_broker_api::MachineBrokerRequest,
+        ) -> bloom_broker_api::ServiceFuture<'a, bloom_broker_api::MachineBrokerResponse> {
+            Box::pin(async move {
+                use bloom_broker_api::*;
+                match request {
+                    MachineBrokerRequest::WalletGetPublic(request) => {
+                        Ok(MachineBrokerResponse::WalletGetPublic(WalletPublic {
+                            wallet_id: request.wallet_id,
+                            wallet_kind: Token::new("local").unwrap(),
+                            root_key_ref: Some(index_key()),
+                            key_refs: vec![index_key()],
+                            policy_version: DecimalU64::new(1),
+                            policy_digest: Digest32::from_bytes([0x32; 32]),
+                            wallet_revocation_epoch: DecimalU64::new(0),
+                        }))
+                    }
+                    _ => panic!("unexpected Broker request"),
+                }
+            })
+        }
+    }
+    fn index_fixture() -> (
+        tempfile::TempDir,
+        DaemonPetalHost,
+        PathBuf,
+        PetalRouteContext,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let host = DaemonPetalHost::new(
+            Arc::new(LateVfsHost::new()),
+            Arc::new(AuditLog::open(temp.path().join("audit.jsonl")).unwrap()),
+        )
+        .with_broker(Some(MachineBrokerClient::new(Arc::new(IndexBroker))))
+        .with_petal_signing_state_root(temp.path().to_owned());
+        let root = temp.path().join(".prepared");
+        drop(lock(&root).unwrap());
+        let mut ctx = context();
+        ctx.params = vec![
+            ("bloom.wallet".into(), "primary".into()),
+            ("bloom.account".into(), "0".into()),
+        ];
+        (temp, host, root, ctx)
+    }
+    fn index_state(ctx: &PetalRouteContext, operation: &str) -> Record {
+        Record {
+            version: 1,
+            package_hash: ctx.package_hash.clone(),
+            route: ctx.route_id.clone(),
+            wallet: "primary".into(),
+            key: index_key(),
+            operation_key: operation.into(),
+            action: action(prepared::Spend::None),
+            outcome: None,
+        }
+    }
+    fn seed_record(root: &Path, ctx: &PetalRouteContext, state: &Record) -> PathBuf {
+        let path = path(root, ctx, &state.wallet, &state.key, &state.operation_key).unwrap();
+        write_record(&path, state).unwrap();
+        path
+    }
+    async fn query(
+        host: &DaemonPetalHost,
+        ctx: &PetalRouteContext,
+        operation: &str,
+    ) -> Result<SigningOutcome, SigningError> {
+        host.status_prepared(
+            prepared::StatusRequest {
+                version: 1,
+                wallet: "primary".into(),
+                operation_key: operation.into(),
+            },
+            ctx.clone(),
+        )
+        .await
+    }
+    #[tokio::test]
+    async fn status_index_ignores_unrelated_records() {
+        let (_temp, host, root, ctx) = index_fixture();
+        for i in 0..4100 {
+            let state = index_state(&ctx, &format!("unrelated-{i}"));
+            seed_record(&root, &ctx, &state);
+        }
+        std::fs::write(root.join("stray.tmp"), b"not a record").unwrap();
+        seed_record(&root, &ctx, &index_state(&ctx, "wanted"));
+        assert!(matches!(
+            query(&host, &ctx, "wanted").await.unwrap(),
+            SigningOutcome::RecoveryRequired { .. }
+        ));
+        assert_eq!(
+            query(&host, &ctx, "unknown").await.unwrap_err().code,
+            ErrorCode::NotFound
+        );
+    }
+    #[tokio::test]
+    async fn status_index_backfills_phase1_records() {
+        let (_temp, host, root, ctx) = index_fixture();
+        seed_record(&root, &ctx, &index_state(&ctx, "wanted"));
+        assert!(!root.with_file_name(".prepared-index").exists());
+        query(&host, &ctx, "wanted").await.unwrap();
+        let marker = index_root(&root).unwrap().join(".complete");
+        let modified = marker.metadata().unwrap().modified().unwrap();
+        query(&host, &ctx, "wanted").await.unwrap();
+        assert_eq!(modified, marker.metadata().unwrap().modified().unwrap());
+    }
+    #[tokio::test]
+    async fn status_index_keeps_ambiguity_and_key_filters() {
+        let (_temp, host, root, ctx) = index_fixture();
+        seed_record(&root, &ctx, &index_state(&ctx, "wanted"));
+        let mut other = ctx.clone();
+        other.route_id = "r2".into();
+        let mut state = index_state(&other, "wanted");
+        let other_path = seed_record(&root, &other, &state);
+        assert_eq!(
+            query(&host, &ctx, "wanted").await.unwrap_err().code,
+            ErrorCode::Conflict
+        );
+        state.key.locator = "wallet/primary/old-key".into();
+        write_record(&other_path, &state).unwrap();
+        assert!(matches!(
+            query(&host, &ctx, "wanted").await.unwrap(),
+            SigningOutcome::RecoveryRequired { .. }
+        ));
+        // A corrupted/misdirected index cannot cross wallet/package/op boundaries.
+        state.wallet = "different".into();
+        write_record(&other_path, &state).unwrap();
+        assert_eq!(
+            query(&host, &ctx, "wanted").await.unwrap_err().code,
+            ErrorCode::Backend
+        );
+    }
+    #[tokio::test]
+    async fn status_not_found_uses_code() {
+        let (_temp, host, _root, ctx) = index_fixture();
+        let err = query(&host, &ctx, "unknown").await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert_eq!(err.message, "operation not found");
+    }
+    #[tokio::test]
+    async fn status_index_crash_between_index_and_record() {
+        let (_temp, host, root, ctx) = index_fixture();
+        let state = index_state(&ctx, "wanted");
+        let path = path(&root, &ctx, &state.wallet, &state.key, &state.operation_key).unwrap();
+        index_record(&root, &path, &state).unwrap();
+        assert_eq!(
+            query(&host, &ctx, "wanted").await.unwrap_err().code,
+            ErrorCode::NotFound
+        );
+        write_record(&path, &state).unwrap();
+        assert!(matches!(
+            query(&host, &ctx, "wanted").await.unwrap(),
+            SigningOutcome::RecoveryRequired { .. }
+        ));
+    }
+    #[tokio::test]
+    async fn status_index_missing_entry_repairs_and_corruption_fails_closed() {
+        let (_temp, host, root, ctx) = index_fixture();
+        seed_record(&root, &ctx, &index_state(&ctx, "wanted"));
+        query(&host, &ctx, "wanted").await.unwrap();
+        let entry = index_path(&root, &ctx.package_hash, "primary", "wanted").unwrap();
+        std::fs::remove_file(&entry).unwrap();
+        query(&host, &ctx, "wanted").await.unwrap();
+        assert!(entry.exists());
+        std::fs::write(&entry, b"[]").unwrap();
+        assert_eq!(
+            query(&host, &ctx, "wanted").await.unwrap_err().code,
+            ErrorCode::Backend
+        );
+        std::fs::write(&entry, b"corrupt").unwrap();
+        assert_eq!(
+            query(&host, &ctx, "wanted").await.unwrap_err().code,
+            ErrorCode::Backend
+        );
+        std::fs::write(&entry, br#"["../outside.json"]"#).unwrap();
+        assert_eq!(
+            query(&host, &ctx, "wanted").await.unwrap_err().code,
+            ErrorCode::Backend
+        );
+    }
 
     #[test]
     fn unknown_signing_outcomes_require_recovery_while_refusals_remain_errors() {
