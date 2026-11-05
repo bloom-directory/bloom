@@ -835,6 +835,10 @@ impl Handler for PetalRouter {
         if rest.is_empty() || Self::is_host_file(&rest) {
             return Err(HandlerError::PermissionDenied);
         }
+        // Check before locking: `WriteLocks` keeps an entry per name it sees.
+        if !self.is_petal(mount) {
+            return Err(HandlerError::not_found(path.to_string_path()));
+        }
         let _held = self.write_locks.shared(mount).await;
         match self.write_route(mount, rest.clone(), data, path).await {
             Ok(()) => {
@@ -866,6 +870,10 @@ impl Handler for PetalRouter {
         let (mount, rest) = Self::mount_path(path)?;
         if rest.is_empty() || Self::is_host_file(&rest) {
             return Err(HandlerError::PermissionDenied);
+        }
+        // Check before locking: `WriteLocks` keeps an entry per name it sees.
+        if !self.is_petal(mount) {
+            return Err(HandlerError::not_found(path.to_string_path()));
         }
         let _held = self.write_locks.exclusive(mount).await?;
         let stored = {

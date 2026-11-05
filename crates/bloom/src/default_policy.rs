@@ -680,17 +680,33 @@ fn clear_settings_pending(home: &std::path::Path, name: &str) {
 /// Chosen Petals whose setup settings are still waiting to be written. Only
 /// catalog Petals with a settings template are honoured, so an edited marker
 /// directory cannot name anything else.
-fn pending_settings(home: &std::path::Path, setup: &WalletSetup) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(pending_settings_dir(home)) else {
-        return Vec::new();
+/// Only a missing directory means nothing is queued; any other read error is
+/// returned.
+fn queued_settings(home: &std::path::Path, setup: &WalletSetup) -> std::io::Result<Vec<String>> {
+    let entries = match std::fs::read_dir(pending_settings_dir(home)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
     };
-    let mut names: Vec<String> = entries
-        .flatten()
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|name| setup_template(name).is_some() && setup.petals.contains_key(name))
-        .collect();
+    let mut names = Vec::new();
+    for entry in entries {
+        if let Ok(name) = entry?.file_name().into_string()
+            && setup_template(&name).is_some()
+            && setup.petals.contains_key(&name)
+        {
+            names.push(name);
+        }
+    }
     names.sort();
-    names
+    Ok(names)
+}
+
+/// [`queued_settings`] for a membership check; a read error is logged.
+fn pending_settings(home: &std::path::Path, setup: &WalletSetup) -> Vec<String> {
+    queued_settings(home, setup).unwrap_or_else(|error| {
+        tracing::error!(%error, "petal.setup_settings_queue_unreadable");
+        Vec::new()
+    })
 }
 
 /// Write the settings that an earlier attempt could not, now that the default
@@ -704,8 +720,13 @@ pub(crate) async fn apply_pending_settings(
     daemon: &Daemon,
     setup: &WalletSetup,
 ) -> PendingSettings {
-    let owners = petal_owners(daemon).unwrap_or_default();
-    apply_queued_writes(&daemon.vfs, daemon.home.root(), setup, &owners).await
+    match petal_owners(daemon) {
+        Ok(owners) => apply_queued_writes(&daemon.vfs, daemon.home.root(), setup, &owners).await,
+        Err(error) => PendingSettings {
+            still_queued: vec![format!("queued setup settings ({error:#})")],
+            ..PendingSettings::default()
+        },
+    }
 }
 
 /// What retrying the queued setup writes did.
@@ -727,7 +748,16 @@ async fn apply_queued_writes(
     owners: &BTreeMap<String, String>,
 ) -> PendingSettings {
     let mut outcome = PendingSettings::default();
-    for name in pending_settings(home, setup) {
+    let queued = match queued_settings(home, setup) {
+        Ok(queued) => queued,
+        Err(error) => {
+            outcome.still_queued.push(format!(
+                "queued setup settings (reading the queue failed: {error})"
+            ));
+            return outcome;
+        }
+    };
+    for name in queued {
         let Some(installed) = owners.get(&name) else {
             continue;
         };
@@ -775,11 +805,26 @@ pub(crate) async fn retry_queued_settings(daemon: Daemon) {
                 continue;
             }
         };
-        if pending_settings(daemon.home.root(), &setup).is_empty() {
-            wait = QUEUED_SETTINGS_RETRY;
-            continue;
+        match queued_settings(daemon.home.root(), &setup) {
+            Ok(queued) if queued.is_empty() => {
+                wait = QUEUED_SETTINGS_RETRY;
+                continue;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::error!(%error, "petal.setup_settings_queue_unreadable");
+                wait = (wait * 2).min(QUEUED_SETTINGS_RETRY_MAX);
+                continue;
+            }
         }
-        let owners = petal_owners(&daemon).unwrap_or_default();
+        let owners = match petal_owners(&daemon) {
+            Ok(owners) => owners,
+            Err(error) => {
+                tracing::error!(error = %format!("{error:#}"), "petal.setup_settings_owners_unreadable");
+                wait = (wait * 2).min(QUEUED_SETTINGS_RETRY_MAX);
+                continue;
+            }
+        };
         let outcome =
             retry_queued_settings_once(&daemon.vfs, daemon.home.root(), &setup, &owners).await;
         wait = match &outcome {
@@ -822,6 +867,17 @@ async fn apply_approved_switches_once(
 ) -> BTreeMap<String, PendingSwitch> {
     let mut committed = BTreeMap::new();
     let home = daemon.home.root();
+    if home.join("pending-persona-resets").exists() {
+        let _held = SWITCH_STATE.lock().await;
+        match bloom_proto::Config::load(&daemon.home.config_path()) {
+            Ok(config) => {
+                for message in retry_persona_resets(&daemon.vfs, home, &config.setup).await {
+                    tracing::info!(%message, "persona.reset_retried");
+                }
+            }
+            Err(error) => tracing::warn!(%error, "persona.reset_retry_config_unreadable"),
+        }
+    }
     let Ok(entries) = std::fs::read_dir(home.join("pending-persona")) else {
         return committed;
     };
@@ -1555,6 +1611,9 @@ pub(crate) enum DefaultPolicyStatus {
     /// `missing`. Only a new wallet's policy is proposed, so nothing is.
     ChangedSinceCreation {
         missing: Vec<String>,
+        /// The persona's `allowed_destinations` entries the policy lacks.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        missing_destinations: Vec<bloom_broker_api::PolicyDestination>,
         /// Setup writes that failed this time and stay queued.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         settings_pending: Vec<String>,
@@ -1909,6 +1968,7 @@ pub(crate) async fn advance_default_policy(
             },
             None => DefaultPolicyStatus::ChangedSinceCreation {
                 missing: request.missing(&current)?,
+                missing_destinations: request.missing_destinations(&current)?,
                 settings_pending,
                 settings_waiting,
                 beyond_persona: request.beyond_persona(&current)?,
@@ -2174,42 +2234,114 @@ async fn reset_persona_settings(
             }
         }
     }
+    // A new switch starts over, so earlier failed resets are dropped.
+    let resets = pending_resets_dir(home, wallet);
+    if let Err(error) = std::fs::remove_dir_all(&resets)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(%wallet, %error, "persona.pending_resets_not_cleared");
+    }
     let mut messages = Vec::new();
     for name in setup.petals.keys() {
-        let settings = match render_petal_settings(setup, name, wallet) {
-            Ok(Some(settings)) => settings,
-            Ok(None) => {
-                if main {
-                    clear_settings_pending(home, name);
-                }
-                continue;
+        messages.extend(reset_petal_settings(vfs, home, wallet, setup, name).await);
+    }
+    messages
+}
+
+/// Failed persona limit resets for `wallet`, one marker file per Petal, so
+/// `bloom serve` retries them.
+fn pending_resets_dir(home: &std::path::Path, wallet: &str) -> std::path::PathBuf {
+    home.join("pending-persona-resets").join(wallet)
+}
+
+/// Reset one chosen Petal's limits for `wallet`. A failed write leaves a
+/// marker that [`retry_persona_resets`] retries; a write that went in clears it.
+async fn reset_petal_settings(
+    vfs: &bloom_vfs::Vfs,
+    home: &std::path::Path,
+    wallet: &str,
+    setup: &WalletSetup,
+    name: &str,
+) -> Option<String> {
+    let main = wallet == DEFAULT_POLICY_WALLET;
+    let marker = pending_resets_dir(home, wallet).join(name);
+    let settings = match render_petal_settings(setup, name, wallet) {
+        Ok(Some(settings)) => settings,
+        Ok(None) => {
+            if main {
+                clear_settings_pending(home, name);
             }
-            Err(error) => {
-                messages.push(format!("petal_settings_failed: {error:#}"));
-                continue;
+            let _ = std::fs::remove_file(&marker);
+            return None;
+        }
+        Err(error) => return Some(format!("petal_settings_failed: {error:#}")),
+    };
+    let written = match bloom_vfs::VfsPath::parse(&settings.path) {
+        Ok(path) => bloom_vfs::Handler::write(vfs, &path, &settings.body)
+            .await
+            .map_err(|error| anyhow!("{error}")),
+        Err(error) => Err(anyhow!("{error}")),
+    };
+    Some(match written {
+        Ok(()) => {
+            if main {
+                clear_settings_pending(home, name);
             }
+            if let Err(error) = std::fs::remove_file(&marker)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(%wallet, petal = %name, %error, "persona.pending_reset_not_cleared");
+            }
+            format!(
+                "petal_settings: {} reset to {}",
+                petal_label(name),
+                settings.summary
+            )
+        }
+        Err(error) => {
+            let mut reason = format!("writing them failed ({error:#})");
+            match std::fs::create_dir_all(pending_resets_dir(home, wallet))
+                .and_then(|()| std::fs::write(&marker, b""))
+            {
+                Ok(()) => reason.push_str("; Bloom retries it while `bloom serve` runs"),
+                Err(marker_error) => reason.push_str(&format!(
+                    " and the automatic retry could not be recorded ({marker_error})"
+                )),
+            }
+            settings_not_written(name, &settings, &reason)
+        }
+    })
+}
+
+/// Retry each failed persona limit reset under `home` with the wallet's saved
+/// setup. A marker for a Petal the setup no longer chooses is dropped.
+async fn retry_persona_resets(
+    vfs: &bloom_vfs::Vfs,
+    home: &std::path::Path,
+    config: &bloom_proto::config::SetupConfig,
+) -> Vec<String> {
+    let mut messages = Vec::new();
+    let Ok(wallets) = std::fs::read_dir(home.join("pending-persona-resets")) else {
+        return messages;
+    };
+    for wallet in wallets.flatten() {
+        let Ok(wallet) = wallet.file_name().into_string() else {
+            continue;
         };
-        let written = match bloom_vfs::VfsPath::parse(&settings.path) {
-            Ok(path) => bloom_vfs::Handler::write(vfs, &path, &settings.body)
-                .await
-                .map_err(|error| anyhow!("{error}")),
-            Err(error) => Err(anyhow!("{error}")),
+        let setup = config.wallet(&wallet);
+        let Ok(names) = std::fs::read_dir(pending_resets_dir(home, &wallet)) else {
+            continue;
         };
-        messages.push(match written {
-            Ok(()) => {
-                if main {
-                    clear_settings_pending(home, name);
-                }
-                format!(
-                    "petal_settings: {} reset to {}",
-                    petal_label(name),
-                    settings.summary
-                )
+        for name in names.flatten() {
+            let Ok(name) = name.file_name().into_string() else {
+                continue;
+            };
+            if setup.petals.contains_key(&name) {
+                messages.extend(reset_petal_settings(vfs, home, &wallet, setup, &name).await);
+            } else {
+                let _ = std::fs::remove_file(pending_resets_dir(home, &wallet).join(&name));
             }
-            Err(error) => {
-                settings_not_written(name, &settings, &format!("writing them failed ({error:#})"))
-            }
-        });
+        }
     }
     messages
 }
@@ -2434,11 +2566,7 @@ impl DefaultPolicyRequest {
     ) -> Result<Vec<String>> {
         let mut missing = petals_not_allowed(current, &self.petals, &self.packages)?;
         let policy = decode_policy(current)?;
-        if self
-            .persona_destinations
-            .iter()
-            .any(|destination| !policy.allowed_destinations.contains(destination))
-        {
+        if !self.missing_destinations(current)?.is_empty() {
             missing.push(PERSONA_TRANSFERS.to_owned());
         }
         if self
@@ -2448,6 +2576,20 @@ impl DefaultPolicyRequest {
             missing.push(PERSONA_STANDING.to_owned());
         }
         Ok(missing)
+    }
+
+    /// The persona's entries `current` lacks, only on configured chains.
+    pub(crate) fn missing_destinations(
+        &self,
+        current: &bloom_broker_api::SignedPolicySnapshot,
+    ) -> Result<Vec<bloom_broker_api::PolicyDestination>> {
+        let policy = decode_policy(current)?;
+        Ok(self
+            .persona_destinations
+            .iter()
+            .filter(|destination| !policy.allowed_destinations.contains(destination))
+            .cloned()
+            .collect())
     }
 
     /// What `current` allows that the saved persona does not propose: an
@@ -2652,6 +2794,7 @@ impl DefaultPolicyWait {
             }
             DefaultPolicyStatus::ChangedSinceCreation {
                 missing,
+                missing_destinations,
                 settings_pending,
                 settings_waiting,
                 beyond_persona,
@@ -2663,12 +2806,22 @@ impl DefaultPolicyWait {
                     petal_labels(missing),
                     policy_update_steps(wallet, "<policy.json>")
                 )?;
-                if missing.iter().any(|label| label == PERSONA_TRANSFERS) {
+                if !missing_destinations.is_empty() {
+                    let entries = missing_destinations
+                        .iter()
+                        .map(|entry| {
+                            format!(
+                                "{{\"chain\": \"{}\", \"destination\": \"{}\"}}",
+                                entry.chain.as_str(),
+                                entry.destination
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" and ");
                     writeln!(
                         output,
-                        "default_policy: to allow {PERSONA_TRANSFERS}, add {{\"chain\": \"evm-1\", \"destination\": \"{marker}\"}} for Ethereum and {{\"chain\": \"evm-137\", \"destination\": \"{marker}\"}} for Polygon to allowed_destinations in a copy of `bloom vfs cat /wallets/{wallet}/policy.json`, then {steps}",
-                        marker = bloom_proto::policy::ERC20_ANY_RECIPIENT,
-                        steps = policy_update_steps(wallet, "<that file>")
+                        "default_policy: to allow {PERSONA_TRANSFERS}, add {entries} to allowed_destinations in a copy of `bloom vfs cat /wallets/{wallet}/policy.json`, then {}",
+                        policy_update_steps(wallet, "<that file>")
                     )?;
                 }
                 report_beyond_persona(output, wallet, beyond_persona)?;
@@ -2996,8 +3149,8 @@ mod tests {
         let entry = github_source::preinstalled_petal("polymarket").unwrap();
         assert_eq!(
             entry.expected_hash,
-            // v0.2.0: same `venue_config_key` as v0.1.6 and v0.1.8.
-            Some("17a50dda0894b7b7e5757033806f8ec31523575438419ea1330b731a2c6c5d14"),
+            // v0.2.1: same `venue_config_key` as v0.1.6, v0.1.8 and v0.2.0.
+            Some("036cce365ff7cfe5c3e35754fc4c15097576c6251eb2277b890cdae673b234fd"),
             "re-check store_key against the new release, then update both"
         );
         let template = setup_template("polymarket").unwrap();
@@ -3009,6 +3162,7 @@ mod tests {
                 "0f365cd7f613129f73ce66fb07256c8a42c4e70abbb77721804dbd6df85b96b5",
                 "6eb2065e8558f3761399fcb0516731a600fdb0b49974c8ed0808abd38fde7db4",
                 "17a50dda0894b7b7e5757033806f8ec31523575438419ea1330b731a2c6c5d14",
+                "036cce365ff7cfe5c3e35754fc4c15097576c6251eb2277b890cdae673b234fd",
             ],
             "list a release only once its key is checked"
         );
@@ -3326,6 +3480,7 @@ mod tests {
             },
             DefaultPolicyStatus::ChangedSinceCreation {
                 missing: vec!["polymarket".into()],
+                missing_destinations: Vec::new(),
                 settings_pending: outcome.still_queued.clone(),
                 settings_waiting: outcome.waiting.clone(),
                 beyond_persona: Vec::new(),
@@ -3715,7 +3870,7 @@ mod tests {
         let (home, vfs) = queued_polymarket(&route);
         let outcome = apply_queued_settings(&vfs, home.path(), &petals, "polymarket", older).await;
         assert!(
-            matches!(&outcome, QueuedWrite::Waiting(reason) if reason.contains("once Bloom updates it to v0.2.0")),
+            matches!(&outcome, QueuedWrite::Waiting(reason) if reason.contains("once Bloom updates it to v0.2.1")),
             "{outcome:?}"
         );
         assert_eq!(*route.stored.lock().await, None);
@@ -4583,6 +4738,40 @@ mod tests {
                 .contains("| bloom vfs write /petals/polymarket/settings/trading/0/venue.toml"),
             "{messages:?}"
         );
+
+        // The failed reset is retried until it goes in, then not again.
+        let mut config = bloom_proto::config::SetupConfig::default();
+        *config.wallet_mut("trading") = setup.clone();
+        let failed = retry_persona_resets(&vfs, home.path(), &config).await;
+        assert!(
+            failed[0].starts_with("petal_settings_not_written"),
+            "{failed:?}"
+        );
+        let route = SettingsRoute::holding(Some(b"enabled = false\n"));
+        let vfs = bloom_vfs::Vfs::builder()
+            .mount("petals", route.clone())
+            .build();
+        assert_eq!(
+            retry_persona_resets(&vfs, home.path(), &config).await,
+            ["petal_settings: Polymarket reset to max_daily_usd = 1000"]
+        );
+        assert!(
+            retry_persona_resets(&vfs, home.path(), &config)
+                .await
+                .is_empty()
+        );
+    }
+
+    /// A queue Bloom cannot read is reported, not taken for an empty one.
+    #[tokio::test]
+    async fn an_unreadable_settings_queue_is_reported() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(pending_settings_dir(home.path()), b"").unwrap();
+        let setup = chosen_setup(&["polymarket"]);
+        assert!(queued_settings(home.path(), &setup).is_err());
+        let vfs = bloom_vfs::Vfs::builder().build();
+        let outcome = apply_queued_writes(&vfs, home.path(), &setup, &BTreeMap::new()).await;
+        assert_eq!(outcome.still_queued.len(), 1, "{outcome:?}");
     }
 
     /// A switch takes only Bloom's canonical Petals, with values their
@@ -4822,6 +5011,7 @@ mod tests {
 
         let output = observe(DefaultPolicyStatus::ChangedSinceCreation {
             missing: vec![PERSONA_TRANSFERS.into()],
+            missing_destinations: vec![any_recipient("evm-1")],
             settings_pending: Vec::new(),
             settings_waiting: Vec::new(),
             beyond_persona: Vec::new(),
@@ -4835,6 +5025,8 @@ mod tests {
             output.contains(r#"{"chain": "evm-1", "destination": "erc20:any-recipient"}"#),
             "{output}"
         );
+        // Only the configured chain's entry: Polygon is not configured here.
+        assert!(!output.contains("evm-137"), "{output}");
         assert_eq!(
             output
                 .matches("bloom wallet commit-policy <operation_id>")
@@ -4876,6 +5068,7 @@ mod tests {
         };
         let changed = |legacy_clear_signing| DefaultPolicyStatus::ChangedSinceCreation {
             missing: vec!["polymarket".into()],
+            missing_destinations: Vec::new(),
             settings_pending: Vec::new(),
             settings_waiting: Vec::new(),
             beyond_persona: Vec::new(),
@@ -5390,6 +5583,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(DefaultPolicyStatus::ChangedSinceCreation {
                 missing: vec!["hyperliquid".into()],
+                missing_destinations: Vec::new(),
                 settings_pending: Vec::new(),
                 settings_waiting: Vec::new(),
                 beyond_persona: Vec::new(),
@@ -5607,6 +5801,7 @@ mod tests {
         let mut output = Vec::new();
         let changed = DefaultPolicyStatus::ChangedSinceCreation {
             missing: vec!["near-intents".into()],
+            missing_destinations: Vec::new(),
             settings_pending: Vec::new(),
             settings_waiting: Vec::new(),
             beyond_persona: Vec::new(),
