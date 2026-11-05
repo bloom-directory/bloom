@@ -96,7 +96,7 @@ Use optimized services. Debug Broker and Signer builds make every mounted
 read slow: twelve reads took 119 s with debug services and 2.8 s optimized,
 which turns agent timing into a measure of the build.
 
-Agents are `claude-opus`, `codex`, `opencode` and, by dispatch only, `claude-sonnet`, using the host's existing
+Agents are `claude-sonnet`, `codex`, `opencode` and, by dispatch only, `pi` and `claude-opus`, using the host's existing
 authentication. Harbor 0.21.0 and the agent image are pinned. Every task uses
 the same image digest. `BLOOM_EVAL_REASONING_EFFORT` selects Codex reasoning
 effort.
@@ -134,13 +134,29 @@ whole thing before a release: it builds the Machine from the ref with the
 Broker and Signer the release matrix pins, smokes them, then runs every task
 with every agent and reports reward, tool calls, tokens and time against the
 baseline. A failed trial runs once more. It fails on a smoke failure, a
-missing result, an agent that cannot authenticate, or a regression against
-the baseline. It
+missing result, an agent that cannot authenticate, a regression against
+the baseline, or a task that passed in both but took more than 1.5 times the
+baseline's tool calls. To accept a slower run on purpose, dispatch with
+`allow_slower` or add the `evals-allow-slower` label to the PR; the report
+lists the slower tasks either way. It
 runs on `release-proposal/*` PRs and by dispatch.
 Model credentials are repository secrets, OAuth where the agent supports it:
 `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) or `ANTHROPIC_API_KEY`;
-`CODEX_AUTH_JSON` (the contents of `~/.codex/auth.json` after `codex login`) or
-`OPENAI_API_KEY`; `DEEPSEEK_API_KEY`. The agent container sees them, so use
-dedicated credentials. A selected agent without one fails the run.
+`CODEX_AUTH_JSON` (the contents of `auth.json` after `codex login`) or
+`OPENAI_API_KEY`; `PI_AUTH_JSON` (Pi's `auth.json` after `/login` with Kimi
+Code); `DEEPSEEK_API_KEY` for OpenCode. Log in to a throwaway home, so
+refreshing the CI session cannot sign out your own:
+
+```
+d=$(mktemp -d); CODEX_HOME=$d codex login --device-auth
+gh secret set CODEX_AUTH_JSON -R bloom-directory/bloom < $d/auth.json
+k=$(mktemp -d); PI_CODING_AGENT_DIR=$k pi    # /login, Kimi Code, then /quit
+gh secret set PI_AUTH_JSON -R bloom-directory/bloom < $k/auth.json
+```
+
+Every agent runs a mid-tier model, not the strongest its provider
+offers: Claude Sonnet 5.5, Codex `gpt-5.6-sol`, OpenCode `deepseek-flash` and
+Pi `kimi-coding/k3`. Pi is off by default until its login is verified in CI.
+Locally, Pi needs `PI_AUTH_JSON_PATH`; it never reads your own `~/.pi` login. The agent container sees them, so use dedicated credentials. A selected agent without one fails the run.
 `requirements.txt` is the full resolved dependency set; edit `requirements.in`
 and regenerate it with the command in its header.

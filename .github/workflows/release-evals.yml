@@ -11,17 +11,26 @@ name: Release evals
 # and on dispatch. Model credentials are repository secrets, OAuth where the
 # agent supports it: CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`) or
 # ANTHROPIC_API_KEY for Claude Code; CODEX_AUTH_JSON (the contents of
-# ~/.codex/auth.json from `codex login`) or OPENAI_API_KEY for Codex;
-# DEEPSEEK_API_KEY for OpenCode. The agent container sees them, so use
-# dedicated revocable credentials. A selected agent without one fails the run
+# auth.json from `codex login`) or OPENAI_API_KEY for Codex; PI_AUTH_JSON
+# (Pi's auth.json after `/login` with Kimi Code) for Pi; DEEPSEEK_API_KEY for
+# OpenCode. Log in under a throwaway CODEX_HOME or PI_CODING_AGENT_DIR so CI
+# refreshing the session cannot sign out your own. The agent container sees
+# them, so use dedicated revocable credentials. A selected agent without one fails the run
 # and the report says so.
 
 on:
   workflow_dispatch:
     inputs:
       agents:
-        description: 'Comma-separated agents to run: claude-opus, codex, opencode by default; claude-sonnet on request.'
-        default: 'claude-opus,codex,opencode'
+        description: 'Comma-separated agents to run: claude-sonnet, codex, opencode by default; pi and claude-opus on request.'
+        default: 'claude-sonnet,codex,opencode'
+      tasks:
+        description: 'Space-separated tasks; empty runs the full release matrix. One cheap task, such as solana-transfer, checks that each login works.'
+        default: ''
+      allow_slower:
+        description: 'Report, without failing, tasks that took over 1.5x the baseline tool calls. On a PR, the evals-allow-slower label does the same.'
+        type: boolean
+        default: false
   pull_request:
 
 concurrency:
@@ -33,6 +42,8 @@ env:
   CARGO_INCREMENTAL: "0"
   # The release matrix; the report fails any cell without a summary.
   TASKS: solana-transfer evm-transfer evm-transfer-denied hyperliquid-order-proposal polymarket-limit-order-proposal near-intents-swap-proposal polymarket-clarification
+  # A dispatch may run a subset; empty means TASKS.
+  SELECTED_TASKS: ${{ inputs.tasks }}
 
 jobs:
   build:
@@ -52,12 +63,12 @@ jobs:
       - name: Select agents
         id: select
         env:
-          AGENTS: ${{ inputs.agents || 'claude-opus,codex,opencode' }}
+          AGENTS: ${{ inputs.agents || 'claude-sonnet,codex,opencode' }}
         run: |
           agents="$(printf '%s' "$AGENTS" | jq -Rc 'split(",") | map(select(length > 0))')"
           # Agent names reach shell steps below; accept only the harness's names.
-          jq -e 'all(.[]; IN("claude-opus", "claude-sonnet", "codex", "opencode")) and length > 0' <<<"$agents" >/dev/null ||
-            { echo "::error::agents must be a comma-separated subset of claude-opus, claude-sonnet, codex, opencode"; exit 1; }
+          jq -e 'all(.[]; IN("claude-opus", "claude-sonnet", "codex", "opencode", "pi")) and length > 0' <<<"$agents" >/dev/null ||
+            { echo "::error::agents must be a comma-separated subset of claude-opus, claude-sonnet, codex, opencode, pi"; exit 1; }
           echo "agents=$agents" >> "$GITHUB_OUTPUT"
       - name: Read the release matrix pins
         id: pins
@@ -170,20 +181,26 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          PI_AUTH_JSON: ${{ secrets.PI_AUTH_JSON }}
         run: |
           if [ -n "$CODEX_AUTH_JSON" ] && [ -z "$OPENAI_API_KEY" ]; then
             (umask 077 && mkdir -p ~/.codex && printf '%s' "$CODEX_AUTH_JSON" > ~/.codex/auth.json)
+          fi
+          if [ -n "$PI_AUTH_JSON" ]; then
+            export PI_AUTH_JSON_PATH="$RUNNER_TEMP/pi-auth.json"
+            (umask 077 && printf '%s' "$PI_AUTH_JSON" > "$PI_AUTH_JSON_PATH")
           fi
           case "$AGENT" in
             claude-*) key="${ANTHROPIC_API_KEY}${CLAUDE_CODE_OAUTH_TOKEN}" ;;
             codex) key="${OPENAI_API_KEY}${CODEX_AUTH_JSON}" ;;
             opencode) key="$DEEPSEEK_API_KEY" ;;
+            pi) key="$PI_AUTH_JSON" ;;
           esac
           if [ -z "$key" ]; then
             echo "::error::no model credential for $AGENT"
             exit 1
           fi
-          for task in $TASKS; do
+          for task in ${SELECTED_TASKS:-$TASKS}; do
             scripts/evals/run-harbor.sh "$task" "$AGENT" ||
               scripts/evals/run-harbor.sh "$task" "$AGENT" ||
               echo "::warning::$task with $AGENT failed twice"
@@ -214,8 +231,9 @@ jobs:
         env:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           AGENTS: ${{ join(fromJSON(needs.build.outputs.agents), ',') }}
+          ALLOW_SLOWER: ${{ inputs.allow_slower || contains(github.event.pull_request.labels.*.name, 'evals-allow-slower') }}
         run: |
-          python3 scripts/evals/release-report.py --agents "$AGENTS" --tasks "$TASKS" \
+          python3 scripts/evals/release-report.py --agents "$AGENTS" --tasks "${SELECTED_TASKS:-$TASKS}" \
             evals/harbor/baselines/README.md trials/*/summaries > report.md || echo "failed=true" >> "$GITHUB_OUTPUT"
           cat report.md >> "$GITHUB_STEP_SUMMARY"
       - name: Comment on the pull request
@@ -223,6 +241,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh pr comment ${{ github.event.pull_request.number }} --body-file report.md
-      - name: Fail on a smoke failure or a baseline regression
+      - name: Fail on a smoke failure, a baseline regression or a slower task
         if: steps.report.outputs.failed == 'true'
         run: exit 1
