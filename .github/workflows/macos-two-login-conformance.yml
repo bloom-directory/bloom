@@ -7,12 +7,12 @@ on:
         description: Public bloom-broker ref
         required: false
         type: string
-        default: 13c4240a9a74a3f9ee5bb84d407e0262484dad24
+        default: 0dc16bd7716f3b0ad44825783befe3953fa625f9
       signer_ref:
         description: Public bloom-signer ref
         required: false
         type: string
-        default: 7dd2569ed0aad165f9b03ff9cdebe0c03f951abb
+        default: fa43841512e6c9370620b435ec0e49b5a61c0375
       login_uid_a:
         description: First active GUI login UID
         required: true
@@ -34,11 +34,11 @@ on:
       broker_ref:
         description: Public bloom-broker ref
         required: true
-        default: 13c4240a9a74a3f9ee5bb84d407e0262484dad24
+        default: 0dc16bd7716f3b0ad44825783befe3953fa625f9
       signer_ref:
         description: Public bloom-signer ref
         required: true
-        default: 7dd2569ed0aad165f9b03ff9cdebe0c03f951abb
+        default: fa43841512e6c9370620b435ec0e49b5a61c0375
       login_uid_a:
         description: First active GUI login UID
         required: true
@@ -75,8 +75,8 @@ jobs:
       - name: Reject mutable sibling refs
         shell: bash
         env:
-          BROKER_REF: ${{ inputs.broker_ref || '13c4240a9a74a3f9ee5bb84d407e0262484dad24' }}
-          SIGNER_REF: ${{ inputs.signer_ref || '7dd2569ed0aad165f9b03ff9cdebe0c03f951abb' }}
+          BROKER_REF: ${{ inputs.broker_ref || '0dc16bd7716f3b0ad44825783befe3953fa625f9' }}
+          SIGNER_REF: ${{ inputs.signer_ref || 'fa43841512e6c9370620b435ec0e49b5a61c0375' }}
         run: |
           [[ "$BROKER_REF" =~ ^[0-9a-f]{40}$ ]]
           [[ "$SIGNER_REF" =~ ^[0-9a-f]{40}$ ]]
@@ -84,13 +84,13 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-broker
-          ref: ${{ inputs.broker_ref || '13c4240a9a74a3f9ee5bb84d407e0262484dad24' }}
+          ref: ${{ inputs.broker_ref || '0dc16bd7716f3b0ad44825783befe3953fa625f9' }}
           path: bloom-broker
       - name: Check out Signer
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-signer
-          ref: ${{ inputs.signer_ref || '7dd2569ed0aad165f9b03ff9cdebe0c03f951abb' }}
+          ref: ${{ inputs.signer_ref || 'fa43841512e6c9370620b435ec0e49b5a61c0375' }}
           path: bloom-signer
       - name: Install checkout browser
         shell: bash

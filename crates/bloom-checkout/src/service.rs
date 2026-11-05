@@ -373,7 +373,7 @@ enum IntakeResponse {
     Result {
         status: CardOperationStatus,
         receipt: Option<Box<CustodyResult>>,
-        output_aad: Option<CustodyOutputHpkeAad>,
+        output_aad: Option<Box<CustodyOutputHpkeAad>>,
     },
     Error,
 }
@@ -497,7 +497,10 @@ impl CheckoutService {
                 }) => match status.state {
                     CardOperationState::Succeeded => {
                         let pending = self.unlocking.lock().await.take();
-                        match self.open_unlock(pending, receipt, output_aad).await {
+                        match self
+                            .open_unlock(pending, receipt, output_aad.map(|aad| *aad))
+                            .await
+                        {
                             Ok(()) => return,
                             Err(_)
                                 if self
@@ -1280,7 +1283,9 @@ impl CheckoutService {
                 match status.state {
                     CardOperationState::Succeeded => {
                         checkout.approved = true;
-                        let result = self.consume_and_fill(checkout, receipt, output_aad).await;
+                        let result = self
+                            .consume_and_fill(checkout, receipt, output_aad.map(|aad| *aad))
+                            .await;
                         if result.is_err() {
                             self.set_state(&operation_id, "disclosure_unknown");
                         }

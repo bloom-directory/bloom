@@ -767,6 +767,8 @@ impl RequestsHandler {
                 host_signer,
                 facts,
                 draft_path: Some(pending.join("private/mpp-unsigned-draft")),
+                // No VFS route reaches `requests/private`.
+                channel_dir: Some(self.requests_root().join("private/mpp-channels")),
             };
             let result = confirm_with_backend(
                 &self.root,
@@ -926,6 +928,7 @@ impl PaidHttpHostSigner for UnwiredPaidHttpHostSigner {
         _preimage: &[u8],
         _signing_hash: [u8; 32],
         _facts: &PaidHttpSigningFacts,
+        _review_envelope: Option<&[u8]>,
     ) -> Result<[u8; 65], String> {
         Err("Broker exact paid-http signing is unavailable".to_string())
     }
@@ -960,6 +963,7 @@ impl PaidHttpHostSigner for BrokerPaidHttpHostSigner {
         preimage: &[u8],
         signing_hash: [u8; 32],
         facts: &PaidHttpSigningFacts,
+        review_envelope: Option<&[u8]>,
     ) -> Result<[u8; 65], String> {
         let operation_class = match intent {
             PAID_HTTP_X402_SIGN_INTENT => "paid-http.x402",
@@ -986,6 +990,7 @@ impl PaidHttpHostSigner for BrokerPaidHttpHostSigner {
                 preimage,
                 bloom_broker_api::Digest32::from_bytes(signing_hash),
                 &facts_json,
+                review_envelope,
             )
             .await?
         {
@@ -2669,7 +2674,7 @@ mod tests {
         for intent in [PAID_HTTP_X402_SIGN_INTENT, PAID_HTTP_MPP_SIGN_INTENT] {
             assert!(
                 signer
-                    .sign_paid_http_payload(intent, "slot", b"payload", [0; 32], &facts)
+                    .sign_paid_http_payload(intent, "slot", b"payload", [0; 32], &facts, None)
                     .await
                     .unwrap_err()
                     .contains("Broker exact")
