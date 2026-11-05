@@ -2077,6 +2077,22 @@ fn wallet_import_rejects_path_names_before_broker_contact() {
 }
 
 #[test]
+fn wallet_import_rejects_wallets_control_names_before_broker_contact() {
+    let home = fresh_home();
+    let _daemon = RunningBloom::start(home.path());
+    for name in ["new", "registrations", "recover", "recoveries"] {
+        bloom_cmd(home.path())
+            .args(["wallet", "import", name])
+            .assert()
+            .failure()
+            .stderr(
+                predicate::str::contains("reserved for a /wallets control entry")
+                    .and(predicate::str::contains("ipc machine.execute").not()),
+            );
+    }
+}
+
+#[test]
 fn request_cli_dry_run_uses_vfs_lifecycle_and_body_receipt_helpers() {
     let home = fresh_home();
     seed_wallet_projection_fixture(home.path(), "alice");
