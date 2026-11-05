@@ -37,9 +37,8 @@ AGENTS: dict[str, AgentSpec] = {
     # Model ids are the API's, not the marketing names: "sonnet-5" is rejected
     # with a 404 unrecognized_model, which surfaces as an errored Harbor trial
     # rather than a configuration error.
-    # Two Claude rows on purpose. Opus is what a paying Claude Code user runs,
-    # so it answers "does Bloom work for the agent people have". Sonnet is the
-    # weaker instrument that exposes missing docs a stronger model reads past.
+    # Release runs use mid-tier models: they cost less, and a weaker model
+    # exposes missing docs a stronger one reads past. Opus runs on request.
     "claude-opus": AgentSpec("claude-code", "claude-opus-5-5"),
     "claude-sonnet": AgentSpec("claude-code", "claude-sonnet-5-5"),
     # Codex and Pi run mid-tier models on subscription logins, not the

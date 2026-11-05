@@ -22,8 +22,8 @@ on:
   workflow_dispatch:
     inputs:
       agents:
-        description: 'Comma-separated agents to run: claude-opus, codex, pi, opencode by default; claude-sonnet on request.'
-        default: 'claude-opus,codex,pi,opencode'
+        description: 'Comma-separated agents to run: claude-sonnet, codex, pi, opencode by default; claude-opus on request.'
+        default: 'claude-sonnet,codex,pi,opencode'
   pull_request:
 
 concurrency:
@@ -54,7 +54,7 @@ jobs:
       - name: Select agents
         id: select
         env:
-          AGENTS: ${{ inputs.agents || 'claude-opus,codex,pi,opencode' }}
+          AGENTS: ${{ inputs.agents || 'claude-sonnet,codex,pi,opencode' }}
         run: |
           agents="$(printf '%s' "$AGENTS" | jq -Rc 'split(",") | map(select(length > 0))')"
           # Agent names reach shell steps below; accept only the harness's names.
