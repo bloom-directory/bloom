@@ -1,4 +1,4 @@
-"""The release report fails only on smoke failures, auth errors and regressions."""
+"""The release report fails only on smoke failures, auth errors, regressions and slower tasks."""
 
 from __future__ import annotations
 
@@ -6,8 +6,10 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 SCRIPT = Path(__file__).parents[3] / "scripts/evals/release-report.py"
@@ -54,6 +56,23 @@ class ReleaseReportTest(unittest.TestCase):
             with contextlib.redirect_stdout(out):
                 code = report.main([*flags, str(root / "README.md"), str(root / "jobs/summaries")])
             return code, out.getvalue()
+
+    def test_a_task_over_one_and_a_half_times_the_baseline_tool_calls_fails_unless_allowed(self):
+        slow = summary("solana-transfer", "opencode")
+        slow["tool_calls"] = 29  # baseline 19; 28.5 is the limit
+        runs = (summary("solana-transfer", "opencode", smoke=True), slow)
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            code, out = self.run_report(*runs)
+        self.assertEqual(code, 1)
+        self.assertIn("SLOWER: 29 tool calls, baseline 19", out)
+        self.assertIn("- solana-transfer with opencode took 29 tool calls, over 1.5x the baseline's 19", out)
+        with unittest.mock.patch.dict(os.environ, {"ALLOW_SLOWER": "true"}, clear=True):
+            code, out = self.run_report(*runs)
+        self.assertEqual(code, 0)
+        self.assertIn("accepted by override", out)
+        slow["tool_calls"] = 28
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(self.run_report(*runs)[0], 0)
 
     def test_passing_run_leads_with_the_verdict_and_baseline_deltas(self):
         code, out = self.run_report(summary("solana-transfer", "opencode", smoke=True), summary("solana-transfer", "opencode"))

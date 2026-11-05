@@ -24,6 +24,10 @@ on:
       agents:
         description: 'Comma-separated agents to run: claude-sonnet, codex, pi, opencode by default; claude-opus on request.'
         default: 'claude-sonnet,codex,pi,opencode'
+      allow_slower:
+        description: 'Report, without failing, tasks that took over 1.5x the baseline tool calls. On a PR, the evals-allow-slower label does the same.'
+        type: boolean
+        default: false
   pull_request:
 
 concurrency:
@@ -222,6 +226,7 @@ jobs:
         env:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           AGENTS: ${{ join(fromJSON(needs.build.outputs.agents), ',') }}
+          ALLOW_SLOWER: ${{ inputs.allow_slower || contains(github.event.pull_request.labels.*.name, 'evals-allow-slower') }}
         run: |
           python3 scripts/evals/release-report.py --agents "$AGENTS" --tasks "$TASKS" \
             evals/harbor/baselines/README.md trials/*/summaries > report.md || echo "failed=true" >> "$GITHUB_OUTPUT"
@@ -231,6 +236,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh pr comment ${{ github.event.pull_request.number }} --body-file report.md
-      - name: Fail on a smoke failure or a baseline regression
+      - name: Fail on a smoke failure, a baseline regression or a slower task
         if: steps.report.outputs.failed == 'true'
         run: exit 1
