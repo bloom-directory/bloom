@@ -24,6 +24,9 @@ on:
       agents:
         description: 'Comma-separated agents to run: claude-sonnet, codex, pi, opencode by default; claude-opus on request.'
         default: 'claude-sonnet,codex,pi,opencode'
+      tasks:
+        description: 'Space-separated tasks; empty runs the full release matrix. One cheap task, such as solana-transfer, checks that each login works.'
+        default: ''
       allow_slower:
         description: 'Report, without failing, tasks that took over 1.5x the baseline tool calls. On a PR, the evals-allow-slower label does the same.'
         type: boolean
@@ -38,7 +41,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   # The release matrix; the report fails any cell without a summary.
-  TASKS: solana-transfer evm-transfer evm-transfer-denied hyperliquid-order-proposal polymarket-limit-order-proposal near-intents-swap-proposal polymarket-clarification
+  TASKS: ${{ inputs.tasks || 'solana-transfer evm-transfer evm-transfer-denied hyperliquid-order-proposal polymarket-limit-order-proposal near-intents-swap-proposal polymarket-clarification' }}
 
 jobs:
   build:
