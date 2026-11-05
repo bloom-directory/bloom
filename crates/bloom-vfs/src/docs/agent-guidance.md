@@ -80,7 +80,9 @@ To discard an entry never sent for signing, write `cancel` to its `confirm`
 file. The entry's own `cancel` file signs a same-nonce replacement and needs
 its own approval. If a signature may exist, even with no hash recorded, Bloom
 keeps the entry and its `last_error.json` says how to reconcile it. Never
-delete a signing record or reuse a nonce to force a fresh attempt.
+delete a signing record or reuse a nonce to force a fresh attempt. A
+`failed/` entry with `signing_unknown.json` may still be signed (an older
+Bloom released it): follow its `next` before staging that payment again.
 
 On Solana, reconcile an ambiguous send by its signature. A `sent` entry with
 `unresolved.md` and no receipt is not proof of failure: show the owner its

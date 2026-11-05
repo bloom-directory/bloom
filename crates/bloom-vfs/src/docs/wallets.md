@@ -149,8 +149,6 @@ entry that may be signed stays pending.
 
 An unreadable signing record does not prove nothing signed: preserve it,
 inspect Broker operation status and the chain nonce, and restore it from backup
-before retrying. A `failed/` entry with `signing_unknown.json` was released by
-an older Bloom although it may be signed: follow its `next` before staging that
-payment again or reusing its nonce. An already broadcast transaction needs
+before retrying. An already broadcast transaction needs
 `bloom wallet cancel` and its own approval. Dropping a reservation does not
 renumber later rows: restage with an explicit nonce to fill a gap.
