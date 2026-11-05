@@ -44,15 +44,9 @@ If the user gave a mount path, read from that path instead.
 
 ## Rules
 
-- If the user did not name a chain, use what Bloom state settles: a read
-  covers every chain (`wallets/<wallet>/<n>/holdings.json`); a write uses the
-  only chain that holds the asset. Ask only when two or more funded chains
-  remain, and name them.
 - Do what the user asked without asking them to confirm it again. Their
   passkey approval, or a valid Sealed Approval, is the authorization.
 - Installing Bloom or this skill does not authorize creating a wallet, adding
   a passkey, recovery, or transactions. Do those only when asked.
 - Never request or handle private keys, seed phrases, passwords, or passkey
   secrets. Give the human the complete ceremony URL; they approve in the browser.
-- After a write error, inspect state before retrying. Never blindly restage or
-  rebroadcast.
