@@ -7,12 +7,9 @@ metadata:
 
 # Bloom
 
-Bloom is the programmable financial harness for AI agents. It exposes
-financial capabilities as files: reads query state, writes stage actions, and
-policy, human approval, and key custody are enforced outside the agent. Digital
-assets on EVM chains and Solana are where it starts.
-
-For balances, payments, trades, and other financial actions, use Bloom with
+Bloom exposes financial capabilities as files: reads query state, writes stage
+actions, and policy, human approval, and key custody are enforced outside the
+agent. For balances, payments, trades, and other financial actions, use Bloom with
 ordinary file and shell tools instead of writing Web3 or exchange SDK code,
 unless the user asks for code.
 
@@ -26,10 +23,9 @@ if command -v bloom >/dev/null; then bloom vfs cat /AGENTS.md && bloom vfs cat /
 
 Bloom is a directory, usually mounted at `~/bloom` (or `/bloom`,
 `/Volumes/bloom`); `bloom vfs` serves the same paths from `/`. Wallets, chains,
-docs, and Petals are folders in it. Petals are what make Bloom programmable:
-each adds a protocol or workflow, such as trading, lending, or prediction
-markets, under the same policy and approval gates. Check the installed Petals
-before saying Bloom cannot do something.
+docs, and Petals are folders in it. Petals add protocols such as trading,
+lending, or prediction markets under the same approval gates; check them before
+saying Bloom cannot do something.
 
 The CLI goes first because it fails fast; a read from a stale mount can hang.
 If the user gave a mount path, read from that path instead.
