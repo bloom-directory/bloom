@@ -22,8 +22,8 @@ on:
   workflow_dispatch:
     inputs:
       agents:
-        description: 'Comma-separated agents to run: claude-sonnet, codex, pi, opencode by default; claude-opus on request.'
-        default: 'claude-sonnet,codex,pi,opencode'
+        description: 'Comma-separated agents to run: claude-sonnet, codex, opencode by default; pi and claude-opus on request.'
+        default: 'claude-sonnet,codex,opencode'
       tasks:
         description: 'Space-separated tasks; empty runs the full release matrix. One cheap task, such as solana-transfer, checks that each login works.'
         default: ''
@@ -63,7 +63,7 @@ jobs:
       - name: Select agents
         id: select
         env:
-          AGENTS: ${{ inputs.agents || 'claude-sonnet,codex,pi,opencode' }}
+          AGENTS: ${{ inputs.agents || 'claude-sonnet,codex,opencode' }}
         run: |
           agents="$(printf '%s' "$AGENTS" | jq -Rc 'split(",") | map(select(length > 0))')"
           # Agent names reach shell steps below; accept only the harness's names.

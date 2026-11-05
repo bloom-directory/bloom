@@ -96,7 +96,7 @@ Use optimized services. Debug Broker and Signer builds make every mounted
 read slow: twelve reads took 119 s with debug services and 2.8 s optimized,
 which turns agent timing into a measure of the build.
 
-Agents are `claude-sonnet`, `codex`, `pi`, `opencode` and, by dispatch only, `claude-opus`, using the host's existing
+Agents are `claude-sonnet`, `codex`, `opencode` and, by dispatch only, `pi` and `claude-opus`, using the host's existing
 authentication. Harbor 0.21.0 and the agent image are pinned. Every task uses
 the same image digest. `BLOOM_EVAL_REASONING_EFFORT` selects Codex reasoning
 effort.
@@ -154,9 +154,9 @@ k=$(mktemp -d); PI_CODING_AGENT_DIR=$k pi    # /login, Kimi Code, then /quit
 gh secret set PI_AUTH_JSON -R bloom-directory/bloom < $k/auth.json
 ```
 
-Every default agent runs a mid-tier model, not the strongest its provider
-offers: Claude Sonnet 5.5, Codex `gpt-5.6-sol`, Pi `kimi-coding/k3` and
-OpenCode `deepseek-flash`. Locally, Pi needs `PI_AUTH_JSON_PATH`; it never reads your own
-`~/.pi` login. The agent container sees them, so use dedicated credentials. A selected agent without one fails the run.
+Every agent runs a mid-tier model, not the strongest its provider
+offers: Claude Sonnet 5.5, Codex `gpt-5.6-sol`, OpenCode `deepseek-flash` and
+Pi `kimi-coding/k3`. Pi is off by default until its login is verified in CI.
+Locally, Pi needs `PI_AUTH_JSON_PATH`; it never reads your own `~/.pi` login. The agent container sees them, so use dedicated credentials. A selected agent without one fails the run.
 `requirements.txt` is the full resolved dependency set; edit `requirements.in`
 and regenerate it with the command in its header.
