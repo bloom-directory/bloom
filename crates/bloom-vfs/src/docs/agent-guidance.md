@@ -59,8 +59,8 @@ it does not create a local wallet. Follow
 
 For native transfers and Petal actions that project into the outbox:
 
-1. Read the write target (`outbox/new.tx` or a Petal's `new`) for the body it
-   accepts, then stage once.
+1. Stage once: write the body to `outbox/new.tx` (formats in
+   `docs/examples.md`) or to a Petal's `new` (its README).
 2. Identify the new entry in `pending/` by its `intent.json` and `plan.md`,
    never by wildcard, sequence number, `latest` or position.
 3. Write `confirm` to that entry's `confirm` file.
@@ -77,11 +77,11 @@ disappeared: list `sent/` and `failed/` first. `confirm.override` is only for
 when the policy projection permits it and the human accepted its warning.
 
 To discard an entry never sent for signing, write `cancel` to its `confirm`
-file. The entry's own `cancel` file signs a same-nonce replacement and needs
-its own approval. If a signature may exist, even with no hash recorded, Bloom
-keeps the entry and its `last_error.json` says how to reconcile it. Never
-delete a signing record or reuse a nonce to force a fresh attempt. A
-`failed/` entry with `signing_unknown.json` may still be signed (an older
+file. On EVM the entry's own `cancel` file instead signs a same-nonce
+replacement and needs its own approval. If a signature may exist, even with
+no hash recorded, Bloom keeps the entry and its `last_error.json` says how to
+reconcile it. Never delete a signing record or reuse a nonce to force a fresh
+attempt. A `failed/` entry with `signing_unknown.json` may still be signed (an older
 Bloom released it): follow its `next` before staging that payment again.
 
 On Solana, reconcile an ambiguous send by its signature. A `sent` entry with
@@ -116,7 +116,8 @@ fields.
 The approval page shows Broker's own reading of the signed bytes: action,
 account, amounts, recipient and limits. Before forwarding the link, tell the
 human in a sentence what you asked for, so they can cancel if the page shows
-something else. Point out **No output protection**, **Spending limit:
+something else. Name an unknown token only by its address and raw units,
+never a guessed ticker. Point out **No output protection**, **Spending limit:
 Unlimited**, or **Contract call Bloom cannot read** if shown. An approval
 proves what was signed, not that an order filled or funds arrived; report
 outcomes from receipts and the Petal's status files.
