@@ -41,6 +41,7 @@ struct FixtureState {
 }
 
 struct BrokerFixture {
+    refuse_cancel: AtomicBool,
     available: AtomicBool,
     complete: AtomicBool,
     lose_prepare_response_once: AtomicBool,
@@ -230,6 +231,16 @@ impl MachineBrokerService for BrokerFixture {
                         },
                     ))
                 }
+                MachineBrokerRequest::CeremonyCancel(_)
+                    if self.refuse_cancel.load(Ordering::SeqCst) =>
+                {
+                    // Broker b6c27339 ceremony.rs: a ceremony past AwaitingUser
+                    // (the owner approved it) cannot be cancelled.
+                    Err(ProtocolError::new(
+                        ProtocolErrorCode::OperationIdConflict,
+                        "ceremony is past the point where it can be cancelled",
+                    ))
+                }
                 MachineBrokerRequest::CeremonyCancel(request) => {
                     *self.ceremony_state_override.lock() = Some(CeremonyState::Cancelled);
                     Ok(MachineBrokerResponse::CeremonyCancel(
@@ -316,6 +327,7 @@ fn broker_fixture_with_policy(
 ) -> Arc<BrokerFixture> {
     let baseline_bytes = serde_jcs::to_vec(&baseline_policy).unwrap();
     Arc::new(BrokerFixture {
+        refuse_cancel: AtomicBool::new(false),
         available: AtomicBool::new(true),
         complete: AtomicBool::new(false),
         lose_prepare_response_once: AtomicBool::new(lose_prepare_response_once),
@@ -1788,10 +1800,13 @@ async fn a_switch_is_proposed_once_and_can_be_cancelled() {
     else {
         panic!("the switch is proposed");
     };
-    handler
-        .cancel_policy_proposal("alice", pending.operation_id.as_str())
-        .await
-        .unwrap();
+    assert_eq!(
+        handler
+            .cancel_policy_proposal("alice", pending.operation_id.as_str())
+            .await
+            .unwrap(),
+        bloom_vfs::handlers::ProposalOutcome::Ended
+    );
     assert!(fixture.requests.lock().iter().any(|request| matches!(
         request,
         MachineBrokerRequest::CeremonyCancel(cancel)
@@ -1876,4 +1891,208 @@ async fn a_persona_lifetime_goes_into_the_first_proposal() {
     let proposed: CanonicalWalletPolicy =
         serde_json::from_slice(changed.state.lock().proposed_policy.as_ref().unwrap()).unwrap();
     assert_eq!(proposed.maximum_approval_lifetime_ms, standing);
+}
+
+/// A switch the owner approved before a later switch's cancel reached Broker
+/// cannot be cancelled: Broker refuses to cancel a ceremony past the owner's
+/// approval, and the proposal commits. The cancel says so, so Machine applies
+/// that switch instead of reporting it cancelled.
+#[tokio::test]
+async fn cancelling_a_switch_the_owner_already_approved_reports_it_committed() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture_with_policy(false, policy(60_000), 2);
+    let handler = eligibility_handler(temp.path(), fixture.clone());
+    let degen = bloom_vfs::handlers::PolicyReplacement {
+        packages: vec![Digest32::from_bytes([3; 32])],
+        destinations: vec![bloom_broker_api::PolicyDestination {
+            chain: Token::new("evm-1").unwrap(),
+            destination: bloom_proto::policy::ERC20_ANY_RECIPIENT.into(),
+        }],
+        maximum_approval_lifetime_ms: bloom_proto::policy::STANDING_APPROVAL_POLICY_LIFETIME_MS,
+    };
+    let PetalEligibility::AwaitingPolicyApproval(pending) = handler
+        .ensure_policy_replaced("alice", &degen, true)
+        .await
+        .unwrap()
+    else {
+        panic!("the switch is proposed");
+    };
+    // The owner approves while nothing polls, then starts another switch.
+    fixture.complete.store(true, Ordering::SeqCst);
+    fixture.refuse_cancel.store(true, Ordering::SeqCst);
+    assert_eq!(
+        handler
+            .cancel_policy_proposal("alice", pending.operation_id.as_str())
+            .await
+            .unwrap(),
+        bloom_vfs::handlers::ProposalOutcome::Committed
+    );
+    assert!(
+        fixture
+            .requests
+            .lock()
+            .iter()
+            .any(|request| matches!(request, MachineBrokerRequest::PolicyCommitUpdate(_)))
+    );
+    assert!(matches!(
+        handler
+            .ensure_policy_replaced("alice", &degen, false)
+            .await
+            .unwrap(),
+        PetalEligibility::Allowed(_)
+    ));
+    // Asked again, the outcome stands.
+    assert_eq!(
+        handler
+            .policy_proposal_outcome("alice", pending.operation_id.as_str())
+            .await
+            .unwrap(),
+        bloom_vfs::handlers::ProposalOutcome::Committed
+    );
+}
+
+/// Machine matches a switch against a replacement it computes again on each
+/// check, from the installed Petals and configured chains. If those changed
+/// after the owner approved, the committed switch no longer matches, but its
+/// own proposal still reads as committed, so Machine applies it rather than
+/// report it ended.
+#[tokio::test]
+async fn an_approved_switch_reads_as_committed_when_the_request_changed() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture_with_policy(false, policy(60_000), 2);
+    let handler = eligibility_handler(temp.path(), fixture.clone());
+    let proposed = bloom_vfs::handlers::PolicyReplacement {
+        packages: vec![Digest32::from_bytes([3; 32])],
+        destinations: vec![setup_destination()],
+        maximum_approval_lifetime_ms: bloom_proto::policy::STANDING_APPROVAL_POLICY_LIFETIME_MS,
+    };
+    let PetalEligibility::AwaitingPolicyApproval(pending) = handler
+        .ensure_policy_replaced("alice", &proposed, true)
+        .await
+        .unwrap()
+    else {
+        panic!("the switch is proposed");
+    };
+    assert!(pending.includes_requested);
+    fixture.complete.store(true, Ordering::SeqCst);
+    // The chosen Petal updated meanwhile, so it resolves to a new hash.
+    let recomputed = bloom_vfs::handlers::PolicyReplacement {
+        packages: vec![Digest32::from_bytes([4; 32])],
+        ..proposed.clone()
+    };
+    assert!(matches!(
+        handler
+            .ensure_policy_replaced("alice", &recomputed, false)
+            .await
+            .unwrap(),
+        PetalEligibility::ChangedSinceCreation(_)
+    ));
+    assert_eq!(
+        handler
+            .policy_proposal_outcome("alice", pending.operation_id.as_str())
+            .await
+            .unwrap(),
+        bloom_vfs::handlers::ProposalOutcome::Committed
+    );
+    // A proposal Machine never made reads as ended.
+    assert_eq!(
+        handler
+            .policy_proposal_outcome("alice", "op_00000000000000000000000000000000")
+            .await
+            .unwrap(),
+        bloom_vfs::handlers::ProposalOutcome::Ended
+    );
+}
+
+/// While another policy change waits for the owner, such as a persona switch
+/// that removes a Petal, Broker keeps one live ceremony per wallet, so a Petal
+/// operation that would need an approval is pointed at that change: told it
+/// does not allow the operation, and to have it approved or refused first.
+/// Once its ceremony is no longer open, as while the owner's approval is
+/// being verified, the committed policy is still the wallet's and a Petal it
+/// allows proceeds; one it does not allow keeps waiting.
+#[tokio::test]
+async fn a_petal_waits_on_another_change_only_while_its_ceremony_is_open() {
+    let temp = tempfile::tempdir().unwrap();
+    let allowed = Digest32::from_bytes([9; 32]);
+    let mut current = policy(60_000);
+    current.allowed_petal_packages = vec![allowed.clone()];
+    let fixture = broker_fixture_with_policy(false, current, 2);
+    let handler = eligibility_handler(temp.path(), fixture.clone());
+    // A switch to a setup without that Petal.
+    let switch = bloom_vfs::handlers::PolicyReplacement {
+        packages: Vec::new(),
+        destinations: Vec::new(),
+        maximum_approval_lifetime_ms: bloom_proto::policy::CREATION_APPROVAL_LIFETIME_MS,
+    };
+    let PetalEligibility::AwaitingPolicyApproval(pending) = handler
+        .ensure_policy_replaced("alice", &switch, true)
+        .await
+        .unwrap()
+    else {
+        panic!("the switch is proposed");
+    };
+
+    let refused = handler.require_petal_eligibility("alice", &allowed).await;
+    let Err(HandlerError::Backend(message)) = refused else {
+        panic!("{refused:?}");
+    };
+    assert!(
+        message.starts_with(
+            "POLICY_APPROVAL_REQUIRED: another policy change for wallet alice is waiting for the owner at "
+        ),
+        "{message}"
+    );
+    assert!(
+        message.contains("it does not allow this operation"),
+        "{message}"
+    );
+    assert!(message.contains(pending.operation_id.as_str()), "{message}");
+
+    // The owner is approving: the ceremony is no longer open.
+    *fixture.ceremony_state_override.lock() = Some(CeremonyState::Verifying);
+    handler
+        .require_petal_eligibility("alice", &allowed)
+        .await
+        .unwrap();
+    let other = Digest32::from_bytes([8; 32]);
+    let refused = handler.require_petal_eligibility("alice", &other).await;
+    let Err(HandlerError::Backend(message)) = refused else {
+        panic!("{refused:?}");
+    };
+    assert!(message.starts_with("POLICY_APPROVAL_REQUIRED"), "{message}");
+    assert!(message.contains(pending.operation_id.as_str()), "{message}");
+}
+
+/// A failure of the proposal a persona switch makes carries the VFS's
+/// marker, so Machine can tell Broker's refusal of that proposal from a
+/// failure around it, and still reads an outage in it.
+#[tokio::test]
+async fn a_switch_proposal_failure_is_marked_as_the_proposal_s() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture_with_policy(false, policy(60_000), 2);
+    *fixture.prepare_refusal_once.lock() = Some(ProtocolErrorCode::ClaimInvalid);
+    let handler = eligibility_handler(temp.path(), fixture.clone());
+    let switch = bloom_vfs::handlers::PolicyReplacement {
+        packages: vec![Digest32::from_bytes([3; 32])],
+        destinations: Vec::new(),
+        maximum_approval_lifetime_ms: bloom_proto::policy::CREATION_APPROVAL_LIFETIME_MS,
+    };
+    let refused = handler.ensure_policy_replaced("alice", &switch, true).await;
+    let Err(HandlerError::Backend(message)) = refused else {
+        panic!("{refused:?}");
+    };
+    let marker = format!(
+        "{}: CLAIM_INVALID: ",
+        bloom_vfs::handlers::wallets::POLICY_PROPOSAL_FAILED
+    );
+    assert!(message.starts_with(&marker), "{message}");
+    // Nothing waits, and asking again proposes.
+    assert!(matches!(
+        handler
+            .ensure_policy_replaced("alice", &switch, true)
+            .await
+            .unwrap(),
+        PetalEligibility::AwaitingPolicyApproval(_)
+    ));
 }

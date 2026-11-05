@@ -166,7 +166,7 @@ Agreed on 2026-09-14:
     and nothing is signed or broadcast. This decision neither adds that check
     nor relaxes it.
 
-    What the pinned release (v0.1.4) enforces: the deposit address comes from
+    What the pinned release (v0.1.5, as v0.1.4) enforces: the deposit address comes from
     a quote whose signature the Petal verifies, the quote must echo the
     request's amount, assets, slippage and recipient, refunds go to the
     wallet, and slippage is at most 1000 bps. It has no input cap, and the
@@ -267,11 +267,36 @@ Agreed on 2026-11-03 with the author of bloom#352 and bloom#377:
     Nothing changes before the owner approves: Machine holds the new setup
     as a waiting switch (`pending-persona/<wallet>.toml`). A switch the owner
     refuses, or that expires, ends with nothing changed and is not proposed
-    again; `bloom wallet default-policy <wallet>` resumes one still waiting.
+    again; so does one whose proposal Broker refuses outright, with a
+    refusal the same request cannot get past and that left nothing behind.
+    `bloom wallet default-policy <wallet>` resumes one still waiting.
+    Once the owner approves, the switch applies within seconds: the command
+    waiting for it applies it, or, with none waiting, `bloom serve` does,
+    so its limit reset comes right after the approval rather than over
+    values the owner set later.
+
     Starting another switch cancels the earlier one's ceremony, so only the
-    latest choice can commit. Setup's other rules do not apply to a switch:
-    it is proposed whatever the policy's version, it removes entries, and it
-    writes limits over stored settings.
+    latest choice can commit. Machine proposes a switch and records its
+    proposal in one step, so the later switch always finds the earlier
+    one's proposal to cancel. If the owner had already approved the earlier
+    one, Broker cannot cancel it and it commits: Machine applies it first and
+    says so, then proposes the new one. A switch the owner approved also
+    applies when what Machine would propose now differs from what it
+    proposed, for example because a chosen Petal updated or a chain was
+    configured meanwhile; the report then names what its policy does not
+    allow instead of claiming it, and an updated Petal asks for its new
+    release on its next signed action. A command changes a waiting switch
+    only while it still holds the one it read, so it never overwrites,
+    clears or applies a newer one. Setup's other rules do not apply to a
+    switch: it is proposed whatever the policy's version, it removes
+    entries, and it writes limits over stored settings.
+
+    Broker keeps one live ceremony per wallet. While a switch's ceremony, or
+    any other policy change's, is open, a Petal operation is pointed at it:
+    told that the change does not allow the operation, and that the owner
+    must approve or refuse it first. Once that ceremony is no longer open,
+    as while the owner's approval is being verified, the committed policy is
+    still the wallet's, and a Petal it allows proceeds.
 19. **Trader and Degen approvals can last until revoked.** bloom#377's
     reusable permissions need the policy's maximum approval lifetime at
     bloom-broker#112's `STANDING_APPROVAL_POLICY_LIFETIME_MS`. A Trader or
@@ -425,8 +450,8 @@ chosen Petals:
   "wallet_id": "main",
   "maximum_approval_lifetime_ms": 2592000000,
   "allowed_petal_packages": [
-    "07fdcc9841c88de8fe1d0b4526bc01deac004c1c7dec202e2c8d7443300f22af",
-    "6eb2065e8558f3761399fcb0516731a600fdb0b49974c8ed0808abd38fde7db4"
+    "d811c181c7ec469026335c9265d7019a520d8d9d882b302064278cf1138d2db2",
+    "17a50dda0894b7b7e5757033806f8ec31523575438419ea1330b731a2c6c5d14"
   ],
   "allowed_destinations": [
     { "chain": "polygon", "destination": "petal:polymarket" }
@@ -437,7 +462,7 @@ chosen Petals:
 
 - **`allowed_petal_packages`** lists each chosen Petal by its installed
   package hash. On an up-to-date home that is the hash Bloom's catalog pins:
-  Hyperliquid v0.1.7 and Polymarket v0.1.8. A home still updating proposes
+  Hyperliquid v0.1.9 and Polymarket v0.2.0. A home still updating proposes
   the release it runs. Until proposals from Petal changes are built
   (section 5), the Petal's first signed action after the update opens a
   policy ceremony that allows the new hash (`ensure_petal_eligibility`).
@@ -511,11 +536,13 @@ else there may be the owner's, so it stays: Machine clears the marker and
 logs the command that would apply setup's choice.
 
 The key is pinned with the releases checked to store settings there
-(`releases` in the catalog's settings template): Polymarket v0.1.8, the
-catalog's release, and v0.1.6, which Bloom v0.4.0 installed and a home may
-still run while it updates. Setup writes only when the installed package hash
-is one of them, and the signed lineage carries a write made to v0.1.6 forward
-to v0.1.8. Another release under the same name, such as a fork or a newer
+(`releases` in the catalog's settings template): Polymarket v0.2.0, the
+catalog's release, and v0.1.6 and v0.1.8, which Bloom v0.4.0 and v0.4.1
+installed and a home may still run while it updates. v0.2.0 moved to a newer
+Petal SDK, whose `state` namespace and `venue_config_key` are unchanged.
+Setup writes only when the installed package hash is one of them, and the
+signed lineage carries a write made to an earlier one forward to v0.2.0.
+Another release under the same name, such as a fork or a newer
 release whose key nobody has checked, may store its settings elsewhere, where
 the check could not see them, so Machine keeps what it holds and clears the
 marker. `bloom init` prints the manual command; a queued retry only logs it
@@ -564,7 +591,7 @@ approvals work exactly as they do today:
   that would pass the daily limit is refused before the owner is asked.
 
 Polymarket's existing daily limit counts buys from its trade receipts over
-the last 24 hours; v0.1.8 counts each buy's amount plus the most its fee can
+the last 24 hours; since v0.1.8 it counts each buy's amount plus the most its fee can
 be. It does not count sells, and it has no total limit.
 
 ### 5. Adding, updating, and removing Petals
@@ -747,8 +774,8 @@ this design and those stacks:
   bloom-petal-polymarket#19 order.
   bloom#377's pins speak Broker–Signer 1.8 and Machine–Broker 1.10.
   Polymarket coverage also needs a published Polymarket package that
-  declares its debits to Broker. None does yet: v0.1.6, v0.1.8 (pinned here)
-  and v0.2.0 declare none for any signature.
+  declares its debits to Broker. None does yet: v0.1.6, v0.1.8 and v0.2.0
+  (pinned here) declare none for any signature.
   bloom-petal-polymarket#19 adds them for bloom#352, and
   bloom-petal-polymarket#26, which contains it, for bloom#377; both conflict
   with main. This design keeps the current Broker, Signer and Polymarket pins
@@ -949,11 +976,11 @@ Automated:
   as awaiting the owner, is replaced by a new ceremony
   (`crates/bloom-vfs/tests/triad_policy_update.rs`).
 - Catalog provisioning reports an update separately from a fresh install.
-- A queued write goes into Polymarket v0.1.6 as well as the catalog's
-  v0.1.8, which store settings under the same key. On v0.1.5, an earlier
-  release whose route differs, it stays queued for the update; any other
-  release gets nothing. The catalog bump test lists both and checks each is
-  the catalog release or one it updates from.
+- A queued write goes into Polymarket v0.1.6 and v0.1.8 as well as the
+  catalog's v0.2.0, which store settings under the same key. On v0.1.5, an
+  earlier release whose route differs, it stays queued for the update; any
+  other release gets nothing. The catalog bump test lists all three and
+  checks each is the catalog release or one it updates from.
 - Enso's router is proposed on exactly the 12 chains pinned Enso v0.1.7
   allows. Polymarket's entry is `petal:polymarket`, and a call to pUSD staged
   by another Petal or by hand is refused under it
@@ -975,8 +1002,21 @@ Automated:
   config; concurrent setup saves keep every wallet; a config save is atomic
   and keeps its permissions; and the wait reports a switch applied or ended.
   A switch is proposed once, not again after it is refused or expires, and
-  a later switch cancels the earlier one's ceremony; the legacy
-  clear-signing rules are dropped only for a Broker with bloom-broker#103.
+  a later switch cancels the earlier one's ceremony; one the owner already
+  approved, which Broker cannot cancel, reads as committed, and so does an
+  approved switch whose request changed since, whose report names what its
+  policy does not allow. Ending a switch leaves a newer one in place, and
+  only Broker's refusal of the switch's own proposal, with no retry and no
+  effect, ends a switch never proposed; a failure to talk to Broker, or
+  around the proposal, does not. While another change's ceremony is open, a
+  Petal is pointed at it and told it does not allow the operation; once it
+  is not open, a Petal the committed policy allows proceeds
+  (`crates/bloom-vfs/tests/triad_policy_update.rs`). The legacy
+  clear-signing rules are dropped only for a Broker with bloom-broker#103,
+  and advice to edit a policy that keeps them says to drop them too. A
+  config saved through a symbolic link keeps the link, unless its target
+  cannot be replaced, and a save's sibling is never more readable than the
+  config.
   The first proposal reads the wallet's setup from disk each time.
   `bloom init --persona` on a set-up home changes nothing and names
   `bloom wallet persona`.
@@ -993,6 +1033,11 @@ Manual, on the developer triad:
   reports it applied without a new ceremony, finishes a queued settings
   write without replacing the owner's, and proposes nothing once the owner
   has changed the policy (`scripts/test-default-policy-e2e.sh`).
+- `bloom wallet persona main <persona>` changes nothing before the owner
+  approves, then replaces the policy and resets the limits; a later switch
+  supersedes one still waiting; and a switch approved with no command
+  waiting applies, reported by the next switch or applied by `bloom serve`
+  (`scripts/test-persona-switch-e2e.sh`).
 - A chosen Petal's first signed action on `main` asks only for that
   action's approval, while a wallet without the default policy is first
   asked to allow the Petal's package.

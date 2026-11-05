@@ -1,7 +1,7 @@
 //! Daemon configuration loaded from `~/.bloom/config.toml`.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -334,6 +334,85 @@ pub struct PrivateRpcChainConfig {
     pub flashbots_url: Option<String>,
 }
 
+/// Write `bytes` over `path` atomically: a sibling is written, synced and
+/// renamed over it, keeping the permissions of the file it replaces.
+fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let existing = std::fs::metadata(path).ok();
+    let (mut file, temporary) = create_sibling(path, existing.as_ref())?;
+    let written = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        if let Some(existing) = &existing {
+            std::fs::set_permissions(&temporary, existing.permissions())?;
+        }
+        std::fs::rename(&temporary, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    written
+}
+
+/// Create the sibling [`write_atomically`] renames over `path`, with the
+/// mode of the file it replaces, which the umask can only narrow, so it is
+/// never readable by more than that file is, even before its permissions
+/// are copied.
+fn create_sibling(
+    path: &Path,
+    existing: Option<&std::fs::Metadata>,
+) -> std::io::Result<(std::fs::File, PathBuf)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SAVES: AtomicU64 = AtomicU64::new(0);
+
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.toml");
+    let temporary = path.with_file_name(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        SAVES.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if let Some(existing) = existing {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        options.mode(existing.permissions().mode() & 0o777);
+    }
+    #[cfg(not(unix))]
+    let _ = existing;
+    Ok((options.open(&temporary)?, temporary))
+}
+
+/// Where saving the config at `path` writes: the file a symbolic link at
+/// `path` points to, followed to its end, so the link itself is kept.
+fn save_target(path: &Path) -> std::io::Result<PathBuf> {
+    let mut target = path.to_path_buf();
+    // Bounded, so a loop of links fails instead of spinning.
+    for _ in 0..40 {
+        match std::fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let link = std::fs::read_link(&target)?;
+                target = match target.parent() {
+                    Some(parent) => parent.join(link),
+                    None => link,
+                };
+            }
+            _ => return Ok(target),
+        }
+    }
+    Err(std::io::Error::other(format!(
+        "{} is a loop of symbolic links",
+        path.display()
+    )))
+}
+
 fn default_mount_path() -> String {
     "/bloom".to_string()
 }
@@ -632,41 +711,27 @@ impl Config {
     /// Write the config atomically: a sibling file is written, synced and
     /// renamed over `path`, so a reader never sees a partly written config
     /// and a crash leaves the old one. The file keeps the config's
-    /// permissions.
+    /// permissions, and the sibling is never readable by more than the
+    /// config is. A `path` that is a symbolic link is kept: the file it
+    /// points to is replaced. If that file cannot be replaced, as one a Nix
+    /// store or home-manager keeps read-only, the link itself is replaced,
+    /// as saving did before it followed links.
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
-        use std::io::Write as _;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SAVES: AtomicU64 = AtomicU64::new(0);
-
         let s = toml::to_string_pretty(self)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("config.toml");
-        let temporary = path.with_file_name(format!(
-            ".{name}.{}.{}.tmp",
-            std::process::id(),
-            SAVES.fetch_add(1, Ordering::Relaxed)
-        ));
-        let written = (|| {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)?;
-            file.write_all(s.as_bytes())?;
-            file.sync_all()?;
-            if let Ok(existing) = std::fs::metadata(path) {
-                std::fs::set_permissions(&temporary, existing.permissions())?;
+        let target = save_target(path)?;
+        match write_atomically(&target, s.as_bytes()) {
+            Err(error)
+                if target != path
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::PermissionDenied
+                            | std::io::ErrorKind::ReadOnlyFilesystem
+                    ) =>
+            {
+                Ok(write_atomically(path, s.as_bytes())?)
             }
-            std::fs::rename(&temporary, path)
-        })();
-        if written.is_err() {
-            let _ = std::fs::remove_file(&temporary);
+            written => Ok(written?),
         }
-        Ok(written?)
     }
 
     pub fn load_or_init(path: &Path) -> Result<Self, ConfigError> {
@@ -1395,6 +1460,92 @@ rpc_urls = ["https://ethereum-rpc.publicnode.com"]
             cfg.save(&path).unwrap();
         }
         reader.join().unwrap();
+    }
+
+    /// A config reached through a symbolic link, as a dotfiles checkout
+    /// keeps it, stays a link: the file it points to is replaced.
+    #[cfg(unix)]
+    #[test]
+    fn saving_through_a_symbolic_link_keeps_the_link() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let td = tempdir().unwrap();
+        let real = td.path().join("dotfiles").join("bloom.toml");
+        let mut cfg = Config::local_default();
+        cfg.save(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let path = td.path().join("config.toml");
+        std::os::unix::fs::symlink("dotfiles/bloom.toml", &path).unwrap();
+
+        cfg.setup.complete = true;
+        cfg.save(&path).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(Config::load(&real).unwrap().setup.complete);
+        assert_eq!(
+            std::fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let names: Vec<String> = std::fs::read_dir(real.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, ["bloom.toml"]);
+
+        let looped = td.path().join("loop.toml");
+        std::os::unix::fs::symlink("loop.toml", &looped).unwrap();
+        assert!(cfg.save(&looped).is_err());
+    }
+
+    /// A link to a file Bloom cannot replace, as a Nix store or home-manager
+    /// keeps one, is replaced itself, so saving still works.
+    #[cfg(unix)]
+    #[test]
+    fn saving_through_a_link_to_an_unwritable_file_replaces_the_link() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let td = tempdir().unwrap();
+        let store = td.path().join("store");
+        let real = store.join("bloom.toml");
+        let mut cfg = Config::local_default();
+        cfg.save(&real).unwrap();
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let path = td.path().join("config.toml");
+        std::os::unix::fs::symlink(&real, &path).unwrap();
+
+        cfg.setup.complete = true;
+        let saved = cfg.save(&path);
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o755)).unwrap();
+        saved.unwrap();
+        assert!(
+            !std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(Config::load(&path).unwrap().setup.complete);
+        assert!(!Config::load(&real).unwrap().setup.complete);
+    }
+
+    /// The sibling a save writes first is never readable by more than the
+    /// config it replaces, before its permissions are copied too.
+    #[cfg(unix)]
+    #[test]
+    fn a_save_sibling_is_never_more_readable_than_the_config() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let td = tempdir().unwrap();
+        let path = td.path().join("config.toml");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let existing = std::fs::metadata(&path).unwrap();
+        let (_file, sibling) = create_sibling(&path, Some(&existing)).unwrap();
+        let mode = std::fs::metadata(&sibling).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode & !0o600, 0, "sibling mode {mode:o}");
     }
 
     #[test]

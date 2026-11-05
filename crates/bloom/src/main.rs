@@ -1803,8 +1803,17 @@ async fn execute_machine_command(
                     format!("wallet name must be a safe single path segment: {error:#}"),
                 )
             })?;
-            let status = default_policy::switch_persona(daemon, &name, persona, petals).await?;
-            format!("{}\n", serde_json::to_string(&status)?)
+            let (notes, status) =
+                default_policy::switch_persona(daemon, &name, persona, petals).await?;
+            // Notes first, one per line; the status is the last line.
+            let mut text = String::new();
+            for note in notes {
+                text.push_str(&note);
+                text.push('\n');
+            }
+            text.push_str(&serde_json::to_string(&status)?);
+            text.push('\n');
+            text
         }
         MachineCommand::WalletOutboxCancel {
             wallet,
@@ -4657,9 +4666,17 @@ async fn run(cli: Cli) -> Result<()> {
                 emit_machine_ready();
                 let daemon = ready_daemon.clone();
                 let context = ready_context.clone();
-                *ready_settings_retry.lock().expect("settings retry handle") = Some(tokio::spawn(
-                    default_policy::retry_queued_settings(daemon.clone()),
-                ));
+                // Queued setup writes and approved persona switches, stopped
+                // together at shutdown.
+                let switches = daemon.clone();
+                let settings = daemon.clone();
+                *ready_settings_retry.lock().expect("settings retry handle") =
+                    Some(tokio::spawn(async move {
+                        tokio::join!(
+                            default_policy::retry_queued_settings(settings),
+                            default_policy::apply_approved_switches(switches),
+                        );
+                    }));
                 *ready_provisioning.lock().expect("provisioning handle") =
                     Some(tokio::task::spawn_blocking(move || {
                         let results = petal_provisioning::provision(&daemon, &context);

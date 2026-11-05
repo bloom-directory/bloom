@@ -93,6 +93,9 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 cli() { "$bloom_bin" --home "$machine_home" "$@"; }
+# For a background command: exec, so `$!` is bloom itself and `kill` stops
+# it, rather than only the subshell that runs the function.
+cli_bg() { exec "$bloom_bin" --home "$machine_home" "$@"; }
 
 # 1. Machine config: a placeholder chain (nothing here reads chain state) and
 #    the setup choices. The launcher copies it unchanged.
@@ -172,7 +175,7 @@ fi
   die "the pending settings marker was removed before the wallet existed"
 
 # 2. Create main; the command waits between the two ceremonies.
-cli wallet new "$WALLET" >"$new_out" 2>&1 &
+cli_bg wallet new "$WALLET" >"$new_out" 2>&1 &
 new_pid=$!
 
 wait_for_line() {

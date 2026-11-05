@@ -10,6 +10,12 @@
 # 6.   A switch to Trader is superseded by a switch to Institutional before
 #      its ceremony is approved: the first ends with nothing changed, and the
 #      second replaces the policy and resets the limit.
+# 7.   A switch to Trader approved while no command waits for it, then a
+#      switch to Degen at once: the approved one applies first, reported by
+#      the Degen switch (Broker cannot cancel it) or applied by `bloom serve`
+#      if its check came first, before Degen's replaces it.
+# 8.   A switch to Institutional approved while no command waits for it:
+#      `bloom serve` applies it on its own within seconds.
 #
 # Binaries and network access as for scripts/test-default-policy-e2e.sh.
 set -euo pipefail
@@ -74,6 +80,9 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 cli() { "$bloom_bin" --home "$machine_home" "$@"; }
+# For a background command: exec, so `$!` is bloom itself and `kill` stops
+# it, rather than only the subshell that runs the function.
+cli_bg() { exec "$bloom_bin" --home "$machine_home" "$@"; }
 
 # 1. Machine config: a placeholder chain (nothing here reads chain state) and
 #    the setup choices. The launcher copies it unchanged.
@@ -177,7 +186,7 @@ fi
   die "the pending settings marker was removed before the wallet existed"
 
 # 2. Create main; the command waits between the two ceremonies.
-cli wallet new "$WALLET" >"$new_out" 2>&1 &
+cli_bg wallet new "$WALLET" >"$new_out" 2>&1 &
 new_pid=$!
 
 wait_for_line() {
@@ -280,7 +289,7 @@ all_hashes="$(for p in polymarket hyperliquid enso near-intents feedback; do own
 start_switch() {
   local persona="$1"
   switch_out="$run_root/persona-$persona.out"
-  cli wallet persona "$WALLET" "$persona" >"$switch_out" 2>&1 &
+  cli_bg wallet persona "$WALLET" "$persona" >"$switch_out" 2>&1 &
   switch_pid=$!
   local attempts=0
   switch_url=""
@@ -357,5 +366,58 @@ resume="$(cli wallet default-policy "$WALLET" 2>&1)" || die "default-policy resu
 printf '%s\n' "$resume" | grep -q '^default_policy: main allows ' || die "resume did not report applied: $resume"
 printf '%s\n' "$resume" | grep -q 'default_policy_url' && die "resume after the switch opened a ceremony: $resume"
 say "a switch to Institutional superseded a waiting Trader switch, which ended unapplied, and replaced main's policy"
+
+# Start a switch, stop its command once the ceremony is open, and approve it,
+# so no command waits for it; sets switch_url.
+approve_unwatched_switch() {
+  local persona="$1"
+  start_switch "$persona"
+  kill "$switch_pid" 2>/dev/null || true
+  wait "$switch_pid" 2>/dev/null || true
+  kill -0 "$switch_pid" 2>/dev/null && die "the $persona switch command is still running"
+  complete_ceremony "$switch_url" "unwatched $persona switch"
+}
+
+# 7. Approve a switch while nothing waits for it, then start another at once.
+approve_unwatched_switch trader
+start_switch degen
+new_pid="$switch_pid"
+grep -q '^preset = "trader"$' "$machine_home/config.toml" || die "the approved Trader switch was not saved"
+cli vfs cat "$settings_path" | grep -q '^max_daily_usd = "1000"$' ||
+  die "Polymarket's limit was not reset to Trader's: $(cli vfs cat "$settings_path")"
+policy_matches '
+  (.allowed_destinations | length) == 21 and
+  .maximum_approval_lifetime_ms == 9007199254740991
+' || die "main's policy is not the approved Trader switch's: $(cli vfs cat "/wallets/$WALLET/policy.json")"
+if grep -q '^default_policy: you had approved switching main to trader, so that switch applied before this one$' "$switch_out"; then
+  applied_by="the Degen switch, which said so"
+elif grep -q 'persona.switch_applied' "$log_dir/machine.log"; then
+  applied_by="bloom serve"
+else
+  die "nothing applied the approved Trader switch: $(cat "$switch_out")"
+fi
+complete_ceremony "$switch_url" "Degen switch after Trader"
+finish_switch "$switch_pid" "the Degen switch after Trader" "$switch_out"
+new_pid=""
+grep -q '^preset = "degen"$' "$machine_home/config.toml" || die "main's Degen setup was not saved after Trader's"
+cli vfs cat "$settings_path" | grep -q '^max_daily_usd = "10000"$' || die "Polymarket's limit was not reset to Degen's"
+say "a switch approved with nothing waiting applied first ($applied_by), then a later switch replaced it"
+
+# 8. Approve a switch while nothing waits for it, and start nothing else.
+applied_before="$(grep -c 'persona.switch_applied' "$log_dir/machine.log" || true)"
+approve_unwatched_switch institutional
+deadline=$(( $(date +%s) + 60 ))
+until grep -q '^preset = "custodian"$' "$machine_home/config.toml"; do
+  [ "$(date +%s)" -lt "$deadline" ] || die "bloom serve did not apply the approved Institutional switch"
+  sleep 1
+done
+cli vfs cat "$settings_path" | grep -q '^max_daily_usd = "100"$' ||
+  die "Polymarket's limit was not reset to Institutional's: $(cli vfs cat "$settings_path")"
+policy_matches '.maximum_approval_lifetime_ms == 2592000000' ||
+  die "main's policy is not the Institutional switch's: $(cli vfs cat "/wallets/$WALLET/policy.json")"
+[ "$(grep -c 'persona.switch_applied' "$log_dir/machine.log")" -gt "$applied_before" ] ||
+  die "Machine did not log applying the switch"
+[ ! -e "$machine_home/pending-persona/$WALLET.toml" ] || die "the applied switch was not cleared"
+say "bloom serve applied a switch approved with no command waiting"
 
 say "passed"

@@ -5322,14 +5322,34 @@ impl Daemon {
     }
 
     /// Cancel a policy proposal Machine made for `wallet`, such as an earlier
-    /// persona switch the owner has not approved.
+    /// persona switch, and say what became of it: one the owner approved
+    /// before the cancel reached Broker commits instead.
     pub async fn cancel_policy_proposal(
         &self,
         wallet: &str,
         operation_id: &str,
-    ) -> Result<(), bloom_vfs::HandlerError> {
+    ) -> Result<bloom_vfs::handlers::ProposalOutcome, bloom_vfs::HandlerError> {
         self.wallets
             .cancel_policy_proposal(wallet, operation_id)
+            .await
+    }
+
+    /// `wallet`'s current policy, read from Broker and verified.
+    pub async fn current_wallet_policy(
+        &self,
+        wallet: &str,
+    ) -> Result<bloom_broker_api::SignedPolicySnapshot, bloom_vfs::HandlerError> {
+        self.wallets.current_policy(wallet).await
+    }
+
+    /// What became of a policy proposal Machine made for `wallet`.
+    pub async fn policy_proposal_outcome(
+        &self,
+        wallet: &str,
+        operation_id: &str,
+    ) -> Result<bloom_vfs::handlers::ProposalOutcome, bloom_vfs::HandlerError> {
+        self.wallets
+            .policy_proposal_outcome(wallet, operation_id)
             .await
     }
 
