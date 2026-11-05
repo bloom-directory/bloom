@@ -831,6 +831,7 @@ PY
 # isolated negative harness launches the same packaged `bloom serve` binary
 # against its private home, endpoint, and mount.
 sudo -H -u "$login_user" env \
+  RUST_LOG=info,bloom_mount::adapter=trace,embednfs::server::compound=trace \
   BLOOM_HOME="$clean_home" \
   BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR="$clean_home/audit-checkpoints" \
   BLOOM_BROKER_SOCKET="$broker_socket" \
@@ -1152,6 +1153,21 @@ except OSError:
     private_outputs_retained = False
 print(f"sealed approval private outputs retained={private_outputs_retained}", file=sys.stderr)
 PY
+  # A VFS stat separates a kernel-mount failure from the packaged VFS
+  # response; the service log carries the NFS operation statuses.
+  if (
+    umask 077
+    run_machine_with_deadline \
+      "$work/approval-after-stat.log" \
+      vfs stat "/wallets/$wallet_id/sealed-approvals/new.json"
+  )
+  then
+    approval_stat_status=0
+  else
+    approval_stat_status=$?
+  fi
+  echo "sealed approval IPC stat status=$approval_stat_status" >&2
+  cat "$work/machine-service.log" >&2
   exit "$approval_read_status"
 fi
 /usr/bin/python3 - "$work/approval-after.log" <<'PY'

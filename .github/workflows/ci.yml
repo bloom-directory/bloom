@@ -232,6 +232,9 @@ jobs:
           cargo nextest run --archive-file target/nextest-archive.tar.zst \
             -E 'package(bloom-it) and (binary(anvil_e2e) or binary(erc20_e2e))' \
             --no-fail-fast
+          cargo nextest run --archive-file target/nextest-archive.tar.zst \
+            -E 'package(bloom-checkout) and binary(browser_lifecycle)' \
+            --no-fail-fast
           # Machine-to-Broker exact signing (x402, MPP, policy update). Only the
           # dispatch-only macOS W0 job ran it before, so Linux PRs missed breaks.
           cargo nextest run --archive-file target/nextest-archive.tar.zst \
@@ -323,8 +326,8 @@ jobs:
       github.ref_name == 'triad-architecture'
     uses: ./.github/workflows/macos-unix-conformance.yml
     with:
-      broker_ref: b6c273397ca0f24f85e7279390fd59f502f290e4
-      signer_ref: 3f880d7b96ebcc18f07afadac6f07c7f7036e90c
+      broker_ref: 0dc16bd7716f3b0ad44825783befe3953fa625f9
+      signer_ref: fa43841512e6c9370620b435ec0e49b5a61c0375
 
   linux_w0_isolation:
     name: Linux W0 principal and socket isolation
@@ -339,7 +342,7 @@ jobs:
           cp packaging/triad/linux/systemd/*.socket "$unit_dir/"
           for source in packaging/triad/linux/systemd/*.service.in; do
             destination="$unit_dir/$(basename "${source%.in}")"
-            sed 's|@BLOOM_BROKER_BINARY@|/usr/bin/true|; s|@BLOOM_SIGNER_BINARY@|/usr/bin/true|' \
+            sed 's|@BLOOM_[A-Z]*_BINARY@|/usr/bin/true|' \
               "$source" > "$destination"
           done
           cp "$unit_dir/bloom-signer@.service" "$unit_dir/bloom-signer@1000.service"

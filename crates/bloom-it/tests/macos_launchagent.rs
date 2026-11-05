@@ -198,7 +198,7 @@ fn legacy_monitor_preserves_session_lifecycle_without_claiming_network_containme
     assert!(monitor.contains("session.sock"));
     assert!(monitor.contains("metadata.file_type().is_socket()"));
     assert!(monitor.contains("system/com.bloom.{service}.{login_uid}"));
-    assert!(monitor.contains("[\"signer\", \"broker\"]"));
+    assert!(monitor.contains("[\"signer\", \"broker\", \"checkout\"]"));
     assert!(monitor.contains("\"kickstart\""));
     assert!(!monitor.contains("signing_seed"));
     assert_ordered(
@@ -207,7 +207,7 @@ fn legacy_monitor_preserves_session_lifecycle_without_claiming_network_containme
             "fn restart_services_for_live_session",
             "prepare_login_sentinel(",
             "session.sock",
-            "[\"signer\", \"broker\"]",
+            "[\"signer\", \"broker\", \"checkout\"]",
             "fn prepare_login_sentinel",
             "user/{login_uid}/com.bloom.session",
             "state = running",
@@ -720,5 +720,65 @@ report_legacy_wallet_migrations
     assert!(
         stdout.contains("Migrate legacy passkey wallet pending"),
         "{stdout}"
+    );
+}
+
+#[test]
+fn macos_checkout_logs_uses_a_per_login_port_and_cleans_up_its_accounts() {
+    let plist = fs::read_to_string(
+        workspace().join("packaging/triad/macos/launchdaemons/com.bloom.checkout.plist.in"),
+    )
+    .unwrap();
+    // A crash before the socket exists must leave a readable reason.
+    assert!(plist.contains("<key>StandardErrorPath</key><string>@BLOOM_CHECKOUT_LOG@</string>"));
+    assert!(!plist.contains("/dev/null"));
+    // Chrome needs a writable HOME; the hidden user's home is /var/empty.
+    assert!(plist.contains("<key>HOME</key><string>@BLOOM_CHECKOUT_STATE@</string>"));
+    assert!(
+        plist.contains("<string>--view-port</string><string>@BLOOM_CHECKOUT_VIEW_PORT@</string>")
+    );
+    assert!(!plist.contains("18736"));
+
+    let installer =
+        fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
+    let linux =
+        fs::read_to_string(workspace().join("packaging/triad/release/install-linux.sh")).unwrap();
+    // Both platforms start from the login UID's slot and skip ports another
+    // login records or something already listens on.
+    assert!(installer.contains("port=$((10000 + (login_uid + offset) % 8000))"));
+    assert!(installer.contains("lsof -nP -iTCP:\"$port\" -sTCP:LISTEN"));
+    assert!(installer.contains("checkout_view_port=\"$(checkout_view_port)\""));
+    assert!(linux.contains("port=$((10000 + (uid + offset) % 8000))"));
+    assert!(installer.contains("-e \"s|@BLOOM_CHECKOUT_VIEW_PORT@|$checkout_view_port|g\""));
+    assert!(installer.contains("checkout_log=\"$log_root/checkout.log\""));
+    assert!(installer.contains("-e \"s|@BLOOM_CHECKOUT_LOG@|$checkout_log|g\""));
+    assert!(installer.contains("chown \"$checkout_user:$log_group\" \"$checkout_log\""));
+    assert!(installer.contains("for service in broker signer checkout; do"));
+
+    // Interrupted fresh installs recover every checkout group, and uninstall
+    // tolerates enrollments created before checkout existed.
+    let groups = "\"$broker_group\" \"$signer_group\" \"$machine_broker_group\" \"$broker_signer_group\" \"$revoke_group\" \"$checkout_group\" \"$machine_checkout_group\" \"$broker_checkout_group\" \"$log_group\"";
+    assert_eq!(installer.matches(groups).count(), 2);
+    assert!(!installer.contains("do dscl . -delete \"/Users/$name\"; done"));
+    assert!(!installer.contains("do dscl . -delete \"/Groups/$name\"; done"));
+}
+
+#[test]
+fn macos_conformance_never_writes_into_live_audit_checkpoint_directories() {
+    // Broker and Signer read every file there on each decision; an empty
+    // probe file is malformed and latches the Triad read-only.
+    let script = fs::read_to_string(
+        workspace().join("tests/conformance/macos-unix-principals/run-disposable.sh"),
+    )
+    .unwrap();
+    assert!(!script.contains("audit-checkpoints/w0-private"));
+    for service in ["broker", "signer"] {
+        assert!(script.contains(&format!(
+            "{service}_checkpoints=\"/private/var/db/bloom/$login_uid/{service}/audit-checkpoints\""
+        )));
+    }
+    assert!(script.contains("sudo -u \"$login_user\" test ! -x \"$broker_checkpoints\""));
+    assert!(
+        script.contains("sudo -u \"bloom-signer-$login_uid\" test ! -x \"$broker_checkpoints\"")
     );
 }

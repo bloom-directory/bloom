@@ -9,6 +9,7 @@ description = "Path router and handlers for bloom virtual filesystem"
 default = []
 
 [dependencies]
+bloom-checkout-api.workspace = true
 bloom-mempool.workspace = true
 bloom-machine-client.workspace = true
 bloom-proto.workspace = true
