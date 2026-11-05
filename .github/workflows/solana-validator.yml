@@ -34,7 +34,7 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.11
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
