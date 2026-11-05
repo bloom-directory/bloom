@@ -44,7 +44,7 @@ AGENTS: dict[str, AgentSpec] = {
     # Codex and Pi run mid-tier models on subscription logins, not the
     # strongest each offers.
     "codex": AgentSpec("codex", "gpt-5.6-sol"),
-    "opencode": AgentSpec("opencode", "deepseek/deepseek-v4-flash"),
+    "opencode": AgentSpec("opencode", "deepseek/deepseek-flash"),
     "pi": AgentSpec("pi", "kimi-coding/k3"),
 }
 

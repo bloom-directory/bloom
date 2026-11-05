@@ -156,7 +156,7 @@ gh secret set PI_AUTH_JSON -R bloom-directory/bloom < $k/auth.json
 
 Every default agent runs a mid-tier model, not the strongest its provider
 offers: Claude Sonnet 5.5, Codex `gpt-5.6-sol`, Pi `kimi-coding/k3` and
-OpenCode `deepseek-v4-flash`. Locally, Pi needs `PI_AUTH_JSON_PATH`; it never reads your own
+OpenCode `deepseek-flash`. Locally, Pi needs `PI_AUTH_JSON_PATH`; it never reads your own
 `~/.pi` login. The agent container sees them, so use dedicated credentials. A selected agent without one fails the run.
 `requirements.txt` is the full resolved dependency set; edit `requirements.in`
 and regenerate it with the command in its header.
