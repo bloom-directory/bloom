@@ -218,46 +218,47 @@ fn indexed_records(
         write_bytes(&marker, b"1")?;
     }
     let entry = index_path(root, package, wallet, operation)?;
-    let names = match read_index(&entry)? {
-        Some(names) => names,
-        None => {
-            // An absent entry may be a deleted index, not an absent operation.
-            // Repair from authoritative records before returning NotFound.
-            scan_records(root, |path, record| {
-                if record.package_hash == package
-                    && record.wallet == wallet
-                    && record.operation_key == operation
-                {
-                    index_record(root, path, &record)?;
-                }
-                Ok(())
-            })?;
-            read_index(&entry)?.unwrap_or_default()
+    let read_candidates = || -> Result<Vec<Record>, SigningError> {
+        let mut records = Vec::new();
+        for name in read_index(&entry)?.unwrap_or_default() {
+            let bytes = match std::fs::read(root.join(name)) {
+                Ok(bytes) => bytes,
+                // Index publication precedes record publication. A crash in
+                // between cannot have reached Broker and is safe to skip.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(error(ErrorCode::Backend, e)),
+            };
+            let state: Record =
+                serde_json::from_slice(&bytes).map_err(|e| error(ErrorCode::Backend, e))?;
+            if state.package_hash != package
+                || state.wallet != wallet
+                || state.operation_key != operation
+            {
+                return Err(error(
+                    ErrorCode::Backend,
+                    "prepared index identity mismatch",
+                ));
+            }
+            records.push(state);
         }
+        Ok(records)
     };
-    let mut records = Vec::new();
-    for name in names {
-        let bytes = match std::fs::read(root.join(name)) {
-            Ok(bytes) => bytes,
-            // Index publication precedes record publication. A crash in
-            // between cannot have reached Broker and is safe to skip.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(error(ErrorCode::Backend, e)),
-        };
-        let state: Record =
-            serde_json::from_slice(&bytes).map_err(|e| error(ErrorCode::Backend, e))?;
-        if state.package_hash != package
-            || state.wallet != wallet
-            || state.operation_key != operation
-        {
-            return Err(error(
-                ErrorCode::Backend,
-                "prepared index identity mismatch",
-            ));
-        }
-        records.push(state);
+    let records = read_candidates()?;
+    if !records.is_empty() {
+        return Ok(records);
     }
-    Ok(records)
+    // An absent entry or dangling index paths may be a damaged index, not
+    // an absent operation. Check authoritative records before NotFound.
+    scan_records(root, |path, record| {
+        if record.package_hash == package
+            && record.wallet == wallet
+            && record.operation_key == operation
+        {
+            index_record(root, path, &record)?;
+        }
+        Ok(())
+    })?;
+    read_candidates()
 }
 
 fn path(
@@ -1030,6 +1031,14 @@ mod tests {
         std::fs::remove_file(&entry).unwrap();
         query(&host, &ctx, "wanted").await.unwrap();
         assert!(entry.exists());
+        // Syntactically valid but dangling paths must not hide a real record.
+        std::fs::write(
+            &entry,
+            serde_json::to_vec(&vec![format!("{}.json", "ff".repeat(32))]).unwrap(),
+        )
+        .unwrap();
+        query(&host, &ctx, "wanted").await.unwrap();
+        assert_eq!(read_index(&entry).unwrap().unwrap().len(), 2);
         std::fs::write(&entry, b"[]").unwrap();
         assert_eq!(
             query(&host, &ctx, "wanted").await.unwrap_err().code,

@@ -176,6 +176,9 @@ async fn onboard(
 }
 
 fn host(f: &AuthorizationFixture) -> (Arc<VenueFixture>, Vfs) {
+    host_with_readiness(f, true)
+}
+fn host_with_readiness(f: &AuthorizationFixture, trading_ready: bool) -> (Arc<VenueFixture>, Vfs) {
     let late = Arc::new(LateVfsHost::new());
     late.set(Arc::new(f.daemon.vfs.clone()));
     let machine = Arc::new(
@@ -186,7 +189,7 @@ fn host(f: &AuthorizationFixture) -> (Arc<VenueFixture>, Vfs) {
             .with_provenance_catalog(Some(f.catalog.clone()))
             .with_petal_signing_state_root(f.home.cache_dir().join("phase1-prepared")),
     );
-    let host = Arc::new(VenueFixture::new(machine, true));
+    let host = Arc::new(VenueFixture::new(machine, trading_ready));
     let vfs = Vfs::builder()
         .mount(
             "petals",
@@ -598,6 +601,55 @@ async fn prepared_buy_uses_real_bounded_permission() {
             boundary.action.spend,
             Spend::erc20("evm-137", PUSD, "1070001000").unwrap()
         );
+        // Revalidation must not replace a frozen pending operation or cause
+        // another signing request. Exercise the installed Petal route, not a mock.
+        assert!(matches!(
+            host.machine
+                .prepared_sign_status(
+                    bloom_petal_contract::prepared::StatusRequest {
+                        version: 1,
+                        wallet: boundary.wallet.clone(),
+                        operation_key: boundary.operation_key.clone(),
+                    },
+                    boundary_context.clone(),
+                )
+                .await
+                .unwrap(),
+            SigningOutcome::ApprovalPending { .. }
+        ));
+        let request_count = host.prepared_requests.lock().unwrap().len();
+        let signed_count = host.prepared_signed.lock().unwrap().len();
+        let approval_count = f
+            .client
+            .list_approvals(f.wallet.clone())
+            .await
+            .unwrap()
+            .len();
+        let refused = vfs
+            .write(
+                &VfsPath::parse(&format!(
+                    "petals/polymarket/trade/{WALLET}/1/drafts/0003/revalidate"
+                ))
+                .unwrap(),
+                br#"{"revalidate":true}"#,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("frozen signing operation"),
+            "{refused}"
+        );
+        assert_eq!(host.prepared_requests.lock().unwrap().len(), request_count);
+        assert_eq!(host.prepared_signed.lock().unwrap().len(), signed_count);
+        assert_eq!(
+            f.client
+                .list_approvals(f.wallet.clone())
+                .await
+                .unwrap()
+                .len(),
+            approval_count
+        );
+        assert_accounting_unchanged(&before_fee_boundary, &usage(&f, &grant.approval_id).await);
         let review: serde_json::Value =
             serde_json::from_slice(&boundary.action.review.bytes).unwrap();
         let raw = review["typed_data"]["message"]["contents"]["makerAmount"]
@@ -886,5 +938,76 @@ async fn installed_account_one_auth_and_exact_continuation_use_real_authority() 
         "exact continuation must sign the frozen pre-ceremony payload"
     );
 
+    // Force onboarding's exact approval batch, then stop at the controlled
+    // venue boundary after signing. No transaction is sent to a live venue.
+    let (batch_host, batch_vfs) = host_with_readiness(&f, false);
+    let continue_path =
+        VfsPath::parse(&format!("petals/polymarket/onboard/{WALLET}/1/continue")).unwrap();
+    let pending = batch_vfs.write(&continue_path, b"{}").await.unwrap_err();
+    let outcome = batch_host
+        .prepared_outcomes
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .unwrap_or_else(|| panic!("batch must reach prepared signing: {pending}"));
+    let SigningOutcome::ApprovalPending { action_id, .. } = outcome.1.unwrap() else {
+        panic!("onboarding batch must require exact review");
+    };
+    complete(&exact_url(&f, &action_id).await, 5, None);
+    let failed_submission = batch_vfs.write(&continue_path, b"{}").await.unwrap_err();
+    let first_batch = batch_host
+        .prepared_signed
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .unwrap_or_else(|| panic!("batch must sign before venue failure: {failed_submission}"));
+    assert_eq!(first_batch.0.action.operation_class, "polymarket.onboard");
+    let approvals = f.client.list_approvals(f.wallet.clone()).await.unwrap();
+    let mut limits = Vec::new();
+    for approval in &approvals {
+        limits.push(
+            f.client
+                .approval_limit_state(approval.approval_id.clone())
+                .await
+                .unwrap(),
+        );
+    }
+    // Recreate both Machine's prepared host and the WASM router against the
+    // durable stores: the deleted Petal signature cache cannot rescue this retry.
+    drop(batch_vfs);
+    drop(batch_host);
+    let (restarted_host, restarted_vfs) = host_with_readiness(&f, false);
+    restarted_vfs
+        .write(&continue_path, b"{}")
+        .await
+        .unwrap_err();
+    let replay = restarted_host
+        .prepared_signed
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("restarted batch write must replay the completed signature");
+    assert_eq!(replay, first_batch);
+    assert_eq!(
+        f.client
+            .list_approvals(f.wallet.clone())
+            .await
+            .unwrap()
+            .len(),
+        approvals.len()
+    );
+    for before in limits {
+        assert_eq!(
+            f.client
+                .approval_limit_state(before.approval_id.clone())
+                .await
+                .unwrap(),
+            before,
+            "batch replay must not add an operation or signature charge"
+        );
+    }
     assert!(f.daemon.persona_sessions(WALLET).await.unwrap().is_empty());
 }

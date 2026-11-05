@@ -131,7 +131,7 @@ bloom-ens      = { path = "crates/bloom-ens" }
 bloom-prices   = { path = "crates/bloom-prices" }
 bloom-revert   = { path = "crates/bloom-revert" }
 bloom-petals   = { path = "crates/bloom-petals" }
-bloom-petal-contract = { git = "https://github.com/bloom-directory/petal", rev = "750df682bebd1dd85c48bd22d8741f22ef7a6185" }
+bloom-petal-contract = { git = "https://github.com/bloom-directory/petal", rev = "465d6f2464a6a87910128f5448d1543ccb2aeb2a" }
 bloom-daemon   = { path = "crates/bloom-daemon" }
 bloom-update   = { path = "crates/bloom-update" }
 bloom-broker-api = { git = "https://github.com/bloom-directory/bloom-broker.git", rev = "c6bea1f002851e8a058d6d8f3f598816ad55675c" }
