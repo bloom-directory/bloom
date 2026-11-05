@@ -117,3 +117,19 @@ sudo journalctl -t bloom-signer-$(id -u) -o cat
 ```
 
 Journal persistence, retention, and read access remain host policy.
+
+## First browser setup
+
+Fresh enrollment requires logging out and back in so the login gains its new
+Unix groups. At the next desktop login, the enrolled user's
+`bloom-onboarding.service` opens `bloom onboard --if-needed` using that user's
+browser. The unit belongs to the graphical session, runs for at most 30 minutes,
+and never restarts itself. Saving browser setup choices suppresses future
+login prompts; this does not imply that a wallet, policy, or session has been
+approved. Repairs and upgrades do not enable or start onboarding.
+
+For a headless login, a desktop that does not activate systemd's graphical
+session target, or an interrupted setup, run `bloom onboard` as the enrolled
+login without `sudo`. It prints the actual local setup URL when a browser
+cannot open. `bloom onboard` also reopens setup after installation to inspect
+wallet, policy, and approval status.

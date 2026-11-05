@@ -12,6 +12,15 @@ fn workspace() -> PathBuf {
         .to_path_buf()
 }
 
+#[test]
+fn custody_fixture_preserves_launch_authority_when_removing_ui_continuation() {
+    let status = Command::new("python3")
+        .arg(workspace().join("tests/conformance/macos-unix-principals/test-custody-launch-url.py"))
+        .status()
+        .expect("run custody fixture URL boundary regressions");
+    assert!(status.success());
+}
+
 fn assert_ordered(source: &str, needles: &[&str]) {
     let mut offset = 0;
     for needle in needles {

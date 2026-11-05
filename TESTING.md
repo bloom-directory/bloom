@@ -101,6 +101,39 @@ release gates still apply.
 | Machine authority boundary or production features | Both authority-boundary scripts | Release/package checks above |
 | macOS packaging or isolation | Disposable Tart VM acceptance | Required release conformance above |
 
+The prepared-signing SDK host fixture requires the canonical SDK checkout at
+Machine's `bloom-petal-contract` revision. In that checkout, run
+`cargo run --locked -p bloom-petal-cli -- build --config fixtures/petal-build.toml`
+with `wasm32-unknown-unknown`, `wasm32-wasip2` and `wasm-tools` installed. Then run from Machine:
+`BLOOM_PREPARED_FIXTURES=<sdk-checkout>/fixtures/components cargo test --locked -p bloom-petals --test prepared_actions`.
+The CI prepared-signing fixture job performs these steps against the pinned revision.
+
+The reusable-permission acceptance harness uses built Petal components and real
+isolated Machine, Broker and Signer services. Set the four exact executable paths
+`BLOOM_INTEGRATION_MACHINE_BIN`, `BLOOM_INTEGRATION_BROKER_BIN`,
+`BLOOM_INTEGRATION_SIGNER_BIN` and `BLOOM_INTEGRATION_DEBUG_DRIVER_BIN` as in the
+development guide. Then select a canonical package archive (or a built source-package tree) and a fresh empty
+`/tmp/pm80-auth.*` directory:
+
+```sh
+BLOOM_PM80_POLYMARKET_ROOT=/path/to/polymarket.petal.tar.gz \
+  scripts/test-polymarket-authorization.sh /tmp/pm80-auth.example prepared-buy
+BLOOM_PM80_GASLESS_ROOT=/path/to/gasless.petal.tar.gz \
+  scripts/test-polymarket-authorization.sh /tmp/pm80-auth.gasless prepared-gasless
+```
+
+Archive mode enrolls, installs and tests the exact archive package hash. Source
+mode regenerates Machine's build artifacts and therefore has a different package
+identity; source-mode evidence does not certify the canonical release archive.
+
+Each mode restarts the services, rearms the retained permission and checks exact
+account/budget identity, signed-volume charges, retries and exact step-up. The
+gasless mode also requires successful mocked Relay submission/status and rejects
+malformed review data, mismatched debits and unsupported classes. External venue
+observations are controlled; this proves authorization and recovery, not live
+funds or settlement. It requires the launcher's systemd and trusted-time setup;
+no mounted VFS is needed. Evidence and disposable test state are retained.
+
 Use `cargo test -p <package> --locked` for package entries. A fixture-backed
 test is evidence only for the boundary it exercises; starting the launcher
 alone is not evidence that a custody or transaction workflow succeeds.

@@ -9,11 +9,16 @@ pub mod deployment;
 pub mod ipc;
 
 mod ens_resolver;
+mod prepared_signing;
 mod price_oracle;
 
 #[cfg(all(test, feature = "triad-dev-harness"))]
 #[path = "tests/polymarket_authorization.rs"]
 mod polymarket_authorization;
+
+#[cfg(all(test, feature = "triad-dev-harness"))]
+#[path = "tests/phase1_native_acceptance.rs"]
+mod phase1_native_acceptance;
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -369,10 +374,7 @@ fn petal_review_payload<'a>(
                 .is_some_and(|value| value["schema"] == "bloom.message.review.v1")
         });
         let signed_message = bloom_machine_client::is_signed_message(crypto_suite, preimage);
-        if (bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES.contains(&operation_class)
-            || signed_message)
-            && message.is_none()
-        {
+        if signed_message && message.is_none() {
             return Err(HostError::Invalid(
                 "This signing operation requires a message review envelope".into(),
             ));
@@ -945,6 +947,7 @@ impl DaemonPetalHost {
         let request_nonce = bloom_broker_api::RequestNonce::new(&request_nonce_hex[..32])
             .map_err(|error| HostError::Invalid(error.to_string()))?;
         let terms = bloom_broker_api::SealedApprovalTerms {
+            session_budget: None,
             subject: bloom_broker_api::ApprovalSubject::Petal {
                 package_hash: scope.package_hash.clone(),
                 route: scope.route.clone(),
@@ -1108,6 +1111,15 @@ impl DaemonPetalHost {
             identity.update(&(part.len() as u64).to_be_bytes());
             identity.update(part);
         }
+        if let Some((_, operation)) = context
+            .params
+            .iter()
+            .find(|(name, _)| name == "bloom.internal.prepared-operation")
+        {
+            identity.update(b"prepared-operation/v1\0");
+            identity.update(&(operation.len() as u64).to_be_bytes());
+            identity.update(operation.as_bytes());
+        }
         let request_id = identity.finalize().to_hex().to_string();
         Ok((
             request_id.clone(),
@@ -1148,6 +1160,15 @@ impl DaemonPetalHost {
         if let Some(binding) = review_binding {
             identity.update(b"solana-message-review/v1\0");
             identity.update(binding.as_str().as_bytes());
+        }
+        if let Some((_, operation)) = context
+            .params
+            .iter()
+            .find(|(name, _)| name == "bloom.internal.prepared-operation")
+        {
+            identity.update(b"prepared-operation/v1\0");
+            identity.update(&(operation.len() as u64).to_be_bytes());
+            identity.update(operation.as_bytes());
         }
         let request_id = identity.finalize().to_hex().to_string();
         Ok((
@@ -2124,8 +2145,27 @@ impl PetalHost for DaemonPetalHost {
             let catalog = self.provenance_catalog.clone().ok_or_else(|| {
                 HostError::Backend("installer provenance catalog is not configured".into())
             })?;
+            let strict = context
+                .params
+                .iter()
+                .any(|(name, _)| name == "bloom.internal.prepared-operation");
+            let expected_key = context
+                .params
+                .iter()
+                .find(|(name, _)| name == "bloom.internal.prepared-key")
+                .map(|(_, value)| {
+                    serde_json::from_str(value)
+                        .map_err(|e| HostError::Invalid(format!("invalid internal key: {e}")))
+                })
+                .transpose()?;
+            if strict && expected_key.is_none() {
+                return Err(HostError::Denied("prepared key binding is missing".into()));
+            }
             let signer = BrokerExactPayloadSigner::new(broker.clone(), catalog)
-                .with_account_key(account_key.clone());
+                .with_account_key(account_key.clone())
+                .with_expected_key(expected_key)
+                .with_persona_discovery(true)
+                .with_strict_recovery(strict);
             let _guard = self.petal_signing_lock.lock().await;
             let outcome = signer
                 .sign_or_prepare_petal(
@@ -2274,41 +2314,38 @@ impl PetalHost for DaemonPetalHost {
         Ok(SignOutcome::Signature(bytes))
     }
 
+    async fn prepared_sign(
+        &self,
+        request: bloom_petal_contract::prepared::Request,
+        context: PetalRouteContext,
+    ) -> Result<
+        bloom_petal_contract::prepared::SigningOutcome,
+        bloom_petal_contract::prepared::SigningError,
+    > {
+        self.run_prepared(request, context).await
+    }
+
+    async fn prepared_sign_status(
+        &self,
+        request: bloom_petal_contract::prepared::StatusRequest,
+        context: PetalRouteContext,
+    ) -> Result<
+        bloom_petal_contract::prepared::SigningOutcome,
+        bloom_petal_contract::prepared::SigningError,
+    > {
+        self.status_prepared(request, context).await
+    }
+
     async fn sign_payload_batch_outcome(
         &self,
-        mut req: PayloadBatchSignRequest,
+        req: PayloadBatchSignRequest,
     ) -> Result<PayloadBatchSignOutcome, HostError> {
         if req.key_ref.is_some() {
             return Err(HostError::Denied(
                 "Petal payload batches require Machine-owned approval and root selection".into(),
             ));
         }
-        // A Petal's reusable preference is not session authority. Until Broker
-        // supports verified order sessions, step up to exact approval before
-        // choosing durable paths or interpreting approval hints. Keep CLOB auth
-        // on its distinct one-use scope; never downgrade an existing attempt.
-        let review_payload = if bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES
-            .contains(&req.operation_class.as_str())
-        {
-            req.selector = bloom_broker_api::PetalSignSelector::Exact;
-            let bytes = req.action.as_deref().ok_or_else(|| {
-                HostError::Invalid(
-                    "Polymarket exact signing requires its complete prepared record".into(),
-                )
-            })?;
-            if bytes.len() > bloom_broker_api::SINGLE_PAYLOAD_MAX_BYTES
-                || req.payloads.len() != 1
-                || req.signature_algorithm != "secp256k1-keccak256-recoverable"
-                || !serde_json::from_slice::<serde_json::Value>(bytes)
-                    .ok()
-                    .is_some_and(|value| value.as_array().is_some_and(|items| items.len() == 1))
-            {
-                return Err(HostError::Invalid("Polymarket exact signing requires one bounded prepared record and one recoverable Keccak payload".into()));
-            }
-            Some(bytes)
-        } else {
-            None
-        };
+        let review_payload = None;
         let broker = self.broker.as_ref().ok_or_else(|| {
             HostError::Backend("SERVICE_UNAVAILABLE: Broker client is not configured".into())
         })?;
@@ -2333,7 +2370,6 @@ impl PetalHost for DaemonPetalHost {
             }
         };
         if review_payload.is_none()
-            && req.operation_class != bloom_broker_api::POLYMARKET_CLOB_AUTH_CLASS
             && req
                 .payloads
                 .iter()
@@ -2511,8 +2547,32 @@ impl PetalHost for DaemonPetalHost {
         let catalog = self.provenance_catalog.clone().ok_or_else(|| {
             HostError::Backend("installer provenance catalog is not configured".into())
         })?;
-        let signer =
-            BrokerExactPayloadSigner::new(broker.clone(), catalog).with_account_key(account_key);
+        let strict = context
+            .params
+            .iter()
+            .any(|(name, _)| name == "bloom.internal.prepared-operation");
+        let expected_key = context
+            .params
+            .iter()
+            .find(|(name, _)| name == "bloom.internal.prepared-key")
+            .map(|(_, value)| {
+                serde_json::from_str(value)
+                    .map_err(|e| HostError::Invalid(format!("invalid internal key: {e}")))
+            })
+            .transpose()?;
+        if strict && expected_key.is_none() {
+            return Err(HostError::Denied("prepared key binding is missing".into()));
+        }
+        let signer = BrokerExactPayloadSigner::new(broker.clone(), catalog)
+            .with_account_key(account_key)
+            .with_expected_key(expected_key)
+            .with_persona_discovery(
+                !strict
+                    || context.params.iter().any(|(name, value)| {
+                        name == "bloom.internal.prepared-persona" && value == "true"
+                    }),
+            )
+            .with_strict_recovery(strict);
         let _guard = self.petal_signing_lock.lock().await;
         let outcome = if req.selector == bloom_broker_api::PetalSignSelector::Reusable {
             signer
@@ -3931,9 +3991,24 @@ impl AccountPetalMount for AccountPetals {
     }
 }
 
+/// The fixed contracts a chosen Petal transacts with, as Broker policy
+/// destinations. The table lives in Bloom's source, never in config.
+fn default_policy_destinations(name: &str) -> Vec<bloom_broker_api::PolicyDestination> {
+    bloom_proto::petal_destinations::for_petal(name)
+        .iter()
+        .filter_map(|destination| {
+            Some(bloom_broker_api::PolicyDestination {
+                chain: bloom_broker_api::Token::new(destination.chain.to_owned()).ok()?,
+                destination: destination.destination.to_owned(),
+            })
+        })
+        .collect()
+}
+
 /// All wired-up state the daemon owns. Cheap to clone (everything is
 /// behind Arc/clone-safe inner types).
 #[derive(Clone)]
+
 pub struct Daemon {
     deployment_locks: Arc<deployment::DeploymentLocks>,
     pub home: HomeDir,
@@ -3947,6 +4022,7 @@ pub struct Daemon {
     /// Command handlers must reuse this client rather than reopening the
     /// Machine journal and creating a second, stale in-memory head.
     pub machine_broker: Option<MachineBrokerClient>,
+    persona_provenance_catalog: Option<bloom_broker_api::ProvenanceCatalog>,
     pub wallet_projections: Arc<dyn WalletProjectionReader>,
     wallets: Arc<WalletsHandler>,
     pub vfs: Vfs,
@@ -4217,6 +4293,9 @@ impl Daemon {
         provenance_catalog: Option<bloom_broker_api::ProvenanceCatalog>,
     ) -> Result<Self, DaemonError> {
         home.ensure()?;
+        let broker = broker.map(|client| {
+            client.with_persona_session_store(home.cache_dir().join("persona-sessions"))
+        });
 
         // Before anything can serve or scan these projections, retire the
         // ceremonies a previous run left advertised.
@@ -4719,6 +4798,73 @@ impl Daemon {
             })),
         );
 
+        // Build the petals runtime: content-addressed store under
+        // `~/.bloom/petals/store`, name registry under
+        // `~/.bloom/petals/registry`, and a wasmtime engine. Petal
+        // packages are exposed under `petals/`.
+        let petals_root = home.root().join("petals");
+        let petal_store = PetalStore::open(petals_root.join("store"))
+            .map_err(|e| DaemonError::Audit(format!("petals store: {e}")))?;
+
+        // The default-policy wallet's first Petal proposal also allows every
+        // installed Petal chosen during setup.
+        let default_policy_packages: bloom_vfs::handlers::DefaultPolicyPackages = {
+            // Browser setup updates choices through this daemon's IPC writer.
+            // Read the current durable selection for every proposal so a running
+            // daemon never reintroduces an integration the owner deselected.
+            let setup_config_path = home.config_path();
+            let store = petal_store.clone();
+            Arc::new(move |wallet: &str| {
+                if wallet != bloom_proto::config::DEFAULT_POLICY_WALLET {
+                    return Ok(bloom_vfs::handlers::DefaultPolicySetup::default());
+                }
+                let current = Config::load(&setup_config_path).map_err(|error| {
+                    bloom_vfs::HandlerError::Backend(format!(
+                        "cannot read current setup choices before policy proposal: {error}"
+                    ))
+                })?;
+                let mut setup = bloom_vfs::handlers::DefaultPolicySetup::default();
+                for name in current.petals.setup.keys() {
+                    let installed = match store.resolve_petal_owner(name) {
+                        Ok(installed) => installed,
+                        Err(error) => {
+                            warn!(
+                                petal = %name,
+                                error = %error,
+                                "petal.default_policy_owner_unreadable"
+                            );
+                            continue;
+                        }
+                    };
+                    let Some(hash) = installed else { continue };
+                    let Ok(package) = bloom_broker_api::Digest32::new(hash) else {
+                        continue;
+                    };
+                    setup.packages.push(package);
+                    setup.destinations.extend(default_policy_destinations(name));
+                }
+                if let Some(profile) = current.persona.as_ref() {
+                    setup.standing_allowances =
+                        profile.preset != bloom_proto::persona::PersonaPreset::Custodian;
+                    if profile.preset == bloom_proto::persona::PersonaPreset::Degen {
+                        for id in [1, 137] {
+                            if current.chains.values().any(|c| c.chain_id == id) {
+                                setup
+                                    .destinations
+                                    .push(bloom_broker_api::PolicyDestination {
+                                        chain: bloom_broker_api::Token::new(format!("evm-{id}"))
+                                            .map_err(|e| {
+                                                bloom_vfs::HandlerError::backend(e.to_string())
+                                            })?,
+                                        destination: bloom_broker_api::ERC20_ANY_RECIPIENT.into(),
+                                    });
+                            }
+                        }
+                    }
+                }
+                Ok(setup)
+            })
+        };
         let wallets_handler = Arc::new(
             WalletsHandler::new(
                 chains.clone(),
@@ -4732,16 +4878,9 @@ impl Daemon {
             .with_home_write_permit_opt(home_write_permit.clone())
             .with_mempool_indexes(mempool_indexes.clone())
             .with_solana(solana_engines)
-            .with_solana_reads(solana_chain_registry.clone()),
+            .with_solana_reads(solana_chain_registry.clone())
+            .with_default_policy_packages(default_policy_packages),
         );
-
-        // Build the petals runtime: content-addressed store under
-        // `~/.bloom/petals/store`, name registry under
-        // `~/.bloom/petals/registry`, and a wasmtime engine. Petal
-        // packages are exposed under `petals/`.
-        let petals_root = home.root().join("petals");
-        let petal_store = PetalStore::open(petals_root.join("store"))
-            .map_err(|e| DaemonError::Audit(format!("petals store: {e}")))?;
         let petal_registry = Arc::new(
             NameRegistry::open(petals_root.join("registry"))
                 .map_err(|e| DaemonError::Audit(format!("petals registry: {e}")))?,
@@ -5101,6 +5240,7 @@ impl Daemon {
             address_book: address_book_arc,
             audit: audit_arc,
             machine_broker: broker,
+            persona_provenance_catalog: provenance_catalog,
             wallet_projections,
             wallets: wallets_handler,
             vfs,
@@ -5123,6 +5263,82 @@ impl Daemon {
     /// callers must not construct a second edge over the same Machine journal.
     pub fn broker_client(&self) -> Option<MachineBrokerClient> {
         self.machine_broker.clone()
+    }
+
+    pub fn persona_provenance_catalog(&self) -> Option<bloom_broker_api::ProvenanceCatalog> {
+        self.persona_provenance_catalog.clone()
+    }
+
+    pub async fn prepare_persona_session(
+        &self,
+        proposal: bloom_machine_client::PersonaSessionProposal,
+    ) -> Result<bloom_machine_client::PersonaSessionStatus, bloom_broker_api::ProtocolError> {
+        self.machine_broker
+            .as_ref()
+            .ok_or_else(|| {
+                bloom_broker_api::ProtocolError::new(
+                    bloom_broker_api::ProtocolErrorCode::ServiceUnavailable,
+                    "Broker is unavailable for persona activation",
+                )
+            })?
+            .prepare_persona_session(proposal)
+            .await
+    }
+
+    pub async fn persona_sessions(
+        &self,
+        wallet: &str,
+    ) -> Result<Vec<bloom_machine_client::PersonaSessionStatus>, bloom_broker_api::ProtocolError>
+    {
+        self.machine_broker
+            .as_ref()
+            .ok_or_else(|| {
+                bloom_broker_api::ProtocolError::new(
+                    bloom_broker_api::ProtocolErrorCode::ServiceUnavailable,
+                    "Broker is unavailable for persona status",
+                )
+            })?
+            .persona_sessions(&bloom_broker_api::Token::new(wallet.to_owned())?)
+            .await
+    }
+
+    pub async fn stop_persona_sessions(
+        &self,
+        wallet: &str,
+        reason: &str,
+    ) -> Result<(), bloom_broker_api::ProtocolError> {
+        self.machine_broker
+            .as_ref()
+            .ok_or_else(|| {
+                bloom_broker_api::ProtocolError::new(
+                    bloom_broker_api::ProtocolErrorCode::ServiceUnavailable,
+                    "Broker is unavailable for persona revocation",
+                )
+            })?
+            .stop_persona_sessions(&bloom_broker_api::Token::new(wallet.to_owned())?, reason)
+            .await
+    }
+
+    /// Propose every package in `packages` and every destination in
+    /// `destinations` together through the wallet's existing policy operation.
+    /// `Allowed` means the policy allows all of them.
+    pub async fn ensure_default_policy(
+        &self,
+        wallet: &str,
+        packages: &[bloom_broker_api::Digest32],
+        destinations: &[bloom_broker_api::PolicyDestination],
+    ) -> Result<bloom_machine_client::PetalEligibility, bloom_vfs::HandlerError> {
+        self.wallets
+            .ensure_petal_packages_allowed_standing(
+                wallet,
+                packages,
+                destinations,
+                bloom_proto::Config::load(&self.home.config_path())
+                    .map_err(|e| bloom_vfs::HandlerError::backend(e.to_string()))?
+                    .persona
+                    .is_some_and(|p| p.preset != bloom_proto::persona::PersonaPreset::Custodian),
+            )
+            .await
     }
 
     /// Idempotent: ensure background workers are running. Already
@@ -5924,37 +6140,34 @@ mod tests {
     }
 
     #[test]
-    fn message_review_mapping_keeps_full_envelopes_and_refuses_downgrades() {
-        let petal_review_payload = |operation, claim, action| {
-            super::petal_review_payload(
-                operation,
-                claim,
-                action,
-                bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable,
-                b"message",
-            )
-        };
+    fn message_review_mapping_is_independent_of_class_spelling() {
         let envelope =
             br#"{"schema":"bloom.message.review.v1","kind":"personal","message":"exact text"}"#
                 .as_slice();
-        for class in bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES {
-            assert_eq!(
-                petal_review_payload(class, class, Some(envelope)).unwrap(),
-                Some(envelope)
+        for class in ["unrelated.message", "another.login"] {
+            let map = |action| {
+                super::petal_review_payload(
+                    class,
+                    class,
+                    action,
+                    bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable,
+                    b"\x19Ethereum Signed Message:\n10exact text",
+                )
+            };
+            assert_eq!(map(Some(envelope)).unwrap(), Some(envelope));
+            assert!(map(None).is_err());
+            assert!(map(Some(b"raw action")).is_err());
+            assert!(
+                super::petal_review_payload(
+                    class,
+                    "mismatched.class",
+                    Some(envelope),
+                    bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable,
+                    b"\x19Ethereum Signed Message:\n10exact text",
+                )
+                .is_err()
             );
-            assert!(petal_review_payload(class, class, None).is_err());
-            assert!(petal_review_payload(class, class, Some(b"raw action")).is_err());
-            assert!(petal_review_payload(class, "another.class", Some(envelope)).is_err());
         }
-        assert_eq!(
-            petal_review_payload("custom.message", "custom.message", Some(envelope)).unwrap(),
-            Some(envelope)
-        );
-        assert_eq!(
-            petal_review_payload("custom.message", "custom.message", Some(b"legacy action"))
-                .unwrap(),
-            None
-        );
     }
 
     #[test]
@@ -6755,6 +6968,7 @@ mod tests {
         let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
         let fixture = Arc::new(PetalKeyBrokerFixture::new());
         let provenance_record = bloom_broker_api::ProvenanceRecord {
+            package_display_name: None,
             subject: bloom_broker_api::ProvenanceSubject::Petal {
                 package_hash: bloom_broker_api::Digest32::from_bytes([0xaa; 32]),
                 route: "r000007".into(),
@@ -6769,6 +6983,8 @@ mod tests {
                 active: true,
             }),
             operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                zero_spend: false,
+                economic_effects_schema: None,
                 operation_class: bloom_broker_api::Token::new("exchange-agent").unwrap(),
                 fee_asset: None,
             }],
@@ -6946,10 +7162,13 @@ mod tests {
         .with_provenance_catalog(Some(bloom_broker_api::ProvenanceCatalog {
             schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
             records: vec![bloom_broker_api::ProvenanceRecord {
+                package_display_name: None,
                 petal_lineage: None,
                 subject: subject.clone(),
                 publisher: bloom_broker_api::Token::new("fixture-publisher").unwrap(),
                 operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                    zero_spend: false,
+                    economic_effects_schema: None,
                     operation_class: bloom_broker_api::Token::new("order.place").unwrap(),
                     fee_asset: None,
                 }],
@@ -6982,6 +7201,7 @@ mod tests {
             bloom_broker_api::Digest32::from_bytes(digest.finalize().into())
         };
         let claim = bloom_broker_api::PetalUseClaim {
+            economic_effects: None,
             package_hash: bloom_broker_api::Digest32::from_bytes([0xbb; 32]),
             route: context.route_id.clone(),
             operation_class: bloom_broker_api::Token::new("order.place").unwrap(),
@@ -7090,25 +7310,12 @@ mod tests {
 
     #[tokio::test]
     async fn exact_petal_batch_is_atomic_and_rejects_an_old_hint_after_reorder() {
-        petal_batch_approval(false).await;
+        petal_batch_approval().await;
     }
 
-    #[tokio::test]
-    async fn reusable_polymarket_order_steps_up_to_exact_and_binds_review_on_retry() {
-        petal_batch_approval(true).await;
-    }
-
-    async fn petal_batch_approval(reviewed: bool) {
-        let class = if reviewed {
-            "polymarket.order.poly1271"
-        } else {
-            "order.batch"
-        };
-        let suite = if reviewed {
-            bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable
-        } else {
-            bloom_broker_api::CryptoSuite::Secp256k1Sha256Recoverable
-        };
+    async fn petal_batch_approval() {
+        let class = "order.batch";
+        let suite = bloom_broker_api::CryptoSuite::Secp256k1Sha256Recoverable;
         let directory = tempfile::tempdir().unwrap();
         let state_root = directory.path().join("petal-signing-requests");
         let broker = Arc::new(PetalExactBrokerFixture::new());
@@ -7121,6 +7328,7 @@ mod tests {
         .with_provenance_catalog(Some(bloom_broker_api::ProvenanceCatalog {
             schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
             records: vec![bloom_broker_api::ProvenanceRecord {
+                package_display_name: None,
                 petal_lineage: None,
                 subject: bloom_broker_api::ProvenanceSubject::Petal {
                     package_hash: bloom_broker_api::Digest32::from_bytes([0xbb; 32]),
@@ -7128,6 +7336,8 @@ mod tests {
                 },
                 publisher: bloom_broker_api::Token::new("fixture-publisher").unwrap(),
                 operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                    zero_spend: false,
+                    economic_effects_schema: None,
                     operation_class: bloom_broker_api::Token::new(class).unwrap(),
                     fee_asset: None,
                 }],
@@ -7148,19 +7358,11 @@ mod tests {
             ],
             actor: None,
         };
-        let preimages = if reviewed {
-            vec![b"\x19\x01order".to_vec()]
-        } else {
-            vec![b"first exact payload".to_vec(), b"second".to_vec()]
-        };
+        let preimages = vec![b"first exact payload".to_vec(), b"second".to_vec()];
         let hashes = preimages
             .iter()
             .map(|payload| {
-                bloom_broker_api::Digest32::from_bytes(if reviewed {
-                    alloy::primitives::keccak256(payload).into()
-                } else {
-                    sha2::Sha256::digest(payload).into()
-                })
+                bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(payload).into())
             })
             .collect::<Vec<_>>();
         let batch_digest = |payloads: &[Vec<u8>]| {
@@ -7174,6 +7376,7 @@ mod tests {
             bloom_broker_api::Digest32::from_bytes(digest.finalize().into())
         };
         let claim = bloom_broker_api::PetalUseClaim {
+            economic_effects: None,
             package_hash: bloom_broker_api::Digest32::from_bytes([0xbb; 32]),
             route: context.route_id.clone(),
             operation_class: bloom_broker_api::Token::new(class).unwrap(),
@@ -7196,27 +7399,14 @@ mod tests {
                     claimed_hash: hash.to_bytes(),
                 })
                 .collect(),
-            signature_algorithm: if reviewed {
-                "secp256k1-keccak256-recoverable"
-            } else {
-                "secp256k1-sha256-recoverable"
-            }
-            .into(),
+            signature_algorithm: "secp256k1-sha256-recoverable".into(),
             operation_class: class.into(),
             petal_use_claim_jcs: serde_jcs::to_vec(&claim).unwrap(),
             claim_assurance_evidence: None,
             approval_hint: None,
-            action: Some(if reviewed {
-                br#"[{"order":"original"}]"#.to_vec()
-            } else {
-                b"two exact orders".to_vec()
-            }),
+            action: Some(b"two exact orders".to_vec()),
             advisory: None,
-            selector: if reviewed {
-                bloom_broker_api::PetalSignSelector::Reusable
-            } else {
-                bloom_broker_api::PetalSignSelector::Exact
-            },
+            selector: bloom_broker_api::PetalSignSelector::Exact,
             key_ref: None,
             context: Some(context),
         };
@@ -7230,86 +7420,26 @@ mod tests {
         };
         assert!(!pending.action_id.contains("ceremony"));
         request.approval_hint = Some(pending.action_id.clone());
-        if reviewed {
-            let mut old_scope = request.clone();
-            old_scope.approval_hint = Some("old-reusable-approval".into());
-            assert!(
-                host.sign_payload_batch_outcome(old_scope)
-                    .await
-                    .unwrap_err()
-                    .to_string()
-                    .contains("approval artifact does not match")
-            );
-            let mut missing = request.clone();
-            missing.action = None;
-            assert!(
-                host.sign_payload_batch_outcome(missing)
-                    .await
-                    .unwrap_err()
-                    .to_string()
-                    .contains("complete prepared record")
-            );
-            let mut changed = request.clone();
-            changed.action = Some(br#"[{"order":"changed"}]"#.to_vec());
-            assert!(
-                host.sign_payload_batch_outcome(changed)
-                    .await
-                    .unwrap_err()
-                    .to_string()
-                    .contains("persisted operation identity")
-            );
-            let mut wrong_hash = request.clone();
-            wrong_hash.payloads[0].preimage.push(0);
-            assert!(
-                host.sign_payload_batch_outcome(wrong_hash)
-                    .await
-                    .unwrap_err()
-                    .to_string()
-                    .contains("claimed hashes")
-            );
-            let requests = broker.requests.lock().unwrap();
-            let prepared = requests
-                .iter()
-                .find_map(|request| match request {
-                    MachineBrokerRequest::SealedApprovalPrepare(request) => Some(request),
-                    _ => None,
-                })
-                .unwrap();
-            assert!(matches!(
-                prepared.terms.selector,
-                bloom_broker_api::ApprovalSelector::Exact { .. }
-            ));
-            assert_eq!(
-                prepared.message_review_payloads[0].decode(),
-                request.action.clone().unwrap()
-            );
-            assert!(
-                !requests
-                    .iter()
-                    .any(|request| matches!(request, MachineBrokerRequest::SigningSignBatch(_)))
-            );
-        } else {
-            let mut reordered = request.clone();
-            reordered.payloads.swap(0, 1);
-            let reordered_preimages = reordered
-                .payloads
-                .iter()
-                .map(|item| item.preimage.clone())
-                .collect::<Vec<_>>();
-            let mut reordered_claim = claim;
-            reordered_claim.payload_digest = batch_digest(&reordered_preimages);
-            reordered_claim.ordered_hashes.reverse();
-            reordered.petal_use_claim_jcs = serde_jcs::to_vec(&reordered_claim).unwrap();
-            let error = host
-                .sign_payload_batch_outcome(reordered)
-                .await
-                .unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("approval artifact does not match")
-            );
-        }
+        let mut reordered = request.clone();
+        reordered.payloads.swap(0, 1);
+        let reordered_preimages = reordered
+            .payloads
+            .iter()
+            .map(|item| item.preimage.clone())
+            .collect::<Vec<_>>();
+        let mut reordered_claim = claim;
+        reordered_claim.payload_digest = batch_digest(&reordered_preimages);
+        reordered_claim.ordered_hashes.reverse();
+        reordered.petal_use_claim_jcs = serde_jcs::to_vec(&reordered_claim).unwrap();
+        let error = host
+            .sign_payload_batch_outcome(reordered)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("approval artifact does not match")
+        );
 
         broker
             .active
@@ -7319,14 +7449,7 @@ mod tests {
         else {
             panic!("approved retry must return the complete signature batch");
         };
-        assert_eq!(
-            signatures,
-            if reviewed {
-                vec![vec![0x40; 65]]
-            } else {
-                vec![vec![0x40; 65], vec![0x41; 65]]
-            }
-        );
+        assert_eq!(signatures, vec![vec![0x40; 65], vec![0x41; 65]]);
         let requests = broker.requests.lock().unwrap();
         let signed = requests.iter().find_map(|request| match request {
             MachineBrokerRequest::SigningSignBatch(request) => Some(request),
@@ -8043,6 +8166,7 @@ mod tests {
             schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
             records: vec![
                 bloom_broker_api::ProvenanceRecord {
+                    package_display_name: None,
                     subject: bloom_broker_api::ProvenanceSubject::System {
                         component_id: bloom_broker_api::Token::new("bloom-machine").unwrap(),
                         operation_class: bloom_broker_api::Token::new("transaction.confirm")
@@ -8051,6 +8175,8 @@ mod tests {
                     publisher: bloom_broker_api::Token::new("bloom-installer").unwrap(),
                     petal_lineage: None,
                     operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                        zero_spend: false,
+                        economic_effects_schema: None,
                         operation_class: bloom_broker_api::Token::new("transaction.confirm")
                             .unwrap(),
                         fee_asset: Some(bloom_broker_api::ProvenanceFeeAsset {
@@ -8062,6 +8188,7 @@ mod tests {
                     installer_signature: bloom_broker_api::Base64UrlBytes::from_bytes(&[11; 64]),
                 },
                 bloom_broker_api::ProvenanceRecord {
+                    package_display_name: None,
                     subject: bloom_broker_api::ProvenanceSubject::System {
                         component_id: bloom_broker_api::Token::new("bloom-machine").unwrap(),
                         operation_class: bloom_broker_api::Token::new("solana.transfer.confirm")
@@ -8070,6 +8197,8 @@ mod tests {
                     publisher: bloom_broker_api::Token::new("bloom-installer").unwrap(),
                     petal_lineage: None,
                     operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                        zero_spend: false,
+                        economic_effects_schema: None,
                         operation_class: bloom_broker_api::Token::new("solana.native-transfer")
                             .unwrap(),
                         fee_asset: Some(bloom_broker_api::ProvenanceFeeAsset {
@@ -9486,6 +9615,7 @@ allowed = ["bloom:vfs.read"]
             })
             .collect::<Vec<_>>();
         let claim = bloom_broker_api::PetalUseClaim {
+            economic_effects: None,
             package_hash: bloom_broker_api::Digest32::new("ab".repeat(32)).unwrap(),
             route: "r000001".into(),
             operation_class: bloom_broker_api::Token::new("test.intent").unwrap(),

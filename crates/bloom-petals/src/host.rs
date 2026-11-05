@@ -133,6 +133,35 @@ pub trait PetalHost: Send + Sync {
         Err(HostError::Denied("sign_payload_batch".into()))
     }
 
+    /// Prepared signing receives only host-injected route context.
+    async fn prepared_sign(
+        &self,
+        _request: bloom_petal_contract::prepared::Request,
+        _context: PetalRouteContext,
+    ) -> Result<
+        bloom_petal_contract::prepared::SigningOutcome,
+        bloom_petal_contract::prepared::SigningError,
+    > {
+        Err(bloom_petal_contract::prepared::SigningError {
+            code: bloom_petal_contract::prepared::ErrorCode::Unsupported,
+            message: "prepared signing is unavailable".into(),
+        })
+    }
+
+    async fn prepared_sign_status(
+        &self,
+        _request: bloom_petal_contract::prepared::StatusRequest,
+        _context: PetalRouteContext,
+    ) -> Result<
+        bloom_petal_contract::prepared::SigningOutcome,
+        bloom_petal_contract::prepared::SigningError,
+    > {
+        Err(bloom_petal_contract::prepared::SigningError {
+            code: bloom_petal_contract::prepared::ErrorCode::Unsupported,
+            message: "prepared signing status is unavailable".into(),
+        })
+    }
+
     /// Request or poll a Signer-owned sub-key. Implementations must use the
     /// trusted route context injected by the runner and return public metadata
     /// only.

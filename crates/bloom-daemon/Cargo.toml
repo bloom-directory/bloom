@@ -24,6 +24,9 @@ unsigned-audit-test-seam = []
 triad-dev-harness = ["bloom-machine-client/triad-dev-harness"]
 
 [dependencies]
+bloom-petal-contract.workspace = true
+ed25519-dalek = { workspace = true, features = ["pkcs8"] }
+k256 = { version = "0.13", features = ["pkcs8"] }
 bloom-proto.workspace = true
 bloom-paid-http.workspace = true
 bloom-evm.workspace = true
@@ -56,6 +59,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 parking_lot.workspace = true
 alloy.workspace = true
+alloy-dyn-abi.workspace = true
 url.workspace = true
 base64.workspace = true
 blake3.workspace = true

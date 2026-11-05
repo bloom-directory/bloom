@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.bloom.onboarding</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@BLOOM_MACHINE_BINARY@</string>
+    <string>onboard</string>
+    <string>--if-needed</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>BLOOM_ENROLLMENT_ROOT</key>
+    <string>/Library/Application Support/BloomTriad/enrollments</string>
+    <key>BLOOM_CONFIG_ROOT</key>
+    <string>/Library/Application Support/BloomTriad/config</string>
+    <key>BLOOM_RUNTIME_ROOT</key>
+    <string>/private/var/run/bloom</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <false/>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+</dict>
+</plist>

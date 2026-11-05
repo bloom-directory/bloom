@@ -310,6 +310,7 @@ impl Vfs {
         &self,
         path: &VfsPath,
         data: &[u8],
+        initialize_package: Option<&str>,
     ) -> Result<(), HandlerError> {
         let head = path.first().ok_or(HandlerError::PermissionDenied)?;
         let h = self
@@ -319,7 +320,11 @@ impl Vfs {
         let rest = path.shift();
         let effect = self.begin_effect(AUDIT_KIND_WRITE, path, data).await?;
         let correlation = effect.as_ref().map(|e| e.correlation_id.as_str());
-        let write_result = h.write(&rest, data).await;
+        let write_result = if let Some(package_hash) = initialize_package {
+            h.write_if_absent(&rest, data, package_hash).await
+        } else {
+            h.write(&rest, data).await
+        };
         match &write_result {
             Ok(()) => self.finish_effect(
                 AUDIT_KIND_WRITE,
@@ -355,7 +360,8 @@ impl Vfs {
         projection_path: &VfsPath,
     ) -> Result<Entry, HandlerError> {
         let _capture_guard = self.identity_capture_lock.write().await;
-        self.write_under_mutation_gate(write_path, data).await?;
+        self.write_under_mutation_gate(write_path, data, None)
+            .await?;
         Handler::lookup(self, projection_path).await
     }
 }
@@ -563,7 +569,18 @@ impl Handler for Vfs {
         // Ordinary writes may run concurrently; only write_then_lookup needs
         // exclusive access while it captures the identity it just produced.
         let _capture_guard = self.identity_capture_lock.read().await;
-        self.write_under_mutation_gate(path, data).await
+        self.write_under_mutation_gate(path, data, None).await
+    }
+
+    async fn write_if_absent(
+        &self,
+        path: &VfsPath,
+        data: &[u8],
+        package_hash: &str,
+    ) -> Result<(), HandlerError> {
+        let _capture_guard = self.identity_capture_lock.read().await;
+        self.write_under_mutation_gate(path, data, Some(package_hash))
+            .await
     }
 
     async fn prepare_write_open(&self, path: &VfsPath) -> Result<(), HandlerError> {

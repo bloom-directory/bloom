@@ -93,6 +93,10 @@ jobs:
     if: needs.release_impact.outputs.required == 'true'
     name: compiled signing producers and real authorization boundary
     runs-on: ubuntu-latest
+    env:
+      # Candidate fixtures are separate from the immutable shipped catalog.
+      PHASE1_POLYMARKET_REF: ff9590c1bda4a8b0eebfde104a86f19580672cc6
+      PHASE1_GASLESS_REF: 5ffb9c14a4632ef7b59498e6aee217199bdf1c53
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - name: Read shipped signing package revisions
@@ -123,8 +127,10 @@ jobs:
           ref: ${{ steps.catalog.outputs.hyperliquid_ref }}
           path: .pm80-packages/hyperliquid
       - name: Fetch the exact Broker fixture input
+        id: release_broker
         run: |
           broker_ref="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["dependencies"]["bloom-broker-api"]["rev"])')"
+          echo "ref=$broker_ref" >> "$GITHUB_OUTPUT"
           git init "$RUNNER_TEMP/pm80-broker"
           git -C "$RUNNER_TEMP/pm80-broker" fetch --depth=1 https://github.com/bloom-directory/bloom-broker.git "$broker_ref"
           git -C "$RUNNER_TEMP/pm80-broker" checkout --detach FETCH_HEAD
@@ -161,6 +167,34 @@ jobs:
           grep -q "test result: ok. 1 passed;" "$RUNNER_TEMP/pm80-producer-test.log"
           cargo test --locked -p bloom --bin bloom github_source::tests::source_built_signing_packages_match_catalog_authority -- --ignored --exact 2>&1 | tee "$RUNNER_TEMP/pm80-catalog-test.log"
           grep -q "test result: ok. 1 passed;" "$RUNNER_TEMP/pm80-catalog-test.log"
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: bloom-directory/bloom-petal-polymarket
+          ref: ${{ env.PHASE1_POLYMARKET_REF }}
+          path: .phase1-packages/polymarket
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: bloom-directory/bloom-petal-gasless
+          ref: ${{ env.PHASE1_GASLESS_REF }}
+          path: .phase1-packages/gasless
+      - name: Read the exact candidate SDK revision
+        id: candidate_sdk
+        run: |
+          python3 - <<'PYSDK' >> "$GITHUB_OUTPUT"
+          import re
+          import tomllib
+          dependency = tomllib.load(open("Cargo.toml", "rb"))["workspace"]["dependencies"]["bloom-petal-contract"]
+          assert dependency["git"] == "https://github.com/bloom-directory/petal"
+          assert re.fullmatch(r"[0-9a-f]{40}", dependency["rev"])
+          print("ref=" + dependency["rev"])
+          PYSDK
+      - name: Build pinned generic prepared signing components
+        run: |
+          revision="${{ steps.candidate_sdk.outputs.ref }}"
+          cargo install --git https://github.com/bloom-directory/petal --rev "$revision" --locked --root "$RUNNER_TEMP/petal-$revision" bloom-petal-cli
+          for name in polymarket gasless; do
+            PETAL_BIN="$RUNNER_TEMP/petal-$revision/bin/petal" bash ".phase1-packages/$name/scripts/build.sh"
+          done
       - name: Read the release Signer revision
         id: release_signer
         run: |
@@ -186,21 +220,45 @@ jobs:
           cargo build --locked --manifest-path "$RUNNER_TEMP/pm80-broker/Cargo.toml" -p bloom-broker -p bloom-broker-debug-driver --features bloom-broker/triad-dev-harness
           cargo build --locked --manifest-path .pm80-packages/signer/Cargo.toml -p bloom-signer --features triad-dev-harness
           cargo build --locked -p bloom --no-default-features --features mount,triad-dev-harness
-      - name: Authorize installed account-1 authentication and exact continuation
+      - name: Create canonical prepared signing archives
+        run: |
+          revision="${{ steps.candidate_sdk.outputs.ref }}"
+          for name in polymarket gasless; do
+            "$RUNNER_TEMP/petal-$revision/bin/petal" package --root ".phase1-packages/$name" --out "$RUNNER_TEMP/phase1-$name.petal.tar.gz" --no-build
+          done
+      - name: Exercise installed generic prepared signing through real authority
         env:
           BLOOM_INTEGRATION_MACHINE_BIN: ${{ github.workspace }}/target/debug/bloom
           BLOOM_INTEGRATION_BROKER_BIN: ${{ runner.temp }}/pm80-broker/target/debug/bloom-broker
           BLOOM_INTEGRATION_DEBUG_DRIVER_BIN: ${{ runner.temp }}/pm80-broker/target/debug/bloom-broker-debug-driver
           BLOOM_INTEGRATION_SIGNER_BIN: ${{ github.workspace }}/.pm80-packages/signer/target/debug/bloom-signer
-          BLOOM_PM80_POLYMARKET_ROOT: ${{ github.workspace }}/.pm80-packages/polymarket
+          BLOOM_INTEGRATION_BROKER_COMMIT: ${{ steps.release_broker.outputs.ref }}
+          BLOOM_INTEGRATION_SIGNER_COMMIT: ${{ steps.release_signer.outputs.ref }}
+          BLOOM_PM80_POLYMARKET_ROOT: ${{ runner.temp }}/phase1-polymarket.petal.tar.gz
+          BLOOM_PM80_GASLESS_ROOT: ${{ runner.temp }}/phase1-gasless.petal.tar.gz
         run: |
-          run_root="$(mktemp -d /tmp/pm80-auth.XXXXXX)"
-          bash scripts/test-polymarket-authorization.sh "$run_root"
-          cp "$run_root/authorization-result.json" "$RUNNER_TEMP/pm80-authorization-result.json"
+          for mode in login prepared-buy prepared-gasless; do
+            run_root="$(mktemp -d /tmp/pm80-auth.XXXXXX)"
+            log="$RUNNER_TEMP/phase1-$mode.log"
+            bash scripts/test-polymarket-authorization.sh "$run_root" "$mode" 2>&1 | tee "$log"
+            cp "$run_root/candidate-inputs.json" "$RUNNER_TEMP/phase1-$mode-inputs.json"
+            case "$mode" in
+              login) expected=1 ;;
+              *)
+                expected=2
+                cp "$run_root/authorization-result.first.json" "$RUNNER_TEMP/phase1-$mode-first.json"
+                cp "$run_root/authorization-result.restart.json" "$RUNNER_TEMP/phase1-$mode-restart.json"
+                ;;
+            esac
+            actual="$(grep -Fc 'test result: ok. 1 passed;' "$log")"
+            test "$actual" -eq "$expected"
+          done
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
         with:
           name: signing-producer-package-records
           path: |
             ${{ runner.temp }}/pm80-package-records.json
-            ${{ runner.temp }}/pm80-authorization-result.json
+            ${{ runner.temp }}/phase1-*.json
+            ${{ runner.temp }}/phase1-*.log
           if-no-files-found: error

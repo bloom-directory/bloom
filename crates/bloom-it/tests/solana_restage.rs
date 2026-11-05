@@ -359,6 +359,7 @@ async fn solana_expired_blockhash_fails_closed_then_restages() -> Result<()> {
     let home = HomeDir::at(tmp.path());
     let permit = Arc::new(HomeWritePermit::acquire(&home)?);
     let record = |action: &str, op: &str, chain: &str| ProvenanceRecord {
+        package_display_name: None,
         subject: ProvenanceSubject::System {
             component_id: tok("bloom-machine"),
             operation_class: tok(action),
@@ -366,6 +367,8 @@ async fn solana_expired_blockhash_fails_closed_then_restages() -> Result<()> {
         publisher: tok("bloom-installer"),
         petal_lineage: None,
         operation_classes: vec![ProvenanceOperationClass {
+            zero_spend: false,
+            economic_effects_schema: None,
             operation_class: tok(op),
             fee_asset: Some(ProvenanceFeeAsset {
                 chain: tok(chain),

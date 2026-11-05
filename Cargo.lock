@@ -2305,6 +2305,7 @@ dependencies = [
  "flate2",
  "hex",
  "humantime",
+ "num-bigint",
  "openssl-sys",
  "oslog",
  "predicates",
@@ -2343,12 +2344,13 @@ dependencies = [
 [[package]]
 name = "bloom-broker-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=b6c273397ca0f24f85e7279390fd59f502f290e4#b6c273397ca0f24f85e7279390fd59f502f290e4"
+source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=c6bea1f002851e8a058d6d8f3f598816ad55675c#c6bea1f002851e8a058d6d8f3f598816ad55675c"
 dependencies = [
  "bech32",
  "bloom-rpc-wire",
  "bs58",
  "hex",
+ "num-bigint",
  "serde",
  "serde_jcs",
  "serde_json",
@@ -2361,6 +2363,7 @@ name = "bloom-daemon"
 version = "0.4.2"
 dependencies = [
  "alloy 2.0.5",
+ "alloy-dyn-abi",
  "anyhow",
  "async-trait",
  "base64 0.22.1",
@@ -2373,6 +2376,7 @@ dependencies = [
  "bloom-mempool",
  "bloom-mount",
  "bloom-paid-http",
+ "bloom-petal-contract",
  "bloom-petals",
  "bloom-prices",
  "bloom-proto",
@@ -2385,9 +2389,11 @@ dependencies = [
  "bloom-vfs",
  "bloom-watch",
  "bs58",
+ "ed25519-dalek",
  "fs2",
  "futures",
  "hex",
+ "k256 0.13.4",
  "parking_lot",
  "reqwest 0.12.28",
  "rustix 1.1.4",
@@ -2642,10 +2648,13 @@ dependencies = [
 [[package]]
 name = "bloom-petal-contract"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/petal?rev=7dd2722db5de305dd63ca4ed03591f3ab82fa40b#7dd2722db5de305dd63ca4ed03591f3ab82fa40b"
+source = "git+https://github.com/bloom-directory/petal?rev=465d6f2464a6a87910128f5448d1543ccb2aeb2a#465d6f2464a6a87910128f5448d1543ccb2aeb2a"
 dependencies = [
  "hex",
+ "serde",
+ "serde_json",
  "sha2 0.11.0",
+ "sha3 0.11.0",
 ]
 
 [[package]]
@@ -2805,7 +2814,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=3f880d7b96ebcc18f07afadac6f07c7f7036e90c#3f880d7b96ebcc18f07afadac6f07c7f7036e90c"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=dd8717982812affc436bdc23a49fb381caa19039#dd8717982812affc436bdc23a49fb381caa19039"
 dependencies = [
  "bloom-rpc-wire",
  "ed25519-dalek",
@@ -2820,7 +2829,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-derive"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=3f880d7b96ebcc18f07afadac6f07c7f7036e90c#3f880d7b96ebcc18f07afadac6f07c7f7036e90c"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=dd8717982812affc436bdc23a49fb381caa19039#dd8717982812affc436bdc23a49fb381caa19039"
 dependencies = [
  "bip39",
  "ed25519-dalek",
@@ -4234,6 +4243,7 @@ version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29fcf32e6c73d1079f83ab4d782de2d81620346a5f38c6237a86a22f8368980a"
 dependencies = [
+ "pkcs8 0.11.0",
  "signature 3.0.0",
 ]
 
@@ -5730,6 +5740,7 @@ dependencies = [
  "once_cell",
  "serdect 0.2.0",
  "sha2 0.10.9",
+ "signature 2.2.0",
 ]
 
 [[package]]

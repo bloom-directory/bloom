@@ -59,6 +59,7 @@ fn open_selected_private_store(
     account: Option<&(String, u32)>,
     policy: Option<&StoreNamespacePolicy>,
     shared_root: Option<&PathBuf>,
+    initialize_only: bool,
 ) -> Result<PrivateStore, crate::host::HostError> {
     let store = match account {
         Some((wallet, number)) => PrivateStore::open_account(root, wallet, *number),
@@ -68,11 +69,13 @@ fn open_selected_private_store(
         Some(root) => store.with_shared_root(root.clone()),
         None => store,
     };
-    Ok(store.with_shared_keys(
-        policy
-            .into_iter()
-            .flat_map(|p| p.shared_keys().iter().cloned()),
-    ))
+    Ok(store
+        .with_initialize_only(initialize_only)
+        .with_shared_keys(
+            policy
+                .into_iter()
+                .flat_map(|p| p.shared_keys().iter().cloned()),
+        ))
 }
 
 const DEFAULT_FUEL: u64 = 100_000_000;
@@ -130,6 +133,8 @@ pub enum ComponentRouteEntryKind {
 
 #[derive(Debug, Clone)]
 pub struct RunOptions {
+    /// Host-only initialization: guest puts cannot overwrite existing values.
+    pub private_store_initialize_only: bool,
     pub fuel: u64,
     pub memory_pages: u32,
     /// Optional runtime network mask. When running through [`PetalRunner`],
@@ -171,6 +176,7 @@ pub struct RunOptions {
 impl Default for RunOptions {
     fn default() -> Self {
         Self {
+            private_store_initialize_only: false,
             fuel: DEFAULT_FUEL,
             memory_pages: DEFAULT_MEMORY_PAGES,
             net_policy: None,
@@ -335,6 +341,7 @@ impl PetalVm {
                             opts.private_store_account.as_ref(),
                             opts.store_namespaces.as_ref(),
                             opts.private_store_shared_root.as_ref(),
+                            opts.private_store_initialize_only,
                         )
                         .map_err(|e| PetalError::vm(format!("private store open: {e}")))?,
                     ),
@@ -419,6 +426,7 @@ impl PetalVm {
                             opts.private_store_account.as_ref(),
                             opts.store_namespaces.as_ref(),
                             opts.private_store_shared_root.as_ref(),
+                            opts.private_store_initialize_only,
                         )
                         .map_err(|e| PetalError::vm(format!("private store open: {e}")))?,
                     ),
@@ -502,6 +510,7 @@ impl PetalVm {
                             opts.private_store_account.as_ref(),
                             opts.store_namespaces.as_ref(),
                             opts.private_store_shared_root.as_ref(),
+                            opts.private_store_initialize_only,
                         )
                         .map_err(|e| PetalError::vm(format!("private store open: {e}")))?,
                     ),
@@ -922,6 +931,18 @@ fn link_component_host_imports(linker: &mut ComponentLinker<StoreData>) -> anyho
         })?;
         sign.func_new_async("sign-payload-batch", |store, params, results| {
             Box::new(async move { component_sign_payload_batch(store, params, results).await })
+        })?;
+    }
+    {
+        let mut signing = linker.instance("bloom:prepared-sign/signing@0.1.0")?;
+        signing.func_new_async("sign", |store, params, results| {
+            Box::new(async move { component_prepared_sign(store, params, results, false).await })
+        })?;
+    }
+    {
+        let mut signing = linker.instance("bloom:prepared-sign/status@0.1.0")?;
+        signing.func_new_async("status", |store, params, results| {
+            Box::new(async move { component_prepared_sign(store, params, results, true).await })
         })?;
     }
     {
@@ -1539,6 +1560,84 @@ fn apply_manifest_key_scope(
     }
     request.allowed_routes = data.key_derive_allowed_routes.clone();
     Ok(())
+}
+
+async fn component_prepared_sign(
+    store: StoreContextMut<'_, StoreData>,
+    params: &[ComponentVal],
+    results: &mut [ComponentVal],
+    status: bool,
+) -> anyhow::Result<()> {
+    use bloom_petal_contract::prepared::{
+        ErrorCode, MAX_REQUEST, Request, SigningError, StatusRequest,
+    };
+    let fail = |code, message: String| SigningError { code, message };
+    let parsed = (|| {
+        if !store.data().caps.contains(&if status {
+            Capability::SignStatus
+        } else {
+            Capability::Sign
+        }) {
+            return Err(fail(ErrorCode::Denied, "sign capability required".into()));
+        }
+        let [ComponentVal::List(values)] = params else {
+            return Err(fail(ErrorCode::Invalid, "request must be bytes".into()));
+        };
+        if values.len() > MAX_REQUEST {
+            return Err(fail(ErrorCode::Invalid, "request exceeds limit".into()));
+        }
+        let bytes = values
+            .iter()
+            .map(|v| match v {
+                ComponentVal::U8(b) => Ok(*b),
+                _ => Err(fail(ErrorCode::Invalid, "request must be bytes".into())),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let context = store
+            .data()
+            .sign_context
+            .clone()
+            .ok_or_else(|| fail(ErrorCode::Denied, "trusted route context required".into()))?;
+        if status {
+            let request: StatusRequest = serde_json::from_slice(&bytes)
+                .map_err(|e| fail(ErrorCode::Invalid, e.to_string()))?;
+            request.validate()?;
+            require_trusted_wallet(store.data(), &request.wallet)
+                .map_err(|e| fail(ErrorCode::Denied, e.to_string()))?;
+            Ok((None, Some(request), context))
+        } else {
+            let request: Request = serde_json::from_slice(&bytes)
+                .map_err(|e| fail(ErrorCode::Invalid, e.to_string()))?;
+            request.validate()?;
+            require_trusted_wallet(store.data(), &request.wallet)
+                .map_err(|e| fail(ErrorCode::Denied, e.to_string()))?;
+            if !sign_intent_allowed(store.data(), &request.action.operation_class) {
+                return Err(fail(ErrorCode::Denied, "sign intent not allowed".into()));
+            }
+            Ok((Some(request), None, context))
+        }
+    })();
+    let outcome = match parsed {
+        Ok((Some(request), _, context)) => store.data().host.prepared_sign(request, context).await,
+        Ok((_, Some(request), context)) => {
+            store
+                .data()
+                .host
+                .prepared_sign_status(request, context)
+                .await
+        }
+        Ok(_) => unreachable!(),
+        Err(error) => Err(error),
+    };
+    let value = match outcome {
+        Ok(outcome) => ComponentVal::Result(Ok(Some(Box::new(component_bytes(
+            serde_json::to_vec(&outcome)?,
+        ))))),
+        Err(error) => ComponentVal::Result(Err(Some(Box::new(component_bytes(
+            serde_json::to_vec(&error)?,
+        ))))),
+    };
+    set_component_result(results, value)
 }
 
 async fn component_petal_key_request(
@@ -3096,6 +3195,7 @@ mod tests {
     fn canonical_test_claim() -> Vec<u8> {
         let digest = bloom_broker_api::Digest32::from_bytes([3; 32]);
         serde_jcs::to_vec(&bloom_broker_api::PetalUseClaim {
+            economic_effects: None,
             package_hash: bloom_broker_api::Digest32::from_bytes([4; 32]),
             route: "r000001".into(),
             operation_class: bloom_broker_api::Token::new("orders.place").unwrap(),
@@ -3986,6 +4086,7 @@ mod tests {
                 account.as_ref(),
                 Some(&policy),
                 Some(&tmp.path().join("data")),
+                false,
             )
             .unwrap();
             let mut store = component_test_store(

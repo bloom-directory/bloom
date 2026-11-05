@@ -236,6 +236,17 @@ pub trait Handler: Send + Sync {
     }
 
     /// Handle a write to a writable file. Default: read-only.
+    /// Initialize backing settings only if no value exists. Handlers must
+    /// enforce this atomically; ordinary read-before-write is insufficient.
+    async fn write_if_absent(
+        &self,
+        _path: &VfsPath,
+        _data: &[u8],
+        _package_hash: &str,
+    ) -> Result<(), HandlerError> {
+        Err(HandlerError::PermissionDenied)
+    }
+
     async fn write(&self, path: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
         let _ = path;
         Err(HandlerError::PermissionDenied)
