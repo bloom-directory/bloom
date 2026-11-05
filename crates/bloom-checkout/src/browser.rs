@@ -60,16 +60,27 @@ impl Browser {
         self.unusable.load(Ordering::SeqCst) || self.cdp.exited()
     }
 
+    /// Launch headless, as every caller but the service entry point wants.
     pub async fn launch(
         executable: &Path,
         profile: &Path,
         test_flags: &[String],
+    ) -> Result<Arc<Self>> {
+        Self::launch_with(executable, profile, test_flags, false).await
+    }
+
+    pub async fn launch_with(
+        executable: &Path,
+        profile: &Path,
+        test_flags: &[String],
+        window: bool,
     ) -> Result<Arc<Self>> {
         // Fixture merchants listen on loopback in tests and developer Triads.
         Self::launch_with_egress(
             executable,
             profile,
             test_flags,
+            window,
             crate::egress::policy(cfg!(any(test, feature = "triad-dev-harness"))),
         )
         .await
@@ -79,6 +90,7 @@ impl Browser {
         executable: &Path,
         profile: &Path,
         test_flags: &[String],
+        window: bool,
         egress: crate::egress::Policy,
     ) -> Result<Arc<Self>> {
         if profile.exists() {
@@ -115,7 +127,7 @@ impl Browser {
             .any(|f| f == "--ignore-certificate-errors");
         let mut flags = crate::egress::chromium_flags(crate::egress::start(egress).await?);
         flags.extend_from_slice(test_flags);
-        let cdp = Cdp::launch(executable, profile, &flags)?;
+        let cdp = Cdp::launch(executable, profile, &flags, window)?;
         let tab = new_tab(&cdp, None, 1).await?;
         Ok(Arc::new(Self {
             cdp,
@@ -1116,6 +1128,7 @@ mod tests {
             &crate::test_chromium(),
             &root.path().join("profile"),
             &["--no-sandbox".into()],
+            false,
             Arc::new(move |address| address == shop_address),
         )
         .await

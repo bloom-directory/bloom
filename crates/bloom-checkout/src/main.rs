@@ -29,6 +29,11 @@ struct Args {
     /// Exit cleanly when the session-bound Broker disappears (launchd lifecycle).
     #[arg(long)]
     follow_broker_lifecycle: bool,
+    /// Shop in an ordinary browser window on the display this process is given,
+    /// rather than a headless one that shops recognise and turn away. The
+    /// display may be virtual, so this does not require a screen.
+    #[arg(long)]
+    browser_window: bool,
     #[cfg(feature = "triad-dev-harness")]
     #[arg(long)]
     fixture_allow_insecure_tls: bool,
@@ -56,7 +61,8 @@ async fn main() -> Result<()> {
     };
     #[cfg(not(feature = "triad-dev-harness"))]
     let flags = Vec::new();
-    let browser = Browser::launch(&args.chromium, &args.profile, &flags).await?;
+    let browser =
+        Browser::launch_with(&args.chromium, &args.profile, &flags, args.browser_window).await?;
     let service = CheckoutService::new(
         browser.clone(),
         &args.state,
