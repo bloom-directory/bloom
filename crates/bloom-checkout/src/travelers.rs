@@ -105,6 +105,15 @@ pub(crate) fn derived_traveler_value(
                 born.get(0..4)?
             )))
         }
+        "born_on_mdy" => {
+            let born = values.get("born_on")?;
+            Some(Zeroizing::new(format!(
+                "{}/{}/{}",
+                born.get(5..7)?,
+                born.get(8..10)?,
+                born.get(0..4)?
+            )))
+        }
         _ => values.get(field).cloned(),
     }
 }
@@ -496,6 +505,119 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state, json!({"same":true,"touched":true,"ready":true}));
+        server.abort();
+    }
+    #[tokio::test]
+    async fn contact_first_forms_do_not_append_email_to_passenger_names() {
+        let (browser, server, _) = browser_at(
+            "<label>E-mail<input type='email'></label><label>Confirm e-mail<input type='email'></label>
+             <label>Mobile number<input type='tel'></label>
+             <fieldset><legend>Gender</legend><label>Male<input type='radio' name='gender' value='male'></label></fieldset>
+             <label>First name(s)<input name='firstName'></label><label>Last name<input name='lastName'></label>",
+        ).await;
+        let tab = browser.handoff().await.unwrap();
+        let fields = [
+            TravelerField::Email,
+            TravelerField::Phone,
+            TravelerField::Gender,
+            TravelerField::GivenName,
+            TravelerField::FamilyName,
+        ];
+        let values = [
+            ("email", "fixture@example.com"),
+            ("phone", "+12025550123"),
+            ("gender", "male"),
+            ("given_name", "Synthetic"),
+            ("family_name", "Fixture"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.into(), Zeroizing::new(v.into())))
+        .collect();
+        let discovery = TravelerDiscovery::read(&tab, &fields).await.unwrap();
+        discovery.fill(&tab, &values).await.unwrap();
+        // A controlled form can clear its confirmation field after the first
+        // pass. The second pass must still edit that email input, not the
+        // passenger name that held the most recent text selection.
+        tab.cdp
+            .evaluate(
+                &tab.session,
+                "document.querySelectorAll('input[type=email]')[1].value = ''; true".into(),
+            )
+            .await
+            .unwrap();
+        let second = TravelerDiscovery::read(&tab, &fields).await.unwrap();
+        let wanted = second
+            .field_names()
+            .into_iter()
+            .filter_map(|field| values.get(&field).map(|v| (field, v.clone())))
+            .collect();
+        second.fill(&tab, &wanted).await.unwrap();
+        let actual = tab.cdp.evaluate(&tab.session,
+            "[...document.querySelectorAll('input')].filter(e=>e.type!=='radio').map(e=>e.value)".into()).await.unwrap();
+        assert_eq!(
+            actual,
+            json!([
+                "fixture@example.com",
+                "fixture@example.com",
+                "+12025550123",
+                "Synthetic",
+                "Fixture"
+            ])
+        );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn ordinary_private_fields_do_not_depend_on_the_pages_text_selection() {
+        let (browser, server, _) = browser_at(
+            "<label>E-mail<input id='email' type='email' onfocus=\"surname.focus()\"></label>
+             <label>Last name<input id='surname' name='lastName'></label>",
+        )
+        .await;
+        let tab = browser.handoff().await.unwrap();
+        let discovery =
+            TravelerDiscovery::read(&tab, &[TravelerField::Email, TravelerField::FamilyName])
+                .await
+                .unwrap();
+        let values = [("email", "fixture@example.com"), ("family_name", "Fixture")]
+            .into_iter()
+            .map(|(k, v)| (k.into(), Zeroizing::new(v.into())))
+            .collect();
+        discovery.fill(&tab, &values).await.unwrap();
+        let actual = tab
+            .cdp
+            .evaluate(&tab.session, "[email.value,surname.value]".into())
+            .await
+            .unwrap();
+        assert_eq!(actual, json!(["fixture@example.com", "Fixture"]));
+        server.abort();
+    }
+    #[tokio::test]
+    async fn a_site_changed_passenger_name_is_not_reported_as_filled() {
+        let (browser, server, _) = browser_at(
+            "<label>First name<input name='firstName'></label><label>Last name<input id='family' name='lastName'></label>
+             <label>E-mail<input type='email' oninput=\"family.value += this.value\"></label>",
+        ).await;
+        let tab = browser.handoff().await.unwrap();
+        let discovery = TravelerDiscovery::read(
+            &tab,
+            &[
+                TravelerField::GivenName,
+                TravelerField::FamilyName,
+                TravelerField::Email,
+            ],
+        )
+        .await
+        .unwrap();
+        let values = [
+            ("given_name", "Synthetic"),
+            ("family_name", "Fixture"),
+            ("email", "fixture@example.com"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.into(), Zeroizing::new(v.into())))
+        .collect();
+        let filled = discovery.fill(&tab, &values).await.unwrap();
+        assert_eq!(filled, ["given_name", "email"]);
         server.abort();
     }
     #[tokio::test]

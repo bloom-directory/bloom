@@ -30,6 +30,8 @@ const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const slot = id();
 const checks = [];
 let stage = 'fresh candidate';
+let ceremonyWindowStarted;
+let ownsFixtureCard = false;
 let fixtureSubmissions = 0;
 function checkpoint(name, details = {}) {
   checks.push({name, ...details});
@@ -87,12 +89,14 @@ async function typeVisible(label, text, required = true) {
   throw Error(`Contact field did not stabilize: ${label}`);
 }
 async function poll(path, states) {
+  let lastState = 'unavailable';
   for (let attempt = 0; attempt < 150; attempt++) {
     const status = await vfs('cat', path);
     if (states.includes(status.state)) return status;
+    lastState = status.state;
     await delay(250);
   }
-  throw Error(`State timeout during ${stage}`);
+  throw Error(`State timeout during ${stage}; last state: ${lastState}`);
 }
 async function returnedToShopping() {
   for (let attempt = 0; attempt < 50; attempt++) {
@@ -168,9 +172,10 @@ try {
     assert.equal(fixtureSubmissions,0,'Refusal must not try any payment action');
   }
   checkpoint('bounded refusal reasons survive real services, VFS status and history without submitting');
-  const started = Date.now();
+  const started = ceremonyWindowStarted = Date.now();
   const add = id();
   await vfs('write','/cards/add.json',{operation_id:add,card_id:'stack-card',label:'Synthetic acceptance card'});
+  ownsFixtureCard = true;
   await approve((await vfs('cat',`/cards/operations/${add}/ceremony.json`)).ceremony_url,'add');
   await poll(`/cards/operations/${add}/status.json`, ['succeeded']);
   const cards = await vfs('cat','/cards/index.json');
@@ -200,7 +205,6 @@ try {
   await privatePage.locator('#finish').click();
   await poll(`/checkout/requests/${manual}/status.json`, ['uncertain']);
   await returnedToShopping(); await privatePage.close();
-  await vfs('write',`/checkout/requests/${manual}/resolve`,{});
   checkpoint('manual fallback releases no card; lost private tab reopens; shopping returns');
 
   stage = 'Stripe sandbox checkout';
@@ -209,6 +213,10 @@ try {
   assert(snapshot.url.startsWith('https://buy.stripe.com/test_'), 'Refuse a live payment page');
   await typeVisible(/^email$/i,'fixture-buyer@example.com');
   await typeVisible(/postal|zip/i,'12345',false);
+  // This test buys the fixture subscription, not a separate Link account.
+  snapshot = await browse({action:'snapshot'});
+  const remember = snapshot.elements.find(e => e.checked === true && /save my information.*faster checkout/i.test(e.label));
+  if (remember) await browse({action:'click',element_ref:remember.ref});
   const payment = id();
   await vfs('write',`/checkout/requests/${payment}/in.json`,{card_id:'stack-card',agent_description:'Stripe public TEST subscription; synthetic card; no real funds'});
   const awaiting = await checkoutStatus(payment);
@@ -221,7 +229,7 @@ try {
 
   await browse({action:'open',url:merchant+'login'}); await delay(500);
   const takeOver = id();
-  await vfs('write',`/checkout/requests/${takeOver}/in.json`,{take_over:true,agent_description:'Log in to the synthetic fixture shop'});
+  await vfs('write',`/checkout/requests/${takeOver}/in.json`,{take_over:true,resolves:manual,agent_description:'Log in to the synthetic fixture shop'});
   const takeoverOpened = context.waitForEvent('page');
   await approve((await checkoutStatus(takeOver)).ceremony_url,'take-over');
   const takeoverPage = await takeoverOpened;
@@ -231,9 +239,10 @@ try {
   await takeoverPage.keyboard.type('ada',{delay:100}); await takeoverPage.keyboard.press('Enter'); await delay(800);
   await takeoverPage.locator('#finish').click();
   await poll(`/checkout/requests/${takeOver}/status.json`, ['returned']);
-  snapshot = await browse({action:'snapshot'}); assert.equal(snapshot.url,merchant+'account'); assert.match(snapshot.text,/Signed in as ada/);
+  await returnedToShopping();
+  assert.equal((await checkoutStatus(manual)).state,'resolved');
   await takeoverPage.close();
-  checkpoint('approved take-over returns the logged-in page');
+  checkpoint('approved take-over clears the unknown payment and never returns the login');
 
   // Keep Broker's production anonymous-ceremony admission limit intact.
   stage = 'waiting for ceremony quota';
@@ -260,6 +269,25 @@ try {
   writeFileSync(output,JSON.stringify({result:'failed',stage,message,checks},null,2));
   console.error(`FAIL ${stage}: ${message}`); process.exitCode = 1;
 } finally {
+  // A diagnostic failure must not strand the synthetic card after closing the
+  // only browser that holds this test's virtual passkey.
+  try {
+    if (ownsFixtureCard && (await vfs('cat','/cards/index.json')).some(card => card.card_id === 'stack-card')) {
+      for (const privatePage of context.pages().filter(p => p.url().startsWith(viewOrigin+'/view'))) {
+        if (await privatePage.locator('#finish').isVisible()) await privatePage.locator('#finish').click();
+      }
+      await delay(Math.max(0,(ceremonyWindowStarted || Date.now())+305000-Date.now()));
+      const cleanup = id();
+      await vfs('write','/cards/delete.json',{operation_id:cleanup,card_id:'stack-card'});
+      await approve((await vfs('cat',`/cards/operations/${cleanup}/ceremony.json`)).ceremony_url,'delete');
+      await poll(`/cards/operations/${cleanup}/status.json`,['succeeded']);
+      assert.deepEqual(await vfs('cat','/cards/index.json'),[]);
+      console.log('CLEANUP synthetic card deleted after test failure');
+    }
+  } catch {
+    console.error('CLEANUP synthetic card could not be deleted; preserve this disposable Triad for recovery');
+    process.exitCode = 1;
+  }
   await browser.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
   neighborServer.closeAllConnections(); await new Promise(resolve => neighborServer.close(resolve));
 }

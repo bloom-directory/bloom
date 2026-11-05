@@ -2,6 +2,7 @@
 pub mod browser;
 mod cdp;
 mod discovery;
+mod egress;
 mod hpke;
 mod scripts;
 pub mod service;

@@ -1,9 +1,15 @@
 name: CI
 
+permissions:
+  contents: read
+
 on:
   pull_request:
     paths: &code_paths
       - ".github/workflows/ci.yml"
+      # The macOS source assertions read both conformance workflows.
+      - ".github/workflows/macos-unix-conformance.yml"
+      - ".github/workflows/macos-two-login-conformance.yml"
       - "Cargo.toml"
       - "Cargo.lock"
       - "deny.toml"
@@ -61,6 +67,8 @@ jobs:
         run: scripts/test-harbor-evals.sh
       - name: Validate hosted relay launcher readiness
         run: scripts/test-triad-dev-hosted-relay.sh
+      - name: Validate macOS logout drain timing
+        run: bash tests/conformance/macos-unix-principals/test-logout-drain.sh
       # Failure-mode cases for the ceremony-port A/B concurrency script
       # (stub launchers; binds no ports and needs no Triad).
       - name: Run concurrency script failure-mode cases
@@ -227,6 +235,16 @@ jobs:
           cargo nextest run --archive-file target/nextest-archive.tar.zst \
             -E 'package(bloom-checkout) and binary(browser_lifecycle)' \
             --no-fail-fast
+          # Machine-to-Broker exact signing (x402, MPP, policy update). Only the
+          # dispatch-only macOS W0 job ran it before, so Linux PRs missed breaks.
+          cargo nextest run --archive-file target/nextest-archive.tar.zst \
+            -E 'package(bloom-vfs) and binary(triad_policy_update)' \
+            --no-tests=fail \
+            --no-fail-fast
+          cargo nextest run --archive-file target/nextest-archive.tar.zst \
+            -E 'package(bloom-daemon) and binary(m2_no_legacy_authority_store)' \
+            --no-tests=fail \
+            --no-fail-fast
       # The triad release binary asserts the content of the packaged
       # installers, launcher, and release gates. It was previously not run at
       # all, so a launcher change could silently invalidate its assertions.
@@ -249,6 +267,15 @@ jobs:
         run: >
           cargo nextest run --archive-file target/nextest-archive.tar.zst
           -E 'package(bloom-it) and binary(triad_release) and not test(/^macos_/)'
+          --no-fail-fast
+      # The macOS LaunchAgent assertions read packaging and Machine sources,
+      # so they run on Linux for every change. The macOS Unix-principal
+      # conformance workflow runs the packaging scripts directly.
+      - name: Run macOS LaunchAgent source assertions from archive
+        run: >
+          cargo nextest run --archive-file target/nextest-archive.tar.zst
+          -E 'package(bloom-it) and binary(macos_launchagent)'
+          --no-tests=fail
           --no-fail-fast
       # Every `solana_*` binary drives a local Agave validator, which this job
       # does not start; they run in the dedicated solana-validator workflow.
@@ -299,8 +326,8 @@ jobs:
       github.ref_name == 'triad-architecture'
     uses: ./.github/workflows/macos-unix-conformance.yml
     with:
-      broker_ref: b4f0c0bf04f3f34cc171f072a87ed982f4e7e196
-      signer_ref: 74e097a566f1bd08f5f43a7e847d3958b6386a3a
+      broker_ref: 0dc16bd7716f3b0ad44825783befe3953fa625f9
+      signer_ref: fa43841512e6c9370620b435ec0e49b5a61c0375
 
   linux_w0_isolation:
     name: Linux W0 principal and socket isolation

@@ -203,8 +203,14 @@
       Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(e,value);
       e.dispatchEvent(new Event('input',{bubbles:true}));
     } else {
-      e.focus();e.select();
-      if (document.activeElement !== e || !e.isConnected || !document.execCommand('insertText',false,value)) throw Error('Traveler input unsupported');
+      e.focus();
+      if (!e.isConnected || e.disabled || e.readOnly || e.type === 'password'
+          || (e.autocomplete || '').split(' ').some(s=>s.startsWith('cc-'))) throw Error('Traveler field changed');
+      // Bind the write to this approved field, not the page's current text
+      // selection. Controlled forms can move focus while handling another field.
+      const prototype = e.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      Object.getOwnPropertyDescriptor(prototype,'value').set.call(e,value);
+      e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));
       // Some forms only accept a value after a key release and leaving the field.
       e.dispatchEvent(new KeyboardEvent('keyup',{key:value.slice(-1),bubbles:true}));
     }
@@ -222,5 +228,16 @@
     skipped.push(`${mapping.field}${mapping.part ? ' ' + mapping.part : ''}: ${error.message}`);
   }
   }
-  return {filled:[...new Set(filled)],skipped};
+  // Later input handlers can rewrite an earlier passenger name. Check the
+  // completed form before reporting acceptance; never return its actual value.
+  const accepted = [...new Set(filled)].filter(field => {
+    if (!['given_name','family_name'].includes(field)) return true;
+    const matches = mapped.filter(m => m.field === field).every(m => {
+      const e = binding.refs[m.index];
+      return e?.isConnected && normalize(e.value) === normalize(values[field]);
+    });
+    if (!matches) skipped.push(`${field}: field changed after filling`);
+    return matches;
+  });
+  return {filled:accepted,skipped};
 })()

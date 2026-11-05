@@ -18,6 +18,7 @@ use bloom_machine_client::{
 use bloom_proto::{AddressBook, HomeDir, HomeWritePermit};
 use bloom_tx::{outbox::Outbox, tx_engine::TxEngine};
 use bloom_vfs::{Handler, HandlerError, VfsPath, handlers::wallets::WalletsHandler};
+use parking_lot::Mutex;
 use sha2::{Digest as _, Sha256};
 
 #[path = "support/m2_exact_production_routes.rs"]
@@ -41,6 +42,7 @@ struct BrokerFixture {
     available: AtomicBool,
     complete: AtomicBool,
     lose_prepare_response_once: AtomicBool,
+    prepare_refusal_once: Mutex<Option<ProtocolErrorCode>>,
     ceremony_state_override: parking_lot::Mutex<Option<CeremonyState>>,
     requests: parking_lot::Mutex<Vec<MachineBrokerRequest>>,
     state: parking_lot::Mutex<FixtureState>,
@@ -56,7 +58,7 @@ impl BrokerFixture {
             canonical_policy: Base64UrlBytes::from_bytes(state.proposed_policy.as_ref().unwrap()),
             policy_digest: state.proposed_digest.clone().unwrap(),
             policy_signing_key_id: Token::new("policy-key").unwrap(),
-            policy_verifying_key: self.baseline.policy_verifying_key.clone(),
+            policy_verifying_key: Base64UrlBytes::from_bytes(&[4; 32]),
             signer_signature: Base64UrlBytes::from_bytes(&[5; 64]),
         }
     }
@@ -167,6 +169,14 @@ impl MachineBrokerService for BrokerFixture {
                     };
                     Ok(MachineBrokerResponse::PolicyRead(snapshot))
                 }
+                MachineBrokerRequest::PolicyValidateUpdate(_)
+                    if self.prepare_refusal_once.lock().is_some() =>
+                {
+                    Err(ProtocolError::new(
+                        self.prepare_refusal_once.lock().take().unwrap(),
+                        "another ceremony is open for this wallet",
+                    ))
+                }
                 MachineBrokerRequest::PolicyValidateUpdate(request) => {
                     self.state.lock().operation_id = Some(request.operation_id.clone());
                     self.state.lock().proposed_policy =
@@ -271,6 +281,7 @@ impl MachineBrokerService for BrokerFixture {
 
 fn policy(maximum_approval_lifetime_ms: u64) -> CanonicalWalletPolicy {
     CanonicalWalletPolicy {
+        clear_signing: None,
         wallet_id: Token::new("alice").unwrap(),
         maximum_approval_lifetime_ms,
         allowed_petal_packages: Vec::new(),
@@ -282,7 +293,6 @@ fn policy(maximum_approval_lifetime_ms: u64) -> CanonicalWalletPolicy {
             verifier_id: Token::new("human").unwrap(),
             verifier_digest: Digest32::from_bytes([4; 32]),
         }],
-        clear_signing: None,
     }
 }
 
@@ -292,6 +302,7 @@ fn broker_fixture(lose_prepare_response_once: bool) -> Arc<BrokerFixture> {
         available: AtomicBool::new(true),
         complete: AtomicBool::new(false),
         lose_prepare_response_once: AtomicBool::new(lose_prepare_response_once),
+        prepare_refusal_once: Mutex::new(None),
         ceremony_state_override: parking_lot::Mutex::new(None),
         requests: parking_lot::Mutex::new(Vec::new()),
         state: parking_lot::Mutex::new(FixtureState {
@@ -489,6 +500,70 @@ async fn vfs_policy_prepare_response_loss_reconciles_the_persisted_operation_id(
     ));
 }
 
+/// A rate-limited prepare opened no ceremony, so nothing may stay pending:
+/// a pending row with no ceremony could not be cancelled and would block
+/// every later policy write.
+#[tokio::test]
+async fn vfs_policy_rate_limited_prepare_leaves_nothing_pending() {
+    for code in [
+        ProtocolErrorCode::CeremonyRateLimited,
+        ProtocolErrorCode::QuotaExceeded,
+        ProtocolErrorCode::PolicyBaselineStale,
+    ] {
+        check_policy_prepare_refusal(code).await;
+    }
+}
+
+async fn check_policy_prepare_refusal(code: ProtocolErrorCode) {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(false);
+    *fixture.prepare_refusal_once.lock() = Some(code);
+    let service: Arc<dyn MachineBrokerService> = fixture.clone();
+    let home = HomeDir::at(temp.path().join("home"));
+    let handler = WalletsHandler::new(
+        bloom_evm::ChainRegistry::default(),
+        TxEngine::new(Outbox::new(temp.path().join("outbox")).unwrap(), 60_000),
+        AddressBook::default(),
+        projection_reader(
+            temp.path().join("cache/rate-limit-wallets.json"),
+            Some(MachineBrokerClient::new(service.clone())),
+        ),
+        temp.path().join("machine-policy-projections"),
+    )
+    .with_broker(Some(MachineBrokerClient::new(service)))
+    .with_home_write_permit(Arc::new(HomeWritePermit::acquire(&home).unwrap()));
+    let write_path = VfsPath::parse("alice/policy.json").unwrap();
+    let proposed = serde_json::to_vec_pretty(&policy(120_000)).unwrap();
+    let updates = temp
+        .path()
+        .join("machine-policy-projections/alice/policy-updates");
+
+    let refused = handler.write(&write_path, &proposed).await.unwrap_err();
+    assert!(matches!(refused, HandlerError::Backend(_)), "{refused:?}");
+    assert_eq!(
+        std::fs::read_dir(updates.join("pending")).unwrap().count(),
+        0
+    );
+    assert_eq!(
+        std::fs::read_dir(updates.join("failed")).unwrap().count(),
+        1
+    );
+
+    if code == ProtocolErrorCode::QuotaExceeded {
+        // Respect the client's 250ms quota backoff before retrying.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+
+    assert!(matches!(
+        handler.write(&write_path, &proposed).await,
+        Err(HandlerError::PermissionDenied)
+    ));
+    assert_eq!(
+        std::fs::read_dir(updates.join("pending")).unwrap().count(),
+        1
+    );
+}
+
 #[tokio::test]
 async fn vfs_policy_write_of_the_current_policy_stages_nothing() {
     let temp = tempfile::tempdir().unwrap();
@@ -627,6 +702,38 @@ async fn vfs_policy_write_prepares_then_commits_only_with_completed_custody_rece
         .unwrap();
     assert_eq!(current, serde_jcs::to_vec(&policy(120_000)).unwrap());
 
+    // `latest` names only a pending update, so it is gone after the commit.
+    // The walkthrough in docs/examples.md must read a status that exists.
+    assert!(matches!(
+        restarted
+            .read(&VfsPath::parse("alice/policy-updates/latest/status.json").unwrap())
+            .await,
+        Err(HandlerError::NotFound(_))
+    ));
+    let examples = include_str!("../src/docs/examples.md");
+    let walkthrough = examples
+        .split_once("## Updating wallet policy")
+        .and_then(|(_, rest)| rest.split("```sh").nth(2))
+        .and_then(|block| block.split_once("```"))
+        .map(|(block, _)| block)
+        .expect("examples.md has a post-commit policy block");
+    let documented: Vec<_> = walkthrough
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("cat \"$BLOOM/wallets/"))
+        .filter_map(|path| path.split('"').next())
+        .filter(|path| path.contains("/policy-updates/"))
+        .map(|path| path.replace("<action_id>", operation_id.as_str()))
+        .collect();
+    assert!(!documented.is_empty(), "{walkthrough}");
+    for path in documented {
+        let status = restarted
+            .read(&VfsPath::parse(&path).unwrap())
+            .await
+            .unwrap_or_else(|error| panic!("documented {path}: {error:?}"));
+        let status: serde_json::Value = serde_json::from_slice(&status).unwrap();
+        assert_eq!(status["status"], "confirmed", "{path}");
+    }
+
     let requests = fixture.requests.lock();
     assert!(matches!(
         requests.as_slice(),
@@ -645,42 +752,6 @@ async fn vfs_policy_write_prepares_then_commits_only_with_completed_custody_rece
             MachineBrokerRequest::WalletAccounts(_)
         ]
     ));
-}
-
-#[tokio::test]
-async fn committed_policy_is_visible_before_the_projection_cache_expires() {
-    let temp = tempfile::tempdir().unwrap();
-    let fixture = broker_fixture(false);
-    let broker = MachineBrokerClient::new(fixture.clone());
-    let projections = Arc::new(
-        CachedWalletProjectionReader::new(
-            Some(broker.clone()),
-            FileProjectionStore::new(temp.path().join("wallets.json")),
-        )
-        .unwrap()
-        .with_max_age(std::time::Duration::from_secs(60)),
-    );
-    let home = HomeDir::at(temp.path().join("home"));
-    let handler = WalletsHandler::new(
-        bloom_evm::ChainRegistry::default(),
-        TxEngine::new(Outbox::new(temp.path().join("outbox")).unwrap(), 60_000),
-        AddressBook::default(),
-        projections,
-        temp.path().join("policy-updates"),
-    )
-    .with_broker(Some(broker))
-    .with_home_write_permit(Arc::new(HomeWritePermit::acquire(&home).unwrap()));
-    let path = VfsPath::parse("alice/policy.json").unwrap();
-    let before = handler.read(&path).await.unwrap();
-    let proposed = serde_jcs::to_vec(&policy(120_000)).unwrap();
-    assert_ne!(before, proposed);
-    assert!(matches!(
-        handler.write(&path, &proposed).await,
-        Err(HandlerError::PermissionDenied)
-    ));
-    fixture.complete.store(true, Ordering::SeqCst);
-    handler.write(&path, &proposed).await.unwrap();
-    assert_eq!(handler.read(&path).await.unwrap(), proposed);
 }
 
 #[tokio::test]

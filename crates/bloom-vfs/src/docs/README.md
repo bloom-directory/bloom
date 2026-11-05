@@ -63,6 +63,7 @@ Representative paths, relative to the mount:
 | ENS / price | `ens/<name>/address`, `prices/spot/eth.usd` |
 | Wallet identity | `wallets/<wallet>/{kind,projection.json,accounts.json}` |
 | Account keys | `wallets/<wallet>/<n>/{account.json,address.evm,address.sol,public_key}` |
+| Account funds on every chain | `wallets/<wallet>/<n>/holdings.json` |
 | Solana account | `wallets/<wallet>/<n>/chains/<solana-chain>/{address,balance,balance.raw,balance.json}` |
 | Solana status | `status/chains/<chain>/{status.json,slot,block_height}` |
 
@@ -109,8 +110,9 @@ with only the wallet name at `wallets/recover`, then inspect
 `wallets/recoveries/<petname>/status.json`.
 
 For a transaction requiring fresh approval, inspect the same action's
-`approval_challenge.json`, verify its identity and expiry, and retry its exact
-`retry_path` once its live `state` is `active`. Read the resulting state and
+`approval_challenge.json`, verify its identity and expiry, and write its exact
+`retry_body` (`confirm` when omitted) to its `retry_path` once its live `state`
+is `active`. Read the resulting state and
 receipt before reporting success; never restage merely because a pending path
 disappeared.
 

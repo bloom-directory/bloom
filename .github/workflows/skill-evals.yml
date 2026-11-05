@@ -1,0 +1,40 @@
+name: Skill evals
+
+on:
+  pull_request:
+    paths: &skill_paths
+      - ".github/workflows/skill-evals.yml"
+      - "skills/**"
+      - "evals/skills/**"
+  push:
+    branches:
+      - master
+    paths: *skill_paths
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: skill-evals-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    name: skill-evals-check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: evals/skills
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: evals/skills/package-lock.json
+      - name: Install Promptfoo
+        run: npm ci --no-audit --no-fund
+      # Grader fixtures and config validation only; no model calls.
+      - name: Check onboarding grader and configs
+        run: npm run check

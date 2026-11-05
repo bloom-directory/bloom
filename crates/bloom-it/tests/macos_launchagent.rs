@@ -194,7 +194,7 @@ fn legacy_monitor_preserves_session_lifecycle_without_claiming_network_containme
     assert!(monitor.contains("status.json"));
     assert!(monitor.contains("restart_services_for_live_session"));
     assert!(monitor.contains("if enrollment_state == \"active\""));
-    assert!(monitor.contains("gui/{login_uid}/com.bloom.session"));
+    assert!(monitor.contains("user/{login_uid}/com.bloom.session"));
     assert!(monitor.contains("session.sock"));
     assert!(monitor.contains("metadata.file_type().is_socket()"));
     assert!(monitor.contains("system/com.bloom.{service}.{login_uid}"));
@@ -204,10 +204,13 @@ fn legacy_monitor_preserves_session_lifecycle_without_claiming_network_containme
     assert_ordered(
         &monitor,
         &[
-            "gui/{login_uid}/com.bloom.session",
-            "state = running",
+            "fn restart_services_for_live_session",
+            "prepare_login_sentinel(",
             "session.sock",
             "[\"signer\", \"broker\", \"checkout\"]",
+            "fn prepare_login_sentinel",
+            "user/{login_uid}/com.bloom.session",
+            "state = running",
         ],
     );
 
@@ -307,16 +310,6 @@ fn macos_installer_manages_the_path_entry_and_migrates_legacy_cli_post_activatio
         ],
     );
     assert!(!source.contains("rm -rf -- \"$login_home/.local"));
-}
-
-#[test]
-#[cfg(target_os = "macos")]
-fn staged_macos_installer_cli_lifecycle_passes() {
-    let status = Command::new("bash")
-        .arg(workspace().join("tests/packaging/macos-installer-staged.sh"))
-        .status()
-        .expect("run staged macOS installer CLI lifecycle");
-    assert!(status.success());
 }
 
 #[test]
@@ -464,6 +457,23 @@ fn macos_conformance_workflows_consume_unified_candidates() {
     let ci = fs::read_to_string(workspace().join(".github/workflows/ci.yml")).unwrap();
     assert!(ci.contains(&format!("broker_ref: {broker_commit}")));
     assert!(ci.contains(&format!("signer_ref: {signer_commit}")));
+
+    // These assertions read both conformance workflows, so editing either
+    // must trigger CI, which runs this binary on Linux. The Unix-principal
+    // workflow runs the packaging scripts directly.
+    let code_paths = ci.split("- \"Cargo.toml\"").next().unwrap();
+    assert!(code_paths.contains("- \".github/workflows/macos-unix-conformance.yml\""));
+    assert!(code_paths.contains("- \".github/workflows/macos-two-login-conformance.yml\""));
+    assert!(ci.contains("-E 'package(bloom-it) and binary(macos_launchagent)'"));
+    let unix = fs::read_to_string(workspace().join(".github/workflows/macos-unix-conformance.yml"))
+        .unwrap();
+    for script in [
+        "macos-installer-staged.sh",
+        "macos-pf-retirement.sh",
+        "macos-upgrade-rollback.sh",
+    ] {
+        assert!(unix.contains(&format!("bash bloom/tests/packaging/{script}")));
+    }
 }
 
 #[test]
@@ -504,7 +514,15 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     assert!(source.contains("task-access-probe"));
     assert!(source.contains("Machine login sampled"));
     assert!(source.contains("session sentinel did not reject an unauthorized login-UID peer"));
-    assert!(source.contains("services did not drain after the login-session sentinel disappeared"));
+    assert!(source.contains("source \"$conformance_dir/logout-drain.sh\""));
+    assert!(source.contains(
+        "wait_for_logout_services \"$broker_uid\" \"$signer_uid\" \"$broker_label\" \"$signer_label\""
+    ));
+    let logout_drain = fs::read_to_string(
+        workspace().join("tests/conformance/macos-unix-principals/logout-drain.sh"),
+    )
+    .unwrap();
+    assert!(logout_drain.contains("services did not exit successfully after login-session logout"));
     assert!(
         source.contains(
             "Broker retained the ceremony listener on $ceremony_host after session logout"
@@ -725,10 +743,12 @@ fn macos_checkout_logs_uses_a_per_login_port_and_cleans_up_its_accounts() {
         fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
     let linux =
         fs::read_to_string(workspace().join("packaging/triad/release/install-linux.sh")).unwrap();
-    // Both platforms derive the same port from the login UID.
-    let derivation = "$((10000 + login_uid % 8000))";
-    assert!(installer.contains(&format!("checkout_view_port=\"{derivation}\"")));
-    assert!(linux.contains("$((10000 + uid % 8000))"));
+    // Both platforms start from the login UID's slot and skip ports another
+    // login records or something already listens on.
+    assert!(installer.contains("port=$((10000 + (login_uid + offset) % 8000))"));
+    assert!(installer.contains("lsof -nP -iTCP:\"$port\" -sTCP:LISTEN"));
+    assert!(installer.contains("checkout_view_port=\"$(checkout_view_port)\""));
+    assert!(linux.contains("port=$((10000 + (uid + offset) % 8000))"));
     assert!(installer.contains("-e \"s|@BLOOM_CHECKOUT_VIEW_PORT@|$checkout_view_port|g\""));
     assert!(installer.contains("checkout_log=\"$log_root/checkout.log\""));
     assert!(installer.contains("-e \"s|@BLOOM_CHECKOUT_LOG@|$checkout_log|g\""));

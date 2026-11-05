@@ -3,7 +3,7 @@
 //! replacement / cancel txs and a legacy (non-1559) build path.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope, TxLegacy};
@@ -48,9 +48,9 @@ sol! {
     }
 }
 use bloom_broker_api::{
-    ApprovalLifecycleState, CryptoSuite, DecimalU64, Digest32, OperationId, OperationState,
-    ProtocolErrorCode, ProvenanceCatalog, ProvenanceRecord, ProvenanceSubject, RequestNonce,
-    SigningResult, Token,
+    ApprovalLifecycleState, CryptoSuite, DecimalU64, Digest32, DurableEffect, OperationId,
+    OperationState, ProtocolErrorCode, ProvenanceCatalog, ProvenanceRecord, ProvenanceSubject,
+    RequestNonce, RetryClass, SigningResult, Token,
 };
 use bloom_proto::plan::ExecutionOrigin;
 use bloom_proto::{
@@ -62,7 +62,7 @@ use fs2::FileExt as _;
 use parking_lot::RwLock;
 use sha2::Digest as _;
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::bump_scanner::MempoolIndexes;
 use crate::intent_parser::ParseError;
@@ -418,10 +418,15 @@ fn classify_action_kind(
 /// Inner lock: `tokio` async mutex (held for the stage critical section).
 type NonceLocks =
     Arc<parking_lot::Mutex<HashMap<(String, String, Address), Arc<tokio::sync::Mutex<()>>>>>;
+type SigningLocks =
+    Arc<parking_lot::Mutex<HashMap<std::path::PathBuf, Arc<tokio::sync::Mutex<()>>>>>;
 
-const TRIAD_SIGNING_STATE_FILE: &str = "ceremony.json";
-const TRIAD_BATCH_STATE_DIR: &str = ".batch-signing";
-const TRIAD_BATCH_STATE_FILE: &str = "ceremony.json";
+type EntryLocks =
+    Arc<parking_lot::Mutex<HashMap<(String, String, String), Weak<tokio::sync::Mutex<()>>>>>;
+
+const TRIAD_SIGNING_STATE_FILE: &str = crate::outbox::SIGNING_STATE_FILE;
+const TRIAD_BATCH_STATE_DIR: &str = crate::outbox::BATCH_SIGNING_STATE_DIR;
+const TRIAD_BATCH_STATE_FILE: &str = crate::outbox::SIGNING_STATE_FILE;
 const TRIAD_EXACT_APPROVAL_TTL_MS: u64 = 10 * 60 * 1_000;
 
 #[derive(Clone)]
@@ -511,6 +516,10 @@ pub struct TxEngine {
     /// microseconds only (HashMap lookup/insert); the inner
     /// `tokio::sync::Mutex` is the actual per-sender stage lock.
     nonce_locks: NonceLocks,
+    entry_locks: EntryLocks,
+    /// Per-entry async mutex held for a whole single-entry signing call, so
+    /// a concurrent confirm cannot overwrite a dispatch marker it never saw.
+    signing_locks: SigningLocks,
     triad_signing: Option<Arc<TriadSigningService>>,
 }
 
@@ -525,6 +534,8 @@ impl TxEngine {
             mempool_indexes: Arc::new(RwLock::new(BTreeMap::new())),
             private_rpcs: Arc::new(RwLock::new(BTreeMap::new())),
             nonce_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            entry_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            signing_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             triad_signing: None,
         }
     }
@@ -573,6 +584,115 @@ impl TxEngine {
             .entry(key)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    fn entry_lock_for(&self, wallet: &str, chain: &str, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let key = (wallet.into(), chain.into(), id.into());
+        let mut locks = self.entry_locks.lock();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
+    }
+
+    /// Take the outbox lifecycle lock to record a signing dispatch for these
+    /// `(chain, id)` entries, refusing if the expiry sweep or a discard has
+    /// already moved one to failed/, or a pending one has expired: new signing
+    /// never starts after expiry. The sweep and discards make their final
+    /// check under the same lock, so either they see the dispatch marker or
+    /// signing sees their move.
+    async fn lock_signing_dispatch(
+        &self,
+        wallet: &str,
+        expected: &[&StagedTx],
+    ) -> Result<crate::outbox::LifecycleLock, TxEngineError> {
+        let lock = self.off_worker(|outbox| outbox.lock_lifecycle()).await??;
+        let now = now_ms();
+        for expected in expected {
+            let id = &expected.id;
+            let retired = || {
+                TxEngineError::ApprovalState(format!(
+                    "transaction '{id}' was expired, discarded, or restaged before signing; nothing was signed"
+                ))
+            };
+            let entry = match self.outbox.read(wallet, &expected.chain, id) {
+                Ok(entry) => entry,
+                Err(OutboxError::NotFound(_)) => return Err(retired()),
+                Err(error) => return Err(error.into()),
+            };
+            let staged = &entry.staged;
+            // Deployment ids are deterministic, so a discarded deployment can
+            // be restaged under the same id with different gas or fees. Sign
+            // only the exact row this confirm read, never its replacement.
+            if entry.state == OutboxState::Failed
+                || serde_json::to_value(staged).ok() != serde_json::to_value(expected).ok()
+            {
+                return Err(retired());
+            }
+            if entry.state == OutboxState::Pending
+                && staged.expires_ms != 0
+                && now >= staged.expires_ms
+            {
+                return Err(TxEngineError::Outbox(OutboxError::StagedExpired {
+                    id: staged.id.clone(),
+                    expired_at: staged.expires_ms,
+                    now,
+                }));
+            }
+        }
+        Ok(lock)
+    }
+
+    /// Run outbox work that may wait for the lifecycle file lock on a
+    /// blocking thread. Waiting on an async worker could stall the task that
+    /// holds the lock and must run on that worker to release it.
+    async fn off_worker<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&Outbox) -> T + Send + 'static,
+    ) -> Result<T, TxEngineError> {
+        let outbox = self.outbox.clone();
+        tokio::task::spawn_blocking(move || work(&outbox))
+            .await
+            .map_err(|error| {
+                TxEngineError::ApprovalState(format!("join outbox lifecycle work: {error}"))
+            })
+    }
+
+    /// Discard a pending entry only if it is provably unsigned (see
+    /// [`Outbox::possibly_signed`]); a possibly signed entry is kept. Refused
+    /// while another operation on the entry is in progress.
+    pub async fn discard_unsigned(
+        &self,
+        permit: &HomeWritePermit,
+        wallet: &str,
+        chain: &str,
+        id: &str,
+    ) -> Result<(), TxEngineError> {
+        self.assert_write_permit(permit)?;
+        let _entry_guard = self
+            .entry_lock_for(wallet, chain, id)
+            .try_lock_owned()
+            .map_err(|_| {
+                TxEngineError::ApprovalState(
+                    "transaction operation in progress; retry after it completes".into(),
+                )
+            })?;
+        Ok(self.outbox_cancel(wallet, chain, id).await??)
+    }
+
+    /// [`Outbox::cancel`] off the async worker (see [`Self::off_worker`]).
+    async fn outbox_cancel(
+        &self,
+        wallet: &str,
+        chain: &str,
+        id: &str,
+    ) -> Result<Result<(), OutboxError>, TxEngineError> {
+        let (wallet, chain, id) = (wallet.to_owned(), chain.to_owned(), id.to_owned());
+        self.off_worker(move |outbox| outbox.cancel(&wallet, &chain, &id))
+            .await
     }
 
     fn assert_write_permit(&self, permit: &HomeWritePermit) -> Result<(), TxEngineError> {
@@ -781,7 +901,8 @@ impl TxEngine {
             return Ok((addr, upper));
         }
         Err(TxEngineError::Token(format!(
-            "unknown token '{token}' on chain id {chain_id}"
+            "unknown token '{token}' on chain id {chain_id}: pass its 0x address \
+             (tokens/known.json lists the tokens Bloom knows by symbol)"
         )))
     }
 
@@ -819,9 +940,7 @@ impl TxEngine {
 
     /// Resolve a parsed intent body into the on-wire fields a staged tx
     /// needs: destination, value, calldata, and optional ERC-20 metadata
-    /// for plan rendering. Shared by [`Self::stage`] and
-    /// [`Self::replace_with_intent`] so the calldata-substitution path is
-    /// guaranteed to encode identically to the original stage.
+    /// for plan rendering.
     async fn resolve_intent_body(
         &self,
         body: &RawIntentBody,
@@ -848,6 +967,34 @@ impl TxEngine {
                 data,
             } => {
                 let to_addr = self.resolve_recipient_async(to, address_book).await?;
+                let spec = chain.spec();
+                // The chain's own native symbol (POL, BNB, AVAX, ...) is a
+                // native send, not an ERC-20 lookup.
+                if token
+                    .as_deref()
+                    .is_some_and(|t| t.trim().eq_ignore_ascii_case(&spec.native_symbol))
+                {
+                    if !matches!(value.trim(), "" | "0") {
+                        return Err(TxEngineError::Amount(
+                            "native sends take one amount; value and amount were both set".into(),
+                        ));
+                    }
+                    let v = parse_units(amount.trim(), spec.native_decimals)
+                        .map_err(|e| TxEngineError::Amount(e.to_string()))?;
+                    let data = data.clone().unwrap_or_else(|| "0x".into());
+                    return Ok((Some(to_addr), v, data, None, None));
+                }
+                // "eth"/"ether" name an asset. On a chain whose native token is
+                // something else, sending it would move a different asset.
+                if token.is_none() && !spec.native_symbol.eq_ignore_ascii_case("ETH") {
+                    let unit = parse_amount(value).map(|p| p.unit).unwrap_or_default();
+                    if unit == "eth" || unit == "ether" {
+                        return Err(TxEngineError::Amount(format!(
+                            "{} pays in {}, not ETH; write the amount in {}",
+                            spec.name, spec.native_symbol, spec.native_symbol
+                        )));
+                    }
+                }
                 if let Some(v) = Self::resolve_native_value(value, token)? {
                     if !amount.trim().is_empty() {
                         return Err(TxEngineError::Amount(
@@ -1237,10 +1384,6 @@ impl TxEngine {
                 nonce: request.nonce,
                 gas_limit_hint: request.gas,
                 usd_value_hint: None,
-                // Contract creation carries initcode, not a call to an
-                // existing described contract, so it keeps the exact
-                // envelope review either way.
-                review_mode: request.review_mode.clone(),
             },
             &selected_chain,
             policy,
@@ -1365,10 +1508,6 @@ impl TxEngine {
                 .validate()
                 .map_err(TxEngineError::ApprovalConstruction)?;
         }
-        // Reject an unknown review mode before reserving a nonce or writing
-        // a pending entry; signing-time validation would otherwise fail the
-        // row only after staging side effects.
-        check_review_mode(intent.review_mode.as_deref())?;
         // Only creation lacks a recipient. A deployment grant must leave
         // sends, calls, spenders and operators under the ordinary allowlist.
         let mut creation_policy;
@@ -1400,6 +1539,15 @@ impl TxEngine {
         ) = self
             .resolve_intent_body(&intent.body, chain, chain_id, address_book, from)
             .await?;
+        // Every send, call, raw, and deploy intent passes here. On a chain
+        // without a native token, a nonzero value names an asset that does
+        // not exist (Tempo's config still carries a display symbol).
+        if !spec.has_native_asset() && !value_wei.is_zero() {
+            return Err(TxEngineError::Amount(format!(
+                "{} has no native token; send a token with token and amount, and set no value",
+                spec.name
+            )));
+        }
 
         // Build a request to estimate gas; choose 1559 vs legacy fields.
         let data_bytes = decode_data(&data_hex)?;
@@ -1460,7 +1608,9 @@ impl TxEngine {
         // reported it as a reservation and refused a deployment that the very
         // next statement would have freed.
         let now_ms = now_ms();
-        let swept = self.outbox.sweep_expired(now_ms)?;
+        let swept = self
+            .off_worker(move |outbox| outbox.sweep_expired(now_ms))
+            .await??;
         if swept > 0 {
             tracing::info!(
                 wallet,
@@ -1549,10 +1699,13 @@ impl TxEngine {
         let gas_price = deployment
             .and_then(|(_, tx)| tx.gas_price)
             .unwrap_or(gas_price);
-        let (max_fee, prio) = fee_overrides.map_or_else(
-            || (gas_price.saturating_mul(2), (gas_price / 10).max(1)),
-            |fees| (fees.max_fee_per_gas, fees.max_priority_fee_per_gas),
-        );
+        let (max_fee, prio) = if let Some(fees) = fee_overrides {
+            (fees.max_fee_per_gas, fees.max_priority_fee_per_gas)
+        } else if spec.legacy_tx {
+            (gas_price, 0)
+        } else {
+            chain.eip1559_fees(gas_price).await
+        };
 
         let mut req = TransactionRequest::default()
             .with_from(from)
@@ -1608,7 +1761,12 @@ impl TxEngine {
         } else {
             (Some(max_fee.to_string()), Some(prio.to_string()), None)
         };
-        let funding_check = match session.balance(from).await {
+        // A chain without a native token answers with a placeholder, not a balance.
+        let balance = match spec.has_native_asset() {
+            true => session.balance(from).await.map_err(|e| e.to_string()),
+            false => Err(bloom_evm::no_native_asset(spec).to_string()),
+        };
+        let funding_check = match balance {
             Ok(available) => insufficient_native_funds_check(
                 &bloom_proto::checksum_address(&from),
                 spec.display_name.as_deref().unwrap_or(&spec.name),
@@ -1916,10 +2074,6 @@ impl TxEngine {
             },
             status: TxStatus::Pending,
             action_kind,
-            // The owner's choice is recorded with the immutable row, so the
-            // mode at signing is the one staging was reviewed under and not
-            // whatever a later caller asks for.
-            review_mode: intent.review_mode.clone(),
             tx_hash: None,
             token: token_for_plan,
             nft: nft_for_plan,
@@ -1971,10 +2125,15 @@ impl TxEngine {
         override_warnings: bool,
     ) -> Result<(), TxEngineError> {
         self.assert_write_permit(permit)?;
+        let _entry_guard = self
+            .entry_lock_for(wallet, chain_name, id)
+            .lock_owned()
+            .await;
         let entry = self
             .outbox
             .read_in_state(wallet, chain_name, id, OutboxState::Pending)?;
-        let mut staged = entry.staged.clone();
+        self.require_no_cancellation(&entry)?;
+        let staged = entry.staged.clone();
 
         if self
             .outbox
@@ -1985,7 +2144,12 @@ impl TxEngine {
         }
 
         let now = now_ms();
-        if staged.expires_ms != 0 && now >= staged.expires_ms {
+        if staged.expires_ms != 0
+            && now >= staged.expires_ms
+            && !self
+                .outbox
+                .possibly_signed(&entry, &self.outbox.batch_index())
+        {
             return Err(TxEngineError::Outbox(OutboxError::StagedExpired {
                 id: staged.id.clone(),
                 expired_at: staged.expires_ms,
@@ -1999,9 +2163,10 @@ impl TxEngine {
 
         let hard = policy_engine::has_hard_violation(&staged.policy_checks);
         if hard {
-            staged.status = TxStatus::Failed;
-            self.outbox
-                .transition(&entry, crate::outbox::OutboxState::Failed)?;
+            // The denial stands even if recording it fails.
+            if let Err(e) = self.outbox.transition_with_status(&entry, TxStatus::Failed) {
+                warn!(id = %staged.id, error = %e, "tx.policy_denied_record_failed");
+            }
             debug!(
                 id = %staged.id,
                 wallet,
@@ -2104,6 +2269,13 @@ impl TxEngine {
                 )));
             }
         }
+        // A deterministic order prevents deadlocks between overlapping batches.
+        let mut refs = unique.into_iter().collect::<Vec<_>>();
+        refs.sort();
+        let mut entry_guards = Vec::with_capacity(refs.len());
+        for (chain, id) in refs {
+            entry_guards.push(self.entry_lock_for(wallet, &chain, &id).lock_owned().await);
+        }
         let parent_state_path =
             batch_signing_state_path(self.outbox.root(), wallet, &ordered_refs)?;
         // The batch projection is the recovery authority for approval, signing,
@@ -2116,10 +2288,12 @@ impl TxEngine {
         let mut entries = Vec::with_capacity(targets.len());
         let mut prepared = Vec::with_capacity(targets.len());
         let mut already_attempted = Vec::with_capacity(targets.len());
+        let batches = self.outbox.batch_index();
         let now = now_ms();
         for target in &targets {
             let policy = &target.policy;
             let entry = self.outbox.read(wallet, &target.chain_name, &target.id)?;
+            self.require_no_cancellation(&entry)?;
             if entry.staged.wallet != wallet
                 || entry.staged.chain != target.chain_name
                 || entry.staged.id != target.id
@@ -2144,7 +2318,11 @@ impl TxEngine {
             };
             if entry.state == OutboxState::Pending && attempt.is_none() {
                 let staged = &entry.staged;
-                if staged.expires_ms != 0 && now >= staged.expires_ms {
+                // A dispatched batch may still reconcile after expiry.
+                if staged.expires_ms != 0
+                    && now >= staged.expires_ms
+                    && !self.outbox.possibly_signed(&entry, &batches)
+                {
                     return Err(TxEngineError::Outbox(OutboxError::StagedExpired {
                         id: staged.id.clone(),
                         expired_at: staged.expires_ms,
@@ -2303,8 +2481,15 @@ impl TxEngine {
             }
             if let Some(attempt) = already_attempted[index].clone() {
                 transactions.push(
-                    self.reconcile_confirm_attempt(entry, attempt, &target.chain, policy)
-                        .await?,
+                    self.reconcile_attempt(
+                        entry,
+                        EvmOutboxActionKind::Confirm,
+                        entry.staged.clone(),
+                        attempt,
+                        &target.chain,
+                        policy,
+                    )
+                    .await?,
                 );
                 continue;
             }
@@ -2335,7 +2520,13 @@ impl TxEngine {
                 .write_broadcast_attempt(entry, BroadcastAttemptKind::Confirm, &attempt)?;
             self.submit_signed_raw(&entry.staged, &target.chain, policy, child)
                 .await?;
-            transactions.push(self.finalize_sent(entry, child.hash, &target.chain)?);
+            transactions.push(self.finalize_sent(
+                entry,
+                entry.staged.clone(),
+                child.hash,
+                EvmOutboxActionKind::Confirm,
+                &target.chain,
+            )?);
         }
 
         Ok(ConfirmBatchResult {
@@ -2361,9 +2552,14 @@ impl TxEngine {
         override_warnings: bool,
     ) -> Result<StagedTx, TxEngineError> {
         self.assert_write_permit(permit)?;
+        let _entry_guard = self
+            .entry_lock_for(wallet, chain_name, id)
+            .lock_owned()
+            .await;
         let entry = self
             .outbox
             .read_in_state(wallet, chain_name, id, OutboxState::Pending)?;
+        self.require_no_cancellation(&entry)?;
         let mut staged = entry.staged.clone();
 
         if let Some(attempt) = self
@@ -2371,15 +2567,28 @@ impl TxEngine {
             .read_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm)?
         {
             return self
-                .reconcile_confirm_attempt(&entry, attempt, chain, policy)
+                .reconcile_attempt(
+                    &entry,
+                    EvmOutboxActionKind::Confirm,
+                    entry.staged.clone(),
+                    attempt,
+                    chain,
+                    policy,
+                )
                 .await;
         }
 
         // Expiry check: stage TTL is enforced regardless of whether the
-        // sweeper has run yet. We use wall-clock here; sweep_expired is the
-        // background mop-up that removes stale dirs.
+        // sweeper has run yet. A possibly signed entry may still reconcile
+        // its recorded signing operation; signing refuses to start anything
+        // new after expiry (`lock_signing_dispatch`, `new_state`).
         let now = now_ms();
-        if staged.expires_ms != 0 && now >= staged.expires_ms {
+        if staged.expires_ms != 0
+            && now >= staged.expires_ms
+            && !self
+                .outbox
+                .possibly_signed(&entry, &self.outbox.batch_index())
+        {
             return Err(TxEngineError::Outbox(OutboxError::StagedExpired {
                 id: staged.id.clone(),
                 expired_at: staged.expires_ms,
@@ -2398,9 +2607,10 @@ impl TxEngine {
         // Policy gate.
         let hard = policy_engine::has_hard_violation(&staged.policy_checks);
         if hard {
-            staged.status = TxStatus::Failed;
-            self.outbox
-                .transition(&entry, crate::outbox::OutboxState::Failed)?;
+            // The denial stands even if recording it fails.
+            if let Err(e) = self.outbox.transition_with_status(&entry, TxStatus::Failed) {
+                warn!(id = %staged.id, error = %e, "tx.policy_denied_record_failed");
+            }
             debug!(
                 id = %staged.id,
                 wallet,
@@ -2459,11 +2669,12 @@ impl TxEngine {
         {
             Ok(h) => h,
             Err(e @ TxEngineError::ApprovalDenied(_)) => {
-                let state = read_triad_signing_state(&entry.dir.join(TRIAD_SIGNING_STATE_FILE))?;
-                if state.is_none_or(|state| !state.sign_dispatched) {
-                    // A terminal refusal before signing cannot yield a
-                    // transaction. Release the local nonce reservation.
-                    self.outbox.cancel(wallet, chain_name, id)?;
+                // A terminal refusal before signing cannot yield a
+                // transaction. Release the local nonce reservation unless
+                // the entry is possibly signed.
+                match self.outbox_cancel(wallet, chain_name, id).await? {
+                    Ok(()) | Err(OutboxError::PossiblySigned { .. }) => {}
+                    Err(error) => return Err(error.into()),
                 }
                 return Err(e);
             }
@@ -2474,19 +2685,21 @@ impl TxEngine {
         staged.status = TxStatus::Sent;
         staged.tx_hash = Some(format!("{:#x}", tx_hash));
 
-        let new_dir = self
-            .outbox
-            .transition(&entry, crate::outbox::OutboxState::Sent)?;
+        // Record the hash before leaving pending, as `finalize_sent` does. The
+        // sent scanner needs `intent.tx_hash`; a crash after the move but
+        // before this write would leave no pending retry and no sent row.
         self.outbox.write_artefact(
-            &new_dir,
+            &entry.dir,
             "intent.json",
             &serde_json::to_vec_pretty(&staged).unwrap(),
         )?;
         self.outbox.write_artefact(
-            &new_dir,
+            &entry.dir,
             "tx_hash",
             staged.tx_hash.as_ref().unwrap().as_bytes(),
         )?;
+        self.outbox
+            .transition(&entry, crate::outbox::OutboxState::Sent)?;
         if let Some(action_id) = staged.action_id.as_deref() {
             self.write_central_evm_result(EvmCentralResult {
                 action_id,
@@ -2502,19 +2715,46 @@ impl TxEngine {
         Ok(staged)
     }
 
-    async fn reconcile_confirm_attempt(
+    /// Settle a recorded broadcast attempt instead of signing again: follow it
+    /// when the chain knows it, otherwise resubmit its exact recorded bytes.
+    /// For a fee repair, `staged` is the replacement and the rejected original
+    /// is followed instead when the chain knows that one.
+    async fn reconcile_attempt(
         &self,
         entry: &crate::outbox::OutboxEntry,
+        action_kind: EvmOutboxActionKind,
+        staged: StagedTx,
         attempt: BroadcastAttempt,
         chain: &ChainClient,
         policy: &Policy,
     ) -> Result<StagedTx, TxEngineError> {
-        let tx_hash: B256 = attempt
-            .tx_hash
-            .parse()
-            .map_err(|e: alloy::hex::FromHexError| TxEngineError::Address(e.to_string()))?;
-        if chain.tx_by_hash(tx_hash).await?.is_some() || chain.receipt(tx_hash).await?.is_some() {
-            return self.finalize_sent(entry, tx_hash, chain);
+        let kind = action_kind.broadcast_kind();
+        let tx_hash = parse_tx_hash(&attempt.tx_hash)?;
+        if chain_knows_tx(chain, tx_hash).await? {
+            return self.finalize_sent(entry, staged, tx_hash, action_kind, chain);
+        }
+        let original = match action_kind {
+            EvmOutboxActionKind::Replace => self
+                .outbox
+                .read_broadcast_attempt(entry, BroadcastAttemptKind::Confirm)?,
+            _ => None,
+        };
+        if let Some(original) = &original {
+            let original_hash = parse_tx_hash(&original.tx_hash)?;
+            if chain_knows_tx(chain, original_hash).await? {
+                let original_staged = serde_json::from_slice(
+                    &std::fs::read(entry.dir.join("replacement_original.json"))
+                        .map_err(OutboxError::Io)?,
+                )
+                .map_err(OutboxError::Json)?;
+                return self.finalize_sent(
+                    entry,
+                    original_staged,
+                    original_hash,
+                    EvmOutboxActionKind::Confirm,
+                    chain,
+                );
+            }
         }
 
         let from: Address = attempt
@@ -2544,7 +2784,8 @@ impl TxEngine {
                 reason: "external pending tx already occupies this nonce".into(),
             });
         }
-        let other_attempts = self
+        // A fee repair's own rejected original was checked above.
+        let other_attempts: Vec<_> = self
             .outbox
             .broadcast_attempts_for_nonce(SameNonceAttemptQuery {
                 wallet: &entry.staged.wallet,
@@ -2553,8 +2794,15 @@ impl TxEngine {
                 chain_id: attempt.chain_id,
                 nonce: attempt.nonce,
                 excluding_id: &entry.staged.id,
-                excluding_kind: BroadcastAttemptKind::Confirm,
-            })?;
+                excluding_kind: kind,
+            })?
+            .into_iter()
+            .filter(|(id, _, other, _)| {
+                !(original.is_some()
+                    && id == &entry.staged.id
+                    && *other == BroadcastAttemptKind::Confirm)
+            })
+            .collect();
         if !other_attempts.is_empty() {
             self.write_reconcile_ambiguous(
                 entry,
@@ -2588,73 +2836,97 @@ impl TxEngine {
                         reason: "current policy changed to private routing".into(),
                     });
                 }
-                let unsigned = self.build_unsigned_evm_tx(&entry.staged, chain)?;
+                let unsigned = self.build_unsigned_evm_tx(&staged, chain)?;
                 let signing_hash = Self::unsigned_signing_hash(&unsigned);
                 self.ensure_action_authorized(
                     entry,
-                    &entry.staged,
-                    EvmOutboxActionKind::Confirm,
+                    &staged,
+                    action_kind,
                     &signing_hash,
                     policy,
                     bloom_proto::AuthorizationSurface::Cli,
                 )
                 .await?;
-                let raw = self.outbox.read_broadcast_raw_tx(
-                    entry,
-                    BroadcastAttemptKind::Confirm,
-                    &attempt,
-                )?;
-                let returned = chain.send_raw(Bytes::from(raw)).await.map_err(|e| {
-                    let _ = self
-                        .write_reconcile_ambiguous(entry, format!("public resubmit failed: {e}"));
-                    TxEngineError::Chain(e)
-                })?;
-                if returned != tx_hash {
-                    return Err(TxEngineError::BroadcastHashMismatch {
-                        expected: format!("{:#x}", tx_hash),
-                        returned: format!("{:#x}", returned),
-                    });
+                let raw = self.outbox.read_broadcast_raw_tx(entry, kind, &attempt)?;
+                match chain.send_raw(Bytes::from(raw)).await {
+                    Ok(returned) if returned != tx_hash => {
+                        return Err(TxEngineError::BroadcastHashMismatch {
+                            expected: format!("{:#x}", tx_hash),
+                            returned: format!("{:#x}", returned),
+                        });
+                    }
+                    Ok(_) => {}
+                    // The node already holds these exact signed bytes.
+                    Err(e) if e.to_string().to_ascii_lowercase().contains("already known") => {}
+                    Err(e) => {
+                        let _ = self.write_reconcile_ambiguous(
+                            entry,
+                            format!("public resubmit failed: {e}"),
+                        );
+                        return Err(TxEngineError::Chain(e));
+                    }
                 }
-                self.finalize_sent(entry, tx_hash, chain)
+                self.finalize_sent(entry, staged, tx_hash, action_kind, chain)
             }
         }
     }
 
+    /// Record an accepted attempt, then move its row to sent. The hash is
+    /// written first, so an interrupted move leaves a pending row naming its
+    /// broadcast, which the next retry reconciles instead of signing again.
     fn finalize_sent(
         &self,
         entry: &crate::outbox::OutboxEntry,
+        mut staged: StagedTx,
         tx_hash: B256,
+        action_kind: EvmOutboxActionKind,
         chain: &ChainClient,
     ) -> Result<StagedTx, TxEngineError> {
-        let mut staged = entry.staged.clone();
         staged.status = TxStatus::Sent;
         staged.tx_hash = Some(format!("{:#x}", tx_hash));
-        let new_dir = self
-            .outbox
-            .transition(entry, crate::outbox::OutboxState::Sent)?;
+        if action_kind == EvmOutboxActionKind::Replace {
+            // A fee repair moves the same row to the replacement's terms.
+            self.outbox.write_artefact(
+                &entry.dir,
+                "plan.md",
+                bloom_proto::PlanRender::render(
+                    &staged,
+                    &chain.spec().native_symbol,
+                    chain.spec().native_decimals,
+                )
+                .as_bytes(),
+            )?;
+        }
         self.outbox.write_artefact(
-            &new_dir,
+            &entry.dir,
             "intent.json",
             &serde_json::to_vec_pretty(&staged).unwrap(),
         )?;
         self.outbox.write_artefact(
-            &new_dir,
+            &entry.dir,
             "tx_hash",
             staged.tx_hash.as_ref().unwrap().as_bytes(),
         )?;
-        if let Some(action_id) = staged.action_id.as_deref() {
-            let signing_hash = self
+        self.outbox
+            .transition(entry, crate::outbox::OutboxState::Sent)?;
+        // The sent row is the record from here on: a failed central
+        // projection must not report an accepted broadcast as failed.
+        if let Some(action_id) = staged.action_id.as_deref()
+            && let Err(error) = self
                 .build_unsigned_evm_tx(&staged, chain)
-                .map(|unsigned| Self::unsigned_signing_hash(&unsigned))?;
-            self.write_central_evm_result(EvmCentralResult {
-                action_id,
-                state: OutboxState::Sent,
-                outcome: "sent",
-                tx_hash,
-                nonce: staged.nonce,
-                signing_hash: &signing_hash,
-                action_kind: EvmOutboxActionKind::Confirm.action_kind(),
-            })?;
+                .and_then(|unsigned| {
+                    self.write_central_evm_result(EvmCentralResult {
+                        action_id,
+                        state: OutboxState::Sent,
+                        outcome: "sent",
+                        tx_hash,
+                        nonce: staged.nonce,
+                        signing_hash: &Self::unsigned_signing_hash(&unsigned),
+                        action_kind: action_kind.action_kind(),
+                    })
+                })
+        {
+            warn!(id = %staged.id, %action_id, %error, "tx.central_result_unwritten");
         }
         Ok(staged)
     }
@@ -2909,55 +3181,7 @@ impl TxEngine {
                 "staged chain ID differs from the current chain profile".into(),
             ));
         }
-        let _from: Address = staged
-            .from
-            .parse()
-            .map_err(|e: alloy::hex::FromHexError| TxEngineError::Address(e.to_string()))?;
-        let destination = staged.transaction_kind().map_err(TxEngineError::Address)?;
-        let value: U256 = staged
-            .value_wei
-            .parse()
-            .map_err(|_| TxEngineError::Amount("value_wei".into()))?;
-        let data = decode_data(&staged.data_hex)?;
-
-        if staged.gas_price.is_some() {
-            let gp: u128 = staged
-                .gas_price
-                .as_deref()
-                .and_then(|s| s.parse::<u128>().ok())
-                .unwrap_or(1_000_000_000);
-            Ok(UnsignedEvmTx::Legacy(TxLegacy {
-                chain_id: Some(staged.chain_id),
-                nonce: staged.nonce,
-                gas_price: gp,
-                gas_limit: staged.gas_limit,
-                to: destination,
-                value,
-                input: data,
-            }))
-        } else {
-            let max_fee: u128 = staged
-                .max_fee_per_gas
-                .as_deref()
-                .and_then(|s| s.parse::<u128>().ok())
-                .unwrap_or(2_000_000_000);
-            let prio: u128 = staged
-                .max_priority_fee_per_gas
-                .as_deref()
-                .and_then(|s| s.parse::<u128>().ok())
-                .unwrap_or(1_000_000);
-            Ok(UnsignedEvmTx::Eip1559(TxEip1559 {
-                chain_id: staged.chain_id,
-                nonce: staged.nonce,
-                gas_limit: staged.gas_limit,
-                max_fee_per_gas: max_fee,
-                max_priority_fee_per_gas: prio,
-                to: destination,
-                value,
-                access_list: AccessList::default(),
-                input: data,
-            }))
-        }
+        unsigned_evm_tx(staged)
     }
 
     fn unsigned_signing_hash(unsigned: &UnsignedEvmTx) -> B256 {
@@ -3114,7 +3338,7 @@ impl TxEngine {
         }
         let signing_preimage = Self::unsigned_signing_preimage(&prepared.unsigned);
         let signature = self
-            .host_sign_evm_hash(
+            .triad_sign_evm_payload(
                 entry,
                 staged,
                 action_kind,
@@ -3163,7 +3387,6 @@ impl TxEngine {
         Ok(signed.hash)
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn triad_sign_evm_payload(
         &self,
         entry: &crate::outbox::OutboxEntry,
@@ -3195,6 +3418,16 @@ impl TxEngine {
             .digest()
             .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?;
         let state_path = entry.dir.join(TRIAD_SIGNING_STATE_FILE);
+        // Every step below rewrites the whole state from what it read at the
+        // start. Serialize the entry's signing so a stale copy never erases a
+        // dispatch marker that a concurrent call wrote meanwhile.
+        let signing_lock = self
+            .signing_locks
+            .lock()
+            .entry(state_path.clone())
+            .or_default()
+            .clone();
+        let _signing = signing_lock.lock().await;
         let new_state = || -> Result<TriadEvmSigningState, TxEngineError> {
             let now = now_ms() as u64;
             let expires = now.saturating_add(TRIAD_EXACT_APPROVAL_TTL_MS);
@@ -3259,8 +3492,43 @@ impl TxEngine {
                         // Confirm, replace, and cancel are distinct exact
                         // operations over one outbox entry. A completed prior
                         // operation must not authorize the next one, but its
-                        // terminal owner projection may be atomically
-                        // superseded by the next ceremony.
+                        // terminal owner projection may be superseded by the
+                        // next ceremony once its signature is recorded as a
+                        // broadcast attempt or Broker proves none exists.
+                        // Otherwise superseding would forget the only handle
+                        // on an uncollected signature.
+                        let recorded = self
+                            .outbox
+                            .read_broadcast_attempt(
+                                entry,
+                                signing_action_broadcast_kind(&state.action_id),
+                            )?
+                            .is_some();
+                        let unsigned = !recorded
+                            && match service
+                                .broker
+                                .operation_status(state.signing_operation_id.clone())
+                                .await
+                            {
+                                Ok(status) => {
+                                    status.operation_id == state.signing_operation_id
+                                        && matches!(
+                                            status.state,
+                                            OperationState::Denied
+                                                | OperationState::Cancelled
+                                                | OperationState::Failed
+                                        )
+                                }
+                                Err(error) => error.code == ProtocolErrorCode::ApprovalNotFound,
+                            };
+                        if !recorded && !unsigned {
+                            return Err(TxEngineError::ApprovalState(format!(
+                                "signing operation {} for action {} was dispatched but its signature is not recorded; {} to reconcile it before starting another",
+                                state.signing_operation_id,
+                                state.action_id,
+                                retry_instruction(&state.action_id)
+                            )));
+                        }
                         new_state()?
                     } else {
                         return Err(TxEngineError::ApprovalState(
@@ -3335,7 +3603,12 @@ impl TxEngine {
                             // produced no signature, so nothing was signed and
                             // nothing can be double-signed. Replace the dead
                             // lineage and prepare a fresh ceremony in this same
-                            // call instead of stranding the outbox entry.
+                            // call instead of stranding the outbox entry. Record
+                            // that first: after expiry no fresh lineage can be
+                            // prepared, and the entry is then provably unsigned.
+                            state.sign_dispatched = false;
+                            state.expected_operation_digest = None;
+                            write_triad_signing_state(&state_path, &state)?;
                             state = new_state()?;
                             write_triad_signing_state(&state_path, &state)?;
                         }
@@ -3343,8 +3616,8 @@ impl TxEngine {
                             state.ceremony_url = None;
                             state.ceremony_expires_at_ms = None;
                             write_triad_signing_state(&state_path, &state)?;
-                            return Err(TxEngineError::ApprovalDenied(format!(
-                                "Broker signing operation is quarantined; reconcile operation {} before confirming again",
+                            return Err(TxEngineError::ApprovalState(format!(
+                                "Broker signing operation is quarantined; a signature may exist — reconcile operation {} before confirming again",
                                 state.signing_operation_id
                             )));
                         }
@@ -3358,7 +3631,9 @@ impl TxEngine {
                     state.expected_operation_digest = None;
                     write_triad_signing_state(&state_path, &state)?;
                 }
-                Err(error) => return Err(protocol_signing_error(error)),
+                Err(error) => {
+                    return Err(unresolved_signing_error(&state.signing_operation_id, error));
+                }
             }
         }
 
@@ -3431,36 +3706,64 @@ impl TxEngine {
             .await
             .map_err(protocol_signing_error)?;
         let key = evm_signing_key(&service.broker, &wallet, &staged.from).await?;
-        let request = exact_evm_sign_request(
-            staged,
-            signing_preimage,
-            signing_hash,
-            provenance,
-            &state,
-            key.selector.clone(),
-        )?;
-        if state.approval_id.is_some() {
-            let expected_operation_digest = expected_evm_sign_operation_digest(
-                &wallet,
-                key.key_ref.clone(),
+        // At most two passes: a definite refusal replaces the lineage with one
+        // that has no approval, and that pass prepares its ceremony.
+        let mut refused = None;
+        let outcome = loop {
+            let request = exact_evm_sign_request(
+                staged,
+                signing_preimage,
+                signing_hash,
+                provenance,
                 &state,
-                state.payload_digest.clone(),
-                state.claimed_hash.clone(),
+                key.selector.clone(),
             )?;
-            // Exact signing only ever dispatches with an activated approval,
-            // and the durable dispatch marker is written first: a lost
-            // response reconciles through operation status instead of signing
-            // twice, and an absent marker proves no signature exists.
-            state.sign_dispatched = true;
-            state.expected_operation_digest = Some(expected_operation_digest);
-            write_triad_signing_state(&state_path, &state)?;
-        }
-        match service
-            .broker
-            .sign_exact_payload(request)
-            .await
-            .map_err(protocol_signing_error)?
-        {
+            if state.approval_id.is_some() {
+                let expected_operation_digest = expected_evm_sign_operation_digest(
+                    &wallet,
+                    key.key_ref.clone(),
+                    &state,
+                    state.payload_digest.clone(),
+                    state.claimed_hash.clone(),
+                )?;
+                // Exact signing only ever dispatches with an activated approval,
+                // and the durable dispatch marker is written first: a lost
+                // response reconciles through operation status instead of signing
+                // twice, and an absent marker proves no signature exists.
+                let _lifecycle = self
+                    .lock_signing_dispatch(&entry.staged.wallet, &[&entry.staged])
+                    .await?;
+                state.sign_dispatched = true;
+                state.expected_operation_digest = Some(expected_operation_digest);
+                write_triad_signing_state(&state_path, &state)?;
+            }
+            match service.broker.sign_exact_payload(request).await {
+                Ok(outcome) => break outcome,
+                // Replace a permanently refused lineage only when nothing durable
+                // remains, and hand back its fresh ceremony so every caller keeps
+                // the row. Retryable and ambiguous failures retain the lineage.
+                Err(error)
+                    if state.approval_id.is_some()
+                        && signing_refusal_releases_reservation(error.code) =>
+                {
+                    // Approval and operation IDs are immutable: clearing only
+                    // the dispatch marker would reuse the same dead request.
+                    // Record the refusal first: after expiry no fresh lineage
+                    // can be prepared, and the entry is then provably unsigned.
+                    state.sign_dispatched = false;
+                    state.expected_operation_digest = None;
+                    write_triad_signing_state(&state_path, &state)?;
+                    state = new_state()?;
+                    write_triad_signing_state(&state_path, &state)?;
+                    refused = Some(refusal_reason(&error));
+                }
+                Err(error) if state.sign_dispatched => {
+                    return Err(unresolved_signing_error(&state.signing_operation_id, error));
+                }
+                Err(error) => return Err(protocol_signing_error(error)),
+            }
+        };
+        match outcome {
             ExactPayloadSignOutcome::ApprovalRequired(prepared) => {
                 if state
                     .approval_id
@@ -3480,7 +3783,9 @@ impl TxEngine {
                 write_triad_signing_state(&state_path, &state)?;
                 Err(TxEngineError::ApprovalRequired(approval_requirement(
                     &state,
-                    "exact Broker approval ceremony required",
+                    refused
+                        .as_deref()
+                        .unwrap_or("exact Broker approval ceremony required"),
                 )?))
             }
             ExactPayloadSignOutcome::Signed(result) => {
@@ -3661,12 +3966,20 @@ impl TxEngine {
                         | OperationState::Failed => {
                             // No signature was produced, so a fresh lineage
                             // cannot double-sign; prepare a new ceremony now.
+                            state.sign_dispatched = false;
+                            state.expected_operation_digest = None;
+                            write_triad_batch_signing_state(&state_path, &state)?;
                             state = new_state()?;
                             write_triad_batch_signing_state(&state_path, &state)?;
                         }
                         OperationState::Quarantined => {
-                            return Err(TxEngineError::ApprovalDenied(format!(
-                                "Broker batch operation is quarantined; reconcile operation {} before confirming again",
+                            // A signature may exist. Keep its identity for
+                            // reconciliation, but stop offering the dead URL.
+                            state.ceremony_url = None;
+                            state.ceremony_expires_at_ms = None;
+                            write_triad_batch_signing_state(&state_path, &state)?;
+                            return Err(TxEngineError::ApprovalState(format!(
+                                "Broker batch operation is quarantined (terminal: Quarantined); a signature may exist — reconcile operation {} before confirming again",
                                 state.signing_operation_id
                             )));
                         }
@@ -3677,7 +3990,9 @@ impl TxEngine {
                     state.expected_operation_digest = None;
                     write_triad_batch_signing_state(&state_path, &state)?;
                 }
-                Err(error) => return Err(protocol_signing_error(error)),
+                Err(error) => {
+                    return Err(unresolved_signing_error(&state.signing_operation_id, error));
+                }
             }
         }
 
@@ -3757,48 +4072,67 @@ impl TxEngine {
             .await
             .map_err(protocol_signing_error)?;
         let key = evm_signing_key(&service.broker, &wallet_public, sender).await?;
-        for staged in staged_plans {
-            check_review_mode(staged.review_mode.as_deref())?;
-        }
-        let request = ExactPayloadBatchSignRequest {
-            wallet_id: Token::new(wallet.to_string())
-                .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?,
-            preimages: preimages.to_vec(),
-            claimed_hashes: ordered_hashes.clone(),
-            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
-            provenance: provenance.subject.clone(),
-            provenance_digest: state.provenance_digest.clone(),
-            activation_mode: None,
-            approval_operation_id: state.approval_operation_id.clone(),
-            signing_operation_id: state.signing_operation_id.clone(),
-            request_nonce: state.request_nonce.clone(),
-            issued_at_ms: state.issued_at_ms.clone(),
-            expires_at_ms: state.expires_at_ms.clone(),
-            canonical_plan_facts_digest: state.canonical_plan_facts_digest.clone(),
-            approval_id: state.approval_id.clone(),
-            account_key_ref: key.selector.clone(),
-            petal_use_claim: None,
-            claim_assurance_evidence: None,
+        let mut refused = None;
+        // Two passes at most, as for single payloads.
+        let outcome = loop {
+            let request = ExactPayloadBatchSignRequest {
+                message_review_payload: None,
+                wallet_id: Token::new(wallet.to_string())
+                    .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?,
+                preimages: preimages.to_vec(),
+                claimed_hashes: ordered_hashes.clone(),
+                crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+                provenance: provenance.subject.clone(),
+                provenance_digest: state.provenance_digest.clone(),
+                activation_mode: None,
+                approval_operation_id: state.approval_operation_id.clone(),
+                signing_operation_id: state.signing_operation_id.clone(),
+                request_nonce: state.request_nonce.clone(),
+                issued_at_ms: state.issued_at_ms.clone(),
+                expires_at_ms: state.expires_at_ms.clone(),
+                canonical_plan_facts_digest: state.canonical_plan_facts_digest.clone(),
+                approval_id: state.approval_id.clone(),
+                account_key_ref: key.selector.clone(),
+                petal_use_claim: None,
+                claim_assurance_evidence: None,
+            };
+            if state.approval_id.is_some() {
+                state.expected_operation_digest = Some(expected_evm_batch_sign_operation_digest(
+                    &wallet_public,
+                    key.key_ref.clone(),
+                    &state,
+                )?);
+                // Same pre-dispatch durability rule as single payloads: batch
+                // signing only ever dispatches with an activated approval, so a
+                // lost response reconciles and an absent marker proves no batch
+                // signature exists.
+                let children = staged_plans.iter().collect::<Vec<_>>();
+                let _lifecycle = self.lock_signing_dispatch(wallet, &children).await?;
+                state.sign_dispatched = true;
+                write_triad_batch_signing_state(&state_path, &state)?;
+            }
+            match service.broker.sign_exact_payload_batch(request).await {
+                Ok(outcome) => break outcome,
+                // Match single-payload recovery: preserve retryable or
+                // ambiguous outcomes, replace definite permanent refusals.
+                Err(error)
+                    if state.approval_id.is_some()
+                        && signing_refusal_releases_reservation(error.code) =>
+                {
+                    state.sign_dispatched = false;
+                    state.expected_operation_digest = None;
+                    write_triad_batch_signing_state(&state_path, &state)?;
+                    state = new_state()?;
+                    write_triad_batch_signing_state(&state_path, &state)?;
+                    refused = Some(refusal_reason(&error));
+                }
+                Err(error) if state.sign_dispatched => {
+                    return Err(unresolved_signing_error(&state.signing_operation_id, error));
+                }
+                Err(error) => return Err(protocol_signing_error(error)),
+            }
         };
-        if state.approval_id.is_some() {
-            state.expected_operation_digest = Some(expected_evm_batch_sign_operation_digest(
-                &wallet_public,
-                key.key_ref.clone(),
-                &state,
-            )?);
-            // Same pre-dispatch durability rule as single payloads: batch
-            // signing only ever dispatches with an activated approval, so a
-            // lost response reconciles and an absent marker proves no batch
-            // signature exists.
-            state.sign_dispatched = true;
-            write_triad_batch_signing_state(&state_path, &state)?;
-        }
-        match service
-            .broker
-            .sign_exact_payload_batch(request)
-            .await
-            .map_err(protocol_signing_error)?
-        {
+        match outcome {
             ExactPayloadSignOutcome::ApprovalRequired(prepared) => {
                 if state
                     .approval_id
@@ -3818,7 +4152,9 @@ impl TxEngine {
                 write_triad_batch_signing_state(&state_path, &state)?;
                 Err(TxEngineError::ApprovalRequired(batch_approval_requirement(
                     &state,
-                    "exact Broker batch approval ceremony required",
+                    refused
+                        .as_deref()
+                        .unwrap_or("exact Broker batch approval ceremony required"),
                 )?))
             }
             ExactPayloadSignOutcome::Signed(result) => {
@@ -3829,18 +4165,6 @@ impl TxEngine {
                 Ok(result)
             }
         }
-    }
-
-    async fn host_sign_evm_hash(
-        &self,
-        entry: &crate::outbox::OutboxEntry,
-        staged: &StagedTx,
-        action_kind: EvmOutboxActionKind,
-        signing_preimage: &[u8],
-        signing_hash: B256,
-    ) -> Result<Signature, TxEngineError> {
-        self.triad_sign_evm_payload(entry, staged, action_kind, signing_preimage, signing_hash)
-            .await
     }
 
     /// Refuse to broadcast when a same-chain dependency has not mined
@@ -4081,6 +4405,25 @@ impl TxEngine {
         Ok(signed.hash)
     }
 
+    fn require_no_cancellation(&self, entry: &crate::OutboxEntry) -> Result<(), TxEngineError> {
+        if entry
+            .dir
+            .join("cancel_tx_hash")
+            .try_exists()
+            .map_err(OutboxError::Io)?
+            || self
+                .outbox
+                .read_broadcast_attempt(entry, BroadcastAttemptKind::CancelReplacement)?
+                .is_some()
+        {
+            return Err(TxEngineError::ApprovalDenied(
+                "cancellation already submitted; reconcile it before confirming the transaction"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn read_replaceable_entry(
         &self,
         wallet: &str,
@@ -4112,104 +4455,157 @@ impl TxEngine {
         }
     }
 
-    /// Issue a same-nonce replacement tx with bumped fees. The original
-    /// must already be persisted in the outbox and be either still staged
-    /// in `pending/` or broadcast-but-unmined in `sent/`. Floors `bump_pct`
-    /// at 10 to satisfy the mempool's >= 10% rule.
+    /// Replace a rejected pending transaction's fees without changing its
+    /// nonce, destination, value, calldata, account, or Petal provenance.
     #[allow(clippy::too_many_arguments)]
-    pub async fn replace(
+    pub async fn replace_fees(
         &self,
         permit: &HomeWritePermit,
         wallet: &str,
         chain_name: &str,
         original_id: &str,
         chain: &ChainClient,
-        bump_pct: u32,
-        policy: &Policy,
-    ) -> Result<StagedTx, TxEngineError> {
-        self.replace_with_intent(
-            permit,
-            wallet,
-            chain_name,
-            original_id,
-            chain,
-            bump_pct,
-            None,
-            None,
-            policy,
-        )
-        .await
-    }
-
-    /// Same-nonce replacement that optionally substitutes the calldata
-    /// (fix #10 carry-over). When `substitute` is `Some(intent)`, the
-    /// new (`to`, `value`, `data`) are derived from it via the same
-    /// encoding pipeline `stage` uses, but the original nonce is
-    /// preserved. Fees are bumped at least `bump_pct%` (floored at 10).
-    #[allow(clippy::too_many_arguments)]
-    pub async fn replace_with_intent(
-        &self,
-        permit: &HomeWritePermit,
-        wallet: &str,
-        chain_name: &str,
-        original_id: &str,
-        chain: &ChainClient,
-        bump_pct: u32,
-        substitute: Option<RawIntent>,
-        address_book: Option<&AddressBook>,
+        fees: Eip1559FeeOverrides,
         policy: &Policy,
     ) -> Result<StagedTx, TxEngineError> {
         self.assert_write_permit(permit)?;
-        let bump = bump_pct.max(10);
+        let _entry_guard = self
+            .entry_lock_for(wallet, chain_name, original_id)
+            .lock_owned()
+            .await;
         let entry = self.read_replaceable_entry(wallet, chain_name, original_id)?;
+        if entry
+            .dir
+            .join("cancel_tx_hash")
+            .try_exists()
+            .map_err(OutboxError::Io)?
+            || self
+                .outbox
+                .read_broadcast_attempt(&entry, BroadcastAttemptKind::CancelReplacement)?
+                .is_some()
+        {
+            return Err(TxEngineError::ApprovalDenied(
+                "cancellation already submitted; reconcile it before replacing the transaction"
+                    .into(),
+            ));
+        }
+        if entry.state != OutboxState::Pending || entry.staged.gas_price.is_some() {
+            return Err(TxEngineError::InvalidFeeOverride(
+                "fee repair requires a pending EIP-1559 transaction".into(),
+            ));
+        }
+        // A repair whose send response was lost may already be signed and
+        // accepted. Settle that exact attempt; never sign another.
+        if let Some(attempt) = self
+            .outbox
+            .read_broadcast_attempt(&entry, BroadcastAttemptKind::Replacement)?
+        {
+            let replacement = serde_json::from_slice(
+                &std::fs::read(entry.dir.join("replacement_intent.json"))
+                    .map_err(OutboxError::Io)?,
+            )
+            .map_err(OutboxError::Json)?;
+            let settled = self
+                .reconcile_attempt(
+                    &entry,
+                    EvmOutboxActionKind::Replace,
+                    replacement,
+                    attempt,
+                    chain,
+                    policy,
+                )
+                .await;
+            return self.retire_if_rejected(&entry, settled);
+        }
+        // Repair admits a pending entry to broadcast, so it passes the
+        // same dependency gate as confirm.
+        if let Some(dep_id) = entry.staged.depends_on.as_deref() {
+            self.ensure_dependency_satisfied(wallet, chain_name, dep_id)?;
+        }
         let original = &entry.staged;
-        self.assert_nonce_still_replaceable(
-            chain,
-            original
-                .from
-                .parse()
-                .map_err(|e: alloy::hex::FromHexError| TxEngineError::Address(e.to_string()))?,
-            original.nonce,
-        )
-        .await?;
+        let from: Address = original
+            .from
+            .parse()
+            .map_err(|e: alloy::hex::FromHexError| TxEngineError::Address(e.to_string()))?;
+        self.assert_nonce_still_replaceable(chain, from, original.nonce)
+            .await?;
 
         let mut bumped = original.clone();
         bumped.status = TxStatus::Pending;
         bumped.tx_hash = None;
 
-        if let Some(intent) = substitute.as_ref() {
-            let chain_id = chain.chain_id().await?;
-            // The `from` passed here must match the original wallet
-            // address; recover it from the original staged tx so NFT
-            // transfer calldata stays correct under same-nonce
-            // substitution.
-            let from: Address = original
-                .from
-                .parse()
-                .map_err(|e: alloy::hex::FromHexError| TxEngineError::Address(e.to_string()))?;
-            let (to, value_wei, data_hex, token, nft) = self
-                .resolve_intent_body(&intent.body, chain, chain_id, address_book, from)
-                .await?;
-            bumped.to = to.map(|address| bloom_proto::checksum_address(&address));
-            bumped.value_wei = value_wei.to_string();
-            bumped.data_hex = data_hex;
-            bumped.token = token;
-            bumped.nft = nft;
-            // Substituted replacements are hard-denied below; classify a
-            // non-token send conservatively because this path does not stage
-            // a fresh destination-code fact.
-            bumped.action_kind = classify_action_kind(&intent.body, bumped.token.is_some(), true);
-            // A substituted body is currently hard-denied below. Do not
-            // leave the original quote attached to the replacement facts.
-            bumped.usd_value = None;
-            bumped.valuation = None;
-            bumped.policy_checks.push(bloom_proto::PolicyCheck::hard(
-                "replacement.substitute",
-                bloom_proto::PolicyOutcome::Deny,
-                "same-nonce replacement with substituted to/value/data is disabled; stage a fresh transaction instead",
+        bump_fees_in_place(&mut bumped, 10);
+        if fees.max_fee_per_gas
+            < bumped
+                .max_fee_per_gas
+                .as_deref()
+                .unwrap_or("0")
+                .parse::<u128>()
+                .unwrap_or(u128::MAX)
+            || fees.max_priority_fee_per_gas
+                < bumped
+                    .max_priority_fee_per_gas
+                    .as_deref()
+                    .unwrap_or("0")
+                    .parse::<u128>()
+                    .unwrap_or(u128::MAX)
+        {
+            return Err(TxEngineError::InvalidFeeOverride(
+                "replacement max fee and priority fee must each increase by at least 10%".into(),
             ));
         }
-        bump_fees_in_place(&mut bumped, bump);
+        bumped.max_fee_per_gas = Some(fees.max_fee_per_gas.to_string());
+        bumped.max_priority_fee_per_gas = Some(fees.max_priority_fee_per_gas.to_string());
+        // The higher cap raises the worst-case gas cost: recheck funding at
+        // the new cap, so policy denies an unaffordable repair before any
+        // ceremony. An unreadable balance leaves the check to the node.
+        bumped
+            .policy_checks
+            .retain(|check| check.rule != "balance.native_funds");
+        if let Ok(available) = chain.balance(from).await {
+            let spec = chain.spec();
+            bumped.policy_checks.extend(insufficient_native_funds_check(
+                &bumped.from,
+                spec.display_name.as_deref().unwrap_or(&spec.name),
+                &spec.native_symbol,
+                spec.native_decimals,
+                available,
+                U256::from_str_radix(&bumped.value_wei, 10).unwrap_or(U256::ZERO),
+                bumped.gas_limit,
+                fees.max_fee_per_gas,
+            ));
+        }
+        // Same pre-broadcast simulation as confirm, before any ceremony.
+        self.simulate_or_reject(&bumped, chain).await?;
+        self.outbox.write_artefact(
+            &entry.dir,
+            "replacement_original.json",
+            &serde_json::to_vec_pretty(original).unwrap(),
+        )?;
+        self.outbox.write_artefact(
+            &entry.dir,
+            "replacement_intent.json",
+            &serde_json::to_vec_pretty(&bumped).unwrap(),
+        )?;
+        self.outbox.write_artefact(
+            &entry.dir,
+            "replacement_plan.md",
+            bloom_proto::PlanRender::render(
+                &bumped,
+                &chain.spec().native_symbol,
+                chain.spec().native_decimals,
+            )
+            .as_bytes(),
+        )?;
+        self.outbox.write_artefact(
+            &entry.dir,
+            "replacement_request.json",
+            &serde_json::to_vec(&serde_json::json!({
+                "max_fee_per_gas": fees.max_fee_per_gas.to_string(),
+                "max_priority_fee_per_gas": fees.max_priority_fee_per_gas.to_string(),
+            }))
+            .unwrap(),
+        )?;
         let unsigned = self.build_unsigned_evm_tx(&bumped, chain)?;
         let prepared = PreparedEvmTx {
             signing_hash: Self::unsigned_signing_hash(&unsigned),
@@ -4225,7 +4621,7 @@ impl TxEngine {
         )
         .await?;
 
-        let tx_hash = self
+        let submitted = self
             .submit_with_marker(
                 &entry,
                 EvmOutboxActionKind::Replace,
@@ -4234,30 +4630,40 @@ impl TxEngine {
                 policy,
                 prepared,
             )
-            .await?;
-        bumped.tx_hash = Some(format!("{:#x}", tx_hash));
-        bumped.status = TxStatus::Sent;
-
-        self.outbox.write_artefact(
-            &entry.dir,
-            "replacement_tx_hash",
-            bumped.tx_hash.as_ref().unwrap().as_bytes(),
-        )?;
-        self.outbox.write_artefact(
-            &entry.dir,
-            "replacement_intent.json",
-            &serde_json::to_vec_pretty(&bumped).unwrap(),
-        )?;
-        let _ = self
-            .outbox
-            .remove_broadcast_raw_tx(&entry, BroadcastAttemptKind::Replacement);
+            .await;
+        let tx_hash = self.retire_if_rejected(&entry, submitted)?;
+        // Keep the original signed attempt as evidence, and follow the
+        // accepted replacement through the same account-owned outbox ID.
+        // `finalize_sent` records the hash and intent; nothing after the
+        // move to sent may fail the call.
+        let bumped =
+            self.finalize_sent(&entry, bumped, tx_hash, EvmOutboxActionKind::Replace, chain)?;
         info!(
             id = %original.id,
             replacement = %bumped.tx_hash.as_deref().unwrap_or(""),
-            substituted = substitute.is_some(),
             "tx.replace"
         );
         Ok(bumped)
+    }
+
+    /// A node that refuses replacement bytes outright never put them in a
+    /// mempool. Set the attempt aside as evidence, so the next fee repair
+    /// signs a new one instead of replaying the refused bytes.
+    fn retire_if_rejected<T>(
+        &self,
+        entry: &crate::outbox::OutboxEntry,
+        result: Result<T, TxEngineError>,
+    ) -> Result<T, TxEngineError> {
+        if let Err(TxEngineError::Chain(error)) = &result
+            && node_rejected_before_acceptance(error)
+        {
+            self.outbox.set_aside_rejected_attempt(
+                entry,
+                BroadcastAttemptKind::Replacement,
+                TRIAD_SIGNING_STATE_FILE,
+            )?;
+        }
+        result
     }
 
     /// Issue a same-nonce self-send to cancel the original. The original
@@ -4275,19 +4681,43 @@ impl TxEngine {
         policy: &Policy,
     ) -> Result<StagedTx, TxEngineError> {
         self.assert_write_permit(permit)?;
+        let _entry_guard = self
+            .entry_lock_for(wallet, chain_name, original_id)
+            .lock_owned()
+            .await;
         let bump = bump_pct.max(10);
         let entry = self.read_replaceable_entry(wallet, chain_name, original_id)?;
-        if entry.state == OutboxState::Pending
-            && entry.staged.tx_hash.is_none()
-            && self
-                .outbox
-                .read_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm)?
-                .is_none()
-            && read_triad_signing_state(&entry.dir.join(TRIAD_SIGNING_STATE_FILE))?
-                .is_none_or(|state| !state.sign_dispatched)
-        {
-            self.outbox.cancel(wallet, chain_name, original_id)?;
-            return Ok(self.outbox.read(wallet, chain_name, original_id)?.staged);
+        // A provably unsigned pending entry is released locally; anything
+        // possibly signed needs a same-nonce cancellation.
+        if entry.state == OutboxState::Pending {
+            match self.outbox_cancel(wallet, chain_name, original_id).await? {
+                Ok(()) => return Ok(self.outbox.read(wallet, chain_name, original_id)?.staged),
+                Err(OutboxError::PossiblySigned { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        // Recover the original hash before submitting a cancel, so a lost
+        // send response cannot leave it outside the reconciler's sent queue.
+        let mut entry = entry;
+        if entry.staged.tx_hash.is_none() {
+            for kind in [
+                BroadcastAttemptKind::Confirm,
+                BroadcastAttemptKind::Replacement,
+            ] {
+                if let Some(attempt) = self.outbox.read_broadcast_attempt(&entry, kind)? {
+                    entry.staged.tx_hash = Some(attempt.tx_hash);
+                    break;
+                }
+            }
+        }
+        if entry.staged.tx_hash.is_some() {
+            self.outbox.write_artefact(
+                &entry.dir,
+                "intent.json",
+                &serde_json::to_vec_pretty(&entry.staged).map_err(OutboxError::Json)?,
+            )?;
+            self.outbox.transition_with_status(&entry, TxStatus::Sent)?;
+            entry = self.outbox.read(wallet, chain_name, original_id)?;
         }
         let original = &entry.staged;
         self.assert_nonce_still_replaceable(
@@ -4343,15 +4773,10 @@ impl TxEngine {
         let _ = self
             .outbox
             .remove_broadcast_raw_tx(&entry, BroadcastAttemptKind::CancelReplacement);
-        if entry.state != OutboxState::Failed
-            && let Err(e) = self.outbox.transition(&entry, OutboxState::Failed)
-        {
-            debug!(
-                id = %original.id,
-                error = %e,
-                "tx.cancel_transition_failed"
-            );
-        }
+        // Broadcast does not settle the nonce race, so the original stays
+        // where it is: a sent original stays visible to the reconciler, and a
+        // pending one reached here only because it is possibly signed, so it
+        // keeps holding its nonce rather than moving to failed/.
         info!(
             id = %original.id,
             cancel = %cancel_tx.tx_hash.as_deref().unwrap_or(""),
@@ -4388,7 +4813,11 @@ fn bump_fees_in_place(staged: &mut StagedTx, pct: u32) {
     fn bump_one(s: &Option<String>, pct: u32) -> Option<String> {
         s.as_deref().and_then(|x| {
             let v = x.parse::<u128>().ok()?;
-            let bump = v.saturating_mul(pct as u128) / 100;
+            // Ceiling of v * pct / 100, split so the product cannot overflow.
+            let pct = u128::from(pct);
+            let bump = (v / 100)
+                .saturating_mul(pct)
+                .saturating_add((v % 100 * pct).div_ceil(100));
             let bumped = v.saturating_add(bump.max(1));
             Some(bumped.to_string())
         })
@@ -4520,26 +4949,6 @@ async fn evm_signing_key(
     }
 }
 
-/// Parse a review mode named by an intent or a staged row.
-///
-/// An unrecognised value is an error rather than a default: a row asking for
-/// a mode this build does not know must not be prepared under some other
-/// one, because the difference is exactly what the owner will be shown.
-/// `reviewMode` used to choose between the readable review and approving
-/// bytes Bloom would not explain. Broker now decides that itself from the
-/// payload it can verify, and discloses which review it gave, so a row asking
-/// for `clear` already gets what it asked for. A row asking for the opposite
-/// cannot be honoured quietly, and says so here.
-fn check_review_mode(mode: Option<&str>) -> Result<(), TxEngineError> {
-    match mode {
-        None | Some("clear") => Ok(()),
-        Some(other) => Err(TxEngineError::ApprovalConstruction(format!(
-            "reviewMode `{other}` is no longer accepted; Broker chooses the review it can \
-             verify from the exact payload"
-        ))),
-    }
-}
-
 fn exact_evm_sign_request(
     staged: &StagedTx,
     signing_preimage: &[u8],
@@ -4568,8 +4977,24 @@ fn exact_evm_sign_request(
         petal_use_claim: None,
         system_use_claim: None,
         claim_assurance_evidence: None,
+        safe_review_payload: None,
+        message_review_payload: None,
+        evm_reported_token: reported_token(staged),
         approval_value_limits: Vec::new(),
     })
+}
+
+/// What the staged token contract reported about itself. Broker shows it as
+/// a marked claim when the token is not in its catalog.
+fn reported_token(staged: &StagedTx) -> Option<bloom_broker_api::EvmReportedToken> {
+    staged
+        .token
+        .as_ref()
+        .map(|token| bloom_broker_api::EvmReportedToken {
+            address: token.address.to_ascii_lowercase(),
+            symbol: token.symbol.clone(),
+            decimals: token.decimals,
+        })
 }
 
 fn expected_evm_sign_operation_digest(
@@ -4907,17 +5332,118 @@ fn write_triad_signing_state(
     result.map_err(|error| TxEngineError::Outbox(error.into()))
 }
 
-fn protocol_signing_error(error: bloom_broker_api::ProtocolError) -> TxEngineError {
-    match error.code {
-        bloom_broker_api::ProtocolErrorCode::ServiceUnavailable => {
-            TxEngineError::ApprovalServiceUnavailable(format!(
-                "{}: {}",
-                error.code.as_str(),
-                error.message
-            ))
-        }
-        _ => TxEngineError::ApprovalDenied(format!("{}: {}", error.code.as_str(), error.message)),
+fn signing_refusal_releases_reservation(code: ProtocolErrorCode) -> bool {
+    // Pre-dispatch peer/version errors say nothing about the approval, and a
+    // pinned Signer without signer#62 reports a quarantined operation as
+    // BackendInvalidRequest. None of these prove the request is dead.
+    let contract = code.contract();
+    contract.retry == RetryClass::Never
+        && matches!(
+            contract.durable_effect,
+            DurableEffect::None | DurableEffect::ReservationReleased
+        )
+        && !matches!(
+            code,
+            ProtocolErrorCode::UnauthenticatedPeer
+                | ProtocolErrorCode::UnsupportedVersion
+                | ProtocolErrorCode::BackendInvalidRequest
+        )
+}
+
+/// Why a definite refusal led to a fresh ceremony, for the owner and agent.
+fn refusal_reason(error: &bloom_broker_api::ProtocolError) -> String {
+    format!(
+        "Broker refused the previous approval ({}: {}); nothing was signed, and a fresh ceremony is required",
+        error.code.as_str(),
+        error.message
+    )
+}
+
+/// A dispatched request, or a quarantined operation, may have produced a
+/// signature. Report it as unresolved rather than as a clean denial.
+fn unresolved_signing_error(
+    operation_id: &impl std::fmt::Display,
+    error: bloom_broker_api::ProtocolError,
+) -> TxEngineError {
+    match protocol_signing_error(error) {
+        TxEngineError::ApprovalDenied(detail) => TxEngineError::ApprovalState(format!(
+            "signing outcome unknown; a signature may exist — reconcile operation {operation_id} before confirming again ({detail})"
+        )),
+        other => other,
     }
+}
+
+/// Only a refusal the Broker says never to retry is a denial; confirm discards
+/// the staged transaction on a denial. A rate limit, quota, stale baseline or
+/// clock repair is temporary, so the transaction is kept for the next confirm.
+fn protocol_signing_error(error: bloom_broker_api::ProtocolError) -> TxEngineError {
+    let reason = format!("{}: {}", error.code.as_str(), error.message);
+    match error.code.contract().retry {
+        bloom_broker_api::RetryClass::Never => TxEngineError::ApprovalDenied(reason),
+        _ => TxEngineError::ApprovalServiceUnavailable(reason),
+    }
+}
+
+/// The unsigned EVM transaction a staged plan signs.
+fn unsigned_evm_tx(staged: &StagedTx) -> Result<UnsignedEvmTx, TxEngineError> {
+    let _from: Address = staged
+        .from
+        .parse()
+        .map_err(|e: alloy::hex::FromHexError| TxEngineError::Address(e.to_string()))?;
+    let destination = staged.transaction_kind().map_err(TxEngineError::Address)?;
+    let value: U256 = staged
+        .value_wei
+        .parse()
+        .map_err(|_| TxEngineError::Amount("value_wei".into()))?;
+    let data = decode_data(&staged.data_hex)?;
+
+    if staged.gas_price.is_some() {
+        let gp: u128 = staged
+            .gas_price
+            .as_deref()
+            .and_then(|s| s.parse::<u128>().ok())
+            .unwrap_or(1_000_000_000);
+        Ok(UnsignedEvmTx::Legacy(TxLegacy {
+            chain_id: Some(staged.chain_id),
+            nonce: staged.nonce,
+            gas_price: gp,
+            gas_limit: staged.gas_limit,
+            to: destination,
+            value,
+            input: data,
+        }))
+    } else {
+        let max_fee: u128 = staged
+            .max_fee_per_gas
+            .as_deref()
+            .and_then(|s| s.parse::<u128>().ok())
+            .unwrap_or(2_000_000_000);
+        let prio: u128 = staged
+            .max_priority_fee_per_gas
+            .as_deref()
+            .and_then(|s| s.parse::<u128>().ok())
+            .unwrap_or(1_000_000);
+        Ok(UnsignedEvmTx::Eip1559(TxEip1559 {
+            chain_id: staged.chain_id,
+            nonce: staged.nonce,
+            gas_limit: staged.gas_limit,
+            max_fee_per_gas: max_fee,
+            max_priority_fee_per_gas: prio,
+            to: destination,
+            value,
+            access_list: AccessList::default(),
+            input: data,
+        }))
+    }
+}
+
+/// SHA-256 of a staged transaction's exact signing preimage: the identity a
+/// batch signing state records for each child it signs.
+pub(crate) fn staged_payload_digest(staged: &StagedTx) -> Option<Digest32> {
+    let unsigned = unsigned_evm_tx(staged).ok()?;
+    Some(Digest32::from_bytes(
+        sha2::Sha256::digest(TxEngine::unsigned_signing_preimage(&unsigned)).into(),
+    ))
 }
 
 fn decode_data(s: &str) -> Result<Bytes, TxEngineError> {
@@ -4945,6 +5471,56 @@ fn outbox_action_id(staged: &StagedTx, action_kind: EvmOutboxActionKind) -> Stri
             .unwrap_or_else(|| format!("{}:{}", staged.chain_id, staged.id)),
         EvmOutboxActionKind::Replace => format!("{}:{}:replace", staged.chain_id, staged.id),
         EvmOutboxActionKind::Cancel => format!("{}:{}:cancel", staged.chain_id, staged.id),
+    }
+}
+
+/// True when the node answered with a validation error for these exact
+/// bytes, so it did not accept them. Timeouts and transport failures are
+/// not proof of rejection and stay ambiguous.
+fn node_rejected_before_acceptance(error: &ChainError) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("error response")
+        && [
+            "underpriced",
+            "fee cap less than block base fee",
+            "max fee per gas less than block base fee",
+            "insufficient funds",
+        ]
+        .iter()
+        .any(|reason| message.contains(reason))
+}
+
+fn parse_tx_hash(hash: &str) -> Result<B256, TxEngineError> {
+    hash.parse()
+        .map_err(|e: alloy::hex::FromHexError| TxEngineError::Address(e.to_string()))
+}
+
+async fn chain_knows_tx(chain: &ChainClient, hash: B256) -> Result<bool, TxEngineError> {
+    Ok(chain.tx_by_hash(hash).await?.is_some() || chain.receipt(hash).await?.is_some())
+}
+
+/// The broadcast marker a signing lineage's action writes once its signature
+/// has been collected; see [`outbox_action_id`].
+fn signing_action_broadcast_kind(action_id: &str) -> BroadcastAttemptKind {
+    if action_id.ends_with(":replace") {
+        BroadcastAttemptKind::Replacement
+    } else if action_id.ends_with(":cancel") {
+        BroadcastAttemptKind::CancelReplacement
+    } else {
+        BroadcastAttemptKind::Confirm
+    }
+}
+
+/// The write that resumes a signing lineage's action on its pending entry.
+fn retry_instruction(action_id: &str) -> &'static str {
+    match signing_action_broadcast_kind(action_id) {
+        BroadcastAttemptKind::Replacement => {
+            "write the same fee pair (replacement_request.json) to this entry's replace control again"
+        }
+        BroadcastAttemptKind::CancelReplacement => {
+            "write cancel to this entry's cancel control again"
+        }
+        BroadcastAttemptKind::Confirm => "write confirm to this entry's confirm control again",
     }
 }
 
@@ -5118,14 +5694,15 @@ fn short_addr_label(a: &Address) -> String {
     }
 }
 
-/// Resolve a common ERC-20 symbol to its address via the shared
-/// `bloom_proto::tokens` table (the single source of truth across the send
-/// path, route path, and VFS token surface). Anvil mainnet forks share chain
+/// Resolve an ERC-20 symbol to its address via the token list Broker also
+/// compiles in, so a symbol resolves to the token Broker names on the
+/// approval page. An ambiguous symbol resolves to nothing. Anvil mainnet forks share chain
 /// id 31337 with vanilla Anvil, so they reuse the Ethereum (id 1) majors; a
 /// caller can always pass a 0x address explicitly.
 fn lookup_known_token(chain_id: u64, symbol_upper: &str) -> Option<&'static str> {
     let lookup_chain = if chain_id == 31337 { 1 } else { chain_id };
-    let hit = bloom_proto::tokens::resolve_symbol(lookup_chain, symbol_upper).map(|t| t.address);
+    let hit = bloom_broker_api::token_by_symbol(lookup_chain, symbol_upper)
+        .map(|token| token.address.as_str());
     if hit.is_none() {
         debug!(chain_id, symbol = symbol_upper, "tx.known_token_miss");
     }
@@ -5156,7 +5733,11 @@ mod tests {
     struct TriadBrokerFixture {
         active: AtomicBool,
         approval_terminal: parking_lot::Mutex<Option<ApprovalLifecycleState>>,
-        signing_terminal: parking_lot::Mutex<Option<OperationState>>,
+        deny_sign: parking_lot::Mutex<Option<ProtocolErrorCode>>,
+        /// Forces `operation.status` to report a terminal state instead of
+        /// `Succeeded`, which is how a dispatched row learns its signing
+        /// operation died.
+        operation_terminal: parking_lot::Mutex<Option<OperationState>>,
         lose_sign_response_once: AtomicBool,
         corrupt_status_result: AtomicBool,
         completed_result: parking_lot::Mutex<Option<SigningResult>>,
@@ -5268,11 +5849,18 @@ mod tests {
                         ))
                     }
                     MachineBrokerRequest::OperationStatus(request) => {
-                        if let Some(state) = *self.signing_terminal.lock() {
+                        if let Some(state) = *self.operation_terminal.lock() {
+                            let operation_digest = self
+                                .completed_result
+                                .lock()
+                                .as_ref()
+                                .filter(|result| result.operation_id == request.operation_id)
+                                .map(|result| result.operation_digest.clone())
+                                .unwrap_or_else(|| Digest32::from_bytes([11; 32]));
                             return Ok(MachineBrokerResponse::OperationStatus(
                                 OperationPublicStatus {
                                     operation_id: request.operation_id,
-                                    operation_digest: Digest32::from_bytes([11; 32]),
+                                    operation_digest,
                                     state,
                                     result: None,
                                     error: None,
@@ -5299,6 +5887,12 @@ mod tests {
                         ))
                     }
                     MachineBrokerRequest::SigningSign(request) => {
+                        if let Some(code) = *self.deny_sign.lock() {
+                            return Err(bloom_broker_api::ProtocolError::new(
+                                code,
+                                "simulated Broker refusal before any signing",
+                            ));
+                        }
                         let SigningPayloads::Single { payload } = &request.payloads else {
                             panic!("fixture expects one exact payload");
                         };
@@ -5324,6 +5918,12 @@ mod tests {
                         Ok(MachineBrokerResponse::SigningSign(result))
                     }
                     MachineBrokerRequest::SigningSignBatch(request) => {
+                        if let Some(code) = *self.deny_sign.lock() {
+                            return Err(bloom_broker_api::ProtocolError::new(
+                                code,
+                                "simulated Broker refusal before any batch signing",
+                            ));
+                        }
                         let SigningPayloads::Batch { children } = &request.payloads else {
                             panic!("fixture expects an exact payload batch");
                         };
@@ -5358,26 +5958,33 @@ mod tests {
         }
     }
 
+    fn system_record(operation_class: &str, signature_byte: u8) -> ProvenanceRecord {
+        ProvenanceRecord {
+            subject: ProvenanceSubject::System {
+                component_id: Token::new("bloom-machine").unwrap(),
+                operation_class: Token::new(operation_class).unwrap(),
+            },
+            publisher: Token::new("bloom-installer").unwrap(),
+            petal_lineage: None,
+            operation_classes: vec![ProvenanceOperationClass {
+                operation_class: Token::new(operation_class).unwrap(),
+                fee_asset: Some(ProvenanceFeeAsset {
+                    chain: Token::new("ethereum").unwrap(),
+                    asset: "native".into(),
+                }),
+            }],
+            installer_key_id: Token::new("installer-key").unwrap(),
+            installer_signature: Base64UrlBytes::from_bytes(&[signature_byte; 64]),
+        }
+    }
+
     fn triad_catalog() -> ProvenanceCatalog {
         ProvenanceCatalog {
             schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
-            records: vec![ProvenanceRecord {
-                subject: ProvenanceSubject::System {
-                    component_id: Token::new("bloom-machine").unwrap(),
-                    operation_class: Token::new("transaction.confirm").unwrap(),
-                },
-                publisher: Token::new("bloom-installer").unwrap(),
-                petal_lineage: None,
-                operation_classes: vec![ProvenanceOperationClass {
-                    operation_class: Token::new("transaction.confirm").unwrap(),
-                    fee_asset: Some(ProvenanceFeeAsset {
-                        chain: Token::new("ethereum").unwrap(),
-                        asset: "native".into(),
-                    }),
-                }],
-                installer_key_id: Token::new("installer-key").unwrap(),
-                installer_signature: Base64UrlBytes::from_bytes(&[11; 64]),
-            }],
+            records: vec![
+                system_record("transaction.confirm", 11),
+                system_record("transaction.cancel", 12),
+            ],
         }
     }
 
@@ -5442,7 +6049,7 @@ mod tests {
         }
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Default)]
     struct RecordingOracle {
         calls: Arc<parking_lot::Mutex<Vec<(String, String)>>>,
         usd_micro: i128,
@@ -5782,7 +6389,81 @@ mod tests {
             nonce: None,
             gas_limit_hint: None,
             usd_value_hint: usd_hint.map(str::to_string),
-            review_mode: None,
+        }
+    }
+
+    async fn resolve_send_on(native_symbol: &str, intent: &str) -> Result<U256, TxEngineError> {
+        let mut spec = stage_chain("http://127.0.0.1:9").spec().clone();
+        spec.native_symbol = native_symbol.into();
+        let chain = ChainClient::new(spec).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TxEngine::new(Outbox::new(dir.path().join("outbox")).unwrap(), 60_000);
+        let body = crate::intent_parser::parse(intent).unwrap().body;
+        let (_, value, data, token, _) = engine
+            .resolve_intent_body(&body, &chain, 31337, None, Address::ZERO)
+            .await?;
+        assert_eq!((data.as_str(), token.is_none()), ("0x", true));
+        Ok(value)
+    }
+
+    #[tokio::test]
+    async fn the_chain_native_symbol_sends_the_native_asset() {
+        let to = "0x2222222222222222222222222222222222222222";
+        let pol = U256::from(10_000_000_000_000_000u64);
+        for intent in [
+            format!("send 0.01 POL to {to}"),
+            format!("send 0.01 pol to {to}"),
+            format!(r#"{{"kind":"send","to":"{to}","token":"POL","amount":"0.01"}}"#),
+        ] {
+            assert_eq!(
+                resolve_send_on("POL", &intent).await.unwrap(),
+                pol,
+                "{intent}"
+            );
+        }
+        assert_eq!(
+            resolve_send_on("POL", &format!("send 10000000000000000 wei to {to}"))
+                .await
+                .unwrap(),
+            pol
+        );
+        assert_eq!(
+            resolve_send_on("ETH", &format!("send 0.01 ETH to {to}"))
+                .await
+                .unwrap(),
+            pol
+        );
+    }
+
+    /// The 0.4.1 ceremony case: `send 0.1 POL` on the shipped polygon chain
+    /// (id 137) failed with "unknown token 'POL' on chain id 137".
+    #[tokio::test]
+    async fn the_default_polygon_chain_sends_pol_natively() {
+        let spec = bloom_proto::config::Config::local_default().chains["polygon"].clone();
+        let chain = ChainClient::new(spec).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TxEngine::new(Outbox::new(dir.path().join("outbox")).unwrap(), 60_000);
+        let to = "0x2222222222222222222222222222222222222222";
+        let body = crate::intent_parser::parse(&format!("send 0.1 POL to {to}"))
+            .unwrap()
+            .body;
+        let (_, value, data, token, _) = engine
+            .resolve_intent_body(&body, &chain, 137, None, Address::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(value, U256::from(100_000_000_000_000_000u64));
+        assert_eq!((data.as_str(), token.is_none()), ("0x", true));
+    }
+
+    #[tokio::test]
+    async fn eth_is_refused_on_a_chain_with_another_native_asset() {
+        let to = "0x2222222222222222222222222222222222222222";
+        for intent in [
+            format!("send 0.01 ETH to {to}"),
+            format!("send 0.01 ether to {to}"),
+        ] {
+            let err = resolve_send_on("POL", &intent).await.unwrap_err();
+            assert!(err.to_string().contains("pays in POL, not ETH"), "{err}");
         }
     }
 
@@ -5802,6 +6483,28 @@ mod tests {
         assert_eq!(
             classify_action_kind(&body, false, false),
             TxActionKind::NativeTransfer
+        );
+    }
+
+    #[test]
+    fn staged_token_is_reported_to_the_broker() {
+        let mut staged = fake_staged_1559("token");
+        assert_eq!(reported_token(&staged), None);
+        staged.token = Some(TokenRef {
+            address: "0xAbCd000000000000000000000000000000000001".into(),
+            symbol: "TKN".into(),
+            decimals: 6,
+            recipient: "0x0000000000000000000000000000000000000002".into(),
+            amount: "1".into(),
+            amount_base_units: None,
+        });
+        assert_eq!(
+            reported_token(&staged),
+            Some(bloom_broker_api::EvmReportedToken {
+                address: "0xabcd000000000000000000000000000000000001".into(),
+                symbol: "TKN".into(),
+                decimals: 6,
+            })
         );
     }
 
@@ -5825,7 +6528,6 @@ mod tests {
             expires_ms: 0,
             status: TxStatus::Pending,
             action_kind: TxActionKind::Unknown,
-            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,
@@ -5913,6 +6615,179 @@ mod tests {
                 .any(|check| check.rule == "deployment.review"),
             "{:?}",
             staged.policy_checks
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_replacement_keeps_sent_original_available_for_reconciliation() {
+        check_cancel_keeps_original(None, false).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_replacement_keeps_lost_broadcast_available_for_reconciliation() {
+        for kind in [
+            BroadcastAttemptKind::Confirm,
+            BroadcastAttemptKind::Replacement,
+        ] {
+            check_cancel_keeps_original(Some(kind), false).await;
+            check_cancel_keeps_original(Some(kind), true).await;
+        }
+    }
+
+    async fn check_cancel_keeps_original(
+        marker: Option<BroadcastAttemptKind>,
+        pending_marker: bool,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let mut staged = fake_staged_1559("cancel-race");
+        staged.created_ms = now_ms();
+        outbox.write_pending(&staged, "original").unwrap();
+        let pending = outbox.read("alice", "anvil", &staged.id).unwrap();
+        if !pending_marker {
+            outbox
+                .transition_with_status(&pending, TxStatus::Sent)
+                .unwrap();
+        }
+        let sent = outbox.read("alice", "anvil", &staged.id).unwrap();
+        staged.status = TxStatus::Sent;
+        staged.tx_hash = Some(format!("{:#x}", B256::repeat_byte(1)));
+        if let Some(kind) = marker {
+            outbox
+                .write_broadcast_attempt(
+                    &sent,
+                    kind,
+                    &crate::outbox::BroadcastAttempt {
+                        schema: "bloom.broadcast_attempted.v1".into(),
+                        tx_hash: staged.tx_hash.clone().unwrap(),
+                        raw_tx_blake3: blake3::hash(b"original").to_hex().to_string(),
+                        raw_tx_path: kind.raw_name().into(),
+                        from: staged.from.clone(),
+                        to: staged.to.clone(),
+                        nonce: staged.nonce,
+                        chain_id: staged.chain_id,
+                        created_ms: now_ms(),
+                        transport: crate::outbox::BroadcastTransport::PublicRpc,
+                        private_provider: None,
+                    },
+                )
+                .unwrap();
+            staged.tx_hash = None;
+        }
+        outbox
+            .write_artefact(
+                &sent.dir,
+                "intent.json",
+                &serde_json::to_vec(&staged).unwrap(),
+            )
+            .unwrap();
+        let (engine, chain) = triad_cancel_engine(&outbox).await;
+        let permit = permit_for(&directory);
+        let policy = Policy::default();
+        let result = engine
+            .cancel(&permit, "alice", "anvil", &staged.id, &chain, 15, &policy)
+            .await;
+        if matches!(result, Err(TxEngineError::ApprovalRequired(_))) {
+            engine
+                .cancel(&permit, "alice", "anvil", &staged.id, &chain, 15, &policy)
+                .await
+                .unwrap();
+        } else {
+            result.unwrap();
+        }
+        let original = outbox.read("alice", "anvil", &staged.id).unwrap();
+        assert_eq!(original.state, OutboxState::Sent);
+        assert_eq!(original.staged.status, TxStatus::Sent);
+        assert_eq!(
+            original.staged.tx_hash,
+            Some(format!("{:#x}", B256::repeat_byte(1)))
+        );
+        assert!(original.dir.join("cancel_tx_hash").exists());
+        assert!(original.dir.join("cancel_intent.json").exists());
+        assert_eq!(outbox.walk_all_sent().unwrap().len(), 1);
+        assert!(
+            outbox
+                .highest_pending_nonce("alice", "anvil", TEST_SIGNER_ADDRESS.parse().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        let err = engine
+            .replace_fees(
+                &permit,
+                "alice",
+                "anvil",
+                &staged.id,
+                &chain,
+                repair_fees("500", "250"),
+                &policy,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TxEngineError::ApprovalDenied(_)));
+    }
+
+    /// A Triad engine authorized to cancel, with an active approval, and a
+    /// chain client for it.
+    async fn triad_cancel_engine(outbox: &Outbox) -> (TxEngine, ChainClient) {
+        let (engine, _, broker) = triad_batch_fixture(outbox.clone(), true, false);
+        let mut catalog = triad_catalog();
+        let mut cancel_record = catalog.records[0].clone();
+        cancel_record.subject = ProvenanceSubject::System {
+            component_id: Token::new("bloom-machine").unwrap(),
+            operation_class: Token::new("transaction.cancel").unwrap(),
+        };
+        cancel_record.operation_classes[0].operation_class =
+            Token::new("transaction.cancel").unwrap();
+        if !catalog
+            .records
+            .iter()
+            .any(|record| record.subject == cancel_record.subject)
+        {
+            catalog.records.push(cancel_record);
+        }
+        let engine = engine.with_triad_signing(broker, catalog).unwrap();
+        (engine, stage_chain(&spawn_batch_rpc(None).await))
+    }
+
+    #[tokio::test]
+    async fn cancel_broadcast_keeps_a_hashless_possibly_signed_original_pending() {
+        // The original has no hash, but its signed raw transaction exists, so
+        // it can still win the nonce race against the cancellation.
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let mut staged = fake_staged_1559("hashless-signed");
+        staged.created_ms = now_ms();
+        outbox.write_pending(&staged, "original").unwrap();
+        let pending = outbox.read("alice", "anvil", &staged.id).unwrap();
+        outbox
+            .write_artefact(
+                &pending.dir,
+                BroadcastAttemptKind::Confirm.raw_name(),
+                b"raw",
+            )
+            .unwrap();
+        let (engine, chain) = triad_cancel_engine(&outbox).await;
+        let permit = permit_for(&directory);
+        let policy = Policy::default();
+        let result = engine
+            .cancel(&permit, "alice", "anvil", &staged.id, &chain, 15, &policy)
+            .await;
+        if matches!(result, Err(TxEngineError::ApprovalRequired(_))) {
+            engine
+                .cancel(&permit, "alice", "anvil", &staged.id, &chain, 15, &policy)
+                .await
+                .unwrap();
+        } else {
+            result.unwrap();
+        }
+        let original = outbox.read("alice", "anvil", &staged.id).unwrap();
+        assert!(original.dir.join("cancel_tx_hash").exists());
+        assert_eq!(original.state, OutboxState::Pending);
+        assert_eq!(
+            outbox
+                .highest_pending_nonce("alice", "anvil", TEST_SIGNER_ADDRESS.parse().unwrap())
+                .unwrap(),
+            Some(staged.nonce)
         );
     }
 
@@ -6048,7 +6923,8 @@ mod tests {
         let fixture = Arc::new(TriadBrokerFixture {
             active: AtomicBool::new(false),
             approval_terminal: parking_lot::Mutex::new(None),
-            signing_terminal: parking_lot::Mutex::new(None),
+            deny_sign: parking_lot::Mutex::new(None),
+            operation_terminal: parking_lot::Mutex::new(None),
             lose_sign_response_once: AtomicBool::new(false),
             corrupt_status_result: AtomicBool::new(false),
             completed_result: parking_lot::Mutex::new(None),
@@ -6207,6 +7083,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stage_respects_node_priority_fee_instead_of_dividing_gas_price() {
+        for (gas_price, priority_response) in [
+            (25_000_000_000u128, "\"0x5d21dba00\""),
+            (1_000_000_000, "\"0x5d21dba00\""),
+            (
+                25_000_000_000,
+                "error:{\"code\":-32601,\"message\":\"unsupported\"}",
+            ),
+        ] {
+            let mut responses = stage_rpc_responses(true);
+            responses.insert("eth_gasPrice".into(), vec![format!("\"0x{gas_price:x}\"")]);
+            responses.insert(
+                "eth_maxPriorityFeePerGas".into(),
+                vec![priority_response.into()],
+            );
+            let url = spawn_queued_rpc(responses).await;
+            let oracle = RecordingOracle {
+                calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                usd_micro: 1_000_000,
+                age_ms: 0,
+                max_age_ms: 60_000,
+            };
+            let (engine, _dir, permit, chain) = stage_fixture(&url, oracle);
+            let staged = engine
+                .stage(
+                    &permit,
+                    "alice",
+                    "0x1111111111111111111111111111111111111111"
+                        .parse()
+                        .unwrap(),
+                    native_intent("0.001 eth", None),
+                    &chain,
+                    &policy_with_usd_cap(),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                staged.max_priority_fee_per_gas.as_deref(),
+                Some("25000000000")
+            );
+            assert_eq!(staged.max_fee_per_gas.as_deref(), Some("50000000000"));
+        }
+    }
+
+    #[tokio::test]
     async fn stage_native_transfer_uses_bound_oracle_value_not_hint() {
         let url = spawn_stage_rpc(true).await;
         let oracle = RecordingOracle {
@@ -6243,6 +7165,46 @@ mod tests {
             calls.lock().as_slice(),
             &[("native:anvil".into(), "1000000000000000000".into())]
         );
+    }
+
+    #[tokio::test]
+    async fn stage_refuses_native_value_on_a_chain_without_a_native_token() {
+        let to = "0x2222222222222222222222222222222222222222";
+        for intent in [
+            native_intent("1 eth", None),
+            RawIntent {
+                body: crate::intent_parser::parse(&format!(
+                    r#"{{"kind":"send","to":"{to}","token":"ETH","amount":"1"}}"#
+                ))
+                .unwrap()
+                .body,
+                ..native_intent("0", None)
+            },
+        ] {
+            let url = spawn_stage_rpc(true).await;
+            let (engine, _dir, permit, chain) = stage_fixture(&url, RecordingOracle::default());
+            let mut spec = chain.spec().clone();
+            spec.chain_id = bloom_proto::chain::TEMPO_MODERATO_CHAIN_ID;
+            let tempo = ChainClient::new(spec).unwrap();
+            let error = engine
+                .stage(
+                    &permit,
+                    "alice",
+                    "0x1111111111111111111111111111111111111111"
+                        .parse()
+                        .unwrap(),
+                    intent,
+                    &tempo,
+                    &Policy::default(),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, TxEngineError::Amount(m) if m.contains("no native token")),
+                "{error}"
+            );
+        }
     }
 
     /// A payable constructor moves native value, and the valuation selector
@@ -6352,7 +7314,6 @@ mod tests {
             nonce: None,
             gas_limit_hint: None,
             usd_value_hint: None,
-            review_mode: None,
         };
         let staged = engine
             .stage(
@@ -6381,6 +7342,62 @@ mod tests {
         assert_eq!(subject.total_value_usd_micro, Some(1_250_000));
         assert_eq!(calls.lock().len(), 1);
         assert_eq!(calls.lock()[0].1, "1250000");
+    }
+
+    #[tokio::test]
+    async fn stage_erc20_transfer_accepts_bare_fractional_amount() {
+        // `send 0.5 USDC to ...` and `{"token":"USDC","amount":"0.5"}` both
+        // carry a bare "0.5"; it must scale by the token's decimals, not wei.
+        let url = spawn_stage_rpc(false).await;
+        let oracle = RecordingOracle {
+            calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            usd_micro: 500_000,
+            age_ms: 0,
+            max_age_ms: 60_000,
+        };
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle);
+        let token_addr: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        engine.token_cache.write().insert(
+            (31337, token_addr),
+            TokenMeta {
+                address: token_addr,
+                symbol: "USDC".into(),
+                decimals: 6,
+            },
+        );
+        let intent = RawIntent {
+            body: RawIntentBody::Send {
+                to: "0x2222222222222222222222222222222222222222".into(),
+                value: String::new(),
+                token: Some(token_addr.to_string()),
+                amount: "0.5".into(),
+                data: None,
+            },
+            chain: Some("anvil".into()),
+            gas: bloom_proto::intent::GasStrategy::Auto,
+            nonce: None,
+            gas_limit_hint: None,
+            usd_value_hint: None,
+        };
+        let staged = engine
+            .stage(
+                &permit,
+                "alice",
+                "0x3333333333333333333333333333333333333333"
+                    .parse()
+                    .unwrap(),
+                intent,
+                &chain,
+                &policy_with_usd_cap(),
+                None,
+            )
+            .await
+            .unwrap();
+        let token = staged.token.as_ref().unwrap();
+        assert_eq!(token.amount, "0.5");
+        assert_eq!(token.amount_base_units.as_deref(), Some("500000"));
     }
 
     #[tokio::test]
@@ -6475,62 +7492,6 @@ mod tests {
             decision,
             bloom_proto::AutonomyDecision::ApprovedAutonomous { .. }
         ));
-    }
-
-    #[tokio::test]
-    async fn stage_rejects_a_review_mode_broker_no_longer_takes() {
-        let url = spawn_stage_rpc(true).await;
-        let oracle = RecordingOracle {
-            calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
-            usd_micro: 42_000_000,
-            age_ms: 0,
-            max_age_ms: 60_000,
-        };
-        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle);
-        let from: Address = TEST_SIGNER_ADDRESS.parse().unwrap();
-        let body = r#"{"kind":"deploy","data":"0x60006000f3","value":"123 wei"}"#;
-        let mut intent = crate::intent_parser::parse(body).unwrap();
-        intent.review_mode = Some("opaque_exact".into());
-        let error = engine
-            .stage(
-                &permit,
-                "alice",
-                from,
-                intent,
-                &chain,
-                &Policy::default(),
-                None,
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(&error, TxEngineError::ApprovalConstruction(reason) if reason.contains("no longer accepted")),
-            "{error:?}"
-        );
-        // The rejection happens before any nonce reservation or outbox write.
-        assert!(
-            engine
-                .outbox
-                .list("alice", "anvil", OutboxState::Pending)
-                .unwrap()
-                .is_empty()
-        );
-        // The one value that still describes what Broker does stages.
-        let mut intent = crate::intent_parser::parse(body).unwrap();
-        intent.review_mode = Some("clear".into());
-        let staged = engine
-            .stage(
-                &permit,
-                "alice",
-                from,
-                intent,
-                &chain,
-                &Policy::default(),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(staged.review_mode.as_deref(), Some("clear"));
     }
 
     #[tokio::test]
@@ -6723,7 +7684,6 @@ mod tests {
             nonce: None,
             gas_limit_hint: None,
             usd_value_hint: Some("999999".into()),
-            review_mode: None,
         };
         let staged = engine
             .stage(
@@ -6768,7 +7728,6 @@ mod tests {
             nonce: None,
             gas_limit_hint: None,
             usd_value_hint: Some("999999".into()),
-            review_mode: None,
         };
         let staged = engine
             .stage_with_oracle_valuation_target(
@@ -6838,6 +7797,716 @@ mod tests {
         assert!(error.to_string().contains("does not match"));
     }
 
+    /// A pending EIP-1559 entry `fee-repair` with a Petal origin, and an
+    /// engine whose Broker fixture authorizes confirm and replace.
+    struct FeeRepair {
+        _directory: tempfile::TempDir,
+        permit: HomeWritePermit,
+        outbox: Outbox,
+        fixture: Arc<TriadBrokerFixture>,
+        engine: TxEngine,
+        staged: StagedTx,
+        chain: ChainClient,
+    }
+
+    fn fee_repair_fixture(url: &str, edit: impl FnOnce(&mut StagedTx)) -> FeeRepair {
+        fee_repair_fixture_with(url, edit, None)
+    }
+
+    fn fee_repair_fixture_with(
+        url: &str,
+        edit: impl FnOnce(&mut StagedTx),
+        projection: Option<Arc<dyn crate::outbox::CentralOutboxProjection>>,
+    ) -> FeeRepair {
+        let directory = tempfile::tempdir().unwrap();
+        let permit = permit_for(&directory);
+        let root = directory.path().join("outbox");
+        let outbox = match projection {
+            Some(projection) => Outbox::new_with_projection(root, projection),
+            None => Outbox::new(root),
+        }
+        .unwrap();
+        let mut staged = fake_staged_1559("fee-repair");
+        staged.created_ms = now_ms();
+        staged.data_hex = "0x12345678".into();
+        staged.execution_origin = Some(ExecutionOrigin {
+            petal_id: "petal:test".into(),
+            petal_digest: "aa".repeat(32),
+            petal_version: "v1".into(),
+            route_id: Some("r000001".into()),
+        });
+        edit(&mut staged);
+        outbox.write_pending(&staged, "original plan").unwrap();
+        let fixture = Arc::new(TriadBrokerFixture {
+            active: AtomicBool::new(false),
+            approval_terminal: parking_lot::Mutex::new(None),
+            deny_sign: parking_lot::Mutex::new(None),
+            operation_terminal: parking_lot::Mutex::new(None),
+            lose_sign_response_once: AtomicBool::new(false),
+            corrupt_status_result: AtomicBool::new(false),
+            completed_result: parking_lot::Mutex::new(None),
+            requests: parking_lot::Mutex::new(Vec::new()),
+            key_ref: triad_key_ref(),
+            derived: Vec::new(),
+        });
+        let mut catalog = triad_catalog();
+        let mut replacement = catalog.records[0].clone();
+        replacement.subject = ProvenanceSubject::System {
+            component_id: Token::new("bloom-machine").unwrap(),
+            operation_class: Token::new("transaction.replace").unwrap(),
+        };
+        replacement.operation_classes[0].operation_class =
+            Token::new("transaction.replace").unwrap();
+        catalog.records.push(replacement);
+        let service: Arc<dyn MachineBrokerService> = fixture.clone();
+        let engine = TxEngine::new(outbox.clone(), 60_000)
+            .with_triad_signing(MachineBrokerClient::new(service), catalog)
+            .unwrap();
+        FeeRepair {
+            _directory: directory,
+            permit,
+            outbox,
+            fixture,
+            engine,
+            staged,
+            chain: stage_chain(url),
+        }
+    }
+
+    fn repair_fees(max_fee: &str, priority: &str) -> Eip1559FeeOverrides {
+        Eip1559FeeOverrides::from_decimal_pair(Some(max_fee), Some(priority), false)
+            .unwrap()
+            .unwrap()
+    }
+
+    impl FeeRepair {
+        async fn repair(&self, fees: Eip1559FeeOverrides) -> Result<StagedTx, TxEngineError> {
+            self.engine
+                .replace_fees(
+                    &self.permit,
+                    "alice",
+                    "anvil",
+                    "fee-repair",
+                    &self.chain,
+                    fees,
+                    &Policy::default(),
+                )
+                .await
+        }
+
+        async fn confirm(&self) -> Result<StagedTx, TxEngineError> {
+            self.engine
+                .confirm(
+                    &self.permit,
+                    "alice",
+                    "anvil",
+                    "fee-repair",
+                    &self.chain,
+                    &Policy::default(),
+                    "confirm",
+                )
+                .await
+        }
+    }
+
+    /// Fee repair admits a pending entry to broadcast, so it must pass the
+    /// same dependency and simulation gates as confirm, before any ceremony.
+    #[tokio::test]
+    async fn fee_repair_refuses_unsatisfied_dependency_and_failed_simulation() {
+        let url = spawn_batch_rpc(None).await;
+        let f = fee_repair_fixture(&url, |staged| staged.depends_on = Some("approve".into()));
+        f.fixture.active.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            f.repair(repair_fees("500", "250")).await,
+            Err(TxEngineError::DependencyNotSatisfied { .. })
+        ));
+        assert!(f.fixture.requests.lock().is_empty());
+
+        let url = spawn_queued_rpc(HashMap::from([(
+            "eth_call".into(),
+            vec![r#"error:{"code":3,"message":"execution reverted","data":"0x"}"#.into()],
+        )]))
+        .await;
+        let f = fee_repair_fixture(&url, |_| {});
+        f.fixture.active.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            f.repair(repair_fees("500", "250")).await,
+            Err(TxEngineError::SimulationReverted { .. })
+        ));
+        assert!(f.fixture.requests.lock().is_empty());
+        let entry = f.outbox.read("alice", "anvil", "fee-repair").unwrap();
+        assert_eq!(entry.state, OutboxState::Pending);
+        assert!(!entry.dir.join("replacement_intent.json").exists());
+    }
+
+    /// The node accepts a repair but its response is lost; the retry answers
+    /// "already known". The retry, and one interrupted before the move to
+    /// sent, must settle the recorded replacement without signing again.
+    #[tokio::test]
+    async fn fee_repair_reconciles_an_ambiguous_replacement_broadcast() {
+        for interrupted in [false, true] {
+            let mut responses = HashMap::from([
+                (
+                    "eth_chainId".to_string(),
+                    vec!["\"0x7a69\"".to_string(); 20],
+                ),
+                ("eth_call".into(), vec!["\"0x\"".into(); 20]),
+                ("eth_getTransactionCount".into(), vec!["\"0x0\"".into(); 20]),
+                ("eth_getTransactionByHash".into(), vec!["null".into(); 20]),
+                ("eth_getTransactionReceipt".into(), vec!["null".into(); 20]),
+            ]);
+            let mut sends =
+                vec![r#"error:{"code":-32000,"message":"request timed out"}"#.to_string()];
+            sends.extend(vec![
+                r#"error:{"code":-32000,"message":"already known"}"#
+                    .to_string();
+                20
+            ]);
+            responses.insert("eth_sendRawTransaction".into(), sends);
+            let url = spawn_queued_rpc(responses).await;
+            let f = fee_repair_fixture(&url, |_| {});
+            assert!(matches!(
+                f.repair(repair_fees("500", "250")).await,
+                Err(TxEngineError::ApprovalRequired(_))
+            ));
+            f.fixture.active.store(true, Ordering::SeqCst);
+            assert!(f.repair(repair_fees("500", "250")).await.is_err());
+            let pending = f.outbox.read("alice", "anvil", "fee-repair").unwrap();
+            assert_eq!(pending.state, OutboxState::Pending);
+            let attempt = f
+                .outbox
+                .read_broadcast_attempt(&pending, BroadcastAttemptKind::Replacement)
+                .unwrap()
+                .expect("replacement marker precedes submission");
+            if interrupted {
+                // Finalization records the hash on the pending row first.
+                let mut recorded = pending.staged.clone();
+                recorded.tx_hash = Some(attempt.tx_hash.clone());
+                std::fs::write(
+                    pending.dir.join("intent.json"),
+                    serde_json::to_vec(&recorded).unwrap(),
+                )
+                .unwrap();
+            }
+            let signs = || {
+                f.fixture
+                    .requests
+                    .lock()
+                    .iter()
+                    .filter(|request| matches!(request, MachineBrokerRequest::SigningSign(_)))
+                    .count()
+            };
+            let signs_before = signs();
+
+            // Different fees on retry must not produce a second replacement.
+            let settled = f.repair(repair_fees("900", "450")).await.unwrap();
+            assert_eq!(signs(), signs_before);
+            assert_eq!(settled.tx_hash.as_deref(), Some(attempt.tx_hash.as_str()));
+            let sent = f.outbox.read("alice", "anvil", "fee-repair").unwrap();
+            assert_eq!(sent.state, OutboxState::Sent);
+            assert_eq!(sent.staged.tx_hash, Some(attempt.tx_hash.clone()));
+            assert_eq!(sent.staged.max_priority_fee_per_gas.as_deref(), Some("250"));
+            assert_eq!(sent.staged.data_hex, f.staged.data_hex);
+            assert_eq!(
+                std::fs::read_to_string(sent.dir.join("tx_hash")).unwrap(),
+                attempt.tx_hash
+            );
+        }
+    }
+
+    /// A node that refuses a repair outright (here: underpriced) never
+    /// accepted it, so a later repair with higher approved fees signs and
+    /// sends a new replacement instead of replaying the refused bytes.
+    #[tokio::test]
+    async fn fee_repair_after_a_definite_rejection_admits_higher_fees() {
+        let mut responses = HashMap::from([
+            (
+                "eth_chainId".to_string(),
+                vec!["\"0x7a69\"".to_string(); 40],
+            ),
+            ("eth_call".into(), vec!["\"0x\"".into(); 40]),
+            ("eth_getTransactionCount".into(), vec!["\"0x0\"".into(); 40]),
+            ("eth_getTransactionByHash".into(), vec!["null".into(); 40]),
+            ("eth_getTransactionReceipt".into(), vec!["null".into(); 40]),
+        ]);
+        responses.insert(
+            "eth_sendRawTransaction".into(),
+            vec![
+                r#"error:{"code":-32000,"message":"replacement transaction underpriced"}"#
+                    .to_string(),
+                r#"error:{"code":-32000,"message":"request timed out"}"#.to_string(),
+                r#"error:{"code":-32000,"message":"already known"}"#.to_string(),
+            ],
+        );
+        let url = spawn_queued_rpc(responses).await;
+        let f = fee_repair_fixture(&url, |_| {});
+        assert!(matches!(
+            f.repair(repair_fees("500", "250")).await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        f.fixture.active.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            f.repair(repair_fees("500", "250")).await,
+            Err(TxEngineError::Chain(_))
+        ));
+        let pending = f.outbox.read("alice", "anvil", "fee-repair").unwrap();
+        assert!(
+            f.outbox
+                .read_broadcast_attempt(&pending, BroadcastAttemptKind::Replacement)
+                .unwrap()
+                .is_none(),
+            "a refused attempt must not be replayed"
+        );
+        let rejected: Vec<String> = std::fs::read_dir(&pending.dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .strip_prefix("replacement_broadcast_attempted.json.rejected-")
+                    .map(str::to_owned)
+            })
+            .collect();
+        assert_eq!(rejected.len(), 1, "the refused attempt stays as evidence");
+        // Only non-executable metadata stays public: the raw signed bytes
+        // are deleted and the signing record is hidden.
+        for item in std::fs::read_dir(&pending.dir).unwrap().flatten() {
+            let name = item.file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.contains(BroadcastAttemptKind::Replacement.raw_name())
+                    && !name.starts_with(TRIAD_SIGNING_STATE_FILE),
+                "{name}"
+            );
+        }
+
+        // The higher fees need their own approval, then sign a new attempt.
+        f.fixture.active.store(false, Ordering::SeqCst);
+        *f.fixture.completed_result.lock() = None;
+        let waiting = f.repair(repair_fees("900", "450")).await;
+        assert!(
+            matches!(waiting, Err(TxEngineError::ApprovalRequired(_))),
+            "{waiting:?}"
+        );
+        f.fixture.active.store(true, Ordering::SeqCst);
+        // Its send times out: that is ambiguous, so the attempt is kept and
+        // the next write replays it rather than signing again.
+        assert!(f.repair(repair_fees("900", "450")).await.is_err());
+        let pending = f.outbox.read("alice", "anvil", "fee-repair").unwrap();
+        let attempt = f
+            .outbox
+            .read_broadcast_attempt(&pending, BroadcastAttemptKind::Replacement)
+            .unwrap()
+            .expect("an ambiguous attempt is kept");
+        assert_ne!(attempt.tx_hash, rejected[0]);
+        let settled = f.repair(repair_fees("900", "450")).await.unwrap();
+        assert_eq!(settled.tx_hash.as_deref(), Some(attempt.tx_hash.as_str()));
+        assert_eq!(settled.max_priority_fee_per_gas.as_deref(), Some("450"));
+        let sent = f.outbox.read("alice", "anvil", "fee-repair").unwrap();
+        assert_eq!(sent.state, OutboxState::Sent);
+    }
+
+    /// Retiring a refused repair hides its signing record, renames its
+    /// marker and deletes its raw bytes. If the process stops before the
+    /// marker moves, the next higher-fee repair is refused once more,
+    /// finishes the retirement, and the one after that starts a fresh
+    /// approval.
+    #[tokio::test]
+    async fn interrupted_rejection_retirement_finishes_on_the_next_repair() {
+        for signing_record_moved in [false, true] {
+            let underpriced =
+                r#"error:{"code":-32000,"message":"replacement transaction underpriced"}"#;
+            let timeout = r#"error:{"code":-32000,"message":"request timed out"}"#;
+            let url = spawn_queued_rpc(HashMap::from([
+                (
+                    "eth_chainId".to_string(),
+                    vec!["\"0x7a69\"".to_string(); 40],
+                ),
+                ("eth_call".into(), vec!["\"0x\"".into(); 40]),
+                ("eth_getTransactionCount".into(), vec!["\"0x0\"".into(); 40]),
+                ("eth_getTransactionByHash".into(), vec!["null".into(); 40]),
+                ("eth_getTransactionReceipt".into(), vec!["null".into(); 40]),
+                (
+                    "eth_sendRawTransaction".into(),
+                    vec![timeout.into(), underpriced.into(), underpriced.into()],
+                ),
+            ]))
+            .await;
+            let f = fee_repair_fixture(&url, |_| {});
+            let _ = f.repair(repair_fees("500", "250")).await;
+            f.fixture.active.store(true, Ordering::SeqCst);
+            // An ambiguous send keeps the bytes; the replay is refused.
+            assert!(f.repair(repair_fees("500", "250")).await.is_err());
+            let dir = f.outbox.read("alice", "anvil", "fee-repair").unwrap().dir;
+            let raw_path = dir.join(BroadcastAttemptKind::Replacement.raw_name());
+            let raw = std::fs::read(&raw_path).unwrap();
+            assert!(matches!(
+                f.repair(repair_fees("500", "250")).await,
+                Err(TxEngineError::Chain(_))
+            ));
+            assert!(!raw_path.exists());
+            // Undo the retirement, as if the process stopped part way.
+            std::fs::write(&raw_path, raw).unwrap();
+            let mut names = vec![("", BroadcastAttemptKind::Replacement.marker_name())];
+            if !signing_record_moved {
+                names.push((".", TRIAD_SIGNING_STATE_FILE));
+            }
+            for (hidden, name) in names {
+                let retired = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .flatten()
+                    .find(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .starts_with(&format!("{hidden}{name}.rejected-"))
+                    })
+                    .unwrap();
+                std::fs::rename(retired.path(), dir.join(name)).unwrap();
+            }
+
+            assert!(matches!(
+                f.repair(repair_fees("900", "450")).await,
+                Err(TxEngineError::Chain(_))
+            ));
+            assert!(!dir.join(TRIAD_SIGNING_STATE_FILE).exists());
+            f.fixture.active.store(false, Ordering::SeqCst);
+            *f.fixture.completed_result.lock() = None;
+            let fresh = f.repair(repair_fees("900", "450")).await;
+            assert!(
+                matches!(fresh, Err(TxEngineError::ApprovalRequired(_))),
+                "{fresh:?}"
+            );
+        }
+    }
+
+    /// Higher fee caps raise the worst-case gas cost. A repair the account
+    /// cannot afford is denied before any ceremony; a node's
+    /// insufficient-funds refusal retires the attempt instead of wedging
+    /// the row on the same unaffordable bytes.
+    #[tokio::test]
+    async fn fee_repair_rechecks_native_funds_and_retires_an_unaffordable_attempt() {
+        let base = || {
+            HashMap::from([
+                (
+                    "eth_chainId".to_string(),
+                    vec!["\"0x7a69\"".to_string(); 40],
+                ),
+                ("eth_call".into(), vec!["\"0x\"".into(); 40]),
+                ("eth_getTransactionCount".into(), vec!["\"0x0\"".into(); 40]),
+                ("eth_getTransactionByHash".into(), vec!["null".into(); 40]),
+                ("eth_getTransactionReceipt".into(), vec!["null".into(); 40]),
+            ])
+        };
+        let mut poor = base();
+        poor.insert("eth_getBalance".into(), vec!["\"0x1\"".into(); 4]);
+        let f = fee_repair_fixture(&spawn_queued_rpc(poor).await, |_| {});
+        f.fixture.active.store(true, Ordering::SeqCst);
+        let denied = f.repair(repair_fees("500", "250")).await;
+        assert!(
+            matches!(&denied, Err(TxEngineError::ApprovalDenied(reason))
+                if reason.contains("balance.native_funds")),
+            "{denied:?}"
+        );
+        assert!(f.fixture.requests.lock().is_empty());
+
+        let mut refused = base();
+        refused.insert(
+            "eth_sendRawTransaction".into(),
+            vec![
+                r#"error:{"code":-32000,"message":"insufficient funds for gas * price + value"}"#
+                    .into(),
+            ],
+        );
+        let f = fee_repair_fixture(&spawn_queued_rpc(refused).await, |_| {});
+        let _ = f.repair(repair_fees("500", "250")).await;
+        f.fixture.active.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            f.repair(repair_fees("500", "250")).await,
+            Err(TxEngineError::Chain(_))
+        ));
+        let pending = f.outbox.read("alice", "anvil", "fee-repair").unwrap();
+        assert!(
+            f.outbox
+                .read_broadcast_attempt(&pending, BroadcastAttemptKind::Replacement)
+                .unwrap()
+                .is_none(),
+            "a refused unaffordable attempt must not be replayed"
+        );
+    }
+
+    /// Stages central actions but cannot write their result or status.
+    struct ResultlessProjection;
+
+    impl crate::outbox::CentralOutboxProjection for ResultlessProjection {
+        fn allocate_action_id(&self, _: &str, _: &str, _: &str, _: u64) -> Result<String, String> {
+            Ok("act-1".into())
+        }
+        fn stage_action(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: &str,
+            _: &[u8],
+            _: crate::outbox::CentralActionIdentity<'_>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn transition_action(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn write_action_file(&self, _: &str, _: &str, file: &str, _: &[u8]) -> Result<(), String> {
+            match file {
+                "approval_challenge.json" => Ok(()),
+                _ => Err("central store unavailable".into()),
+            }
+        }
+        fn read_action_file(&self, _: &str, _: &str, _: &str) -> Result<Vec<u8>, String> {
+            Err("not found".into())
+        }
+    }
+
+    /// Once the node accepts a repair, the sent row is the record: a failed
+    /// central projection must not tell the caller the repair failed.
+    #[tokio::test]
+    async fn accepted_fee_repair_succeeds_when_the_central_projection_fails() {
+        let url = spawn_batch_rpc(None).await;
+        let f = fee_repair_fixture_with(&url, |_| {}, Some(Arc::new(ResultlessProjection)));
+        let _ = f.repair(repair_fees("500", "250")).await;
+        f.fixture.active.store(true, Ordering::SeqCst);
+        let repaired = f.repair(repair_fees("500", "250")).await.unwrap();
+        let sent = f.outbox.read("alice", "anvil", "fee-repair").unwrap();
+        assert_eq!(sent.state, OutboxState::Sent);
+        assert_eq!(sent.staged.tx_hash, repaired.tx_hash);
+    }
+
+    /// The hash is recorded before the entry leaves pending. If the move to
+    /// sent fails after the broadcast, the pending entry still names the
+    /// transaction, so a restart reconciles it instead of losing it.
+    #[tokio::test]
+    async fn broadcast_hash_survives_a_failed_move_to_sent() {
+        let url = spawn_batch_rpc(None).await;
+        let f = fee_repair_fixture(&url, |_| {});
+        let _ = f.confirm().await;
+        f.fixture.active.store(true, Ordering::SeqCst);
+        let pending = f.outbox.read("alice", "anvil", "fee-repair").unwrap();
+        // A file where the sent directory goes makes the move fail.
+        let chain_dir = pending.dir.parent().unwrap().parent().unwrap();
+        std::fs::write(chain_dir.join("sent"), b"").unwrap();
+        assert!(f.confirm().await.is_err());
+        let kept = f.outbox.read("alice", "anvil", "fee-repair").unwrap();
+        assert_eq!(kept.state, OutboxState::Pending);
+        assert!(kept.staged.tx_hash.is_some(), "{:?}", kept.staged);
+        assert_eq!(kept.staged.status, TxStatus::Sent);
+    }
+
+    /// A different action may not supersede a dispatched signing operation
+    /// whose signature was never recorded: that would lose its only handle.
+    #[tokio::test]
+    async fn another_action_cannot_supersede_an_uncollected_signature() {
+        let url = spawn_batch_rpc(None).await;
+        let f = fee_repair_fixture(&url, |_| {});
+        assert!(matches!(
+            f.confirm().await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        f.fixture.active.store(true, Ordering::SeqCst);
+        f.fixture
+            .lose_sign_response_once
+            .store(true, Ordering::SeqCst);
+        assert!(f.confirm().await.is_err());
+        let entry = f.outbox.read("alice", "anvil", "fee-repair").unwrap();
+        let dispatched = read_triad_signing_state(&entry.dir.join(TRIAD_SIGNING_STATE_FILE))
+            .unwrap()
+            .unwrap();
+        assert!(dispatched.sign_dispatched);
+        assert!(dispatched.ceremony_url.is_none());
+
+        let error = f.repair(repair_fees("500", "250")).await.unwrap_err();
+        assert!(
+            matches!(&error, TxEngineError::ApprovalState(message) if message.contains("not recorded") && message.contains("write confirm to this entry's confirm control")),
+            "{error}"
+        );
+        let kept = read_triad_signing_state(&entry.dir.join(TRIAD_SIGNING_STATE_FILE))
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.signing_operation_id, dispatched.signing_operation_id);
+
+        // Retrying the dispatched action collects its signature and sends it.
+        let sent = f.confirm().await.unwrap();
+        assert_eq!(sent.status, TxStatus::Sent);
+    }
+
+    /// The refusal names the write that resumes the uncollected action: a
+    /// fee repair is resumed through `replace`, not `confirm`.
+    #[tokio::test]
+    async fn an_uncollected_fee_repair_names_the_replace_write() {
+        let url = spawn_batch_rpc(None).await;
+        let f = fee_repair_fixture(&url, |_| {});
+        let _ = f.repair(repair_fees("500", "250")).await;
+        f.fixture.active.store(true, Ordering::SeqCst);
+        f.fixture
+            .lose_sign_response_once
+            .store(true, Ordering::SeqCst);
+        assert!(f.repair(repair_fees("500", "250")).await.is_err());
+        let error = f.confirm().await.unwrap_err();
+        assert!(
+            matches!(&error, TxEngineError::ApprovalState(message)
+                if message.contains("replacement_request.json) to this entry's replace control")),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fee_repair_requires_fresh_approval_and_keeps_the_rejected_call() {
+        let url = spawn_batch_rpc(Some(1)).await;
+        let FeeRepair {
+            _directory,
+            permit,
+            outbox,
+            fixture,
+            engine,
+            staged,
+            chain,
+        } = fee_repair_fixture(&url, |_| {});
+        let policy = Policy::default();
+        assert!(matches!(
+            engine
+                .confirm(
+                    &permit,
+                    "alice",
+                    "anvil",
+                    "fee-repair",
+                    &chain,
+                    &policy,
+                    "confirm"
+                )
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        fixture.active.store(true, Ordering::SeqCst);
+        assert!(
+            engine
+                .confirm(
+                    &permit,
+                    "alice",
+                    "anvil",
+                    "fee-repair",
+                    &chain,
+                    &policy,
+                    "confirm"
+                )
+                .await
+                .is_err()
+        );
+        let original = outbox.read("alice", "anvil", "fee-repair").unwrap();
+        let original_attempt = outbox
+            .read_broadcast_attempt(&original, BroadcastAttemptKind::Confirm)
+            .unwrap()
+            .unwrap();
+        let original_signing =
+            read_triad_signing_state(&original.dir.join(TRIAD_SIGNING_STATE_FILE))
+                .unwrap()
+                .unwrap();
+
+        // This fixture keeps one operation result; the replacement has its
+        // own approval and signing identities, not the original's result.
+        *fixture.completed_result.lock() = None;
+
+        let requests_before = fixture.requests.lock().len();
+        for (max_fee, priority) in [("109", "20"), ("120", "10")] {
+            let fees = Eip1559FeeOverrides::from_decimal_pair(Some(max_fee), Some(priority), false)
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                engine
+                    .replace_fees(
+                        &permit,
+                        "alice",
+                        "anvil",
+                        "fee-repair",
+                        &chain,
+                        fees,
+                        &policy
+                    )
+                    .await,
+                Err(TxEngineError::InvalidFeeOverride(_))
+            ));
+        }
+        assert_eq!(fixture.requests.lock().len(), requests_before);
+
+        fixture.active.store(false, Ordering::SeqCst);
+        let fees = Eip1559FeeOverrides::from_decimal_pair(Some("500"), Some("250"), false)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            engine
+                .replace_fees(
+                    &permit,
+                    "alice",
+                    "anvil",
+                    "fee-repair",
+                    &chain,
+                    fees,
+                    &policy
+                )
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        let waiting = outbox.read("alice", "anvil", "fee-repair").unwrap();
+        assert_eq!(waiting.state, OutboxState::Pending);
+        assert_eq!(
+            waiting.staged.max_priority_fee_per_gas,
+            staged.max_priority_fee_per_gas
+        );
+        let signing = read_triad_signing_state(&waiting.dir.join(TRIAD_SIGNING_STATE_FILE))
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            signing.approval_operation_id,
+            original_signing.approval_operation_id
+        );
+        assert_ne!(signing.payload_digest, original_signing.payload_digest);
+        assert!(!signing.sign_dispatched);
+        let candidate: StagedTx = serde_json::from_slice(
+            &std::fs::read(waiting.dir.join("replacement_intent.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(candidate.nonce, staged.nonce);
+        assert_eq!(candidate.from, staged.from);
+        assert_eq!(candidate.to, staged.to);
+        assert_eq!(candidate.data_hex, staged.data_hex);
+        assert_eq!(candidate.value_wei, staged.value_wei);
+        assert_eq!(candidate.execution_origin, staged.execution_origin);
+
+        fixture.active.store(true, Ordering::SeqCst);
+        let repaired = engine
+            .replace_fees(
+                &permit,
+                "alice",
+                "anvil",
+                "fee-repair",
+                &chain,
+                fees,
+                &policy,
+            )
+            .await
+            .unwrap();
+        let sent = outbox.read("alice", "anvil", "fee-repair").unwrap();
+        assert_eq!(sent.state, OutboxState::Sent);
+        assert_eq!(sent.staged.tx_hash, repaired.tx_hash);
+        assert_eq!(sent.staged.max_priority_fee_per_gas.as_deref(), Some("250"));
+        assert_eq!(sent.staged.data_hex, staged.data_hex);
+        assert_eq!(sent.staged.execution_origin, staged.execution_origin);
+        assert_eq!(
+            outbox
+                .read_broadcast_attempt(&sent, BroadcastAttemptKind::Confirm)
+                .unwrap()
+                .unwrap()
+                .tx_hash,
+            original_attempt.tx_hash
+        );
+        assert!(sent.dir.join("replacement_original.json").exists());
+    }
+
     #[tokio::test]
     async fn triad_confirm_persists_prepare_identity_then_signs_exact_preimage_after_activation() {
         let directory = tempfile::tempdir().unwrap();
@@ -6852,7 +8521,8 @@ mod tests {
         let fixture = Arc::new(TriadBrokerFixture {
             active: AtomicBool::new(false),
             approval_terminal: parking_lot::Mutex::new(None),
-            signing_terminal: parking_lot::Mutex::new(None),
+            deny_sign: parking_lot::Mutex::new(None),
+            operation_terminal: parking_lot::Mutex::new(None),
             lose_sign_response_once: AtomicBool::new(false),
             corrupt_status_result: AtomicBool::new(false),
             completed_result: parking_lot::Mutex::new(None),
@@ -6970,7 +8640,8 @@ mod tests {
         let fixture = Arc::new(TriadBrokerFixture {
             active: AtomicBool::new(true),
             approval_terminal: parking_lot::Mutex::new(None),
-            signing_terminal: parking_lot::Mutex::new(None),
+            deny_sign: parking_lot::Mutex::new(None),
+            operation_terminal: parking_lot::Mutex::new(None),
             lose_sign_response_once: AtomicBool::new(false),
             corrupt_status_result: AtomicBool::new(false),
             completed_result: parking_lot::Mutex::new(None),
@@ -7079,7 +8750,8 @@ mod tests {
         let fixture = Arc::new(TriadBrokerFixture {
             active: AtomicBool::new(true),
             approval_terminal: parking_lot::Mutex::new(None),
-            signing_terminal: parking_lot::Mutex::new(None),
+            deny_sign: parking_lot::Mutex::new(None),
+            operation_terminal: parking_lot::Mutex::new(None),
             lose_sign_response_once: AtomicBool::new(false),
             corrupt_status_result: AtomicBool::new(false),
             completed_result: parking_lot::Mutex::new(None),
@@ -7416,6 +9088,187 @@ mod tests {
         );
     }
 
+    /// Delegates to the fixture, but holds the first armed approval-status
+    /// response until released, and can fail the next wallet lookup.
+    struct HeldStatusBroker {
+        inner: Arc<TriadBrokerFixture>,
+        hold_next_status: AtomicBool,
+        fail_next_wallet: AtomicBool,
+        held: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl MachineBrokerService for HeldStatusBroker {
+        fn dispatch<'a>(
+            &'a self,
+            request: MachineBrokerRequest,
+        ) -> ServiceFuture<'a, MachineBrokerResponse> {
+            Box::pin(async move {
+                if matches!(request, MachineBrokerRequest::WalletGetPublic(_))
+                    && self.fail_next_wallet.swap(false, Ordering::SeqCst)
+                {
+                    return Err(bloom_broker_api::ProtocolError::new(
+                        ProtocolErrorCode::ServiceUnavailable,
+                        "simulated wallet lookup failure",
+                    ));
+                }
+                let hold = matches!(request, MachineBrokerRequest::SealedApprovalStatus(_))
+                    && self.hold_next_status.swap(false, Ordering::SeqCst);
+                let response = self.inner.dispatch(request).await;
+                if hold {
+                    self.held.notify_one();
+                    self.release.notified().await;
+                }
+                response
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn triad_concurrent_confirm_cannot_erase_a_dispatch_marker() {
+        // Confirm A reads the state before dispatch and waits on approval
+        // status. Confirm B dispatches signing and loses the response. A then
+        // resumes and fails before dispatching. The marker B wrote must
+        // survive, or discard and expiry would treat a signed entry as unsigned.
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let mut staged = fake_staged_1559("triad-concurrent");
+        staged.wallet = "alice".into();
+        staged.created_ms = now_ms();
+        outbox.write_pending(&staged, "exact EVM review").unwrap();
+        let entry = outbox
+            .read_in_state("alice", "anvil", &staged.id, OutboxState::Pending)
+            .unwrap();
+        let (engine, fixture, _) = triad_batch_fixture(outbox.clone(), false, false);
+        let unsigned = UnsignedEvmTx::Eip1559(TxEip1559 {
+            chain_id: staged.chain_id,
+            nonce: staged.nonce,
+            gas_limit: staged.gas_limit,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 10,
+            to: TxKind::Call(staged.to.as_deref().unwrap().parse().unwrap()),
+            value: U256::ZERO,
+            access_list: AccessList::default(),
+            input: Bytes::new(),
+        });
+        let preimage = TxEngine::unsigned_signing_preimage(&unsigned);
+        let signing_hash = TxEngine::unsigned_signing_hash(&unsigned);
+        macro_rules! sign {
+            ($engine:expr) => {
+                $engine.triad_sign_evm_payload(
+                    &entry,
+                    &staged,
+                    EvmOutboxActionKind::Confirm,
+                    &preimage,
+                    signing_hash,
+                )
+            };
+        }
+        assert!(matches!(
+            sign!(engine).await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        fixture.active.store(true, Ordering::SeqCst);
+        fixture
+            .lose_sign_response_once
+            .store(true, Ordering::SeqCst);
+        let broker = Arc::new(HeldStatusBroker {
+            inner: fixture.clone(),
+            hold_next_status: AtomicBool::new(true),
+            fail_next_wallet: AtomicBool::new(false),
+            held: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let service: Arc<dyn MachineBrokerService> = broker.clone();
+        let engine = TxEngine::new(outbox.clone(), 60_000)
+            .with_triad_signing(MachineBrokerClient::new(service), triad_catalog())
+            .unwrap();
+
+        let confirm_b = async {
+            broker.held.notified().await;
+            let b = sign!(engine);
+            tokio::pin!(b);
+            // Without serialization B finishes while A is held; with it, B
+            // waits for A, so release A after a bounded wait.
+            let finished = tokio::select! {
+                result = &mut b => Some(result),
+                () = tokio::time::sleep(Duration::from_millis(300)) => None,
+            };
+            broker.fail_next_wallet.store(true, Ordering::SeqCst);
+            broker.release.notify_one();
+            match finished {
+                Some(result) => result,
+                None => b.await,
+            }
+        };
+        let (a, b) = tokio::join!(sign!(engine), confirm_b);
+        assert!(a.is_err() && b.is_err(), "{a:?} {b:?}");
+
+        let dispatched = fixture
+            .requests
+            .lock()
+            .iter()
+            .filter(|request| matches!(request, MachineBrokerRequest::SigningSign(_)))
+            .count();
+        assert_eq!(dispatched, 1);
+        let state = read_triad_signing_state(&entry.dir.join(TRIAD_SIGNING_STATE_FILE))
+            .unwrap()
+            .unwrap();
+        assert!(state.sign_dispatched, "a stale write erased the marker");
+        assert!(matches!(
+            outbox.cancel("alice", "anvil", &staged.id),
+            Err(OutboxError::PossiblySigned { .. })
+        ));
+    }
+
+    #[test]
+    fn lifecycle_lock_waits_do_not_block_the_async_worker() {
+        // Signing takes the lifecycle lock on a blocking thread and hands it
+        // to its task. If a discard on the same single worker waited for the
+        // lock synchronously, that task could never run to release it.
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let mut staged = fake_staged_1559("unsigned");
+        staged.created_ms = now_ms();
+        outbox.write_pending(&staged, "unsigned").unwrap();
+        let permit = permit_for(&directory);
+        drop(outbox.lock_lifecycle().unwrap());
+        let engine = Arc::new(TxEngine::new(outbox, 60_000));
+        let lock_path = directory.path().join("outbox/.lifecycle.lock");
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let signer = engine.clone();
+                let signing = tokio::spawn(async move {
+                    signer
+                        .lock_signing_dispatch("alice", &[&staged])
+                        .await
+                        .map(drop)
+                });
+                // Let the blocking thread take the lock before the discard.
+                tokio::task::yield_now().await;
+                let probe = std::fs::File::open(&lock_path).unwrap();
+                while fs2::FileExt::try_lock_exclusive(&probe).is_ok() {
+                    fs2::FileExt::unlock(&probe).unwrap();
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let discarded = engine
+                    .discard_unsigned(&permit, "alice", "anvil", "unsigned")
+                    .await;
+                signing.await.unwrap().unwrap();
+                discarded.unwrap();
+            });
+            done.send(()).unwrap();
+        });
+        finished
+            .recv_timeout(Duration::from_secs(10))
+            .expect("discard deadlocked against a lifecycle lock handoff");
+    }
+
     #[tokio::test]
     async fn triad_confirm_quarantined_operation_stays_blocked_on_reconciliation() {
         let directory = tempfile::tempdir().unwrap();
@@ -7459,7 +9312,7 @@ mod tests {
         dead.sign_dispatched = true;
         dead.expected_operation_digest = Some(Digest32::from_bytes([11; 32]));
         write_triad_signing_state(&state_path, &dead).unwrap();
-        *fixture.signing_terminal.lock() = Some(OperationState::Quarantined);
+        *fixture.operation_terminal.lock() = Some(OperationState::Quarantined);
 
         let error = engine
             .triad_sign_evm_payload(
@@ -7472,8 +9325,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&error, TxEngineError::ApprovalDenied(reason) if reason.contains("quarantined")),
-            "ambiguous outcomes must stay blocked: {error:?}"
+            matches!(&error, TxEngineError::ApprovalState(reason) if reason.contains("quarantined")),
+            "ambiguous outcomes must stay blocked, never reported as denied: {error:?}"
         );
         let after = read_triad_signing_state(&state_path).unwrap().unwrap();
         assert_eq!(after.signing_operation_id, dead.signing_operation_id);
@@ -7675,7 +9528,7 @@ mod tests {
         dead.sign_dispatched = true;
         dead.expected_operation_digest = Some(Digest32::from_bytes([11; 32]));
         write_triad_signing_state(&state_path, &dead).unwrap();
-        *fixture.signing_terminal.lock() = Some(OperationState::Failed);
+        *fixture.operation_terminal.lock() = Some(OperationState::Failed);
 
         assert!(
             matches!(
@@ -7831,6 +9684,322 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_refused_signature_replaces_the_stale_single_lineage() {
+        let (engine, fixture, entry, staged, preimage, signing_hash, _outbox_dir) =
+            single_material("triad-refused", false);
+        // First call mints the approval and hands back the ceremony.
+        assert!(matches!(
+            engine
+                .triad_sign_evm_payload(
+                    &entry,
+                    &staged,
+                    EvmOutboxActionKind::Confirm,
+                    &preimage,
+                    signing_hash,
+                )
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        let state_path = entry.dir.join(TRIAD_SIGNING_STATE_FILE);
+        let first = read_triad_signing_state(&state_path).unwrap().unwrap();
+
+        fixture.active.store(true, Ordering::SeqCst);
+        // Recoverable and ambiguous errors must not mint another approval.
+        for code in [
+            ProtocolErrorCode::BackendInvalidRequest,
+            ProtocolErrorCode::UnauthenticatedPeer,
+            ProtocolErrorCode::UnsupportedVersion,
+            ProtocolErrorCode::AmbiguousProviderEffect,
+            ProtocolErrorCode::ServiceUnavailable,
+            ProtocolErrorCode::OperationIdConflict,
+        ] {
+            *fixture.deny_sign.lock() = Some(code);
+            let outcome = engine
+                .triad_sign_evm_payload(
+                    &entry,
+                    &staged,
+                    EvmOutboxActionKind::Confirm,
+                    &preimage,
+                    signing_hash,
+                )
+                .await;
+            // A retained, possibly signed request is unresolved, not denied.
+            assert!(
+                matches!(
+                    outcome,
+                    Err(TxEngineError::ApprovalState(_)
+                        | TxEngineError::ApprovalServiceUnavailable(_))
+                ),
+                "{code:?}: {outcome:?}"
+            );
+            let held = read_triad_signing_state(&state_path).unwrap().unwrap();
+            assert!(held.sign_dispatched, "{code:?}");
+            assert_eq!(held.approval_id, first.approval_id, "{code:?}");
+            assert_eq!(
+                held.signing_operation_id, first.signing_operation_id,
+                "{code:?}"
+            );
+            assert_eq!(held.request_nonce, first.request_nonce, "{code:?}");
+        }
+        // The simulated QUOTA_EXCEEDED above makes the Machine client refuse
+        // requests locally for its initial 250 ms backoff.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        *fixture.deny_sign.lock() = Some(ProtocolErrorCode::LimitExceededValue);
+        assert!(matches!(
+            engine
+                .triad_sign_evm_payload(
+                    &entry,
+                    &staged,
+                    EvmOutboxActionKind::Confirm,
+                    &preimage,
+                    signing_hash,
+                )
+                .await,
+            Err(TxEngineError::ApprovalRequired(required))
+                if required.reason.contains("LIMIT_EXCEEDED_VALUE")
+        ));
+
+        let state = read_triad_signing_state(&state_path).unwrap().unwrap();
+        assert_eq!(
+            ProtocolErrorCode::LimitExceededValue
+                .contract()
+                .durable_effect,
+            DurableEffect::ReservationReleased,
+            "the premise of this test is the Broker releasing the reservation, so nothing durable remains"
+        );
+        // Regression: only this marker was cleared. The stale approval and
+        // operation IDs still wedged both retry and cancellation.
+        assert!(
+            !state.sign_dispatched,
+            "a refusal that changed nothing must not leave a dispatch recorded"
+        );
+        assert!(state.expected_operation_digest.is_none());
+        // The fresh lineage is already prepared, awaiting its own ceremony.
+        assert!(state.approval_id.is_some() && state.approval_id != first.approval_id);
+        assert_ne!(state.approval_operation_id, first.approval_operation_id);
+        assert_ne!(state.signing_operation_id, first.signing_operation_id);
+        assert_ne!(state.request_nonce, first.request_nonce);
+
+        *fixture.deny_sign.lock() = None;
+        fixture.active.store(false, Ordering::SeqCst);
+        assert!(matches!(
+            engine
+                .triad_sign_evm_payload(
+                    &entry,
+                    &staged,
+                    EvmOutboxActionKind::Confirm,
+                    &preimage,
+                    signing_hash,
+                )
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        let reissued = read_triad_signing_state(&state_path).unwrap().unwrap();
+        assert_eq!(reissued.approval_operation_id, state.approval_operation_id);
+        assert_eq!(reissued.signing_operation_id, state.signing_operation_id);
+        assert!(reissued.approval_id.is_some());
+        assert_ne!(reissued.approval_id, first.approval_id);
+    }
+
+    #[tokio::test]
+    async fn confirm_keeps_a_refused_row_pending_behind_a_fresh_ceremony() {
+        let url = spawn_batch_rpc(None).await;
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let mut staged = fake_staged_1559("refused-confirm");
+        staged.created_ms = now_ms();
+        outbox.write_pending(&staged, "exact EVM review").unwrap();
+        let (engine, fixture, _) = triad_batch_fixture(outbox.clone(), false, false);
+        let (permit, chain, policy) =
+            (permit_for(&directory), stage_chain(&url), Policy::default());
+        let confirm = || {
+            engine.confirm(
+                &permit,
+                "alice",
+                "anvil",
+                "refused-confirm",
+                &chain,
+                &policy,
+                "y",
+            )
+        };
+        assert!(matches!(
+            confirm().await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        let first = read_triad_signing_state(
+            &outbox
+                .read("alice", "anvil", "refused-confirm")
+                .unwrap()
+                .dir
+                .join(TRIAD_SIGNING_STATE_FILE),
+        )
+        .unwrap()
+        .unwrap();
+
+        fixture.active.store(true, Ordering::SeqCst);
+        *fixture.deny_sign.lock() = Some(ProtocolErrorCode::LimitExceededValue);
+        let refused = confirm().await;
+        assert!(
+            matches!(refused, Err(TxEngineError::ApprovalRequired(_))),
+            "{refused:?}"
+        );
+        let entry = outbox.read("alice", "anvil", "refused-confirm").unwrap();
+        assert_eq!(
+            entry.state,
+            OutboxState::Pending,
+            "the retry lineage must stay usable"
+        );
+        let fresh = read_triad_signing_state(&entry.dir.join(TRIAD_SIGNING_STATE_FILE))
+            .unwrap()
+            .unwrap();
+        assert!(fresh.approval_id.is_some() && fresh.approval_id != first.approval_id);
+        assert!(!fresh.sign_dispatched);
+
+        *fixture.deny_sign.lock() = None;
+        let sent = confirm().await.unwrap();
+        assert_eq!(sent.status, TxStatus::Sent);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_after_expiry_still_records_the_entry_unsigned() {
+        let (engine, fixture, entry, mut staged, preimage, signing_hash, _outbox_dir) =
+            single_material("triad-refused-expired", false);
+        let sign = |staged: StagedTx| {
+            let (engine, entry, preimage) = (&engine, &entry, &preimage);
+            async move {
+                engine
+                    .triad_sign_evm_payload(
+                        entry,
+                        &staged,
+                        EvmOutboxActionKind::Confirm,
+                        preimage,
+                        signing_hash,
+                    )
+                    .await
+            }
+        };
+        assert!(matches!(
+            sign(staged.clone()).await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        fixture.active.store(true, Ordering::SeqCst);
+        *fixture.deny_sign.lock() = Some(ProtocolErrorCode::LimitExceededValue);
+        // The staged deadline passes while the request is in flight, so no
+        // fresh lineage can be prepared after the refusal.
+        staged.expires_ms = now_ms() - 1;
+        assert!(sign(staged).await.is_err());
+        let state = read_triad_signing_state(&entry.dir.join(TRIAD_SIGNING_STATE_FILE))
+            .unwrap()
+            .unwrap();
+        // A refusal proves no signature exists; a stale marker would make the
+        // expired entry look possibly signed and block its discard.
+        assert!(!state.sign_dispatched);
+        assert!(state.expected_operation_digest.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_refused_confirmation_can_be_superseded_by_cancellation() {
+        let (engine, fixture, entry, staged, preimage, signing_hash, _outbox_dir) =
+            single_material("triad-refused-cancel", false);
+        assert!(matches!(
+            engine
+                .triad_sign_evm_payload(
+                    &entry,
+                    &staged,
+                    EvmOutboxActionKind::Confirm,
+                    &preimage,
+                    signing_hash,
+                )
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        fixture.active.store(true, Ordering::SeqCst);
+        *fixture.deny_sign.lock() = Some(ProtocolErrorCode::ClaimInvalid);
+        assert!(matches!(
+            engine
+                .triad_sign_evm_payload(
+                    &entry,
+                    &staged,
+                    EvmOutboxActionKind::Confirm,
+                    &preimage,
+                    signing_hash,
+                )
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        let state_path = entry.dir.join(TRIAD_SIGNING_STATE_FILE);
+        let refused = read_triad_signing_state(&state_path).unwrap().unwrap();
+        assert!(!refused.sign_dispatched);
+
+        *fixture.deny_sign.lock() = None;
+        fixture.active.store(false, Ordering::SeqCst);
+        assert!(matches!(
+            engine
+                .triad_sign_evm_payload(
+                    &entry,
+                    &staged,
+                    EvmOutboxActionKind::Cancel,
+                    &preimage,
+                    signing_hash,
+                )
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        let cancellation = read_triad_signing_state(&state_path).unwrap().unwrap();
+        assert_eq!(
+            cancellation.action_id,
+            outbox_action_id(&staged, EvmOutboxActionKind::Cancel)
+        );
+        assert_ne!(
+            cancellation.approval_operation_id,
+            refused.approval_operation_id
+        );
+        assert!(cancellation.approval_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_lost_response_keeps_the_dispatch_marker_because_a_signature_may_exist() {
+        let (engine, fixture, entry, staged, preimage, signing_hash, _outbox_dir) =
+            single_material("triad-lost", true);
+        assert!(matches!(
+            engine
+                .triad_sign_evm_payload(
+                    &entry,
+                    &staged,
+                    EvmOutboxActionKind::Confirm,
+                    &preimage,
+                    signing_hash,
+                )
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+
+        // ServiceUnavailable after the Broker already committed: the signature
+        // exists, only the answer was lost. Clearing the marker here would let
+        // a retry sign the same nonce twice.
+        fixture.active.store(true, Ordering::SeqCst);
+        assert!(
+            engine
+                .triad_sign_evm_payload(
+                    &entry,
+                    &staged,
+                    EvmOutboxActionKind::Confirm,
+                    &preimage,
+                    signing_hash,
+                )
+                .await
+                .is_err()
+        );
+        let state_path = entry.dir.join(TRIAD_SIGNING_STATE_FILE);
+        let state = read_triad_signing_state(&state_path).unwrap().unwrap();
+        assert!(
+            state.sign_dispatched,
+            "an unresolved dispatch must stay recorded so recovery reconciles it"
+        );
+    }
+
     fn triad_batch_fixture(
         outbox: Outbox,
         active: bool,
@@ -7839,7 +10008,8 @@ mod tests {
         let fixture = Arc::new(TriadBrokerFixture {
             active: AtomicBool::new(active),
             approval_terminal: parking_lot::Mutex::new(None),
-            signing_terminal: parking_lot::Mutex::new(None),
+            deny_sign: parking_lot::Mutex::new(None),
+            operation_terminal: parking_lot::Mutex::new(None),
             lose_sign_response_once: AtomicBool::new(lose_sign_response_once),
             corrupt_status_result: AtomicBool::new(false),
             completed_result: parking_lot::Mutex::new(None),
@@ -7899,6 +10069,54 @@ mod tests {
         (refs, staged, preimages, hashes)
     }
 
+    /// Stage one entry and stand the engine up over it — the single-payload
+    /// counterpart of `batch_material`. Keep the returned `TempDir` alive for
+    /// the whole test: it owns the outbox tree on disk.
+    fn single_material(
+        id: &str,
+        lose_sign_response_once: bool,
+    ) -> (
+        TxEngine,
+        Arc<TriadBrokerFixture>,
+        crate::outbox::OutboxEntry,
+        StagedTx,
+        Vec<u8>,
+        B256,
+        tempfile::TempDir,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let mut staged = fake_staged_1559(id);
+        staged.created_ms = now_ms();
+        outbox.write_pending(&staged, "exact EVM review").unwrap();
+        let entry = outbox
+            .read_in_state("alice", "anvil", id, OutboxState::Pending)
+            .unwrap();
+        let (engine, fixture, _) = triad_batch_fixture(outbox, false, lose_sign_response_once);
+        let unsigned = UnsignedEvmTx::Eip1559(TxEip1559 {
+            chain_id: staged.chain_id,
+            nonce: staged.nonce,
+            gas_limit: staged.gas_limit,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 10,
+            to: TxKind::Call(staged.to.as_deref().unwrap().parse().unwrap()),
+            value: U256::ZERO,
+            access_list: AccessList::default(),
+            input: Bytes::new(),
+        });
+        let preimage = TxEngine::unsigned_signing_preimage(&unsigned);
+        let signing_hash = TxEngine::unsigned_signing_hash(&unsigned);
+        (
+            engine,
+            fixture,
+            entry,
+            staged,
+            preimage,
+            signing_hash,
+            directory,
+        )
+    }
+
     #[tokio::test]
     async fn batch_signing_state_lock_serializes_competing_confirmations() {
         let directory = tempfile::tempdir().unwrap();
@@ -7933,6 +10151,9 @@ mod tests {
         let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
         let (engine, fixture, _) = triad_batch_fixture(outbox, false, false);
         let (refs, staged, preimages, hashes) = batch_material(&["batch-a", "batch-b"]);
+        for plan in &staged {
+            engine.outbox.write_pending(plan, "p").unwrap();
+        }
 
         let error = engine
             .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
@@ -7975,6 +10196,197 @@ mod tests {
                 .iter()
                 .any(|request| matches!(request, MachineBrokerRequest::SigningSign(_)))
         );
+    }
+
+    #[tokio::test]
+    async fn a_refused_batch_signature_replaces_the_stale_lineage() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let (engine, fixture, _) = triad_batch_fixture(outbox.clone(), false, false);
+        let (refs, staged, preimages, hashes) = batch_material(&["refused-a", "refused-b"]);
+        for plan in &staged {
+            outbox.write_pending(plan, "p").unwrap();
+        }
+
+        assert!(matches!(
+            engine
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        let state_path = batch_signing_state_path(outbox.root(), "alice", &refs).unwrap();
+        let first = read_triad_batch_signing_state(&state_path)
+            .unwrap()
+            .unwrap();
+
+        fixture.active.store(true, Ordering::SeqCst);
+        for code in [
+            ProtocolErrorCode::BackendInvalidRequest,
+            ProtocolErrorCode::UnauthenticatedPeer,
+            ProtocolErrorCode::UnsupportedVersion,
+            ProtocolErrorCode::AmbiguousProviderEffect,
+            ProtocolErrorCode::ServiceUnavailable,
+            ProtocolErrorCode::OperationIdConflict,
+        ] {
+            *fixture.deny_sign.lock() = Some(code);
+            let outcome = engine
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .await;
+            assert!(
+                matches!(
+                    outcome,
+                    Err(TxEngineError::ApprovalState(_)
+                        | TxEngineError::ApprovalServiceUnavailable(_))
+                ),
+                "{code:?}: {outcome:?}"
+            );
+            let held = read_triad_batch_signing_state(&state_path)
+                .unwrap()
+                .unwrap();
+            assert!(held.sign_dispatched, "{code:?}");
+            assert_eq!(held.approval_id, first.approval_id, "{code:?}");
+            assert_eq!(
+                held.signing_operation_id, first.signing_operation_id,
+                "{code:?}"
+            );
+            assert_eq!(held.request_nonce, first.request_nonce, "{code:?}");
+        }
+        // The simulated QUOTA_EXCEEDED above makes the Machine client refuse
+        // requests locally for its initial 250 ms backoff.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        *fixture.deny_sign.lock() = Some(ProtocolErrorCode::LimitExceededValue);
+        assert!(matches!(
+            engine
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .await,
+            Err(TxEngineError::ApprovalRequired(required))
+                if required.reason.contains("LIMIT_EXCEEDED_VALUE")
+        ));
+
+        let state = read_triad_batch_signing_state(&state_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ProtocolErrorCode::LimitExceededValue
+                .contract()
+                .durable_effect,
+            DurableEffect::ReservationReleased,
+            "the premise of this test is the Broker releasing the reservation, so nothing durable remains"
+        );
+        // Regression: only this marker was cleared. The batch then reused its
+        // dead approval and immutable operation ID forever.
+        assert!(
+            !state.sign_dispatched,
+            "a refusal that changed nothing must not leave a dispatch recorded"
+        );
+        assert!(state.expected_operation_digest.is_none());
+        // The fresh lineage is already prepared, awaiting its own ceremony.
+        assert!(state.approval_id.is_some() && state.approval_id != first.approval_id);
+        assert_ne!(state.approval_operation_id, first.approval_operation_id);
+        assert_ne!(state.signing_operation_id, first.signing_operation_id);
+        assert_ne!(state.request_nonce, first.request_nonce);
+
+        *fixture.deny_sign.lock() = None;
+        fixture.active.store(false, Ordering::SeqCst);
+        assert!(matches!(
+            engine
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        let reissued = read_triad_batch_signing_state(&state_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reissued.approval_operation_id, state.approval_operation_id);
+        assert_eq!(reissued.signing_operation_id, state.signing_operation_id);
+        assert!(reissued.approval_id.is_some());
+        assert_ne!(reissued.approval_id, first.approval_id);
+    }
+
+    #[tokio::test]
+    async fn a_definitely_terminal_batch_operation_releases_the_row_but_quarantine_holds_it() {
+        for (terminal, marker_should_clear) in [
+            // The Broker releases the reservation for these and calls them a
+            // definite terminal failure: no signature exists or can.
+            (OperationState::Denied, true),
+            (OperationState::Cancelled, true),
+            (OperationState::Failed, true),
+            // Quarantine is an ambiguous provider effect. A signature may be
+            // out there, so re-signing these nonces could double-spend them.
+            (OperationState::Quarantined, false),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+            let (engine, fixture, _) = triad_batch_fixture(outbox.clone(), false, true);
+            let (refs, staged, preimages, hashes) = batch_material(&["terminal-a", "terminal-b"]);
+            for plan in &staged {
+                outbox.write_pending(plan, "p").unwrap();
+            }
+
+            assert!(matches!(
+                engine
+                    .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                    .await,
+                Err(TxEngineError::ApprovalRequired(_))
+            ));
+            // Lose the response so the row is left holding `sign_dispatched`,
+            // which is the only way to reach the status re-read below.
+            fixture.active.store(true, Ordering::SeqCst);
+            assert!(matches!(
+                engine
+                    .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                    .await,
+                Err(TxEngineError::ApprovalServiceUnavailable(_))
+            ));
+            let state_path = batch_signing_state_path(outbox.root(), "alice", &refs).unwrap();
+            let dispatched = read_triad_batch_signing_state(&state_path)
+                .unwrap()
+                .unwrap();
+            assert!(dispatched.sign_dispatched);
+
+            *fixture.operation_terminal.lock() = Some(terminal);
+            let outcome = engine
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .await;
+            if marker_should_clear {
+                assert!(matches!(outcome, Err(TxEngineError::ApprovalRequired(_))));
+            } else {
+                assert!(matches!(outcome, Err(TxEngineError::ApprovalState(_))));
+            }
+
+            let state = read_triad_batch_signing_state(&state_path)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                !state.sign_dispatched, marker_should_clear,
+                "{terminal:?} was handled as though it were the other kind of terminal"
+            );
+            if marker_should_clear {
+                assert!(state.approval_id.is_some());
+                assert_ne!(state.approval_id, dispatched.approval_id);
+                assert_ne!(
+                    state.approval_operation_id,
+                    dispatched.approval_operation_id
+                );
+                assert_ne!(state.signing_operation_id, dispatched.signing_operation_id);
+                assert_ne!(state.request_nonce, dispatched.request_nonce);
+
+                *fixture.operation_terminal.lock() = None;
+                *fixture.completed_result.lock() = None;
+                fixture.active.store(false, Ordering::SeqCst);
+                assert!(matches!(
+                    engine
+                        .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                        .await,
+                    Err(TxEngineError::ApprovalRequired(_))
+                ));
+            } else {
+                assert_eq!(state.approval_id, dispatched.approval_id);
+                assert_eq!(state.signing_operation_id, dispatched.signing_operation_id);
+                assert!(state.ceremony_url.is_none(), "{terminal:?}");
+                assert!(state.ceremony_expires_at_ms.is_none(), "{terminal:?}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -8026,6 +10438,9 @@ mod tests {
         let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
         let (engine, fixture, broker) = triad_batch_fixture(outbox.clone(), false, false);
         let (refs, staged, preimages, hashes) = batch_material(&["loss-a", "loss-b"]);
+        for plan in &staged {
+            engine.outbox.write_pending(plan, "p").unwrap();
+        }
         assert!(matches!(
             engine
                 .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
@@ -8073,6 +10488,9 @@ mod tests {
         let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
         let (engine, fixture, _) = triad_batch_fixture(outbox, false, false);
         let (refs, staged, preimages, hashes) = batch_material(&["bad-a", "bad-b"]);
+        for plan in &staged {
+            engine.outbox.write_pending(plan, "p").unwrap();
+        }
         assert!(matches!(
             engine
                 .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
@@ -8386,6 +10804,86 @@ mod tests {
         );
     }
 
+    /// A batch whose signing reply was lost and whose children then expired
+    /// is kept by cancel, which names the exact ordered batch. Following that
+    /// guidance reconciles the one signing operation and broadcasts both.
+    #[tokio::test]
+    async fn cancel_guidance_recovers_an_expired_batch_with_a_lost_reply() {
+        let url = spawn_batch_rpc(None).await;
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let (_, mut staged, _, _) = batch_material(&["lost-b", "lost-a"]);
+        for child in &mut staged {
+            child.expires_ms = now_ms() + 1_500;
+            outbox.write_pending(child, "batch review").unwrap();
+        }
+        let (engine, fixture, _) = triad_batch_fixture(outbox.clone(), false, false);
+        let permit = permit_for(&directory);
+        let chain = stage_chain(&url);
+        let targets = |refs: &[&str]| {
+            refs.iter()
+                .map(|reference| {
+                    let (chain_name, id) = reference.split_once(':').unwrap();
+                    ConfirmBatchTarget {
+                        chain_name: chain_name.into(),
+                        id: id.into(),
+                        chain: chain.clone(),
+                        policy: Policy::default(),
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let original = targets(&["anvil:lost-b", "anvil:lost-a"]);
+        assert!(matches!(
+            engine
+                .confirm_batch(&permit, "alice", original.clone(), false)
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        fixture.active.store(true, Ordering::SeqCst);
+        fixture
+            .lose_sign_response_once
+            .store(true, Ordering::SeqCst);
+        assert!(
+            engine
+                .confirm_batch(&permit, "alice", original, false)
+                .await
+                .is_err()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1_600)).await;
+
+        let Err(TxEngineError::Outbox(OutboxError::PossiblySigned {
+            evidence: crate::outbox::SigningEvidence::Batch { ordered_refs },
+            ..
+        })) = engine
+            .discard_unsigned(&permit, "alice", "anvil", "lost-a")
+            .await
+        else {
+            panic!("cancel must keep a child of a dispatched batch");
+        };
+        let refs = ordered_refs.iter().map(String::as_str).collect::<Vec<_>>();
+        let result = engine
+            .confirm_batch(&permit, "alice", targets(&refs), false)
+            .await
+            .unwrap();
+        assert!(
+            result
+                .transactions
+                .iter()
+                .all(|transaction| transaction.status == TxStatus::Sent)
+        );
+        assert_eq!(
+            fixture
+                .requests
+                .lock()
+                .iter()
+                .filter(|request| matches!(request, MachineBrokerRequest::SigningSignBatch(_)))
+                .count(),
+            1,
+            "recovery must query the recorded batch operation, not re-sign"
+        );
+    }
+
     #[tokio::test]
     async fn confirm_batch_recovers_marker_written_before_first_send() {
         let url = spawn_batch_rpc(None).await;
@@ -8485,9 +10983,15 @@ mod tests {
         bump_fees_in_place(&mut s, 15);
         // 100 * 1.15 = 115; integer math: 100 + (100*15/100) = 115.
         assert_eq!(s.max_fee_per_gas.as_deref(), Some("115"));
-        // 10 * 1.15 = 11.5 — integer math: 10 + (10*15/100=1) = 11.
-        // But our bump-one floors the bump at 1 wei.
-        assert_eq!(s.max_priority_fee_per_gas.as_deref(), Some("11"));
+        // 10 * 1.15 = 11.5; the bump rounds up so it is never below pct.
+        assert_eq!(s.max_priority_fee_per_gas.as_deref(), Some("12"));
+        let mut s = fake_staged_1559("b");
+        s.max_fee_per_gas = Some("109".into());
+        bump_fees_in_place(&mut s, 10);
+        assert_eq!(s.max_fee_per_gas.as_deref(), Some("120"));
+        s.max_fee_per_gas = Some(u128::MAX.to_string());
+        bump_fees_in_place(&mut s, 10);
+        assert_eq!(s.max_fee_per_gas, Some(u128::MAX.to_string()));
     }
 
     #[test]
@@ -9065,6 +11569,141 @@ mod tests {
         }
     }
 
+    /// A signing request whose reply was lost leaves the entry pending with
+    /// no hash. After expiry, confirm must still reconcile that recorded
+    /// operation (here: collect its signature and broadcast) rather than
+    /// refuse with `StagedExpired` and strand the reserved nonce.
+    #[tokio::test]
+    async fn confirm_reconciles_a_dispatched_signature_after_expiry() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let (engine, fixture, _) = triad_batch_fixture(outbox.clone(), false, true);
+        let permit = permit_for(&directory);
+        let chain = stage_chain(&spawn_queued_rpc(HashMap::new()).await);
+        let policy = Policy::default();
+        let mut staged = fake_staged_1559("expired-dispatch");
+        staged.created_ms = now_ms();
+        let entry_dir = outbox.write_pending(&staged, "p").unwrap();
+        let confirm = || {
+            engine.confirm(
+                &permit,
+                "alice",
+                "anvil",
+                "expired-dispatch",
+                &chain,
+                &policy,
+                policy.override_sentinel(),
+            )
+        };
+        assert!(matches!(
+            confirm().await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        fixture.active.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            confirm().await,
+            Err(TxEngineError::ApprovalServiceUnavailable(_))
+        ));
+
+        staged.expires_ms = 1;
+        std::fs::write(
+            entry_dir.join("intent.json"),
+            serde_json::to_vec(&staged).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(outbox.sweep_expired(now_ms()).unwrap(), 0);
+        let result = confirm().await;
+        assert!(
+            !matches!(
+                result,
+                Err(TxEngineError::Outbox(OutboxError::StagedExpired { .. }))
+            ),
+            "{result:?}"
+        );
+        assert!(entry_dir.join("broadcast_attempted.json").exists());
+        assert_eq!(
+            fixture
+                .requests
+                .lock()
+                .iter()
+                .filter(|request| matches!(request, MachineBrokerRequest::SigningSign(_)))
+                .count(),
+            1,
+            "reconciliation must not send a second signing request"
+        );
+    }
+
+    /// Signing records a dispatch only under the lifecycle lock, and only
+    /// for the exact row the confirm read: not expired, not moved to failed/,
+    /// not missing, and not replaced by a restage under the same id.
+    #[tokio::test]
+    async fn signing_dispatch_refuses_expired_or_retired_entries() {
+        let (engine, _, _dir) = fake_engine(60_000);
+        let mut staged = fake_staged_1559("late");
+        staged.expires_ms = 1;
+        engine.outbox.write_pending(&staged, "p").unwrap();
+        assert!(matches!(
+            engine.lock_signing_dispatch("alice", &[&staged]).await,
+            Err(TxEngineError::Outbox(OutboxError::StagedExpired { .. }))
+        ));
+        assert_eq!(engine.outbox.sweep_expired(now_ms()).unwrap(), 1);
+        assert!(matches!(
+            engine.lock_signing_dispatch("alice", &[&staged]).await,
+            Err(TxEngineError::ApprovalState(_))
+        ));
+        assert!(matches!(
+            engine
+                .lock_signing_dispatch("alice", &[&fake_staged_1559("absent")])
+                .await,
+            Err(TxEngineError::ApprovalState(_))
+        ));
+        let live = fake_staged_1559("live");
+        engine.outbox.write_pending(&live, "p").unwrap();
+        drop(
+            engine
+                .lock_signing_dispatch("alice", &[&live])
+                .await
+                .unwrap(),
+        );
+        // A restage under the same id (deterministic deployment ids) must not
+        // admit a confirm that read the earlier bytes.
+        let mut stale = live.clone();
+        stale.gas_limit += 1;
+        assert!(matches!(
+            engine.lock_signing_dispatch("alice", &[&stale]).await,
+            Err(TxEngineError::ApprovalState(_))
+        ));
+    }
+
+    /// `bloom wallet cancel` releases a pending entry locally only under the
+    /// shared rule: a bare signed raw transaction keeps it pending.
+    #[tokio::test]
+    async fn wallet_cancel_keeps_a_pending_entry_with_signed_raw_bytes() {
+        let (engine, spec, dir) = fake_engine(60_000);
+        let permit = permit_for(&dir);
+        let chain = bloom_evm::ChainClient::new(spec).unwrap();
+        let entry = engine
+            .outbox
+            .write_pending(&fake_staged_1559("raw-only"), "p")
+            .unwrap();
+        std::fs::write(entry.join("raw_tx"), b"signed").unwrap();
+        let result = engine
+            .cancel(
+                &permit,
+                "alice",
+                "anvil",
+                "raw-only",
+                &chain,
+                15,
+                &Policy::default(),
+            )
+            .await;
+        assert!(result.is_err(), "{result:?}");
+        let entry = engine.outbox.read("alice", "anvil", "raw-only").unwrap();
+        assert_eq!(entry.state, OutboxState::Pending);
+        assert!(entry.dir.join("raw_tx").exists());
+    }
+
     #[test]
     fn nft_erc721_safe_transfer_from_calldata_matches_selector_and_args() {
         use alloy::sol_types::SolCall;
@@ -9398,6 +12037,151 @@ mod tests {
             crate::outbox::OutboxState::Failed,
             "tx must be Failed after hard deny"
         );
+        assert_eq!(entry.staged.status, TxStatus::Failed);
+        // Persisted, not only normalised by `read`: the CLI serves these bytes.
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(entry.dir.join("intent.json")).unwrap()).unwrap();
+        assert_eq!(raw["status"], "failed");
+
+        // The mounted confirm path prepares before it submits. It must expose
+        // the same terminal outcome to a Petal reconciling its execution.
+        staged.id = "0002-prepare".into();
+        engine.outbox.write_pending(&staged, "p").unwrap();
+        let result = engine
+            .prepare_confirm_write_open(
+                &permit, "alice", "anvil", &staged.id, &chain, &policy, false,
+            )
+            .await;
+        assert!(matches!(result, Err(TxEngineError::PolicyDenied)));
+        let entry = engine.outbox.read("alice", "anvil", &staged.id).unwrap();
+        assert_eq!(entry.state, OutboxState::Failed);
+        assert_eq!(entry.staged.status, TxStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn discard_refuses_an_entry_held_by_confirmation() {
+        let (engine, _, dir) = fake_engine(60_000);
+        let permit = permit_for(&dir);
+        let staged = fake_staged_1559("0001-lock");
+        engine.outbox.write_pending(&staged, "p").unwrap();
+        let guard = engine
+            .entry_lock_for("alice", "anvil", &staged.id)
+            .lock_owned()
+            .await;
+        let other = engine.clone();
+        let error = other
+            .discard_unsigned(&permit, "alice", "anvil", &staged.id)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("operation in progress"));
+        assert!(
+            engine
+                .outbox
+                .read_in_state("alice", "anvil", &staged.id, OutboxState::Pending)
+                .is_ok()
+        );
+        drop(guard);
+        other
+            .discard_unsigned(&permit, "alice", "anvil", &staged.id)
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .outbox
+                .read_in_state("alice", "anvil", &staged.id, OutboxState::Pending)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn discard_refuses_every_broadcast_attempt_kind() {
+        for kind in [
+            BroadcastAttemptKind::Confirm,
+            BroadcastAttemptKind::Replacement,
+            BroadcastAttemptKind::CancelReplacement,
+        ] {
+            let (engine, _, dir) = fake_engine(60_000);
+            let permit = permit_for(&dir);
+            let staged = fake_staged_1559(kind.marker_name());
+            engine.outbox.write_pending(&staged, "p").unwrap();
+            let entry = engine
+                .outbox
+                .read_in_state("alice", "anvil", &staged.id, OutboxState::Pending)
+                .unwrap();
+            engine
+                .outbox
+                .write_broadcast_attempt(
+                    &entry,
+                    kind,
+                    &BroadcastAttempt {
+                        schema: "bloom.broadcast_attempted.v1".into(),
+                        tx_hash: format!("{:#x}", B256::ZERO),
+                        raw_tx_blake3: blake3::hash(&[]).to_hex().to_string(),
+                        raw_tx_path: kind.raw_name().into(),
+                        from: staged.from.clone(),
+                        to: staged.to.clone(),
+                        nonce: staged.nonce,
+                        chain_id: staged.chain_id,
+                        created_ms: now_ms(),
+                        transport: BroadcastTransport::PublicRpc,
+                        private_provider: None,
+                    },
+                )
+                .unwrap();
+
+            let error = engine
+                .discard_unsigned(&permit, "alice", "anvil", &staged.id)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("cannot discard"), "{kind:?}");
+            assert!(
+                engine
+                    .outbox
+                    .read_in_state("alice", "anvil", &staged.id, OutboxState::Pending)
+                    .is_ok(),
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// Confirm discards the staged transaction on `ApprovalDenied`, so a
+    /// temporary Broker refusal must never be classified as one.
+    #[test]
+    fn temporary_broker_refusals_keep_the_staged_transaction() {
+        use bloom_broker_api::{ProtocolError, ProtocolErrorCode as Code};
+        for code in [
+            Code::CeremonyRateLimited,
+            Code::QuotaExceeded,
+            Code::PolicyBaselineStale,
+            Code::ApprovalRearmRequired,
+            Code::RevocationEpochUnreconciled,
+            Code::ClockRollback,
+            Code::ServiceUnavailable,
+        ] {
+            assert!(
+                matches!(
+                    protocol_signing_error(ProtocolError::new(code, "later")),
+                    TxEngineError::ApprovalServiceUnavailable(_)
+                ),
+                "{code:?}"
+            );
+        }
+        assert!(matches!(
+            protocol_signing_error(ProtocolError::new(Code::LimitExceededValue, "no")),
+            TxEngineError::ApprovalDenied(_)
+        ));
+    }
+
+    #[test]
+    fn entry_lock_registry_reclaims_completed_ids() {
+        let (engine, _, _dir) = fake_engine(60_000);
+        for index in 0..100 {
+            let lock = engine.entry_lock_for("alice", "anvil", &format!("{index:04}"));
+            let guard = lock.try_lock().unwrap();
+            drop(guard);
+            drop(lock);
+        }
+        assert_eq!(engine.entry_locks.lock().len(), 1);
     }
 
     /// A soft-Warn check must block confirm() when no override sentinel is

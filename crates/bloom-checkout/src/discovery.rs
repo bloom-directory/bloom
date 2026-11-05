@@ -417,7 +417,9 @@ impl Discovery {
                     refusal = match (refusal, reason) {
                         (_, "pay_control_ambiguous") => PreparationReason::PaymentActionAmbiguous,
                         (PreparationReason::PaymentActionAmbiguous, _) => refusal,
-                        (_, "installment_choice") => PreparationReason::ChargeTermsUnreadable,
+                        (_, "installment_choice" | "renewal_terms") => {
+                            PreparationReason::ChargeTermsUnreadable
+                        }
                         _ => refusal,
                     };
                 } else if let Ok(facts) = serde_json::from_value::<CheckoutFacts>(candidate) {
@@ -2165,7 +2167,22 @@ pub(crate) mod tests {
         ] {
             let (url, server) = fixture(page(lang, lines)).await;
             let tab = open(&browser, url).await;
-            let facts = Discovery::read(&tab).await.unwrap().facts;
+            let facts = match Discovery::read(&tab).await {
+                Ok(discovery) => discovery.facts,
+                // A subscription without one clear later price is not
+                // approvable here; the person finishes it privately.
+                Err(error) => {
+                    assert_eq!(expected, None, "{lang} {lines:?}");
+                    assert_eq!(
+                        error.downcast_ref::<PreparationReason>().copied(),
+                        Some(PreparationReason::ChargeTermsUnreadable),
+                        "{lang} {lines:?}"
+                    );
+                    browser.return_control().await.unwrap();
+                    server.abort();
+                    continue;
+                }
+            };
             assert_eq!(
                 (
                     facts.renewal_minor,
@@ -2197,12 +2214,34 @@ pub(crate) mod tests {
                 &[
                     "Premium Individual subscription",
                     "Total USD 0.00",
+                    "Free for 2 months, then $12.99 per month starting 2026-12-25",
+                ][..],
+                Ok(0),
+            ),
+            // Free today with no first charge date: when it starts is unbound.
+            (
+                &[
+                    "Premium Individual subscription",
+                    "Total USD 0.00",
                     "Free for 2 months, then $12.99 per month",
                 ][..],
-                Some(0),
+                Err(PreparationReason::ChargeTermsUnreadable),
+            ),
+            // A subscription that charges today but never says what it costs
+            // later cannot be approved for its renewals.
+            (
+                &[
+                    "Membership subscription",
+                    "Total USD 9.99",
+                    "Renews automatically. Cancel anytime",
+                ][..],
+                Err(PreparationReason::ChargeTermsUnreadable),
             ),
             // No subscription anywhere on the page: nothing to approve.
-            (&["Gift registry", "Total USD 0.00"][..], None),
+            (
+                &["Gift registry", "Total USD 0.00"][..],
+                Err(PreparationReason::FactsUnreadable),
+            ),
             // Says it recurs, but never says what it will cost.
             (
                 &[
@@ -2210,7 +2249,7 @@ pub(crate) mod tests {
                     "Total USD 0.00",
                     "Cancel anytime",
                 ][..],
-                None,
+                Err(PreparationReason::FactsUnreadable),
             ),
         ] {
             let body: String = lines.iter().map(|l| format!("<div>{l}</div>")).collect();
@@ -2220,20 +2259,11 @@ pub(crate) mod tests {
             ))
             .await;
             let tab = open(&browser, url).await;
-            let read = Discovery::read(&tab).await;
-            assert_eq!(
-                read.as_ref().ok().map(|d| d.facts.total_minor),
-                total,
-                "{lines:?}"
-            );
-            if total.is_none() {
-                let error = read.err().unwrap();
-                assert_eq!(
-                    error.downcast_ref::<PreparationReason>().copied(),
-                    Some(PreparationReason::FactsUnreadable),
-                    "{lines:?}"
-                );
-            }
+            let read = Discovery::read(&tab)
+                .await
+                .map(|d| d.facts.total_minor)
+                .map_err(|error| error.downcast_ref::<PreparationReason>().copied());
+            assert_eq!(read, total.map_err(Some), "{lines:?}");
             browser.return_control().await.unwrap();
             server.abort();
         }
@@ -2546,7 +2576,7 @@ pub(crate) mod tests {
             let tab = open(&browser, url).await;
             let expression = crate::scripts::prepare(include_str!("facts.js"))
                 .replace("BLOOM_FIXTURE_TOTALS", "false")
-                .replacen("(async () => {", "(async () => { const location={origin:'https://buy.stripe.com',hostname:'buy.stripe.com',pathname:'/test_fixture'}; globalThis.__bloomHostedStripeFacts={total_minor:2000,currency:'USD',recurring:true};", 1);
+                .replacen("(async () => {", "(async () => { const location={origin:'https://buy.stripe.com',hostname:'buy.stripe.com',pathname:'/test_fixture'}; globalThis.__bloomHostedStripeFacts={total_minor:2000,currency:'USD',recurring:false};", 1);
             let result = tab.cdp.evaluate(&tab.session, expression).await.unwrap();
             assert_eq!(
                 result.get("total_minor") == Some(&json!(2000)),

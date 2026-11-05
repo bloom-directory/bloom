@@ -43,6 +43,41 @@ fn heights_past_window(chain: &str, height: u64) -> std::collections::HashMap<St
 }
 
 #[test]
+fn interrupted_terminal_move_preserves_the_reason_and_restage_lookup() {
+    for status in [SolanaTxStatus::Expired, SolanaTxStatus::Cancelled] {
+        let (_dir, outbox) = outbox();
+        outbox
+            .write_pending(&staged("interrupted"), "plan")
+            .unwrap();
+        let mut entry = outbox
+            .read("alice", "solana-devnet", "interrupted")
+            .unwrap();
+        entry.staged.status = status;
+        outbox
+            .transition(&entry, SolanaOutboxState::Failed)
+            .unwrap();
+        // Simulate death before rewrite_intent: the on-disk intent is pending.
+        assert_eq!(
+            outbox
+                .read("alice", "solana-devnet", "interrupted")
+                .unwrap()
+                .staged
+                .status,
+            status
+        );
+        assert_eq!(
+            outbox
+                .read_restageable("alice", "solana-devnet", "interrupted")
+                .unwrap()
+                .0
+                .staged
+                .status,
+            status
+        );
+    }
+}
+
+#[test]
 fn stage_and_read_roundtrip() {
     let (_dir, outbox) = outbox();
     let s = staged("0001-00001");
@@ -189,6 +224,39 @@ fn broadcast_attempt_binds_raw_tx_hash() {
     assert_eq!(raw, b"signed-tx-bytes");
 }
 
+/// An older binary wrote the broadcast marker, then crashed before moving the
+/// entry to `sent`. Those bytes may be on-chain: restage must refuse them and
+/// the expiry sweep must hand them to reconciliation, never to `failed`.
+#[test]
+fn marked_pending_entry_is_not_restageable_and_sweeps_to_sent() {
+    let (_dir, outbox) = outbox();
+    let mut marked = staged("0001-marked");
+    marked.expires_ms = 500;
+    outbox.write_pending(&marked, "plan").unwrap();
+    let entry = outbox.read("alice", "solana-devnet", &marked.id).unwrap();
+    outbox
+        .write_broadcast_attempt(&entry, "SIG1", b"signed-tx-bytes", 2000)
+        .unwrap();
+
+    let error = outbox
+        .read_restageable("alice", "solana-devnet", &marked.id)
+        .unwrap_err();
+    assert!(matches!(error, OutboxError::BroadcastAttempted(_)));
+
+    let heights = heights_past_window("solana-devnet", 999_999);
+    assert_eq!(outbox.sweep_expired(1000, &heights).unwrap(), 1);
+    let entry = outbox
+        .read_in_state(
+            "alice",
+            "solana-devnet",
+            &marked.id,
+            SolanaOutboxState::Sent,
+        )
+        .unwrap();
+    assert_eq!(entry.staged.status, SolanaTxStatus::Sent);
+    assert_eq!(outbox.walk_all_sent().unwrap()[0].signature, "SIG1");
+}
+
 #[test]
 fn broadcast_attempt_makes_a_pending_entry_non_cancellable() {
     let (_dir, outbox) = outbox();
@@ -290,19 +358,27 @@ fn sweep_requires_live_cluster_height_not_just_the_wall_estimate() {
 }
 
 #[test]
-fn sweep_does_not_reap_signed_pending_entry() {
+fn sweep_retires_signed_entry_only_after_history_proves_absence() {
     let (_dir, outbox) = outbox();
     let mut signed = staged("0001-signed");
     signed.expires_ms = 500;
-    signed.signature =
-        Some("SIG1111111111111111111111111111111111111111111111111111111111111".into());
     outbox.write_pending(&signed, "plan").unwrap();
+    outbox
+        .record_signature("alice", "solana-devnet", "0001-signed", "SIG1")
+        .unwrap();
 
+    let candidates = outbox
+        .expired_pending(1000, &heights_past_window("solana-devnet", 999_999))
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert!(candidates[0].dir.join("intent.json").exists());
+    assert!(candidates[0].dir.join(".signature").exists());
     assert_eq!(
         outbox
-            .sweep_expired(1000, &heights_past_window("solana-devnet", 999_999))
+            .sweep_expired(1000, &heights_past_window("solana-devnet", 999_999),)
             .unwrap(),
-        0
+        0,
+        "missing/error status observations must retain the entry"
     );
     assert!(
         outbox
@@ -310,10 +386,65 @@ fn sweep_does_not_reap_signed_pending_entry() {
                 "alice",
                 "solana-devnet",
                 "0001-signed",
-                SolanaOutboxState::Pending,
+                SolanaOutboxState::Failed
             )
-            .is_ok()
+            .is_err()
     );
+
+    // Every endpoint answering `null` is not an observation: the signed
+    // entry stays pending for the operator to cancel or restage.
+    assert_eq!(
+        outbox
+            .sweep_targets(
+                1000,
+                &heights_past_window("solana-devnet", 999_999),
+                &Default::default(),
+            )
+            .unwrap()
+            .len(),
+        0
+    );
+    outbox
+        .read_in_state(
+            "alice",
+            "solana-devnet",
+            "0001-signed",
+            SolanaOutboxState::Pending,
+        )
+        .unwrap();
+}
+
+#[test]
+fn sweep_sends_observed_simulation_signature_to_reconciliation() {
+    let (_dir, outbox) = outbox();
+    let mut signed = staged("0001-observed");
+    signed.expires_ms = 500;
+    outbox.write_pending(&signed, "plan").unwrap();
+    outbox
+        .record_signature("alice", "solana-devnet", &signed.id, "SIG1")
+        .unwrap();
+    assert_eq!(
+        outbox
+            .sweep_expired_with_statuses(
+                1000,
+                &heights_past_window("solana-devnet", 999_999),
+                &std::collections::HashSet::from([("solana-devnet".into(), "SIG1".into())]),
+            )
+            .unwrap(),
+        1
+    );
+    let entry = outbox
+        .read_in_state(
+            "alice",
+            "solana-devnet",
+            &signed.id,
+            SolanaOutboxState::Sent,
+        )
+        .unwrap();
+    assert_eq!(entry.staged.status, SolanaTxStatus::Sent);
+    let reconcilable = outbox.walk_all_sent().unwrap();
+    assert_eq!(reconcilable.len(), 1);
+    assert_eq!(reconcilable[0].signature, "SIG1");
 }
 
 // Fix C's related dead-code cleanup (PLAN-SOLANA-PR-FIXES.md): from_status

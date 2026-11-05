@@ -75,6 +75,24 @@ impl Browser {
         test_flags: &[String],
         window: bool,
     ) -> Result<Arc<Self>> {
+        // Fixture merchants listen on loopback in tests and developer Triads.
+        Self::launch_with_egress(
+            executable,
+            profile,
+            test_flags,
+            window,
+            crate::egress::policy(cfg!(any(test, feature = "triad-dev-harness"))),
+        )
+        .await
+    }
+
+    pub(crate) async fn launch_with_egress(
+        executable: &Path,
+        profile: &Path,
+        test_flags: &[String],
+        window: bool,
+        egress: crate::egress::Policy,
+    ) -> Result<Arc<Self>> {
         if profile.exists() {
             let metadata = std::fs::symlink_metadata(profile)?;
             if !metadata.is_dir()
@@ -107,7 +125,9 @@ impl Browser {
         let fixture_payment_hosts = test_flags
             .iter()
             .any(|f| f == "--ignore-certificate-errors");
-        let cdp = Cdp::launch(executable, profile, test_flags, window)?;
+        let mut flags = crate::egress::chromium_flags(crate::egress::start(egress).await?);
+        flags.extend_from_slice(test_flags);
+        let cdp = Cdp::launch(executable, profile, &flags, window)?;
         let tab = new_tab(&cdp, None, 1).await?;
         Ok(Arc::new(Self {
             cdp,
@@ -124,6 +144,7 @@ impl Browser {
         self.available()?;
         let mut tab = self.tab.lock().await;
         self.available()?;
+        self.recover_closed_tab(&mut tab).await?;
         if let BrowseRequest::Open { url } = &mut request {
             let parsed = shopping_url(url)?;
             *url = parsed.to_string();
@@ -284,26 +305,47 @@ impl Browser {
                 secret.to_uppercase(),
                 secret.to_lowercase(),
             ];
+            // A page can echo "A\u{200b}lice": invisible characters between
+            // letters must not hide a saved value.
             let alternatives = variants
                 .iter()
-                .map(|s| regex::escape(s))
+                .map(|s| {
+                    s.chars()
+                        .map(|c| regex::escape(c.encode_utf8(&mut [0; 4])))
+                        .collect::<Vec<_>>()
+                        .join(&format!("{INVISIBLE}*"))
+                })
                 .collect::<Vec<_>>()
                 .join("|");
             // Short ASCII names and year fragments are whole tokens, so Li
             // does not hide "airline" and 90 does not hide part of 1990.
-            let pattern = if secret.is_ascii() && secret.chars().count() < 3 {
-                format!(r"\b(?:{alternatives})\b")
-            } else {
-                format!("(?:{alternatives})")
+            let short = secret.is_ascii() && secret.chars().count() < 3;
+            let bounded = |alternatives: &str| {
+                if short {
+                    format!(r"\b(?:{alternatives})\b")
+                } else {
+                    format!("(?:{alternatives})")
+                }
             };
-            let pattern = regex::RegexBuilder::new(&pattern)
+            let pattern = regex::RegexBuilder::new(&bounded(&alternatives))
+                .case_insensitive(true)
+                .build()?;
+            // Anything still matching after compatibility normalization
+            // (full-width letters, ligatures) cannot be cut out precisely, so
+            // the whole string is withheld.
+            let residual = regex::RegexBuilder::new(&bounded(&regex::escape(&fold(secret))))
                 .case_insensitive(true)
                 .build()?;
             let replace = |value: &mut Value| {
                 if let Value::String(text) = value {
-                    *text = pattern
+                    let masked = pattern
                         .replace_all(text, regex::NoExpand(label))
                         .into_owned();
+                    *text = if residual.is_match(&fold(&LABEL.replace_all(&masked, " "))) {
+                        label.clone()
+                    } else {
+                        masked
+                    };
                 }
             };
             for key in ["url", "text"] {
@@ -313,7 +355,7 @@ impl Browser {
             }
             if let Some(elements) = value.get_mut("elements").and_then(Value::as_array_mut) {
                 for element in elements {
-                    for key in ["label", "context", "value"] {
+                    for key in ["label", "context", "value", "href"] {
                         if let Some(value) = element.get_mut(key) {
                             replace(value);
                         }
@@ -663,14 +705,58 @@ impl Browser {
         }
         let target = child["targetId"].as_str().context("Missing popup target")?;
         let journey = tab.journey;
-        *tab = attach_tab(
+        match attach_tab(
             &self.cdp,
             tab.context.clone(),
             target.to_owned(),
             tab.generation + 1,
         )
-        .await?;
+        .await
+        {
+            Ok(popup) => {
+                *tab = popup;
+                tab.journey = journey;
+                Ok(())
+            }
+            // A download (such as a PDF link) or a self-closing popup can
+            // disappear while attaching. Keep shopping on the current page.
+            Err(_) if !self.target_exists(target).await => {
+                eprintln!("checkout ignored a popup that closed while opening");
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn target_exists(&self, target: &str) -> bool {
+        self.cdp
+            .call(None, "Target.getTargetInfo", json!({"targetId":target}))
+            .await
+            .is_ok()
+    }
+
+    /// A followed popup can close itself later. Continue on the one page left
+    /// in this browsing context, or a blank tab there, so the journey and its
+    /// cookies survive and later requests do not fail forever.
+    async fn recover_closed_tab(&self, tab: &mut Tab) -> Result<()> {
+        if self.target_exists(&tab.target).await {
+            return Ok(());
+        }
+        let targets = self.cdp.call(None, "Target.getTargets", json!({})).await?;
+        let pages = targets["targetInfos"]
+            .as_array()
+            .context("Missing browser targets")?
+            .iter()
+            .filter(|page| page["type"] == "page" && page["browserContextId"] == tab.context)
+            .filter_map(|page| page["targetId"].as_str())
+            .collect::<Vec<_>>();
+        let (context, generation, journey) = (tab.context.clone(), tab.generation + 1, tab.journey);
+        *tab = match pages.as_slice() {
+            [page] => attach_tab(&self.cdp, context, (*page).to_owned(), generation).await?,
+            _ => new_tab(&self.cdp, Some(context), generation).await?,
+        };
         tab.journey = journey;
+        eprintln!("checkout recovered shopping after its page closed");
         Ok(())
     }
 
@@ -776,96 +862,6 @@ impl Browser {
         self.revoked.store(false, Ordering::SeqCst);
         Ok(())
     }
-
-    /// After a take-over, shopping continues on the page the human left.
-    pub(crate) async fn return_control_at(&self, target: &str, url: Option<String>) -> Result<()> {
-        self.resume_shopping(target, url).await.inspect_err(|_| {
-            self.unusable.store(true, Ordering::SeqCst);
-        })
-    }
-
-    async fn resume_shopping(&self, target: &str, url: Option<String>) -> Result<()> {
-        let Some(url) = url.filter(|u| u.starts_with("https://") || u.starts_with("http://"))
-        else {
-            return self.return_control().await;
-        };
-        let mut tab = self.tab.lock().await;
-        let mut resumed = attach_tab(
-            &self.cdp,
-            tab.context.clone(),
-            target.to_owned(),
-            tab.generation + 1,
-        )
-        .await?;
-        resumed.journey = tab.journey;
-        // Navigate away before returning, so Chrome cannot restore private
-        // form values as it might during a reload of the same history entry.
-        self.cdp
-            .call(
-                Some(&resumed.session),
-                "Page.navigate",
-                json!({"url":"about:blank"}),
-            )
-            .await?;
-        let tree = self
-            .cdp
-            .call(Some(&resumed.session), "Page.getFrameTree", json!({}))
-            .await?;
-        let previous = tree["frameTree"]["frame"]["loaderId"]
-            .as_str()
-            .context("Missing private document")?;
-        let navigation = self
-            .cdp
-            .call(Some(&resumed.session), "Page.navigate", json!({"url":url}))
-            .await?;
-        let loader = navigation["loaderId"]
-            .as_str()
-            .filter(|id| *id != previous)
-            .context("Private document was not replaced; shopping remains paused")?;
-        // A new document clears private DOM and execution contexts while the
-        // tab's sessionStorage keeps the airline's booking session alive.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            if tokio::time::Instant::now() >= deadline {
-                bail!("Private document replacement timed out; shopping remains paused");
-            }
-            let tree = self
-                .cdp
-                .call(Some(&resumed.session), "Page.getFrameTree", json!({}))
-                .await?;
-            let targets = self.cdp.call(None, "Target.getTargets", json!({})).await?;
-            let other_pages = targets["targetInfos"]
-                .as_array()
-                .context("Missing browser targets")?
-                .iter()
-                .filter(|page| page["type"] == "page" && page["targetId"] != target)
-                .collect::<Vec<_>>();
-            if tree["frameTree"]["frame"]["loaderId"] == loader && other_pages.is_empty() {
-                break;
-            }
-            for page in other_pages {
-                self.cdp
-                    .call(
-                        None,
-                        "Target.closeTarget",
-                        json!({"targetId":page["targetId"]}),
-                    )
-                    .await?;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        self.cdp
-            .call(
-                Some(&resumed.session),
-                "Page.resetNavigationHistory",
-                json!({}),
-            )
-            .await?;
-        resumed.refs.clear();
-        *tab = resumed;
-        self.revoked.store(false, Ordering::SeqCst);
-        Ok(())
-    }
 }
 
 async fn new_tab(cdp: &Cdp, context: Option<String>, generation: u64) -> Result<Tab> {
@@ -925,6 +921,22 @@ async fn attach_tab(cdp: &Cdp, context: String, target: String, generation: u64)
     })
 }
 
+/// Characters a page can place inside a value without changing what a reader
+/// sees: soft hyphen, zero-width spaces and joiners, word joiner, BOM.
+const INVISIBLE: &str = r"[\p{Default_Ignorable_Code_Point}\p{Cf}]";
+static INVISIBLES: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(INVISIBLE).unwrap());
+static LABEL: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"\[saved [a-z_]+\]").unwrap());
+
+/// What a reader sees: compatibility forms folded, invisible characters gone.
+fn fold(text: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    INVISIBLES
+        .replace_all(&text.nfkc().collect::<String>(), "")
+        .to_lowercase()
+}
+
 fn shopping_url(url: &str) -> Result<url::Url> {
     let parsed = url::Url::parse(url).context("Invalid browsing URL")?;
     if !matches!(parsed.scheme(), "http" | "https")
@@ -971,6 +983,15 @@ fn accessibility_text(tree: &Value) -> Result<String> {
             }
         }
     }
+    // Text nodes repeat the name of the node that contains them.
+    let mut parent_name = std::collections::HashMap::new();
+    for node in nodes {
+        for child in node["childIds"].as_array().into_iter().flatten() {
+            if let (Some(child), Some(name)) = (child.as_str(), node["name"]["value"].as_str()) {
+                parent_name.insert(child, name);
+            }
+        }
+    }
     let text = nodes
         .iter()
         .filter(|n| n["ignored"] != true)
@@ -978,7 +999,12 @@ fn accessibility_text(tree: &Value) -> Result<String> {
         .filter_map(|n| {
             let role = n["role"]["value"].as_str()?;
             let name = n["name"]["value"].as_str()?;
-            if name.is_empty() || matches!(role, "textbox" | "Iframe" | "IframePresentational") {
+            let repeats_parent = matches!(role, "StaticText" | "InlineTextBox")
+                && parent_name.get(n["nodeId"].as_str()?) == Some(&name);
+            if name.is_empty()
+                || repeats_parent
+                || matches!(role, "textbox" | "Iframe" | "IframePresentational")
+            {
                 None
             } else {
                 Some(format!("{role}: {name}"))
@@ -993,6 +1019,23 @@ fn accessibility_text(tree: &Value) -> Result<String> {
 mod tests {
     use super::*;
     use axum::{Router, response::Html, routing::get};
+
+    #[test]
+    fn page_text_names_each_line_once() {
+        let node = |id: &str, role: &str, name: &str, children: &[&str]| json!({"nodeId":id,"role":{"value":role},"name":{"value":name},"childIds":children});
+        let tree = json!({"nodes":[
+            node("1", "link", "Sign in", &["2"]),
+            node("2", "StaticText", "Sign in", &["3"]),
+            node("3", "InlineTextBox", "Sign in", &[]),
+            node("4", "heading", "Top flights", &["5"]),
+            node("5", "StaticText", "From 305 US dollars", &["6"]),
+            node("6", "InlineTextBox", "From 305 US dollars", &[]),
+        ]});
+        assert_eq!(
+            accessibility_text(&tree).unwrap(),
+            "link: Sign in\nheading: Top flights\nStaticText: From 305 US dollars"
+        );
+    }
 
     #[tokio::test]
     async fn short_private_tokens_do_not_change_control_metadata_or_other_words() {
@@ -1038,6 +1081,129 @@ mod tests {
         assert_eq!(element["value"], "[saved family_name]");
         assert_eq!(element["options"][0]["label"], "[saved family_name]");
         assert_eq!(element["options"][0]["value"], "[saved family_name]");
+    }
+
+    /// Redirects, subresources and popups go through the same address check
+    /// as the first page, so a permitted page cannot reach a local service.
+    #[tokio::test]
+    async fn shopping_cannot_reach_a_refused_address_by_any_route() {
+        let local = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_url = format!("http://127.0.0.1:{}/", local.local_addr().unwrap().port());
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = hits.clone();
+        let local_server = tokio::spawn(async move {
+            axum::serve(
+                local,
+                Router::new().fallback(get(move || {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async { Html("<h1>local secret</h1>") }
+                })),
+            )
+            .await
+            .unwrap();
+        });
+        // The shop stands in for a public site: the only allowed address.
+        let shop = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let shop_address = shop.local_addr().unwrap();
+        let page = format!(
+            "<img src='{local_url}img'><script>fetch('{local_url}fetch').catch(()=>{{}});\
+             window.open('{local_url}popup')</script><a href='/redirect'>next</a>"
+        );
+        let target = local_url.clone();
+        let shop_server = tokio::spawn(async move {
+            axum::serve(
+                shop,
+                Router::new()
+                    .route("/", get(move || async move { Html(page) }))
+                    .route(
+                        "/redirect",
+                        get(move || async move { axum::response::Redirect::temporary(&target) }),
+                    ),
+            )
+            .await
+            .unwrap();
+        });
+        let root = tempfile::tempdir().unwrap();
+        let browser = Browser::launch_with_egress(
+            &crate::test_chromium(),
+            &root.path().join("profile"),
+            &["--no-sandbox".into()],
+            false,
+            Arc::new(move |address| address == shop_address),
+        )
+        .await
+        .unwrap();
+        let shop_url = format!("http://{shop_address}/");
+        for url in [
+            local_url.clone(),
+            local_url.replace("127.0.0.1", "localhost"),
+            shop_url.clone(),
+            format!("{shop_url}redirect"),
+        ] {
+            browser
+                .browse(BrowseRequest::Open { url: url.clone() })
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            let text = browser
+                .browse(BrowseRequest::Snapshot)
+                .await
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            assert!(!text.contains("local secret"), "{url}: {text}");
+            if url == shop_url {
+                // The allowed shop itself loads, so the refusals are the policy's.
+                assert!(text.contains("next"), "{text}");
+            }
+        }
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        local_server.abort();
+        shop_server.abort();
+    }
+
+    #[tokio::test]
+    async fn invisible_or_compatibility_characters_do_not_reveal_saved_values() {
+        let root = tempfile::tempdir().unwrap();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.path().join("profile"),
+            &["--no-sandbox".into()],
+        )
+        .await
+        .unwrap();
+        browser.redact([
+            ("Alice".into(), "[saved given_name]".into()),
+            ("ada@example.com".into(), "[saved email]".into()),
+        ]);
+        let snapshot = browser
+            .redacted(json!({
+                "url":"https://shop.example/?n=A\u{200b}lice",
+                "text":"Hello A\u{200b}l\u{00ad}ice, receipt to ada@exa\u{2060}mple.com",
+                "elements":[{
+                    "ref":"1:1", "role":"input", "type":"text",
+                    "label":"\u{ff21}\u{ff4c}\u{ff49}\u{ff43}\u{ff45}", "context":"For ALI\u{feff}CE",
+                    "value":"a\u{200d}lice", "options":[{"value":"x","label":"A\u{200c}lice"}]
+                }]
+            }))
+            .unwrap();
+        assert_eq!(
+            snapshot["text"],
+            "Hello [saved given_name], receipt to [saved email]"
+        );
+        assert_eq!(
+            snapshot["url"],
+            "https://shop.example/?n=[saved given_name]"
+        );
+        let element = &snapshot["elements"][0];
+        assert_eq!(element["label"], "[saved given_name]");
+        assert_eq!(element["context"], "For [saved given_name]");
+        assert_eq!(element["value"], "[saved given_name]");
+        assert_eq!(element["options"][0]["label"], "[saved given_name]");
+        let seen = fold(&snapshot.to_string());
+        assert!(
+            !seen.contains("alice") && !seen.contains("ada@example"),
+            "{seen}"
+        );
     }
 
     #[tokio::test]
@@ -1686,6 +1852,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn document_and_closing_popups_leave_shopping_usable() {
+        let root = tempfile::tempdir().unwrap();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.path().join("profile"),
+            &["--no-sandbox".into()],
+        )
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let fixture =
+            tokio::spawn(async move {
+                axum::serve(listener, Router::new()
+                .route("/", get(|| async { Html(r#"<!doctype html><h1>Product page</h1>
+                  <a href="/manual.pdf?token=secret#page=2" target="_blank">Manual del usuario</a>
+                  <a href="javascript:void(0)">Script link</a>
+                  <button onclick="window.open('/gone')">Brief popup</button>
+                  <button onclick="window.open('/late')">Late popup</button>"#) }))
+                .route("/gone", get(|| async { Html("<script>window.close()</script>") }))
+                .route("/late", get(|| async {
+                    Html("<h1>Popup</h1><script>setTimeout(()=>window.close(),400)</script>")
+                }))
+                .route("/manual.pdf", get(|| async {
+                    ([("content-type", "application/pdf")], "%PDF-1.4\n%%EOF\n")
+                })))
+                .await.unwrap();
+            });
+        let reference = |snapshot: &Value, label: &str| {
+            snapshot["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["label"] == label)
+                .unwrap()["ref"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        for label in ["Manual del usuario", "Brief popup", "Late popup"] {
+            browser
+                .browse(BrowseRequest::Open { url: url.clone() })
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let page = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+            serde_json::from_value::<bloom_checkout_api::BrowseResponse>(page.clone()).unwrap();
+            let link = |label: &str| {
+                page["elements"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["label"] == label)
+                    .unwrap()["href"]
+                    .clone()
+            };
+            // Agents can read a document link without opening it; queries and
+            // fragments can carry tokens and stay out.
+            assert_eq!(
+                link("Manual del usuario"),
+                json!(format!("{url}manual.pdf"))
+            );
+            assert_eq!(link("Script link"), Value::Null);
+            assert_eq!(link("Brief popup"), Value::Null);
+            browser
+                .browse(BrowseRequest::Click {
+                    element_ref: reference(&page, label),
+                })
+                .await
+                .unwrap();
+            // Give the popup time to load, download or close itself.
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let _ = browser.browse(BrowseRequest::Snapshot).await;
+            }
+            browser
+                .browse(BrowseRequest::Open { url: url.clone() })
+                .await
+                .unwrap_or_else(|e| panic!("open after {label}: {e:#}"));
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let again = browser
+                .browse(BrowseRequest::Snapshot)
+                .await
+                .unwrap_or_else(|e| panic!("snapshot after {label}: {e:#}"));
+            assert!(again["text"].as_str().unwrap().contains("Product page"));
+        }
+        fixture.abort();
+    }
+
+    #[tokio::test]
     async fn large_catalog_keeps_filters_private_fields_and_following_actions_usable() {
         // Text alone exceeds the pipe limit: platform accessibility trees
         // differ in whether they repeat it in inline-text nodes.
@@ -1714,6 +1970,15 @@ mod tests {
         // Wait for the end-of-document marker before testing the AX size limit.
         let snapshot = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
+                // Observing the entire page while its multi-megabyte response
+                // is still parsing repeatedly forces layout on an unfinished
+                // document. Wait on the fixture marker with a small DOM read.
+                let ready = browser.cdp.evaluate(&browser.tab.lock().await.session,
+                    "document.readyState === 'complete' && document.querySelector('button')?.textContent === 'Select fixture 0 ready'".into()).await;
+                if !ready.is_ok_and(|ready| ready == true) {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    continue;
+                }
                 match browser.browse(BrowseRequest::Snapshot).await {
                     Ok(snapshot)
                         if snapshot["elements"].as_array().is_some_and(|elements| {

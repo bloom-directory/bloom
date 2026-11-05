@@ -55,6 +55,12 @@ pub enum Request {
         agent_description: String,
         #[serde(default)]
         take_over: bool,
+        /// With `take_over`, an earlier card or site checkout whose result is
+        /// unknown. The person checks the shop or bank in the private view;
+        /// only their Done there marks it checked and allows another payment
+        /// at that shop.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolves: Option<String>,
     },
     /// Unlock a saved traveler for the current website with one approval.
     /// Values stay in checkout; `FillTraveler` puts them on each page.
@@ -66,11 +72,6 @@ pub enum Request {
         operation_id: String,
     },
     Cancel {
-        operation_id: String,
-    },
-    /// The person checked an unresolved shop with the merchant or bank.
-    /// The body is ignored. Refused while approval is still open.
-    Resolve {
         operation_id: String,
     },
     /// The 50 most recent checkout requests, newest first.
@@ -137,7 +138,8 @@ pub enum PreparationReason {
     /// More than one distinct payment action remains. Choose privately;
     /// trying buttons is not a safe discovery method.
     PaymentActionAmbiguous,
-    /// Installment choices do not identify one clear charge schedule.
+    /// Installment choices, or a subscription's later price, period or first
+    /// charge date, do not identify one clear charge schedule.
     ChargeTermsUnreadable,
     /// The card fields are missing, duplicated or in an unexpected shape.
     FieldsUnsupported,
@@ -221,6 +223,9 @@ pub struct Element {
     pub value: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checked: Option<bool>,
+    /// A link's http(s) origin and path, without query or fragment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub href: Option<String>,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

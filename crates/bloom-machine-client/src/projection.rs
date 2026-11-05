@@ -178,10 +178,6 @@ pub trait WalletProjectionReader: Send + Sync {
         self.list_wallets().await
     }
     async fn get_wallet(&self, wallet_id: &Token) -> Result<WalletProjection, ProtocolError>;
-    /// Forget freshness after a committed mutation; retain the offline snapshot.
-    async fn invalidate_wallet(&self, _wallet_id: &Token) -> Result<(), ProtocolError> {
-        Ok(())
-    }
     /// Read account authority from Broker without a cached success or fallback.
     async fn get_wallet_authority(
         &self,
@@ -741,22 +737,6 @@ impl CachedWalletProjectionReader {
 
 #[async_trait]
 impl WalletProjectionReader for CachedWalletProjectionReader {
-    async fn invalidate_wallet(&self, wallet_id: &Token) -> Result<(), ProtocolError> {
-        // Wait for an older in-flight observation before clearing freshness.
-        let store = self.store.clone();
-        let _refresh_lock = tokio::task::spawn_blocking(move || store.acquire_refresh_lock())
-            .await
-            .map_err(|error| {
-                unavailable(format!("join Machine projection lock task: {error}"))
-            })??;
-        self.last_live_refresh_ms.store(0, Ordering::SeqCst);
-        self.wallet_refreshed_ms
-            .lock()
-            .map_err(|_| unavailable("Machine projection freshness mutex poisoned"))?
-            .remove(wallet_id.as_str());
-        Ok(())
-    }
-
     async fn list_wallets(&self) -> Result<Vec<WalletProjection>, ProtocolError> {
         match self.refresh_coalesced().await {
             Ok(projections) => Ok(projections),
@@ -826,7 +806,11 @@ impl WalletProjectionReader for CachedWalletProjectionReader {
         &self,
         wallet_id: &Token,
     ) -> Result<WalletProjection, ProtocolError> {
-        self.refresh_wallet(wallet_id)
+        // An earlier observation may share this request's millisecond. Even
+        // timestamp-based refresh sharing must be disabled for authority.
+        self.clone()
+            .with_max_age(Duration::ZERO)
+            .refresh_wallet(wallet_id)
             .await?
             .ok_or_else(|| invalid_projection(format!("wallet {} not found", wallet_id.as_str())))
     }
@@ -2118,6 +2102,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_policy_commit_can_outpace_display_cache_but_not_authority_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let broker = Arc::new(FakeBroker::new(fixture(1)));
+        let reader = CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(broker.clone())),
+            FileProjectionStore::new(directory.path().join("wallets.json")),
+        )
+        .unwrap()
+        .with_max_age(Duration::from_secs(60));
+        let wallet = token("alice");
+        let initial = reader.get_wallet(&wallet).await.unwrap();
+        assert_eq!(initial.policy.version.get(), 1);
+
+        broker
+            .wallets
+            .lock()
+            .unwrap()
+            .insert("alice".into(), fixture(2));
+        let cached = reader.get_wallet(&wallet).await.unwrap();
+        assert_eq!(cached.policy.version.get(), 1);
+        // Force the refresh-sharing condition without relying on the test
+        // completing within one wall-clock millisecond. Authority must bypass
+        // it even if the clock moved backwards after the cached observation.
+        reader
+            .wallet_refreshed_ms
+            .lock()
+            .unwrap()
+            .insert("alice".into(), u64::MAX);
+        let authoritative = reader.get_wallet_authority(&wallet).await.unwrap();
+        assert_eq!(authoritative.policy.version.get(), 2);
+        let refreshed = reader.get_wallet(&wallet).await.unwrap();
+        assert_eq!(refreshed.policy.version.get(), 2);
+    }
+
+    #[tokio::test]
     async fn mounted_reads_reuse_a_refresh_within_the_configured_age() {
         let directory = tempfile::tempdir().unwrap();
         let store = FileProjectionStore::new(directory.path().join("wallets.json"));
@@ -2659,12 +2678,12 @@ mod tests {
     fn migrated_fixture() -> ProjectionFixture {
         let mut fixture = fixture(1);
         let policy = CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: token("alice"),
             maximum_approval_lifetime_ms: 30 * 24 * 60 * 60 * 1_000,
             allowed_petal_packages: Vec::new(),
             allowed_destinations: Vec::new(),
             required_verifiers: Vec::new(),
-            clear_signing: None,
         };
         let policy_bytes = serde_jcs::to_vec(&policy).unwrap();
         let policy_digest = Digest32::from_bytes(Sha256::digest(&policy_bytes).into());

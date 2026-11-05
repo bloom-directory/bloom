@@ -353,6 +353,29 @@ render() {
     "$src" >"$tmp"; chmod "$mode" "$tmp"; mv -f "$tmp" "$dst"
 }
 
+# Each login's private checkout view listens on its own localhost port. Keep
+# the port in this login's plist unless another login holds it; otherwise take
+# the first port from the UID's slot that no login records and nothing uses.
+checkout_view_port() {
+  local file taken=" " port offset
+  local pattern='s|.*<string>--view-port</string><string>\([0-9][0-9]*\)</string>.*|\1|p'
+  for file in "$root_prefix/Library/LaunchDaemons"/com.bloom.checkout.*.plist; do
+    [[ "$file" != "$checkout_plist" && -f "$file" && ! -L "$file" ]] || continue
+    taken+="$(sed -n "$pattern" "$file") "
+  done
+  if [[ -f "$checkout_plist" && ! -L "$checkout_plist" ]]; then
+    port="$(sed -n "$pattern" "$checkout_plist")"
+    if [[ -n "$port" && "$taken" != *" $port "* ]]; then printf '%s\n' "$port"; return; fi
+  fi
+  for ((offset = 0; offset < 8000; offset++)); do
+    port=$((10000 + (login_uid + offset) % 8000))
+    [[ "$taken" == *" $port "* ]] && continue
+    $live && lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 && continue
+    printf '%s\n' "$port"; return
+  done
+  return 69
+}
+
 paths() {
   product="$root_prefix/Library/Application Support/BloomTriad"; enrollments="$product/enrollments"
   enrollment="$enrollments/$login_uid.json"; release_base="$root_prefix/usr/local/libexec/bloom"
@@ -366,10 +389,9 @@ paths() {
   log_root="$variable/log/bloom/$login_uid"; broker_log="$log_root/broker.jsonl"; signer_log="$log_root/signer.jsonl"
   broker_bootstrap_log="$log_root/broker-bootstrap.log"; signer_bootstrap_log="$log_root/signer-bootstrap.log"
   checkout_log="$log_root/checkout.log"
-  # Each login's private checkout view needs its own localhost port.
-  checkout_view_port="$((10000 + login_uid % 8000))"
   broker_plist="$root_prefix/Library/LaunchDaemons/com.bloom.broker.$login_uid.plist"
   checkout_plist="$root_prefix/Library/LaunchDaemons/com.bloom.checkout.$login_uid.plist"
+  checkout_view_port="$(checkout_view_port)" || die "no per-login Bloom checkout view port is available"
   signer_plist="$root_prefix/Library/LaunchDaemons/com.bloom.signer.$login_uid.plist"
   containment_plist="$root_prefix/Library/LaunchDaemons/com.bloom.containment.plist"
   session_plist="$root_prefix/Library/LaunchAgents/com.bloom.session.plist"

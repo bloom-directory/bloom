@@ -17,6 +17,26 @@ Evidence: [shopping acceptance and lessons](../reviews/2026-10-27-shopping-check
 The workspace's `shared/checkout-1027-evidence/full-service-verification.json`
 holds revision-bound results; it needs refreshing before final acceptance.
 
+Current execution update (28 October): the user makes flights the primary
+use case and wants to make real payments after the remaining fixes. Existing
+#346 now includes the flight fixes and reconciled Broker pin; active writer
+`checkout-live-1028`, no new PR or merge. Runtime `b8dff781` binds private bulk
+text writes to their exact input, after a real surname/email corruption was
+confirmed. The real Gotogate itinerary reached final USD863.87 preparation
+without surname re-entry, using private handback and restored seller choices.
+This is not a fully automatic passenger flow or a ticket. All eight current
+service checks,103 local Checkout tests, strict Clippy,12VFS docs and the staged
+Linux custody-preserving upgrade regression pass. Failure cleanup also preserves
+pre-existing cards and deletes only this run's synthetic card. See the current
+acceptance report and `live-payment-readiness-verification.json` for proof limits.
+
+The host's installed Bloom has no checkout interface. Real payments need a
+verified installed candidate and normal private human approval. Do not use the
+software-passkey developer Triad for a real card. Release40748774212 and native
+Mac40748765800 remain pending. Reviews, landed pins, the second-login Mac and
+any required explicit merge/installation approval are not waived by this plan.
+Do not mark the whole plan complete or claim public release readiness.
+
 ## Established baseline
 
 Execution update: diagnostics and dropdown recovery are implemented and pushed
