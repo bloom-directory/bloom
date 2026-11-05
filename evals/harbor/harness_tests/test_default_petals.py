@@ -57,27 +57,24 @@ class HostBoundaryTests(unittest.TestCase):
                 spec = _agent_spec("codex")
             self.assertEqual(spec.env, {"CODEX_AUTH_JSON_PATH": str(auth)})
 
-    def test_opencode_auth_is_an_explicit_file_or_the_usual_login(self):
+    def test_pi_auth_is_only_an_explicit_file(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            usual = root / ".pi/agent/auth.json"
+            usual.parent.mkdir(parents=True)
+            usual.write_text("{}")
             with (
                 mock.patch.dict(os.environ, {}, clear=True),
                 mock.patch("pathlib.Path.home", return_value=root),
             ):
+                # The user's own login is never picked up.
                 with self.assertRaises(EvalError):
-                    _agent_spec("opencode")
-                usual = root / ".local/share/opencode/auth.json"
-                usual.parent.mkdir(parents=True)
-                usual.write_text("{}")
-                self.assertEqual(
-                    _agent_spec("opencode").env, {"OPENCODE_AUTH_JSON_PATH": str(usual)}
-                )
+                    _agent_spec("pi")
                 explicit = root / "ci-auth.json"
                 explicit.write_text("{}")
-                os.environ["OPENCODE_AUTH_JSON_PATH"] = str(explicit)
+                os.environ["PI_AUTH_JSON_PATH"] = str(explicit)
                 self.assertEqual(
-                    _agent_spec("opencode").env,
-                    {"OPENCODE_AUTH_JSON_PATH": str(explicit)},
+                    _agent_spec("pi").env, {"PI_AUTH_JSON_PATH": str(explicit)}
                 )
 
     def test_absent_mount_and_staged_work_cannot_pass_as_no_pending_work(self):

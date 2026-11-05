@@ -42,13 +42,25 @@ AGENTS: dict[str, AgentSpec] = {
     # weaker instrument that exposes missing docs a stronger model reads past.
     "claude-opus": AgentSpec("claude-code", "claude-opus-5-5"),
     "claude-sonnet": AgentSpec("claude-code", "claude-sonnet-5-5"),
-    # Codex and OpenCode run mid-tier models on subscription logins, not the
+    # Codex and Pi run mid-tier models on subscription logins, not the
     # strongest each offers.
     "codex": AgentSpec("codex", "gpt-5.6-sol"),
-    "opencode": AgentSpec("opencode", "kimi-code-plan-global/k3"),
+    "opencode": AgentSpec("opencode", "deepseek/deepseek-v4-flash"),
+    "pi": AgentSpec("pi", "kimi-coding/k3"),
 }
 
-AGENT_VERSIONS = {"claude-code": "2.1.245", "codex": "0.149.1", "opencode": "1.18.26"}
+AGENT_VERSIONS = {
+    "claude-code": "2.1.245",
+    "codex": "0.149.1",
+    "opencode": "1.18.26",
+    "pi": "1.4.0",
+}
+
+# Agents Harbor runs through a local subclass.
+IMPORT_PATHS = {
+    "opencode": "harness.image_opencode:ImageOpenCode",
+    "pi": "harness.image_pi:ImagePi",
+}
 
 REASONING_EFFORT_ENV = "BLOOM_EVAL_REASONING_EFFORT"
 REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
@@ -156,10 +168,8 @@ async def run_harbor_job(context: EvalRunContext, agent: AgentSpec) -> Any:
         retry=RetryConfig(max_retries=0),
         agents=[
             AgentConfig(
-                name=None if agent.harbor_name == "opencode" else agent.harbor_name,
-                import_path="harness.image_opencode:ImageOpenCode"
-                if agent.harbor_name == "opencode"
-                else None,
+                name=None if agent.harbor_name in IMPORT_PATHS else agent.harbor_name,
+                import_path=IMPORT_PATHS.get(agent.harbor_name),
                 model_name=agent.model,
                 n_concurrent=1,
                 env=shared_env,
@@ -215,17 +225,13 @@ def _agent_spec(name: str) -> AgentSpec:
         return AgentSpec(
             spec.harbor_name, spec.model, {"CODEX_AUTH_JSON_PATH": str(auth_file)}
         )
-    if name == "opencode":
-        auth_file = Path(
-            os.getenv("OPENCODE_AUTH_JSON_PATH")
-            or Path(os.getenv("XDG_DATA_HOME") or Path.home() / ".local/share")
-            / "opencode/auth.json"
-        )
-        if not auth_file.is_file():
-            raise EvalError("OpenCode auth is missing")
-        return AgentSpec(
-            spec.harbor_name, spec.model, {"OPENCODE_AUTH_JSON_PATH": str(auth_file)}
-        )
+    if name == "pi":
+        # Never default to ~/.pi: the agent refreshes the OAuth login it is
+        # given, which can sign out the copy it came from.
+        auth = os.getenv("PI_AUTH_JSON_PATH")
+        if not auth or not Path(auth).is_file():
+            raise EvalError("Pi auth is missing; set PI_AUTH_JSON_PATH")
+        return AgentSpec(spec.harbor_name, spec.model, {"PI_AUTH_JSON_PATH": auth})
     return spec
 
 
