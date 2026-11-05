@@ -37,16 +37,29 @@ AGENTS: dict[str, AgentSpec] = {
     # Model ids are the API's, not the marketing names: "sonnet-5" is rejected
     # with a 404 unrecognized_model, which surfaces as an errored Harbor trial
     # rather than a configuration error.
-    # Two Claude rows on purpose. Opus is what a paying Claude Code user runs,
-    # so it answers "does Bloom work for the agent people have". Sonnet is the
-    # weaker instrument that exposes missing docs a stronger model reads past.
+    # Release runs use mid-tier models: they cost less, and a weaker model
+    # exposes missing docs a stronger one reads past. Opus runs on request.
     "claude-opus": AgentSpec("claude-code", "claude-opus-5-5"),
     "claude-sonnet": AgentSpec("claude-code", "claude-sonnet-5-5"),
-    "codex": AgentSpec("codex", "gpt-5.6-terra"),
-    "opencode": AgentSpec("opencode", "deepseek/deepseek-v4-flash"),
+    # Codex and Pi run mid-tier models on subscription logins, not the
+    # strongest each offers.
+    "codex": AgentSpec("codex", "gpt-5.6-sol"),
+    "opencode": AgentSpec("opencode", "deepseek/deepseek-flash"),
+    "pi": AgentSpec("pi", "kimi-coding/k3"),
 }
 
-AGENT_VERSIONS = {"claude-code": "2.1.245", "codex": "0.149.1", "opencode": "1.18.26"}
+AGENT_VERSIONS = {
+    "claude-code": "2.1.245",
+    "codex": "0.149.1",
+    "opencode": "1.18.26",
+    "pi": "1.4.0",
+}
+
+# Agents Harbor runs through a local subclass.
+IMPORT_PATHS = {
+    "opencode": "harness.image_opencode:ImageOpenCode",
+    "pi": "harness.image_pi:ImagePi",
+}
 
 REASONING_EFFORT_ENV = "BLOOM_EVAL_REASONING_EFFORT"
 REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
@@ -154,10 +167,8 @@ async def run_harbor_job(context: EvalRunContext, agent: AgentSpec) -> Any:
         retry=RetryConfig(max_retries=0),
         agents=[
             AgentConfig(
-                name=None if agent.harbor_name == "opencode" else agent.harbor_name,
-                import_path="harness.image_opencode:ImageOpenCode"
-                if agent.harbor_name == "opencode"
-                else None,
+                name=None if agent.harbor_name in IMPORT_PATHS else agent.harbor_name,
+                import_path=IMPORT_PATHS.get(agent.harbor_name),
                 model_name=agent.model,
                 n_concurrent=1,
                 env=shared_env,
@@ -213,6 +224,13 @@ def _agent_spec(name: str) -> AgentSpec:
         return AgentSpec(
             spec.harbor_name, spec.model, {"CODEX_AUTH_JSON_PATH": str(auth_file)}
         )
+    if name == "pi":
+        # Never default to ~/.pi: the agent refreshes the OAuth login it is
+        # given, which can sign out the copy it came from.
+        auth = os.getenv("PI_AUTH_JSON_PATH")
+        if not auth or not Path(auth).is_file():
+            raise EvalError("Pi auth is missing; set PI_AUTH_JSON_PATH")
+        return AgentSpec(spec.harbor_name, spec.model, {"PI_AUTH_JSON_PATH": auth})
     return spec
 
 

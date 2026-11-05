@@ -368,15 +368,16 @@ impl PetalRouter {
                 }
             } else if let Some(wallet) = wallet
                 && checked_wallets.insert(wallet)
-                && !self
-                    .host
-                    .vfs_list("wallets")
-                    .await
-                    .map_err(map_host_err)?
-                    .iter()
-                    .any(|entry| {
-                        entry.name == wallet && entry.kind == crate::host::HostVfsEntryKind::Dir
-                    })
+                && (is_reserved_wallet_entry(wallet)
+                    || !self
+                        .host
+                        .vfs_list("wallets")
+                        .await
+                        .map_err(map_host_err)?
+                        .iter()
+                        .any(|entry| {
+                            entry.name == wallet && entry.kind == crate::host::HostVfsEntryKind::Dir
+                        }))
             {
                 return Err(HandlerError::not_found(format!("wallets/{wallet}")));
             }
@@ -417,7 +418,7 @@ impl PetalRouter {
             }
             for entry in self.host.vfs_list(&core).await.map_err(map_host_err)? {
                 if entry.kind == crate::host::HostVfsEntryKind::Dir
-                    && (core == "wallets" && entry.name != "registrations"
+                    && (core == "wallets" && !is_reserved_wallet_entry(&entry.name)
                         || core != "wallets" && canonical_account(&entry.name).is_some())
                 {
                     entries.insert(entry.name.clone(), Entry::dir(&entry.name));
@@ -489,6 +490,11 @@ impl PetalRouter {
             _ => Err(HandlerError::PermissionDenied),
         }
     }
+}
+
+/// Core lists control entries such as `recoveries` beside the wallets.
+fn is_reserved_wallet_entry(name: &str) -> bool {
+    bloom_vfs::handlers::wallets::is_wallet_control_entry(name)
 }
 
 fn canonical_account(segment: &str) -> Option<u32> {
@@ -1024,7 +1030,14 @@ mod tests {
         }
         async fn vfs_list(&self, path: &str) -> Result<Vec<HostVfsEntry>, HostError> {
             let names = match path {
-                "wallets" => vec!["alice"],
+                // Core lists its control entries beside the wallets.
+                "wallets" => std::iter::once("alice")
+                    .chain(
+                        bloom_vfs::handlers::wallets::WALLET_CONTROL_ENTRIES
+                            .iter()
+                            .map(|(name, _)| *name),
+                    )
+                    .collect(),
                 "wallets/alice" => vec!["0", "1"],
                 _ => return Err(HostError::NotFound(path.into())),
             };
