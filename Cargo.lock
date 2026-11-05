@@ -2458,7 +2458,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-checkout"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -2490,7 +2490,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-checkout-api"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde",
  "serde_json",
