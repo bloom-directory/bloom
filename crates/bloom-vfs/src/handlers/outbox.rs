@@ -182,9 +182,15 @@ impl CentralOutbox {
     }
 
     /// Move an action from one state to another (atomic rename).
+    /// A retry after the rename succeeded but the status write failed
+    /// finishes that write. The wallet outbox rolls back only its own state,
+    /// so it retries against an action already in `to`.
     pub fn transition(&self, action_id: &str, from: &str, to: &str) -> std::io::Result<()> {
         let from_dir = self.action_dir(from, action_id);
         let to_dir = self.action_dir(to, action_id);
+        if !from_dir.exists() && to_dir.exists() {
+            return self.write_status_state(action_id, to);
+        }
         if !from_dir.exists() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -777,6 +783,30 @@ mod tests {
                 .expect("status.json parses");
         assert_eq!(status["action_id"], "act-status");
         assert_eq!(status["state"], "sent");
+    }
+
+    /// The rename landed but the status write did not, and the wallet outbox
+    /// rolled back. Its retry must finish the move, not report it missing.
+    #[tokio::test]
+    async fn transition_retry_finishes_a_move_whose_status_write_failed() {
+        let h = handler();
+        h.outbox
+            .stage("act-split", b"{}", "hash", "plan", b"[]")
+            .unwrap();
+        std::fs::create_dir_all(h.outbox.state_dir("sent")).unwrap();
+        std::fs::rename(
+            h.outbox.action_dir("pending", "act-split"),
+            h.outbox.action_dir("sent", "act-split"),
+        )
+        .unwrap();
+
+        h.outbox.transition("act-split", "pending", "sent").unwrap();
+
+        let status_path = VfsPath::parse("sent/act-split/status.json").unwrap();
+        let status: serde_json::Value =
+            serde_json::from_slice(&h.read(&status_path).await.unwrap()).unwrap();
+        assert_eq!(status["state"], "sent");
+        assert!(h.outbox.transition("act-none", "pending", "sent").is_err());
     }
 
     #[tokio::test]
