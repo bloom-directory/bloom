@@ -428,8 +428,10 @@ the action they produced, such as Polymarket's `PreparedOrder`,
 `PreparedBatch` or login timestamp. A crash therefore never leaves the
 inputs and the frozen action out of step.
 
-**Operation key** = `"{scope}#{generation}"`. Scopes are unique per package
-and wallet, which the status lookup requires. The SDK rejects a key longer
+**Operation key** = `"{scope}#{generation}"`. Each scope belongs to exactly one signing route and is unique per package
+and wallet. Machine binds signing records to the route as well as the
+operation key; sharing a scope across signing routes can create two operations
+and is unsupported. Read-only approval routes may inspect that scope. The SDK rejects a key longer
 than the contract's 256 bytes.
 
 **State normalization:**
@@ -717,8 +719,9 @@ for P1 to P5 and tests 13 to 15.
 - `crates/bloom-petals/tests/prepared_actions.rs`: add tests 13 to 15. The
   existing mock host is sufficient. Test 15 needs a second package hash for
   the same component, which is a test-harness change only.
-- No change to `phase1_acceptance.rs`. It never depends on Petal operation-key
-  formats. Rebuild only the `BLOOM_PM80_*_ROOT` archives.
+- `phase1_acceptance.rs` additionally checks that a pending frozen BUY
+  refuses revalidation without new approvals or charges. Rebuild the
+  `BLOOM_PM80_*_ROOT` archives against the final shared SDK pin.
 - Polymarket and Gasless pin the same SDK commit (the Phase 1 rule).
 
 **Broker and Signer: no change.** No demonstrated need. The only Machine
@@ -761,6 +764,24 @@ Bloom can run, and it was approved for this delivery.
   selected-key check stays as well.
 - Operators upgrade Petals only with no spending attempts in flight. Continuing
   across a package upgrade is deferred.
+
+#### Phase 2 implementation measurements
+
+The implementation keeps readable explicit calls rather than adding another
+workflow abstraction to meet line-count targets. On the initial Phase 2
+consumer commits, Polymarket `approval.rs` falls from 257 to 40 nonblank
+production lines (the remainder is review-intent storage and owner signature
+verification); production `route/src` falls by 331 lines. Its five prepared
+approval route bodies are 2–4 lines each. Gasless production `route/src`
+falls by 29 lines while adding owner verification and retaining its public
+status mapping. The SDK is approximately 385 nonblank production lines.
+
+The aggregate ≤60/≤25 Petal-plumbing targets and ≤350 SDK target above are
+not demonstrated. These are recorded target misses, not passing acceptance
+claims. Explicit terminal renewal and domain-specific submission handling
+remain at the call sites; catalog extraction and a larger workflow API remain
+out of scope. Signing deduplication does not claim exactly-once venue HTTP
+submission; in particular, concurrent Gasless submission was not redesigned.
 
 #### Phase 2 open questions
 
