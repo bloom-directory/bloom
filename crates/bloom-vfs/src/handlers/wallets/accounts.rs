@@ -598,6 +598,13 @@ impl WalletsHandler {
                 }
             }
             let tokens = holdings_tokens(spec.chain_id);
+            if !spec.has_native_asset() && tokens.is_empty() {
+                // Otherwise the chain would look checked and empty.
+                return Err(HandlerError::not_found(format!(
+                    "no balances checked: chain '{chain}' has no native token and no known \
+                     tokens; read chains/{chain}/addresses/<address>/tokens/<token>/ by address"
+                )));
+            }
             // Futures are lazy: `buffer_unordered` runs at most
             // HOLDINGS_CONCURRENCY, and yields each read as it finishes, so a
             // slow token does not hide later ones that completed in time.
@@ -2033,6 +2040,10 @@ impl WalletsHandler {
         record.state = AccountCreationState::Created;
         record.number = number;
         write_atomic_json(path, &record)?;
+        // Navigation may reuse a projection observed before the ceremony
+        // finished. Refresh it now so the reported account is readable at
+        // once. A failed refresh leaves the old view to age out normally.
+        let _ = self.wallet_projection_authority(&record.wallet_id).await;
         Self::render_record(&record, true)
     }
 
