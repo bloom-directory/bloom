@@ -11653,17 +11653,20 @@ value = "0""#,
         held: fn(&str) -> Option<u64>,
         delay: std::time::Duration,
     ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
-        spawn_holdings_node_with(chain_id, native, held, Arc::new(move |_| delay)).await
+        spawn_holdings_node_with(chain_id, native, held, Arc::new(move |_| delay), false).await
     }
 
     type HoldingsDelay = dyn Fn(Option<&str>) -> std::time::Duration + Send + Sync;
 
     /// `delay` gets the token symbol a call reads, or `None` for other calls.
+    /// With `multicall`, the node answers Multicall3 `aggregate3`; without
+    /// it, Multicall3 has no code there and answers at once.
     async fn spawn_holdings_node_with(
         chain_id: u64,
         native: u64,
         held: fn(&str) -> Option<u64>,
         delay: Arc<HoldingsDelay>,
+        multicall: bool,
     ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let tokens: Arc<Vec<(String, Option<u64>, String)>> = Arc::new(
@@ -11701,12 +11704,54 @@ value = "0""#,
                     let to = request["params"][0]["to"].as_str().unwrap_or_default();
                     let method = request["method"].as_str().unwrap_or_default();
                     let token = tokens.iter().find(|(a, ..)| a.eq_ignore_ascii_case(to));
+                    let multicall3 =
+                        to.eq_ignore_ascii_case(&format!("{:#x}", bloom_evm::MULTICALL3));
+                    if multicall3 && !multicall {
+                        let body =
+                            serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":"0x"})
+                                .to_string();
+                        let _ = socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+                        return;
+                    }
                     if method != "eth_chainId" {
                         tokio::time::sleep(delay(token.map(|(.., symbol)| symbol.as_str()))).await;
                     }
                     let result = match method {
                         "eth_chainId" => serde_json::json!(format!("{chain_id:#x}")),
                         "eth_getBalance" => serde_json::json!(format!("{native:#x}")),
+                        "eth_call" if multicall3 => {
+                            use alloy::sol_types::SolCall;
+                            use bloom_evm::IMulticall3::{Call3Result, aggregate3Call};
+                            let params = &request["params"][0];
+                            let input = params["input"].as_str().or(params["data"].as_str());
+                            let input = hex::decode(input.unwrap().trim_start_matches("0x"));
+                            let calls = aggregate3Call::abi_decode(&input.unwrap()).unwrap().calls;
+                            let results: Vec<Call3Result> = calls
+                                .iter()
+                                .map(|call| {
+                                    let target = format!("{:#x}", call.target);
+                                    let held = tokens
+                                        .iter()
+                                        .find(|(a, ..)| a.eq_ignore_ascii_case(&target))
+                                        .and_then(|(_, held, _)| *held);
+                                    Call3Result {
+                                        success: held.is_some(),
+                                        returnData: held
+                                            .map(|value| {
+                                                alloy::primitives::U256::from(value)
+                                                    .to_be_bytes::<32>()
+                                                    .to_vec()
+                                            })
+                                            .unwrap_or_default()
+                                            .into(),
+                                    }
+                                })
+                                .collect();
+                            serde_json::json!(format!(
+                                "0x{}",
+                                hex::encode(aggregate3Call::abi_encode_returns(&results))
+                            ))
+                        }
                         "eth_call" if token.is_some_and(|(_, held, _)| held.is_none()) => {
                             let body = serde_json::json!({"jsonrpc":"2.0","id":request["id"],
                                 "error":{"code":3,"message":"execution reverted"}})
@@ -11900,7 +11945,7 @@ value = "0""#,
                 std::time::Duration::ZERO
             }
         });
-        let (url, _) = spawn_holdings_node_with(1, 1, |_| Some(1), delay).await;
+        let (url, _) = spawn_holdings_node_with(1, 1, |_| Some(1), delay, false).await;
         f.handler.chains.add(holdings_chain("ethereum", 1, url));
         let v = read_holdings(&f).await;
         let symbols: Vec<&str> = v["holdings"]
@@ -11916,6 +11961,42 @@ value = "0""#,
             format!("timed out; could not read {}", tokens[0].1),
             "{v}"
         );
+    }
+
+    /// With Multicall3, a chain costs one native read and one token batch,
+    /// not one request per token, and a failed token in the batch is named.
+    #[tokio::test]
+    async fn holdings_read_tokens_in_one_multicall_request() {
+        let f = make_handler();
+        let tokens = accounts::holdings_tokens(1);
+        assert!(tokens.iter().any(|(_, s, _)| s == "USDC"), "{tokens:?}");
+        let (url, served) = spawn_holdings_node_with(
+            1,
+            1,
+            |symbol| (symbol != "USDC").then_some(1),
+            Arc::new(|_| std::time::Duration::ZERO),
+            true,
+        )
+        .await;
+        f.handler.chains.add(holdings_chain("ethereum", 1, url));
+        let before = served.load(std::sync::atomic::Ordering::SeqCst);
+        let v = read_holdings(&f).await;
+        let symbols: Vec<&str> = v["holdings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["symbol"].as_str().unwrap())
+            .collect();
+        let rest: Vec<&str> = tokens
+            .iter()
+            .map(|(_, s, _)| s.as_str())
+            .filter(|s| *s != "USDC")
+            .collect();
+        assert_eq!(symbols, [&["ETH"][..], &rest].concat(), "{v}");
+        assert_eq!(v["errors"]["ethereum"], "could not read USDC", "{v}");
+        // eth_chainId, eth_getBalance and one aggregate3.
+        let requests = served.load(std::sync::atomic::Ordering::SeqCst) - before;
+        assert!(requests <= 3, "{requests} requests");
     }
 
     /// Tempo has no native token: holdings skip the native read rather than
