@@ -34,6 +34,7 @@ Petals before choosing paths; their names and availability vary by installation.
 | `ens/`, `prices/` | ENS resolution and price-provider reads |
 | `addressbook/` | Named public addresses |
 | `tools/` | Pure encoding, hashing, address, ABI, and unit helpers |
+| `views/` | Read-only HTML pages for a person to open in a browser; read `views/AGENTS.md` before pointing someone at one |
 | `docs/` | Route reference, examples, installed-Petal index |
 | `petal-key-requests/`, `petal-signing-requests/` | Broker-backed Petal request projections |
 
