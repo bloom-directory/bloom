@@ -4822,6 +4822,14 @@ impl WalletsHandler {
                     )
                     .map_err(solana_outbox_err)?;
                 require_pinned(&entry.staged, id)?;
+                // As on EVM, `cancel` written to confirm discards the entry
+                // instead of signing it.
+                if confirm_text.eq_ignore_ascii_case("cancel") {
+                    return engine
+                        .cancel(wallet, id)
+                        .await
+                        .map_err(|e| HandlerError::backend(e.to_string()));
+                }
                 // Re-select the exact account this transfer was staged
                 // against. Resolving the wallet's children again would let a
                 // second active child sign a message staged for the first.
@@ -6936,6 +6944,31 @@ value = "0""#
                 .unwrap();
             assert_eq!(sink.mode, 0o644, "{path}/restage must be writable");
         }
+
+        // `cancel` written to confirm discards the entry; it never signs.
+        handler
+            .write(
+                &vfs(format!(
+                    "/{w}/0/chains/solana-devnet/outbox/pending/sol-zero/confirm"
+                )),
+                b"cancel\n",
+            )
+            .await
+            .unwrap();
+        let names = |state: &'static str| {
+            let handler = handler.clone();
+            async move {
+                handler
+                    .list(&vfs(format!("/{w}/0/chains/solana-devnet/outbox/{state}")))
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|entry| entry.name)
+                    .collect::<Vec<String>>()
+            }
+        };
+        assert!(names("pending").await.is_empty());
+        assert!(names("failed").await.contains(&"sol-zero".to_string()));
     }
 
     /// A crash after the move to `failed/` but before the intent rewrite
