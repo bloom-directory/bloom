@@ -366,6 +366,20 @@ fn refresh_developer_provenance_catalog(
     let mut developer_records = developer_records;
     let mut conflicts = Vec::new();
     for record in &mut developer_records {
+        // Enrolment keeps a Petal's predecessor packages in the catalog,
+        // re-signed with `active: false`. Such a record cannot authorize
+        // anything, so a disagreement on one is not worth refusing a launch
+        // over — and re-enrolling could not clear it anyway, because enrolment
+        // only re-derives the package hash on disk. A record carrying no
+        // lineage at all, such as the authority fixture the launcher injects,
+        // is treated as live.
+        if record
+            .petal_lineage
+            .as_ref()
+            .is_some_and(|membership| !membership.active)
+        {
+            continue;
+        }
         if matches!(record.subject, ProvenanceSubject::Petal { .. }) {
             let (package_hash, route) = match &record.subject {
                 ProvenanceSubject::Petal {
@@ -2082,6 +2096,111 @@ mod tests {
         let after: ProvenanceCatalog =
             serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
         assert_eq!(after, stale, "a refused refresh must not touch the catalog");
+    }
+
+    /// A predecessor package stays in the catalog, re-signed inactive, and can
+    /// never authorize anything again. A disagreement on one must not refuse
+    /// the launch: the launcher runs this refresh before enrolment, and
+    /// enrolment only re-derives the package hash on disk, so there would be
+    /// no way out but the override.
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
+    fn developer_catalog_refresh_ignores_an_inactive_package() {
+        let _fixture = FIXTURE_PETAL
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        assert!(
+            std::env::var_os(REWRITE_EXISTING_FEE_ASSETS).is_none(),
+            "{REWRITE_EXISTING_FEE_ASSETS} is exported in this environment, which turns \
+             the refusal this test asserts into a rewrite"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("config");
+        fs::create_dir(&output).unwrap();
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o700)).unwrap();
+        let owner = rustix::process::geteuid().as_raw();
+        let plan = EnrollmentPlan {
+            template_dir: template_dir(),
+            output_dir: output.clone(),
+            login_uid: 1_001,
+            broker_uid: 1_002,
+            signer_uid: 1_003,
+            session_socket_gid: 1_004,
+            release_digest: "44".repeat(32),
+        };
+        generate_for_owner(&plan, owner).unwrap();
+        let petal_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join("tests/fixtures/triad-authority-petal");
+        enroll_developer_petal_provenance(&output, &petal_dir, owner).unwrap();
+        let catalog_path = output.join("provenance-catalog.json");
+        let mut stale: ProvenanceCatalog =
+            serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
+
+        // The same conflict the replace test plants, on a record enrolment has
+        // since superseded.
+        let builder_class = Token::new(HYPERLIQUID_BUILDER_ORDER_CLASS).unwrap();
+        let mut retired = 0;
+        for record in &mut stale.records {
+            if !matches!(record.subject, ProvenanceSubject::Petal { .. })
+                || record.publisher == Token::new("bloom-release-pins").unwrap()
+            {
+                continue;
+            }
+            let Some(membership) = record.petal_lineage.as_mut() else {
+                continue;
+            };
+            membership.active = false;
+            if let Some(class) = record.operation_classes.first_mut() {
+                class.operation_class = builder_class.clone();
+                class.fee_asset = Some(ProvenanceFeeAsset {
+                    chain: Token::new("polygon").unwrap(),
+                    asset: "pusd".to_owned(),
+                });
+                retired += 1;
+            }
+        }
+        assert!(
+            retired > 0,
+            "the fixture must enroll a record with a lineage"
+        );
+        assert!(
+            catalogued_fee_asset(builder_class.as_str())
+                .unwrap()
+                .is_some(),
+            "the planted class must be one the table catalogues, or this proves nothing"
+        );
+        rewrite_private_json(&catalog_path, &serde_json::to_value(&stale).unwrap()).unwrap();
+
+        let template = template_dir().join("provenance-catalog.unsigned.json");
+        refresh_developer_provenance_catalog(&template, &output, owner)
+            .expect("an inactive package must not refuse the refresh");
+
+        // And it is left exactly as it was, not healed and not rewritten.
+        let after: ProvenanceCatalog =
+            serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
+        for record in &after.records {
+            let Some(membership) = &record.petal_lineage else {
+                continue;
+            };
+            if membership.active {
+                continue;
+            }
+            for class in &record.operation_classes {
+                if class.operation_class == builder_class {
+                    assert_eq!(
+                        class.fee_asset,
+                        Some(ProvenanceFeeAsset {
+                            chain: Token::new("polygon").unwrap(),
+                            asset: "pusd".to_owned(),
+                        }),
+                        "an inactive record must be carried across untouched"
+                    );
+                }
+            }
+        }
     }
 
     /// Clearing a fee asset for a class this build does not catalogue would
