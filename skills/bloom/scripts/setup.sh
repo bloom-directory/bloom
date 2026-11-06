@@ -1,26 +1,9 @@
 #!/bin/sh
 set -eu
 
-# Bloom review-before-execute setup.
-#
-# This script downloads, verifies, and stages the latest published stable Bloom triad
-# release for the current platform. It never elevates privilege, never handles
-# a password, and never starts a Bloom service. After staging it prints the
-# captured values for one narrow, reviewed privileged handoff (pkexec/osascript,
-# or user-run sudo as a Linux fallback).
-#
-# Supported production targets and their signed release artifacts:
-#
-#   Linux x86_64   bloom-triad-linux-x86_64.tar.gz    claim linux
-#   Linux aarch64  bloom-triad-linux-aarch64.tar.gz   claim linux
-#   macOS arm64    bloom-triad-macos-aarch64.tar.gz   claim macos-unix-principals
-#
-# Each artifact ships .sha256, .sig, and .pub sidecars signed by the reviewed
-# Bloom release key. Upstream release note: the tag workflow publishes the
-# Linux x86_64 and aarch64 assets, and the macOS aarch64 asset is signed and
-# attached to the same release tag by its native release lane. If an expected
-# asset is absent from the resolved release the download below fails and
-# nothing is installed.
+# Downloads, verifies, and stages the latest stable signed Bloom release for
+# this platform below ~/.cache/bloom/install. Runs as the login user only: it
+# starts nothing and installs nothing. references/install.md covers the rest.
 
 sha256_file() {
   digest_input=$1
@@ -103,10 +86,6 @@ require_triad_environment() {
       exit 1
     fi
   done
-  if [ ! -x /usr/bin/ssh-keygen ]; then
-    printf '%s\n' "/usr/bin/ssh-keygen is required to verify Bloom release signatures." >&2
-    exit 1
-  fi
 
   case "$os" in
     Linux)
@@ -134,9 +113,6 @@ require_triad_environment() {
           exit 1
         fi
       done
-      # The packaged macOS installer bootstraps the Machine and session
-      # LaunchAgents into this login's GUI domain and refuses to install
-      # without it.
       if ! launchctl print "gui/$login_uid" >/dev/null 2>&1; then
         printf '%s\n' "An active macOS login session is required to install Bloom." >&2
         exit 1

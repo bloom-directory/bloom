@@ -9,8 +9,8 @@ read-only chain access, and starting the components required for an active Bloom
 session. Bloom is a triad: Machine runs as the login user while Broker and Signer
 run as isolated service principals, under systemd on Linux and under launchd on
 macOS. Setup therefore authorizes enabling those packaged Bloom services, but it
-never authorizes the agent to handle a sudo password, a polkit credential, or a
-macOS administrator credential, or to broaden the reviewed privileged command.
+never authorizes the agent to handle an administrator password or polkit
+credential, or to broaden the reviewed privileged command.
 
 Setup does not authorize creating or registering a wallet, starting a passkey
 ceremony, adding a passkey, recovering a wallet, staging/signing/broadcasting
@@ -32,7 +32,7 @@ artifacts:
 The script verifies both the archive and internal payload signatures against
 Bloom's reviewed release key, verifies their SHA-256 manifests, checks the
 platform claim, and stages the payload below `~/.cache/bloom/install`. It does
-not execute the staged release or invoke sudo. Resolve `releases/latest` only once
+not execute the staged release or elevate privileges. Resolve `releases/latest` only once
 and keep every artifact download on the resolved tag; do not use moving
 `releases/latest/download` URLs or substitute one platform's artifact for the
 other. If discovery, download, or verification fails, stop and report the failure;
@@ -40,10 +40,10 @@ never fall back to an older release or cached payload.
 
 This setup script supports only the targets above. On macOS x86_64 or any other
 platform the script stops; report that instead of improvising an install.
-Linux also needs systemd with a user session, and every target needs
-`/usr/bin/ssh-keygen` to verify release signatures. If setup reports a missing
-command, tell the user which package provides it (OpenSSH's client for
-`ssh-keygen`) and stop; do not install packages yourself.
+Linux also needs systemd with a user session, and every target needs the
+OpenSSH client to verify release signatures. If setup reports a missing
+command, tell the user which package provides it and stop; do not install
+packages yourself.
 Bloom requires macOS 26 or later: it mounts `~/bloom` over NFSv4.1, which
 earlier versions lack, and the privileged installer refuses an older macOS
 before changing anything. Report that the user must update macOS first.
@@ -81,7 +81,7 @@ prefix as that skill.
 Inspect the complete downloaded script before execution. It should contact only the
 Bloom repository's GitHub latest-release URL and the resolved release downloads,
 write only to a temporary directory and the reported
-user-owned staging directory, and perform no wallet, transaction, sudo, or
+user-owned staging directory, and perform no wallet, transaction, privileged, or
 service action. If it matches, run:
 
 ```sh
@@ -106,69 +106,65 @@ BLOOM_LOGIN_UID=<decimal UID>
 BLOOM_LOGIN_USER=<login name>
 ```
 
-One privileged step remains. Root never runs files from the user-owned stage:
-the privileged command below copies the payload into a new root-owned
-directory, verifies the copy's signature with the release key written into the
-command, and only then runs the signed release installer from the copy. Every
-supported path runs this identical command; only who runs it and who asks for
-the credential differs.
+One privileged step remains. Broker and Signer run as separate system users so
+the agent, which runs as the login user, cannot read or alter key custody or
+policy; creating those users and their services needs administrator rights.
+Root never runs files from the user-owned stage: the root script below copies
+the payload into a new root-owned directory, verifies the copy's signature with
+the release key written into the script, and only then runs the signed release
+installer from the copy. Every path runs this identical root script; only who
+runs it and who asks for the credential differs.
 
-The command is fixed. Replace only the three placeholders `STAGE`, `UID`, and
-`USER` with the captured `BLOOM_STAGE`, `BLOOM_LOGIN_UID`, and
+The root script is fixed. Replace only the three placeholders `STAGE`, `UID`,
+and `USER` with the captured `BLOOM_STAGE`, `BLOOM_LOGIN_UID`, and
 `BLOOM_LOGIN_USER` values as shell-quoted literals:
 single-quote each value, replacing any embedded `'` with `'\''`. Shell
 variables are not available, because staging runs in a child process and its
 output must not be evaluated. Do not add arguments, add environment variables,
 change the root, or substitute a different stage.
 
+```sh
+pkexec /bin/sh -c 'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); trap "rm -rf -- $s" EXIT; trap "exit 129" HUP INT TERM; cp -R "$1/bloom-triad" "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; if find "$s" -type l -o ! -type f ! -type d | grep -q .; then echo "Bloom stage contains a link or special file." >&2; exit 65; fi; k="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFY9na4hytUNsW+8LWu//HrX9TaPU7H7Vg0GRWcZM+uP"; printf "%s\n" "$k" > "$s/key.pub"; printf "bloom-release %s\n" "$k" > "$s/signers"; p="$s/bloom-triad"; /usr/bin/ssh-keygen -Y verify -f "$s/signers" -I bloom-release -n bloom-release-payload-v1 -s "$p/RELEASE_SIGNATURE" < "$p/SHA256SUMS" > /dev/null; cd "$p"; { sha256sum -c SHA256SUMS 2>/dev/null || shasum -a 256 -c SHA256SUMS; } > /dev/null; case $(uname -s) in Linux) i=linux;; Darwin) i=macos;; *) exit 65;; esac; BLOOM_RELEASE_PUBLIC_KEY="$s/key.pub" "$p/installer/release/install-$i.sh" install / "$2" "$3" "$p"' bloom-install 'STAGE' 'UID' 'USER'
+```
+
+The root script is the single-quoted argument after `/bin/sh -c`.
+
 | Target | Privileged path |
 | --- | --- |
 | macOS arm64 | the agent runs the command through `/usr/bin/osascript` |
 | Linux x86_64 or aarch64 with `pkexec` | the agent runs the command through `pkexec` |
-| Linux x86_64 or aarch64 without `pkexec` | the user runs the command under `sudo` |
+| Linux x86_64 or aarch64 without `pkexec` | the user runs the command as root in their own terminal |
 
 The credential belongs to the operating system and the user alone. Never
 request, read, relay, or receive a password. If the user cancels the dialog
 (pkexec exits `126`; osascript fails with `-128`), report the cancellation and
 stop rather than retrying through a different privileged path.
 
-### Linux: pkexec when installed, otherwise user-run sudo
+### Linux
 
-Check `command -v pkexec`. If it is installed, run the command yourself; the
-system authentication agent shows its own credential dialog:
-
-```sh
-pkexec /bin/sh -c 'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); trap "rm -rf -- $s" EXIT; trap "exit 129" HUP INT TERM; cp -R "$1/bloom-triad" "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; if find "$s" -type l -o ! -type f ! -type d | grep -q .; then echo "Bloom stage contains a link or special file." >&2; exit 65; fi; k="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFY9na4hytUNsW+8LWu//HrX9TaPU7H7Vg0GRWcZM+uP"; printf "%s\n" "$k" > "$s/key.pub"; printf "bloom-release %s\n" "$k" > "$s/signers"; p="$s/bloom-triad"; /usr/bin/ssh-keygen -Y verify -f "$s/signers" -I bloom-release -n bloom-release-payload-v1 -s "$p/RELEASE_SIGNATURE" < "$p/SHA256SUMS" > /dev/null; cd "$p"; { sha256sum -c SHA256SUMS 2>/dev/null || shasum -a 256 -c SHA256SUMS; } > /dev/null; case $(uname -s) in Linux) i=linux;; Darwin) i=macos;; *) exit 65;; esac; BLOOM_RELEASE_PUBLIC_KEY="$s/key.pub" "$p/installer/release/install-$i.sh" install / "$2" "$3" "$p"' bloom-install 'STAGE' 'UID' 'USER'
-```
-
-Nothing may sit between `pkexec` and `/bin/sh`: no `sudo`, `env`, variable
-assignments, or `pkexec` options. Do not fall back to sudo when the user
-cancels the dialog.
+Check `command -v pkexec`. If it is installed, run the command above yourself;
+the system authentication agent shows its own credential dialog. Nothing may
+sit between `pkexec` and `/bin/sh`: no other elevation, `env`, variable
+assignments, or `pkexec` options.
 
 If `pkexec` is not installed, or it exits `127` with no dialog shown (for
-example "No authentication agent found" over SSH), give the user the same command with `sudo` in
-place of `pkexec` to run in their terminal, values already substituted. For
-example, if staging reported these values:
+example "No authentication agent found" over SSH), give the user the same
+command with `sudo` in place of `pkexec` and the captured values substituted.
+They run it in their own terminal and type their password there.
 
-```sh
-sudo /bin/sh -c 'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); trap "rm -rf -- $s" EXIT; trap "exit 129" HUP INT TERM; cp -R "$1/bloom-triad" "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; if find "$s" -type l -o ! -type f ! -type d | grep -q .; then echo "Bloom stage contains a link or special file." >&2; exit 65; fi; k="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFY9na4hytUNsW+8LWu//HrX9TaPU7H7Vg0GRWcZM+uP"; printf "%s\n" "$k" > "$s/key.pub"; printf "bloom-release %s\n" "$k" > "$s/signers"; p="$s/bloom-triad"; /usr/bin/ssh-keygen -Y verify -f "$s/signers" -I bloom-release -n bloom-release-payload-v1 -s "$p/RELEASE_SIGNATURE" < "$p/SHA256SUMS" > /dev/null; cd "$p"; { sha256sum -c SHA256SUMS 2>/dev/null || shasum -a 256 -c SHA256SUMS; } > /dev/null; case $(uname -s) in Linux) i=linux;; Darwin) i=macos;; *) exit 65;; esac; BLOOM_RELEASE_PUBLIC_KEY="$s/key.pub" "$p/installer/release/install-$i.sh" install / "$2" "$3" "$p"' bloom-install '/home/lee/.cache/bloom/install/v1.2.3-linux-x86_64' '1000' 'lee'
-```
+### macOS
 
-Use the actual captured values, not the example values. The user types their
-sudo password into their own terminal.
-
-### macOS: the agent runs osascript
-
-Run the command yourself through `/usr/bin/osascript`; macOS shows its own
-administrator dialog. Pass the fixed script and the three values as arguments so
-they stay out of the AppleScript source:
+Run the root script yourself through `/usr/bin/osascript`; macOS shows its own
+administrator dialog. Pass the root script and the three values as arguments so
+they stay out of the AppleScript source. Replace `ROOT_SCRIPT` with the root
+script exactly as above, single-quoted:
 
 ```sh
 /usr/bin/osascript \
   -e 'on run argv' \
   -e 'do shell script ("/bin/sh -c " & quoted form of (item 1 of argv) & " bloom-install " & quoted form of (item 2 of argv) & " " & quoted form of (item 3 of argv) & " " & quoted form of (item 4 of argv)) with administrator privileges' \
   -e 'end run' \
-  'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); trap "rm -rf -- $s" EXIT; trap "exit 129" HUP INT TERM; cp -R "$1/bloom-triad" "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; if find "$s" -type l -o ! -type f ! -type d | grep -q .; then echo "Bloom stage contains a link or special file." >&2; exit 65; fi; k="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFY9na4hytUNsW+8LWu//HrX9TaPU7H7Vg0GRWcZM+uP"; printf "%s\n" "$k" > "$s/key.pub"; printf "bloom-release %s\n" "$k" > "$s/signers"; p="$s/bloom-triad"; /usr/bin/ssh-keygen -Y verify -f "$s/signers" -I bloom-release -n bloom-release-payload-v1 -s "$p/RELEASE_SIGNATURE" < "$p/SHA256SUMS" > /dev/null; cd "$p"; { sha256sum -c SHA256SUMS 2>/dev/null || shasum -a 256 -c SHA256SUMS; } > /dev/null; case $(uname -s) in Linux) i=linux;; Darwin) i=macos;; *) exit 65;; esac; BLOOM_RELEASE_PUBLIC_KEY="$s/key.pub" "$p/installer/release/install-$i.sh" install / "$2" "$3" "$p"' 'STAGE' 'UID' 'USER'
+  'ROOT_SCRIPT' 'STAGE' 'UID' 'USER'
 ```
 
 Never add a `user name` or `password` parameter to `do shell script`.
@@ -182,8 +178,8 @@ approve from another device such as a phone; DNS and certificate issuance can
 take a while, and on macOS the installer waits up to 10 minutes for it. Allow
 the command at least 15 minutes, and do not interrupt, time out, or rerun it
 while it runs. A relay that is not ready yet does not fail the install: approvals
-in a browser on this computer still work, and the installer prints a
-`sudo ... admin provision` retry command. Pass that command to the user; do not
+in a browser on this computer still work, and the installer prints an
+`admin provision` retry command. Pass that command to the user; do not
 run it yourself or broaden the reviewed invocation to include it.
 
 ### Linux post-install readiness
@@ -204,16 +200,14 @@ command -v bloom
 ```
 
 For a failed unit, capture `systemctl status` and `journalctl` diagnostics rather
-than declaring readiness. The packaged Linux mount is the only persistence this
-setup authorizes; do not create additional systemd, launchd, cron, shell-profile
-auto-start, or restart configuration.
+than declaring readiness.
 
 ### macOS post-install readiness
 
 On macOS, an active GUI login session is required and validated by the privileged
 installer. The installer bootstraps the packaged launchd Machine and session
 services in the user domain, and Broker and Signer in the system domain. Do not
-launch a second Machine or create extra LaunchAgents/LaunchDaemons. Require the
+launch a second Machine. Require the
 installed CLI and the following user-domain and system-domain labels for the
 captured login UID to be loaded before declaring readiness:
 
@@ -225,9 +219,10 @@ launchctl print "system/com.bloom.broker.$(id -u)"
 launchctl print "system/com.bloom.signer.$(id -u)"
 ```
 
-If any check fails, capture `launchctl print` diagnostics for that label. The
-packaged launchd triad owns its own lifecycle; do not add auto-start or restart
-configuration beyond it.
+If any check fails, capture `launchctl print` diagnostics for that label.
+
+On either target, the packaged services own their lifecycle; do not add any
+other auto-start or restart configuration.
 
 ## Mounted VFS and audit readiness
 
