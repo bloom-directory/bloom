@@ -184,11 +184,8 @@ normalization rules.
 
 Guest VFS calls cannot invoke another Petal or re-enter the current Petal:
 every `petals/…` path is denied, even under the selected wallet and account.
-Wallet VFS access is restricted to the selected numbered account, and a guest
-cannot stage a transaction by writing a wallet's `outbox/new.tx`: it stages
-through `bloom:tx.outbox`, which records the Petal as the transaction's origin.
-Component composition described above does not enable nested Petal VFS
-dispatch.
+Wallet VFS access is restricted to the selected numbered account. Component
+composition described above does not enable nested Petal VFS dispatch.
 
 ## Build and validate
 

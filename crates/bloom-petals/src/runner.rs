@@ -71,23 +71,6 @@ fn deny_apps_subtree(path: &VfsPath) -> Result<(), HostError> {
     Ok(())
 }
 
-/// A Petal stages a transaction with its own staging call, which records the
-/// Petal as the transaction's origin. Writing a wallet's `outbox/new.tx` would
-/// stage it as the wallet's own send instead, and Machine gives wallet-origin
-/// transfers a rule it never gives a Petal's: the Degen persona's
-/// `erc20:any-recipient` entry.
-fn deny_wallet_outbox_staging(path: &VfsPath) -> Result<(), HostError> {
-    if matches!(path.segments(), [root, _, _, chains, _, outbox, leaf]
-        if root == "wallets" && chains == "chains" && outbox == "outbox" && leaf == "new.tx")
-    {
-        return Err(HostError::Denied(
-            "Petals stage transactions with their own staging call, not a wallet's outbox/new.tx"
-                .into(),
-        ));
-    }
-    Ok(())
-}
-
 #[async_trait]
 impl PetalHost for VfsHost {
     async fn vfs_lookup(&self, path: &str) -> Result<HostVfsEntry, HostError> {
@@ -119,7 +102,6 @@ impl PetalHost for VfsHost {
     async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
         let path = VfsPath::parse(path).map_err(|e| HostError::Invalid(format!("path: {e}")))?;
         deny_apps_subtree(&path)?;
-        deny_wallet_outbox_staging(&path)?;
         self.vfs
             .write(&path, bytes)
             .await
@@ -949,39 +931,6 @@ impl PetalRunner {
     fn petal_sign_intents(&self, hash: &str) -> Result<BTreeSet<String>, PetalError> {
         let manifest = std::fs::read(self.store.package_path(hash)?.join("source/petal.toml"))?;
         sign_intents_from_manifest_toml(&manifest)
-    }
-
-    /// Whether the Petal at `mount` stores a value under `key` for the write
-    /// route at `path`, in the partition a run of that route uses for
-    /// `account`. Data a replaced release carries forward is moved first, as
-    /// before a run, so carried values count as stored.
-    pub fn petal_store_has(
-        &self,
-        mount: &str,
-        path: &str,
-        account: Option<&AccountPetalContext>,
-        key: &str,
-    ) -> Result<bool, PetalError> {
-        let matched = self.petal_route(mount, DispatchOp::Write, path)?;
-        self.prepare_private_store(&matched.hash, account)?;
-        let root = match account {
-            Some(_) => self.store.private_account_data_root(),
-            None => self.store.private_data_root(),
-        };
-        let account = account.map(|account| (account.wallet.clone(), account.number));
-        let policy = self.petal_store_policy(&matched.hash)?;
-        let store = crate::vm::open_selected_private_store(
-            root,
-            account.as_ref(),
-            Some(&policy),
-            Some(&self.store.private_data_root()),
-        )
-        .map_err(|e| PetalError::vm(format!("private store open: {e}")))?;
-        match store.get(&matched.hash, key) {
-            Ok(_) => Ok(true),
-            Err(crate::host::HostError::NotFound(_)) => Ok(false),
-            Err(e) => Err(PetalError::vm(format!("private store read: {e}"))),
-        }
     }
 
     fn petal_store_policy(
@@ -2046,41 +1995,6 @@ namespaces = ["settings"]
             host.vfs_list("../wallets").await,
             Err(HostError::Invalid(_))
         ));
-    }
-
-    #[tokio::test]
-    async fn vfs_host_refuses_staging_through_a_wallet_outbox() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let calls = Arc::new(AtomicUsize::new(0));
-        let vfs = Vfs::builder()
-            .mount("wallets", Arc::new(StaticHandler(calls.clone())) as _)
-            .build();
-        let host = VfsHost::new(Arc::new(vfs));
-        for staging in [
-            "wallets/main/0/chains/ethereum/outbox/new.tx",
-            "/wallets/main/0/chains/solana/outbox/new.tx",
-            "wallets/main/0/chains/./ethereum/outbox/x/../new.tx",
-        ] {
-            assert!(
-                matches!(
-                    host.vfs_write(staging, b"{}").await,
-                    Err(HostError::Denied(_))
-                ),
-                "{staging}"
-            );
-        }
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-
-        // Only staging is refused: reading the outbox and other wallet
-        // writes still reach the VFS.
-        host.vfs_read("wallets/main/0/chains/ethereum/outbox/new.tx")
-            .await
-            .unwrap();
-        host.vfs_write("wallets/main/0/chains/ethereum/outbox/abc/note", b"x")
-            .await
-            .unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
