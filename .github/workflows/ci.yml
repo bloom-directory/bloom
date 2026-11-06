@@ -41,7 +41,7 @@ jobs:
     name: fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install Rust toolchain
         run: rustup show
       - name: Check formatting
@@ -51,7 +51,7 @@ jobs:
     name: cargo deny advisories
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       # RustSec vulnerabilities and yanked crates, configured in deny.toml.
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
@@ -61,7 +61,7 @@ jobs:
     name: Harbor eval static checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
       - name: Validate bounded Harbor harness
         run: scripts/test-harbor-evals.sh
@@ -83,7 +83,7 @@ jobs:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install Rust toolchain
         run: rustup show
       - name: Install sccache
@@ -107,7 +107,7 @@ jobs:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install Rust toolchain
         run: rustup show
       - name: Install sccache
@@ -129,7 +129,7 @@ jobs:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install Rust toolchain
         run: rustup show
       - name: Install cargo-nextest
@@ -175,7 +175,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build_test_archive
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install Rust toolchain
         run: rustup show
       - name: Install cargo-nextest
@@ -194,7 +194,7 @@ jobs:
     needs: build_test_archive
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install Rust toolchain
         run: rustup show
       - name: Install cargo-nextest
@@ -330,7 +330,7 @@ jobs:
     name: Linux W0 principal and socket isolation
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install Rust toolchain
         run: rustup show
       - name: Verify rendered systemd units
@@ -363,7 +363,7 @@ jobs:
       BLOOM_ETHERSCAN_KEY: ${{ secrets.BLOOM_ETHERSCAN_KEY }}
       BLOOM_RUN_LIVE_TESTS: 1
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install Rust toolchain
         run: rustup show
       - name: Install wasm target
@@ -411,7 +411,7 @@ jobs:
       matrix:
         mode: [mount]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Run docker ${{ matrix.mode }} suite
         run: |
           case "${{ matrix.mode }}" in
@@ -427,7 +427,7 @@ jobs:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install Rust toolchain
         run: rustup show
       - name: Install sccache
