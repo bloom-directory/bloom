@@ -69,7 +69,8 @@ struct AppOwner {
 impl PetalStore {
     /// Hold from before route selection through guest completion. Ordinary
     /// invocations share this permit; package activation never waits on a guest.
-    pub(crate) async fn execution_guard(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+    /// Public so other crates' tests can stand in for a running Petal call.
+    pub async fn execution_guard(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
         self.execution_gate.read().await
     }
 
