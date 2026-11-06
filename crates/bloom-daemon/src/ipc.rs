@@ -485,39 +485,9 @@ pub struct IpcOperationContext {
     petal_active_sessions: Option<ActiveSessionSlots>,
     /// Set by an install that explicitly overrides the session guard.
     petal_install_force: bool,
-    /// How long an install waits, just before activating, for a moment with
-    /// no Petal code running ([`Self::waiting_for_idle_activation`]).
-    activation_idle_wait: Option<std::time::Duration>,
-}
-
-/// How often an install waiting for idle Petals looks again.
-const ACTIVATION_IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(10);
-
-/// Look every `poll`, until `now()` reaches `deadline`, for a moment with
-/// no Petal code running. Returns whether one came; on false the caller
-/// activates anyway and the store refuses it if Petal code still runs. Stops
-/// at once when `cancelled`. Nothing is locked while it waits.
-fn wait_for_idle(
-    executing: impl Fn() -> bool,
-    cancelled: impl Fn() -> bool,
-    deadline: std::time::Instant,
-    poll: std::time::Duration,
-    now: impl Fn() -> std::time::Instant,
-    mut sleep: impl FnMut(std::time::Duration),
-) -> bool {
-    loop {
-        if cancelled() {
-            return false;
-        }
-        if !executing() {
-            return true;
-        }
-        let left = deadline.saturating_duration_since(now());
-        if left.is_zero() {
-            return false;
-        }
-        sleep(poll.min(left));
-    }
+    /// How long an install queues for its turn to activate
+    /// ([`Self::waiting_to_activate`]).
+    activation_wait: Option<std::time::Duration>,
 }
 
 impl IpcOperationContext {
@@ -528,7 +498,7 @@ impl IpcOperationContext {
             petal_mutation: None,
             petal_active_sessions: None,
             petal_install_force: false,
-            activation_idle_wait: None,
+            activation_wait: None,
         }
     }
 
@@ -539,20 +509,19 @@ impl IpcOperationContext {
             petal_mutation: None,
             petal_active_sessions: None,
             petal_install_force: false,
-            activation_idle_wait: None,
+            activation_wait: None,
         }
     }
 
-    /// This context, for an install that waits up to `limit` for a moment
-    /// with no Petal code running before it activates. The store refuses a
-    /// package change while any runs and never waits itself (bloom#328); an
-    /// install that retries such a refusal waits here instead, after staging
-    /// and its checks, so the activation lands in a gap between Petal calls
-    /// rather than losing the race to the next one. Cancelling either
-    /// context cancels both.
-    pub fn waiting_for_idle_activation(&self, limit: std::time::Duration) -> Self {
+    /// This context, for an install that queues up to `limit` for its turn
+    /// to activate. The store refuses a package change while any Petal code
+    /// runs (bloom#328); an install retrying such a refusal instead queues
+    /// for the store's permit after staging: running calls finish, calls
+    /// that start meanwhile wait behind it, so busy callers cannot starve it.
+    /// Cancelling either context cancels both.
+    pub fn waiting_to_activate(&self, limit: std::time::Duration) -> Self {
         let mut context = self.clone();
-        context.activation_idle_wait = Some(limit);
+        context.activation_wait = Some(limit);
         context
     }
 
@@ -611,26 +580,37 @@ impl IpcOperationContext {
             return Err(PetalError::vm("Petal install cancelled"));
         }
         let staged = store.stage_petal_package(package)?;
-        // A waiting install looks for idle Petals without the mutation lock,
-        // so Petal listing, management and other installs never queue behind
-        // its wait. Once idle it takes the lock and activates straight away;
-        // if Petal code started again meanwhile it lets go and keeps looking
-        // until the deadline, after which the store decides.
-        let deadline = self
-            .activation_idle_wait
-            .map(|limit| std::time::Instant::now() + limit);
-        let _mutation = loop {
-            if let Some(deadline) = deadline {
-                wait_for_idle(
-                    || store.is_executing(),
-                    || self.is_cancelled(),
-                    deadline,
-                    ACTIVATION_IDLE_POLL,
-                    std::time::Instant::now,
-                    std::thread::sleep,
-                );
+        // A waiting install queues for the store's permit first and only
+        // then tries the Petal mutation lock, letting the permit go if
+        // another change holds it: it never waits for that lock while Petal
+        // calls queue behind it, and listing or managing Petals never waits
+        // behind its queue.
+        let mut permit = None;
+        let _mutation = match self.activation_wait {
+            Some(limit) => {
+                let deadline = std::time::Instant::now() + limit;
+                loop {
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    let held = store.activation_permit_waiting(left, || self.is_cancelled())?;
+                    let guard = match &self.petal_mutation {
+                        Some(mutation) => match mutation.try_lock() {
+                            Ok(guard) => Some(guard),
+                            Err(_) => {
+                                drop(held);
+                                if std::time::Instant::now() >= deadline {
+                                    return Err(PetalError::Busy);
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                                continue;
+                            }
+                        },
+                        None => None,
+                    };
+                    permit = Some(held);
+                    break guard;
+                }
             }
-            let guard = match &self.petal_mutation {
+            None => match &self.petal_mutation {
                 Some(mutation) => Some(loop {
                     if self.is_cancelled() {
                         return Err(PetalError::vm("Petal install cancelled"));
@@ -641,20 +621,18 @@ impl IpcOperationContext {
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }),
                 None => None,
-            };
-            if self.is_cancelled() {
-                return Err(PetalError::vm("Petal install cancelled"));
-            }
-            let settled = deadline.is_none_or(|deadline| {
-                !store.is_executing() || std::time::Instant::now() >= deadline
-            });
-            if settled {
-                break guard;
-            }
-            drop(guard);
+            },
         };
+        if self.is_cancelled() {
+            return Err(PetalError::vm("Petal install cancelled"));
+        }
         check()?;
-        runner.install_staged_petal_package(staged, source, check)
+        match permit {
+            Some(permit) => {
+                runner.install_staged_petal_package_permitted(permit, staged, source, check)
+            }
+            None => runner.install_staged_petal_package(staged, source, check),
+        }
     }
 
     pub fn emit(&self, stream: IpcOutputStream, bytes: impl Into<Vec<u8>>) -> bool {
@@ -2422,54 +2400,6 @@ mod tests {
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
-    /// An install waiting to activate looks for the first moment no Petal
-    /// code runs, gives up at its deadline on the clock rather than by
-    /// counting sleeps, and stops at once when cancelled.
-    #[test]
-    fn an_activation_waits_for_a_gap_between_petal_calls() {
-        use std::cell::Cell;
-        use std::time::{Duration, Instant};
-        let start = Instant::now();
-        let poll = Duration::from_millis(10);
-        // Busy for three looks, then a gap.
-        let clock = Cell::new(start);
-        let looks = Cell::new(0);
-        assert!(wait_for_idle(
-            || {
-                looks.set(looks.get() + 1);
-                looks.get() <= 3
-            },
-            || false,
-            start + Duration::from_millis(100),
-            poll,
-            || clock.get(),
-            |wait| clock.set(clock.get() + wait),
-        ));
-        assert_eq!(clock.get() - start, Duration::from_millis(30));
-
-        // Never a gap, and each sleep overruns: the deadline still holds.
-        let clock = Cell::new(start);
-        assert!(!wait_for_idle(
-            || true,
-            || false,
-            start + Duration::from_millis(100),
-            poll,
-            || clock.get(),
-            |wait| clock.set(clock.get() + wait * 4),
-        ));
-        assert!(clock.get() - start <= Duration::from_millis(130));
-
-        // Cancelled: no wait at all.
-        assert!(!wait_for_idle(
-            || true,
-            || true,
-            start + Duration::from_millis(100),
-            poll,
-            Instant::now,
-            |_| unreachable!()
-        ));
-    }
-
     fn echo_package(root: &std::path::Path) -> std::path::PathBuf {
         let package = root.join("echo-app");
         for (path, bytes) in [
@@ -2501,46 +2431,55 @@ allowed = ["bloom:vfs.read"]
         package
     }
 
-    /// While Petal code runs, a plain install is refused at once, and a
-    /// waiting install neither activates nor holds the Petal mutation lock;
-    /// it activates as soon as the call ends, and a cancelled one stops.
+    fn echo_runner(root: &std::path::Path) -> bloom_petals::runner::PetalRunner {
+        bloom_petals::runner::PetalRunner::new(
+            bloom_petals::store::PetalStore::open(root.join("store")).unwrap(),
+            Arc::new(bloom_petals::NameRegistry::open(root.join("reg")).unwrap()),
+            bloom_petals::vm::PetalVm::new().unwrap(),
+        )
+    }
+
+    /// While Petal code runs, a plain install is refused at once. A waiting
+    /// install queues: it does not hold the Petal mutation lock, a Petal
+    /// call that starts after it waits behind it, and it activates as soon
+    /// as the running call ends. It gives up as busy at its limit and stops
+    /// when cancelled.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_waiting_install_activates_once_petal_code_stops() {
+    async fn a_waiting_install_queues_ahead_of_new_petal_calls() {
         use bloom_petals::package::PreparedPetalPackage;
         let dir = tempfile::tempdir().unwrap();
-        let runner = bloom_petals::runner::PetalRunner::new(
-            bloom_petals::store::PetalStore::open(dir.path().join("store")).unwrap(),
-            Arc::new(bloom_petals::NameRegistry::open(dir.path().join("reg")).unwrap()),
-            bloom_petals::vm::PetalVm::new().unwrap(),
-        );
+        let runner = echo_runner(dir.path());
         let package = echo_package(dir.path());
         let mutation = Arc::new(tokio::sync::Mutex::new(()));
         let mut context = IpcOperationContext::detached();
         context.petal_mutation = Some(mutation.clone());
+        let commit = |context: IpcOperationContext| {
+            let (runner, package) = (runner.clone(), package.clone());
+            tokio::task::spawn_blocking(move || {
+                context.commit_petal_package(
+                    &runner,
+                    PreparedPetalPackage::from_dir(&package).unwrap(),
+                    None,
+                    None,
+                )
+            })
+        };
 
         let running = runner.store().execution_guard().await;
         assert!(matches!(
-            context.commit_petal_package(
-                &runner,
-                PreparedPetalPackage::from_dir(&package).unwrap(),
-                None,
-                None
-            ),
+            commit(context.clone()).await.unwrap(),
             Err(PetalError::Busy)
         ));
-
-        // Cancelled while waiting: stops with the cancellation.
-        let cancelled = context.waiting_for_idle_activation(std::time::Duration::from_secs(30));
-        let (task_context, task_runner, task_package) =
-            (cancelled.clone(), runner.clone(), package.clone());
-        let task = tokio::task::spawn_blocking(move || {
-            task_context.commit_petal_package(
-                &task_runner,
-                PreparedPetalPackage::from_dir(&task_package).unwrap(),
-                None,
-                None,
-            )
-        });
+        // The running call outlasts a short limit: busy, nothing installed.
+        assert!(matches!(
+            commit(context.waiting_to_activate(std::time::Duration::from_millis(200)))
+                .await
+                .unwrap(),
+            Err(PetalError::Busy)
+        ));
+        // Cancelled while queued: stops with the cancellation.
+        let cancelled = context.waiting_to_activate(std::time::Duration::from_secs(30));
+        let task = commit(cancelled.clone());
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         cancelled.cancel();
         assert!(matches!(
@@ -2548,48 +2487,48 @@ allowed = ["bloom:vfs.read"]
             Err(PetalError::Vm(message)) if message == "Petal install cancelled"
         ));
 
+        // Cancelling a waiting context cancels the one it came from too.
+        assert!(context.is_cancelled());
         let mut context = IpcOperationContext::detached();
         context.petal_mutation = Some(mutation.clone());
-        let waiting = context.waiting_for_idle_activation(std::time::Duration::from_secs(30));
-        let (task_runner, task_package) = (runner.clone(), package.clone());
-        let task = tokio::task::spawn_blocking(move || {
-            waiting.commit_petal_package(
-                &task_runner,
-                PreparedPetalPackage::from_dir(&task_package).unwrap(),
-                None,
-                None,
-            )
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert!(!task.is_finished(), "activated while Petal code ran");
+        let task = commit(context.waiting_to_activate(std::time::Duration::from_secs(30)));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(
             mutation.try_lock().is_ok(),
-            "the wait holds the Petal mutation lock"
+            "a queued install holds the Petal mutation lock"
         );
-        assert_eq!(runner.store().resolve_petal_owner("echo").unwrap(), None);
+        // A call starting now waits behind the queued install.
+        let store = runner.store().clone();
+        let later = tokio::spawn(async move {
+            let _call = store.execution_guard().await;
+            store.resolve_petal_owner("echo").unwrap()
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!task.is_finished(), "activated while Petal code ran");
+        assert!(
+            !later.is_finished(),
+            "a later call cut in ahead of the install"
+        );
         drop(running);
         task.await.unwrap().unwrap();
         assert!(
-            runner
-                .store()
-                .resolve_petal_owner("echo")
-                .unwrap()
-                .is_some()
+            later.await.unwrap().is_some(),
+            "the later call ran before the install activated"
         );
     }
 
-    /// Only a context asked to wait for idle Petals waits, and it shares
+    /// Only a context asked to queue for activation does, and it shares
     /// cancellation with the one it came from.
     #[test]
     fn a_waiting_context_shares_cancellation() {
         let context = IpcOperationContext::detached();
-        assert_eq!(context.activation_idle_wait, None);
-        let waiting = context.waiting_for_idle_activation(std::time::Duration::from_secs(30));
+        assert_eq!(context.activation_wait, None);
+        let waiting = context.waiting_to_activate(std::time::Duration::from_secs(30));
         assert_eq!(
-            waiting.activation_idle_wait,
+            waiting.activation_wait,
             Some(std::time::Duration::from_secs(30))
         );
-        assert_eq!(context.activation_idle_wait, None);
+        assert_eq!(context.activation_wait, None);
         context.cancel();
         assert!(waiting.is_cancelled());
     }

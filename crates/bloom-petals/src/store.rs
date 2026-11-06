@@ -59,6 +59,40 @@ pub struct InstallResult {
     pub already_present: bool,
 }
 
+/// The store's exclusive permit for one package change: no Petal code runs
+/// while it is held.
+pub struct ActivationPermit<'a>(
+    #[expect(dead_code, reason = "held only until the change is done")]
+    tokio::sync::RwLockWriteGuard<'a, ()>,
+);
+
+/// How old an abandoned staging directory must be before a store opening
+/// removes it: far longer than any install takes to stage and activate, so
+/// one still in use by a running Machine is never touched.
+const STALE_STAGING: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Remove `.install-*` staging directories under `packages` that a Machine
+/// stopped mid-install left behind. Failures are only logged.
+fn sweep_stale_staging(packages: &Path) {
+    let Ok(entries) = std::fs::read_dir(packages) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let stale = entry.file_name().to_string_lossy().starts_with(".install-")
+            && entry.metadata().is_ok_and(|meta| {
+                meta.is_dir()
+                    && meta
+                        .modified()
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age >= STALE_STAGING)
+            });
+        if stale && let Err(error) = std::fs::remove_dir_all(entry.path()) {
+            tracing::warn!(path = %entry.path().display(), %error, "petal.stale_staging_not_removed");
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AppOwner {
@@ -80,10 +114,48 @@ impl PetalStore {
             .map_err(|_| PetalError::Busy)
     }
 
-    /// Whether Petal code is running now, so a package change would be
-    /// refused as [`PetalError::Busy`].
-    pub fn is_executing(&self) -> bool {
-        self.execution_gate.try_write().is_err()
+    /// Queue for the exclusive permit a package change needs, for up to
+    /// `limit`. Petal calls already running finish first; calls that start
+    /// meanwhile wait behind it, since Tokio's lock is fair, so busy callers
+    /// cannot starve the change. Gives [`PetalError::Busy`] when the running
+    /// calls outlast `limit`, and stops soon after `cancelled` says so.
+    /// Waits only within a multi-threaded Tokio runtime, as in Machine;
+    /// elsewhere it takes the permit only if it is free.
+    pub fn activation_permit_waiting(
+        &self,
+        limit: std::time::Duration,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<ActivationPermit<'_>, PetalError> {
+        // Waiting needs a runtime whose timers run while this thread blocks.
+        let runtime = match tokio::runtime::Handle::try_current() {
+            Ok(runtime)
+                if runtime.runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread =>
+            {
+                runtime
+            }
+            _ => return self.mutation_guard().map(ActivationPermit),
+        };
+        let gate = &self.execution_gate;
+        tokio::task::block_in_place(|| {
+            runtime.block_on(async {
+                let deadline = tokio::time::Instant::now() + limit;
+                let write = gate.write();
+                tokio::pin!(write);
+                loop {
+                    tokio::select! {
+                        guard = &mut write => return Ok(ActivationPermit(guard)),
+                        () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
+                            if cancelled() {
+                                return Err(PetalError::vm("Petal install cancelled"));
+                            }
+                            if tokio::time::Instant::now() >= deadline {
+                                return Err(PetalError::Busy);
+                            }
+                        }
+                    }
+                }
+            })
+        })
     }
 
     /// Open (or create) a store rooted at `base`. Creates the
@@ -94,6 +166,7 @@ impl PetalStore {
         std::fs::create_dir_all(base.join(META))?;
         std::fs::create_dir_all(base.join(PACKAGES))?;
         std::fs::create_dir_all(base.join(OWNERS))?;
+        sweep_stale_staging(&base.join(PACKAGES));
         let store = Self {
             base,
             execution_gate: Arc::new(tokio::sync::RwLock::new(())),
@@ -308,7 +381,25 @@ impl PetalStore {
         F: Fn() -> Result<(), PetalError>,
         G: Fn(&PetalMeta) -> Result<(), PetalError>,
     {
-        let _execution = self.mutation_guard()?;
+        let permit = ActivationPermit(self.mutation_guard()?);
+        self.install_staged_with_permit(permit, staged, source, commit_guard, prepare_state)
+    }
+
+    /// [`Self::install_staged_petal_package_with_activation`] with the
+    /// exclusive permit already held, as from
+    /// [`Self::activation_permit_waiting`].
+    pub(crate) fn install_staged_with_permit<F, G>(
+        &self,
+        _permit: ActivationPermit<'_>,
+        staged: StagedPetalPackage,
+        source: Option<PetalSourceProvenance>,
+        commit_guard: F,
+        prepare_state: G,
+    ) -> Result<(InstallResult, PetalMeta, RouteIndex), PetalError>
+    where
+        F: Fn() -> Result<(), PetalError>,
+        G: Fn(&PetalMeta) -> Result<(), PetalError>,
+    {
         let StagedPetalPackage { package, directory } = staged;
         let hash = package.hash.clone();
         let package_path = self.package_path_unchecked(&hash);
@@ -874,6 +965,37 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = PetalStore::open(dir.path()).unwrap();
         (dir, store)
+    }
+
+    /// Opening the store removes staging directories an earlier Machine
+    /// left behind an hour or more ago, and nothing else: not a recent one
+    /// that may still be in use, a file, or another directory.
+    #[test]
+    fn opening_removes_only_abandoned_staging() {
+        let dir = TempDir::new().unwrap();
+        let packages = dir.path().join(PACKAGES);
+        let made = |name: &str, age: std::time::Duration, is_dir: bool| {
+            let path = packages.join(name);
+            if is_dir {
+                std::fs::create_dir_all(path.join("petal")).unwrap();
+            } else {
+                std::fs::write(&path, b"x").unwrap();
+            }
+            std::fs::File::open(&path)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - age)
+                .unwrap();
+            path
+        };
+        std::fs::create_dir_all(&packages).unwrap();
+        let hour = STALE_STAGING;
+        let abandoned = made(".install-old", hour * 2, true);
+        let recent = made(".install-new", std::time::Duration::from_secs(60), true);
+        let file = made(".install-file", hour * 2, false);
+        let other = made("kept", hour * 2, true);
+        PetalStore::open(dir.path()).unwrap();
+        assert!(!abandoned.exists());
+        assert!(recent.exists() && file.exists() && other.exists());
     }
 
     #[test]

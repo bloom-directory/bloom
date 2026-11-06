@@ -1,6 +1,7 @@
 //! One best-effort pass per daemon start, then retries of installs refused
-//! because other Petal code was running. Installation is not signing
-//! authorization.
+//! because other Petal code was running or whose download failed.
+//! Installation is not signing authorization.
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -22,18 +23,24 @@ pub(crate) enum ProvisioningOutcome {
     /// release's settings forward; an update outside that lineage starts empty.
     Updated,
     /// Refused because other Petal code was running when this one would have
-    /// activated; [`retry_busy`] tries it again.
+    /// activated; [`retry_pending`] tries it again while Machine runs.
     Busy(String),
+    /// The release could not be downloaded or staged; [`retry_pending`]
+    /// tries it again up to [`DOWNLOAD_RETRIES`] times.
+    DownloadFailed(String),
     Failed(String),
 }
 
-/// The first wait before a busy install is tried again. It doubles up to
-/// [`BUSY_RETRY_MAX`], then stays there while Machine runs.
-const BUSY_RETRY_FIRST: Duration = Duration::from_secs(1);
-const BUSY_RETRY_MAX: Duration = Duration::from_secs(60);
-/// How long a retried install, downloaded and staged, waits for a moment with
-/// no Petal code running before it activates. An agent's calls leave gaps
-/// between them; activating in one is what lets the install in.
+/// The first wait before an install is tried again. It doubles up to
+/// [`RETRY_MAX`], then stays there while Machine runs.
+const RETRY_FIRST: Duration = Duration::from_secs(1);
+const RETRY_MAX: Duration = Duration::from_secs(60);
+/// How many times a failed download is tried again, about a minute in all,
+/// before Bloom says to restart it.
+const DOWNLOAD_RETRIES: usize = 6;
+/// How long a retried install, downloaded and staged, queues for its turn to
+/// activate: running Petal calls finish, and calls starting meanwhile wait
+/// behind it.
 const IDLE_WAIT: Duration = Duration::from_secs(30);
 
 pub(crate) fn provision(daemon: &Daemon, context: &IpcOperationContext) -> Vec<ProvisioningResult> {
@@ -78,7 +85,7 @@ pub(crate) fn provision_with(
                 }
             }
             let prepared = acquire(daemon, &entry, context)
-                .with_context(|| format!("download default {name}"))?;
+                .context(Download(format!("download default {name}")))?;
             let updated = expected_owner.is_some();
             prepared.commit(daemon, context, Some(expected_owner))?;
             Ok(if updated {
@@ -94,17 +101,17 @@ pub(crate) fn provision_with(
             Err(error) if context.is_cancelled() => {
                 ProvisioningOutcome::Failed(format!("{error:#}"))
             }
-            // Machine installs the catalog when it starts. `bloom init` and
-            // a repository install are no help on a running home: the first
-            // cannot open it, and the second builds a different package
-            // from the one the catalog pins.
-            Err(error) => {
-                ProvisioningOutcome::Failed(format!("{error:#}; restart Bloom to try again"))
+            Err(error) if error.downcast_ref::<Download>().is_some() => {
+                ProvisioningOutcome::DownloadFailed(format!("{error:#}"))
             }
+            Err(error) => ProvisioningOutcome::Failed(with_restart_advice(&format!("{error:#}"))),
         };
         match &outcome {
             ProvisioningOutcome::Busy(error) => {
                 tracing::info!(petal = %name, %error, "petal.provisioning_busy");
+            }
+            ProvisioningOutcome::DownloadFailed(error) => {
+                tracing::info!(petal = %name, %error, "petal.provisioning_download_failed");
             }
             ProvisioningOutcome::Failed(error) if context.is_cancelled() => {
                 tracing::info!(petal = %name, %error, "petal.provisioning_cancelled");
@@ -122,6 +129,24 @@ pub(crate) fn provision_with(
     results
 }
 
+/// Context marking a failure to download or stage a release, which a later
+/// attempt can get past.
+#[derive(Debug)]
+struct Download(String);
+
+impl std::fmt::Display for Download {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Machine installs the catalog when it starts. `bloom init` and a repository
+/// install are no help on a running home: the first cannot open it, and the
+/// second builds a different package from the one the catalog pins.
+fn with_restart_advice(error: &str) -> String {
+    format!("{error}; restart Bloom to try again")
+}
+
 /// Whether `error` is a package change refused because Petal code was
 /// running, which succeeds once the store is idle.
 fn is_busy(error: &anyhow::Error) -> bool {
@@ -133,31 +158,23 @@ fn is_busy(error: &anyhow::Error) -> bool {
     })
 }
 
-fn busy_names(results: &[ProvisioningResult]) -> Vec<String> {
-    results
-        .iter()
-        .filter(|result| matches!(result.outcome, ProvisioningOutcome::Busy(_)))
-        .map(|result| result.name.clone())
-        .collect()
-}
-
 /// Try again each catalog Petal in `first` whose install was refused because
 /// other Petal code was running, such as setup writing Polymarket's settings
 /// right after `bloom wallet new`, until it installs, fails for another
-/// reason, or Machine stops. Each retry downloads and stages the package,
-/// then activates in the first moment no Petal code runs
-/// ([`IpcOperationContext::waiting_for_idle_activation`]), so an agent
-/// calling Petals back to back cannot starve it. `on_retried` receives each
-/// round's results, so setup's settings are written once a chosen Petal
-/// installs.
-pub(crate) fn retry_busy(
+/// reason, or Machine stops. A Petal whose download failed is tried again
+/// [`DOWNLOAD_RETRIES`] times. A retry queues for its turn to activate
+/// ([`IpcOperationContext::waiting_to_activate`]): running Petal calls
+/// finish, and calls starting meanwhile wait behind it, so an agent calling
+/// Petals back to back cannot starve it. `on_retried` receives each round's
+/// results, so setup's settings are written once a chosen Petal installs.
+pub(crate) fn retry_pending(
     daemon: &Daemon,
     context: &IpcOperationContext,
     first: &[ProvisioningResult],
     on_retried: impl FnMut(&[ProvisioningResult]),
 ) {
-    let waiting = context.waiting_for_idle_activation(IDLE_WAIT);
-    retry_busy_with(
+    let waiting = context.waiting_to_activate(IDLE_WAIT);
+    retry_pending_with(
         first,
         |names| {
             provision_with(
@@ -173,26 +190,54 @@ pub(crate) fn retry_busy(
     );
 }
 
-/// [`retry_busy`] with its rounds and waits supplied. `wait` returns false
+/// [`retry_pending`] with its rounds and waits supplied. `wait` returns false
 /// once Machine is stopping.
-fn retry_busy_with(
+fn retry_pending_with(
     first: &[ProvisioningResult],
     mut round: impl FnMut(&[&str]) -> Vec<ProvisioningResult>,
     mut wait: impl FnMut(Duration) -> bool,
     mut on_retried: impl FnMut(&[ProvisioningResult]),
 ) {
-    let mut busy = busy_names(first);
-    let mut delay = BUSY_RETRY_FIRST;
-    while !busy.is_empty() {
+    let mut downloads = HashMap::<String, usize>::new();
+    let mut pending = pending_names(first, &mut downloads);
+    let mut delay = RETRY_FIRST;
+    while !pending.is_empty() {
         if !wait(delay) {
             return;
         }
-        delay = (delay * 2).min(BUSY_RETRY_MAX);
-        let names: Vec<&str> = busy.iter().map(String::as_str).collect();
+        delay = (delay * 2).min(RETRY_MAX);
+        let names: Vec<&str> = pending.iter().map(String::as_str).collect();
         let results = round(&names);
         on_retried(&results);
-        busy = busy_names(&results);
+        pending = pending_names(&results, &mut downloads);
     }
+}
+
+/// The Petals in `results` to try again: every busy one, and each whose
+/// download failed until it has been retried [`DOWNLOAD_RETRIES`] times.
+/// `downloads` counts the failed downloads so far.
+fn pending_names(
+    results: &[ProvisioningResult],
+    downloads: &mut HashMap<String, usize>,
+) -> Vec<String> {
+    let mut pending = Vec::new();
+    for result in results {
+        match &result.outcome {
+            ProvisioningOutcome::Busy(_) => pending.push(result.name.clone()),
+            ProvisioningOutcome::DownloadFailed(error) => {
+                let failures = downloads.entry(result.name.clone()).or_default();
+                *failures += 1;
+                if *failures <= DOWNLOAD_RETRIES {
+                    pending.push(result.name.clone());
+                } else {
+                    let error = with_restart_advice(error);
+                    tracing::warn!(petal = %result.name, %error, "petal.provisioning_failed");
+                }
+            }
+            _ => {}
+        }
+    }
+    pending
 }
 
 /// Wait for `total` in short steps; false once `context` is cancelled, so
@@ -253,7 +298,7 @@ mod tests {
         let rounds = RefCell::new(Vec::new());
         let waits = RefCell::new(Vec::new());
         let reported = RefCell::new(Vec::new());
-        retry_busy_with(
+        retry_pending_with(
             &first,
             |names| {
                 rounds.borrow_mut().push(names.join(","));
@@ -290,7 +335,7 @@ mod tests {
     fn retries_back_off_to_a_cap_and_stop_with_machine() {
         let rounds = Cell::new(0);
         let waits = RefCell::new(Vec::new());
-        retry_busy_with(
+        retry_pending_with(
             &[result("enso", busy())],
             |names| {
                 rounds.set(rounds.get() + 1);
@@ -306,7 +351,7 @@ mod tests {
         assert_eq!(rounds.get(), 8, "every round but the stopped one tries");
 
         let waited = Cell::new(false);
-        retry_busy_with(
+        retry_pending_with(
             &[result("enso", ProvisioningOutcome::Installed)],
             |_| unreachable!(),
             |_| {
@@ -316,6 +361,89 @@ mod tests {
             |_| {},
         );
         assert!(!waited.get());
+    }
+
+    /// A failed download is tried again a bounded number of times, alongside
+    /// a busy Petal that keeps being retried; a download that then works
+    /// installs.
+    #[test]
+    fn a_failed_download_is_tried_again_a_few_times() {
+        let failed =
+            || ProvisioningOutcome::DownloadFailed("download default enso: offline".into());
+        let rounds = RefCell::new(Vec::new());
+        retry_pending_with(
+            &[result("enso", failed()), result("polymarket", busy())],
+            |names| {
+                rounds.borrow_mut().push(names.join(","));
+                names
+                    .iter()
+                    .map(|&name| result(name, if name == "enso" { failed() } else { busy() }))
+                    .collect()
+            },
+            |_| rounds.borrow().len() < DOWNLOAD_RETRIES + 2,
+            |_| {},
+        );
+        let rounds = rounds.into_inner();
+        assert_eq!(rounds.len(), DOWNLOAD_RETRIES + 2);
+        assert!(
+            rounds[..DOWNLOAD_RETRIES]
+                .iter()
+                .all(|round| round == "enso,polymarket")
+        );
+        assert!(
+            rounds[DOWNLOAD_RETRIES..]
+                .iter()
+                .all(|round| round == "polymarket")
+        );
+
+        let tried = Cell::new(0);
+        let installed = RefCell::new(Vec::new());
+        retry_pending_with(
+            &[result("enso", failed())],
+            |names| {
+                tried.set(tried.get() + 1);
+                let outcome = if tried.get() < 2 {
+                    failed()
+                } else {
+                    ProvisioningOutcome::Installed
+                };
+                names
+                    .iter()
+                    .map(|name| result(name, outcome.clone()))
+                    .collect()
+            },
+            |_| true,
+            |results| {
+                installed
+                    .borrow_mut()
+                    .extend(results.iter().map(|r| r.outcome.clone()))
+            },
+        );
+        assert_eq!(tried.get(), 2);
+        assert_eq!(
+            installed.borrow().last(),
+            Some(&ProvisioningOutcome::Installed)
+        );
+    }
+
+    /// A download failure is marked as one, under the attempt's context, and
+    /// gives no restart advice before its retries.
+    #[test]
+    fn a_failed_download_is_reported_for_retry() {
+        let home = tempfile::tempdir().unwrap();
+        let daemon = Daemon::from_home(bloom_proto::HomeDir::at(home.path())).unwrap();
+        let results = provision_with(
+            &daemon,
+            &IpcOperationContext::detached(),
+            &["enso"],
+            |name| github_source::preinstalled_petal(name).copied(),
+            |_, _, _| bail!("offline"),
+        );
+        assert!(
+            matches!(&results[0].outcome,
+                ProvisioningOutcome::DownloadFailed(message) if message == "download default enso: offline"),
+            "{results:?}"
+        );
     }
 
     /// An install stopped because Machine is stopping says so and gives no
@@ -370,8 +498,7 @@ mod tests {
             );
             assert_eq!(results.len(), 5);
             assert!(results.iter().all(|result| matches!(&result.outcome,
-                ProvisioningOutcome::Failed(message) if message.contains("download default")
-                    && message.ends_with("restart Bloom to try again"))));
+                ProvisioningOutcome::DownloadFailed(message) if message.contains("download default"))));
         }
     }
 }

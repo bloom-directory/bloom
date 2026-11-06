@@ -360,6 +360,34 @@ impl PetalRunner {
         )
     }
 
+    /// [`Self::install_staged_petal_package`] with the store's exclusive
+    /// permit already held, as from
+    /// [`crate::store::PetalStore::activation_permit_waiting`].
+    pub fn install_staged_petal_package_permitted<F>(
+        &self,
+        permit: crate::store::ActivationPermit<'_>,
+        staged: crate::store::StagedPetalPackage,
+        source: Option<crate::meta::PetalSourceProvenance>,
+        commit_guard: F,
+    ) -> Result<
+        (
+            crate::store::InstallResult,
+            crate::meta::PetalMeta,
+            RouteIndex,
+        ),
+        PetalError,
+    >
+    where
+        F: Fn() -> Result<(), PetalError>,
+    {
+        self.store
+            .install_staged_with_permit(permit, staged, source, commit_guard, |meta| {
+                let name = meta.name.as_deref().expect("staged package name");
+                self.check_activation(&meta.hash, name)?;
+                self.carry_private_store(meta, None).map(|_| ())
+            })
+    }
+
     fn prepare_private_store(
         &self,
         hash: &str,
@@ -1635,7 +1663,6 @@ namespaces = ["settings"]
         let concurrent = runner.store().execution_guard().await;
         data.put(&predecessor, "settings/value", b"before", false)
             .unwrap();
-        assert!(runner.store().is_executing());
         // Typed, so Machine can try a refused install again.
         assert!(matches!(
             runner.store().uninstall(&predecessor),
@@ -1672,7 +1699,6 @@ namespaces = ["settings"]
             .unwrap();
         drop(concurrent);
         drop(active);
-        assert!(!runner.store().is_executing());
         let successor = install_echo_successor(&dir, &runner);
         let runner = runner.with_provenance_catalog(Some(catalog(vec![
             lineage_record(
