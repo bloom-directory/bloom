@@ -1723,6 +1723,7 @@ mod tests {
             "polymarket.onboard",
             "polymarket.order.poly1271",
             "polymarket.relayer_batch",
+            "polymarket.clob_auth.v1",
             // Absent on purpose: nothing bounds a Polymarket builder fee, so
             // Broker must keep refusing a claim that declares one.
             "polymarket.builder_code_order.poly1271",
@@ -1884,7 +1885,9 @@ mod tests {
             .flat_map(|record| record.operation_classes.iter())
             .collect::<Vec<_>>();
         assert!(!classes.is_empty());
-        assert!(classes.iter().all(|class| class.fee_asset.is_none()));
+        // Named check first. A pin listing a catalogued class is the only way
+        // this tripwire fires, and it would also trip the blanket assertion
+        // below — which prints nothing useful, so it must not run first.
         for catalogued in FEE_BEARING_OPERATION_CLASSES {
             assert!(
                 classes
@@ -1894,6 +1897,11 @@ mod tests {
                 catalogued.operation_class
             );
         }
+        assert!(
+            classes.iter().all(|class| class.fee_asset.is_none()),
+            "a pinned class carries a fee asset without being in \
+             FEE_BEARING_OPERATION_CLASSES, so enrollment and the table disagree"
+        );
     }
 
     #[cfg(feature = "triad-dev-harness")]
@@ -2103,6 +2111,78 @@ mod tests {
         let after: ProvenanceCatalog =
             serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
         assert_eq!(after, stale, "a refused refresh must not touch the catalog");
+    }
+
+    /// A record with no lineage at all stays governed. The launcher's
+    /// `jq`-injected authority fixture is exactly that, and its hand-written
+    /// `fee_asset` literal has to keep being re-derived — which is why the
+    /// guard is `is_some_and` and not `is_none_or`. Rewriting it the other way
+    /// silently stops governing this record, and nothing else would notice.
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
+    fn developer_catalog_refresh_governs_a_record_with_no_lineage() {
+        let _fixture = FIXTURE_PETAL
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        assert!(
+            std::env::var_os(REWRITE_EXISTING_FEE_ASSETS).is_none(),
+            "{REWRITE_EXISTING_FEE_ASSETS} is exported in this environment, which turns \
+             the refusal this test asserts into a rewrite"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("config");
+        fs::create_dir(&output).unwrap();
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o700)).unwrap();
+        let owner = rustix::process::geteuid().as_raw();
+        let plan = EnrollmentPlan {
+            template_dir: template_dir(),
+            output_dir: output.clone(),
+            login_uid: 1_001,
+            broker_uid: 1_002,
+            signer_uid: 1_003,
+            session_socket_gid: 1_004,
+            release_digest: "44".repeat(32),
+        };
+        generate_for_owner(&plan, owner).unwrap();
+        let petal_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join("tests/fixtures/triad-authority-petal");
+        enroll_developer_petal_provenance(&output, &petal_dir, owner).unwrap();
+        let catalog_path = output.join("provenance-catalog.json");
+        let mut stale: ProvenanceCatalog =
+            serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
+
+        // Strip the lineage and plant a conflict the table disagrees with.
+        let builder_class = Token::new(HYPERLIQUID_BUILDER_ORDER_CLASS).unwrap();
+        let mut planted = 0;
+        for record in &mut stale.records {
+            if !matches!(record.subject, ProvenanceSubject::Petal { .. })
+                || record.publisher == Token::new("bloom-release-pins").unwrap()
+            {
+                continue;
+            }
+            record.petal_lineage = None;
+            if let Some(class) = record.operation_classes.first_mut() {
+                class.operation_class = builder_class.clone();
+                class.fee_asset = Some(ProvenanceFeeAsset {
+                    chain: Token::new("polygon").unwrap(),
+                    asset: "pusd".to_owned(),
+                });
+                planted += 1;
+            }
+        }
+        assert!(planted > 0, "the fixture must enroll a developer record");
+        rewrite_private_json(&catalog_path, &serde_json::to_value(&stale).unwrap()).unwrap();
+
+        let template = template_dir().join("provenance-catalog.unsigned.json");
+        let error = refresh_developer_provenance_catalog(&template, &output, owner)
+            .expect_err("a record with no lineage must still be governed");
+        assert!(
+            format!("{error:#}").contains("is signed with"),
+            "the refusal must name the record: {error:#}"
+        );
     }
 
     /// A predecessor package stays in the catalog, re-signed inactive, and can
