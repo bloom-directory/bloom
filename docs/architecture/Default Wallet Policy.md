@@ -498,7 +498,15 @@ chosen Petals:
 3. Machine proposes every chosen, installed Petal together through the
    wallet's existing policy operation, the same pending-proposal flow the
    mounted `wallets/<wallet>/policy.json` uses. The command prints that
-   ceremony's URL once.
+   ceremony's URL once. The default policy is proposed only once every
+   chosen Petal is installed, so the owner approves it in one ceremony. A
+   wallet created first, while one is still installing after Machine
+   started, skips it: the command names the missing Petals and says to run
+   `bloom wallet default-policy <wallet>` once they are installed, or to
+   restart Bloom if one stays missing. The wallet keeps the policy creation
+   installed, so that command then proposes the whole default policy. A
+   persona switch likewise starts only with every chosen Petal installed;
+   otherwise nothing changes and the command says to run it again.
 4. Once the owner completes the ceremony, the next check commits the policy,
    and the command reports that `main` now allows the chosen Petals.
 
@@ -616,7 +624,20 @@ config; the owner can explicitly apply them later.
 
 Catalog Petals are installed and updated in two places: `bloom init`
 (`ensure_preinstalled_petals`) and every `bloom serve` start
-(`petal_provisioning::provision`). A fresh install receives the saved settings
+(`petal_provisioning::provision`). `bloom serve` installs them after it is
+ready, so other Petal code can be running, such as setup writing
+Polymarket's settings right after `bloom wallet new`. The Petal store refuses
+to activate a package while any Petal code runs (bloom#328), so Machine tries
+such an install again after one second, doubling the wait up to one minute
+and staying there while it runs. A retry downloads and stages the package
+and runs its checks, then activates in the first moment no Petal code runs,
+looking every 10 ms for up to 30 seconds right before the store's own check,
+so an agent calling Petals back to back cannot starve it. Any other
+failure waits for the next start, so the log says to restart Bloom: `bloom
+init` cannot open a running home, and installing from a Petal's repository
+builds a different package from the one the catalog pins. An install
+cancelled because Machine is stopping says only that. A fresh install
+receives the saved settings
 when the Petal stores nothing for them, which holds unless the same release
 was installed before and its settings kept. An update receives them
 only when the default wallet is known not to exist, and on the same terms.
@@ -981,6 +1002,19 @@ Automated:
   as awaiting the owner, is replaced by a new ceremony
   (`crates/bloom-vfs/tests/triad_policy_update.rs`).
 - Catalog provisioning reports an update separately from a fresh install.
+  An install refused because Petal code was running is reported as busy and
+  tried again, with a doubling wait capped at one minute, until it goes in
+  or Machine stops. Any other failure says to restart Bloom, and a
+  cancellation does not (`crates/bloom/src/petal_provisioning.rs`). A
+  retrying install waits, just before activating, for the first gap between
+  Petal calls, gives up looking after its limit, and stops when cancelled;
+  only a context asked to wait does (`crates/bloom-daemon/src/ipc.rs`). The
+  store refuses a package change during a Petal call with a typed busy error
+  (`crates/bloom-petals/src/runner.rs`).
+- With a chosen Petal not installed, the default policy is skipped before
+  Broker is asked, and the command names the missing Petals and what to run;
+  a persona switch starts nothing and records no waiting switch. The new
+  status carries the list, and the others are unchanged on the wire.
 - A queued write goes into Polymarket v0.1.6, v0.1.8 and v0.2.0 as well as
   the catalog's v0.2.1, which store settings under the same key. On v0.1.5, an
   earlier release whose route differs, it stays queued for the update; any

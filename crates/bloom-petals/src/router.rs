@@ -1075,6 +1075,7 @@ fn map_petal_err(e: PetalError) -> HandlerError {
             HandlerError::Backend(format!("capability denied: petal={petal} cap={cap}"))
         }
         PetalError::Vm(s) => HandlerError::Backend(format!("vm: {s}")),
+        PetalError::Busy => HandlerError::Backend(PetalError::Busy.to_string()),
         PetalError::Io(e) => HandlerError::Io(e),
         PetalError::Serde(s) => HandlerError::Backend(format!("serde: {s}")),
         PetalError::ModeCapMismatch { mode, cap } => HandlerError::invalid(format!(

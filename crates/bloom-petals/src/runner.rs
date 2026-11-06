@@ -1635,6 +1635,12 @@ namespaces = ["settings"]
         let concurrent = runner.store().execution_guard().await;
         data.put(&predecessor, "settings/value", b"before", false)
             .unwrap();
+        assert!(runner.store().is_executing());
+        // Typed, so Machine can try a refused install again.
+        assert!(matches!(
+            runner.store().uninstall(&predecessor),
+            Err(crate::PetalError::Busy)
+        ));
         assert!(
             runner
                 .store()
@@ -1666,6 +1672,7 @@ namespaces = ["settings"]
             .unwrap();
         drop(concurrent);
         drop(active);
+        assert!(!runner.store().is_executing());
         let successor = install_echo_successor(&dir, &runner);
         let runner = runner.with_provenance_catalog(Some(catalog(vec![
             lineage_record(

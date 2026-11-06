@@ -485,6 +485,39 @@ pub struct IpcOperationContext {
     petal_active_sessions: Option<ActiveSessionSlots>,
     /// Set by an install that explicitly overrides the session guard.
     petal_install_force: bool,
+    /// How long an install waits, just before activating, for a moment with
+    /// no Petal code running ([`Self::waiting_for_idle_activation`]).
+    activation_idle_wait: Option<std::time::Duration>,
+}
+
+/// How often an install waiting for idle Petals looks again.
+const ACTIVATION_IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Look every `poll`, for at most `limit`, for a moment with no Petal code
+/// running. Returns whether one came; on false the caller activates anyway
+/// and the store refuses it if Petal code still runs. Stops at once when
+/// `cancelled`.
+fn wait_for_idle(
+    executing: impl Fn() -> bool,
+    cancelled: impl Fn() -> bool,
+    limit: std::time::Duration,
+    poll: std::time::Duration,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> bool {
+    let mut waited = std::time::Duration::ZERO;
+    loop {
+        if cancelled() {
+            return false;
+        }
+        if !executing() {
+            return true;
+        }
+        if waited >= limit {
+            return false;
+        }
+        sleep(poll);
+        waited += poll;
+    }
 }
 
 impl IpcOperationContext {
@@ -495,6 +528,7 @@ impl IpcOperationContext {
             petal_mutation: None,
             petal_active_sessions: None,
             petal_install_force: false,
+            activation_idle_wait: None,
         }
     }
 
@@ -505,7 +539,21 @@ impl IpcOperationContext {
             petal_mutation: None,
             petal_active_sessions: None,
             petal_install_force: false,
+            activation_idle_wait: None,
         }
+    }
+
+    /// This context, for an install that waits up to `limit` for a moment
+    /// with no Petal code running before it activates. The store refuses a
+    /// package change while any runs and never waits itself (bloom#328); an
+    /// install that retries such a refusal waits here instead, after staging
+    /// and its checks, so the activation lands in a gap between Petal calls
+    /// rather than losing the race to the next one. Cancelling either
+    /// context cancels both.
+    pub fn waiting_for_idle_activation(&self, limit: std::time::Duration) -> Self {
+        let mut context = self.clone();
+        context.activation_idle_wait = Some(limit);
+        context
     }
 
     /// Common installation seam for local, source and background installs.
@@ -577,6 +625,18 @@ impl IpcOperationContext {
             None
         };
         check()?;
+        if let Some(limit) = self.activation_idle_wait {
+            wait_for_idle(
+                || store.is_executing(),
+                || self.is_cancelled(),
+                limit,
+                ACTIVATION_IDLE_POLL,
+                std::thread::sleep,
+            );
+            if self.is_cancelled() {
+                return Err(PetalError::vm("Petal install cancelled"));
+            }
+        }
         runner.install_staged_petal_package(staged, source, check)
     }
 
@@ -2070,6 +2130,7 @@ fn map_petal_err(id: Value, e: PetalError) -> Response {
             format!("capability denied: petal={petal} cap={cap}"),
         ),
         PetalError::Vm(s) => (-32000, format!("vm: {s}")),
+        PetalError::Busy => (-32000, PetalError::Busy.to_string()),
         PetalError::Io(e) => (-32001, format!("io: {e}")),
         PetalError::Serde(s) => (-32602, format!("serde: {s}")),
         PetalError::ModeCapMismatch { mode, cap } => (
@@ -2343,6 +2404,67 @@ mod tests {
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
+
+    /// An install waiting to activate looks for the first moment no Petal
+    /// code runs, gives up after its limit, and stops at once when
+    /// cancelled.
+    #[test]
+    fn an_activation_waits_for_a_gap_between_petal_calls() {
+        use std::cell::Cell;
+        use std::time::Duration;
+        let poll = Duration::from_millis(10);
+        let limit = Duration::from_millis(100);
+        // Busy for three looks, then a gap.
+        let looks = Cell::new(0);
+        let slept = Cell::new(Duration::ZERO);
+        assert!(wait_for_idle(
+            || {
+                looks.set(looks.get() + 1);
+                looks.get() <= 3
+            },
+            || false,
+            limit,
+            poll,
+            |wait| slept.set(slept.get() + wait),
+        ));
+        assert_eq!(slept.get(), Duration::from_millis(30));
+
+        // Never a gap: give up after the limit; the store then decides.
+        let slept = Cell::new(Duration::ZERO);
+        assert!(!wait_for_idle(
+            || true,
+            || false,
+            limit,
+            poll,
+            |wait| slept.set(slept.get() + wait)
+        ));
+        assert_eq!(slept.get(), limit);
+
+        // Cancelled: no wait at all.
+        assert!(!wait_for_idle(
+            || true,
+            || true,
+            limit,
+            poll,
+            |_| unreachable!()
+        ));
+    }
+
+    /// Only a context asked to wait for idle Petals waits, and it shares
+    /// cancellation with the one it came from.
+    #[test]
+    fn a_waiting_context_shares_cancellation() {
+        let context = IpcOperationContext::detached();
+        assert_eq!(context.activation_idle_wait, None);
+        let waiting = context.waiting_for_idle_activation(std::time::Duration::from_secs(30));
+        assert_eq!(
+            waiting.activation_idle_wait,
+            Some(std::time::Duration::from_secs(30))
+        );
+        assert_eq!(context.activation_idle_wait, None);
+        context.cancel();
+        assert!(waiting.is_cancelled());
+    }
 
     #[tokio::test]
     async fn bounded_frame_reader_rejects_oversized_input_before_newline() {

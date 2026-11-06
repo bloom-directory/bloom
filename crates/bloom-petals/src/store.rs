@@ -74,9 +74,15 @@ impl PetalStore {
     }
 
     fn mutation_guard(&self) -> Result<tokio::sync::RwLockWriteGuard<'_, ()>, PetalError> {
-        self.execution_gate.try_write().map_err(|_| {
-            PetalError::vm("Petal execution is in progress; retry the package change when idle")
-        })
+        self.execution_gate
+            .try_write()
+            .map_err(|_| PetalError::Busy)
+    }
+
+    /// Whether Petal code is running now, so a package change would be
+    /// refused as [`PetalError::Busy`].
+    pub fn is_executing(&self) -> bool {
+        self.execution_gate.try_write().is_err()
     }
 
     /// Open (or create) a store rooted at `base`. Creates the
