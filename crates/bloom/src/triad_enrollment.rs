@@ -686,31 +686,6 @@ fn rewrite_existing_requested(value: Option<&std::ffi::OsStr>) -> bool {
 /// use time until those limits are populated.
 const HYPERLIQUID_BUILDER_ORDER_CLASS: &str = "hyperliquid.builder_order";
 
-/// Polymarket's fee-bearing CLOB order class, separate from the fee-free
-/// `polymarket.order.poly1271` that plain orders keep using.
-///
-/// Named for the *code*, not borrowed from Hyperliquid's class above, because
-/// the two venues charge a builder differently and the difference matters to
-/// an approval. Hyperliquid identifies a builder by address, takes the fee
-/// per order, and bounds it by a cap the user approved on-chain, so a
-/// declared fee can be checked against something the owner already agreed to.
-/// Polymarket identifies a builder by an opaque `bytes32` code whose maker and
-/// taker rates live on the builder's profile, with no per-user approval and no
-/// per-order fee field, so nothing at the venue bounds it.
-///
-/// The declared fee is therefore what Broker counts against the approval's
-/// value limits, not a ceiling the venue honours: that Petal refuses a buy on
-/// this class for exactly that reason and signs only sells, where the signed
-/// order does bound the outflow. See "Operation-class granularity and
-/// `fee_asset`" in `docs/architecture/Sealed Approvals.md`.
-///
-/// The Petal must emit this exact string, and declare its fee in the matching
-/// asset below, before enrollment has any effect here: Broker compares the
-/// catalogued chain and asset against `DeclaredFee::Fee` and answers
-/// `FEE_ASSET_MISMATCH` when either differs. Until bloom-petal-polymarket
-/// declares that fee, no claim carries this class and the row is inert.
-const POLYMARKET_BUILDER_CODE_ORDER_CLASS: &str = "polymarket.builder_code_order.poly1271";
-
 /// One row per operation class whose *every* claim declares an exact fee.
 ///
 /// Adding a venue is one row here plus the Petal-side route split that makes
@@ -721,15 +696,24 @@ const POLYMARKET_BUILDER_CODE_ORDER_CLASS: &str = "polymarket.builder_code_order
 /// pin does not list.
 ///
 /// It is not sufficient on its own. Broker reviews a class only if it is
-/// registered there: neither `hyperliquid.builder_order` nor
-/// `polymarket.builder_code_order.poly1271` appears in
-/// `MESSAGE_REVIEW_OPERATION_CLASSES` or
+/// registered there, and `hyperliquid.builder_order` appears in neither
+/// `MESSAGE_REVIEW_OPERATION_CLASSES` nor
 /// `POLYMARKET_REVIEW_OPERATION_CLASSES`, so a builder order is not required
 /// to carry the decoded order review its fee-free sibling must, and a
 /// session-signed one falls outside `verify_hyperliquid_agent_use`, which
 /// matches `hyperliquid.agent_action` with no declared fee. Cataloguing a fee
 /// asset makes the claim authorizable; it does not make the operation
 /// reviewed.
+///
+/// Polymarket's builder-code order class is deliberately absent. Its fee
+/// cannot be bounded from what the owner signs: CLOB V2 removed
+/// `feeRateBps`, so the signed order carries no fee at all, and the builder's
+/// maker and taker rates live off-chain on the builder's profile with no
+/// per-user approval. Cataloguing it would let Broker count a fee that
+/// nothing can check, which is the gap bloom-broker#131 closes for
+/// Hyperliquid by deriving its own bound from the signed order. Until
+/// something bounds a Polymarket builder fee the class stays fee-free, and a
+/// claim declaring a fee under it is denied `FEE_NOT_ALLOWED`.
 ///
 /// Those tables, and the witness named below, are on Broker's master, not the
 /// revision pinned in `Cargo.toml`: `message_review.rs` does not exist in that
@@ -748,18 +732,11 @@ const POLYMARKET_BUILDER_CODE_ORDER_CLASS: &str = "polymarket.builder_code_order
 /// classes, but each route grant is filtered by the classes the Petal actually
 /// requests, and it asks for the builder class only when a builder is bound. See "Operation-class granularity
 /// and `fee_asset`" in `docs/architecture/Sealed Approvals.md`.
-const FEE_BEARING_OPERATION_CLASSES: &[CataloguedFeeAsset] = &[
-    CataloguedFeeAsset {
-        operation_class: HYPERLIQUID_BUILDER_ORDER_CLASS,
-        chain: "hyperliquid",
-        asset: "usdc",
-    },
-    CataloguedFeeAsset {
-        operation_class: POLYMARKET_BUILDER_CODE_ORDER_CLASS,
-        chain: "polygon",
-        asset: "pusd",
-    },
-];
+const FEE_BEARING_OPERATION_CLASSES: &[CataloguedFeeAsset] = &[CataloguedFeeAsset {
+    operation_class: HYPERLIQUID_BUILDER_ORDER_CLASS,
+    chain: "hyperliquid",
+    asset: "usdc",
+}];
 
 /// A fee-bearing operation class and the asset its declared fee must name.
 struct CataloguedFeeAsset {
@@ -1717,6 +1694,9 @@ mod tests {
             "polymarket.onboard",
             "polymarket.order.poly1271",
             "polymarket.relayer_batch",
+            // Absent on purpose: nothing bounds a Polymarket builder fee, so
+            // Broker must keep refusing a claim that declares one.
+            "polymarket.builder_code_order.poly1271",
         ] {
             assert!(
                 catalogued_fee_asset(class).unwrap().is_none(),
@@ -1724,16 +1704,14 @@ mod tests {
             );
         }
 
-        for (class, chain, asset) in [
-            ("hyperliquid.builder_order", "hyperliquid", "usdc"),
-            ("polymarket.builder_code_order.poly1271", "polygon", "pusd"),
-        ] {
-            let fee = catalogued_fee_asset(class)
-                .unwrap()
-                .unwrap_or_else(|| panic!("{class} declares a fee on every claim"));
-            assert_eq!(fee.chain.as_str(), chain, "{class} fee chain");
-            assert_eq!(fee.asset, asset, "{class} fee asset");
-        }
+        // Hyperliquid's builder-order class is the only catalogued row, now
+        // that Polymarket's is deliberately fee-free.
+        let class = "hyperliquid.builder_order";
+        let fee = catalogued_fee_asset(class)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{class} declares a fee on every claim"));
+        assert_eq!(fee.chain.as_str(), "hyperliquid", "{class} fee chain");
+        assert_eq!(fee.asset, "usdc", "{class} fee asset");
     }
 
     /// A fee-bearing class is only safe when a dedicated route makes every one

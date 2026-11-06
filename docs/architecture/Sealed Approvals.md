@@ -364,7 +364,17 @@ declared fee against the approval's value limits instead of refusing it.
 | Fee-bearing class | Fee asset | Fee-free sibling |
 |---|---|---|
 | `hyperliquid.builder_order` | `hyperliquid` / `usdc` | `hyperliquid.order`, `hyperliquid.agent_action` |
-| `polymarket.builder_code_order.poly1271` | `polygon` / `pusd` | `polymarket.order.poly1271` |
+
+Polymarket's builder-code class is deliberately not catalogued. Its fee cannot
+be bounded from what the owner signs: CLOB V2 removed `feeRateBps`, so the
+signed order carries no fee, and the builder's maker and taker rates live
+off-chain on the builder's profile with no per-user approval. Cataloguing it
+would have Broker count a fee nothing can check. Hyperliquid's is catalogued
+because the fee *is* derivable from the signed order — bloom-broker#131
+computes Broker's own bound from each leg's limit price and size and refuses a
+claim declaring less. Until something bounds a Polymarket builder fee, that
+class stays fee-free and a claim declaring a fee under it is denied
+`FEE_NOT_ALLOWED`.
 
 Splitting a fee-bearing operation into its own operation class is what makes
 a `fee_asset` safe to assert. Adding one to a shared class is a breaking
@@ -406,9 +416,9 @@ answers `FEE_ASSET_MISMATCH`.
 
 Cataloguing makes the claim authorizable, not reviewed. Broker reviews a class
 only if it is registered in `MESSAGE_REVIEW_OPERATION_CLASSES` or
-`POLYMARKET_REVIEW_OPERATION_CLASSES`, and neither fee-bearing class is, so a
-builder order is not required to carry the decoded order review its fee-free
-sibling must. A session-signed one is further outside Broker's delegated-action
+`POLYMARKET_REVIEW_OPERATION_CLASSES`, and the one catalogued fee-bearing
+class is in neither, so a builder order is not required to carry the decoded
+order review its fee-free sibling must. A session-signed one is further outside Broker's delegated-action
 witness, which matches `hyperliquid.agent_action` with no declared fee — and
 cannot be authorized at all today, because the reusable key-scope approval
 carries empty `value_limits` and a declared fee is the first value to reach it.
