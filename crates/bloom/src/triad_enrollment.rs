@@ -367,12 +367,28 @@ fn refresh_developer_provenance_catalog(
     let mut conflicts = Vec::new();
     for record in &mut developer_records {
         // Enrolment keeps a Petal's predecessor packages in the catalog,
-        // re-signed with `active: false`. Such a record cannot authorize
-        // anything, so a disagreement on one is not worth refusing a launch
-        // over — and re-enrolling could not clear it anyway, because enrolment
-        // only re-derives the package hash on disk. A record carrying no
-        // lineage at all, such as the authority fixture the launcher injects,
-        // is treated as live.
+        // re-signed with `active: false`. A disagreement on one is not worth
+        // refusing a launch over, because re-enrolling could not clear it
+        // anyway — enrolment only re-derives the package hash on disk — so the
+        // override would be the only way out.
+        //
+        // What makes that safe is not the flag. Broker reads lineage `active`
+        // only on the scope-derived key path (`prepare_petal_key_scope` and
+        // `validate_scoped_route_lineage`); a plain Petal approval never
+        // consults it, and an inactive record's `fee_asset` still decides the
+        // claim. The reason no claim can name a superseded package is that
+        // `bloom-petals`' store keeps one owner package per Petal name and
+        // uninstalls the losers, so the predecessor is not on disk to run. If
+        // that ever changes — two hashes of one Petal installed at once, or a
+        // claim allowed to name a non-owner hash — this skip becomes a hole,
+        // and no test here would notice.
+        //
+        // Note also that enrolment refuses to reactivate a superseded hash
+        // below, so a developer who rebuilds back to one gets a hard failure
+        // there and no healing here.
+        //
+        // A record carrying no lineage at all, such as the authority fixture
+        // the launcher injects, is treated as live.
         if record
             .petal_lineage
             .as_ref()
@@ -433,7 +449,9 @@ fn refresh_developer_provenance_catalog(
              table is right, re-enrolling that Petal re-derives its records from the table \
              and needs no override, though only for the package hash on disk, and not from \
              inside the launcher, which stops here before it reaches enrolment. Otherwise \
-             {}=1 rewrites every conflicting record in one pass, in both directions at once, \
+             {}=1 rewrites every record listed above in one pass, in both directions at once \
+             (records the lineage marks inactive are skipped before this check and never \
+             appear here), \
              so read the per-record notes above to see what it changed: a claim declaring \
              the rewritten value is then authorized where its approval's value limits cover \
              that asset, and a Petal still declaring the old value is denied — \
@@ -688,8 +706,11 @@ const HYPERLIQUID_BUILDER_ORDER_CLASS: &str = "hyperliquid.builder_order";
 
 /// One row per operation class whose *every* claim declares an exact fee.
 ///
-/// Adding a venue is one row here plus the Petal-side route split that makes
-/// the new class uniformly fee-bearing. A row for a class no installed Petal
+/// Adding a venue takes more than a row. The fee must be derivable from what
+/// the owner signs, or Broker counts a figure nothing can check — that
+/// precondition is why Polymarket's class is absent below. Given it, a venue
+/// is one row here plus the Petal-side route split that makes the new class
+/// uniformly fee-bearing. A row for a class no installed Petal
 /// emits stays inert — and releasing it also needs the class on the Petal's
 /// `PetalAuthorityRoute` row in `github_source.rs` and a pin bump, or
 /// `validate_release_authority` rejects the release for declaring a class the
@@ -710,16 +731,24 @@ const HYPERLIQUID_BUILDER_ORDER_CLASS: &str = "hyperliquid.builder_order";
 /// `feeRateBps`, so the signed order carries no fee at all, and the builder's
 /// maker and taker rates live off-chain on the builder's profile with no
 /// per-user approval. Cataloguing it would let Broker count a fee that
-/// nothing can check, which is the gap bloom-broker#131 closes for
-/// Hyperliquid by deriving its own bound from the signed order. Until
-/// something bounds a Polymarket builder fee the class stays fee-free, and a
-/// claim declaring a fee under it is denied `FEE_NOT_ALLOWED`.
+/// nothing can check. bloom-broker#131 is written to close that gap for
+/// Hyperliquid by deriving Broker's own bound from the signed order, per leg,
+/// and refusing a claim that declares less — but it is open and **not pinned
+/// here**, so today neither venue's declared fee is checked against the
+/// signature. Cataloguing only the venue whose fee *can* be bounded is the
+/// conservative half of that asymmetry, taken on the expectation that #131
+/// lands and is pinned. Until something bounds a Polymarket builder fee that
+/// class stays fee-free, and a claim declaring a fee under it is denied
+/// `FEE_NOT_ALLOWED`.
 ///
-/// Those tables, and the witness named below, are on Broker's master, not the
-/// revision pinned in `Cargo.toml`: `message_review.rs` does not exist in that
-/// tree and `agent_action` appears nowhere in it, so against the pin the class
-/// is unreviewed for the simpler reason that nothing is. Acting on any of this
-/// needs a pin bump.
+/// The pin moved with master. The revision in `Cargo.toml` now does have
+/// `message_review.rs` and its per-venue modules, and `agent_action` appears
+/// in `service.rs` — an earlier revision of this comment said otherwise and
+/// was made wrong by that merge. What the pin still does not have is this
+/// class in either review table, so it is unreviewed because it is unlisted,
+/// not because nothing is. The delegated-action witness matches
+/// `hyperliquid.agent_action` with no declared fee, so a session-signed
+/// builder order falls outside it there too.
 ///
 /// Registering a fee-bearing class there is NOT the remedy. Polymarket's
 /// `validate_petal_profile` rejects any claim in a

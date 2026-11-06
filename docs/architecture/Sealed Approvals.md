@@ -370,11 +370,14 @@ be bounded from what the owner signs: CLOB V2 removed `feeRateBps`, so the
 signed order carries no fee, and the builder's maker and taker rates live
 off-chain on the builder's profile with no per-user approval. Cataloguing it
 would have Broker count a fee nothing can check. Hyperliquid's is catalogued
-because the fee *is* derivable from the signed order — bloom-broker#131
-computes Broker's own bound from each leg's limit price and size and refuses a
-claim declaring less. Until something bounds a Polymarket builder fee, that
-class stays fee-free and a claim declaring a fee under it is denied
-`FEE_NOT_ALLOWED`.
+because its fee *is* derivable from the signed order: bloom-broker#131 computes
+Broker's own bound from each leg's limit price and size and refuses a claim
+declaring less. That PR is open and **not pinned here**, so today neither
+venue's declared fee is checked against the signature — cataloguing only the
+venue whose fee can be bounded is the conservative half of the asymmetry, taken
+on the expectation that #131 lands and is pinned. Until something bounds a
+Polymarket builder fee, that class stays fee-free and a claim declaring a fee
+under it is denied `FEE_NOT_ALLOWED`.
 
 Splitting a fee-bearing operation into its own operation class is what makes
 a `fee_asset` safe to assert. Adding one to a shared class is a breaking
@@ -387,7 +390,8 @@ bounds it by a cap the user approved on-chain, so a declared fee can be checked
 against something the owner already agreed to. Polymarket identifies a builder
 by an opaque `bytes32` code whose maker and taker rates live on the builder's
 profile, with no per-user approval and no per-order fee field, so nothing at the
-venue bounds it. A reviewer should be able to tell which model a class belongs
+venue bounds it. That difference is why only one of the two is
+catalogued, and a reviewer should be able to tell which model a class belongs
 to from its name.
 
 A declared fee is not a bound. It is what Broker counts against the approval's
@@ -395,15 +399,20 @@ value limits, and on a venue that does not enforce it the two can diverge:
 Polymarket's CLOB V2 order carries no fee field, its operator supplies the fee
 at settlement, and a review of bloom-petal-polymarket reproduced a signed
 50 pUSD buy settling for 550. A class whose declared fee nothing enforces is
-only honest in the direction the signature does bound, which is why that Petal
-refuses a buy on its fee-bearing class and signs only sells, where the outflow
-is the shares the order commits to. Cataloguing a fee asset says what asset a
-claim must name; it does not make the amount enforceable.
+only honest in the direction the signature does bound, which is why
+bloom-petal-polymarket#10 refuses a buy on its builder-code route and signs
+only sells, where the outflow is the shares the order commits to. That
+reasoning is what finally kept the class out of the table: the shipped Petal
+refuses builder-coded orders outright, and #10 is held until something bounds
+the fee. Cataloguing a fee asset says what asset a claim must name; it does not
+make the amount enforceable.
 
-Adding a venue is one row in `FEE_BEARING_OPERATION_CLASSES`
-(`crates/bloom/src/triad_enrollment.rs`) plus the Petal-side route split that
-makes the new class uniformly fee-bearing, and then the class on that Petal's
-`PetalAuthorityRoute` row with a pin bump — without which
+Adding a venue starts with a precondition, not a row: the fee must be derivable
+from what the owner signs, or Broker counts a figure nothing can check. That is
+why Polymarket's class is absent above. Given it, a venue is one row in
+`FEE_BEARING_OPERATION_CLASSES` (`crates/bloom/src/triad_enrollment.rs`) plus
+the Petal-side route split that makes the new class uniformly fee-bearing, and
+then the class on that Petal's `PetalAuthorityRoute` row with a pin bump — without which
 `validate_release_authority` rejects the release for declaring a class the pin
 does not list.
 
@@ -422,11 +431,13 @@ order review its fee-free sibling must. A session-signed one is further outside 
 witness, which matches `hyperliquid.agent_action` with no declared fee — and
 cannot be authorized at all today, because the reusable key-scope approval
 carries empty `value_limits` and a declared fee is the first value to reach it.
-Those tables **and that witness** live on Broker's master; the revision pinned
-here has neither — `message_review.rs` does not exist in that tree and the
-string `agent_action` appears nowhere in it, so against the pin the class is
-unreviewed because no Petal class is. Everything that follows is a master-side
-change needing a pin bump.
+The pin moved with master, and the revision pinned here now *does* have
+`message_review.rs` with its per-venue modules, and `agent_action` in
+`service.rs`. An earlier revision of this section said it had neither; the
+merge on this branch made that false. What the pin still lacks is this class in
+either table, so it is unreviewed because it is unlisted rather than because
+nothing is reviewed — and the witness matches `hyperliquid.agent_action` with
+no declared fee, so a session-signed builder order falls outside it there too.
 
 **Registering a fee-bearing class in those tables is not the remedy, and for
 Polymarket it is the opposite of one.** `validate_petal_profile` rejects any
