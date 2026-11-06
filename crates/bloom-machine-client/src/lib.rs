@@ -9,9 +9,7 @@
 mod petal_eligibility;
 mod projection;
 
-pub use petal_eligibility::{
-    PendingPolicyUpdate, PetalEligibility, policy_with_destinations, policy_with_packages,
-};
+pub use petal_eligibility::{PendingPolicyUpdate, PetalEligibility, policy_with_package};
 
 pub use projection::{
     CachedWalletProjectionReader, FileProjectionStore, ProjectionFreshness, ProjectionVerification,
