@@ -389,6 +389,12 @@ pub enum ProposalOutcome {
     Ended,
 }
 
+/// The version of the restrictive policy wallet creation installs. Every
+/// committed change increments it, so only a policy at this version is still
+/// the one creation installed. An empty package list is not the same fact:
+/// the owner may have removed every Petal on purpose.
+pub const CREATION_POLICY_VERSION: u64 = 1;
+
 /// Whether the Broker this Machine is built for refuses a policy that keeps
 /// the legacy clear-signing rules: bloom-broker#103 and later, which speak
 /// Machine–Broker 1.8, decode transfers themselves and refuse to sign under
@@ -2312,10 +2318,6 @@ impl WalletsHandler {
         if allows(&policy) {
             return Ok(PetalEligibility::Allowed(current));
         }
-        // Wallet creation installs the restrictive policy at version 1 and
-        // every committed change increments it. An empty package list is not
-        // the same fact: the owner may have removed every Petal on purpose.
-        const CREATION_POLICY_VERSION: u64 = 1;
         let creation_policy = current.version.get() == CREATION_POLICY_VERSION;
         if !creation_policy && after_change == AfterPolicyChange::Report {
             return Ok(PetalEligibility::ChangedSinceCreation(current));

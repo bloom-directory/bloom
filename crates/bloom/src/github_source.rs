@@ -2804,7 +2804,7 @@ mod tests {
         );
         assert_eq!(calls.get(), 2);
         assert!(
-            matches!(&results[0].outcome, ProvisioningOutcome::Failed(message) if message.contains("offline"))
+            matches!(&results[0].outcome, ProvisioningOutcome::DownloadFailed(message) if message.contains("offline"))
         );
         // The fixture replaces an older installed release.
         assert_eq!(results[1].outcome, ProvisioningOutcome::Updated);

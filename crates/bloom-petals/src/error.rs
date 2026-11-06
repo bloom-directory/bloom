@@ -35,6 +35,10 @@ pub enum PetalError {
     ChainCall(String),
     #[error("chain call trapped after {fuel_used} fuel: {detail}")]
     ChainCallTrap { detail: String, fuel_used: u64 },
+    /// A package change refused because Petal code is running; it can
+    /// succeed once the store is idle.
+    #[error("vm: Petal execution is in progress; retry the package change when idle")]
+    Busy,
 }
 
 impl PetalError {
