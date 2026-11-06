@@ -377,11 +377,16 @@ fn refresh_developer_provenance_catalog(
         // `validate_scoped_route_lineage`); a plain Petal approval never
         // consults it, and an inactive record's `fee_asset` still decides the
         // claim. The reason no claim can name a superseded package is that
-        // `bloom-petals`' store keeps one owner package per Petal name and
-        // uninstalls the losers, so the predecessor is not on disk to run. If
-        // that ever changes — two hashes of one Petal installed at once, or a
-        // claim allowed to name a non-owner hash — this skip becomes a hole,
-        // and no test here would notice.
+        // `bloom-petals`' store resolves a Petal through a single owner
+        // pointer: `write_petal_owner` flips it under the install commit, and
+        // `resolve_petal_owner` is what the runner consults, so a superseded
+        // hash stops being reachable at that rename. Not because its bytes are
+        // gone — `store.rs` deliberately keeps prior package data until the
+        // next store open so a request that resolved the old owner can finish,
+        // and `reconcile_petal_owners` deletes it later. If owner resolution
+        // ever stops being the only way in — two hashes of one Petal reachable
+        // at once, or a claim allowed to name a non-owner hash — this skip
+        // becomes a hole, and no test here would notice.
         //
         // Note also that enrolment refuses to reactivate a superseded hash
         // below, so a developer who rebuilds back to one gets a hard failure

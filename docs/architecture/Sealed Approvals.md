@@ -398,12 +398,14 @@ A declared fee is not a bound. It is what Broker counts against the approval's
 value limits, and on a venue that does not enforce it the two can diverge:
 Polymarket's CLOB V2 order carries no fee field, its operator supplies the fee
 at settlement, and a review of bloom-petal-polymarket reproduced a signed
-50 pUSD buy settling for 550. A class whose declared fee nothing enforces is
+50 pUSD buy settling for 550 — a figure from that
+review rather than from anything reproducible in this repository. A class whose declared fee nothing enforces is
 only honest in the direction the signature does bound, which is why
 bloom-petal-polymarket#10 refuses a buy on its builder-code route and signs
 only sells, where the outflow is the shares the order commits to. That
-reasoning is what finally kept the class out of the table: the shipped Petal
-refuses builder-coded orders outright, and #10 is held until something bounds
+reasoning is the evidence behind the precondition stated below, which is the
+operative rule: a fee must be derivable from what the owner signs. The shipped
+Petal has no builder-code class at all, and #10 is held until something bounds
 the fee. Cataloguing a fee asset says what asset a claim must name; it does not
 make the amount enforceable.
 
@@ -447,8 +449,9 @@ it exists to permit — in practice it would fail even earlier, since
 `polymarket::decode` rebuilds the order with a zero builder field and the
 preimage comparison runs before that check. On the Hyperliquid side
 `message_review_requires_exact` makes prepare refuse a reusable Petal approval
-whose scope contains such a class. The Petal's manifest declares the builder
-class on its `[[key.derive]]` route, but each route grant's classes are
+whose scope contains such a class. bloom-petal-hyperliquid#19's manifest declares
+the builder class on its `[[key.derive]]` route — the released Petal declares
+no builder class at all — but each route grant's classes are
 filtered by the scope the Petal actually requests
 (`bloom-daemon`), and that request is conditional — only a session created with
 a builder bound asks for the builder class. So listing it would make
