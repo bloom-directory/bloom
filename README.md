@@ -87,6 +87,11 @@ bloom wallet address main --profile solana
 bloom wallet address main --profile evm
 ```
 
+Creating `main` also asks you to approve its default policy, which allows the
+Petals chosen in `bloom init`. A packaged install skips `bloom init`, so choose
+a persona once `main` exists: `bloom wallet persona main trader` (or
+`institutional`, `degen`) picks its Petals and opens that one approval.
+
 Native Solana transfers use the same wallet outbox shape as EVM transfers,
 with genesis pinning, exact-message semantic verification in Broker,
 signature-verifying simulation, explicit owner approval, and finalized

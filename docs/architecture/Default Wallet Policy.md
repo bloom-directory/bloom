@@ -417,8 +417,12 @@ recorded by `complete = true` under `[setup]`, saved together with the
 choices once the menu finishes; a config file on its own proves nothing,
 because `bloom serve` creates one too, and an interrupted menu saves nothing.
 An empty `[setup.wallets.main]` is not the marker either: declining every Petal is
-a valid choice. Scripts and packaged installs record the catalog's
-suggestions instead of asking. Later runs of `bloom init` see the marker and
+a valid choice. A `bloom init` run without a terminal records the catalog's
+suggestions instead of asking. A packaged install runs Machine as a service,
+which holds the home, so `bloom init` cannot run there and no setup is
+recorded: `bloom wallet new main` then proposes nothing and says to choose a
+persona with `bloom wallet persona main <persona>`, which works through the
+running Machine. Later runs of `bloom init` see the marker and
 use the config as it is, with the catalog's suggestions for any value not
 saved.
 
@@ -450,8 +454,8 @@ chosen Petals:
   "wallet_id": "main",
   "maximum_approval_lifetime_ms": 2592000000,
   "allowed_petal_packages": [
-    "d811c181c7ec469026335c9265d7019a520d8d9d882b302064278cf1138d2db2",
-    "17a50dda0894b7b7e5757033806f8ec31523575438419ea1330b731a2c6c5d14"
+    "05fa377aa2b2df95a87a21ba58733e95b145d3f10c6a297ebcf969dfc5f8e08b",
+    "036cce365ff7cfe5c3e35754fc4c15097576c6251eb2277b890cdae673b234fd"
   ],
   "allowed_destinations": [
     { "chain": "polygon", "destination": "petal:polymarket" }
@@ -462,7 +466,7 @@ chosen Petals:
 
 - **`allowed_petal_packages`** lists each chosen Petal by its installed
   package hash. On an up-to-date home that is the hash Bloom's catalog pins:
-  Hyperliquid v0.1.9 and Polymarket v0.2.0. A home still updating proposes
+  Hyperliquid v0.1.10 and Polymarket v0.2.1. A home still updating proposes
   the release it runs. Until proposals from Petal changes are built
   (section 5), the Petal's first signed action after the update opens a
   policy ceremony that allows the new hash (`ensure_petal_eligibility`).
@@ -536,12 +540,13 @@ else there may be the owner's, so it stays: Machine clears the marker and
 logs the command that would apply setup's choice.
 
 The key is pinned with the releases checked to store settings there
-(`releases` in the catalog's settings template): Polymarket v0.2.0, the
-catalog's release, and v0.1.6 and v0.1.8, which Bloom v0.4.0 and v0.4.1
-installed and a home may still run while it updates. v0.2.0 moved to a newer
-Petal SDK, whose `state` namespace and `venue_config_key` are unchanged.
+(`releases` in the catalog's settings template): Polymarket v0.2.1, the
+catalog's release, and v0.1.6, v0.1.8 and v0.2.0, which earlier Bloom
+releases installed and a home may still run while it updates. v0.2.0 moved to
+a newer Petal SDK, whose `state` namespace and `venue_config_key` are
+unchanged; v0.2.1 changes neither.
 Setup writes only when the installed package hash is one of them, and the
-signed lineage carries a write made to an earlier one forward to v0.2.0.
+signed lineage carries a write made to an earlier one forward to v0.2.1.
 Another release under the same name, such as a fork or a newer
 release whose key nobody has checked, may store its settings elsewhere, where
 the check could not see them, so Machine keeps what it holds and clears the
@@ -774,7 +779,7 @@ this design and those stacks:
   bloom-petal-polymarket#19 order.
   bloom#377's pins speak Broker–Signer 1.8 and Machine–Broker 1.10.
   Polymarket coverage also needs a published Polymarket package that
-  declares its debits to Broker. None does yet: v0.1.6, v0.1.8 and v0.2.0
+  declares its debits to Broker. None does yet: v0.1.6 to v0.2.1
   (pinned here) declare none for any signature.
   bloom-petal-polymarket#19 adds them for bloom#352, and
   bloom-petal-polymarket#26, which contains it, for bloom#377; both conflict
@@ -976,10 +981,10 @@ Automated:
   as awaiting the owner, is replaced by a new ceremony
   (`crates/bloom-vfs/tests/triad_policy_update.rs`).
 - Catalog provisioning reports an update separately from a fresh install.
-- A queued write goes into Polymarket v0.1.6 and v0.1.8 as well as the
-  catalog's v0.2.0, which store settings under the same key. On v0.1.5, an
+- A queued write goes into Polymarket v0.1.6, v0.1.8 and v0.2.0 as well as
+  the catalog's v0.2.1, which store settings under the same key. On v0.1.5, an
   earlier release whose route differs, it stays queued for the update; any
-  other release gets nothing. The catalog bump test lists all three and
+  other release gets nothing. The catalog bump test lists all four and
   checks each is the catalog release or one it updates from.
 - Enso's router is proposed on exactly the 12 chains pinned Enso v0.1.7
   allows. Polymarket's entry is `petal:polymarket`, and a call to pUSD staged
