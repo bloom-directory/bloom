@@ -1561,6 +1561,9 @@ pub(crate) fn proposes_chosen_petals_default() -> bool {
 pub(crate) enum DefaultPolicyStatus {
     /// None of the Petals chosen during setup is installed.
     NothingToAllow,
+    /// No Petal is chosen for the wallet, as on a packaged install, where
+    /// `bloom init` cannot run while Machine does.
+    NothingChosen,
     /// The wallet does not exist yet, or Broker could not answer for now
     /// while Machine read the wallet or proposed its policy: it was
     /// unavailable, rate-limited or over quota. `reason` says which.
@@ -1840,7 +1843,11 @@ pub(crate) async fn advance_default_policy(
     // A switch to a setup that allows nothing still replaces what the policy
     // allowed before.
     if request.is_empty() && switch.is_none() {
-        return Ok(DefaultPolicyStatus::NothingToAllow);
+        return Ok(if setup.petals.is_empty() {
+            DefaultPolicyStatus::NothingChosen
+        } else {
+            DefaultPolicyStatus::NothingToAllow
+        });
     }
     let destinations = request.destinations();
     let wallet_id = bloom_broker_api::Token::new(wallet.to_owned())?;
@@ -2756,6 +2763,13 @@ impl DefaultPolicyWait {
                 writeln!(
                     output,
                     "default_policy: none of the Petals chosen during setup is installed; nothing to approve"
+                )?;
+                Ok(WaitStep::Stop)
+            }
+            DefaultPolicyStatus::NothingChosen => {
+                writeln!(
+                    output,
+                    "default_policy: no Petals are chosen for {wallet}, so there is no default policy to approve. To choose a persona and its Petals, run `bloom wallet persona {wallet} <institutional|trader|degen>`"
                 )?;
                 Ok(WaitStep::Stop)
             }
@@ -4979,6 +4993,12 @@ mod tests {
             );
             String::from_utf8(output).unwrap()
         };
+        // A packaged install records no setup: say how to choose one.
+        let output = observe(DefaultPolicyStatus::NothingChosen);
+        assert!(
+            output.contains("run `bloom wallet persona main <institutional|trader|degen>`"),
+            "{output}"
+        );
         let output = observe(DefaultPolicyStatus::Applied {
             petals: vec!["polymarket".into()],
             settings_pending: Vec::new(),
