@@ -26,7 +26,7 @@ use bloom_broker_api::{
 };
 use bloom_machine_client::MachineBrokerClient;
 use sha2::{Digest as _, Sha256};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
 
@@ -50,6 +50,7 @@ pub struct ExactSigningBrokerFixture {
 impl ExactSigningBrokerFixture {
     fn policy_snapshot(&self, wallet_id: Token) -> SignedPolicySnapshot {
         let canonical_policy = serde_json::to_vec(&CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: wallet_id.clone(),
             maximum_approval_lifetime_ms: 3_600_000,
             allowed_petal_packages: Vec::new(),
@@ -77,7 +78,6 @@ impl ExactSigningBrokerFixture {
                 }]
             },
             required_verifiers: Vec::new(),
-            clear_signing: None,
         })
         .unwrap();
         let policy_digest = Digest32::from_bytes(Sha256::digest(&canonical_policy).into());
@@ -386,24 +386,47 @@ impl Drop for AnvilGuard {
 }
 
 /// Pick an OS-assigned free TCP port by binding to :0 and releasing it.
+///
+/// Prefer letting the child process bind `:0` itself. The port is free when
+/// this returns and can be taken before the child binds it, which is a race
+/// every concurrent test in this crate shares — see [`spawn_anvil`].
 pub fn pick_free_port() -> Result<u16> {
     let l = TcpListener::bind("127.0.0.1:0")?;
     Ok(l.local_addr()?.port())
 }
 
-/// Spawn anvil on a free port and wait until its stdout reports it is
-/// listening. Returns a guard that kills the child on drop.
+/// Spawn anvil and wait until its stdout reports the port it is listening on.
+/// Returns a guard that kills the child on drop.
 pub async fn spawn_anvil() -> Result<AnvilGuard> {
-    let port = pick_free_port()?;
+    spawn_anvil_inner(false).await
+}
+
+/// As [`spawn_anvil`], but with `--no-mining`, so a submitted transaction stays
+/// in the mempool until something mines it and can be replaced before it does.
+pub async fn spawn_anvil_no_mining() -> Result<AnvilGuard> {
+    spawn_anvil_inner(true).await
+}
+
+/// The port comes from anvil itself, via `--port 0`, rather than from probing
+/// for a free one and passing it: probing leaves a window between releasing the
+/// port and anvil binding it, and a sibling test spawning its own anvil can take
+/// it in between. Anvil then exits at once with "Address already in use" on
+/// stderr, which nothing here reads, so the failure used to surface as a bare
+/// "exited before becoming ready" roughly 80ms into the test. Several tests in
+/// this crate spawn two anvils in a row, which makes the window easy to hit.
+async fn spawn_anvil_inner(no_mining: bool) -> Result<AnvilGuard> {
     let mut cmd = Command::new(anvil_bin());
     cmd.arg("--port")
-        .arg(port.to_string())
+        .arg("0")
         .arg("--host")
         .arg("127.0.0.1")
         // Determinism: chain id 31337, default mnemonic.
         .arg("--chain-id")
-        .arg("31337")
-        .stdout(Stdio::piped())
+        .arg("31337");
+    if no_mining {
+        cmd.arg("--no-mining");
+    }
+    cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
@@ -413,28 +436,68 @@ pub async fn spawn_anvil() -> Result<AnvilGuard> {
         .take()
         .ok_or_else(|| anyhow!("anvil stdout missing"))?;
 
-    // Read lines until we see "Listening on" or hit a timeout.
+    // Read lines until anvil reports its port, it exits, or we hit a timeout.
     let mut reader = BufReader::new(stdout).lines();
     let wait = async {
         loop {
             match reader.next_line().await? {
                 Some(line) => {
-                    if line.contains("Listening on") {
-                        return Ok::<(), anyhow::Error>(());
+                    if !line.contains("Listening on") {
+                        continue;
                     }
+                    // The wording is anvil's own, and CI pins a version this
+                    // was not developed against, so a line we cannot parse
+                    // fails here with the line in hand rather than running the
+                    // readiness deadline out and reporting a timeout.
+                    let Some(port) = listening_port(&line) else {
+                        return Err(anyhow!(
+                            "anvil reported it is listening, but no port could be \
+                             parsed from {line:?}"
+                        ));
+                    };
+                    return Ok::<Option<u16>, anyhow::Error>(Some(port));
                 }
-                None => return Err(anyhow!("anvil exited before becoming ready")),
+                None => return Ok(None),
             }
         }
     };
-    timeout(Duration::from_secs(15), wait)
+    let listening = timeout(Duration::from_secs(15), wait)
         .await
         .map_err(|_| anyhow!("timed out waiting for anvil to start"))??;
+
+    let Some(port) = listening else {
+        // anvil closed stdout, so it is gone and its stderr cannot grow any
+        // further. Draining it is safe only here: anvil logs to stdout and
+        // writes nothing to stderr in the ordinary case, so reading that pipe
+        // while the child is alive would block until it exited anyway.
+        let mut reason = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            stderr.read_to_string(&mut reason).await.ok();
+        }
+        let reason = reason.trim();
+        return Err(if reason.is_empty() {
+            anyhow!("anvil exited before becoming ready")
+        } else {
+            anyhow!("anvil exited before becoming ready: {reason}")
+        });
+    };
 
     Ok(AnvilGuard {
         child: Some(child),
         port,
     })
+}
+
+/// The port out of anvil's `Listening on 127.0.0.1:PORT` line.
+///
+/// Takes the first whitespace-delimited token after the text and the last
+/// `:`-separated field of it, so a trailing suffix such as `(http)` and an
+/// IPv6 host such as `[::1]:8545` both parse.
+fn listening_port(line: &str) -> Option<u16> {
+    let (_, rest) = line.split_once("Listening on")?;
+    let host_port = rest.split_whitespace().next()?;
+    let (_, port) = host_port.rsplit_once(':')?;
+    port.parse().ok()
 }
 
 /// Send a raw transaction with `cast send` from the prefunded funder
@@ -458,4 +521,36 @@ pub async fn cast_send(rpc_url: &str, args: &[&str]) -> Result<String> {
         ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+#[cfg(test)]
+mod listening_port_tests {
+    use super::listening_port;
+
+    #[test]
+    fn a_port_is_read_out_of_the_shapes_anvil_prints() {
+        assert_eq!(listening_port("Listening on 127.0.0.1:8545"), Some(8545));
+        // Trailing text: the parse must not be coupled to the line ending at
+        // the port, which is the regression this guards.
+        assert_eq!(
+            listening_port("Listening on 127.0.0.1:8545 (http)"),
+            Some(8545)
+        );
+        assert_eq!(listening_port("Listening on [::1]:8545"), Some(8545));
+        assert_eq!(
+            listening_port("    Listening on 127.0.0.1:61186"),
+            Some(61186)
+        );
+        assert_eq!(listening_port("Listening on 127.0.0.1:0"), Some(0));
+    }
+
+    #[test]
+    fn anything_without_a_port_is_not_mistaken_for_one() {
+        assert_eq!(listening_port("Available Accounts"), None);
+        assert_eq!(listening_port("Listening on"), None);
+        assert_eq!(listening_port("Listening on 127.0.0.1"), None);
+        assert_eq!(listening_port("Listening on 127.0.0.1:wat"), None);
+        // Above u16: parses as a number but not a port.
+        assert_eq!(listening_port("Listening on 127.0.0.1:99999"), None);
+    }
 }

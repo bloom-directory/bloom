@@ -53,12 +53,21 @@ assert type(verifier).__name__ == "HostProjectionVerifier"
 agent = AgentFactory.create_agent_from_config(
     AgentConfig(
         import_path="harness.image_opencode:ImageOpenCode",
-        model_name="deepseek/deepseek-v4-flash",
+        model_name="deepseek/deepseek-flash",
         kwargs={"version": "1.18.26"},
     ),
     logs_dir=jobs / "agent",
 )
 assert type(agent).__name__ == "ImageOpenCode"
+agent = AgentFactory.create_agent_from_config(
+    AgentConfig(
+        import_path="harness.image_pi:ImagePi",
+        model_name="kimi-coding/k3",
+        kwargs={"version": "1.4.0"},
+    ),
+    logs_dir=jobs / "pi",
+)
+assert type(agent).__name__ == "ImagePi"
 environment = EnvironmentFactory.create_environment_from_config(
     EnvironmentConfig(import_path="harness.environment:BloomDockerEnvironment"),
     environment_dir=evals / "tasks/polymarket-limit-order-proposal/environment",

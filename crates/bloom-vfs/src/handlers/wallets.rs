@@ -26,6 +26,7 @@
 //! - `wallets/<wallet>/<n>/address.sol`                             — the account's Solana address, if it has a Solana key
 //! - `wallets/<wallet>/<n>/address.sol.qr.{svg,png}`                — scannable QR images of that address
 //! - `wallets/<wallet>/<n>/public_key`                              — canonical public key hex (EVM key, else Solana)
+//! - `wallets/<wallet>/<n>/holdings.json`                           — non-zero native and major-token balances on every chain
 //! - `wallets/<wallet>/<n>/chains/<chain>/{balance,balance.raw,balance.json}` — native balance of account n
 //! - `wallets/<wallet>/<n>/chains/<evm-chain>/nonce`
 //! - `wallets/<wallet>/<n>/chains/<evm-chain>/{pending_external.jsonl,nonce_conflicts.json}` — mempool views of account n's address
@@ -54,6 +55,23 @@ use accounts::accounts_json_with_numbers as render_accounts_json;
 pub use accounts::{
     ACCOUNT_KEY_FILES, accounts_json_with_numbers, derivation_path_number, parse_account_segment,
 };
+
+/// Control entries `/wallets` lists beside the wallets, and whether each is a
+/// directory. The root listing is built from this table, so no wallet may
+/// take these names and wallet inventories skip exactly these.
+pub const WALLET_CONTROL_ENTRIES: [(&str, bool); 4] = [
+    ("new", false),
+    ("registrations", true),
+    ("recover", false),
+    ("recoveries", true),
+];
+
+/// Whether `name` is one of `WALLET_CONTROL_ENTRIES` rather than a wallet.
+pub fn is_wallet_control_entry(name: &str) -> bool {
+    WALLET_CONTROL_ENTRIES
+        .iter()
+        .any(|(entry, _)| *entry == name)
+}
 
 use async_trait::async_trait;
 use bloom_broker_api::ProtocolErrorCode;
@@ -171,9 +189,34 @@ impl TriadPolicyUpdateProjection {
         Ok(bytes)
     }
 
+    /// View a pending policy change. `required`, `destinations` and
+    /// `lifetime` are what the caller asked to be allowed; a change that does
+    /// not carry all of them is somebody else's, and must never be presented
+    /// as the caller's own. A change with the packages but not their
+    /// destinations would leave those Petals' outbox transactions denied after
+    /// it commits.
     fn pending_view(
         &self,
-        package_hash: &bloom_broker_api::Digest32,
+        required: &[bloom_broker_api::Digest32],
+        destinations: &[bloom_broker_api::PolicyDestination],
+        lifetime: Option<u64>,
+    ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
+        self.pending_view_where(|proposed| {
+            required
+                .iter()
+                .all(|package| proposed.allowed_petal_packages.contains(package))
+                && destinations
+                    .iter()
+                    .all(|destination| proposed.allowed_destinations.contains(destination))
+                && lifetime.is_none_or(|lifetime| proposed.maximum_approval_lifetime_ms == lifetime)
+        })
+    }
+
+    /// View a pending policy change, which is the caller's own when
+    /// `is_requested` holds for the policy it proposes.
+    fn pending_view_where(
+        &self,
+        is_requested: impl FnOnce(&bloom_broker_api::CanonicalWalletPolicy) -> bool,
     ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
         let proposed: bloom_broker_api::CanonicalWalletPolicy =
             serde_json::from_slice(&self.retained_policy_bytes()?).map_err(err_be)?;
@@ -210,9 +253,7 @@ impl TriadPolicyUpdateProjection {
                     challenge_path: format!(
                         "/wallets/{wallet}/policy-updates/pending/{operation}/{APPROVAL_CHALLENGE_FILE}"
                     ),
-                    includes_requested_package: proposed
-                        .allowed_petal_packages
-                        .contains(package_hash),
+                    includes_requested: is_requested(&proposed),
                 },
             ),
         )
@@ -300,6 +341,142 @@ pub trait AccountPetalMount: Send + Sync {
         slot: &str,
     ) -> Result<(), HandlerError>;
 }
+/// What a default-policy request does once the wallet's policy has changed
+/// since wallet creation. A named type rather than a `bool`, so another flag
+/// passed in the same position does not compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterPolicyChange {
+    /// Report what the policy lacks and propose nothing.
+    Report,
+    /// Propose it: the owner has just chosen it.
+    Propose,
+}
+
+/// What a wallet's first Petal policy proposal also allows: the Petals chosen
+/// during setup and the fixed contracts they transact with, and the
+/// persona's approval lifetime. All are empty for wallets without a setup.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DefaultPolicySetup {
+    pub packages: Vec<bloom_broker_api::Digest32>,
+    pub destinations: Vec<bloom_broker_api::PolicyDestination>,
+    /// Set on the first proposal; never required of a later one, so a Petal's
+    /// own use does not open a ceremony just for it.
+    pub maximum_approval_lifetime_ms: Option<u64>,
+}
+
+/// What a persona switch replaces a wallet's policy with: exactly these
+/// packages and destinations, and this maximum approval lifetime. The
+/// policy's required verifiers and clear-signing setting stay as they are,
+/// since setup never chooses them, except the legacy clear-signing rules a
+/// Broker built with bloom-broker#103 refuses ([`BROKER_REFUSES_LEGACY_CLEAR_SIGNING`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PolicyReplacement {
+    pub packages: Vec<bloom_broker_api::Digest32>,
+    pub destinations: Vec<bloom_broker_api::PolicyDestination>,
+    pub maximum_approval_lifetime_ms: u64,
+}
+
+/// What became of a policy proposal Machine made, from its retained
+/// projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposalOutcome {
+    /// It still waits for the owner.
+    Pending,
+    /// The owner approved it and it committed. A later change may have
+    /// replaced it since.
+    Committed,
+    /// It was cancelled, refused, expired or failed, so it never committed.
+    Ended,
+}
+
+/// Whether the Broker this Machine is built for refuses a policy that keeps
+/// the legacy clear-signing rules: bloom-broker#103 and later, which speak
+/// Machine–Broker 1.8, decode transfers themselves and refuse to sign under
+/// a policy that still carries those rules until a replacement removes them.
+pub const BROKER_REFUSES_LEGACY_CLEAR_SIGNING: bool = bloom_broker_api::BROKER_API_MINOR_MIN >= 8;
+
+/// The verifier through which a policy requires the legacy clear-signing
+/// rules.
+const LEGACY_CLEAR_SIGNING_VERIFIER: &str = "evm-clear-signing-v1";
+
+/// Whether `policy` carries the legacy clear-signing rules: a
+/// `clear_signing` setting, or a required `evm-clear-signing-v1` verifier.
+pub fn has_legacy_clear_signing(policy: &bloom_broker_api::CanonicalWalletPolicy) -> bool {
+    policy.clear_signing.is_some()
+        || policy
+            .required_verifiers
+            .iter()
+            .any(|required| required.verifier_id.as_str() == LEGACY_CLEAR_SIGNING_VERIFIER)
+}
+
+impl PolicyReplacement {
+    /// Whether `policy` already allows exactly this, in any order.
+    fn matches(&self, policy: &bloom_broker_api::CanonicalWalletPolicy) -> bool {
+        self.matches_for(policy, BROKER_REFUSES_LEGACY_CLEAR_SIGNING)
+    }
+
+    fn matches_for(
+        &self,
+        policy: &bloom_broker_api::CanonicalWalletPolicy,
+        drop_legacy_clear_signing: bool,
+    ) -> bool {
+        fn same<T: PartialEq>(left: &[T], right: &[T]) -> bool {
+            left.iter().all(|item| right.contains(item))
+                && right.iter().all(|item| left.contains(item))
+        }
+        same(&policy.allowed_petal_packages, &self.packages)
+            && same(&policy.allowed_destinations, &self.destinations)
+            && policy.maximum_approval_lifetime_ms == self.maximum_approval_lifetime_ms
+            && !(drop_legacy_clear_signing && has_legacy_clear_signing(policy))
+    }
+
+    /// `current` with its setup-chosen parts replaced, each entry once.
+    fn applied_to(
+        &self,
+        current: &bloom_broker_api::CanonicalWalletPolicy,
+    ) -> bloom_broker_api::CanonicalWalletPolicy {
+        self.applied_to_for(current, BROKER_REFUSES_LEGACY_CLEAR_SIGNING)
+    }
+
+    fn applied_to_for(
+        &self,
+        current: &bloom_broker_api::CanonicalWalletPolicy,
+        drop_legacy_clear_signing: bool,
+    ) -> bloom_broker_api::CanonicalWalletPolicy {
+        let mut proposed = current.clone();
+        proposed.allowed_petal_packages.clear();
+        proposed.allowed_destinations.clear();
+        proposed.maximum_approval_lifetime_ms = self.maximum_approval_lifetime_ms;
+        if drop_legacy_clear_signing {
+            proposed.clear_signing = None;
+            proposed
+                .required_verifiers
+                .retain(|required| required.verifier_id.as_str() != LEGACY_CLEAR_SIGNING_VERIFIER);
+        }
+        bloom_machine_client::policy_with_destinations(
+            &bloom_machine_client::policy_with_packages(&proposed, &self.packages),
+            &self.destinations,
+        )
+    }
+}
+
+/// Where a wallet's policy stands once its retained proposals are reconciled.
+enum PolicyBaseline {
+    /// A proposal still waits for the owner.
+    Awaiting(TriadPolicyUpdateProjection),
+    /// No proposal waits: the verified current policy.
+    Current(
+        bloom_broker_api::SignedPolicySnapshot,
+        bloom_broker_api::CanonicalWalletPolicy,
+    ),
+}
+
+/// Reads a wallet's [`DefaultPolicySetup`]. A failure, such as an unreadable
+/// Petal owner record, stops the first proposal rather than letting it leave
+/// a chosen Petal out: once that proposal commits, later ones add only the
+/// requested package, so nothing would put the missing Petal back.
+pub type DefaultPolicyPackages =
+    Arc<dyn Fn(&str) -> Result<DefaultPolicySetup, HandlerError> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct WalletsHandler {
@@ -341,6 +518,8 @@ pub struct WalletsHandler {
     /// host needs this handler, so there is exactly one of each and the
     /// session seam is attached once both exist.
     account_petals: Arc<parking_lot::RwLock<Option<Arc<dyn AccountPetalMount>>>>,
+    /// Setup choices proposed together with a wallet's first Petal package.
+    default_policy_packages: Option<DefaultPolicyPackages>,
 }
 
 impl WalletsHandler {
@@ -367,7 +546,13 @@ impl WalletsHandler {
             solana: None,
             solana_reads: None,
             account_petals: Arc::new(parking_lot::RwLock::new(None)),
+            default_policy_packages: None,
         }
+    }
+
+    pub fn with_default_policy_packages(mut self, packages: DefaultPolicyPackages) -> Self {
+        self.default_policy_packages = Some(packages);
+        self
     }
 
     /// Attach the session seam that serves `wallets/<w>/<n>/sessions/`.
@@ -750,10 +935,8 @@ impl WalletsHandler {
             }
         };
         let requested_name = request.name.as_str();
-        if matches!(
-            requested_name,
-            "new" | "registrations" | "recover" | "recoveries"
-        ) || requested_name.is_empty()
+        if is_wallet_control_entry(requested_name)
+            || requested_name.is_empty()
             || requested_name.len() > 64
             || !requested_name.chars().all(|character| {
                 character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
@@ -1144,10 +1327,8 @@ impl WalletsHandler {
             }
         };
         let requested_name = request.name.as_str();
-        if matches!(
-            requested_name,
-            "new" | "registrations" | "recover" | "recoveries"
-        ) || requested_name.is_empty()
+        if is_wallet_control_entry(requested_name)
+            || requested_name.is_empty()
             || requested_name.len() > 64
             || !requested_name.chars().all(|character| {
                 character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
@@ -1905,12 +2086,274 @@ impl WalletsHandler {
         wallet: &str,
         package_hash: &bloom_broker_api::Digest32,
     ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
-        use bloom_machine_client::{PetalEligibility, policy_with_package};
-        use sha2::Digest as _;
+        // A wallet's first proposal also allows the Petals chosen during setup,
+        // so the owner approves one policy rather than one per Petal. "First"
+        // is the Broker policy version, not the package list: once the owner
+        // has committed any change, later proposals add only the requested
+        // package, so a Petal the owner removed is never proposed again behind
+        // another.
+        let setup = match &self.default_policy_packages {
+            Some(defaults) => defaults(wallet),
+            None => Ok(DefaultPolicySetup::default()),
+        };
+        self.ensure_policy_allows(
+            wallet,
+            std::slice::from_ref(package_hash),
+            std::slice::from_ref(package_hash),
+            &[],
+            None,
+            setup.as_ref(),
+            AfterPolicyChange::Propose,
+        )
+        .await
+    }
+
+    /// Drive a wallet's default policy: propose every package and destination
+    /// together through the existing policy operation. `Allowed` means the
+    /// policy allows all of them. Once any change has been committed, nothing
+    /// is proposed unless `after_change` is [`AfterPolicyChange::Propose`]
+    /// because the owner has just chosen these again, so a Petal or destination
+    /// the owner removed is reported as `ChangedSinceCreation` instead of being
+    /// proposed again. A persona's destinations or approval `lifetime` may
+    /// be proposed without any package.
+    pub async fn ensure_petal_packages_allowed(
+        &self,
+        wallet: &str,
+        packages: &[bloom_broker_api::Digest32],
+        destinations: &[bloom_broker_api::PolicyDestination],
+        lifetime: Option<u64>,
+        after_change: AfterPolicyChange,
+    ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
+        if packages.is_empty() && destinations.is_empty() && lifetime.is_none() {
+            return Err(HandlerError::invalid(
+                "no packages, destinations or lifetime to allow",
+            ));
+        }
+        self.ensure_policy_allows(
+            wallet,
+            packages,
+            packages,
+            destinations,
+            lifetime,
+            Ok(&DefaultPolicySetup::default()),
+            after_change,
+        )
+        .await
+    }
+
+    /// Replace what setup chose in a wallet's policy, after the owner switched
+    /// its persona: propose exactly `replacement`'s packages, destinations and
+    /// lifetime, whatever the policy's version, removing anything else setup
+    /// could have chosen. `Allowed` means the policy already matches it. With
+    /// `may_propose` false, as once a switch's own proposal was refused or
+    /// expired, nothing new is proposed, and a policy that does not match is
+    /// returned as `ChangedSinceCreation`.
+    pub async fn ensure_policy_replaced(
+        &self,
+        wallet: &str,
+        replacement: &PolicyReplacement,
+        may_propose: bool,
+    ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
+        self.write_permit()?;
+        let _lock = self.lock_wallet_policy_update(wallet)?;
+        let (current, policy) = match self.reconcile_policy_updates_locked(wallet).await? {
+            PolicyBaseline::Awaiting(projection) => {
+                return projection.pending_view_where(|proposed| replacement.matches(proposed));
+            }
+            PolicyBaseline::Current(current, policy) => (current, policy),
+        };
+        if replacement.matches(&policy) {
+            return Ok(bloom_machine_client::PetalEligibility::Allowed(current));
+        }
+        if !may_propose {
+            return Ok(bloom_machine_client::PetalEligibility::ChangedSinceCreation(current));
+        }
+        self.propose_policy_locked(wallet, &replacement.applied_to(&policy), &current)
+            .await
+            .map_err(|error| match error {
+                HandlerError::Backend(message) => {
+                    HandlerError::Backend(format!("{POLICY_PROPOSAL_FAILED}: {message}"))
+                }
+                other => other,
+            })?
+            .pending_view_where(|proposed| replacement.matches(proposed))
+    }
+
+    /// Read and verify `wallet`'s current policy from Broker.
+    pub async fn current_policy(
+        &self,
+        wallet: &str,
+    ) -> Result<bloom_broker_api::SignedPolicySnapshot, HandlerError> {
+        let _lock = self.lock_wallet_policy_update(wallet)?;
+        Ok(self.current_policy_locked(wallet).await?.0)
+    }
+
+    /// Cancel a policy proposal Machine made, such as an earlier persona
+    /// switch, so it can no longer commit, and say what became of it. A
+    /// proposal the owner approved before the cancel reached Broker commits
+    /// instead, and is reported as [`ProposalOutcome::Committed`], so the
+    /// caller can apply what it proposed. A proposal that is no longer
+    /// pending needs no cancel; its outcome is reported as it stands.
+    pub async fn cancel_policy_proposal(
+        &self,
+        wallet: &str,
+        operation_id: &str,
+    ) -> Result<ProposalOutcome, HandlerError> {
+        self.write_permit()?;
+        validate_policy_action_id(operation_id)?;
+        let _lock = self.lock_wallet_policy_update(wallet)?;
+        let dir = self.policy_update_action_dir(wallet, "pending", operation_id);
+        if !dir.is_dir() {
+            return Ok(self.proposal_outcome_unchecked(wallet, operation_id));
+        }
+        let projection: TriadPolicyUpdateProjection = read_json(dir.join(APPROVAL_CHALLENGE_FILE))?;
+        let cancelled = self
+            .broker()?
+            .cancel_ceremony(projection.operation_id)
+            .await;
+        // Let the retained proposal settle either way: a cancelled one leaves
+        // `pending`, and one the owner approved just now commits, because
+        // Broker refuses to cancel a ceremony past the owner's approval.
+        self.reconcile_policy_updates_locked(wallet).await?;
+        match cancelled {
+            _ if !dir.is_dir() => Ok(self.proposal_outcome_unchecked(wallet, operation_id)),
+            Ok(_) => Ok(ProposalOutcome::Ended),
+            Err(error) => Err(HandlerError::backend(format!(
+                "cancel the earlier policy proposal for wallet {wallet}: {error}"
+            ))),
+        }
+    }
+
+    /// What became of a policy proposal Machine made for `wallet`, after
+    /// reconciling the wallet's retained proposals, so one the owner approved
+    /// meanwhile reads as committed.
+    pub async fn policy_proposal_outcome(
+        &self,
+        wallet: &str,
+        operation_id: &str,
+    ) -> Result<ProposalOutcome, HandlerError> {
+        self.write_permit()?;
+        validate_policy_action_id(operation_id)?;
+        let _lock = self.lock_wallet_policy_update(wallet)?;
+        self.reconcile_policy_updates_locked(wallet).await?;
+        Ok(self.proposal_outcome_unchecked(wallet, operation_id))
+    }
+
+    /// Read a proposal's outcome from where its projection is retained. The
+    /// caller validated `operation_id` and reconciled.
+    fn proposal_outcome_unchecked(&self, wallet: &str, operation_id: &str) -> ProposalOutcome {
+        if self
+            .policy_update_action_dir(wallet, "pending", operation_id)
+            .is_dir()
+        {
+            ProposalOutcome::Pending
+        } else if self
+            .policy_update_action_dir(wallet, "confirmed", operation_id)
+            .is_dir()
+        {
+            ProposalOutcome::Committed
+        } else {
+            ProposalOutcome::Ended
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn ensure_policy_allows(
+        &self,
+        wallet: &str,
+        required: &[bloom_broker_api::Digest32],
+        additions: &[bloom_broker_api::Digest32],
+        destinations: &[bloom_broker_api::PolicyDestination],
+        // Required of the policy, and proposed with the rest.
+        lifetime: Option<u64>,
+        // Added only while the policy is still the one wallet creation
+        // installed, so one ceremony makes every chosen Petal usable instead
+        // of gating each one. If it could not be read, nothing is proposed
+        // while that is the case.
+        first_proposal: Result<&DefaultPolicySetup, &HandlerError>,
+        // Whether to propose the request once the policy is no longer the one
+        // wallet creation installed.
+        after_change: AfterPolicyChange,
+    ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
+        use bloom_machine_client::{
+            PetalEligibility, policy_with_destinations, policy_with_packages,
+        };
 
         self.write_permit()?;
         let _lock = self.lock_wallet_policy_update(wallet)?;
-        let broker = self.broker()?;
+        let allows = |policy: &bloom_broker_api::CanonicalWalletPolicy| {
+            required
+                .iter()
+                .all(|package| policy.allowed_petal_packages.contains(package))
+                && destinations
+                    .iter()
+                    .all(|destination| policy.allowed_destinations.contains(destination))
+                && lifetime.is_none_or(|lifetime| policy.maximum_approval_lifetime_ms == lifetime)
+        };
+        let (current, policy) = match self.reconcile_policy_updates_locked(wallet).await? {
+            PolicyBaseline::Awaiting(projection) => {
+                // Broker keeps one live ceremony per wallet, so while the
+                // waiting change's ceremony is open, any approval this request
+                // needs would be refused: point at that ceremony. Otherwise,
+                // as while the owner's approval is being verified, the
+                // committed policy is still the wallet's, and a request it
+                // already allows proceeds. If it cannot be read, the waiting
+                // change is reported as before.
+                if projection.ceremony_state != bloom_broker_api::CeremonyState::AwaitingUser
+                    && let Ok((current, policy)) = self.current_policy_locked(wallet).await
+                    && allows(&policy)
+                {
+                    return Ok(PetalEligibility::Allowed(current));
+                }
+                return projection.pending_view(required, destinations, lifetime);
+            }
+            PolicyBaseline::Current(current, policy) => (current, policy),
+        };
+        if allows(&policy) {
+            return Ok(PetalEligibility::Allowed(current));
+        }
+        // Wallet creation installs the restrictive policy at version 1 and
+        // every committed change increments it. An empty package list is not
+        // the same fact: the owner may have removed every Petal on purpose.
+        const CREATION_POLICY_VERSION: u64 = 1;
+        let creation_policy = current.version.get() == CREATION_POLICY_VERSION;
+        if !creation_policy && after_change == AfterPolicyChange::Report {
+            return Ok(PetalEligibility::ChangedSinceCreation(current));
+        }
+        let mut additions = additions.to_vec();
+        // Kept apart from `destinations`, which stays what the caller asked
+        // for so a pending change is judged against the request alone.
+        let mut proposed_destinations = destinations.to_vec();
+        let mut proposed_lifetime = lifetime;
+        if creation_policy {
+            let first_proposal = first_proposal.map_err(|error| {
+                HandlerError::backend(format!(
+                    "the Petals chosen during setup could not be read, so no policy was proposed for wallet {wallet}: {error}"
+                ))
+            })?;
+            additions.extend_from_slice(&first_proposal.packages);
+            proposed_destinations.extend_from_slice(&first_proposal.destinations);
+            proposed_lifetime = proposed_lifetime.or(first_proposal.maximum_approval_lifetime_ms);
+        }
+        let mut proposed = policy_with_destinations(
+            &policy_with_packages(&policy, &additions),
+            &proposed_destinations,
+        );
+        if let Some(lifetime) = proposed_lifetime {
+            proposed.maximum_approval_lifetime_ms = lifetime;
+        }
+        self.propose_policy_locked(wallet, &proposed, &current)
+            .await?
+            .pending_view(required, destinations, lifetime)
+    }
+
+    /// Reconcile a wallet's retained policy proposals, then read and verify
+    /// its current policy. The caller holds the wallet's policy lock.
+    async fn reconcile_policy_updates_locked(
+        &self,
+        wallet: &str,
+    ) -> Result<PolicyBaseline, HandlerError> {
+        self.broker()?;
         // Reconcile retained proposals before choosing a baseline. In particular,
         // unrelated pending consent must never be overwritten or silently rebased.
         for operation_id in self.policy_update_action_ids(wallet, "pending") {
@@ -1919,18 +2362,54 @@ impl WalletsHandler {
                 .join(APPROVAL_CHALLENGE_FILE);
             let projection: TriadPolicyUpdateProjection = read_json(&path)?;
             let proposed_bytes = projection.retained_policy_bytes()?;
-            match self
+            let mut resumed = self
                 .resume_wallet_policy_update(wallet, &operation_id, &proposed_bytes)
-                .await
+                .await;
+            if matches!(resumed, Err(HandlerError::PermissionDenied))
+                && self
+                    .cancel_expired_policy_ceremony(wallet, &operation_id)
+                    .await?
             {
+                resumed = self
+                    .resume_wallet_policy_update(wallet, &operation_id, &proposed_bytes)
+                    .await;
+            }
+            match resumed {
                 Ok(()) => continue,
                 Err(HandlerError::PermissionDenied) => {
-                    let projection: TriadPolicyUpdateProjection = read_json(&path)?;
-                    return projection.pending_view(package_hash);
+                    return Ok(PolicyBaseline::Awaiting(read_json(&path)?));
+                }
+                // A cancelled, expired, or failed ceremony has left `pending`;
+                // propose again from the current policy.
+                Err(_)
+                    if !self
+                        .policy_update_action_dir(wallet, "pending", &operation_id)
+                        .is_dir() =>
+                {
+                    continue;
                 }
                 Err(error) => return Err(error),
             }
         }
+        let (current, policy) = self.current_policy_locked(wallet).await?;
+        Ok(PolicyBaseline::Current(current, policy))
+    }
+
+    /// Read and verify `wallet`'s current policy from Broker. The caller
+    /// holds the wallet's policy lock.
+    async fn current_policy_locked(
+        &self,
+        wallet: &str,
+    ) -> Result<
+        (
+            bloom_broker_api::SignedPolicySnapshot,
+            bloom_broker_api::CanonicalWalletPolicy,
+        ),
+        HandlerError,
+    > {
+        use sha2::Digest as _;
+
+        let broker = self.broker()?;
         let wallet_id = bloom_broker_api::Token::new(wallet.to_owned())
             .map_err(|error| HandlerError::invalid(error.to_string()))?;
         let current = broker
@@ -1950,13 +2429,21 @@ impl WalletsHandler {
                 "Broker eligibility policy has invalid wallet, digest, or canonical bytes",
             ));
         }
-        if policy.allowed_petal_packages.contains(package_hash) {
-            return Ok(PetalEligibility::Allowed(current));
-        }
-        let proposed = policy_with_package(&policy, package_hash);
-        let proposed_bytes = serde_jcs::to_vec(&proposed).map_err(err_be)?;
+        Ok((current, policy))
+    }
+
+    /// Propose `proposed` against `current` and return the pending change it
+    /// opened, which waits for the owner. The caller holds the wallet's
+    /// policy lock.
+    async fn propose_policy_locked(
+        &self,
+        wallet: &str,
+        proposed: &bloom_broker_api::CanonicalWalletPolicy,
+        current: &bloom_broker_api::SignedPolicySnapshot,
+    ) -> Result<TriadPolicyUpdateProjection, HandlerError> {
+        let proposed_bytes = serde_jcs::to_vec(proposed).map_err(err_be)?;
         match self
-            .write_wallet_policy_update_locked(wallet, &proposed_bytes, Some(&current))
+            .write_wallet_policy_update_locked(wallet, &proposed_bytes, Some(current))
             .await
         {
             Err(HandlerError::PermissionDenied) => {
@@ -1965,17 +2452,42 @@ impl WalletsHandler {
                         .ok_or_else(|| {
                             HandlerError::backend("prepared policy operation was not persisted")
                         })?;
-                let projection: TriadPolicyUpdateProjection = read_json(
+                read_json(
                     self.policy_update_action_dir(wallet, "pending", &operation_id)
                         .join(APPROVAL_CHALLENGE_FILE),
-                )?;
-                projection.pending_view(package_hash)
+                )
             }
             Err(error) => Err(error),
             Ok(()) => Err(HandlerError::backend(
                 "fresh policy proposal unexpectedly committed without owner consent",
             )),
         }
+    }
+
+    /// The Broker reports an expired ceremony as awaiting the owner until asked
+    /// to act on it. Cancel a pending policy ceremony past its expiry so the
+    /// next status read is terminal; returns whether the Broker accepted.
+    async fn cancel_expired_policy_ceremony(
+        &self,
+        wallet: &str,
+        operation_id: &str,
+    ) -> Result<bool, HandlerError> {
+        let projection: TriadPolicyUpdateProjection = read_json(
+            self.policy_update_action_dir(wallet, "pending", operation_id)
+                .join(APPROVAL_CHALLENGE_FILE),
+        )?;
+        if !projection
+            .ceremony_expires_at_ms
+            .as_ref()
+            .is_some_and(|expires_at_ms| expires_at_ms.get() <= now_ms_u64())
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .broker()?
+            .cancel_ceremony(projection.operation_id)
+            .await
+            .is_ok())
     }
 
     /// Gate an explicit caller operation without treating policy completion as submission.
@@ -1986,16 +2498,31 @@ impl WalletsHandler {
     ) -> Result<(), HandlerError> {
         match self.ensure_petal_eligibility(wallet, package_hash).await? {
             bloom_machine_client::PetalEligibility::Allowed(_) => Ok(()),
+            // Not produced here: this request is proposed at any version.
+            bloom_machine_client::PetalEligibility::ChangedSinceCreation(_) => Err(
+                HandlerError::backend("wallet policy does not allow this Petal package"),
+            ),
             bloom_machine_client::PetalEligibility::AwaitingPolicyApproval(pending) => {
-                Err(HandlerError::backend(format!(
-                    "POLICY_APPROVAL_REQUIRED: complete the owner ceremony at {} then retry this operation; status: {}",
-                    pending
-                        .prepare
-                        .as_ref()
-                        .map(|prepare| prepare.ceremony_url.as_str())
-                        .unwrap_or(&pending.status_path),
-                    pending.status_path,
-                )))
+                let ceremony = pending
+                    .prepare
+                    .as_ref()
+                    .map(|prepare| prepare.ceremony_url.as_str())
+                    .unwrap_or(&pending.status_path);
+                Err(HandlerError::backend(if pending.includes_requested {
+                    format!(
+                        "POLICY_APPROVAL_REQUIRED: complete the owner ceremony at {ceremony} then retry this operation; status: {}",
+                        pending.status_path,
+                    )
+                } else {
+                    // Somebody else's change, such as a persona switch, which
+                    // may even remove this Petal: approving it does not allow
+                    // this operation, but Broker opens one ceremony per wallet
+                    // at a time, so it must finish first.
+                    format!(
+                        "POLICY_APPROVAL_REQUIRED: another policy change for wallet {wallet} is waiting for the owner at {ceremony}; it does not allow this operation, but Broker opens one ceremony per wallet at a time, so the owner must approve or refuse it first, then retry this operation; status: {}",
+                        pending.status_path,
+                    )
+                }))
             }
         }
     }
@@ -2068,7 +2595,7 @@ impl WalletsHandler {
             .truncate(false)
             .open(directory.join(".coordinator.lock"))?;
         fs2::FileExt::try_lock_exclusive(&file).map_err(|error| {
-            HandlerError::backend(format!("wallet policy coordination busy; retry: {error}"))
+            HandlerError::backend(format!("{POLICY_COORDINATION_BUSY}; retry: {error}"))
         })?;
         Ok(file)
     }
@@ -2109,7 +2636,7 @@ impl WalletsHandler {
             let prepared = broker
                 .validate_policy_update(projection.request(proposed_bytes))
                 .await
-                .map_err(|error| HandlerError::backend(error.to_string()))?;
+                .map_err(|error| self.policy_prepare_refused(wallet, operation_id, error))?;
             projection.adopt_prepare(prepared)?;
             write_atomic_json(&projection_path, &projection)?;
             return Err(HandlerError::PermissionDenied);
@@ -2188,6 +2715,19 @@ impl WalletsHandler {
                     "pending",
                     "confirmed",
                 )?;
+                // Staging reads the cached wallet projection. Observe the new
+                // policy now, or a stage in the next second keeps the old
+                // verdict and its entry is refused at confirm (bloom#354).
+                // If that read fails, drop the cached observation so the next
+                // stage observes Broker rather than the superseded policy.
+                if let Err(error) = self.wallet_projection_authority(wallet).await {
+                    tracing::warn!(wallet, %error, "policy committed; wallet refresh failed");
+                    if let Some(projections) = &self.wallet_projections {
+                        projections
+                            .invalidate_wallet(&wallet_id)
+                            .map_err(|error| HandlerError::backend(error.to_string()))?;
+                    }
+                }
                 Ok(())
             }
             bloom_broker_api::CeremonyState::Cancelled
@@ -2347,7 +2887,7 @@ impl WalletsHandler {
         let prepared = broker
             .validate_policy_update(projection.request(&proposed_bytes))
             .await
-            .map_err(|error| HandlerError::backend(error.to_string()))?;
+            .map_err(|error| self.policy_prepare_refused(wallet, operation_id.as_str(), error))?;
         projection.adopt_prepare(prepared)?;
         write_atomic_json(&projection_path, &projection)?;
         Err(HandlerError::PermissionDenied)
@@ -2421,11 +2961,27 @@ impl WalletsHandler {
         self.policy_update_state_dir(wallet, state).join(action_id)
     }
 
-    /// Atomically move an action between lifecycle states (e.g. `pending` →
-    /// `confirmed` once the approved policy is installed). Best-effort: a
-    /// failure is logged but never overrides an already-decided install/error
-    /// outcome. In production the Broker/Signer receipt is authoritative and
-    /// this move changes only Machine's workflow projection.
+    /// A definitive prepare refusal means the Broker opened no ceremony, so
+    /// the pending proposal has nothing to approve or cancel. Left in
+    /// `pending/` it would block every later policy write; move it to
+    /// `failed/` and return the Broker's reason.
+    fn policy_prepare_refused(
+        &self,
+        wallet: &str,
+        operation_id: &str,
+        error: bloom_broker_api::ProtocolError,
+    ) -> HandlerError {
+        if error.code != ProtocolErrorCode::ServiceUnavailable
+            && let Err(io) =
+                self.policy_update_transition(wallet, operation_id, "pending", "failed")
+        {
+            return HandlerError::from(io);
+        }
+        HandlerError::backend(error.to_string())
+    }
+
+    /// Atomically move Machine's workflow projection between lifecycle states.
+    /// The Broker/Signer receipt remains authoritative.
     fn policy_update_transition(
         &self,
         wallet: &str,
@@ -2709,6 +3265,15 @@ fn validate_policy_action_id(id: &str) -> Result<(), HandlerError> {
     Ok(())
 }
 
+/// Start of the error a policy writer gets while another command holds the
+/// wallet's policy lock. Waiting commands poll again instead of failing.
+pub const POLICY_COORDINATION_BUSY: &str = "wallet policy coordination busy";
+
+/// Marks a failure of the proposal a persona switch makes, as opposed to a
+/// failure reconciling or reading the policy around it, so Machine can tell
+/// Broker's refusal of that proposal apart. Followed by `: ` and the failure.
+pub const POLICY_PROPOSAL_FAILED: &str = "POLICY_PROPOSAL_FAILED";
+
 fn tx_open_err(e: TxEngineError) -> HandlerError {
     match e {
         TxEngineError::ApprovalRequired(_) => HandlerError::PermissionDenied,
@@ -2921,7 +3486,7 @@ fn record_confirm_error(
         (
             "policy_approval_required",
             format!(
-                "The wallet policy does not yet allow the Petal that staged this transaction. Give the owner the ceremony link in error (pending updates are under wallets/{wallet}/policy-updates/pending/); once they approve, write confirm again."
+                "The wallet policy does not yet allow the Petal that staged this transaction, or another policy change must finish first. Give the owner the ceremony link in error (pending updates are under wallets/{wallet}/policy-updates/pending/); once they have approved or refused it, write confirm again."
             ),
         )
     } else {
@@ -3373,6 +3938,11 @@ impl Handler for WalletsHandler {
     fn cache_ttl(&self, path: &VfsPath) -> Option<std::time::Duration> {
         // Chain leaves exist only under a numbered account.
         match path.segments() {
+            [_, number, leaf]
+                if parse_account_segment(number).is_some() && leaf == "holdings.json" =>
+            {
+                Some(super::balances::LIVE_BALANCE_TTL)
+            }
             [_, number, s, _, leaf]
                 if parse_account_segment(number).is_some()
                     && s == "chains"
@@ -3907,10 +4477,13 @@ impl WalletsHandler {
                 .into_iter()
                 .map(|projection| Entry::dir(projection.wallet.wallet_id.as_str()))
                 .collect();
-            out.push(Entry::writable_file("new"));
-            out.push(Entry::dir("registrations"));
-            out.push(Entry::writable_file("recover"));
-            out.push(Entry::dir("recoveries"));
+            out.extend(WALLET_CONTROL_ENTRIES.iter().map(|(name, is_dir)| {
+                if *is_dir {
+                    Entry::dir(name)
+                } else {
+                    Entry::writable_file(name)
+                }
+            }));
             return Ok(out);
         }
         if segs[0] == "recoveries" {
@@ -4249,6 +4822,14 @@ impl WalletsHandler {
                     )
                     .map_err(solana_outbox_err)?;
                 require_pinned(&entry.staged, id)?;
+                // As on EVM, `cancel` written to confirm discards the entry
+                // instead of signing it.
+                if confirm_text.eq_ignore_ascii_case("cancel") {
+                    return engine
+                        .cancel(wallet, id)
+                        .await
+                        .map_err(|e| HandlerError::backend(e.to_string()));
+                }
                 // Re-select the exact account this transfer was staged
                 // against. Resolving the wallet's children again would let a
                 // second active child sign a message staged for the first.
@@ -4624,6 +5205,49 @@ impl WalletsHandler {
 }
 #[cfg(test)]
 mod tests {
+    /// A replacement keeps the policy's clear-signing rules for a Broker that
+    /// accepts them, and drops the legacy ones for a Broker built with
+    /// bloom-broker#103, which refuses to sign under them; a policy that still
+    /// carries them then does not match.
+    #[test]
+    fn a_replacement_drops_legacy_clear_signing_only_where_broker_refuses_it() {
+        let verifier = |id: &str| bloom_broker_api::RequiredVerifier {
+            verifier_id: bloom_broker_api::Token::new(id).unwrap(),
+            verifier_digest: bloom_broker_api::Digest32::from_bytes([4; 32]),
+        };
+        let current = bloom_broker_api::CanonicalWalletPolicy {
+            wallet_id: bloom_broker_api::Token::new("alice").unwrap(),
+            allowed_petal_packages: Vec::new(),
+            allowed_destinations: Vec::new(),
+            maximum_approval_lifetime_ms: 60_000,
+            required_verifiers: vec![verifier("human"), verifier(LEGACY_CLEAR_SIGNING_VERIFIER)],
+            clear_signing: Some(bloom_broker_api::LegacyClearSigningPolicy {
+                catalog_id: bloom_broker_api::Token::new("bloom").unwrap(),
+                trusted_keys: Vec::new(),
+                signature_threshold: 1,
+                maximum_observation_age_ms: 60_000,
+                opaque_exact_allowed: false,
+                unlimited_allowance_allowed: false,
+                verifier: verifier(LEGACY_CLEAR_SIGNING_VERIFIER),
+            }),
+        };
+        let replacement = PolicyReplacement {
+            maximum_approval_lifetime_ms: 60_000,
+            ..PolicyReplacement::default()
+        };
+
+        let kept = replacement.applied_to_for(&current, false);
+        assert_eq!(kept.clear_signing, current.clear_signing);
+        assert_eq!(kept.required_verifiers, current.required_verifiers);
+        assert!(replacement.matches_for(&current, false));
+
+        let dropped = replacement.applied_to_for(&current, true);
+        assert_eq!(dropped.clear_signing, None);
+        assert_eq!(dropped.required_verifiers, vec![verifier("human")]);
+        assert!(!replacement.matches_for(&current, true));
+        assert!(replacement.matches_for(&dropped, true));
+    }
+
     use super::*;
     use alloy::primitives::Address;
     use bloom_broker_api::{
@@ -4987,6 +5611,37 @@ mod tests {
         }
     }
 
+    /// Counts live authority reads so a test can tell a refresh happened.
+    struct CountingProjection(WalletProjection, std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl WalletProjectionReader for CountingProjection {
+        async fn list_wallets(
+            &self,
+        ) -> Result<Vec<WalletProjection>, bloom_broker_api::ProtocolError> {
+            Ok(vec![self.0.clone()])
+        }
+
+        async fn get_wallet(
+            &self,
+            _wallet_id: &Token,
+        ) -> Result<WalletProjection, bloom_broker_api::ProtocolError> {
+            Ok(self.0.clone())
+        }
+
+        async fn get_wallet_authority(
+            &self,
+            _wallet_id: &Token,
+        ) -> Result<WalletProjection, bloom_broker_api::ProtocolError> {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.0.clone())
+        }
+
+        fn cached_wallets(&self) -> Result<Vec<WalletProjection>, bloom_broker_api::ProtocolError> {
+            Ok(vec![self.0.clone()])
+        }
+    }
+
     fn static_projection_value(address: Address) -> WalletProjection {
         let wallet_id = token("alice");
         let key_ref = KeyRef {
@@ -4998,12 +5653,12 @@ mod tests {
             derivation: None,
         };
         let canonical = serde_jcs::to_vec(&CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: wallet_id.clone(),
             maximum_approval_lifetime_ms: 300_000,
             allowed_petal_packages: Vec::new(),
             allowed_destinations: Vec::new(),
             required_verifiers: Vec::new(),
-            clear_signing: None,
         })
         .unwrap();
         let policy_digest = Digest32::from_bytes(sha2::Sha256::digest(&canonical).into());
@@ -5079,12 +5734,12 @@ mod tests {
             }),
         };
         let canonical = serde_jcs::to_vec(&CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: wallet_id.clone(),
             maximum_approval_lifetime_ms: 300_000,
             allowed_petal_packages: Vec::new(),
             allowed_destinations: Vec::new(),
             required_verifiers: Vec::new(),
-            clear_signing: None,
         })
         .unwrap();
         let policy_digest = Digest32::from_bytes(sha2::Sha256::digest(&canonical).into());
@@ -5442,7 +6097,12 @@ mod tests {
         });
         let broker = MachineBrokerClient::new(shared_service.clone());
         let mut handler = f.handler.with_broker(Some(broker));
-        handler.wallet_projections = Some(bip39_projection(f.wallet_addr, accounts));
+        let projection = Arc::new(CountingProjection(
+            bip39_projection_value(f.wallet_addr, accounts),
+            Default::default(),
+        ));
+        handler.wallet_projections = Some(projection.clone());
+        let authority_reads = || projection.1.load(std::sync::atomic::Ordering::SeqCst);
         let w = &f.wallet_name;
 
         // The write starts one ceremony and stores a pending request.
@@ -5479,12 +6139,16 @@ mod tests {
         // returned paths.
         *shared_service.state.lock().unwrap() = bloom_broker_api::CeremonyState::Succeeded;
 
+        let reads_before = authority_reads();
         let status: serde_json::Value =
             serde_json::from_slice(&handler.read(&vfs(format!("/{w}/new"))).await.unwrap())
                 .unwrap();
         assert_eq!(status["requests"][0]["state"], "created");
         assert_eq!(status["requests"][0]["number"], 2);
         assert_eq!(status["requests"][0]["already_created"], true);
+        // Reporting the account refreshes the wallet projection, so a
+        // navigation read straight after it cannot reuse a pre-ceremony view.
+        assert_eq!(authority_reads(), reads_before + 1);
 
         // The prepared request carried the multi-family list and terms.
         let prepared = shared_service.prepared.lock().unwrap().clone().unwrap();
@@ -5839,7 +6503,6 @@ mod tests {
             expires_ms: u128::MAX,
             status: bloom_proto::TxStatus::Pending,
             action_kind: bloom_proto::TxActionKind::Unknown,
-            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,
@@ -6281,6 +6944,31 @@ value = "0""#
                 .unwrap();
             assert_eq!(sink.mode, 0o644, "{path}/restage must be writable");
         }
+
+        // `cancel` written to confirm discards the entry; it never signs.
+        handler
+            .write(
+                &vfs(format!(
+                    "/{w}/0/chains/solana-devnet/outbox/pending/sol-zero/confirm"
+                )),
+                b"cancel\n",
+            )
+            .await
+            .unwrap();
+        let names = |state: &'static str| {
+            let handler = handler.clone();
+            async move {
+                handler
+                    .list(&vfs(format!("/{w}/0/chains/solana-devnet/outbox/{state}")))
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|entry| entry.name)
+                    .collect::<Vec<String>>()
+            }
+        };
+        assert!(names("pending").await.is_empty());
+        assert!(names("failed").await.contains(&"sol-zero".to_string()));
     }
 
     /// A crash after the move to `failed/` but before the intent rewrite
@@ -7129,6 +7817,87 @@ value = "0""#,
     /// A stub Broker service: the Solana outbox read path never reaches it,
     /// so every method is a catch-all error.
     struct StubBroker;
+
+    #[tokio::test]
+    async fn policy_json_preserves_legacy_authority_until_explicit_removal_review() {
+        struct PolicyBroker {
+            baseline: SignedPolicySnapshot,
+            prepared: Mutex<Option<bloom_broker_api::PolicyUpdateRequest>>,
+        }
+        impl bloom_broker_api::MachineBrokerService for PolicyBroker {
+            fn dispatch<'a>(
+                &'a self,
+                request: MachineBrokerRequest,
+            ) -> bloom_broker_api::ServiceFuture<'a, MachineBrokerResponse> {
+                Box::pin(async move {
+                    match request {
+                        MachineBrokerRequest::PolicyRead(_) => {
+                            Ok(MachineBrokerResponse::PolicyRead(self.baseline.clone()))
+                        }
+                        MachineBrokerRequest::PolicyValidateUpdate(request) => {
+                            *self.prepared.lock().unwrap() = Some(request.clone());
+                            Ok(MachineBrokerResponse::PolicyValidateUpdate(
+                                bloom_broker_api::PolicyUpdatePrepareResponse {
+                                    operation_id: request.operation_id,
+                                    ceremony_kind: bloom_broker_api::CeremonyKind::PolicyUpdate,
+                                    ceremony_url: "https://example.invalid/legacy-removal-review"
+                                        .into(),
+                                    ceremony_expires_at_ms: DecimalU64::new(u64::MAX),
+                                    review_manifest_digest: digest(90),
+                                },
+                            ))
+                        }
+                        other => panic!("unexpected policy request: {other:?}"),
+                    }
+                })
+            }
+        }
+        let f = make_handler();
+        let mut vector: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../bloom-machine-client/tests/fixtures/legacy-policy-removal.json"
+        ))
+        .unwrap();
+        for field in ["current", "proposed"] {
+            vector[field]["wallet_id"] = serde_json::json!(f.wallet_name);
+        }
+        let current: CanonicalWalletPolicy =
+            serde_json::from_value(vector["current"].clone()).unwrap();
+        let proposed: CanonicalWalletPolicy =
+            serde_json::from_value(vector["proposed"].clone()).unwrap();
+        let bytes = serde_jcs::to_vec(&current).unwrap();
+        let mut projection = static_projection_value(f.wallet_addr);
+        projection.policy.canonical_policy = Base64UrlBytes::from_bytes(&bytes);
+        projection.policy.policy_digest = Digest32::from_bytes(sha2::Sha256::digest(&bytes).into());
+        let broker = Arc::new(PolicyBroker {
+            baseline: projection.policy.clone(),
+            prepared: Mutex::new(None),
+        });
+        let home = bloom_proto::HomeDir::at(f._tmp.path());
+        let handler = f
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(broker.clone())))
+            .with_projection_reader(Arc::new(StaticProjection(projection)))
+            .with_home_write_permit(Arc::new(HomeWritePermit::acquire(&home).unwrap()));
+        let path = VfsPath::parse(&format!("/{}/policy.json", f.wallet_name)).unwrap();
+        assert_eq!(handler.read(&path).await.unwrap(), bytes);
+        let proposed_bytes = serde_jcs::to_vec(&proposed).unwrap();
+        assert!(matches!(
+            handler.write(&path, &proposed_bytes).await,
+            Err(HandlerError::PermissionDenied)
+        ));
+        let prepared = broker.prepared.lock().unwrap().clone().unwrap();
+        assert_eq!(prepared.proposed_canonical_policy.decode(), proposed_bytes);
+        assert_eq!(
+            prepared.authority_diff_digest.as_str(),
+            "65f348e08a8ded736ad13843456a1afbaacf16bf5518147b1d7d900f703e7401"
+        );
+        assert_eq!(
+            handler.read(&path).await.unwrap(),
+            bytes,
+            "staging must not remove signed policy authority"
+        );
+    }
+
     impl bloom_broker_api::MachineBrokerService for StubBroker {
         fn dispatch<'a>(
             &'a self,
@@ -7829,7 +8598,6 @@ value = "0""#,
             expires_ms: u128::MAX,
             status: bloom_proto::TxStatus::Pending,
             action_kind: bloom_proto::TxActionKind::Unknown,
-            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,
@@ -8977,15 +9745,16 @@ value = "0""#,
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
+            evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-            safe_review_payloads: Vec::new(),
             evm_review_payloads: Vec::new(),
+            safe_review_payloads: Vec::new(),
+            message_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
             petal_use_claim: None,
             system_use_claim: None,
-            requested_review_mode: None,
         };
         let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
         f.handler
@@ -9027,15 +9796,16 @@ value = "0""#,
                 .handler
                 .with_broker(Some(MachineBrokerClient::new(broker.clone())));
             let request = ApprovalPrepareRequest {
+                evm_reported_token: None,
                 surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-                safe_review_payloads: Vec::new(),
                 evm_review_payloads: Vec::new(),
+                safe_review_payloads: Vec::new(),
+                message_review_payloads: Vec::new(),
                 operation_id: OperationId::from_bytes([30; 32]),
                 terms: approval_terms("alice", None),
                 canonical_plan_facts_digest: digest(31),
                 petal_use_claim: None,
                 system_use_claim: None,
-                requested_review_mode: None,
             };
             let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
             f.handler
@@ -9062,15 +9832,16 @@ value = "0""#,
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
+            evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-            safe_review_payloads: Vec::new(),
             evm_review_payloads: Vec::new(),
+            safe_review_payloads: Vec::new(),
+            message_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
             petal_use_claim: None,
             system_use_claim: None,
-            requested_review_mode: None,
         };
         let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
         f.handler
@@ -9096,15 +9867,16 @@ value = "0""#,
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker)));
         let request = ApprovalPrepareRequest {
+            evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-            safe_review_payloads: Vec::new(),
             evm_review_payloads: Vec::new(),
+            safe_review_payloads: Vec::new(),
+            message_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
             petal_use_claim: None,
             system_use_claim: None,
-            requested_review_mode: None,
         };
         let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
 
@@ -10370,6 +11142,81 @@ value = "0""#,
     }
 
     #[tokio::test]
+    async fn confirm_and_override_cancel_preserve_possible_signatures() {
+        for marker in ["hash", "broadcast", "dispatched", "malformed"] {
+            for control in ["confirm", "confirm.override"] {
+                let mut f = make_handler_with_chain(true);
+                f.handler.home_write_permit = Some(Arc::new(
+                    HomeWritePermit::acquire(&bloom_proto::HomeDir::at(f._tmp.path())).unwrap(),
+                ));
+                seed_pending(&f, "0001-test");
+                let entry = f
+                    .handler
+                    .tx_engine
+                    .outbox
+                    .read(&f.wallet_name, "anvil", "0001-test")
+                    .unwrap();
+                match marker {
+                    "hash" => {
+                        let mut staged = entry.staged.clone();
+                        staged.tx_hash = Some(format!("0x{}", "11".repeat(32)));
+                        std::fs::write(
+                            entry.dir.join("intent.json"),
+                            serde_json::to_vec(&staged).unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    "broadcast" => {
+                        std::fs::write(
+                            entry.dir.join("broadcast_attempted.json"),
+                            serde_json::to_vec(&serde_json::json!({
+                                "schema": "bloom.broadcast_attempted.v1", "tx_hash": "signed",
+                                "raw_tx_blake3": "digest", "raw_tx_path": "raw_tx",
+                                "from": entry.staged.from, "to": null, "nonce": 0,
+                                "chain_id": 31337, "created_ms": 0, "transport": "public_rpc"
+                            }))
+                            .unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    "dispatched" => {
+                        let digest = "11".repeat(32);
+                        std::fs::write(entry.dir.join("ceremony.json"), serde_json::to_vec(&serde_json::json!({
+                            "schema": "bloom.machine-evm-signing.1", "action_id": "test",
+                            "payload_digest": digest, "claimed_hash": digest,
+                            "provenance_digest": digest, "canonical_plan_facts_digest": digest,
+                            "approval_operation_id": digest, "signing_operation_id": digest,
+                            "request_nonce": "11".repeat(16), "issued_at_ms": "1", "expires_at_ms": "2",
+                            "sign_dispatched": true
+                        })).unwrap()).unwrap();
+                    }
+                    _ => std::fs::write(entry.dir.join("ceremony.json"), b"invalid").unwrap(),
+                }
+                let path = VfsPath::parse(&format!(
+                    "/{}/0/chains/anvil/outbox/pending/0001-test/{control}",
+                    f.wallet_name
+                ))
+                .unwrap();
+                let error = f.handler.write(&path, b"cancel").await.unwrap_err();
+                if marker != "malformed" {
+                    assert!(
+                        error.to_string().contains("cannot discard"),
+                        "{marker}: {error}"
+                    );
+                }
+                let retained = f
+                    .handler
+                    .tx_engine
+                    .outbox
+                    .read(&f.wallet_name, "anvil", "0001-test")
+                    .unwrap();
+                assert_eq!(retained.state, OutboxState::Pending, "{marker}/{control}");
+                assert!(!retained.dir.join("cancel.txt").exists());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn normal_confirm_open_preserves_body_control_semantics() {
         let f = make_handler_with_chain(true);
         let p = VfsPath::parse(&format!(
@@ -11392,6 +12239,426 @@ value = "0""#,
                 Err(HandlerError::NotFound(_))
             ),
             "wallet-root chains must be absent"
+        );
+    }
+
+    /// An EVM node for chain id 1 holding no ETH and 2.5 USDC, whose DAI
+    /// `balanceOf` fails. Returns its URL and a count of requests served.
+    async fn spawn_usdc_only_evm_node() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        spawn_holdings_node(
+            1,
+            0,
+            |symbol| match symbol {
+                "USDC" => Some(2_500_000),
+                "DAI" => None,
+                _ => Some(0),
+            },
+            std::time::Duration::ZERO,
+        )
+        .await
+    }
+
+    /// An EVM node for `chain_id` whose native balance is `native` and whose
+    /// holdings-token balances come from `held` by symbol (`None` reverts).
+    /// Every balance read waits `delay`. Returns its URL and a request count.
+    async fn spawn_holdings_node(
+        chain_id: u64,
+        native: u64,
+        held: fn(&str) -> Option<u64>,
+        delay: std::time::Duration,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        spawn_holdings_node_with(chain_id, native, held, Arc::new(move |_| delay), false).await
+    }
+
+    type HoldingsDelay = dyn Fn(Option<&str>) -> std::time::Duration + Send + Sync;
+
+    /// `delay` gets the token symbol a call reads, or `None` for other calls.
+    /// With `multicall`, the node answers Multicall3 `aggregate3`; without
+    /// it, Multicall3 has no code there and answers at once.
+    async fn spawn_holdings_node_with(
+        chain_id: u64,
+        native: u64,
+        held: fn(&str) -> Option<u64>,
+        delay: Arc<HoldingsDelay>,
+        multicall: bool,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let tokens: Arc<Vec<(String, Option<u64>, String)>> = Arc::new(
+            accounts::holdings_tokens(chain_id)
+                .into_iter()
+                .map(|(address, symbol, _)| (format!("{address:#x}"), held(&symbol), symbol))
+                .collect(),
+        );
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = served.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let tokens = tokens.clone();
+                let delay = delay.clone();
+                tokio::spawn(async move {
+                    let mut bytes = Vec::new();
+                    let mut chunk = [0; 4096];
+                    let request: serde_json::Value = loop {
+                        let len = socket.read(&mut chunk).await.unwrap_or(0);
+                        if len == 0 {
+                            return;
+                        }
+                        bytes.extend_from_slice(&chunk[..len]);
+                        if let Some((_, body)) =
+                            String::from_utf8_lossy(&bytes).split_once("\r\n\r\n")
+                            && let Ok(request) = serde_json::from_str(body)
+                        {
+                            break request;
+                        }
+                    };
+                    let word = |value: u64| format!("0x{value:064x}");
+                    let to = request["params"][0]["to"].as_str().unwrap_or_default();
+                    let method = request["method"].as_str().unwrap_or_default();
+                    let token = tokens.iter().find(|(a, ..)| a.eq_ignore_ascii_case(to));
+                    let multicall3 =
+                        to.eq_ignore_ascii_case(&format!("{:#x}", bloom_evm::MULTICALL3));
+                    if multicall3 && !multicall {
+                        let body =
+                            serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":"0x"})
+                                .to_string();
+                        let _ = socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+                        return;
+                    }
+                    if method != "eth_chainId" {
+                        tokio::time::sleep(delay(token.map(|(.., symbol)| symbol.as_str()))).await;
+                    }
+                    let result = match method {
+                        "eth_chainId" => serde_json::json!(format!("{chain_id:#x}")),
+                        "eth_getBalance" => serde_json::json!(format!("{native:#x}")),
+                        "eth_call" if multicall3 => {
+                            use alloy::sol_types::SolCall;
+                            use bloom_evm::IMulticall3::{Call3Result, aggregate3Call};
+                            let params = &request["params"][0];
+                            let input = params["input"].as_str().or(params["data"].as_str());
+                            let input = hex::decode(input.unwrap().trim_start_matches("0x"));
+                            let calls = aggregate3Call::abi_decode(&input.unwrap()).unwrap().calls;
+                            let results: Vec<Call3Result> = calls
+                                .iter()
+                                .map(|call| {
+                                    let target = format!("{:#x}", call.target);
+                                    let held = tokens
+                                        .iter()
+                                        .find(|(a, ..)| a.eq_ignore_ascii_case(&target))
+                                        .and_then(|(_, held, _)| *held);
+                                    Call3Result {
+                                        success: held.is_some(),
+                                        returnData: held
+                                            .map(|value| {
+                                                alloy::primitives::U256::from(value)
+                                                    .to_be_bytes::<32>()
+                                                    .to_vec()
+                                            })
+                                            .unwrap_or_default()
+                                            .into(),
+                                    }
+                                })
+                                .collect();
+                            serde_json::json!(format!(
+                                "0x{}",
+                                hex::encode(aggregate3Call::abi_encode_returns(&results))
+                            ))
+                        }
+                        "eth_call" if token.is_some_and(|(_, held, _)| held.is_none()) => {
+                            let body = serde_json::json!({"jsonrpc":"2.0","id":request["id"],
+                                "error":{"code":3,"message":"execution reverted"}})
+                            .to_string();
+                            let _ = socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+                            return;
+                        }
+                        "eth_call" => {
+                            serde_json::json!(word(
+                                token.and_then(|(_, held, _)| *held).unwrap_or(0)
+                            ))
+                        }
+                        method => panic!("unexpected holdings RPC {method}"),
+                    };
+                    let body =
+                        serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result})
+                            .to_string();
+                    let _ = socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+                });
+            }
+        });
+        (endpoint, served)
+    }
+
+    /// `<n>/holdings.json` reads every chain the account lists: zero
+    /// balances are left out, known tokens are included, and a chain that
+    /// cannot be reached is recorded under `errors` instead of failing the
+    /// whole read.
+    #[tokio::test]
+    async fn holdings_list_nonzero_balances_and_record_unreachable_chains() {
+        let f = make_handler();
+        let chain = |name: &str, chain_id: u64, url: String| {
+            bloom_evm::ChainClient::new(bloom_proto::ChainSpec {
+                name: name.into(),
+                chain_id,
+                rpc_urls: vec![url],
+                rpc_endpoints: Vec::new(),
+                etherscan_api_url: None,
+                display_name: None,
+                native_symbol: "ETH".into(),
+                native_decimals: 18,
+                legacy_tx: false,
+                op_stack: false,
+            })
+            .unwrap()
+        };
+        let (ethereum, served) = spawn_usdc_only_evm_node().await;
+        f.handler.chains.add(chain("ethereum", 1, ethereum));
+        f.handler
+            .chains
+            .add(chain("arc", 5042002, "http://127.0.0.1:1".into()));
+        let accounts = vec![
+            derived_account(
+                bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+                "m/44'/60'/0'/0/0",
+                0xaa,
+                &format!("{:#x}", f.wallet_addr),
+            ),
+            derived_account(
+                bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                "m/44'/501'/0'/0'",
+                0xbb,
+                &bs58::encode([0xbb_u8; 32]).into_string(),
+            ),
+        ];
+        let handler = f
+            .handler
+            .clone()
+            .with_projection_reader(bip39_projection(f.wallet_addr, accounts))
+            .with_solana_reads(solana_read_registry(spawn_solana_node().await));
+        let w = &f.wallet_name;
+
+        // Listing the account and looking the file up (what `ls -l` asks
+        // the handler for) read no chain.
+        let listed = handler.list(&vfs(format!("/{w}/0"))).await.unwrap();
+        assert!(listed.iter().any(|entry| entry.name == "holdings.json"));
+        handler
+            .lookup(&vfs(format!("/{w}/0/holdings.json")))
+            .await
+            .unwrap();
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let body = handler
+            .read(&vfs(format!("/{w}/0/holdings.json")))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let held: Vec<(&str, &str, &str)> = v["holdings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| {
+                (
+                    h["chain"].as_str().unwrap(),
+                    h["symbol"].as_str().unwrap(),
+                    h["display"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            held,
+            [
+                ("ethereum", "USDC", "2.5 USDC"),
+                ("solana-devnet", "SOL", "1.5 SOL"),
+            ],
+            "zero ETH and zero tokens must be omitted: {v}"
+        );
+        // The unreachable chain names its unread native asset; the failed DAI
+        // read keeps the rest of ethereum's holdings.
+        let errors = v["errors"].as_object().unwrap();
+        assert_eq!(
+            errors.keys().collect::<Vec<_>>(),
+            ["arc", "ethereum"],
+            "{v}"
+        );
+        assert_eq!(errors["arc"], "could not read ETH", "{v}");
+        assert_eq!(errors["ethereum"], "could not read DAI", "{v}");
+    }
+
+    fn holdings_chain(name: &str, chain_id: u64, url: String) -> bloom_evm::ChainClient {
+        bloom_evm::ChainClient::new(bloom_proto::ChainSpec {
+            name: name.into(),
+            chain_id,
+            rpc_urls: vec![url],
+            rpc_endpoints: Vec::new(),
+            etherscan_api_url: None,
+            display_name: None,
+            native_symbol: "ETH".into(),
+            native_decimals: 18,
+            legacy_tx: false,
+            op_stack: false,
+        })
+        .unwrap()
+    }
+
+    async fn read_holdings(f: &Fixture) -> serde_json::Value {
+        let handler = f.handler.clone().with_projection_reader(bip39_projection(
+            f.wallet_addr,
+            vec![derived_account(
+                bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+                "m/44'/60'/0'/0/0",
+                0xaa,
+                &format!("{:#x}", f.wallet_addr),
+            )],
+        ));
+        let body = handler
+            .read(&vfs(format!("/{}/0/holdings.json", f.wallet_name)))
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// The token reads hold at most `HOLDINGS_CONCURRENCY` calls in flight
+    /// and stop at the chain deadline: rows read by then are kept and the
+    /// rest are named, rather than the whole chain being dropped.
+    #[tokio::test]
+    async fn slow_holdings_keep_completed_rows_and_name_the_rest() {
+        let f = make_handler();
+        // 2 s per read: native at 2 s, four tokens at 4 s, the rest past 5 s.
+        let (url, _) =
+            spawn_holdings_node(1, 1, |_| Some(1), std::time::Duration::from_secs(2)).await;
+        f.handler.chains.add(holdings_chain("ethereum", 1, url));
+        let tokens = accounts::holdings_tokens(1);
+        assert!(tokens.len() > 4, "{} tokens", tokens.len());
+        let v = read_holdings(&f).await;
+        let symbols: Vec<&str> = v["holdings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["symbol"].as_str().unwrap())
+            .collect();
+        let read: Vec<&str> = tokens[..4].iter().map(|(_, s, _)| s.as_str()).collect();
+        assert_eq!(symbols, [&["ETH"][..], &read].concat(), "{v}");
+        let unread: Vec<&str> = tokens[4..].iter().map(|(_, s, _)| s.as_str()).collect();
+        assert_eq!(
+            v["errors"]["ethereum"],
+            format!("timed out; could not read {}", unread.join(", ")),
+            "{v}"
+        );
+    }
+
+    /// A slow first token must not hide later tokens that finished in time.
+    #[tokio::test]
+    async fn a_slow_token_does_not_hide_later_completed_tokens() {
+        let f = make_handler();
+        let tokens = accounts::holdings_tokens(1);
+        let slow = tokens[0].1.clone();
+        let delay = Arc::new(move |symbol: Option<&str>| {
+            if symbol == Some(slow.as_str()) {
+                std::time::Duration::from_secs(30)
+            } else {
+                std::time::Duration::ZERO
+            }
+        });
+        let (url, _) = spawn_holdings_node_with(1, 1, |_| Some(1), delay, false).await;
+        f.handler.chains.add(holdings_chain("ethereum", 1, url));
+        let v = read_holdings(&f).await;
+        let symbols: Vec<&str> = v["holdings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["symbol"].as_str().unwrap())
+            .collect();
+        let rest: Vec<&str> = tokens[1..].iter().map(|(_, s, _)| s.as_str()).collect();
+        assert_eq!(symbols, [&["ETH"][..], &rest].concat(), "{v}");
+        assert_eq!(
+            v["errors"]["ethereum"],
+            format!("timed out; could not read {}", tokens[0].1),
+            "{v}"
+        );
+    }
+
+    /// With Multicall3, a chain costs one native read and one token batch,
+    /// not one request per token, and a failed token in the batch is named.
+    #[tokio::test]
+    async fn holdings_read_tokens_in_one_multicall_request() {
+        let f = make_handler();
+        let tokens = accounts::holdings_tokens(1);
+        assert!(tokens.iter().any(|(_, s, _)| s == "USDC"), "{tokens:?}");
+        let (url, served) = spawn_holdings_node_with(
+            1,
+            1,
+            |symbol| (symbol != "USDC").then_some(1),
+            Arc::new(|_| std::time::Duration::ZERO),
+            true,
+        )
+        .await;
+        f.handler.chains.add(holdings_chain("ethereum", 1, url));
+        let before = served.load(std::sync::atomic::Ordering::SeqCst);
+        let v = read_holdings(&f).await;
+        let symbols: Vec<&str> = v["holdings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["symbol"].as_str().unwrap())
+            .collect();
+        let rest: Vec<&str> = tokens
+            .iter()
+            .map(|(_, s, _)| s.as_str())
+            .filter(|s| *s != "USDC")
+            .collect();
+        assert_eq!(symbols, [&["ETH"][..], &rest].concat(), "{v}");
+        assert_eq!(v["errors"]["ethereum"], "could not read USDC", "{v}");
+        // eth_chainId, eth_getBalance and one aggregate3.
+        let requests = served.load(std::sync::atomic::Ordering::SeqCst) - before;
+        assert!(requests <= 3, "{requests} requests");
+    }
+
+    /// Tempo has no native token: holdings skip the native read rather than
+    /// failing the chain, and still list its token balances.
+    #[tokio::test]
+    async fn tempo_holdings_list_tokens_without_a_native_row() {
+        let tempo = bloom_proto::chain::TEMPO_MAINNET_CHAIN_ID;
+        let tokens = accounts::holdings_tokens(tempo);
+        assert!(
+            tokens.iter().any(|(_, symbol, _)| symbol == "pathUSD"),
+            "{tokens:?}"
+        );
+        let f = make_handler();
+        // eth_getBalance would answer a nonzero placeholder if it were read.
+        let (url, _) =
+            spawn_holdings_node(tempo, u64::MAX, |_| Some(3_000_000), Default::default()).await;
+        f.handler.chains.add(holdings_chain("tempo", tempo, url));
+        let v = read_holdings(&f).await;
+        let symbols: Vec<&str> = v["holdings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["symbol"].as_str().unwrap())
+            .collect();
+        let expected: Vec<&str> = tokens.iter().map(|(_, s, _)| s.as_str()).collect();
+        assert_eq!(symbols, expected, "{v}");
+        assert!(v["errors"].as_object().unwrap().is_empty(), "{v}");
+    }
+
+    /// A chain with nothing Bloom knows to read reports that instead of
+    /// looking checked and empty.
+    #[tokio::test]
+    async fn holdings_name_a_chain_with_nothing_to_read() {
+        let testnet = bloom_proto::chain::TEMPO_MODERATO_CHAIN_ID;
+        assert!(accounts::holdings_tokens(testnet).is_empty());
+        let f = make_handler();
+        let (url, _) = spawn_holdings_node(testnet, u64::MAX, |_| None, Default::default()).await;
+        f.handler
+            .chains
+            .add(holdings_chain("tempo-testnet", testnet, url));
+        let v = read_holdings(&f).await;
+        assert!(v["holdings"].as_array().unwrap().is_empty(), "{v}");
+        assert!(
+            v["errors"]["tempo-testnet"]
+                .as_str()
+                .unwrap()
+                .contains("no balances checked"),
+            "{v}"
         );
     }
 

@@ -331,12 +331,12 @@ fn seed_wallet_projection_fixture(home: &Path, name: &str) {
         derivation: None,
     };
     let canonical_policy = serde_jcs::to_vec(&CanonicalWalletPolicy {
+        clear_signing: None,
         wallet_id: wallet_id.clone(),
         maximum_approval_lifetime_ms: 300_000,
         allowed_petal_packages: Vec::new(),
         allowed_destinations: Vec::new(),
         required_verifiers: Vec::new(),
-        clear_signing: None,
     })
     .expect("canonicalize fixture policy");
     let policy_digest = Digest32::from_bytes(Sha256::digest(&canonical_policy).into());
@@ -952,6 +952,304 @@ fn init_ignores_legacy_preinstalled_opt_out() {
         .stderr(predicate::str::contains(
             "provision canonical pre-installed Petals",
         ));
+}
+
+/// Setup is recorded when it finishes, not inferred from the config file:
+/// `bloom serve` writes a default config before any `bloom init`, and an
+/// empty `[setup.petals]` is a valid choice rather than "never asked".
+#[test]
+fn init_runs_setup_once_even_when_the_config_already_exists() {
+    let home = fresh_home();
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    home_dir.ensure().unwrap();
+    // What `bloom serve` leaves behind when it starts before any `bloom init`.
+    bloom_proto::Config::local_default()
+        .save(&home_dir.config_path())
+        .unwrap();
+    let init = |home: &Path| {
+        bloom_cmd(home)
+            .env("HTTPS_PROXY", "http://127.0.0.1:1")
+            .env("https_proxy", "http://127.0.0.1:1")
+            .env("NO_PROXY", "")
+            .env("no_proxy", "")
+            .arg("init")
+            .assert()
+            // Setup is saved before Petal provisioning, which is offline here.
+            .failure()
+            .stderr(predicate::str::contains(
+                "provision canonical pre-installed Petals",
+            ));
+    };
+
+    init(home.path());
+    let mut config = bloom_proto::Config::load(&home_dir.config_path()).unwrap();
+    assert!(config.setup.complete);
+    assert!(
+        config.setup.main().petals.contains_key("hyperliquid"),
+        "non-interactive setup records the catalog's suggestions: {:?}",
+        config.setup.main().petals
+    );
+
+    // The owner's choice was "none of them"; a later run must keep it.
+    config.setup.main_mut().petals.clear();
+    config.save(&home_dir.config_path()).unwrap();
+    init(home.path());
+    let config = bloom_proto::Config::load(&home_dir.config_path()).unwrap();
+    assert!(config.setup.complete);
+    assert!(
+        config.setup.main().petals.is_empty(),
+        "{:?}",
+        config.setup.main().petals
+    );
+}
+
+/// `bloom init` records main's persona before the Petal setup it suggests
+/// values for. Without a terminal, first setup records Institutional, and
+/// `--persona` chooses one. On a home whose setup already ran it changes
+/// nothing: a switch is a fresh start that `bloom wallet persona` makes.
+#[test]
+fn init_records_the_chosen_persona_before_petal_setup() {
+    use bloom_proto::persona::PersonaPreset;
+
+    let init = |home: &Path, persona: Option<&str>| {
+        let mut command = bloom_cmd(home);
+        command
+            .env("HTTPS_PROXY", "http://127.0.0.1:1")
+            .env("https_proxy", "http://127.0.0.1:1")
+            .env("NO_PROXY", "")
+            .env("no_proxy", "")
+            .arg("init");
+        if let Some(persona) = persona {
+            command.args(["--persona", persona]);
+        }
+        let output = command
+            .assert()
+            // Choices are saved before Petal provisioning, which is offline here.
+            .failure()
+            .stderr(predicate::str::contains(
+                "provision canonical pre-installed Petals",
+            ))
+            .get_output()
+            .stdout
+            .clone();
+        (
+            bloom_proto::Config::load(&bloom_proto::HomeDir::at(home).config_path()).unwrap(),
+            String::from_utf8(output).unwrap(),
+        )
+    };
+    let polymarket_limit = |config: &bloom_proto::Config| {
+        config.setup.main().petals["polymarket"].values["max_daily_usd"].clone()
+    };
+
+    let degen_home = fresh_home();
+    let (degen, stdout) = init(degen_home.path(), Some("degen"));
+    assert_eq!(
+        degen.setup.main().persona.as_ref().unwrap().preset,
+        PersonaPreset::Degen
+    );
+    assert_eq!(polymarket_limit(&degen), "10000");
+    assert!(!stdout.contains("persona_note:"), "first setup: {stdout}");
+
+    let home = fresh_home();
+    let (first, _) = init(home.path(), None);
+    assert_eq!(
+        first.setup.main().persona.as_ref().unwrap().preset,
+        PersonaPreset::Custodian
+    );
+    assert_eq!(polymarket_limit(&first), "100");
+    let (later, stdout) = init(home.path(), Some("trader"));
+    assert_eq!(
+        later.setup.wallets, first.setup.wallets,
+        "a later --persona changes nothing"
+    );
+    assert!(
+        stdout.contains("persona_note: setup already ran, so nothing changed")
+            && stdout.contains("run `bloom wallet persona main trader` while Bloom is running"),
+        "{stdout}"
+    );
+}
+
+/// A home set up before personas keeps having none until the owner chooses
+/// one, and a saved persona that is no longer usable is set aside rather
+/// than stopping every command; `bloom init --persona` then names the switch.
+#[test]
+fn init_leaves_a_legacy_home_alone_and_sets_an_unusable_persona_aside() {
+    use bloom_proto::persona::PersonaPreset;
+
+    let home = fresh_home();
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    home_dir.ensure().unwrap();
+    let mut legacy = bloom_proto::Config::local_default();
+    legacy.setup.complete = true;
+    legacy.save(&home_dir.config_path()).unwrap();
+    let init = |persona: Option<&str>| {
+        let mut command = bloom_cmd(home.path());
+        command
+            .env("HTTPS_PROXY", "http://127.0.0.1:1")
+            .env("https_proxy", "http://127.0.0.1:1")
+            .env("NO_PROXY", "")
+            .env("no_proxy", "")
+            .arg("init");
+        if let Some(persona) = persona {
+            command.args(["--persona", persona]);
+        }
+        command.assert().failure().stderr(predicate::str::contains(
+            "provision canonical pre-installed Petals",
+        ));
+        bloom_proto::Config::load(&home_dir.config_path()).unwrap()
+    };
+
+    assert_eq!(
+        init(None).setup.main().persona,
+        None,
+        "a legacy home keeps no persona"
+    );
+
+    // A hand-edited persona that no longer validates.
+    let mut degen = legacy.clone();
+    degen.setup.main_mut().persona = Some(bloom_proto::persona::PersonaConfig::suggested(
+        PersonaPreset::Degen,
+    ));
+    let edited = toml::to_string(&degen)
+        .unwrap()
+        .replace("window_secs = 604800", "window_secs = 3600");
+    std::fs::write(home_dir.config_path(), edited).unwrap();
+    assert_eq!(init(Some("trader")).setup.main().persona, None);
+}
+
+/// Setup queues the chosen settings before provisioning. Here provisioning
+/// fails, as a run that stops part-way would, so nothing is installed or
+/// written, and Polymarket's settings must stay queued for when `main`'s
+/// account exists rather than depend on a later step remembering them.
+#[test]
+fn an_interrupted_init_still_queues_the_chosen_petal_settings() {
+    let home = fresh_home();
+    bloom_cmd(home.path())
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("https_proxy", "http://127.0.0.1:1")
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .arg("init")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "provision canonical pre-installed Petals",
+        ));
+
+    let pending = home.path().join("pending-petal-settings");
+    assert!(
+        pending.join("polymarket").exists(),
+        "Polymarket's setup settings must stay queued after an interrupted init"
+    );
+    // Only Petals with setup settings are queued.
+    assert!(!pending.join("hyperliquid").exists());
+}
+
+/// A home that recorded choices before `setup.complete` existed (an earlier
+/// build of this setup) keeps them when `bloom init` runs setup again: a
+/// declined Petal stays declined and a custom value stays.
+#[test]
+fn init_setup_on_an_existing_config_keeps_earlier_choices() {
+    let home = fresh_home();
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    home_dir.ensure().unwrap();
+    let mut config = bloom_proto::Config::local_default();
+    config.setup.main_mut().petals.insert(
+        "polymarket".into(),
+        bloom_proto::config::PetalSetupConfig {
+            values: std::collections::BTreeMap::from([("max_daily_usd".into(), "42.5".into())]),
+        },
+    );
+    assert!(!config.setup.complete);
+    config.save(&home_dir.config_path()).unwrap();
+
+    bloom_cmd(home.path())
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("https_proxy", "http://127.0.0.1:1")
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .arg("init")
+        .assert()
+        // Setup is saved before Petal provisioning, which is offline here.
+        .failure()
+        .stderr(predicate::str::contains(
+            "provision canonical pre-installed Petals",
+        ));
+
+    let config = bloom_proto::Config::load(&home_dir.config_path()).unwrap();
+    assert!(config.setup.complete);
+    assert_eq!(
+        config.setup.main().petals.keys().collect::<Vec<_>>(),
+        ["polymarket"],
+        "declined Petals were added back: {:?}",
+        config.setup.main().petals
+    );
+    assert_eq!(
+        config.setup.main().petals["polymarket"].values["max_daily_usd"],
+        "42.5"
+    );
+}
+
+/// A home whose setup an earlier build saved under `[petals]`, where a Bloom
+/// release refuses unknown keys, has them moved to `[setup]` by the next
+/// `bloom init`, even though setup itself does not run again.
+#[test]
+fn init_moves_setup_choices_out_of_the_petals_table() {
+    let home = fresh_home();
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    home_dir.ensure().unwrap();
+    // The layout an earlier build wrote: setup's choices under `[petals]`.
+    let mut legacy = toml::Value::try_from(bloom_proto::Config::local_default()).unwrap();
+    let petals = legacy["petals"].as_table_mut().unwrap();
+    petals.insert("setup_complete".into(), true.into());
+    petals.insert(
+        "setup".into(),
+        toml::Value::try_from(std::collections::BTreeMap::from([(
+            "polymarket",
+            bloom_proto::config::PetalSetupConfig {
+                values: std::collections::BTreeMap::from([("max_daily_usd".into(), "42.5".into())]),
+            },
+        )]))
+        .unwrap(),
+    );
+    let legacy = toml::to_string_pretty(&legacy).unwrap();
+    assert!(
+        legacy.contains("[petals.setup.polymarket.values]"),
+        "{legacy}"
+    );
+    std::fs::write(home_dir.config_path(), &legacy).unwrap();
+
+    bloom_cmd(home.path())
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("https_proxy", "http://127.0.0.1:1")
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .arg("init")
+        .assert()
+        // The move is saved before Petal provisioning, which is offline here.
+        .failure()
+        .stderr(predicate::str::contains(
+            "provision canonical pre-installed Petals",
+        ));
+
+    let saved = std::fs::read_to_string(home_dir.config_path()).unwrap();
+    let document: toml::Value = toml::from_str(&saved).unwrap();
+    assert_eq!(
+        document["petals"]
+            .as_table()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        ["runtime"],
+        "{saved}"
+    );
+    let config = bloom_proto::Config::load(&home_dir.config_path()).unwrap();
+    assert!(config.setup.complete);
+    assert_eq!(
+        config.setup.main().petals["polymarket"].values["max_daily_usd"],
+        "42.5"
+    );
+    assert!(!config.holds_legacy_setup_keys());
 }
 
 #[test]
@@ -2077,6 +2375,22 @@ fn wallet_import_rejects_path_names_before_broker_contact() {
 }
 
 #[test]
+fn wallet_import_rejects_wallets_control_names_before_broker_contact() {
+    let home = fresh_home();
+    let _daemon = RunningBloom::start(home.path());
+    for name in ["new", "registrations", "recover", "recoveries"] {
+        bloom_cmd(home.path())
+            .args(["wallet", "import", name])
+            .assert()
+            .failure()
+            .stderr(
+                predicate::str::contains("reserved for a /wallets control entry")
+                    .and(predicate::str::contains("ipc machine.execute").not()),
+            );
+    }
+}
+
+#[test]
 fn request_cli_dry_run_uses_vfs_lifecycle_and_body_receipt_helpers() {
     let home = fresh_home();
     seed_wallet_projection_fixture(home.path(), "alice");
@@ -2933,7 +3247,7 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         return;
     }
     // Exercise source installation of the current pinned Polymarket release.
-    let petal_ref = "74f1f928313916b332d9059f2e4363eac8f147af";
+    let petal_ref = "1141037cc840127c48c06f1f4e39da78225ff188";
     let home = fresh_home();
     let home_dir = bloom_proto::HomeDir::at(home.path());
     let config = bloom_proto::Config::local_default();
@@ -2962,8 +3276,8 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         )))
         .stdout(predicate::str::contains("Building source package..."))
         .stdout(predicate::str::contains("Validating Petal package..."))
-        .stdout(predicate::str::contains("\"routes\": 109"))
-        .stdout(predicate::str::contains("routes: 109"));
+        .stdout(predicate::str::contains("\"routes\": 110"))
+        .stdout(predicate::str::contains("routes: 110"));
 
     bloom_cmd(home.path())
         .args(["petals", "ls"])

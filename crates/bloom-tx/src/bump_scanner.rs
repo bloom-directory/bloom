@@ -405,7 +405,6 @@ mod tests {
             expires_ms: 0,
             status,
             action_kind: bloom_proto::TxActionKind::Unknown,
-            review_mode: None,
             tx_hash: Some(hash.into()),
             token: None,
             nft: None,

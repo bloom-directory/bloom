@@ -57,7 +57,8 @@ pub struct PaidHttpSigningFacts {
 pub trait PaidHttpHostSigner: Send + Sync {
     /// Sign an exact payload-bearing request. `signing_hash` must equal the
     /// selected suite's hash of `preimage`; the authority service verifies
-    /// that binding before approval or signing.
+    /// that binding before approval or signing. `review_envelope` is the
+    /// message Broker decodes for the owner, when the protocol has one.
     async fn sign_paid_http_payload(
         &self,
         intent: &str,
@@ -65,6 +66,7 @@ pub trait PaidHttpHostSigner: Send + Sync {
         preimage: &[u8],
         signing_hash: [u8; 32],
         facts: &PaidHttpSigningFacts,
+        review_envelope: Option<&[u8]>,
     ) -> Result<[u8; 65], String>;
 
     /// Sign `signing_hash` under the live paid-HTTP grant for `intent`

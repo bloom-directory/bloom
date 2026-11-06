@@ -16,12 +16,13 @@ pub mod config;
 pub mod defi_policy;
 pub mod home;
 pub mod intent;
+pub mod persona;
+pub mod petal_destinations;
 pub mod petal_identity;
 pub mod plan;
 pub mod policy;
 pub mod polymarket_policy;
 pub mod serde_micro;
-pub mod tokens;
 pub mod units;
 pub mod valuation;
 
