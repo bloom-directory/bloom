@@ -102,7 +102,8 @@ impl Store {
         // card was released. Restarting cannot turn that into proof of no charge.
         conn.execute("UPDATE operations SET state='uncertain',status=json_set(status,'$.state','uncertain','$.ceremony_url',NULL) WHERE state IN ('submitted','needs_input','not_submitted','manual_required','human_control')",[])?;
         conn.execute("UPDATE operations SET state='disclosure_unknown',status=json_set(status,'$.state','disclosure_unknown','$.ceremony_url',NULL) WHERE state IN ('release_started','filled','partially_filled')",[])?;
-        conn.execute("UPDATE operations SET state='failed_before_release',status=json_set(status,'$.state','failed_before_release','$.ceremony_url',NULL) WHERE state IN ('requested','preparing','awaiting_approval')",[])?;
+        conn.execute("UPDATE operations SET state='failed_before_release',status=json_set(status,'$.state','failed_before_release','$.ceremony_url',NULL) WHERE state='requested'",[])?;
+        conn.execute("UPDATE operations SET state='restart_cancelling',status=json_set(status,'$.state','restart_cancelling','$.ceremony_url',NULL) WHERE state IN ('preparing','awaiting_approval')",[])?;
         // This process owns a fresh browser; no earlier private view can pause it.
         conn.execute("UPDATE operations SET status=json_set(status,'$.paused',json('false')) WHERE json_extract(status,'$.paused')=1",[])?;
         // The unlocked values lived in memory. After a restart they are gone.
@@ -126,6 +127,18 @@ impl Store {
                 row.get(0)
             })
             .context("Unknown checkout request")
+    }
+    fn restart_cancellations(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.0.lock();
+        let mut query =
+            conn.prepare("SELECT id,kind FROM operations WHERE state='restart_cancelling'")?;
+        let rows = query.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn finish_restart_cancellation(&self, id: &str, state: &str) -> Result<()> {
+        self.0.lock().execute("UPDATE operations SET state=?2,status=json_set(status,'$.state',?2,'$.ceremony_url',NULL) WHERE id=?1 AND state='restart_cancelling'", params![id, state])?;
+        Ok(())
     }
     fn finish_traveler(&self, id: &str, state: &str) -> Result<()> {
         self.0.lock().execute("UPDATE operations SET state=?2,status=json_set(status,'$.state',?2,'$.ceremony_url',NULL) WHERE id=?1 AND kind='traveler' AND state!='cancelled'",params![id,state])?;
@@ -164,7 +177,7 @@ impl Store {
         let conn = self.0.lock();
         match conn.query_row(
             "SELECT id FROM operations WHERE shop=?1 AND kind IN ('card','site') AND state IN \
-             ('submitted','needs_input','uncertain','declined','disclosure_unknown','partially_filled','filled','release_started') \
+             ('submitted','needs_input','uncertain','declined','disclosure_unknown','partially_filled','filled','release_started','restart_cancelling') \
              LIMIT 1",
             [shop],
             |row| row.get(0),
@@ -971,6 +984,63 @@ impl CheckoutService {
             broker_uid,
             view_port,
         }))
+    }
+
+    /// Revoke approvals left behind by an interrupted Checkout process.
+    pub async fn reconcile_restarted(self: Arc<Self>) {
+        loop {
+            let pending = match self.store.restart_cancellations() {
+                Ok(pending) if pending.is_empty() => return,
+                Ok(pending) => pending,
+                Err(error) => {
+                    eprintln!(
+                        "cannot inspect interrupted checkout approvals: {}",
+                        loggable(&error)
+                    );
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+            for (id, kind) in pending {
+                let cancel = self
+                    .intake(json!({"method":"cancel","operation_id":id}))
+                    .await;
+                let status = match cancel {
+                    Ok(IntakeResponse::Result { status, .. }) => Some(status),
+                    _ => match self
+                        .intake(json!({"method":"result","operation_id":id}))
+                        .await
+                    {
+                        Ok(IntakeResponse::Result { status, .. }) => Some(status),
+                        _ => None,
+                    },
+                };
+                let state = match status.map(|status| status.state) {
+                    Some(CardOperationState::Succeeded) if kind == "card" => {
+                        Some("disclosure_unknown")
+                    }
+                    Some(CardOperationState::Succeeded) if kind == "traveler" => Some("expired"),
+                    Some(
+                        CardOperationState::Succeeded
+                        | CardOperationState::Cancelled
+                        | CardOperationState::Expired
+                        | CardOperationState::Failed,
+                    ) => Some("failed_before_release"),
+                    // A missing operation may still be in flight at Broker.
+                    // Keep checking until its outcome can be established.
+                    _ => None,
+                };
+                if let Some(state) = state {
+                    if let Err(error) = self.store.finish_restart_cancellation(&id, state) {
+                        eprintln!(
+                            "cannot record interrupted checkout reconciliation: {}",
+                            loggable(&error)
+                        );
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
     }
 
     async fn intake(&self, request: Value) -> Result<IntakeResponse> {
@@ -3450,6 +3520,95 @@ mod tests {
             "manual_required"
         );
         assert!(service.private.lock().await.is_some());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn restart_cancels_abandoned_approvals_and_preserves_unknown_results() {
+        let (_, browser, _, server) = shopping_service("<h1>Shop</h1>").await;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        let socket = directory.path().join("broker.sock");
+        let ids = ["a".repeat(64), "b".repeat(64), "c".repeat(64)];
+        let store = Store::open(&path).unwrap();
+        for id in &ids {
+            store
+                .insert(
+                    &Status {
+                        operation_id: id.clone(),
+                        state: "awaiting_approval".into(),
+                        ceremony_url: Some("http://localhost/old".into()),
+                        filled_fields: vec![],
+                        outcome: None,
+                        paused: false,
+                        reason: None,
+                        view_url: None,
+                    },
+                    "card",
+                    "Fixture",
+                )
+                .unwrap();
+        }
+        drop(store);
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let peer = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader).read_line(&mut line).await.unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let id = request["operation_id"].as_str().unwrap();
+                let state = if id.starts_with('a') {
+                    "cancelled"
+                } else if id.starts_with('b') {
+                    "succeeded"
+                } else {
+                    "missing"
+                };
+                let response = if id.starts_with('b') && request["method"] == "cancel" {
+                    json!({"kind":"error","message":"already completed"})
+                } else {
+                    json!({"kind":"result","status":{"operation_id":id,"state":state},"receipt":null,"output_aad":null})
+                };
+                writer
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let service =
+            CheckoutService::new(browser, &path, socket, unsafe { libc::geteuid() }, 47999)
+                .unwrap();
+        for id in &ids {
+            let status = service.store.get(id).unwrap();
+            assert_eq!(status.state, "restart_cancelling");
+            assert!(status.ceremony_url.is_none());
+        }
+        let recovery = tokio::spawn(service.clone().reconcile_restarted());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while service.store.get(&ids[0]).unwrap().state == "restart_cancelling"
+                || service.store.get(&ids[1]).unwrap().state == "restart_cancelling"
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            service.store.get(&ids[0]).unwrap().state,
+            "failed_before_release"
+        );
+        assert_eq!(
+            service.store.get(&ids[1]).unwrap().state,
+            "disclosure_unknown"
+        );
+        assert_eq!(
+            service.store.get(&ids[2]).unwrap().state,
+            "restart_cancelling"
+        );
+        recovery.abort();
+        peer.abort();
         server.abort();
     }
 

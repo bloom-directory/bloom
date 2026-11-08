@@ -124,6 +124,7 @@ bank charge.
 | --- | --- |
 | `booked`, `paid` | Merchant reported success. `outcome.order_id` is the code shown; for flights it is not proof of a ticket. |
 | `requested`, `preparing`, `awaiting_approval`, `release_started` | The request is in progress. Read status; do not submit another payment. |
+| `restart_cancelling` | Checkout restarted and is reconciling the old approval with Broker. Wait for a definite result; do not request another payment. |
 | `declined` | A merchant page reported a decline. Have the person check before another checkout. |
 | `filled`, `submitted` | Payment details were filled or a submission was attempted; neither proves payment. The shop remains blocked until the result is checked. |
 | `needs_input` | The page wants more input; payment may already be submitted. The person finishes in the private view. Optional wallet signup can add fields: complete or decline it there. |

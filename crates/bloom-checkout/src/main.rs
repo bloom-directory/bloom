@@ -64,6 +64,7 @@ async fn main() -> Result<()> {
         args.broker_uid,
         args.view_port,
     )?;
+    tokio::spawn(service.clone().reconcile_restarted());
     let view_listener =
         tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, args.view_port)).await?;
     let api = serve_api(service.clone(), &args.socket, args.machine_uid);
