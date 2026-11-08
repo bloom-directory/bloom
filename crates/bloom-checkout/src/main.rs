@@ -48,6 +48,8 @@ async fn main() -> Result<()> {
     let lifecycle_socket = args.broker_socket.clone();
     let lifecycle_uid = args.broker_uid;
     let follow_broker = args.follow_broker_lifecycle;
+    CheckoutService::reconcile_before_browser(&args.state, &args.broker_socket, args.broker_uid)
+        .await?;
     #[cfg(feature = "triad-dev-harness")]
     let flags = if args.fixture_allow_insecure_tls {
         vec!["--ignore-certificate-errors".into()]
@@ -64,7 +66,6 @@ async fn main() -> Result<()> {
         args.broker_uid,
         args.view_port,
     )?;
-    tokio::spawn(service.clone().reconcile_restarted());
     let view_listener =
         tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, args.view_port)).await?;
     let api = serve_api(service.clone(), &args.socket, args.machine_uid);
