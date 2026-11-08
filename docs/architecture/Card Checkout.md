@@ -155,7 +155,7 @@ inside the VFS.
 
 ## Private view
 
-The private view is an HTTP page on `localhost` served by `bloom-checkout`,
+The private view is an HTTP page on `127.0.0.1` served by `bloom-checkout`,
 opened from the approval page with a one-use capability, exchanged for a
 separate random session secret kept in the human browser's origin-scoped
 localStorage. Requests send that key explicitly in an Authorization header.

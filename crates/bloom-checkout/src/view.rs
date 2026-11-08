@@ -28,7 +28,7 @@ fn check_origin(
     service: &CheckoutService,
     mutation: bool,
 ) -> Result<(), StatusCode> {
-    let host = format!("localhost:{}", service.view_port);
+    let host = format!("127.0.0.1:{}", service.view_port);
     if headers.get(header::HOST).and_then(|v| v.to_str().ok()) != Some(host.as_str()) {
         return Err(StatusCode::FORBIDDEN);
     }

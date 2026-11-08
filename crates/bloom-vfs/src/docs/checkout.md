@@ -20,6 +20,18 @@ them only on Bloom's private ceremony page. Every ID you create below is a new
 - For each of these, read `<cards|travelers>/operations/<operation_id>/ceremony.json`
   and send the person its URL.
 
+If the card passkey is lost, existing saved cards and travelers cannot be
+recovered or replaced with a new passkey. An administrator can reset them:
+stop the login's Triad services and their activation sockets, then move
+`cards.sqlite3` and any `cards.sqlite3-journal` out of the Signer state
+directory before restarting the services. On Linux that directory is
+`/var/lib/bloom/<login-uid>/signer/`; on macOS it is
+`/private/var/db/bloom/<login-uid>/signer/`. This permanently discards all
+saved cards and travelers. It does not remove `signer.db` or wallet keys. Add
+the cards and travelers again with a new passkey. Keep the old encrypted files
+only if the person may recover the old passkey; never move them while Signer
+is running.
+
 ## Browse
 
 Write `checkout/browse/<slot>/in.json`, then read `out.json` (kept five
@@ -167,5 +179,5 @@ USD uses 100 per dollar, and KWD and IQD use 1,000 per unit.
 
 Search and seller choice are in `/petals/flights/README.md`. Agencies can add
 fees, handle changes and refunds themselves, and may email the e-ticket after
-the order: record the agency as the shop, and do not call an order number a
-paid ticket.
+the order. Tell the person which agency is selling the flight; checkout
+history records the page origin. Do not call an order number a paid ticket.

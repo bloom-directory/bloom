@@ -22,7 +22,7 @@ assert(binary && home && endpoint && ceremonyOrigin && viewOrigin && output,
 assert(endpoint.startsWith('unix:'));
 assert.equal(new URL(ceremonyOrigin).hostname, 'localhost');
 assert.notEqual(new URL(ceremonyOrigin).port, '18734', 'Leave installed custody alone');
-assert.equal(new URL(viewOrigin).hostname, 'localhost');
+assert.equal(new URL(viewOrigin).hostname, '127.0.0.1');
 const require = createRequire(resolve(process.env.BLOOM_CHECKOUT_PLAYWRIGHT_ROOT || '.', 'package.json'));
 const {chromium} = require('playwright-core');
 const id = () => randomBytes(32).toString('hex');

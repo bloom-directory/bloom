@@ -472,7 +472,7 @@ impl CheckoutService {
         self.store
             .record_order(&operation_id, Some(&origin), None, None)?;
         let recipient = Recipient::generate();
-        let challenge_url = format!("http://localhost:{}/unlocked", self.view_port);
+        let challenge_url = format!("http://127.0.0.1:{}/unlocked", self.view_port);
         let response = self
             .intake(
                 json!({"method":"traveler","operation_id":operation_id,"traveler_id":traveler_id,
@@ -1031,7 +1031,7 @@ impl CheckoutService {
                 if self.private.lock().await.as_ref().is_some_and(|checkout| {
                     checkout.operation_id == operation_id && checkout.approved
                 }) {
-                    status.view_url = Some(format!("http://localhost:{}/view", self.view_port));
+                    status.view_url = Some(format!("http://127.0.0.1:{}/view", self.view_port));
                 }
                 Ok(serde_json::to_value(status)?)
             }
@@ -1584,7 +1584,7 @@ fn claim_view_session(
 }
 
 fn challenge_url(view_port: u16, capability: &str) -> String {
-    format!("http://localhost:{view_port}/private?token={capability}")
+    format!("http://127.0.0.1:{view_port}/private?token={capability}")
 }
 
 impl CheckoutService {
@@ -4791,7 +4791,8 @@ mod tests {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap();
-        let base = format!("http://localhost:{port}");
+        let base = format!("http://127.0.0.1:{port}");
+        assert!(challenge_url(port, &token).starts_with(&format!("{base}/private?")));
         assert!(
             service
                 .private_claim(&hex_token(&[43; 32]), None)

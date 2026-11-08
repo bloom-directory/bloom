@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use parking_lot::Mutex;
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -373,19 +374,71 @@ impl Cdp {
     }
 
     pub async fn call(&self, session: Option<&str>, method: &str, params: Value) -> Result<Value> {
+        self.call_with_params(session, method, &params).await
+    }
+
+    pub async fn evaluate_in_world(
+        &self,
+        session: &str,
+        world: i64,
+        expression: &str,
+    ) -> Result<Value> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Params<'a> {
+            context_id: i64,
+            expression: &'a str,
+            return_by_value: bool,
+            await_promise: bool,
+        }
+        self.call_with_params(
+            Some(session),
+            "Runtime.evaluate",
+            &Params {
+                context_id: world,
+                expression,
+                return_by_value: true,
+                await_promise: true,
+            },
+        )
+        .await
+    }
+
+    async fn call_with_params<P: Serialize + Sync>(
+        &self,
+        session: Option<&str>,
+        method: &str,
+        params: &P,
+    ) -> Result<Value> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Message<'a, P> {
+            id: u64,
+            method: &'a str,
+            params: &'a P,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            session_id: Option<&'a str>,
+        }
         let id = self.sequence.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = oneshot::channel();
         self.replies.lock().insert(id, sender);
-        let mut message = json!({"id":id,"method":method,"params":params});
-        if let Some(session) = session {
-            message["sessionId"] = json!(session);
+        let message = Message {
+            id,
+            method,
+            params,
+            session_id: session,
+        };
+        let mut bytes = zeroize::Zeroizing::new(Vec::new());
+        if let Err(error) = serde_json::to_writer(&mut *bytes, &message) {
+            self.replies.lock().remove(&id);
+            return Err(error.into());
         }
-        let mut bytes = serde_json::to_vec(&message)?;
         bytes.push(0);
         if self.writer.lock().write_all(&bytes).is_err() {
             self.replies.lock().remove(&id);
             bail!("Checkout browser disconnected");
         }
+        drop(bytes);
         let response = tokio::time::timeout(Duration::from_secs(30), receiver).await;
         self.replies.lock().remove(&id);
         let value = response
