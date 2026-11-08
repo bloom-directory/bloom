@@ -2054,6 +2054,19 @@ pub(crate) mod tests {
         // A bare "$" renewal needs the page's region, exactly as the charge
         // total does, so each page states its language.
         for (lang, lines, expected) in [
+            (
+                "en-US",
+                &["Total USD 1.00", "then $12.99 per month after"][..],
+                Some((1299, "month", None)),
+            ),
+            (
+                "en-US",
+                &[
+                    "Total USD 1.00",
+                    "$99.99/mo. after 3-day free trial unless canceled.",
+                ][..],
+                Some((9999, "month", None)),
+            ),
             // A trial, its ongoing price and the day it starts.
             (
                 "en",
