@@ -6,8 +6,10 @@
 Prints a verdict per agent, then every trial in a collapsed table with the
 baseline's number in parentheses. A cell run more than once keeps its best
 attempt. Exits 1 when a smoke did not pass, an agent could not authenticate,
-an expected cell has no summary, or an agent that passed a task in the
-baseline no longer does. RUN_URL, when set, links the artifacts.
+an expected cell has no summary, an agent that passed a task in the
+baseline no longer does, or a task both passed takes more than SLOWER times
+the baseline's tool calls. ALLOW_SLOWER=true reports that last case without
+failing. RUN_URL, when set, links the artifacts.
 """
 
 import json
@@ -18,6 +20,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 AUTH = "auth is missing"
+SLOWER = 1.5
 
 
 def baseline(readme: Path) -> dict[tuple[str, str], dict]:
@@ -78,7 +81,7 @@ def main(argv: list[str]) -> int:
             s = json.loads(path.read_text())
             s["_root"] = Path(root).parent
             cells.setdefault((s["agent"], s["run_kind"] != "deterministic-smoke", s["task"]), []).append(s)
-    verdicts, failures, rows = {}, [], []
+    verdicts, failures, rows, slower = {}, [], [], []
     for agent in expected_agents:
         if (agent, False, "solana-transfer") not in cells:
             failures.append(f"{agent}: no smoke summary")
@@ -109,6 +112,10 @@ def main(argv: list[str]) -> int:
                 note = error
             elif ok:
                 note = "passed on retry" if len(attempts) > 1 else ""
+                b = base.get((task, agent), {})
+                if b.get("passed") and b["tool_calls"].isdigit() and (s.get("tool_calls") or 0) > SLOWER * int(b["tool_calls"]):
+                    note = f"SLOWER: {s['tool_calls']} tool calls, baseline {b['tool_calls']}. {note}".strip()
+                    slower.append(f"{task} with {agent} took {s['tool_calls']} tool calls, over {SLOWER}x the baseline's {b['tool_calls']}")
             elif error.startswith("no summary"):
                 note = "MISSING: " + error
             else:
@@ -138,6 +145,10 @@ def main(argv: list[str]) -> int:
             line += f" · config error: {v['config']}"
             failures.append(f"{agent} could not authenticate: {v['config']}")
         print(line)
+    if slower and os.environ.get("ALLOW_SLOWER") == "true":
+        print("\n**Slower than baseline, accepted by override:**\n" + "\n".join(f"- {x}" for x in slower))
+    else:
+        failures += slower
     if failures:
         print("\n**Failed:**\n" + "\n".join(f"- {f}" for f in dict.fromkeys(failures)))
     if os.environ.get("RUN_URL"):

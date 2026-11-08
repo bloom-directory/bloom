@@ -1,21 +1,7 @@
 # Bloom virtual filesystem
 
-This is the route reference for the mounted operator interface. Read the
-mount's `AGENTS.md` for action-selection and recovery rules, and
-[examples.md](./examples.md) for complete procedures. Contributor setup lives
-in the repository's `DEVELOPMENT.md`.
-
-Work from a scratch directory outside the mount and set its actual location:
-
-```sh
-BLOOM="<bloom-vfs-mount>"
-ls "$BLOOM"
-cat "$BLOOM/AGENTS.md"
-cat "$BLOOM/next.md"
-```
-
-Keep scratch files outside the mount. Discover configured wallets, chains, and
-Petals before choosing paths; their names and availability vary by installation.
+Route reference. Rules are in the mount's `AGENTS.md`; procedures are in
+[examples.md](./examples.md) and [wallets.md](./wallets.md).
 
 ## Top-level routes
 
@@ -47,12 +33,6 @@ under `petals/`.
 
 ## Reads
 
-Public projections and metadata do not authorize a transaction. Chain, balance,
-ENS, price, and status leaves can contact configured providers, consume quota,
-and disclose the queried public identifier. Petal reads follow the package's
-capabilities and network policy. Listing wallet accounts and reading their
-addresses do not call chain RPC; read balance leaves explicitly.
-
 Representative paths, relative to the mount:
 
 | Data | Path |
@@ -70,32 +50,15 @@ Representative paths, relative to the mount:
 | Solana account | `wallets/<wallet>/<n>/chains/<solana-chain>/{address,balance,balance.raw,balance.json}` |
 | Solana status | `status/chains/<chain>/{status.json,slot,block_height}` |
 
-Braces above abbreviate separate leaves, not action selectors. Match the
-intended Solana key's full fingerprint and derivation path in `accounts.json`
-to its `number`, then use that number as `<n>`. Address and balance leaves
-refer only to that account; never select by list position.
+Braces abbreviate separate leaves. Delegated sessions are under
+`wallets/<wallet>/<n>/sessions/`; Petal routes name the wallet and account,
+for example `petals/enso/intents/<wallet>/<n>/new`.
 
-Numbered accounts live at `wallets/<wallet>/<n>/`: read `account.json` to
-verify the keys, then use `chains/<chain>/outbox/` beneath that account to
-stage and inspect its transactions. Use the explicit `0` account path for the
-initial account.
-Address, QR, and public-key files exist only beneath a numbered account.
-Delegated sessions live beneath the numbered account at
-`sessions/<petal>/<key-slot>/`; installed Petals are mounted only at
-`petals/<petal>/`, with wallet/index pairs in each account-dependent route
-(for example `petals/enso/intents/<wallet>/<n>/new`). Public routes stay unscoped. See the mount `AGENTS.md` for account creation, session
-status, and revocation rules.
-
-## Writes and authority
-
-Every write is an operation: it may stage work, start a ceremony, consume
-reusable authority, or broadcast. Inspect the exact action before confirmation,
-and inspect the result before retrying. A timeout does not prove that a
-transaction was not submitted.
+## Writes
 
 | Operation | Route / procedure |
 |---|---|
-| Register wallet | `wallets/new`; [wallet creation](./examples.md#creating-a-wallet) |
+| Register wallet | `wallets/new`; [wallet creation](./examples.md#creating-a-wallet), [wallets.md](./wallets.md) |
 | Recover wallet | `wallets/recover`; [recovery](./examples.md#recovering-a-wallet) |
 | EVM transaction | `wallets/<wallet>/0/chains/<chain>/outbox/new.tx`; [Anvil workflow](./examples.md#local-anvil-transaction) |
 | Solana transaction | Same outbox shape with strict JSON; [Solana workflow](./examples.md#solana-account-aware-reads-and-transfer) |
@@ -103,25 +66,3 @@ transaction was not submitted.
 | Reusable authority | `wallets/<wallet>/sealed-approvals/` |
 | Petal operation | Package-defined `<wallet>/<index>` routes; [installed package workflow](./examples.md#installed-petal-workflow) |
 | Paid HTTP | `requests/`; inspect plan, wallet, payment protocol, cap, approval, and receipt |
-
-Wallet registration is asynchronous and does not create a local wallet.
-Read `wallets/registrations/<petname>/status.json`, verify `requested_name`,
-complete the human ceremony, then check `COMPLETED` and `result.json`.
-Mnemonic and raw-key input stays in the Broker-hosted browser ceremony.
-Recovery ID and secret input likewise stays in the Browser ceremony; start it
-with only the wallet name at `wallets/recover`, then inspect
-`wallets/recoveries/<petname>/status.json`.
-
-For a transaction requiring fresh approval, inspect the same action's
-`approval_challenge.json`, verify its identity and expiry, and write its exact
-`retry_body` (`confirm` when omitted) to its `retry_path` once its live `state`
-is `active`. Read the resulting state and
-receipt before reporting success; never restage merely because a pending path
-disappeared.
-
-Broker enforces Sealed Approval scope, expiry, limits, counters, and revocation.
-Machine and Petals cannot mint or broaden that authority. For
-`policy.json` updates, Broker runs `policy.validate_update` before the
-ceremony and `policy.commit_update` on the authorized retry. Reuse the
-**exact same proposed bytes**, then verify the committed policy and terminal
-update status.

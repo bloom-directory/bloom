@@ -56,6 +56,23 @@ pub use accounts::{
     ACCOUNT_KEY_FILES, accounts_json_with_numbers, derivation_path_number, parse_account_segment,
 };
 
+/// Control entries `/wallets` lists beside the wallets, and whether each is a
+/// directory. The root listing is built from this table, so no wallet may
+/// take these names and wallet inventories skip exactly these.
+pub const WALLET_CONTROL_ENTRIES: [(&str, bool); 4] = [
+    ("new", false),
+    ("registrations", true),
+    ("recover", false),
+    ("recoveries", true),
+];
+
+/// Whether `name` is one of `WALLET_CONTROL_ENTRIES` rather than a wallet.
+pub fn is_wallet_control_entry(name: &str) -> bool {
+    WALLET_CONTROL_ENTRIES
+        .iter()
+        .any(|(entry, _)| *entry == name)
+}
+
 use async_trait::async_trait;
 use bloom_broker_api::ProtocolErrorCode;
 use bloom_evm::ChainRegistry;
@@ -751,10 +768,8 @@ impl WalletsHandler {
             }
         };
         let requested_name = request.name.as_str();
-        if matches!(
-            requested_name,
-            "new" | "registrations" | "recover" | "recoveries"
-        ) || requested_name.is_empty()
+        if is_wallet_control_entry(requested_name)
+            || requested_name.is_empty()
             || requested_name.len() > 64
             || !requested_name.chars().all(|character| {
                 character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
@@ -1145,10 +1160,8 @@ impl WalletsHandler {
             }
         };
         let requested_name = request.name.as_str();
-        if matches!(
-            requested_name,
-            "new" | "registrations" | "recover" | "recoveries"
-        ) || requested_name.is_empty()
+        if is_wallet_control_entry(requested_name)
+            || requested_name.is_empty()
             || requested_name.len() > 64
             || !requested_name.chars().all(|character| {
                 character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
@@ -2189,6 +2202,19 @@ impl WalletsHandler {
                     "pending",
                     "confirmed",
                 )?;
+                // Staging reads the cached wallet projection. Observe the new
+                // policy now, or a stage in the next second keeps the old
+                // verdict and its entry is refused at confirm (bloom#354).
+                // If that read fails, drop the cached observation so the next
+                // stage observes Broker rather than the superseded policy.
+                if let Err(error) = self.wallet_projection_authority(wallet).await {
+                    tracing::warn!(wallet, %error, "policy committed; wallet refresh failed");
+                    if let Some(projections) = &self.wallet_projections {
+                        projections
+                            .invalidate_wallet(&wallet_id)
+                            .map_err(|error| HandlerError::backend(error.to_string()))?;
+                    }
+                }
                 Ok(())
             }
             bloom_broker_api::CeremonyState::Cancelled
@@ -3929,10 +3955,13 @@ impl WalletsHandler {
                 .into_iter()
                 .map(|projection| Entry::dir(projection.wallet.wallet_id.as_str()))
                 .collect();
-            out.push(Entry::writable_file("new"));
-            out.push(Entry::dir("registrations"));
-            out.push(Entry::writable_file("recover"));
-            out.push(Entry::dir("recoveries"));
+            out.extend(WALLET_CONTROL_ENTRIES.iter().map(|(name, is_dir)| {
+                if *is_dir {
+                    Entry::dir(name)
+                } else {
+                    Entry::writable_file(name)
+                }
+            }));
             return Ok(out);
         }
         if segs[0] == "recoveries" {
@@ -4271,6 +4300,14 @@ impl WalletsHandler {
                     )
                     .map_err(solana_outbox_err)?;
                 require_pinned(&entry.staged, id)?;
+                // As on EVM, `cancel` written to confirm discards the entry
+                // instead of signing it.
+                if confirm_text.eq_ignore_ascii_case("cancel") {
+                    return engine
+                        .cancel(wallet, id)
+                        .await
+                        .map_err(|e| HandlerError::backend(e.to_string()));
+                }
                 // Re-select the exact account this transfer was staged
                 // against. Resolving the wallet's children again would let a
                 // second active child sign a message staged for the first.
@@ -6342,6 +6379,31 @@ value = "0""#
                 .unwrap();
             assert_eq!(sink.mode, 0o644, "{path}/restage must be writable");
         }
+
+        // `cancel` written to confirm discards the entry; it never signs.
+        handler
+            .write(
+                &vfs(format!(
+                    "/{w}/0/chains/solana-devnet/outbox/pending/sol-zero/confirm"
+                )),
+                b"cancel\n",
+            )
+            .await
+            .unwrap();
+        let names = |state: &'static str| {
+            let handler = handler.clone();
+            async move {
+                handler
+                    .list(&vfs(format!("/{w}/0/chains/solana-devnet/outbox/{state}")))
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|entry| entry.name)
+                    .collect::<Vec<String>>()
+            }
+        };
+        assert!(names("pending").await.is_empty());
+        assert!(names("failed").await.contains(&"sol-zero".to_string()));
     }
 
     /// A crash after the move to `failed/` but before the intent rewrite
@@ -11640,17 +11702,20 @@ value = "0""#,
         held: fn(&str) -> Option<u64>,
         delay: std::time::Duration,
     ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
-        spawn_holdings_node_with(chain_id, native, held, Arc::new(move |_| delay)).await
+        spawn_holdings_node_with(chain_id, native, held, Arc::new(move |_| delay), false).await
     }
 
     type HoldingsDelay = dyn Fn(Option<&str>) -> std::time::Duration + Send + Sync;
 
     /// `delay` gets the token symbol a call reads, or `None` for other calls.
+    /// With `multicall`, the node answers Multicall3 `aggregate3`; without
+    /// it, Multicall3 has no code there and answers at once.
     async fn spawn_holdings_node_with(
         chain_id: u64,
         native: u64,
         held: fn(&str) -> Option<u64>,
         delay: Arc<HoldingsDelay>,
+        multicall: bool,
     ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let tokens: Arc<Vec<(String, Option<u64>, String)>> = Arc::new(
@@ -11688,12 +11753,54 @@ value = "0""#,
                     let to = request["params"][0]["to"].as_str().unwrap_or_default();
                     let method = request["method"].as_str().unwrap_or_default();
                     let token = tokens.iter().find(|(a, ..)| a.eq_ignore_ascii_case(to));
+                    let multicall3 =
+                        to.eq_ignore_ascii_case(&format!("{:#x}", bloom_evm::MULTICALL3));
+                    if multicall3 && !multicall {
+                        let body =
+                            serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":"0x"})
+                                .to_string();
+                        let _ = socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+                        return;
+                    }
                     if method != "eth_chainId" {
                         tokio::time::sleep(delay(token.map(|(.., symbol)| symbol.as_str()))).await;
                     }
                     let result = match method {
                         "eth_chainId" => serde_json::json!(format!("{chain_id:#x}")),
                         "eth_getBalance" => serde_json::json!(format!("{native:#x}")),
+                        "eth_call" if multicall3 => {
+                            use alloy::sol_types::SolCall;
+                            use bloom_evm::IMulticall3::{Call3Result, aggregate3Call};
+                            let params = &request["params"][0];
+                            let input = params["input"].as_str().or(params["data"].as_str());
+                            let input = hex::decode(input.unwrap().trim_start_matches("0x"));
+                            let calls = aggregate3Call::abi_decode(&input.unwrap()).unwrap().calls;
+                            let results: Vec<Call3Result> = calls
+                                .iter()
+                                .map(|call| {
+                                    let target = format!("{:#x}", call.target);
+                                    let held = tokens
+                                        .iter()
+                                        .find(|(a, ..)| a.eq_ignore_ascii_case(&target))
+                                        .and_then(|(_, held, _)| *held);
+                                    Call3Result {
+                                        success: held.is_some(),
+                                        returnData: held
+                                            .map(|value| {
+                                                alloy::primitives::U256::from(value)
+                                                    .to_be_bytes::<32>()
+                                                    .to_vec()
+                                            })
+                                            .unwrap_or_default()
+                                            .into(),
+                                    }
+                                })
+                                .collect();
+                            serde_json::json!(format!(
+                                "0x{}",
+                                hex::encode(aggregate3Call::abi_encode_returns(&results))
+                            ))
+                        }
                         "eth_call" if token.is_some_and(|(_, held, _)| held.is_none()) => {
                             let body = serde_json::json!({"jsonrpc":"2.0","id":request["id"],
                                 "error":{"code":3,"message":"execution reverted"}})
@@ -11887,7 +11994,7 @@ value = "0""#,
                 std::time::Duration::ZERO
             }
         });
-        let (url, _) = spawn_holdings_node_with(1, 1, |_| Some(1), delay).await;
+        let (url, _) = spawn_holdings_node_with(1, 1, |_| Some(1), delay, false).await;
         f.handler.chains.add(holdings_chain("ethereum", 1, url));
         let v = read_holdings(&f).await;
         let symbols: Vec<&str> = v["holdings"]
@@ -11903,6 +12010,42 @@ value = "0""#,
             format!("timed out; could not read {}", tokens[0].1),
             "{v}"
         );
+    }
+
+    /// With Multicall3, a chain costs one native read and one token batch,
+    /// not one request per token, and a failed token in the batch is named.
+    #[tokio::test]
+    async fn holdings_read_tokens_in_one_multicall_request() {
+        let f = make_handler();
+        let tokens = accounts::holdings_tokens(1);
+        assert!(tokens.iter().any(|(_, s, _)| s == "USDC"), "{tokens:?}");
+        let (url, served) = spawn_holdings_node_with(
+            1,
+            1,
+            |symbol| (symbol != "USDC").then_some(1),
+            Arc::new(|_| std::time::Duration::ZERO),
+            true,
+        )
+        .await;
+        f.handler.chains.add(holdings_chain("ethereum", 1, url));
+        let before = served.load(std::sync::atomic::Ordering::SeqCst);
+        let v = read_holdings(&f).await;
+        let symbols: Vec<&str> = v["holdings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["symbol"].as_str().unwrap())
+            .collect();
+        let rest: Vec<&str> = tokens
+            .iter()
+            .map(|(_, s, _)| s.as_str())
+            .filter(|s| *s != "USDC")
+            .collect();
+        assert_eq!(symbols, [&["ETH"][..], &rest].concat(), "{v}");
+        assert_eq!(v["errors"]["ethereum"], "could not read USDC", "{v}");
+        // eth_chainId, eth_getBalance and one aggregate3.
+        let requests = served.load(std::sync::atomic::Ordering::SeqCst) - before;
+        assert!(requests <= 3, "{requests} requests");
     }
 
     /// Tempo has no native token: holdings skip the native read rather than
