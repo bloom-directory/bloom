@@ -812,6 +812,15 @@ switch_release() {
   machine_binary="$release_base/current/bloom"; broker_binary="$release_base/current/bloom-broker"; signer_binary="$release_base/current/bloom-signer"
 }
 
+write_macos_checkout_endpoint() {
+  if checkout_browser_available; then
+    printf '{"socket":"%s","uid":%s}\n' "$runtime/machine-checkout/checkout.sock" "$BLOOM_MACOS_CHECKOUT_UID" > "$config/checkout.json.new.$$"
+    chmod 0644 "$config/checkout.json.new.$$"; mv -f "$config/checkout.json.new.$$" "$config/checkout.json"
+  else
+    rm -f -- "$config/checkout.json"
+  fi
+}
+
 install_config() {
   [[ -n "${BLOOM_MACOS_CHECKOUT_UID:-}" ]] || allocate_checkout_accounts
   mkdir -p "$checkout_state" "$runtime/machine-checkout" "$runtime/broker-checkout"
@@ -829,8 +838,7 @@ install_config() {
     [[ -d "$directory" && ! -L "$directory" ]] || die "security directory is missing or substituted: $directory"
   done
   chmod 0711 "$config" "$runtime" "$runtime/revoke"
-  printf '{"socket":"%s","uid":%s}\n' "$runtime/machine-checkout/checkout.sock" "$BLOOM_MACOS_CHECKOUT_UID" > "$config/checkout.json.new.$$"
-  chmod 0644 "$config/checkout.json.new.$$"; mv -f "$config/checkout.json.new.$$" "$config/checkout.json"
+  write_macos_checkout_endpoint
   chmod 0700 "$runtime/signer-admin" "$installer_config/admin"
   chmod 0700 "$broker_config" "$signer_config" "$machine_config" "$session_config" "$installer_config" \
     "$broker_state" "$signer_state" "$machine_state" "$broker_state/audit-checkpoints" \
@@ -906,7 +914,7 @@ install_assets() {
 }
 
 secure_ownership() {
-  chown root:wheel "$config/checkout.json"
+  if [[ -f "$config/checkout.json" ]]; then chown root:wheel "$config/checkout.json"; fi
   if [[ -f "$checkout_plist" ]]; then chown root:wheel "$checkout_plist"; fi
   chown "$checkout_user:$log_group" "$checkout_log"
   chown -R "$checkout_user:$checkout_group" "$checkout_state"

@@ -3356,6 +3356,58 @@ fn macos_staged_lifecycle_upgrades_repairs_retains_restores_and_rejects_downgrad
 }
 
 #[test]
+fn installers_expose_checkout_only_when_a_browser_is_available() {
+    let linux = fs::read_to_string(release_script("install-linux.sh")).unwrap();
+    let start = linux.find("write_linux_checkout_environment() {").unwrap();
+    let end = start + linux[start..].find("\n}\n").unwrap() + 3;
+    let linux_function = linux[start..end].replace("[[ \"$install_root\" == / ]]", "true");
+    let mac = fs::read_to_string(release_script("install-macos.sh")).unwrap();
+    let start = mac.find("write_macos_checkout_endpoint() {").unwrap();
+    let end = start + mac[start..].find("\n}\n").unwrap() + 3;
+    let mac_function = &mac[start..end];
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("etc/bloom/501");
+    fs::create_dir_all(&config).unwrap();
+    for available in [true, false] {
+        fs::write(
+            config.join("machine.env"),
+            "BLOOM_NFS_LISTEN=old\nBLOOM_CHECKOUT_SOCKET=old\nBLOOM_CHECKOUT_UID=4\n",
+        )
+        .unwrap();
+        let harness = format!(
+            r#"set -Eeuo pipefail
+id() {{ echo 501; }}
+linux_checkout_browser() {{ [[ {available} == true ]] && printf /usr/bin/chromium || true; }}
+allocate_linux_checkout_view_port() {{ echo 15001; }}
+atomic_install() {{ install -m "$3" "$1" "$2"; }}
+{linux_function}
+write_linux_checkout_environment '{root}' 501
+config='{config}'; runtime=/run/bloom/501; BLOOM_MACOS_CHECKOUT_UID=501
+checkout_browser_available() {{ {available}; }}
+{mac_function}
+write_macos_checkout_endpoint
+"#,
+            root = root.path().display(),
+            config = config.display()
+        );
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(harness)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let machine = fs::read_to_string(config.join("machine.env")).unwrap();
+        assert!(machine.contains("BLOOM_NFS_LISTEN=old"));
+        assert_eq!(machine.contains("BLOOM_CHECKOUT_SOCKET="), available);
+        assert_eq!(config.join("checkout.json").exists(), available);
+    }
+}
+
+#[test]
 fn linux_upgrade_requests_relogin_when_checkout_group_is_new() {
     let source = fs::read_to_string(release_script("install-linux.sh")).unwrap();
     let start = source.find("linux_checkout_relogin_required() {").unwrap();

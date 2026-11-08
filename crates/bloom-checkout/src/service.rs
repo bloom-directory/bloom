@@ -49,6 +49,18 @@ impl std::fmt::Display for Refusal {
     }
 }
 impl std::error::Error for Refusal {}
+impl Refusal {
+    fn response(&self) -> Value {
+        match self {
+            Self::Blocked(operation_id) => {
+                json!({"error_code":"blocked","operation_id":operation_id})
+            }
+            Self::FormErrors => json!({"error_code":"form_errors"}),
+            Self::UnlockPending => json!({"error_code":"unlock_pending"}),
+            Self::IdUsed => json!({"error_code":"id_used"}),
+        }
+    }
+}
 
 struct Store(Mutex<Connection>);
 /// The ongoing price, period and start date to keep for a subscription. A
@@ -2372,7 +2384,7 @@ pub async fn serve_api(service: Arc<CheckoutService>, path: &Path, machine_uid: 
                             }})
                         }
                         Err(error) if error.downcast_ref::<Refusal>().is_some() => {
-                            json!({"error":error.to_string()})
+                            error.downcast_ref::<Refusal>().unwrap().response()
                         }
                         Err(_) => {
                             json!({"error":"Checkout request rejected or unavailable. Check status before retrying."})
@@ -4622,8 +4634,8 @@ mod tests {
             .await
             .unwrap();
         let result: Value = serde_json::from_str(&response).unwrap();
-        assert!(result["error"].as_str().unwrap().contains(&prior));
-        assert!(result["error"].as_str().unwrap().contains("resolves"));
+        assert_eq!(result["error_code"], "blocked");
+        assert_eq!(result["operation_id"], prior);
         api.abort();
         server.abort();
     }
