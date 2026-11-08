@@ -1,7 +1,7 @@
 pub(crate) use crate::travelers::{derived_traveler_value, formatted_phone};
 use crate::{
     browser::{Browser, PrivateTab},
-    discovery::{BeforeSubmit, Discovery},
+    discovery::{BeforeFill, BeforeSubmit, Discovery},
     hpke::Recipient,
 };
 use anyhow::{Context, Result, bail};
@@ -1539,12 +1539,13 @@ impl CheckoutService {
                 .map_err(|_| anyhow::anyhow!("Invalid release binding"))?,
         )?;
         let card = serde_json::from_slice(&plaintext).context("Invalid card release")?;
-        if discovery
+        if let Err(error) = discovery
             .fill(&checkout.tab, &card, &mut status.filled_fields)
             .await
-            .is_err()
         {
-            status.state = if status.filled_fields.is_empty() {
+            status.state = if error.downcast_ref::<BeforeFill>().is_some() {
+                "failed_before_release"
+            } else if status.filled_fields.is_empty() {
                 "disclosure_unknown"
             } else {
                 "partially_filled"

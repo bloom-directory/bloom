@@ -133,7 +133,7 @@ BLOOM_BIN=/path/to/candidate/bloom \
 BLOOM_HOME=/tmp/shopping-test/root/home \
 BLOOM_RPC_ENDPOINT=unix:/tmp/shopping-test/m.sock \
 BLOOM_CHECKOUT_CEREMONY_ORIGIN=http://localhost:28820 \
-BLOOM_CHECKOUT_VIEW_ORIGIN=http://localhost:28821 \
+BLOOM_CHECKOUT_VIEW_ORIGIN=http://127.0.0.1:28821 \
 BLOOM_CHECKOUT_PLAYWRIGHT_ROOT=/path/to/playwright-package \
 node scripts/test-card-checkout.mjs /tmp/shopping-test/result.json
 ```

@@ -18,6 +18,15 @@ impl std::fmt::Display for BeforeSubmit {
 
 impl std::error::Error for BeforeSubmit {}
 
+#[derive(Debug)]
+pub(crate) struct BeforeFill;
+impl std::fmt::Display for BeforeFill {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Payment fields were not filled")
+    }
+}
+impl std::error::Error for BeforeFill {}
+
 #[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CardInput {
@@ -612,7 +621,7 @@ impl Discovery {
         card: &CardInput,
         filled: &mut Vec<String>,
     ) -> Result<()> {
-        self.recheck(tab).await?;
+        self.recheck(tab).await.context(BeforeFill)?;
         for frame in &self.frames {
             for field in &frame.fields {
                 let value = zeroize::Zeroizing::new(match field.kind.as_str() {
@@ -3079,6 +3088,26 @@ pub(crate) mod tests {
         assert!(preview.starts_with(&[0xff, 0xd8, 0xff]) && preview.len() <= 1 << 20);
         discovery.recheck(&tab).await.unwrap();
         let mut filled = Vec::new();
+        tab.cdp
+            .evaluate(
+                &tab.session,
+                "document.getElementById('total').dataset.bloomTotalMinor='799'".into(),
+            )
+            .await
+            .unwrap();
+        let error = discovery
+            .fill(&tab, &card(), &mut filled)
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<BeforeFill>().is_some());
+        assert!(filled.is_empty());
+        tab.cdp
+            .evaluate(
+                &tab.session,
+                "document.getElementById('total').dataset.bloomTotalMinor='399'".into(),
+            )
+            .await
+            .unwrap();
         discovery.fill(&tab, &card(), &mut filled).await.unwrap();
         assert_eq!(filled.len(), 3);
         tab.cdp
