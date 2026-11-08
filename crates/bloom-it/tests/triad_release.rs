@@ -3229,8 +3229,7 @@ fn macos_staged_lifecycle_upgrades_repairs_retains_restores_and_rejects_downgrad
         root.join("Library/Application Support/BloomTriad/config/501/signer/identity.json");
     let identity_before = fs::read(&identity).unwrap();
 
-    // Schema 1 is a supported migration source even though schema 2 remains
-    // the lowest state an old release may reopen after the upgrade commits.
+    // Schema 1 is a supported migration source for the current release.
     fs::write(
         root.join("Library/Application Support/BloomTriad/state-schema"),
         b"machine=1\nbroker=1\nsigner=1\n",
@@ -3331,7 +3330,7 @@ fn macos_staged_lifecycle_upgrades_repairs_retains_restores_and_rejects_downgrad
 
     fs::write(
         root.join("Library/Application Support/BloomTriad/state-schema"),
-        b"machine=3\nbroker=2\nsigner=2\n",
+        b"machine=4\nbroker=2\nsigner=2\n",
     )
     .unwrap();
     let downgrade = stage_macos_install_digest(&installer, &root, &candidate, &new_digest);
