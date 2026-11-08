@@ -88,8 +88,8 @@ struct BrowseError {
 mod tests {
     use super::*;
     async fn response(value: &'static str, uid: u32) -> Result<Value, String> {
-        let root = tempfile::tempdir().unwrap().keep();
-        let socket = root.join("api.sock");
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("api.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -139,8 +139,8 @@ mod tests {
     #[tokio::test]
     async fn slow_checkout_response_is_delivered() {
         use std::os::unix::fs::MetadataExt;
-        let root = tempfile::tempdir().unwrap().keep();
-        let socket = root.join("api.sock");
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("api.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let uid = socket.metadata().unwrap().uid();
         tokio::spawn(async move {

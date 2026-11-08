@@ -68,12 +68,14 @@ Amounts use ISO 4217 minor units. Checkout conversion and Broker's approval
 display use those exponents, not the browser's currency display precision:
 for example, HUF28,826.50 is 2882650 minor units even when CLDR normally
 displays forints without fractions.
-A card is filled only into fields hosted by a known payment provider
-(`PROVIDER_FIELD_ORIGINS`); other pages go to the private view.
+A card is filled only into reviewed provider field origins, provider page
+origins, or merchant card origins (`PROVIDER_FIELD_ORIGINS`,
+`PROVIDER_PAGE_ORIGINS`, and `MERCHANT_CARD_ORIGINS`). Other pages go to the
+private view.
 
-The approval page also shows the entered fields and, when checkout owns the
-browser, a screenshot of the order. These are human aids and are not bound to
-the approval.
+The approval page can also show entered fields and a screenshot of the order.
+Checkout omits both after saved traveler data is used, because the approval
+link is available to the agent. These aids are not bound to the approval.
 
 ## Saved booking party
 

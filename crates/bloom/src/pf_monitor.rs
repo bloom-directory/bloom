@@ -212,8 +212,17 @@ fn restart_services_for_live_session(login_uid: u32, revoke_gid: u32) -> Result<
             continue;
         }
         let target = format!("system/com.bloom.{service}.{login_uid}");
-        let state = command_output("/bin/launchctl", &["print", &target])
-            .with_context(|| format!("inspect loaded {service} job for login {login_uid}"))?;
+        let state = match command_output("/bin/launchctl", &["print", &target]) {
+            Ok(state) => state,
+            // Checkout is optional and may be unloaded during an upgrade.
+            // Do not prevent lifecycle checks for the remaining logins.
+            Err(_) if service == "checkout" => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("inspect loaded {service} job for login {login_uid}")
+                });
+            }
+        };
         if !state.lines().any(|line| line.trim() == "state = running") {
             command_output("/bin/launchctl", &["kickstart", &target])
                 .with_context(|| format!("restart {service} for live login {login_uid}"))?;

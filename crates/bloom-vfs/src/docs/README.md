@@ -27,6 +27,9 @@ Petals before choosing paths; their names and availability vary by installation.
 | `wallets/` | Public wallet/account projections, policy, transaction outboxes |
 | `petals/` | Installed packages and their instructions |
 | `requests/` | Planned, authority-gated paid HTTP requests |
+| `cards/` | Saved card management and approval status, when Checkout is configured |
+| `travelers/` | Saved traveler management, when Checkout is configured |
+| `checkout/` | Private shopping, payment requests and history, when Checkout is configured |
 | `outbox/` | Central action projections and correlation records |
 | `simulate/` | EVM dry-run sessions; never broadcasts |
 | `status/` | Daemon, chain, backend, and update status |

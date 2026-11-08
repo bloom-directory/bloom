@@ -111,11 +111,18 @@ bank charge.
 | State | Meaning and next step |
 | --- | --- |
 | `booked`, `paid` | Merchant reported success. `outcome.order_id` is the code shown; for flights it is not proof of a ticket. |
-| `declined` | Merchant declined. Tell the person; do not retry without asking. |
-| `filled` | Fields filled; not proof of payment. |
+| `requested`, `preparing`, `awaiting_approval`, `release_started` | The request is in progress. Read status; do not submit another payment. |
+| `declined` | A merchant page reported a decline. Have the person check before another checkout. |
+| `filled`, `submitted` | Payment details were filled or a submission was attempted; neither proves payment. The shop remains blocked until the result is checked. |
 | `needs_input` | The page wants more input; payment may already be submitted. The person finishes in the private view. Optional wallet signup can add fields: complete or decline it there. |
 | `partially_filled`, `disclosure_unknown`, `uncertain` | Unknown whether money moved. Bloom refuses another checkout at that shop until the person checks it: write a new request with `"take_over": true` and `"resolves": "<id>"`. Their Done after checking the shop account, email or bank clears it; you cannot. |
-| `paused` | Checkout could not hand the browser back. Check status before anything else; for a request that never released a card, write its `cancel` again to retry cleanup. A restart clears `paused`, not an uncertain result. |
+| `manual_required`, `human_control` | The person must continue in the private view. |
+| `failed_before_release`, `cancelled`, `expired`, `resolved` | The request has ended. Check its history before deciding what to do next. |
+
+`paused` is a separate status field: Checkout could not hand the browser back.
+Check status before anything else; for a request that never released a card,
+write its `cancel` again to retry cleanup. A restart clears `paused`, not an
+uncertain result.
 
 Never buy again after a timeout, form error or closed view. Read
 `checkout/history.json` (latest 50 requests, with shop, total and status)
@@ -152,6 +159,9 @@ and period (and the start date of a free trial); otherwise the person
 completes it privately. Bloom cannot cap later charges. To cancel, do it on
 the shop's site: the person does it in a take-over; it is never a payment
 request.
+
+Amounts ending in `_minor` use ISO 4217 minor units: JPY uses 1 per yen,
+USD uses 100 per dollar, and KWD and IQD use 1,000 per unit.
 
 ## Flights
 

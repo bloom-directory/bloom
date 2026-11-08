@@ -1,7 +1,7 @@
 pub(crate) use crate::travelers::{derived_traveler_value, formatted_phone};
 use crate::{
     browser::{Browser, PrivateTab},
-    discovery::Discovery,
+    discovery::{BeforeSubmit, Discovery},
     hpke::Recipient,
 };
 use anyhow::{Context, Result, bail};
@@ -30,6 +30,25 @@ pub use bloom_checkout_api::{HistoryEntry, Request, Status};
 
 /// Approval links last fifteen minutes; allow a short result-delivery grace.
 const APPROVAL_RESULT_WAIT: Duration = Duration::from_secs(15 * 60 + 30);
+
+#[derive(Debug)]
+enum Refusal {
+    Blocked(String),
+    FormErrors,
+    UnlockPending,
+    IdUsed,
+}
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Blocked(id) => write!(f, "{id}: payment result unknown. Ask the person to check it: request a take-over with \"resolves\": \"{id}\""),
+            Self::FormErrors => f.write_str("The page shows form errors; fix them before payment"),
+            Self::UnlockPending => f.write_str("A saved traveler unlock is waiting for approval; finish or cancel it before payment"),
+            Self::IdUsed => f.write_str("Operation ID already used; check its status"),
+        }
+    }
+}
+impl std::error::Error for Refusal {}
 
 struct Store(Mutex<Connection>);
 /// The ongoing price, period and start date to keep for a subscription. A
@@ -145,7 +164,7 @@ impl Store {
         let conn = self.0.lock();
         match conn.query_row(
             "SELECT id FROM operations WHERE shop=?1 AND kind IN ('card','site') AND state IN \
-             ('submitted','needs_input','uncertain','disclosure_unknown','partially_filled','filled','release_started') \
+             ('submitted','needs_input','uncertain','declined','disclosure_unknown','partially_filled','filled','release_started') \
              LIMIT 1",
             [shop],
             |row| row.get(0),
@@ -379,6 +398,16 @@ enum IntakeResponse {
 }
 
 impl CheckoutService {
+    async fn approval_order_details(&self, tab: &PrivateTab) -> (Option<String>, Value) {
+        if self.browser.has_private_traveler_data() {
+            (None, json!([]))
+        } else {
+            (
+                crate::discovery::order_preview(tab).await,
+                crate::discovery::order_fields(tab).await,
+            )
+        }
+    }
     /// One approval unlocks a saved traveler for the shopping website. The
     /// values stay in this process, are filled on request and are replaced by
     /// placeholders in everything the agent reads.
@@ -657,6 +686,7 @@ impl CheckoutService {
         let traveler = selected_traveler(&mut travelers, &context, &origin, traveler_id)?;
         let text = derived_traveler_value(&traveler.values, field)
             .context("That saved traveler field is not available")?;
+        self.browser.remember_private_traveler_use();
         Self::remember_sent(&self.browser, field, &text);
         if matches!(
             field,
@@ -722,6 +752,7 @@ impl CheckoutService {
                 values.insert(field.into(), part);
             }
         }
+        self.browser.remember_private_traveler_use();
         Self::remember_fill(&self.browser, &values);
         let filled = self
             .browser
@@ -791,6 +822,11 @@ impl CheckoutService {
                     format!("{month}-{day}-{year}"),
                     format!("{day:02}-{month:02}-{year}"),
                     format!("{month:02}-{day:02}-{year}"),
+                    format!("{day}.{month}.{year}"),
+                    format!("{month}.{day}.{year}"),
+                    format!("{day:02}.{month:02}.{year}"),
+                    format!("{month:02}.{day:02}.{year}"),
+                    format!("{year}.{month:02}.{day:02}"),
                 ];
                 for name in [names[month - 1], &names[month - 1][..3]] {
                     forms.extend([
@@ -1051,9 +1087,7 @@ impl CheckoutService {
                     bail!("A checkout already has private control");
                 }
                 if unlocking.is_some() {
-                    bail!(
-                        "A saved traveler unlock is waiting for approval; finish or cancel it before payment"
-                    );
+                    return Err(Refusal::UnlockPending.into());
                 }
                 drop(unlocking);
                 let mut status = Status {
@@ -1080,14 +1114,7 @@ impl CheckoutService {
                             "payment refused over form errors: {}",
                             Self::form_error_count(&attention)
                         );
-                        bail!(
-                            "The page shows form errors; fix them before payment: {}",
-                            if errors.is_empty() {
-                                "a field is marked invalid".into()
-                            } else {
-                                errors.join(" / ")
-                            }
-                        );
+                        return Err(Refusal::FormErrors.into());
                     }
                 }
                 let kind = match mode {
@@ -1098,22 +1125,14 @@ impl CheckoutService {
                 if matches!(mode, Mode::Card | Mode::Site) {
                     if let Ok((_, origin)) = self.browser.shopping_scope().await {
                         if let Some(open) = self.store.unresolved(&origin)? {
-                            bail!(
-                                "{open}: payment result unknown. Ask the person to check it: request a take-over with \"resolves\": \"{open}\""
-                            );
+                            return Err(Refusal::Blocked(open).into());
                         }
                     }
                 }
                 if self.store.get(&operation_id).is_ok() {
-                    bail!("Operation ID already used");
+                    return Err(Refusal::IdUsed.into());
                 }
                 let tab = self.browser.handoff().await?;
-                if let Err(error) = self.store.insert(&status, kind, &agent_description) {
-                    let _ = self.return_control().await;
-                    return Err(error);
-                }
-                status.state = "preparing".into();
-                self.store.update(&status)?;
                 let read = match mode {
                     Mode::Card => Some(Discovery::read(&tab).await),
                     Mode::Site => Some(Discovery::read_site(&tab).await),
@@ -1126,7 +1145,6 @@ impl CheckoutService {
                     Some(Err(error)) => {
                         eprintln!("payment page needs the private view: {error:#}");
                         status.reason = error.downcast_ref::<PreparationReason>().copied();
-                        self.store.update(&status)?;
                         None
                     }
                     None => None,
@@ -1136,8 +1154,32 @@ impl CheckoutService {
                     None => tab_url(&tab)
                         .await
                         .and_then(|url| url::Url::parse(&url).ok())
+                        .filter(|url| {
+                            matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
+                        })
                         .map(|url| url.origin().ascii_serialization()),
                 };
+                if matches!(mode, Mode::Card | Mode::Site) {
+                    let check = (|| -> Result<()> {
+                        let origin = shop
+                            .as_deref()
+                            .context("Cannot determine checkout origin")?;
+                        if let Some(open) = self.store.unresolved(origin)? {
+                            return Err(Refusal::Blocked(open).into());
+                        }
+                        Ok(())
+                    })();
+                    if let Err(error) = check {
+                        self.return_control().await?;
+                        return Err(error);
+                    }
+                }
+                if let Err(error) = self.store.insert(&status, kind, &agent_description) {
+                    let _ = self.return_control().await;
+                    return Err(error);
+                }
+                status.state = "preparing".into();
+                self.store.update(&status)?;
                 self.store.record_order(
                     &operation_id,
                     shop.as_deref(),
@@ -1150,20 +1192,27 @@ impl CheckoutService {
                     (mode == Mode::Card && discovery.is_some()).then(Recipient::generate);
                 let capability = new_view_token();
                 let challenge_url = challenge_url(self.view_port, &capability);
+                // The approval URL is available to the agent. A page preview
+                // or field value may contain private traveler information.
+                let (order_preview, order_fields) = if discovery.is_some() {
+                    self.approval_order_details(&tab).await
+                } else {
+                    (None, json!([]))
+                };
                 let request = match (&discovery, &recipient) {
                     (Some(discovery), Some(recipient)) => {
                         json!({"method":"prepare","operation_id":operation_id,"card_id":card_id,
                         "facts":discovery.facts,"recipient_key":recipient.public,
                         "agent_description":agent_description,"challenge_url":challenge_url,
-                        "order_preview":crate::discovery::order_preview(&tab).await,
-                        "order_fields":crate::discovery::order_fields(&tab).await})
+                        "order_preview":order_preview,
+                        "order_fields":order_fields})
                     }
                     (Some(discovery), None) => {
                         json!({"method":"site","operation_id":operation_id,
                         "facts":discovery.facts,"agent_description":agent_description,
                         "challenge_url":challenge_url,
-                        "order_preview":crate::discovery::order_preview(&tab).await,
-                        "order_fields":crate::discovery::order_fields(&tab).await})
+                        "order_preview":order_preview,
+                        "order_fields":order_fields})
                     }
                     _ => json!({"method":"manual","operation_id":operation_id,"card_id":card_id,
                         "agent_description":agent_description,"challenge_url":challenge_url}),
@@ -1288,6 +1337,17 @@ impl CheckoutService {
                             .await;
                         if result.is_err() {
                             self.set_state(&operation_id, "disclosure_unknown");
+                        } else if self
+                            .store
+                            .get(&operation_id)
+                            .is_ok_and(|status| status.state == "failed_before_release")
+                        {
+                            if self.return_control().await.is_ok() {
+                                *private = None;
+                            } else {
+                                self.mark_paused(&operation_id);
+                            }
+                            return;
                         }
                         drop(private);
                         self.watch_outcome(operation_id).await;
@@ -1370,6 +1430,10 @@ impl CheckoutService {
                     status.state = "needs_input".into();
                     self.store.update(&status)?;
                 }
+                Err(error) if error.downcast_ref::<BeforeSubmit>().is_some() => {
+                    status.state = "failed_before_release".into();
+                    self.store.update(&status)?;
+                }
                 Err(_) => {
                     checkout.submitted = true;
                     status.state = "uncertain".into();
@@ -1378,7 +1442,12 @@ impl CheckoutService {
             }
             return Ok(());
         }
-        discovery.recheck(&checkout.tab).await?;
+        if discovery.recheck(&checkout.tab).await.is_err() {
+            // No card has been decrypted or filled at this point.
+            status.state = "failed_before_release".into();
+            self.store.update(&status)?;
+            return Ok(());
+        }
         let key = checkout
             .recipient
             .take()
@@ -1671,17 +1740,18 @@ impl CheckoutService {
                 // Success text counts only from the top document, after checkout
                 // or the person pressed pay. "needs_input" alone may mean the
                 // pay button was never pressed.
-                let completed_allowed =
-                    status.state == "submitted" || (status.state == "needs_input" && submitted);
+                let completed_allowed = status.state == "submitted"
+                    || (matches!(
+                        status.state.as_str(),
+                        "needs_input" | "uncertain" | "declined"
+                    ) && submitted);
                 let outcome = observed
                     .iter()
                     .find_map(|(is_top, outcome)| {
                         let terminal = match outcome["state"].as_str() {
                             Some("booked") if *is_top && completed_allowed => Some("booked"),
                             // Help text can say "payment failed" before anyone pays.
-                            Some("declined") if attempt || status.state == "declined" => {
-                                Some("declined")
-                            }
+                            Some("declined") if *is_top && attempt => Some("declined"),
                             Some("payment_phrase") if *is_top && completed_allowed => Some("paid"),
                             _ => None,
                         }?;
@@ -1710,10 +1780,10 @@ impl CheckoutService {
                             let _ = self.store.update(&status);
                         }
                     } else if state == "declined" {
-                        // Record the merchant decline and leave the pages up.
-                        if status.state != "declined" {
-                            status.state = "declined".into();
-                            status.outcome = serde_json::from_value((*outcome).clone()).ok();
+                        // Page text alone cannot prove that no payment occurred.
+                        if status.state != "uncertain" {
+                            status.state = "uncertain".into();
+                            status.outcome = None;
                             status.ceremony_url = None;
                             let _ = self.store.update(&status);
                         }
@@ -1722,7 +1792,10 @@ impl CheckoutService {
                         if state == "paid" {
                             recorded["state"] = json!("paid");
                         }
-                        let close = matches!(status.state.as_str(), "submitted" | "needs_input");
+                        let close = matches!(
+                            status.state.as_str(),
+                            "submitted" | "needs_input" | "uncertain" | "declined"
+                        );
                         status.state = state.into();
                         status.outcome = serde_json::from_value(recorded).ok();
                         status.ceremony_url = None;
@@ -2226,6 +2299,9 @@ pub async fn serve_api(service: Arc<CheckoutService>, path: &Path, machine_uid: 
                                 eprintln!("checkout browse failed: {}", loggable(&error));
                                 "The page could not be read or changed; open it again or request a new snapshot".into()
                             }})
+                        }
+                        Err(error) if error.downcast_ref::<Refusal>().is_some() => {
+                            json!({"error":error.to_string()})
                         }
                         Err(_) => {
                             json!({"error":"Checkout request rejected or unavailable. Check status before retrying."})
@@ -3378,6 +3454,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn changed_total_stops_before_card_release_or_site_submit() {
+        for mode in [Mode::Card, Mode::Site] {
+            let (service, browser, _, server) = shopping_service(
+                "<div id='total' data-bloom-total-minor='399' data-bloom-currency='USD'>Total USD 3.99</div><input autocomplete='cc-number'><input autocomplete='cc-exp'><input autocomplete='cc-csc'><button onclick='window.paid=true'>Pay</button>",
+            ).await;
+            let tab = browser.handoff().await.unwrap();
+            let discovery = if mode == Mode::Card {
+                Discovery::read(&tab).await.unwrap()
+            } else {
+                Discovery::read_site(&tab).await.unwrap()
+            };
+            let status = Status {
+                operation_id: "changed-total".into(),
+                state: "awaiting_approval".into(),
+                ceremony_url: None,
+                filled_fields: vec![],
+                outcome: None,
+                paused: false,
+                reason: None,
+                view_url: None,
+            };
+            service
+                .store
+                .insert(
+                    &status,
+                    if mode == Mode::Card { "card" } else { "site" },
+                    "Fixture",
+                )
+                .unwrap();
+            tab.cdp
+                .evaluate(
+                    &tab.session,
+                    "document.getElementById('total').dataset.bloomTotalMinor='799'".into(),
+                )
+                .await
+                .unwrap();
+            let mut checkout = PrivateCheckout {
+                operation_id: status.operation_id.clone(),
+                mode,
+                view_target: tab.target.clone(),
+                view_session: tab.session.clone(),
+                seen_pages: std::collections::HashSet::new(),
+                tab: tab.clone(),
+                discovery: Some(discovery),
+                recipient: None,
+                capability: "fixture".into(),
+                session: None,
+                approved: true,
+                manual_submission: false,
+                submitted: false,
+                resolves: None,
+            };
+            service
+                .consume_and_fill(&mut checkout, None, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                service.store.get(&status.operation_id).unwrap().state,
+                "failed_before_release"
+            );
+            assert!(!checkout.submitted);
+            assert_ne!(
+                tab.cdp
+                    .evaluate(&tab.session, "!!window.paid".into())
+                    .await
+                    .unwrap(),
+                true
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_decline_phrase_stays_unresolved_and_can_be_followed_by_success() {
+        let (service, browser, _, server) = shopping_service("<p>Payment failed</p>").await;
+        let (_, origin) = browser.shopping_scope().await.unwrap();
+        let tab = browser.handoff().await.unwrap();
+        let observer = tab.clone();
+        let status = Status {
+            operation_id: "fixture-provisional-decline".into(),
+            state: "submitted".into(),
+            ceremony_url: None,
+            filled_fields: vec![],
+            outcome: None,
+            paused: false,
+            reason: None,
+            view_url: None,
+        };
+        service.store.insert(&status, "card", "Fixture").unwrap();
+        service
+            .store
+            .record_order(&status.operation_id, Some(&origin), None, None)
+            .unwrap();
+        *service.private.lock().await = Some(PrivateCheckout {
+            operation_id: status.operation_id.clone(),
+            mode: Mode::Card,
+            view_target: tab.target.clone(),
+            view_session: tab.session.clone(),
+            seen_pages: std::collections::HashSet::from([tab.target.clone()]),
+            tab,
+            discovery: None,
+            recipient: None,
+            capability: "fixture".into(),
+            session: None,
+            approved: true,
+            manual_submission: false,
+            submitted: true,
+            resolves: None,
+        });
+        let watcher = {
+            let service = service.clone();
+            let id = status.operation_id.clone();
+            tokio::spawn(async move { service.watch_outcome(id).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while service.store.get(&status.operation_id).unwrap().state != "uncertain" {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            service.store.unresolved(&origin).unwrap(),
+            Some(status.operation_id.clone())
+        );
+        observer
+            .cdp
+            .evaluate(
+                &observer.session,
+                "document.body.innerText='Order confirmed. What if payment failed?'".into(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), watcher)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            service.store.get(&status.operation_id).unwrap().state,
+            "paid"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn payment_failed_help_text_keeps_manual_required() {
         let (url, server) = crate::discovery::tests::fixture(
             "<h1>Help</h1><p>If your payment failed, check the card and try again.</p>
@@ -3643,6 +3864,36 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(15));
         server.abort();
     }
+    #[tokio::test]
+    async fn approval_details_do_not_expose_private_traveler_values() {
+        let (service, browser, _, server) =
+            shopping_service("<label>Passenger <input value='Alice Example'></label>").await;
+        let tab = browser.handoff().await.unwrap();
+        let (_, fields) = service.approval_order_details(&tab).await;
+        assert!(fields.to_string().contains("Alice Example"));
+        browser.remember_private_traveler_use();
+        let (preview, fields) = service.approval_order_details(&tab).await;
+        assert!(preview.is_none());
+        assert_eq!(fields, json!([]));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn dotted_traveler_dates_are_redacted_from_page_text() {
+        let (service, browser, _, server) =
+            shopping_service("<p>Born 07.05.1990</p><p>Expiry 2030.03.15</p><p>Price 7.05</p>")
+                .await;
+        CheckoutService::remember_sent(&browser, "born_on", "1990-05-07");
+        CheckoutService::remember_sent(&browser, "document_expiry", "2030-03-15");
+        let page = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        let text = page["text"].as_str().unwrap();
+        assert!(text.contains("Born [saved born_on]"), "{text}");
+        assert!(text.contains("Expiry [saved document_expiry]"), "{text}");
+        assert!(text.contains("Price 7.05"), "{text}");
+        drop(service);
+        server.abort();
+    }
+
     #[tokio::test]
     async fn split_birth_dates_are_private_without_redacting_prices_or_flight_dates() {
         let (service, browser, _, server) = shopping_service(
@@ -4143,7 +4394,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            error.to_string().contains("Este campo es obligatorio"),
+            error.to_string().contains("page shows form errors"),
             "{error}"
         );
         // Nothing was recorded or handed off: shopping goes on on the same page.
@@ -4151,6 +4402,72 @@ mod tests {
         assert!(browser.browse(BrowseRequest::Snapshot).await.is_ok());
         server.abort();
     }
+    #[tokio::test]
+    async fn socket_reports_blocked_shop_recovery() {
+        let (service, browser, _, server) = shopping_service("<h1>Shop</h1>").await;
+        let (_, origin) = browser.shopping_scope().await.unwrap();
+        let prior = "a".repeat(64);
+        let status = Status {
+            operation_id: prior.clone(),
+            state: "uncertain".into(),
+            ceremony_url: None,
+            filled_fields: vec![],
+            outcome: None,
+            paused: false,
+            reason: None,
+            view_url: None,
+        };
+        service.store.insert(&status, "card", "Fixture").unwrap();
+        service
+            .store
+            .record_order(&prior, Some(&origin), None, None)
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            directory.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o710),
+        )
+        .unwrap();
+        let socket = directory.path().join("checkout.sock");
+        let api = {
+            let service = service.clone();
+            let socket = socket.clone();
+            tokio::spawn(
+                async move { serve_api(service, &socket, unsafe { libc::geteuid() }).await },
+            )
+        };
+        let mut stream = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match tokio::net::UnixStream::connect(&socket).await {
+                    Ok(stream) => break stream,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let request = Request::Checkout {
+            operation_id: "b".repeat(64),
+            card_id: None,
+            agent_description: "Fixture".into(),
+            take_over: false,
+            resolves: None,
+        };
+        let mut bytes = serde_json::to_vec(&request).unwrap();
+        bytes.push(b'\n');
+        stream.write_all(&bytes).await.unwrap();
+        let mut response = String::new();
+        BufReader::new(stream)
+            .read_line(&mut response)
+            .await
+            .unwrap();
+        let result: Value = serde_json::from_str(&response).unwrap();
+        assert!(result["error"].as_str().unwrap().contains(&prior));
+        assert!(result["error"].as_str().unwrap().contains("resolves"));
+        api.abort();
+        server.abort();
+    }
+
     #[tokio::test]
     async fn an_unresolved_shop_blocks_the_next_checkout_until_the_person_checks_it() {
         let (shop_url, server) = crate::discovery::tests::fixture("<h1>Shop</h1>".into()).await;

@@ -7,6 +7,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+#[derive(Debug)]
+pub(crate) struct BeforeSubmit;
+
+impl std::fmt::Display for BeforeSubmit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Payment was not submitted")
+    }
+}
+
+impl std::error::Error for BeforeSubmit {}
+
 #[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CardInput {
@@ -618,7 +629,7 @@ impl Discovery {
     /// True only when the pay control was clicked. False is a known local
     /// validation stop, not an ambiguous payment attempt.
     pub async fn submit(&self, tab: &PrivateTab) -> Result<bool> {
-        self.recheck(tab).await?;
+        self.recheck(tab).await.context(BeforeSubmit)?;
         let response = run(tab, &self.facts_session, self.main_world, Script::Submit).await?;
         response
             .as_bool()
@@ -1276,7 +1287,14 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        assert!(discovery.submit(&tab).await.is_err());
+        assert!(
+            discovery
+                .submit(&tab)
+                .await
+                .unwrap_err()
+                .downcast_ref::<BeforeSubmit>()
+                .is_some()
+        );
         tab.cdp
             .evaluate(
                 &tab.session,
@@ -2054,6 +2072,11 @@ pub(crate) mod tests {
         // A bare "$" renewal needs the page's region, exactly as the charge
         // total does, so each page states its language.
         for (lang, lines, expected) in [
+            (
+                "en-US",
+                &["Total USD 1.00", "Automatically renews at $12.99/month"][..],
+                Some((1299, "month", None)),
+            ),
             (
                 "en-US",
                 &["Total USD 1.00", "then $12.99 per month after"][..],
@@ -2931,11 +2954,32 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn outcome_omits_totals_for_non_two_decimal_currencies() {
+        let browser = browser().await;
+        for (currency, expected) in [("USD", Some(125_000)), ("JPY", None), ("KWD", None)] {
+            let (url, server) = fixture(format!("Order confirmed. Total {currency} 1250.00")).await;
+            let tab = open(&browser, url).await;
+            let result = tab
+                .cdp
+                .evaluate(&tab.session, include_str!("outcome.js").into())
+                .await
+                .unwrap();
+            assert_eq!(result["merchant_reported_total_minor"].as_u64(), expected);
+            browser.return_control().await.unwrap();
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn fixture_plain_installments_confirmation_and_decline() {
         let browser = browser().await;
         for (outcome, expected) in [
             (
                 "Order confirmed. Order ID FIXTURE-01 Total USD 3.99",
+                "payment_phrase",
+            ),
+            (
+                "Order confirmed. Order ID FIXTURE-01 Total USD 3.99. Help: What if my payment failed?",
                 "payment_phrase",
             ),
             ("Your card was declined", "declined"),

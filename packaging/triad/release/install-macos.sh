@@ -181,6 +181,7 @@ persist_legacy_log_identity() {
 }
 
 load_ids() {
+  local allocated_checkout=false allocated_log=false
   if recorded_checkout_uid="$(field "$enrollment" checkout_uid 2>/dev/null)"; then
     BLOOM_MACOS_CHECKOUT_UID="$recorded_checkout_uid"
     BLOOM_MACOS_CHECKOUT_GID="$(field "$enrollment" checkout_gid)"
@@ -188,6 +189,7 @@ load_ids() {
     BLOOM_MACOS_BROKER_CHECKOUT_GID="$(field "$enrollment" broker_checkout_gid)"
   elif [[ "$action" != uninstall ]]; then
     allocate_checkout_accounts
+    allocated_checkout=true
   fi
   BLOOM_MACOS_BROKER_UID="$(field "$enrollment" broker_uid)"
   BLOOM_MACOS_SIGNER_UID="$(field "$enrollment" signer_uid)"
@@ -198,20 +200,25 @@ load_ids() {
   BLOOM_MACOS_REVOKE_GID="$(field "$enrollment" revoke_gid)"
   if recorded_log_gid="$(field "$enrollment" log_gid 2>/dev/null)"; then
     BLOOM_MACOS_LOG_GID="$recorded_log_gid"
-    return
-  fi
-  if [[ "$action" == uninstall ]]; then BLOOM_MACOS_LOG_GID=""; return; fi
-  if $live; then
+  elif [[ "$action" == uninstall ]]; then
+    BLOOM_MACOS_LOG_GID=""
+  elif $live; then
     if record_exists Groups "$log_group"; then adopt_existing_log_group
     else
-      BLOOM_MACOS_LOG_GID="$(next_id Groups PrimaryGroupID)"; new_group "$log_group" "$BLOOM_MACOS_LOG_GID"
+      BLOOM_MACOS_LOG_GID="$(next_id Groups PrimaryGroupID)"; new_group "$log_group" "$BLOOM_MACOS_LOG_GID"; allocated_log=true
       join_group "$log_group" "$login_user"; dsmemberutil flushcache
     fi
   else
     [[ "${BLOOM_MACOS_LOG_GID:-}" =~ ^[1-9][0-9]*$ ]] || die "BLOOM_MACOS_LOG_GID must be positive decimal"
   fi
-  persist_legacy_log_identity
-  created_groups="${created_groups/ $log_group/}"
+  if $allocated_checkout || $allocated_log || [[ -z "${recorded_log_gid:-}" && "$action" != uninstall ]]; then
+    persist_legacy_log_identity
+    created_users="${created_users/ $checkout_user/}"
+    created_groups="${created_groups/ $checkout_group/}"
+    created_groups="${created_groups/ $machine_checkout_group/}"
+    created_groups="${created_groups/ $broker_checkout_group/}"
+    created_groups="${created_groups/ $log_group/}"
+  fi
 }
 
 allocate_accounts() {
@@ -1073,6 +1080,9 @@ reload_installed_set() {
     reload_launchagent_job "$uid" com.bloom.session "$root_prefix/Library/LaunchAgents/com.bloom.session.plist" || { reload_failed; return 1; }
     reload_launchd_job system "com.bloom.signer.$uid" "$root_prefix/Library/LaunchDaemons/com.bloom.signer.$uid.plist" || { reload_failed; return 1; }
     reload_launchd_job system "com.bloom.broker.$uid" "$root_prefix/Library/LaunchDaemons/com.bloom.broker.$uid.plist" || { reload_failed; return 1; }
+    if [[ -f "$root_prefix/Library/LaunchDaemons/com.bloom.checkout.$uid.plist" ]]; then
+      reload_launchd_job system "com.bloom.checkout.$uid" "$root_prefix/Library/LaunchDaemons/com.bloom.checkout.$uid.plist" || { reload_failed; return 1; }
+    fi
     reload_launchagent_job "$uid" com.bloom.machine "$root_prefix/Library/LaunchAgents/com.bloom.machine.plist" || { reload_failed; return 1; }
     if ! require_triad_health "$uid" "$(field "$record" login_user)" "$(field "$record" release_digest)"; then
       # This login's own check set health_timed_out; keep it as reported.
@@ -1119,6 +1129,7 @@ snapshot_macos_upgrade_state() {
       "Library/LaunchDaemons/com.bloom.signer.$uid.plist"
       "$etc_relative/newsyslog.d/bloom-$uid.conf"
     )
+    [[ ! -f "$root_prefix/Library/LaunchDaemons/com.bloom.checkout.$uid.plist" ]] || paths+=("Library/LaunchDaemons/com.bloom.checkout.$uid.plist")
     [[ ! -f "$root_prefix/etc/pf.anchors/com.bloom.triad.$uid" ]] || paths+=("$etc_relative/pf.anchors/com.bloom.triad.$uid")
   done
   (cd "${root_prefix:-/}" && tar -cpf "$scratch" "${paths[@]}")
@@ -1133,6 +1144,14 @@ snapshot_macos_upgrade_state() {
 restore_macos_upgrade_state() {
   local archive="$upgrade_transaction/rollback-state.tar"
   [[ -f "$archive" && ! -L "$archive" ]] || die "macOS upgrade rollback state is missing or unsafe"
+  # The previous release may not have had a checkout job at all.
+  local record uid
+  for record in "$enrollments"/*.json; do
+    [[ -f "$record" && ! -L "$record" ]] || continue
+    uid="${record##*/}"; uid="${uid%.json}"
+    [[ "$uid" =~ ^[1-9][0-9]*$ ]] || return 65
+    rm -f -- "$root_prefix/Library/LaunchDaemons/com.bloom.checkout.$uid.plist"
+  done
   if $live; then
     # Historical snapshots use etc/... although /etc is a symlink on macOS.
     # Do not enable tar's global symlink-traversal override. Restore those exact

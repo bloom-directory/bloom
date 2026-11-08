@@ -38,6 +38,7 @@ pub struct Browser {
     tab: Mutex<Tab>,
     revoked: AtomicBool,
     unusable: AtomicBool,
+    private_traveler_used: AtomicBool,
     #[cfg(test)]
     fixture_payment_hosts: bool,
     /// Unlocked traveler values and their placeholders, removed from snapshots.
@@ -56,6 +57,14 @@ pub(crate) struct PrivateTab {
 }
 
 impl Browser {
+    pub(crate) fn remember_private_traveler_use(&self) {
+        self.private_traveler_used.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn has_private_traveler_data(&self) -> bool {
+        self.private_traveler_used.load(Ordering::SeqCst)
+    }
+
     pub fn needs_restart(&self) -> bool {
         self.unusable.load(Ordering::SeqCst) || self.cdp.exited()
     }
@@ -125,6 +134,7 @@ impl Browser {
             revoked: AtomicBool::new(false),
             unusable: AtomicBool::new(false),
             redactions: std::sync::RwLock::new(Vec::new()),
+            private_traveler_used: AtomicBool::new(false),
         }))
     }
 

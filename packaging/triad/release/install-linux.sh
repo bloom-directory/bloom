@@ -52,6 +52,15 @@ linux_checkout_browser() {
   done
 }
 
+linux_checkout_relogin_required() {
+  if [[ "$release_upgrade" == true && "$root" == "/" ]] &&
+    id -nG "$login_user" | tr ' ' '\n' | grep -Fxq "bloom-machine-checkout-$login_uid"; then
+    printf 0
+  else
+    printf 1
+  fi
+}
+
 # Each login's private checkout view listens on its own localhost port. Keep
 # the recorded port unless another login holds it; otherwise take the first
 # port from the UID's slot that no login records and nothing listens on.
@@ -1797,6 +1806,7 @@ case "$action" in
     mv -f "$unit_root/bloom-checkout@.service.new" "$unit_root/bloom-checkout@.service"
 
     source_config=""
+    checkout_relogin_required="$(linux_checkout_relogin_required)"
     if [[ "$root" == "/" ]]; then
       systemd-sysusers "$sysusers"
       # tmpfiles may run before NSS observes identities just created by
@@ -1992,7 +2002,7 @@ case "$action" in
       printf '%s\n' \
         "BLOOM_BIN=/usr/bin/bloom" \
         "BLOOM_INSTALL_MODE=triad-linux-systemd" \
-        "BLOOM_RELOGIN_REQUIRED=$([[ "$release_upgrade" == true ]] && printf 0 || printf 1)"
+        "BLOOM_RELOGIN_REQUIRED=$checkout_relogin_required"
     elif [[ "$release_upgrade" == true ]]; then
       finish_linux_upgrade
     fi

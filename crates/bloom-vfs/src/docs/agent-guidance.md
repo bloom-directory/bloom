@@ -45,13 +45,7 @@ Report a failed or partially completed action as a failure, never as done.
 
 ### Cards and online checkout
 
-When `cards/` is present, read `docs/checkout.md` before shopping. Select product
-variants, confirm the cart updated, and finish delivery details before treating
-a displayed total as the final charge. Never ask
-for card or traveler values in chat, shell, or VFS.
-
-Protection depends on separate service principals. Root and root-equivalent
-access, including membership in the Docker group, is outside that claim.
+When `cards/` is present, read `docs/checkout.md` before shopping.
 
 Machine exposes this VFS; Broker controls approval ceremonies and policy;
 Signer holds Bloom wallet keys and signs. Secret ceremony input belongs only
