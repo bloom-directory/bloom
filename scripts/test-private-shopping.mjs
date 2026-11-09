@@ -163,7 +163,10 @@ async function payRefused(page) {
   await page.locator('#saved-card').selectOption('synthetic');
   await page.locator('#unpaid-checked').check();
   await page.locator('#pay-saved').click();
-  await page.waitForFunction(() => /could not be prepared|Check the page/.test(document.getElementById('saved-status').textContent),null,{timeout:30000});
+  await page.waitForFunction(() => /not from a known payment provider/.test(document.getElementById('saved-status').textContent),null,{timeout:30000});
+  // The reason must survive the view's status refresh.
+  await delay(3000);
+  assert.match(await page.locator('#saved-status').textContent(), /not from a known payment provider/);
   assert(await page.locator('#saved-approval').isHidden());
   assert.equal((await privateState(page)).closed,false);
 }
