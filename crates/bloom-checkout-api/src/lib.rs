@@ -31,9 +31,9 @@ pub enum Request {
         #[serde(default)]
         take_over: bool,
         /// With `take_over`, an earlier card or site checkout whose result is
-        /// unknown. The person checks the shop or bank in the private view;
-        /// only their Done there marks it checked and allows another payment
-        /// at that shop.
+        /// unknown. The approved take-over lets the person inspect the shop or
+        /// bank in the private view. Its Done never clears that uncertainty
+        /// or permits another payment at the shop.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resolves: Option<String>,
     },
@@ -145,9 +145,6 @@ pub struct Outcome {
     pub order_id: Option<String>,
     pub merchant_reported_total_minor: Option<u64>,
     pub currency: Option<String>,
-    /// Set when a person marks an unresolved result checked.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resolution: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
