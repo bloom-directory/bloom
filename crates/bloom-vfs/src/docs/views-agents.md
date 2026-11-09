@@ -55,8 +55,8 @@ These pages are deliberately narrow about what they claim:
   a claim that the network is a testnet or that its native asset has no value.
 - Balances cover native coins only; token holdings are not scanned. Chains
   without a native token (Tempo) are skipped.
-- Balance reads for projected accounts share one ten-second budget and up to eight
-  account workers, each reading its configured chains concurrently. A read that does not finish is omitted and named. A recent
+- Balance reads for projected accounts share one ten-second budget and at most
+  eight concurrent provider calls. A read that does not finish is omitted and named. A recent
   successful read (at most five minutes old) stands in for a failed one and is
   disclosed. Activity opens at most 256 operations in each state; older
   records are omitted and the page says coverage is incomplete.
@@ -80,4 +80,5 @@ These pages are deliberately narrow about what they claim:
   exists. Solana receiving addresses must decode to 32 bytes.
 - Receive starts with every wallet collapsed. Native disclosure controls work
   without JavaScript; explicit wallet deep links open the named wallet.
-- Test networks are listed separately. Test funds are not main-network funds.
+- Recognized test networks are listed separately. Other names do not establish
+  whether a network is a mainnet. Test funds are not main-network funds.

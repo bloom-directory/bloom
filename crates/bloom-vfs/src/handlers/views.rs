@@ -354,17 +354,19 @@ impl ViewsHandler {
         let solana: Arc<[String]> = solana_chains.into();
         let jobs = Arc::new(jobs);
         let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let permits = Arc::new(tokio::sync::Semaphore::new(PORTFOLIO_CONCURRENCY));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut reads = tokio::task::JoinSet::new();
         let workers = PORTFOLIO_CONCURRENCY.min(jobs.len());
         for _ in 0..workers {
-            let (this, evm, solana, jobs, next, tx) = (
+            let (this, evm, solana, jobs, next, tx, permits) = (
                 this.clone(),
                 evm.clone(),
                 solana.clone(),
                 jobs.clone(),
                 next.clone(),
                 tx.clone(),
+                permits.clone(),
             );
             reads.spawn(async move {
                 loop {
@@ -381,7 +383,8 @@ impl ViewsHandler {
                             account,
                             address,
                         } => {
-                            let mut read = this.read_balances(wallet, *address, &evm).await;
+                            let mut read =
+                                this.read_balances(wallet, *address, &evm, &permits).await;
                             for holding in &mut read.holdings {
                                 holding.account.clone_from(account);
                             }
@@ -392,7 +395,7 @@ impl ViewsHandler {
                             account,
                             address,
                         } => {
-                            this.read_solana_balances(wallet, account, address, &solana)
+                            this.read_solana_balances(wallet, account, address, &solana, &permits)
                                 .await
                         }
                     };
@@ -477,9 +480,9 @@ impl ViewsHandler {
         self.sorted_chains()
             .into_iter()
             .filter(|chain| {
-                self.chains
-                    .get(chain)
-                    .is_some_and(|client| seen.insert(client.spec().chain_id))
+                self.chains.get(chain).is_some_and(|client| {
+                    client.spec().has_native_asset() && seen.insert(client.spec().chain_id)
+                })
             })
             .collect()
     }
@@ -514,6 +517,7 @@ impl ViewsHandler {
         owner: &str,
         address: alloy::primitives::Address,
         chains: &[String],
+        permits: &Arc<tokio::sync::Semaphore>,
     ) -> BalanceRead {
         let mut reads = tokio::task::JoinSet::new();
         let mut seen_chains = BTreeSet::new();
@@ -525,7 +529,9 @@ impl ViewsHandler {
                 continue;
             }
             let name = chain.clone();
+            let permits = permits.clone();
             reads.spawn(async move {
+                let _permit = permits.acquire().await.expect("semaphore remains open");
                 let symbol = client.spec().native_symbol.clone();
                 let decimals = client.spec().native_decimals;
                 let chain_id = client.spec().chain_id;
@@ -607,6 +613,7 @@ impl ViewsHandler {
         account: &str,
         address: &str,
         chains: &[String],
+        permits: &Arc<tokio::sync::Semaphore>,
     ) -> BalanceRead {
         let Some(registry) = self.solana.clone() else {
             return BalanceRead::default();
@@ -618,7 +625,9 @@ impl ViewsHandler {
             };
             let name = chain.clone();
             let address = address.to_owned();
+            let permits = permits.clone();
             reads.spawn(async move {
+                let _permit = permits.acquire().await.expect("semaphore remains open");
                 let lamports =
                     match tokio::time::timeout(BALANCE_TIMEOUT, client.get_balance(&address)).await
                     {
@@ -1106,12 +1115,10 @@ impl ViewsHandler {
         let (mainnets, testnets): (Vec<String>, Vec<String>) =
             self.sorted_chains().into_iter().partition(|name| {
                 !is_test_network(name)
-                    && !self.chains.get(name).is_some_and(|client| {
-                        matches!(
-                            client.spec().chain_id,
-                            11155111 | 17000 | 31337 | 1337 | 84532 | 421614 | 42431
-                        )
-                    })
+                    && !self
+                        .chains
+                        .get(name)
+                        .is_some_and(|client| is_test_chain_id(client.spec().chain_id))
             });
 
         let mut body = String::new();
@@ -1252,7 +1259,7 @@ impl ViewsHandler {
             .map(|name| self.network_label(name))
             .collect();
         let networks = match names.as_slice() {
-            [] => "<p class=\"receiving-network\">No networks are configured for this address yet.</p>"
+            [] => "<p class=\"receiving-network\">No other EVM networks are configured.</p>"
                 .to_owned(),
             [only] => format!(
                 "<p class=\"receiving-network\">One address on {}.</p>",
@@ -2467,10 +2474,8 @@ fn explorer_address_link(chain_id: Option<u64>, address: &str) -> String {
     )
 }
 
-/// A test network is named as one. No chain spec carries a testnet flag, so
-/// the name is the only signal available — the same rule the design prototype
-/// used. Being wrong in the safe direction means a main network is disclosed
-/// as a test one, never the reverse.
+/// Recognize common test network names. Unknown names do not establish an
+/// environment; callers must not label the remaining networks as mainnets.
 fn is_test_network(chain: &str) -> bool {
     let name = chain.to_ascii_lowercase();
     [
@@ -2484,6 +2489,10 @@ fn is_test_network(chain: &str) -> bool {
     ]
     .iter()
     .any(|part| name.contains(part))
+}
+
+fn is_test_chain_id(id: u64) -> bool {
+    matches!(id, 11155111 | 17000 | 31337 | 1337 | 84532 | 421614 | 42431)
 }
 
 fn fresh_quote(timestamp: u64, now: u64) -> bool {
@@ -2810,6 +2819,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn activity_renders_serialized_token_and_nft_facts() {
+        let fixture = fixture();
+        let recipient = "0x0000000000000000000000000000000000000001";
+        let contract = "0x0000000000000000000000000000000000000002";
+        let token = bloom_proto::TokenRef {
+            address: contract.into(),
+            symbol: "USDC".into(),
+            decimals: 6,
+            recipient: recipient.into(),
+            amount: "12".into(),
+            amount_base_units: Some("12000000".into()),
+        };
+        let nft = bloom_proto::NftRef {
+            action: bloom_proto::NftAction::Transfer,
+            contract: contract.into(),
+            kind: "erc721".into(),
+            symbol: "ART".into(),
+            token_id: "42".into(),
+            counterparty: recipient.into(),
+            amount: "1".into(),
+            approved: None,
+        };
+        for (id, kind, key, value) in [
+            (
+                "token",
+                "erc20_transfer",
+                "token",
+                serde_json::to_value(token).unwrap(),
+            ),
+            (
+                "nft",
+                "nft_transfer",
+                "nft",
+                serde_json::to_value(nft).unwrap(),
+            ),
+        ] {
+            let mut intent = serde_json::json!({"action_kind":kind,"to":contract,"value_wei":"0"});
+            intent[key] = value;
+            stage_files(
+                &fixture,
+                "pending",
+                id,
+                "# Transfer",
+                &[("intent.json", &intent.to_string())],
+            );
+        }
+        let html = render(&fixture.handler, ACTIVITY_HTML).await;
+        for fact in [
+            "12 USDC",
+            "ART",
+            "#42",
+            recipient,
+            contract,
+            "(contract)",
+            "Native value",
+        ] {
+            assert!(html.contains(fact), "missing {fact}");
+        }
+    }
+
+    #[tokio::test]
     async fn wallets_page_renders_every_projected_wallet() {
         let mut fixture = fixture();
         let reader = crate::test_support::wallet_projection_reader("first", ADDRESS);
@@ -2992,12 +3062,28 @@ mod tests {
             format!("solana:mainnet:{SOLANA}"),
         ];
         projection.keys.push(solana_key);
+        let solana = bloom_solana::SolanaChainRegistry::new();
+        solana.add(
+            bloom_solana::SolanaClient::build(&bloom_proto::SolanaSpec {
+                name: "solana-devnet".into(),
+                endpoints: vec![bloom_proto::EndpointSpec {
+                    url: "http://127.0.0.1:1".into(),
+                    weight: 100,
+                    cu_per_sec: None,
+                    max_rps: None,
+                    http_only: false,
+                }],
+                expected_genesis_base58: None,
+            })
+            .unwrap(),
+        );
         let handler = ViewsHandler::new(
             crate::test_support::wallet_projection_reader_from(projection),
             ChainRegistry::default(),
             bloom_prices::PricesClient::with_base_url("http://127.0.0.1:1"),
             fixture.handler.outbox,
-        );
+        )
+        .with_solana_reads(solana);
 
         let html = render(&handler, RECEIVE_HTML).await;
         assert!(
@@ -3011,6 +3097,8 @@ mod tests {
             "duplicate CAIP identities must render one Solana card: {html}"
         );
         assert!(html.contains("Send on Solana only."), "{html}");
+        assert!(html.contains("solana-devnet"));
+        assert!(!html.contains("explorer.solana.com/address/"));
     }
 
     #[tokio::test]
@@ -3104,6 +3192,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn balance_calls_share_a_limit_across_accounts_and_chains() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = accepted.clone();
+        let server = tokio::spawn(async move {
+            let mut sockets = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                sockets.push(socket);
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let fixture = fixture();
+        let chains = ChainRegistry::new();
+        for id in 1..=5 {
+            let mut spec = bloom_proto::ChainSpec::anvil_default();
+            spec.name = format!("chain-{id}");
+            spec.chain_id = id;
+            spec.rpc_urls = vec![url.clone()];
+            chains.add(bloom_evm::ChainClient::new(spec).unwrap());
+        }
+        let handler = ViewsHandler::new(
+            fixture.handler.projections,
+            chains,
+            bloom_prices::PricesClient::with_base_url("http://127.0.0.1:1"),
+            fixture.handler.outbox,
+        );
+        let jobs = (1..=4)
+            .map(|n| BalanceJob::Evm {
+                wallet: "alice".into(),
+                account: n.to_string(),
+                address: alloy::primitives::Address::repeat_byte(n),
+            })
+            .collect();
+        let names = handler.sorted_chains();
+        let task = tokio::spawn(async move {
+            handler
+                .read_all_balances(&mut Portfolio::default(), jobs, &names, &[])
+                .await;
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            PORTFOLIO_CONCURRENCY
+        );
+        task.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn recent_balance_survives_a_transient_rpc_failure() {
         let fixture = fixture_with_unreachable_chains();
         let address = ADDRESS.parse::<alloy::primitives::Address>().unwrap();
@@ -3127,7 +3265,12 @@ mod tests {
 
         let read = fixture
             .handler
-            .read_balances("alice", address, &["ethereum".into()])
+            .read_balances(
+                "alice",
+                address,
+                &["ethereum".into()],
+                &Arc::new(tokio::sync::Semaphore::new(PORTFOLIO_CONCURRENCY)),
+            )
             .await;
 
         assert!(read.unavailable.is_empty(), "recent observation is usable");
@@ -3718,6 +3861,10 @@ mod tests {
         for name in ["ethereum", "base", "arbitrum", "solana-mainnet"] {
             assert!(!is_test_network(name), "{name} is a main network");
         }
+        for id in [11155111, 17000, 31337, 1337] {
+            assert!(is_test_chain_id(id));
+        }
+        assert!(!is_test_chain_id(1));
     }
 
     #[test]
@@ -3778,6 +3925,7 @@ mod tests {
             ("ethereum", 1u64, "Ethereum"),
             ("base", 8453, "Base"),
             ("tempo", 4217, "Tempo"),
+            ("tempo-moderato", 42431, "Tempo Moderato"),
             ("robinhood", 4663, "Robinhood Chain"),
         ] {
             chains.add(
