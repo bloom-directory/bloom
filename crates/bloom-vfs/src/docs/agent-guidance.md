@@ -4,7 +4,7 @@ This is the operating contract for agents using the mounted Bloom virtual
 filesystem. Treat the directory containing this file as the VFS root and keep
 all paths mount-relative. Keep scratch files outside the mount.
 
-`ls` the mount and read `next.md` (actions needing attention). Read on demand:
+`ls` the mount and read `next.md` (pending outbox entries, approvals and policy updates). Read on demand:
 `cat docs/README.md` lists every route, `docs/examples.md` has command
 walkthroughs (including contract deploys and local Anvil), `docs/wallets.md` covers accounts, wallet creation, recovery,
 passkeys and sessions, and `docs/petals.md` lists installed Petals. Read a
