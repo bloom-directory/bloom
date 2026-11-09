@@ -4695,6 +4695,13 @@ async fn run(cli: Cli) -> Result<()> {
                     Some(tokio::task::spawn_blocking(move || {
                         let results = petal_provisioning::provision(&daemon, &context);
                         default_policy::apply_provisioned_settings(&daemon, &results);
+                        // Machine is already serving, so a Petal's code can be
+                        // running when its update would activate, and a
+                        // download can fail. Try those installs again rather
+                        // than leave them out.
+                        petal_provisioning::retry_pending(&daemon, &context, &results, |retried| {
+                            default_policy::apply_provisioned_settings(&daemon, retried);
+                        });
                         results
                     }));
             }));

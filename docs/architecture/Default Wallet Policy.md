@@ -417,8 +417,12 @@ recorded by `complete = true` under `[setup]`, saved together with the
 choices once the menu finishes; a config file on its own proves nothing,
 because `bloom serve` creates one too, and an interrupted menu saves nothing.
 An empty `[setup.wallets.main]` is not the marker either: declining every Petal is
-a valid choice. Scripts and packaged installs record the catalog's
-suggestions instead of asking. Later runs of `bloom init` see the marker and
+a valid choice. A `bloom init` run without a terminal records the catalog's
+suggestions instead of asking. A packaged install runs Machine as a service,
+which holds the home, so `bloom init` cannot run there and no setup is
+recorded: `bloom wallet new main` then proposes nothing and says to choose a
+persona with `bloom wallet persona main <persona>`, which works through the
+running Machine. Later runs of `bloom init` see the marker and
 use the config as it is, with the catalog's suggestions for any value not
 saved.
 
@@ -450,8 +454,8 @@ chosen Petals:
   "wallet_id": "main",
   "maximum_approval_lifetime_ms": 2592000000,
   "allowed_petal_packages": [
-    "d811c181c7ec469026335c9265d7019a520d8d9d882b302064278cf1138d2db2",
-    "17a50dda0894b7b7e5757033806f8ec31523575438419ea1330b731a2c6c5d14"
+    "05fa377aa2b2df95a87a21ba58733e95b145d3f10c6a297ebcf969dfc5f8e08b",
+    "036cce365ff7cfe5c3e35754fc4c15097576c6251eb2277b890cdae673b234fd"
   ],
   "allowed_destinations": [
     { "chain": "polygon", "destination": "petal:polymarket" }
@@ -462,7 +466,7 @@ chosen Petals:
 
 - **`allowed_petal_packages`** lists each chosen Petal by its installed
   package hash. On an up-to-date home that is the hash Bloom's catalog pins:
-  Hyperliquid v0.1.9 and Polymarket v0.2.0. A home still updating proposes
+  Hyperliquid v0.1.10 and Polymarket v0.2.1. A home still updating proposes
   the release it runs. Until proposals from Petal changes are built
   (section 5), the Petal's first signed action after the update opens a
   policy ceremony that allows the new hash (`ensure_petal_eligibility`).
@@ -494,7 +498,27 @@ chosen Petals:
 3. Machine proposes every chosen, installed Petal together through the
    wallet's existing policy operation, the same pending-proposal flow the
    mounted `wallets/<wallet>/policy.json` uses. The command prints that
-   ceremony's URL once.
+   ceremony's URL once. The default policy is proposed only once every
+   chosen Petal is installed, so the owner approves it in one ceremony. For a
+   wallet created first, while one is still installing after Machine
+   started, Machine proposes nothing: the command names the missing Petals
+   and says to run `bloom wallet default-policy <wallet>` once they are
+   installed, or to restart Bloom if one stays missing, and `bloom wallet
+   new` adds that creating the wallet once `bloom petals ls` lists them gets
+   the policy in the same step. The wallet keeps the policy creation
+   installed, so that command then proposes the whole default policy. A
+   policy that has changed since creation is never proposed this way, so
+   for it a missing Petal is only named alongside what the policy allows
+   or lacks. A persona switch likewise starts only with every chosen Petal
+   installed; otherwise nothing changes and the command says to run it
+   again. A switch's proposal can still be made later, after a chosen
+   Petal was uninstalled, and then leaves it out, so Machine records which
+   Petals the proposal included and describes the switch's ceremony by
+   that record, not by what is installed now. A Petal uninstalled while a
+   switch waits for approval is named once it is approved: as
+   allowed but not installed when the approved policy allows its catalog
+   release, otherwise with `bloom wallet default-policy <wallet>` to run
+   once it is installed, which then says how to add it.
 4. Once the owner completes the ceremony, the next check commits the policy,
    and the command reports that `main` now allows the chosen Petals.
 
@@ -506,9 +530,10 @@ already installed while `main`'s account is known not to exist. For an
 installed Petal whose account exists or cannot be checked, it clears any
 marker instead. On a new home `main` does not exist when `bloom init` runs,
 so its settings write is refused and the marker stays. The first check after
-`main` appears writes the settings: the wallet-creation flow's, `bloom wallet
-default-policy main`, a rerun of `bloom init` once `main` exists, or `bloom
-serve`, which checks every 30 seconds while a write is queued, so a `main`
+`main` appears writes the settings: the wallet-creation flow's or `bloom
+wallet default-policy main` once every chosen Petal is installed (until then
+both stop before writing), a rerun of `bloom init` once `main` exists, or
+`bloom serve`, which checks every 30 seconds while a write is queued, so a `main`
 an agent creates by writing `wallets/new` gets them too. A rerun of `bloom
 init` covers a home where `main` already existed, so no wallet creation
 follows. A rerun or `bloom serve` that updates the Petal makes a queued
@@ -536,12 +561,13 @@ else there may be the owner's, so it stays: Machine clears the marker and
 logs the command that would apply setup's choice.
 
 The key is pinned with the releases checked to store settings there
-(`releases` in the catalog's settings template): Polymarket v0.2.0, the
-catalog's release, and v0.1.6 and v0.1.8, which Bloom v0.4.0 and v0.4.1
-installed and a home may still run while it updates. v0.2.0 moved to a newer
-Petal SDK, whose `state` namespace and `venue_config_key` are unchanged.
+(`releases` in the catalog's settings template): Polymarket v0.2.1, the
+catalog's release, and v0.1.6, v0.1.8 and v0.2.0, which earlier Bloom
+releases installed and a home may still run while it updates. v0.2.0 moved to
+a newer Petal SDK, whose `state` namespace and `venue_config_key` are
+unchanged; v0.2.1 changes neither.
 Setup writes only when the installed package hash is one of them, and the
-signed lineage carries a write made to an earlier one forward to v0.2.0.
+signed lineage carries a write made to an earlier one forward to v0.2.1.
 Another release under the same name, such as a fork or a newer
 release whose key nobody has checked, may store its settings elsewhere, where
 the check could not see them, so Machine keeps what it holds and clears the
@@ -611,7 +637,39 @@ config; the owner can explicitly apply them later.
 
 Catalog Petals are installed and updated in two places: `bloom init`
 (`ensure_preinstalled_petals`) and every `bloom serve` start
-(`petal_provisioning::provision`). A fresh install receives the saved settings
+(`petal_provisioning::provision`). `bloom serve` installs them after it is
+ready, so Petal code can be running, such as setup writing Polymarket's
+settings right after `bloom wallet new`. The Petal store refuses to change a
+Petal's package while that Petal's code runs (bloom#328). Each Petal has its
+own gate, so another Petal's calls, MCP resource reads included, never hold
+up an install, and a first install, which no call can be running, goes in at
+once; an uninstall is refused while any Petal's code runs. MCP resource
+reads check that a Petal route's read does not act under that Petal's gate
+rather than Machine's Petal mutation lock. A parameterized route counts as
+acting until a lookup evaluates it, so an MCP read looks such a route up
+first, as `bloom vfs stat` would; a read refused under the gate, because the
+package changed after the first check, gets the same "not an inert
+resource" error as one refused before it ran. When an install is refused, Machine
+tries it again after one second, doubling the wait up to one minute and
+staying there while it runs. A retry downloads and stages the package, then
+takes Machine's Petal mutation lock in turn, as listing and managing Petals
+do, and queues for its turn to activate for up to 3 seconds by the clock:
+that Petal's calls already running finish, and its calls that start
+meanwhile wait behind it (`PetalStore::activation_permit_waiting`). So
+agents calling a Petal back to back, even several at once or through MCP,
+cannot starve its update, and none of that Petal's calls, and no Petal
+listing, waits on it for more than 3 seconds. If the Petal's running calls outlast that, it lets them go
+and tries again in its next round. A release file that fails to download is
+tried again on the same schedule, six times, about a minute in all; a
+failed check of what was downloaded, such as its checksum, is not, since
+another attempt cannot change it. Any other failure, or a download that
+still fails, waits for the next start, so the log says to restart
+Bloom: `bloom init` cannot open a running home, and installing from a
+Petal's repository builds a different package from the one the catalog
+pins. An install cancelled because Machine is stopping says only that.
+Opening the store removes staging directories an earlier Machine left
+behind, such as one killed mid-install, once they are an hour old. A fresh install
+receives the saved settings
 when the Petal stores nothing for them, which holds unless the same release
 was installed before and its settings kept. An update receives them
 only when the default wallet is known not to exist, and on the same terms.
@@ -774,7 +832,7 @@ this design and those stacks:
   bloom-petal-polymarket#19 order.
   bloom#377's pins speak Broker–Signer 1.8 and Machine–Broker 1.10.
   Polymarket coverage also needs a published Polymarket package that
-  declares its debits to Broker. None does yet: v0.1.6, v0.1.8 and v0.2.0
+  declares its debits to Broker. None does yet: v0.1.6 to v0.2.1
   (pinned here) declare none for any signature.
   bloom-petal-polymarket#19 adds them for bloom#352, and
   bloom-petal-polymarket#26, which contains it, for bloom#377; both conflict
@@ -976,10 +1034,49 @@ Automated:
   as awaiting the owner, is replaced by a new ceremony
   (`crates/bloom-vfs/tests/triad_policy_update.rs`).
 - Catalog provisioning reports an update separately from a fresh install.
-- A queued write goes into Polymarket v0.1.6 and v0.1.8 as well as the
-  catalog's v0.2.0, which store settings under the same key. On v0.1.5, an
+  An install refused because that Petal's code was running is reported as busy and
+  tried again, with a doubling wait capped at one minute, until it goes in
+  or Machine stops; a failed download is tried again six times, and a failed
+  checksum is not. Any other failure says to restart Bloom, and a
+  cancellation does not (`crates/bloom/src/petal_provisioning.rs`). While a
+  Petal's code runs, a plain install of it is refused at once; with a
+  retrying install queued, a call to that Petal starting after it waits
+  behind it for no longer than its limit, it activates as soon as the
+  running call ends, and it stops when cancelled or past its limit. Another
+  Petal's calls neither hold up an install nor wait behind one, and an MCP
+  resource read holds up no install. Callers that hold the Petal mutation
+  lock back to back cannot keep a plain or retrying install from it
+  (`crates/bloom-daemon/src/ipc.rs`). Under an inert read, a route whose read
+  acts is refused under its Petal's gate, including after a package change
+  that makes it act, and is reported as refused for acting; a setup write's
+  stored check waits while that Petal's package changes
+  (`crates/bloom-petals/src/router.rs`). An MCP read of a route not yet
+  evaluated looks it up first, and any refusal for acting gets the same
+  error (`crates/bloom-daemon/src/ipc.rs`).
+  The store refuses a package change during a Petal call with a typed busy
+  error (`crates/bloom-petals/src/runner.rs`), refuses an install that holds a permit
+  for another Petal, keeps every held gate when it forgets idle ones, and
+  removes abandoned staging when opened (`crates/bloom-petals/src/store.rs`).
+  A real failed `curl` download is marked for retry
+  (`crates/bloom/src/github_source.rs`).
+- With a chosen Petal not installed, Machine proposes no default policy
+  while one could be proposed: for a setup the owner just chose, before
+  Broker is asked, and otherwise while the policy is the one creation
+  installed. The command names the missing Petals and what to run without
+  calling it skipped; a persona switch starts nothing and records no waiting
+  switch. A switch records the Petals its proposal included, and its
+  ceremony lists them; a Petal it left out but installed since is named as
+  not installed when it was proposed, never as not installed now or as
+  changed, and a record or status with fields a build does not know still
+  reads. After a switch, a missing Petal its policy
+  allows is named as allowed, and one it does not is named with
+  `bloom wallet default-policy`.
+  The new status carries the list, and the others are unchanged on the
+  wire.
+- A queued write goes into Polymarket v0.1.6, v0.1.8 and v0.2.0 as well as
+  the catalog's v0.2.1, which store settings under the same key. On v0.1.5, an
   earlier release whose route differs, it stays queued for the update; any
-  other release gets nothing. The catalog bump test lists all three and
+  other release gets nothing. The catalog bump test lists all four and
   checks each is the catalog release or one it updates from.
 - Enso's router is proposed on exactly the 12 chains pinned Enso v0.1.7
   allows. Polymarket's entry is `petal:polymarket`, and a call to pUSD staged
