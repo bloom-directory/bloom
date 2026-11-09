@@ -29,6 +29,9 @@ pub use bloom_checkout_api::{HistoryEntry, Request, Status};
 mod saved;
 pub use saved::SavedAction;
 
+/// Marks a pre-submit page Checkout could not read.
+const UNREADABLE: &str = "\u{0}";
+
 /// Approval links last fifteen minutes; allow a short result-delivery grace.
 const APPROVAL_RESULT_WAIT: Duration = Duration::from_secs(15 * 60 + 30);
 
@@ -336,6 +339,8 @@ pub struct CheckoutService {
     pub browser: Arc<Browser>,
     store: Store,
     private: AsyncMutex<Option<PrivateCheckout>>,
+    /// The operation and its top-document text before each submission.
+    before_submit: Mutex<Option<(String, String)>>,
     completed: Mutex<Option<CompletedView>>,
     broker_socket: PathBuf,
     broker_uid: u32,
@@ -434,6 +439,7 @@ impl CheckoutService {
             browser,
             store,
             private: AsyncMutex::new(None),
+            before_submit: Mutex::new(None),
             completed: Mutex::new(None),
             broker_socket,
             broker_uid,
@@ -941,6 +947,8 @@ impl CheckoutService {
         };
         let mut status = self.store.consume(&checkout.operation_id)?; // Durable before plaintext.
         if checkout.mode == Mode::Site {
+            self.remember_before_submit(&checkout.operation_id, &checkout.tab)
+                .await;
             // Record the submission attempt first; a lost response must not cause a second click.
             status.state = "submitted".into();
             self.store.update(&status)?;
@@ -1013,6 +1021,8 @@ impl CheckoutService {
         if std::env::var_os("BLOOM_CHECKOUT_REHEARSAL_NO_SUBMIT").is_some() {
             return Ok(());
         }
+        self.remember_before_submit(&checkout.operation_id, &checkout.tab)
+            .await;
         // Record the submission attempt first; a lost response must not cause a second click.
         status.state = "submitted".into();
         self.store.update(&status)?;
@@ -1186,6 +1196,44 @@ impl CheckoutService {
         Ok(session)
     }
 
+    /// Records the top document's address and text just before a submission,
+    /// so success copy already on the page cannot count as its result.
+    async fn remember_before_submit(&self, id: &str, tab: &PrivateTab) {
+        let read = async {
+            let contexts = tab.cdp.contexts(&tab.session, "bloom-outcome").await?;
+            let top = contexts
+                .iter()
+                .find(|c| c.parent_id.is_none())
+                .context("Document unavailable")?;
+            let result = tab.cdp.call(Some(&top.session), "Runtime.evaluate", json!({"contextId":top.world,"returnByValue":true,
+                "expression":"(location.origin+location.pathname+'\\n'+document.body.innerText).toLowerCase()"})).await?;
+            result["result"]["value"]
+                .as_str()
+                .map(str::to_owned)
+                .context("Document text unavailable")
+        };
+        // An unreadable page leaves no success copy that can count.
+        let text = tokio::time::timeout(Duration::from_secs(2), read)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_else(|| UNREADABLE.into());
+        let mut before = self.before_submit.lock();
+        match before.as_mut() {
+            Some((saved, earlier)) if saved == id => earlier.push_str(&text),
+            _ => *before = Some((id.into(), text)),
+        }
+    }
+
+    fn new_since_submit(&self, id: &str, phrase: &str) -> bool {
+        match self.before_submit.lock().as_ref() {
+            Some((saved, text)) if saved == id => {
+                !phrase.is_empty() && !text.contains(UNREADABLE) && !text.contains(phrase)
+            }
+            _ => !phrase.is_empty(),
+        }
+    }
+
     async fn watch_outcome(&self, id: String) {
         let started = tokio::time::Instant::now();
         let mut copied_contact = false;
@@ -1274,11 +1322,17 @@ impl CheckoutService {
                 let outcome = observed
                     .iter()
                     .find_map(|(is_top, outcome)| {
+                        // Success copy the page already showed before the
+                        // submission is not evidence that it paid.
+                        let new = completed_allowed
+                            && outcome["phrase"]
+                                .as_str()
+                                .is_some_and(|phrase| self.new_since_submit(&id, phrase));
                         let terminal = match outcome["state"].as_str() {
-                            Some("booked") if *is_top && completed_allowed => Some("booked"),
+                            Some("booked") if *is_top && new => Some("booked"),
                             // Help text can say "payment failed" before anyone pays.
                             Some("declined") if *is_top && attempt => Some("declined"),
-                            Some("payment_phrase") if *is_top && completed_allowed => Some("paid"),
+                            Some("payment_phrase") if *is_top && new => Some("paid"),
                             _ => None,
                         }?;
                         Some((terminal, outcome))
@@ -1317,6 +1371,9 @@ impl CheckoutService {
                         let mut recorded = (*outcome).clone();
                         if state == "paid" {
                             recorded["state"] = json!("paid");
+                        }
+                        if let Some(fields) = recorded.as_object_mut() {
+                            fields.remove("phrase");
                         }
                         let close = !self
                             .saved
@@ -1585,6 +1642,7 @@ impl CheckoutService {
                         tokio::time::timeout(Duration::from_secs(2), discovery.recheck(&tab))
                             .await
                             .map_err(|_| anyhow::anyhow!("Private page is still loading"))??;
+                        self.remember_before_submit(&operation_id, &tab).await;
                         {
                             let mut private = self.private.lock().await;
                             let checkout = private
@@ -1671,6 +1729,7 @@ impl CheckoutService {
                     )
                     .await
                     .map_err(|_| anyhow::anyhow!("Private page is still loading"))??;
+                    self.remember_before_submit(&operation_id, &tab).await;
                     {
                         let mut private = self.private.lock().await;
                         let checkout = private
@@ -2091,6 +2150,25 @@ mod tests {
         assert_eq!(watch_briefly(&service, &id).await, "needs_input");
         server.abort();
         let (service, id, _, server) = watched_checkout(page, "needs_input", true, false).await;
+        assert_eq!(watch_briefly(&service, &id).await, "paid");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn success_copy_shown_before_submission_is_not_a_result() {
+        let page = "<p>Order confirmed emails arrive within a minute.</p><button>Pay</button>";
+        let (service, id, _, server) = watched_checkout(page, "submitted", true, false).await;
+        let tab = service.private.lock().await.as_ref().unwrap().tab.clone();
+        service.remember_before_submit(&id, &tab).await;
+        assert_eq!(watch_briefly(&service, &id).await, "submitted");
+        // The merchant's own confirmation after the submission still counts.
+        tab.cdp
+            .evaluate(
+                &tab.session,
+                "document.body.innerText='Thank you for your order'".into(),
+            )
+            .await
+            .unwrap();
         assert_eq!(watch_briefly(&service, &id).await, "paid");
         server.abort();
     }
@@ -2729,11 +2807,25 @@ mod tests {
             service.store.unresolved(&origin).unwrap(),
             Some(status.operation_id.clone())
         );
+        // Mixed success and failure copy proves neither.
         observer
             .cdp
             .evaluate(
                 &observer.session,
                 "document.body.innerText='Order confirmed. What if payment failed?'".into(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            service.store.get(&status.operation_id).unwrap().state,
+            "uncertain"
+        );
+        observer
+            .cdp
+            .evaluate(
+                &observer.session,
+                "document.body.innerText='Order confirmed'".into(),
             )
             .await
             .unwrap();
