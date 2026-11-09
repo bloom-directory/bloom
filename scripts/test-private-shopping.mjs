@@ -123,7 +123,7 @@ async function approve(url, kind, cancel = false) {
   }
   if (kind === 'card') await auth.locator('#card-cvc').fill('937');
   await auth.locator('#approve').click();
-  await auth.waitForFunction(() => /Approved\.|saved\.|browser is yours/.test(document.getElementById('status').textContent),null,{timeout:30000});
+  await auth.waitForFunction(() => /Approved\.|saved( privately)?\.|browser is yours/.test(document.getElementById('status').textContent),null,{timeout:30000});
 }
 async function privateClick(page,x,y) {
   await page.locator('#screen').waitFor({state:'visible'});
