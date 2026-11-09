@@ -356,10 +356,11 @@ CLOB orders under `polymarket.order.poly1271` the same way. Naming a
 `fee_asset` on any of those would deny most of that venue's legitimate
 traffic.
 
-A builder-coded order is the one claim that declares a fee, so it signs under
-its own class through a dedicated route. Enrollment catalogues those classes,
-and only those, with the asset the Petal declares; Broker then counts the
-declared fee against the approval's value limits instead of refusing it.
+A builder-coded order is the one claim shape that declares a fee, so it signs
+under its own class through a dedicated route. Enrollment catalogues the single
+class in the table below, with the asset named there — the table is the source
+of that asset, not the Petal's manifest — and Broker then counts the declared
+fee against the approval's value limits instead of refusing it.
 
 | Fee-bearing class | Fee asset | Fee-free sibling |
 |---|---|---|
@@ -398,9 +399,9 @@ A declared fee is not a bound. It is what Broker counts against the approval's
 value limits, and on a venue that does not enforce it the two can diverge:
 Polymarket's CLOB V2 order carries no fee field, its operator supplies the fee
 at settlement, and a review of bloom-petal-polymarket reproduced a signed
-50 pUSD buy settling for 550 — a figure from that
-review rather than from anything reproducible in this repository. A class whose declared fee nothing enforces is
-only honest in the direction the signature does bound, which is why
+50 pUSD buy settling for 550 — a figure from that review rather than from
+anything reproducible in this repository. A class whose declared fee nothing
+enforces is only honest in the direction the signature does bound, which is why
 bloom-petal-polymarket#10 refuses a buy on its builder-code route and signs
 only sells, where the outflow is the shares the order commits to. That
 reasoning is the evidence behind the precondition stated below, which is the
@@ -429,10 +430,12 @@ Cataloguing makes the claim authorizable, not reviewed. Broker reviews a class
 only if it is registered in `MESSAGE_REVIEW_OPERATION_CLASSES` or
 `POLYMARKET_REVIEW_OPERATION_CLASSES`, and the one catalogued fee-bearing
 class is in neither, so a builder order is not required to carry the decoded
-order review its fee-free sibling must. A session-signed one is further outside Broker's delegated-action
-witness, which matches `hyperliquid.agent_action` with no declared fee — and
-cannot be authorized at all today, because the reusable key-scope approval
-carries empty `value_limits` and a declared fee is the first value to reach it.
+order review `hyperliquid.order` must — of the two fee-free siblings named
+above, only that one is registered. A session-signed builder order is further
+outside Broker's delegated-action witness, which matches
+`hyperliquid.agent_action` with no declared fee — and cannot be authorized at
+all today, because the reusable key-scope approval carries empty `value_limits`
+and a declared fee is the first value to reach it.
 The pin moved with master, and the revision pinned here now *does* have
 `message_review.rs` with its per-venue modules, and `agent_action` in
 `service.rs`. An earlier revision of this section said it had neither; the

@@ -372,21 +372,32 @@ fn refresh_developer_provenance_catalog(
         // anyway — enrolment only re-derives the package hash on disk — so the
         // override would be the only way out.
         //
-        // What makes that safe is not the flag. Broker reads lineage `active`
-        // only on the scope-derived key path (`prepare_petal_key_scope` and
-        // `validate_scoped_route_lineage`); a plain Petal approval never
-        // consults it, and an inactive record's `fee_asset` still decides the
-        // claim. The reason no claim can name a superseded package is that
+        // What makes that safe is not the flag. Broker's only per-claim reads
+        // of lineage `active` are on the scope-derived key path
+        // (`prepare_petal_key_scope` and `validate_scoped_route_lineage`); a
+        // plain Petal approval never consults it, and an inactive record's
+        // `fee_asset` still decides the claim. (`bloom-broker-api`'s
+        // `provenance.rs` reads the flag too, but as a load-time uniqueness
+        // invariant over the catalog, not to authorize anything.)
+        //
+        // The reason no claim can name a superseded package is that
         // `bloom-petals`' store resolves a Petal through a single owner
         // pointer: `write_petal_owner` flips it under the install commit, and
-        // `resolve_petal_owner` is what the runner consults, so a superseded
-        // hash stops being reachable at that rename. Not because its bytes are
-        // gone — `store.rs` deliberately keeps prior package data until the
-        // next store open so a request that resolved the old owner can finish,
-        // and `reconcile_petal_owners` deletes it later. If owner resolution
-        // ever stops being the only way in — two hashes of one Petal reachable
-        // at once, or a claim allowed to name a non-owner hash — this skip
-        // becomes a hole, and no test here would notice.
+        // every dispatch path resolves through `resolve_petal_owner` by way of
+        // `resolve_petal_mount`, so a superseded hash stops being reachable at
+        // that rename. Not because its bytes are gone — `store.rs` deliberately
+        // keeps prior package data until the next store open so a request that
+        // resolved the old owner can finish, and `reconcile_petal_owners`
+        // deletes it later. `Runner::resolve` is the one resolver that prefers a
+        // raw hash over the owner pointer, so the superseded hash does resolve
+        // to itself inside that window; it is read-only, its one caller being
+        // the `petals.resolve` IPC, which returns a hash and executes nothing.
+        // Broker separately requires the approval's package hash to be in
+        // `allowed_petal_packages`, so reaching a superseded record's
+        // `fee_asset` would take that gate failing as well. If owner resolution
+        // ever stops being the way in — two hashes of one Petal reachable at
+        // once, or an *executing* path allowed to name a non-owner hash — this
+        // skip becomes a hole, and no test here would notice.
         //
         // Note also that enrolment refuses to reactivate a superseded hash
         // below, so a developer who rebuilds back to one gets a hard failure
@@ -697,10 +708,11 @@ fn rewrite_existing_requested(value: Option<&std::ffi::OsStr>) -> bool {
 }
 
 /// The one Hyperliquid operation class whose every claim declares a fee:
-/// builder-bearing orders sign under it and nothing else does
-/// (bloom-petal-hyperliquid's `BUILDER_ORDER_INTENT`).
+/// builder-bearing orders sign under it and nothing else does. No released
+/// Petal emits it yet — that route split lives in bloom-petal-hyperliquid#19,
+/// and the released Petal declares no builder class at all.
 ///
-/// Owner-signed only, in practice. The Petal routes session-signed builder
+/// Owner-signed only, in practice. #19's Petal routes session-signed builder
 /// orders here too, but the reusable key-scope approval is prepared with
 /// `value_limits: Vec::new()` (`bloom-daemon`), and Broker refuses a claim
 /// whose fee asset is absent from those limits with `VALUE_ASSET_NOT_ALLOWED`.
@@ -725,7 +737,7 @@ const HYPERLIQUID_BUILDER_ORDER_CLASS: &str = "hyperliquid.builder_order";
 /// registered there, and `hyperliquid.builder_order` appears in neither
 /// `MESSAGE_REVIEW_OPERATION_CLASSES` nor
 /// `POLYMARKET_REVIEW_OPERATION_CLASSES`, so a builder order is not required
-/// to carry the decoded order review its fee-free sibling must, and a
+/// to carry the decoded order review `hyperliquid.order` must, and a
 /// session-signed one falls outside `verify_hyperliquid_agent_use`, which
 /// matches `hyperliquid.agent_action` with no declared fee. Cataloguing a fee
 /// asset makes the claim authorizable; it does not make the operation
@@ -762,10 +774,11 @@ const HYPERLIQUID_BUILDER_ORDER_CLASS: &str = "hyperliquid.builder_order";
 /// claim it exists to permit; and `message_review_requires_exact` makes Broker
 /// refuse a reusable Petal approval whose scope contains a reviewed class, so
 /// listing the Hyperliquid one would make a builder-bound session's scope
-/// unpreparable. A plain session is unaffected: the manifest declares both
+/// unpreparable. A plain session is unaffected: #19's manifest declares both
 /// classes, but each route grant is filtered by the classes the Petal actually
-/// requests, and it asks for the builder class only when a builder is bound. See "Operation-class granularity
-/// and `fee_asset`" in `docs/architecture/Sealed Approvals.md`.
+/// requests, and it asks for the builder class only when a builder is bound.
+/// See "Operation-class granularity and `fee_asset`" in
+/// `docs/architecture/Sealed Approvals.md`.
 const FEE_BEARING_OPERATION_CLASSES: &[CataloguedFeeAsset] = &[CataloguedFeeAsset {
     operation_class: HYPERLIQUID_BUILDER_ORDER_CLASS,
     chain: "hyperliquid",
