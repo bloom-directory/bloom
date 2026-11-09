@@ -106,8 +106,10 @@ take-over for that step; never bypass the guard.
 
 For a login, code, captcha or bot check, write a request with
 `"take_over": true` and an `agent_description` telling the person what to do.
-Send the ceremony URL. They work in Bloom's browser and click Done;
-`status.json` says `returned` and shopping restarts on a blank page without
+Send the ceremony URL. They work in Bloom's browser and click Done.
+Any interaction may charge a shop-saved method, so the result remains
+`uncertain` unless merchant evidence establishes an outcome. An untouched
+view can return as `returned`. Shopping restarts on a blank page without
 their login, cookies or the page they left: a logged-in shop could charge its
 saved payment method on any click. Reopen the shop and recheck the basket.
 The first cardless take-over enrolls a passkey without requiring a saved card
@@ -126,7 +128,7 @@ bank charge.
 | `declined` | A merchant page reported a decline. Have the person check before another checkout. |
 | `filled`, `submitted` | Payment details were filled or a submission was attempted; neither proves payment. The shop remains blocked until the result is checked. |
 | `needs_input` | The page wants more input; payment may already be submitted. The person finishes in the private view. Optional wallet signup can add fields: complete or decline it there. |
-| `partially_filled`, `disclosure_unknown`, `uncertain` | Unknown whether money moved. Bloom refuses another checkout at that shop until the person checks it: write a new request with `"take_over": true` and `"resolves": "<id>"`. Their Done after checking the shop account, email or bank clears it; you cannot. |
+| `partially_filled`, `disclosure_unknown`, `uncertain` | Unknown whether money moved. Bloom refuses another checkout at that shop. A take-over with `"resolves": "<id>"` lets the person inspect it; Done alone does not clear uncertainty or permit a duplicate attempt. |
 | `manual_required`, `human_control` | The person must continue in the private view. |
 | `failed_before_release`, `cancelled`, `expired`, `resolved` | The request has ended. Check its history before deciding what to do next. |
 

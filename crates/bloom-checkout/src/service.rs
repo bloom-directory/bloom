@@ -302,7 +302,7 @@ enum Mode {
     Card,
     /// Click the merchant's pay button; the merchant charges its saved method.
     Site,
-    /// The human takes over the browser and hands it back; nothing is bought.
+    /// The human controls the browser; merchant handlers may charge.
     TakeOver,
 }
 
@@ -324,8 +324,6 @@ struct PrivateCheckout {
     /// Checkout pressed the pay button, or may have. Without this or a manual
     /// submission, no page text can make the checkout paid or booked.
     submitted: bool,
-    /// The unknown earlier checkout this take-over lets the person check.
-    resolves: Option<String>,
 }
 
 struct PendingUnlock {
@@ -947,28 +945,6 @@ impl CheckoutService {
         Ok(status)
     }
 
-    /// Called only from the person's Done in an approved take-over.
-    async fn mark_checked(&self, operation_id: &str) -> Result<()> {
-        let mut status = self.resolvable(operation_id).await?;
-        let mut outcome = status
-            .outcome
-            .take()
-            .unwrap_or(bloom_checkout_api::Outcome {
-                state: "resolved".into(),
-                source: "human".into(),
-                confirmation_reached: false,
-                order_id: None,
-                merchant_reported_total_minor: None,
-                currency: None,
-                resolution: None,
-            });
-        outcome.resolution = Some("human_checked".into());
-        status.state = "resolved".into();
-        status.ceremony_url = None;
-        status.outcome = Some(outcome);
-        self.store.update(&status)
-    }
-
     async fn return_control(&self) -> Result<()> {
         self.forget_travelers().await;
         self.journey_filler.lock().await.take();
@@ -1169,8 +1145,8 @@ impl CheckoutService {
                         let shop = self.store.shop(prior)?.unwrap_or("this shop".into());
                         let note = format!(
                             "Bloom does not know whether an earlier payment at {shop} went through. \
-                             Check the shop account, email or bank, then click Done; \
-                             only then can your agent pay there again. Agent: "
+                             Check the shop account, email or bank. Done closes the view; \
+                             it does not prove that payment failed or permit another attempt. Agent: "
                         );
                         let room = 1024usize.saturating_sub(note.len());
                         let mut end = agent_description.len().min(room);
@@ -1344,7 +1320,6 @@ impl CheckoutService {
                             approved: false,
                             manual_submission: false,
                             submitted: false,
-                            resolves,
                         });
                         let service = self.clone();
                         tokio::spawn(async move {
@@ -1932,7 +1907,7 @@ impl CheckoutService {
                 // person made must never stay usable by shopping.
                 if self.return_control().await.is_ok() {
                     let current = self.store.get(&id).map(|s| s.state).unwrap_or_default();
-                    let final_state = if mode == Mode::TakeOver {
+                    let final_state = if mode == Mode::TakeOver && current == "human_control" {
                         "returned"
                     } else {
                         closing_state(&current)
@@ -2105,6 +2080,20 @@ impl CheckoutService {
     }
 
     pub async fn private_action(&self, token: &str, action: ViewAction) -> Result<()> {
+        if !matches!(action, ViewAction::Finish | ViewAction::SelectPage { .. }) {
+            let mut private = self.private.lock().await;
+            let checkout = private.as_mut().context("No active private checkout")?;
+            authorize_view(checkout, token)?;
+            if checkout.mode == Mode::TakeOver {
+                // Any merchant event handler can charge a saved method.
+                // Record uncertainty before dispatch, including failed calls.
+                let mut status = self.store.get(&checkout.operation_id)?;
+                status.state = "uncertain".into();
+                status.outcome = None;
+                self.store.update(&status)?;
+                checkout.manual_submission = true;
+            }
+        }
         match action {
             ViewAction::Click { x, y } => {
                 if !x.is_finite()
@@ -2312,26 +2301,23 @@ impl CheckoutService {
                 checkout.view_session = session;
             }
             ViewAction::Finish => {
-                let (operation_id, mode, resolves) = {
+                let (operation_id, mode) = {
                     let private = self.private.lock().await;
                     let checkout = private.as_ref().context("No active private checkout")?;
                     authorize_view(checkout, token)?;
-                    (
-                        checkout.operation_id.clone(),
-                        checkout.mode,
-                        checkout.resolves.clone(),
-                    )
+                    (checkout.operation_id.clone(), checkout.mode)
                 };
                 if mode == Mode::TakeOver {
                     self.return_control().await?;
-                    self.set_state(&operation_id, "returned");
-                    // Shopping is already back; a prior that changed meanwhile
-                    // simply stays unresolved.
-                    if let Some(prior) = resolves {
-                        if let Err(error) = self.mark_checked(&prior).await {
-                            eprintln!("earlier checkout left unresolved: {}", loggable(&error));
-                        }
-                    }
+                    let current = self.store.get(&operation_id)?.state;
+                    self.set_state(
+                        &operation_id,
+                        if current == "human_control" {
+                            "returned"
+                        } else {
+                            closing_state(&current)
+                        },
+                    );
                 } else {
                     let current = self.store.get(&operation_id)?.state;
                     self.set_state(&operation_id, closing_state(&current));
@@ -3034,7 +3020,6 @@ mod tests {
             approved: true,
             manual_submission: false,
             submitted,
-            resolves: None,
         });
         (service, status.operation_id, token, server)
     }
@@ -3413,7 +3398,6 @@ mod tests {
             approved: true,
             manual_submission: false,
             submitted: false,
-            resolves: None,
         });
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -3490,7 +3474,6 @@ mod tests {
             approved: true,
             manual_submission: false,
             submitted: false,
-            resolves: None,
         });
         tokio::time::timeout(
             Duration::from_secs(4),
@@ -3579,7 +3562,6 @@ mod tests {
             approved: true,
             manual_submission: false,
             submitted: false,
-            resolves: None,
         });
         let finished = tokio::time::timeout(
             Duration::from_secs(3),
@@ -3762,7 +3744,6 @@ mod tests {
                 approved: true,
                 manual_submission: false,
                 submitted: false,
-                resolves: None,
             };
             service
                 .consume_and_fill(&mut checkout, None, None)
@@ -3819,7 +3800,6 @@ mod tests {
             approved: true,
             manual_submission: false,
             submitted: true,
-            resolves: None,
         });
         let watcher = {
             let service = service.clone();
@@ -3916,7 +3896,6 @@ mod tests {
             approved: true,
             manual_submission: false,
             submitted: false,
-            resolves: None,
         });
         let finished = tokio::time::timeout(
             Duration::from_secs(3),
@@ -3973,7 +3952,6 @@ mod tests {
             approved: true,
             manual_submission: false,
             submitted: false,
-            resolves: None,
         });
         let watcher = tokio::spawn({
             let service = service.clone();
@@ -4107,7 +4085,6 @@ mod tests {
             approved: true,
             manual_submission: false,
             submitted: false,
-            resolves: None,
         });
         let started = tokio::time::Instant::now();
         let capture = {
@@ -4817,7 +4794,7 @@ mod tests {
             .unwrap();
         assert_eq!(unapproved["state"], "failed_before_release");
         assert_eq!(service.store.get(&prior).unwrap().state, "uncertain");
-        // The person's Done in an approved take-over is what marks it checked.
+        // Done alone cannot establish whether the earlier charge happened.
         let tab = browser.handoff().await.unwrap();
         let token = hex_token(&[45; 32]);
         service
@@ -4851,18 +4828,13 @@ mod tests {
             approved: true,
             manual_submission: false,
             submitted: false,
-            resolves: Some(prior.clone()),
         });
         service
             .private_action(&token, ViewAction::Finish)
             .await
             .unwrap();
         let resolved = service.store.get(&prior).unwrap();
-        assert_eq!(resolved.state, "resolved");
-        assert_eq!(
-            resolved.outcome.unwrap().resolution.as_deref(),
-            Some("human_checked")
-        );
+        assert_eq!(resolved.state, "uncertain");
         browser
             .browse(BrowseRequest::Open { url: shop_url })
             .await
@@ -4877,9 +4849,9 @@ mod tests {
                 resolves: None,
             })
             .await
-            .unwrap();
-        assert_ne!(again["state"], "uncertain");
-        assert!(service.store.get(&"c".repeat(64)).is_ok());
+            .unwrap_err();
+        assert!(again.to_string().contains(&prior));
+        assert!(service.store.get(&"c".repeat(64)).is_err());
         let pending = "d".repeat(64);
         service
             .store
@@ -5039,7 +5011,6 @@ mod tests {
             approved: false,
             manual_submission: false,
             submitted: false,
-            resolves: None,
         });
         let router = crate::view::router(service.clone());
         let viewer = tokio::spawn(async move {
@@ -5351,7 +5322,6 @@ mod tests {
             approved: true,
             manual_submission: false,
             submitted: false,
-            resolves: None,
         });
         service
             .private_action(&token, ViewAction::Click { x: 20., y: 15. })
@@ -5386,7 +5356,7 @@ mod tests {
             .private_action(&token, ViewAction::Finish)
             .await
             .unwrap();
-        assert_eq!(service.store.get("take-over").unwrap().state, "returned");
+        assert_eq!(service.store.get("take-over").unwrap().state, "uncertain");
         // A merchant session can charge a saved payment method on any click,
         // so shopping restarts outside the person's login.
         let snapshot = browser
