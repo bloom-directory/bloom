@@ -27,6 +27,7 @@ pub(crate) const DEFAULT_PETALS: &[&str] = &[
     "enso",
     "near-intents",
     "feedback",
+    "safe",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +53,11 @@ pub(crate) struct PetalAuthorityRoute {
     pub route_id: &'static str,
     pub operation_classes: &'static [&'static str],
 }
+
+const SAFE_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[PetalAuthorityRoute {
+    route_id: "r000020",
+    operation_classes: &["safe.transaction.confirm"],
+}];
 
 const BASELINE_POLYMARKET_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
     PetalAuthorityRoute {
@@ -445,6 +451,10 @@ pub(crate) fn release_lineage_predecessors(name: &str) -> &'static [ReleaseLinea
         "5f26e7bbf7f507cfcf4c13645cf9f4f0c903d769c201e3e9d1f5c914b14fa2a3",
         &[],
     )];
+    const SAFE: &[ReleaseLineagePredecessor] = &[baseline(
+        "578ad00feced6178caf565e6cc6c8b66ec7a9886b2bf457864cc81fc881666f3",
+        SAFE_AUTHORITY_ROUTES,
+    )];
     const TOLLY: &[ReleaseLineagePredecessor] = &[baseline(
         "f50f9f6f55eca103c11ed40d424311c6e5863ff5046231f57f58822d1aac6709",
         &[],
@@ -455,6 +465,7 @@ pub(crate) fn release_lineage_predecessors(name: &str) -> &'static [ReleaseLinea
         "enso" => ENSO,
         "near-intents" => NEAR_INTENTS,
         "feedback" => FEEDBACK,
+        "safe" => SAFE,
         "tolly" => TOLLY,
         _ => &[],
     }
@@ -538,6 +549,23 @@ const PREINSTALLED_FEEDBACK: PreinstalledPetal = PreinstalledPetal {
     release_sequence: 1,
     predecessor_package_hashes: &[],
     authority_routes: &[],
+};
+
+const PREINSTALLED_SAFE: PreinstalledPetal = PreinstalledPetal {
+    name: "safe",
+    repository: "https://github.com/bloom-directory/bloom-petal-safe",
+    commit: "9bf737753c7cd13ff136a0aeacf9b748b5763760",
+    release_tag: "v0.1.0",
+    archive: "safe-v0.1.0.petal.tar.gz",
+    expected_hash: Some("578ad00feced6178caf565e6cc6c8b66ec7a9886b2bf457864cc81fc881666f3"),
+    archive_sha256: "3f1b592ccafbed856d8ec0fb0ddea5cbc896ba91cbba827a51b1f554a1fb60bf",
+    tooling_commit: "2beed2ff344ce2b0c112e07096027e1ae0404007",
+    petal_abi: "bloom.petal-host/payload-signing-v1",
+    default_eligible: true,
+    lineage_id: None,
+    release_sequence: 1,
+    predecessor_package_hashes: &[],
+    authority_routes: SAFE_AUTHORITY_ROUTES,
 };
 
 const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
@@ -1437,6 +1465,7 @@ pub(crate) fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPeta
         "hyperliquid" => Some(&PREINSTALLED_HYPERLIQUID),
         "near-intents" => Some(&PREINSTALLED_NEAR_INTENTS),
         "feedback" => Some(&PREINSTALLED_FEEDBACK),
+        "safe" => Some(&PREINSTALLED_SAFE),
         "enso" => Some(&PREINSTALLED_ENSO),
         "gasless" => Some(&PREINSTALLED_GASLESS),
         "privacy-pools" => Some(&PREINSTALLED_PRIVACY_POOLS),
@@ -1448,13 +1477,14 @@ pub(crate) fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPeta
 
 /// Bundled releases whose signed lineage also controls private-state
 /// carry-forward. Non-authority Petals receive a lineage-only catalog record.
-pub(crate) fn release_lineage_petals() -> [&'static PreinstalledPetal; 5] {
+pub(crate) fn release_lineage_petals() -> [&'static PreinstalledPetal; 6] {
     [
         &PREINSTALLED_POLYMARKET,
         &PREINSTALLED_HYPERLIQUID,
         &PREINSTALLED_ENSO,
         &PREINSTALLED_NEAR_INTENTS,
         &PREINSTALLED_FEEDBACK,
+        &PREINSTALLED_SAFE,
     ]
 }
 
@@ -2217,6 +2247,7 @@ mod tests {
             "hyperliquid",
             "near-intents",
             "feedback",
+            "safe",
             "enso",
             "gasless",
             "privacy-pools",
@@ -2231,7 +2262,7 @@ mod tests {
                 entry.default_eligible,
                 matches!(
                     name,
-                    "polymarket" | "hyperliquid" | "enso" | "near-intents" | "feedback"
+                    "polymarket" | "hyperliquid" | "enso" | "near-intents" | "feedback" | "safe"
                 )
             );
         }

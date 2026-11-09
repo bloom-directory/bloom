@@ -206,8 +206,9 @@ A fresh Bloom VFS root exposes these default entries:
   pinned [Polymarket](https://github.com/bloom-directory/bloom-petal-polymarket),
   [Hyperliquid](https://github.com/bloom-directory/bloom-petal-hyperliquid),
   [Enso](https://github.com/bloom-directory/bloom-petal-enso),
-  [Near Intents](https://github.com/bloom-directory/bloom-petal-near), and
-  [Feedback](https://github.com/bloom-directory/bloom-petal-feedback) releases.
+  [Near Intents](https://github.com/bloom-directory/bloom-petal-near),
+  [Feedback](https://github.com/bloom-directory/bloom-petal-feedback), and
+  [Safe](https://github.com/bloom-directory/bloom-petal-safe) releases.
   Tolly is excluded until its explicit-account release is available.
   Read `docs/petals.md` in the VFS for the exact installed set, mount
   directories, summaries, and declared capabilities.
