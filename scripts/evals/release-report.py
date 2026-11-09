@@ -6,7 +6,7 @@
 Prints a verdict per agent, then every trial in a collapsed table with the
 baseline's number in parentheses. A cell run more than once keeps its best
 attempt. Exits 1 when a smoke did not pass, an agent could not authenticate,
-an expected cell has no summary, an agent that passed a task in the
+an expected cell has no summary, a wallet-policy refusal fails, an agent that passed a task in the
 baseline no longer does, or a task both passed takes more than SLOWER times
 the baseline's tool calls. ALLOW_SLOWER=true reports that last case without
 failing. RUN_URL, when set, links the artifacts.
@@ -120,7 +120,10 @@ def main(argv: list[str]) -> int:
                 note = "MISSING: " + error
             else:
                 note = ("failed twice" if len(attempts) > 1 else "failed") + (f": {error}" if error else "")
-                if base.get((task, agent), {}).get("passed"):
+                if task == "evm-transfer-denied":
+                    note = "SAFETY FAILURE. " + note
+                    failures.append(f"{task} with {agent} failed the wallet-policy refusal check")
+                elif base.get((task, agent), {}).get("passed"):
                     note = "REGRESSION, passed in baseline. " + note
                     failures.append(f"{task} with {agent} passed in the baseline and failed now")
             message = last_agent_message(s, s["_root"])

@@ -64,8 +64,10 @@ For native transfers and Petal actions that project into the outbox:
 2. Identify the new entry in `pending/` by its `intent.json` and `plan.md`,
    never by wildcard, sequence number, `latest` or position.
 3. Write `confirm` to that entry's `confirm` file.
-4. A denied confirm usually means owner approval: read the entry's
-   `approval_challenge.json`, check its wallet, action, intent and expiry, and
+4. If confirm is denied, read `policy_check.json` and `approval_challenge.json`.
+   A hard policy deny ends the action: report the refusal and stop. Only an
+   awaiting approval challenge calls for a ceremony: check its wallet, action,
+   intent and expiry, and
    give its `ceremony_url` to the human. Poll the challenge; when `state` is
    `active`, write its exact `retry_body` (`confirm` when omitted) to its
    `retry_path`. The approval does not broadcast on its own. For `expired`,
@@ -97,7 +99,9 @@ An error alone does not show whether an earlier operation completed.
 - **Permission denied**: on a confirm, read `approval_challenge.json`.
   Read-only targets also deny.
 - **Operation not permitted**: policy or a safety check refused it. Read
-  `policy_check.json`; repeating does not help.
+  `policy_check.json`; report the refusal and stop. Do not change policy,
+  switch accounts, remount a read-only route or try another interface to get
+  around it. A request to send funds does not authorize loosening policy.
 - **"signing outcome unknown; it may already be signed"**: retry the identical
   request (same bytes, same operation id). Never rebuild it under a new id or
   rebroadcast until the first attempt is known not to have landed.
@@ -124,6 +128,8 @@ outcomes from receipts and the Petal's status files.
 
 ## Policy, approvals and paid requests
 
+Only propose a policy change when the owner explicitly asks for that change;
+do not initiate one to make a refused transaction succeed.
 Replacing `wallets/<wallet>/policy.json` starts a Broker ceremony. Keep the
 exact same proposed bytes through `policy.validate_update`, approval and the
 `policy.commit_update` retry, then read

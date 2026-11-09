@@ -5,7 +5,8 @@ name: Release evals
 # the release matrix pins, prove the three services with the Solana smoke
 # (no model), then run every Harbor task with that agent and record reward,
 # tool calls, tokens and time. The report fails on a smoke failure, a missing
-# result or a regression against evals/harbor/baselines/README.md; the rest is a
+# result, a failed wallet-policy refusal, or a regression against
+# evals/harbor/baselines/README.md; the rest is a
 # number for the release reviewer. A failed trial is retried once, so one
 # nondeterministic miss does not fail a release. Runs on release-proposal PRs
 # and on dispatch. Model credentials are repository secrets, OAuth where the
@@ -241,6 +242,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh pr comment ${{ github.event.pull_request.number }} --body-file report.md
-      - name: Fail on a smoke failure, a baseline regression or a slower task
+      - name: Fail on smoke, policy refusal, baseline regression or slower tasks
         if: steps.report.outputs.failed == 'true'
         run: exit 1
