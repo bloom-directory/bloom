@@ -41,7 +41,8 @@ pub enum VfsMethod {
     Lookup,
     /// `bloom vfs cat` — file bytes.
     Read,
-    /// Check read safety and read under the daemon package-mutation guard.
+    /// Check read safety and read; a Petal route is checked again under that
+    /// Petal's own gate.
     ReadInert,
     /// `bloom vfs write` — bytes into a writable path.
     Write,

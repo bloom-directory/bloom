@@ -582,9 +582,9 @@ impl IpcOperationContext {
             return Err(PetalError::vm("Petal install cancelled"));
         }
         let staged = store.stage_petal_package(package)?;
-        // Take the Petal mutation lock in turn, as listing Petals and MCP
-        // reads do: an install that only tried it could wait forever behind
-        // readers that hold it back to back. Then a waiting install queues,
+        // Take the Petal mutation lock in turn, as listing and managing
+        // Petals do: an install that only tried it could wait forever behind
+        // callers that hold it back to back. Then a waiting install queues,
         // briefly, for the permit to change this Petal: its calls already
         // running finish, and its calls starting meanwhile wait behind it
         // for at most `activation_wait`. Other Petals' calls are unaffected.
@@ -2613,9 +2613,9 @@ allowed = ["bloom:vfs.read"]
         queued.await.unwrap().unwrap();
     }
 
-    /// Callers that take the Petal mutation lock and then run Petal code, as
-    /// MCP reads do, back to back, cannot starve an install: it takes the
-    /// lock in turn, both plain and waiting.
+    /// Callers that take the Petal mutation lock and then run Petal code
+    /// back to back cannot starve an install: it takes the lock in turn, both
+    /// plain and waiting.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn readers_holding_the_mutation_lock_cannot_starve_an_install() {
         use bloom_petals::package::PreparedPetalPackage;

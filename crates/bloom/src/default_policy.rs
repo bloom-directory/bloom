@@ -2221,25 +2221,42 @@ pub(crate) async fn advance_default_policy(
                     ControlFlow::Continue(false) => {}
                 }
             }
-            let (petals, not_installed, left_out) =
-                awaiting_listing(&request, switch.as_ref().filter(|_| switch_own));
-            DefaultPolicyStatus::AwaitingOwner {
-                operation_id: pending.operation_id.as_str().to_owned(),
-                ceremony_url: pending
-                    .prepare
-                    .as_ref()
-                    .map(|prepare| prepare.ceremony_url.clone()),
-                ceremony_expires_at_ms: pending
-                    .prepare
-                    .as_ref()
-                    .map(|prepare| prepare.ceremony_expires_at_ms.get()),
-                petals,
-                proposes_chosen_petals: pending.includes_requested || switch_own,
-                not_installed,
-                left_out,
-            }
+            awaiting_owner(
+                pending.operation_id.as_str().to_owned(),
+                pending.prepare.as_ref().map(|prepare| {
+                    (
+                        prepare.ceremony_url.clone(),
+                        prepare.ceremony_expires_at_ms.get(),
+                    )
+                }),
+                pending.includes_requested || switch_own,
+                &request,
+                switch.as_ref().filter(|_| switch_own),
+            )
         }
     })
+}
+
+/// The status of policy change `operation_id` waiting for the owner, with its
+/// ceremony's link and expiry when it has one, listed by [`awaiting_listing`].
+fn awaiting_owner(
+    operation_id: String,
+    ceremony: Option<(String, u64)>,
+    proposes_chosen_petals: bool,
+    request: &DefaultPolicyRequest,
+    own_switch: Option<&PendingSwitch>,
+) -> DefaultPolicyStatus {
+    let (petals, not_installed, left_out) = awaiting_listing(request, own_switch);
+    let (ceremony_url, ceremony_expires_at_ms) = ceremony.unzip();
+    DefaultPolicyStatus::AwaitingOwner {
+        operation_id,
+        ceremony_url,
+        ceremony_expires_at_ms,
+        petals,
+        proposes_chosen_petals,
+        not_installed,
+        left_out,
+    }
 }
 
 /// What a policy change waiting for the owner allows, as they are told: what
@@ -2320,11 +2337,24 @@ async fn applied_switch(
     current: &bloom_broker_api::SignedPolicySnapshot,
     settings_pending: Vec<String>,
 ) -> Result<DefaultPolicyStatus> {
-    let (left_out, not_allowed) = left_out_of_switch(switch, request.missing(current)?);
-    let (allowed_not_installed, not_installed) = split_not_installed(request, current)?;
     let settings_reset = promote_switch(daemon, wallet, switch)
         .await?
         .unwrap_or_default();
+    switch_applied(switch, request, current, settings_pending, settings_reset)
+}
+
+/// What the committed policy `current` allows once the owner approved
+/// `switch`: a chosen Petal its proposal left out is named as such, one that
+/// changed since is not allowed, and neither is counted as allowed.
+fn switch_applied(
+    switch: &PendingSwitch,
+    request: &DefaultPolicyRequest,
+    current: &bloom_broker_api::SignedPolicySnapshot,
+    settings_pending: Vec<String>,
+    settings_reset: Vec<String>,
+) -> Result<DefaultPolicyStatus> {
+    let (left_out, not_allowed) = left_out_of_switch(switch, request.missing(current)?);
+    let (allowed_not_installed, not_installed) = split_not_installed(request, current)?;
     Ok(DefaultPolicyStatus::Applied {
         petals: request
             .allowed()
@@ -4901,6 +4931,89 @@ mod tests {
             assert!(!output.contains("is not installed"), "{output}");
             assert!(!output.contains("changed after you approved"), "{output}");
         }
+    }
+
+    /// The statuses carry what a switch left out: while its ceremony waits,
+    /// and once approved, where a Petal its proposal left out is neither
+    /// allowed nor changed, and without a record it is changed.
+    #[test]
+    fn a_switchs_statuses_carry_what_it_left_out() {
+        let names = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>()
+        };
+        let (hyperliquid, polymarket) = (
+            bloom_broker_api::Digest32::from_bytes([1; 32]),
+            bloom_broker_api::Digest32::from_bytes([2; 32]),
+        );
+        let request = DefaultPolicyRequest {
+            petals: names(&["hyperliquid", "polymarket"]),
+            packages: vec![hyperliquid, polymarket.clone()],
+            ..DefaultPolicyRequest::default()
+        };
+        let switch = |proposed: Option<&[&str]>| PendingSwitch {
+            setup: chosen_setup(&["hyperliquid", "polymarket"]),
+            operation_id: Some("ab".repeat(32)),
+            proposed: proposed.map(names),
+        };
+        let late = switch(Some(&["polymarket"]));
+        assert_eq!(
+            awaiting_owner(
+                "op".into(),
+                Some(("http://localhost/c".into(), 7)),
+                true,
+                &request,
+                Some(&late)
+            ),
+            DefaultPolicyStatus::AwaitingOwner {
+                operation_id: "op".into(),
+                ceremony_url: Some("http://localhost/c".into()),
+                ceremony_expires_at_ms: Some(7),
+                petals: names(&["polymarket"]),
+                proposes_chosen_petals: true,
+                not_installed: Vec::new(),
+                left_out: names(&["hyperliquid"]),
+            }
+        );
+        let mut policy: bloom_broker_api::CanonicalWalletPolicy =
+            serde_json::from_value(serde_json::json!({
+                "wallet_id": "main",
+                "allowed_petal_packages": [],
+                "allowed_destinations": [],
+                "required_verifiers": [],
+                "maximum_approval_lifetime_ms": 2592000000u64
+            }))
+            .unwrap();
+        policy.allowed_petal_packages = vec![polymarket];
+        policy.allowed_destinations = policy_destinations("polymarket").unwrap();
+        let current = snapshot_of(&policy);
+        let applied = |switch: &PendingSwitch| match switch_applied(
+            switch,
+            &request,
+            &current,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap()
+        {
+            DefaultPolicyStatus::Applied {
+                petals,
+                not_allowed,
+                left_out,
+                ..
+            } => (petals, not_allowed, left_out),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            applied(&late),
+            (names(&["polymarket"]), Vec::new(), names(&["hyperliquid"]))
+        );
+        assert_eq!(
+            applied(&switch(None)),
+            (names(&["polymarket"]), names(&["hyperliquid"]), Vec::new())
+        );
     }
 
     /// A switch's own ceremony is described by what its proposal included,

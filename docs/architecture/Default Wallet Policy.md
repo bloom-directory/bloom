@@ -1054,7 +1054,7 @@ Automated:
   evaluated looks it up first, and any refusal for acting gets the same
   error (`crates/bloom-daemon/src/ipc.rs`).
   The store refuses a package change during a Petal call with a typed busy
-  error (`crates/bloom-petals/src/runner.rs`), refuses an install a permit
+  error (`crates/bloom-petals/src/runner.rs`), refuses an install that holds a permit
   for another Petal, keeps every held gate when it forgets idle ones, and
   removes abandoned staging when opened (`crates/bloom-petals/src/store.rs`).
   A real failed `curl` download is marked for retry
