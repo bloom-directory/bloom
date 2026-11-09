@@ -1118,7 +1118,7 @@ impl CheckoutService {
                     // Any merchant event handler can place an order, even on
                     // a field or a control labelled "Continue". Only the
                     // approved private flow may dispatch these effects.
-                    bail!("Merchant interaction requires approval; request a private take-over");
+                    bail!(MERCHANT_APPROVAL);
                 }
                 if matches!(request, BrowseRequest::Open { .. }) {
                     self.forget_travelers().await;
@@ -2421,15 +2421,7 @@ pub async fn serve_api(service: Arc<CheckoutService>, path: &Path, machine_uid: 
                         Ok(value) => value,
                         // Browse errors are Bloom's own guidance strings; anything else
                         // (CDP or page-derived text) stays generic.
-                        Err(error) if browse => {
-                            let message = error.to_string();
-                            json!({"error": if BROWSE_ERRORS.contains(&message.as_str()) {
-                                message
-                            } else {
-                                eprintln!("checkout browse failed: {}", loggable(&error));
-                                "The page could not be read or changed; open it again or request a new snapshot".into()
-                            }})
-                        }
+                        Err(error) if browse => browse_error(&error),
                         Err(error) if error.downcast_ref::<Refusal>().is_some() => {
                             error.downcast_ref::<Refusal>().unwrap().response()
                         }
@@ -2472,7 +2464,24 @@ fn loggable(error: &anyhow::Error) -> String {
     out.chars().take(300).collect()
 }
 
+/// The agent's view of a browse failure. Only Bloom's own guidance passes;
+/// CDP or page-derived text stays generic.
+fn browse_error(error: &anyhow::Error) -> Value {
+    let message = error.to_string();
+    json!({"error": if BROWSE_ERRORS.contains(&message.as_str()) {
+        message
+    } else {
+        eprintln!("checkout browse failed: {}", loggable(error));
+        "The page could not be read or changed; open it again or request a new snapshot".into()
+    }})
+}
+
+const MERCHANT_APPROVAL: &str =
+    "Merchant interaction requires approval; request a private take-over";
+
 const BROWSE_ERRORS: &[&str] = &[
+    MERCHANT_APPROVAL,
+    "Saved traveler details are unlocked for another website",
     "Invalid browsing URL",
     "Only ordinary HTTP(S) shopping URLs are supported",
     "Only ordinary shopping documents can be observed",
@@ -3206,7 +3215,8 @@ mod tests {
                 .request(Request::Browse { request })
                 .await
                 .unwrap_err();
-            assert!(error.to_string().contains("requires approval"));
+            // The agent must see the refusal itself, not the generic failure.
+            assert_eq!(browse_error(&error)["error"], MERCHANT_APPROVAL);
         }
         let tab = browser.handoff().await.unwrap();
         let title = tab
