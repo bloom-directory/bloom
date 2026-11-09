@@ -3003,9 +3003,10 @@ pub(crate) mod tests {
                 "Order confirmed. Order ID FIXTURE-01 Total USD 3.99",
                 "payment_phrase",
             ),
+            // Mixed success and failure copy proves neither.
             (
                 "Order confirmed. Order ID FIXTURE-01 Total USD 3.99. Help: What if my payment failed?",
-                "payment_phrase",
+                "waiting",
             ),
             ("Your card was declined", "declined"),
             (
