@@ -4,6 +4,8 @@ const pages = document.getElementById('pages');
 let closed = false;
 let approvalBusy = false;
 let savedRequestBusy = false;
+// Why the last saved-details request was refused; kept until the next one.
+let savedNotice = '';
 const sessionKey = 'bloom.checkout.session';
 let session = '';
 let frameUrl;
@@ -93,18 +95,25 @@ async function useSaved(action) {
   if (closed || approvalBusy || savedRequestBusy) return;
   savedRequestBusy = true;
   approvalBusy = true;
+  savedNotice = '';
   document.getElementById('controls').disabled = true;
   document.getElementById('saved-status').textContent = 'Preparing a fresh approval for this page…';
   try {
     await queue;
     const response = await privateFetch('/saved', {method:'POST',
       headers:{'Content-Type':'application/json'}, body:JSON.stringify(action)});
-    if (!response.ok) throw Error('Check the page and any previous payment before trying again. Your seller session is still open.');
+    if (!response.ok) {
+      const reason = (await response.json().catch(() => ({}))).reason;
+      throw Error(reason === 'receiving_origin_unreviewed'
+        ? "This page's card fields are not from a known payment provider, so Bloom will not fill a saved card here. You can type the card yourself in this view. Your seller session is still open."
+        : 'Check the page and any previous payment before trying again. Your seller session is still open.');
+    }
     const result = await response.json();
     showSaved({busy:true, status:result});
     document.getElementById('unpaid-checked').checked = false;
   } catch (error) {
     approvalBusy = false;
+    savedNotice = error.message;
     document.getElementById('saved-status').textContent = error.message;
   } finally { savedRequestBusy = false; }
 }
@@ -121,11 +130,11 @@ function showSaved(saved) {
   else link.removeAttribute('href');
   document.getElementById('saved-status').textContent = saved.busy
     ? 'Approve or cancel in the review tab. This seller session stays open; page controls are paused.'
-    : state?.state === 'traveler_filled'
+    : savedNotice || (state?.state === 'traveler_filled'
       ? 'Traveler fields filled. Check them on the seller page before continuing.'
       : state?.state === 'failed_before_release'
         ? 'No saved details were filled. Correct the page or request a new approval.'
-        : 'The result is uncertain. Check the seller before attempting payment again.';
+        : 'The result is uncertain. Check the seller before attempting payment again.');
 }
 document.getElementById('fill-traveler').addEventListener('click', () => {
   const traveler_id = document.getElementById('saved-traveler').value;

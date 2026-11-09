@@ -118,7 +118,11 @@ async fn saved(
         Ok(value) => Json(value).into_response(),
         Err(error) => {
             eprintln!("checkout saved action failed: {}", loggable(&error));
-            (StatusCode::CONFLICT, Json(serde_json::json!({"error":"Saved details could not be prepared. Check the page and any earlier payment; your seller session is still open."}))).into_response()
+            // Reason codes are Checkout-owned constants, never page text.
+            let reason = error
+                .downcast_ref::<bloom_checkout_api::PreparationReason>()
+                .map(ToString::to_string);
+            (StatusCode::CONFLICT, Json(serde_json::json!({"error":"Saved details could not be prepared. Check the page and any earlier payment; your seller session is still open.","reason":reason}))).into_response()
         }
     }
 }
