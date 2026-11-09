@@ -40,8 +40,9 @@ const RETRY_MAX: Duration = Duration::from_secs(60);
 const DOWNLOAD_RETRIES: usize = 6;
 /// How long a retried install, downloaded and staged, queues for its turn to
 /// activate: running Petal calls finish, and calls starting meanwhile wait
-/// behind it.
-const IDLE_WAIT: Duration = Duration::from_secs(30);
+/// behind it, so no Petal call waits longer than this for an install.
+/// Calls that outlast it leave the install busy until the next retry.
+const QUEUE_WAIT: Duration = Duration::from_secs(3);
 
 pub(crate) fn provision(daemon: &Daemon, context: &IpcOperationContext) -> Vec<ProvisioningResult> {
     provision_with(
@@ -162,10 +163,11 @@ fn is_busy(error: &anyhow::Error) -> bool {
 /// other Petal code was running, such as setup writing Polymarket's settings
 /// right after `bloom wallet new`, until it installs, fails for another
 /// reason, or Machine stops. A Petal whose download failed is tried again
-/// [`DOWNLOAD_RETRIES`] times. A retry queues for its turn to activate
-/// ([`IpcOperationContext::waiting_to_activate`]): running Petal calls
-/// finish, and calls starting meanwhile wait behind it, so an agent calling
-/// Petals back to back cannot starve it. `on_retried` receives each round's
+/// [`DOWNLOAD_RETRIES`] times. A retry queues briefly for its turn to
+/// activate ([`IpcOperationContext::waiting_to_activate`], up to
+/// [`QUEUE_WAIT`]): running Petal calls finish, and calls starting meanwhile
+/// wait behind it, so agents calling Petals back to back cannot starve it,
+/// while no call waits on it for long. `on_retried` receives each round's
 /// results, so setup's settings are written once a chosen Petal installs.
 pub(crate) fn retry_pending(
     daemon: &Daemon,
@@ -173,7 +175,7 @@ pub(crate) fn retry_pending(
     first: &[ProvisioningResult],
     on_retried: impl FnMut(&[ProvisioningResult]),
 ) {
-    let waiting = context.waiting_to_activate(IDLE_WAIT);
+    let waiting = context.waiting_to_activate(QUEUE_WAIT);
     retry_pending_with(
         first,
         |names| {

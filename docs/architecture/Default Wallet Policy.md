@@ -640,13 +640,14 @@ Polymarket's settings right after `bloom wallet new`. The Petal store refuses
 to activate a package while any Petal code runs (bloom#328), so Machine tries
 such an install again after one second, doubling the wait up to one minute
 and staying there while it runs. A retry downloads and stages the package,
-then queues for its turn to activate, for up to 30 seconds by the clock:
-Petal calls already running finish, and calls that start meanwhile wait
-behind it (`PetalStore::activation_permit_waiting`), so agents calling
-Petals back to back, even several at once, cannot starve it. It queues
-without holding Machine's Petal mutation lock, so listing and managing
-Petals never wait behind it; once its turn comes it takes the lock, runs its
-checks and activates. A download that fails is tried again on the same
+then takes Machine's Petal mutation lock in turn, as listing Petals and MCP
+reads do, and queues for its turn to activate for up to 3 seconds by the
+clock: Petal calls already running finish, and calls that start meanwhile
+wait behind it (`PetalStore::activation_permit_waiting`). So agents calling
+Petals back to back, even several at once or through MCP, cannot starve it,
+and no Petal call or Petal listing waits on it for more than 3 seconds. If
+running calls outlast that, it lets them go and tries again in its next
+round. A download that fails is tried again on the same
 schedule, six times, about a minute in all. Any other failure, or a download
 that still fails, waits for the next start, so the log says to restart
 Bloom: `bloom init` cannot open a running home, and installing from a
@@ -1024,10 +1025,12 @@ Automated:
   or Machine stops; a failed download is tried again six times. Any other
   failure says to restart Bloom, and a cancellation does not
   (`crates/bloom/src/petal_provisioning.rs`). While Petal code runs, a plain
-  install is refused at once; a retrying install does not activate or hold
-  the Petal mutation lock, a call starting after it waits behind it, it
-  activates as soon as the running call ends, and it stops when cancelled or
-  past its deadline (`crates/bloom-daemon/src/ipc.rs`). The store refuses a
+  install is refused at once; with a retrying install queued, a call starting
+  after it waits behind it for no longer than its limit, it activates as soon
+  as the running call ends, and it stops when cancelled or past its limit.
+  Callers that hold the Petal mutation lock back to back, as MCP reads do,
+  cannot keep a plain or retrying install from it
+  (`crates/bloom-daemon/src/ipc.rs`). The store refuses a
   package change during a Petal call with a typed busy error
   (`crates/bloom-petals/src/runner.rs`) and removes abandoned staging when
   opened (`crates/bloom-petals/src/store.rs`).
