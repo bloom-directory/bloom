@@ -461,7 +461,9 @@ impl Outbox {
         root: impl Into<PathBuf>,
         projection: Arc<dyn CentralOutboxProjection>,
     ) -> Result<Self, OutboxError> {
-        Self::new_inner(root, Some(projection))
+        let outbox = Self::new_inner(root, Some(projection))?;
+        outbox.reconcile_terminal_actions()?;
+        Ok(outbox)
     }
 
     fn new_inner(
@@ -481,6 +483,57 @@ impl Outbox {
                 projection,
             }),
         })
+    }
+
+    /// Repair wallet-first transitions interrupted before the central projection.
+    /// Run before serving requests; this only updates projections, never transactions.
+    pub fn reconcile_terminal_actions(&self) -> Result<(), OutboxError> {
+        for wallet in fs::read_dir(&self.inner.root)? {
+            let wallet = wallet?;
+            if !wallet.file_type()?.is_dir()
+                || wallet.file_name().to_string_lossy().starts_with('.')
+            {
+                continue;
+            }
+            for chain in fs::read_dir(wallet.path())? {
+                let chain = chain?;
+                if !chain.file_type()?.is_dir() {
+                    continue;
+                }
+                for state in [OutboxState::Sent, OutboxState::Failed] {
+                    let entries = match fs::read_dir(chain.path().join(state.dirname())) {
+                        Ok(entries) => entries,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(e) => return Err(e.into()),
+                    };
+                    for entry in entries {
+                        let entry = entry?;
+                        if !entry.file_type()?.is_dir() {
+                            continue;
+                        }
+                        let staged: StagedTx =
+                            serde_json::from_slice(&fs::read(entry.path().join("intent.json"))?)?;
+                        self.reconcile_terminal_action(&staged, state)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn reconcile_terminal_action(
+        &self,
+        staged: &StagedTx,
+        state: OutboxState,
+    ) -> Result<(), OutboxError> {
+        if state != OutboxState::Pending
+            && let Some(action_id) = &staged.action_id
+        {
+            // The central transition also repairs status.json when its rename
+            // already completed. Never infer a new action from the wallet id.
+            self.transition_central_action(action_id, OutboxState::Pending, state)?;
+        }
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {
@@ -1009,6 +1062,7 @@ impl Outbox {
         new_state: OutboxState,
     ) -> Result<PathBuf, OutboxError> {
         if entry.state == new_state {
+            self.reconcile_terminal_action(&entry.staged, new_state)?;
             return Ok(entry.dir.clone());
         }
         let target_parent = self.state_dir(&entry.staged.wallet, &entry.staged.chain, new_state)?;
@@ -2792,6 +2846,61 @@ mod tests {
         ) -> Result<Vec<u8>, String> {
             Err("not found".into())
         }
+    }
+
+    #[test]
+    fn terminal_wallet_crash_is_repaired_on_retry_and_restart() {
+        for state in [OutboxState::Sent, OutboxState::Failed] {
+            let dir = tempfile::tempdir().unwrap();
+            let projection = Arc::new(MockProjection::new());
+            let outbox = Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
+            let staged = fake_staged("crash");
+            outbox.write_pending(&staged, "plan").unwrap();
+            let pending = outbox.read("alice", "anvil", &staged.id).unwrap();
+            let action_id = pending.staged.action_id.clone().unwrap();
+            // Persist exactly the crash window: wallet rename completed, central
+            // transition never called. The intent still has its pending status.
+            let parent = outbox.state_dir("alice", "anvil", state).unwrap();
+            outbox.create_dir_durable(&parent).unwrap();
+            fs::rename(&pending.dir, parent.join(&staged.id)).unwrap();
+            sync_dir(&parent).unwrap();
+            sync_dir(pending.dir.parent().unwrap()).unwrap();
+            drop(outbox);
+            let reopened = Outbox::new(dir.path()).unwrap();
+            let terminal = reopened.read("alice", "anvil", &staged.id).unwrap();
+            let bytes = fs::read(terminal.dir.join("intent.json")).unwrap();
+            drop(reopened);
+            let reopened = Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
+            assert_eq!(
+                *projection.transitions.lock().unwrap(),
+                vec![(action_id.clone(), "pending".into(), state.dirname().into())]
+            );
+            reopened.transition(&terminal, state).unwrap();
+            assert_eq!(projection.transitions.lock().unwrap().len(), 2);
+            assert_eq!(fs::read(terminal.dir.join("intent.json")).unwrap(), bytes);
+            // Projection errors remain visible and leave the durable wallet alone.
+            *projection.fail_transition.lock().unwrap() = Some("unavailable".into());
+            assert!(reopened.transition(&terminal, state).is_err());
+            assert!(Outbox::new_with_projection(dir.path(), projection.clone()).is_err());
+            assert_eq!(fs::read(terminal.dir.join("intent.json")).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn reconciliation_leaves_pending_and_legacy_entries_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(dir.path()).unwrap();
+        let staged = fake_staged("legacy");
+        outbox.write_pending(&staged, "plan").unwrap();
+        let entry = outbox.read("alice", "anvil", &staged.id).unwrap();
+        outbox.transition(&entry, OutboxState::Sent).unwrap();
+        let projection = Arc::new(MockProjection::new());
+        let reopened = Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
+        reopened
+            .write_pending(&fake_staged("pending"), "plan")
+            .unwrap();
+        reopened.reconcile_terminal_actions().unwrap();
+        assert!(projection.transitions.lock().unwrap().is_empty());
     }
 
     #[test]
