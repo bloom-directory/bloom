@@ -74,7 +74,10 @@ Machine receives the public signature/receipts and records the result
 
 Ceremony completion activates an approval only. It never broadcasts or
 executes the Machine action as part of the browser POST. Execution is a
-subsequent operation with its own operation identity.
+subsequent operation with its own operation identity. An IPC confirm (CLI,
+`bloom vfs`, MCP) that needs approval waits up to 50 seconds for Broker to
+report the approval active, then performs that execution itself; if the wait
+ends first, confirming again resumes it. Mounted writes do not wait.
 
 ## Mode matrix
 

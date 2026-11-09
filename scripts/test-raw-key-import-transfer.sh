@@ -15,10 +15,9 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-broker_repo="$(cd "${repo_root}/../bloom-broker" && pwd -P)"
 launcher="${BLOOM_TRIAD_DEV_LAUNCHER:-${repo_root}/scripts/triad-dev-launch.sh}"
 bloom_bin="${BLOOM_INTEGRATION_MACHINE_BIN:-${repo_root}/target/debug/bloom}"
-driver_bin="${BLOOM_INTEGRATION_DEBUG_DRIVER_BIN:-${broker_repo}/target/debug/bloom-broker-debug-driver}"
+driver_bin="${BLOOM_INTEGRATION_DEBUG_DRIVER_BIN:-$(cd "${repo_root}/../bloom-broker" && pwd -P)/target/debug/bloom-broker-debug-driver}"
 startup_timeout_secs="${BLOOM_INTEGRATION_STARTUP_TIMEOUT_SECS:-300}"
 
 die() { printf 'raw-import transfer e2e: %s\n' "$*" >&2; exit 1; }
@@ -267,23 +266,29 @@ policy_check="$(vcat "${pending_dir}/${pending_id}/policy_check.json")"
 printf '%s' "$policy_check" | jq -e . >/dev/null || die "policy_check.json is not valid JSON"
 printf 'raw-import transfer e2e: staged pending entry %s\n' "$pending_id"
 
-# 9. First confirm must fail closed and persist the Sealed Approval ceremony.
+# 9. Confirm waits for the owner: it stays blocked, without signing, while the
+#    ceremony is open. A second concurrent confirm must not sign again.
 confirm_path="${pending_dir}/${pending_id}/confirm"
-if vwrite "$confirm_path" "y" >/dev/null 2>&1; then
-  die "confirm succeeded before the approval ceremony completed"
-fi
+vwrite "$confirm_path" "y" >/dev/null 2>"${run_root}/confirm.err" &
+confirm_pid=$!
 challenge="$(wait_for_file "pending approval challenge" "${pending_dir}/${pending_id}/approval_challenge.json")"
 approval_ceremony_url="$(printf '%s' "$challenge" | jq -er '.ceremony_url')"
 printf '%s' "$challenge" | jq -e '(.approval_id | test("^[0-9a-f]{64}$")) and .state == "awaiting_ceremony"' >/dev/null ||
   die "pending approval challenge omitted its approval id or live state: $challenge"
+vwrite "$confirm_path" "y" >/dev/null 2>"${run_root}/confirm2.err" &
+confirm2_pid=$!
+sleep 1
+kill -0 "$confirm_pid" 2>/dev/null || die "confirm returned before the approval ceremony completed"
+[ "$(cast nonce --rpc-url "$rpc_url" "$expected_addr")" = "0" ] || die "a transaction was sent before approval"
 
-# 10. Complete the approval ceremony and confirm on the exact retry.
+# 10. Completing the ceremony lets the waiting confirm sign and send.
 "$driver_bin" complete "$approval_ceremony_url" "$AUTH_SEED" --sign-count 3 >/dev/null ||
   die "completing the Sealed Approval ceremony failed"
-challenge_now="$(vcat "${pending_dir}/${pending_id}/approval_challenge.json")"
-printf '%s' "$challenge_now" | jq -e '.state == "active" and .ceremony_url == null' >/dev/null ||
-  die "approval_challenge.json did not report the completed approval before the retry: $challenge_now"
-vwrite "$confirm_path" "y" || die "post-ceremony confirm retry failed"
+wait "$confirm_pid" || die "waiting confirm failed after approval: $(cat "${run_root}/confirm.err")"
+grep -qF "Approval required: open ${approval_ceremony_url}" "${run_root}/confirm.err" ||
+  die "waiting confirm did not show its ceremony link: $(cat "${run_root}/confirm.err")"
+wait "$confirm2_pid" || grep -q 'not found' "${run_root}/confirm2.err" ||
+  die "concurrent confirm failed unexpectedly: $(cat "${run_root}/confirm2.err")"
 
 # 11. The entry must reconcile into sent/ with a transaction hash.
 sent_dir="/wallets/${wallet_id}/0/chains/anvil/outbox/sent"

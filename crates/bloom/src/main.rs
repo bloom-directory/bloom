@@ -3420,8 +3420,12 @@ async fn try_ipc_coded(
     method: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, (i32, std::io::Error)> {
-    match client.call(method, params).await {
-        Ok(value) => Ok(value),
+    // Stream stderr so an approval wait shows its ceremony link at once.
+    match client
+        .call_streaming(method, params, write_ipc_output_event)
+        .await
+    {
+        Ok(reply) => Ok(reply.result),
         Err(error) => {
             let code = match &error {
                 IpcClientError::Rpc(rpc) => rpc.rpc_code,
@@ -3858,11 +3862,12 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             };
             let client = IpcClient::new(&client_endpoint.socket);
-            try_ipc(
+            try_ipc_streaming(
                 &client,
                 &client_endpoint,
                 "write",
                 serde_json::json!({ "path": path, "bytes_b64": B64.encode(&body) }),
+                write_ipc_output_event,
             )
             .await
             .with_context(|| format!("ipc write via {}", client_endpoint.display))?;
