@@ -191,6 +191,12 @@ pub trait WalletProjectionReader: Send + Sync {
     ) -> Result<WalletProjection, ProtocolError> {
         self.get_wallet(wallet_id).await
     }
+    /// Mark `wallet_id`'s cached projection superseded: the next read
+    /// observes Broker, and fails rather than serve the cache if Broker is
+    /// unavailable.
+    fn invalidate_wallet(&self, _wallet_id: &Token) -> Result<(), ProtocolError> {
+        Ok(())
+    }
     async fn begin_legacy_migration(
         &self,
         _operation_id: &OperationId,
@@ -274,6 +280,7 @@ impl FileProjectionStore {
     ) -> Result<ProjectionCache, ProtocolError> {
         let mut cache = self.load()?;
         cache.apply_live_refresh(observed, completed_migrations, terminal_migrations)?;
+        cache.superseded.clear();
         self.save_unlocked(&cache)?;
         Ok(cache)
     }
@@ -284,7 +291,19 @@ impl FileProjectionStore {
         _refresh_lock: &ProjectionRefreshLock,
     ) -> Result<ProjectionCache, ProtocolError> {
         let mut cache = self.load()?;
+        cache.superseded.remove(projection.wallet_id().as_str());
         cache.apply_wallet_refresh(projection)?;
+        self.save_unlocked(&cache)?;
+        Ok(cache)
+    }
+
+    fn mark_superseded(
+        &self,
+        wallet_id: &Token,
+        _refresh_lock: &ProjectionRefreshLock,
+    ) -> Result<ProjectionCache, ProtocolError> {
+        let mut cache = self.load()?;
+        cache.superseded.insert(wallet_id.as_str().to_owned());
         self.save_unlocked(&cache)?;
         Ok(cache)
     }
@@ -786,6 +805,13 @@ impl WalletProjectionReader for CachedWalletProjectionReader {
             .cache
             .lock()
             .map_err(|_| unavailable("Machine projection cache mutex poisoned"))?;
+        if cache.superseded.contains(wallet_id.as_str()) {
+            return Err(unavailable(format!(
+                "{}; wallet {} changed since its cached projection",
+                broker_error.message,
+                wallet_id.as_str()
+            )));
+        }
         match cache.wallets.get(wallet_id.as_str()) {
             Some(CachedWallet::Live(projection)) => Ok(projection.clone().stale()),
             Some(CachedWallet::Tombstone { .. }) => Err(invalid_projection(format!(
@@ -806,7 +832,11 @@ impl WalletProjectionReader for CachedWalletProjectionReader {
         &self,
         wallet_id: &Token,
     ) -> Result<WalletProjection, ProtocolError> {
-        self.refresh_wallet(wallet_id)
+        // An earlier observation may share this request's millisecond. Even
+        // timestamp-based refresh sharing must be disabled for authority.
+        self.clone()
+            .with_max_age(Duration::ZERO)
+            .refresh_wallet(wallet_id)
             .await?
             .ok_or_else(|| invalid_projection(format!("wallet {} not found", wallet_id.as_str())))
     }
@@ -825,6 +855,22 @@ impl WalletProjectionReader for CachedWalletProjectionReader {
             return Ok(projection);
         }
         self.get_wallet(wallet_id).await
+    }
+
+    fn invalidate_wallet(&self, wallet_id: &Token) -> Result<(), ProtocolError> {
+        self.wallet_refreshed_ms
+            .lock()
+            .map_err(|_| unavailable("Machine projection freshness mutex poisoned"))?
+            .remove(wallet_id.as_str());
+        let refresh_lock = self.store.acquire_refresh_lock()?;
+        let updated = self.store.mark_superseded(wallet_id, &refresh_lock)?;
+        *self
+            .cache
+            .lock()
+            .map_err(|_| unavailable("Machine projection cache mutex poisoned"))? = updated;
+        // A full refresh also counts as this wallet's observation.
+        self.last_live_refresh_ms.store(0, Ordering::SeqCst);
+        Ok(())
     }
 
     async fn begin_legacy_migration(
@@ -879,6 +925,11 @@ struct ProjectionCache {
     pending_legacy_migrations: BTreeMap<String, PendingLegacyMigration>,
     #[serde(default, alias = "reconciled_legacy_migrations")]
     completed_legacy_migrations: BTreeMap<String, String>,
+    /// Wallets whose cached projection is known to be superseded, such as by
+    /// a committed policy update. Saved so a restart cannot serve it as a
+    /// stale fallback before a live observation replaces it.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    superseded: BTreeSet<String>,
 }
 
 impl ProjectionCache {
@@ -888,6 +939,7 @@ impl ProjectionCache {
             wallets: BTreeMap::new(),
             pending_legacy_migrations: BTreeMap::new(),
             completed_legacy_migrations: BTreeMap::new(),
+            superseded: BTreeSet::new(),
         }
     }
 
@@ -1436,6 +1488,15 @@ mod tests {
         keys: Vec<KeyPublic>,
         credentials: Vec<CredentialPublic>,
         policy: SignedPolicySnapshot,
+    }
+
+    #[derive(Debug, serde::Deserialize, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct Schema1CredentialPublic {
+        credential_id: String,
+        wallet_id: String,
+        created_at_ms: String,
+        state: String,
     }
 
     struct FakeBroker {
@@ -2089,6 +2150,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_policy_commit_can_outpace_display_cache_but_not_authority_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let broker = Arc::new(FakeBroker::new(fixture(1)));
+        let reader = CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(broker.clone())),
+            FileProjectionStore::new(directory.path().join("wallets.json")),
+        )
+        .unwrap()
+        .with_max_age(Duration::from_secs(60));
+        let wallet = token("alice");
+        let initial = reader.get_wallet(&wallet).await.unwrap();
+        assert_eq!(initial.policy.version.get(), 1);
+
+        broker
+            .wallets
+            .lock()
+            .unwrap()
+            .insert("alice".into(), fixture(2));
+        let cached = reader.get_wallet(&wallet).await.unwrap();
+        assert_eq!(cached.policy.version.get(), 1);
+        // Force the refresh-sharing condition without relying on the test
+        // completing within one wall-clock millisecond. Authority must bypass
+        // it even if the clock moved backwards after the cached observation.
+        reader
+            .wallet_refreshed_ms
+            .lock()
+            .unwrap()
+            .insert("alice".into(), u64::MAX);
+        let authoritative = reader.get_wallet_authority(&wallet).await.unwrap();
+        assert_eq!(authoritative.policy.version.get(), 2);
+        let refreshed = reader.get_wallet(&wallet).await.unwrap();
+        assert_eq!(refreshed.policy.version.get(), 2);
+    }
+
+    /// A failed refresh after a policy commit leaves the wallet marked. A
+    /// restarted Machine must not serve that cache while Broker is down.
+    #[tokio::test]
+    async fn a_superseded_wallet_stays_unserved_across_a_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileProjectionStore::new(directory.path().join("wallets.json"));
+        let broker = Arc::new(FakeBroker::new(fixture(1)));
+        let online = || {
+            CachedWalletProjectionReader::new(
+                Some(MachineBrokerClient::new(broker.clone())),
+                store.clone(),
+            )
+            .unwrap()
+        };
+        let wallet = token("alice");
+        let reader = online();
+        reader.get_wallet(&wallet).await.unwrap();
+        reader.invalidate_wallet(&wallet).unwrap();
+        drop(reader);
+
+        let restarted = CachedWalletProjectionReader::new(None, store.clone()).unwrap();
+        let error = restarted.get_wallet(&wallet).await.unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("changed since its cached projection"),
+            "{error:?}"
+        );
+
+        // A live observation replaces the cache and lifts the mark.
+        online().get_wallet(&wallet).await.unwrap();
+        let offline = CachedWalletProjectionReader::new(None, store).unwrap();
+        assert_eq!(
+            offline.get_wallet(&wallet).await.unwrap().freshness,
+            ProjectionFreshness::Stale
+        );
+    }
+
+    #[tokio::test]
     async fn mounted_reads_reuse_a_refresh_within_the_configured_age() {
         let directory = tempfile::tempdir().unwrap();
         let store = FileProjectionStore::new(directory.path().join("wallets.json"));
@@ -2480,17 +2614,11 @@ mod tests {
 
     #[test]
     fn schema1_credentials_load_but_surface_projections_require_schema2_reader() {
-        // Serialize with the actual released API, not a current object with
-        // its version marker changed. The surrounding cache format is stable.
-        let old: schema1_broker_api::CredentialPublic = serde_json::from_value(serde_json::json!({
-            "credential_id": "CwsLCwsLCwsLCwsLCwsLCw",
-            "wallet_id": "alice",
-            "created_at_ms": "1",
-            "state": "ACTIVE"
-        }))
-        .unwrap();
-        let legacy_bytes = serde_json::to_vec(&old).unwrap();
-        let credential: CredentialPublic = serde_json::from_slice(&legacy_bytes).unwrap();
+        // Frozen output from Broker dd2add2b's released schema-1 API. Keep the
+        // reader local so a compatibility fixture cannot enter release pins.
+        let legacy_bytes = br#"{"credential_id":"CwsLCwsLCwsLCwsLCwsLCw","wallet_id":"alice","created_at_ms":"1","state":"ACTIVE"}"#;
+        serde_json::from_slice::<Schema1CredentialPublic>(legacy_bytes).unwrap();
+        let credential: CredentialPublic = serde_json::from_slice(legacy_bytes).unwrap();
         assert!(credential.surface.is_none());
         let mut fixture = migrated_fixture();
         fixture.credentials = vec![credential];
@@ -2524,8 +2652,7 @@ mod tests {
         )
         .unwrap();
         let updated = serde_json::to_vec(&projection.credentials[0]).unwrap();
-        let error =
-            serde_json::from_slice::<schema1_broker_api::CredentialPublic>(&updated).unwrap_err();
+        let error = serde_json::from_slice::<Schema1CredentialPublic>(&updated).unwrap_err();
         assert!(error.to_string().contains("unknown field `surface`"));
         cache
             .wallets
@@ -2637,12 +2764,12 @@ mod tests {
     fn migrated_fixture() -> ProjectionFixture {
         let mut fixture = fixture(1);
         let policy = CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: token("alice"),
             maximum_approval_lifetime_ms: 30 * 24 * 60 * 60 * 1_000,
             allowed_petal_packages: Vec::new(),
             allowed_destinations: Vec::new(),
             required_verifiers: Vec::new(),
-            clear_signing: None,
         };
         let policy_bytes = serde_jcs::to_vec(&policy).unwrap();
         let policy_digest = Digest32::from_bytes(Sha256::digest(&policy_bytes).into());

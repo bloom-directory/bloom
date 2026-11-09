@@ -1261,7 +1261,7 @@ impl IpcServer {
 
     async fn do_write(&self, params: &Value) -> Result<(), HandlerError> {
         let path = parse_path(params)?;
-        if write_path_uses_wallet_signer(&path) {
+        if write_path_uses_wallet_signer(&path) && !is_fee_repair_write(&path, params) {
             return Err(HandlerError::PermissionDenied);
         }
         let bytes = parse_write_bytes(params)?;
@@ -1273,7 +1273,7 @@ impl IpcServer {
     /// race while preserving the existing VFS protocol.
     async fn do_write_with_lookup(&self, params: &Value) -> Result<Value, HandlerError> {
         let path = parse_path(params)?;
-        if write_path_uses_wallet_signer(&path) {
+        if write_path_uses_wallet_signer(&path) && !is_fee_repair_write(&path, params) {
             return Err(HandlerError::PermissionDenied);
         }
         let bytes = parse_write_bytes(params)?;
@@ -1829,6 +1829,28 @@ fn validated_petal_archive_output(
         Err(error) => return Err(error.into()),
     }
     Ok(output)
+}
+
+// Fee-only replacement delegates exact authorization to Broker in the VFS
+// handler. Keep legacy cancellation and body substitution out of raw IPC.
+fn is_fee_repair_write(path: &VfsPath, params: &Value) -> bool {
+    let segments = path.segments();
+    if !matches!(segments, [root, _, _, chains, _, outbox, pending, _, action]
+        if root == "wallets" && chains == "chains" && outbox == "outbox"
+            && pending == "pending" && action == "replace")
+    {
+        return false;
+    }
+    let Ok(bytes) = parse_write_bytes(params) else {
+        return false;
+    };
+    let Ok(Value::Object(fields)) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    fields.len() == 2
+        && ["max_fee_per_gas", "max_priority_fee_per_gas"]
+            .iter()
+            .all(|key| fields.get(*key).is_some_and(Value::is_string))
 }
 
 fn write_path_uses_wallet_signer(path: &VfsPath) -> bool {
@@ -3323,6 +3345,46 @@ summary = "Demo app used by IPC tests."
                 })
                 .await;
             assert_eq!(response.error.unwrap().code, -32007, "{action}");
+        }
+    }
+
+    #[test]
+    fn fee_repair_ipc_admission_is_limited_to_exact_fee_pair() {
+        let path =
+            VfsPath::parse("/wallets/minnow/0/chains/polygon/outbox/pending/tx-1/replace").unwrap();
+        let fees =
+            json!({"max_fee_per_gas":"60000000000","max_priority_fee_per_gas":"30000000000"});
+        let params =
+            |value: &Value| json!({"bytes_b64":B64.encode(serde_json::to_vec(value).unwrap())});
+        assert!(is_fee_repair_write(&path, &params(&fees)));
+        for body in [
+            json!({"max_fee_per_gas":"60000000000"}),
+            json!({"max_fee_per_gas":60000000000u64,"max_priority_fee_per_gas":"30000000000"}),
+            json!({"max_fee_per_gas":"60000000000","max_priority_fee_per_gas":"30000000000","to":"0x1234"}),
+        ] {
+            assert!(!is_fee_repair_write(&path, &params(&body)));
+        }
+        let cancel =
+            VfsPath::parse("/wallets/minnow/0/chains/polygon/outbox/pending/tx-1/cancel").unwrap();
+        assert!(!is_fee_repair_write(&cancel, &params(&fees)));
+    }
+
+    #[tokio::test]
+    async fn raw_ipc_fee_repair_reaches_vfs_authorization() {
+        let server = IpcServer::new(vfs(), "0", vec![]);
+        for method in ["write", "write_with_lookup"] {
+            let response = server.dispatch(Request {
+                jsonrpc: "2.0".into(),
+                id: json!(1),
+                method: method.into(),
+                params: json!({
+                    "path":"/wallets/minnow/0/chains/polygon/outbox/pending/tx-1/replace",
+                    "projection_path":"/wallets/minnow/0/chains/polygon/outbox/pending/tx-1/approval_challenge.json",
+                    "bytes_b64":B64.encode(br#"{"max_fee_per_gas":"60000000000","max_priority_fee_per_gas":"30000000000"}"#),
+                }),
+            }).await;
+            let error = response.error.expect("absent wallet must fail in VFS");
+            assert_eq!(error.code, -32004, "{method}: {}", error.message);
         }
     }
 

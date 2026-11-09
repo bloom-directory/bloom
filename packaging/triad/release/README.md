@@ -77,7 +77,17 @@ source-quality gates. All targets emit the archive plus `.sha256`, `.sig`,
 and `.pub` sidecars.
 
 The release workflow builds Linux aarch64 natively on `ubuntu-24.04-arm` and
-macOS aarch64 on `macos-15` alongside Linux x86_64. A manual `dry_run=true`
+macOS aarch64 on `macos-15` alongside Linux x86_64 on `ubuntu-24.04`. Both
+Linux builds run in a pinned `ubuntu:22.04` container so the binaries need
+only glibc 2.35: a build on 24.04 requires glibc 2.38+ and fails to start on
+22.04. Both jobs share the same image digest, Ubuntu archive snapshot
+(`20261027T000000Z`) and checksum-verified rustup 1.29.2 installer. The snapshot
+pins transitive build packages as well as gcc/libc-dev; update it deliberately
+for security fixes. The hosted runner's read-only public CA bundle bootstraps
+HTTPS until the container installs its own certificates. Archive signatures
+remain required; historical snapshot metadata is exempt from expiry checks.
+These pins remove live package/bootstrap drift, not a guarantee of bit-identical
+binaries across different hosts. A manual `dry_run=true`
 dispatch uploads all three `test-unclaimed` candidates as Actions artifacts
 and cannot reach production
 signing or GitHub publication. Live candidate installation requires both a
@@ -181,11 +191,22 @@ an immutable release directory and a coordinated host-wide transaction: stop
 all active enrollments, atomically switch `current`, update the release digest
 in active and retained configuration, and validate active services before
 committing. Active enrollments require available user session buses. Failed
-activation and interrupted transactions restore the previous release. Custody,
-identity material, and allocated NFS ports are preserved.
+activation and interrupted transactions restore the previous release unless
+the upgrade is forward-only (below). Custody, identity material, and allocated
+NFS ports are preserved.
+
+Each release directory keeps its `compatibility-v1.toml`. Before anything is
+stopped, Linux applies the same state checks as macOS: it refuses a candidate
+whose record is malformed, whose `current` state is older than the installed
+release's, or whose `migration_floor` is above it. The upgrade is
+forward-only when the installed release's `current` state is below the
+candidate's `downgrade_floor`, or when the installed release has no record.
+A failed forward-only upgrade stops the release set, keeps the candidate
+selected, keeps the transaction, and exits with "state migration is
+forward-only". The previous binaries could not read the migrated state.
 
 Before any unit is mutated, the transaction (`schema
-bloom.linux-upgrade-transaction.2`) snapshots the installed Bloom-owned unit
+bloom.linux-upgrade-transaction.3`) snapshots the installed Bloom-owned unit
 templates — both ceremony sockets, the Broker and Signer service templates, the
 session path, the two user service units, and the retired RPC/control socket
 templates — recording explicit absence alongside bytes and modes. A rollback
@@ -199,7 +220,14 @@ payload of the last installation, so a KMS host that rolls back after an
 upgrade with a payload lacking the KMS overlay is repaired by rerunning the
 installer with that overlay.
 
-Recovery after an interruption restores the coherent previous installation and
+Recovery of a forward-only transaction selects its candidate and keeps the
+transaction. The installer run that triggered recovery then runs the full
+upgrade steps even when it requests that same candidate: every login is
+rewritten and started under the authenticated health gate, and only then is
+the transaction retired. Requesting a different release instead retires the
+kept transaction and upgrades from the candidate.
+
+Recovery of any other transaction restores the coherent previous installation and
 then lets the verified installer retry the requested release; it never
 completes the interrupted candidate in place. Recovery clears the transaction
 as soon as the previous installation is restored and only then restarts it,
@@ -212,7 +240,8 @@ transaction recorded by an earlier installer (`schema
 bloom.linux-upgrade-transaction.1`) carries no unit snapshot; it is recovered
 by rolling the binary selection and release metadata back on their own, as the
 installer that opened it would have, and the retried installation then rewrites
-every Bloom-owned unit coherently before starting anything.
+every Bloom-owned unit coherently before starting anything. Schemas 1 and 2
+carry no forward-only marker and always roll back, as their installers would.
 
 Linux installs provide `bloom-uninstall`. Its default `--retain-custody` mode
 stops and disables the selected enrollment, removes runtime integration, and
@@ -333,8 +362,16 @@ Deployments requiring network enforcement of exact outbound destinations need a
 reviewed egress proxy or firewall policy covering relay, ACME and DNS lifecycle;
 static ingress addresses alone do not cover CA renewal endpoints.
 
-The remote suite requires Machine–Broker API 1.7 and Broker–Signer API 1.6,
-with release state schema 2 and downgrade floor 2 for all three services.
+The shipped v0.4.0 bundle used Machine–Broker API 1.7 and Machine and Broker
+state/floor 2. This clear-signing candidate adopts the landed Broker's API 1.8
+and moves both Machine and Broker to state/floor 3: Machine state 3 adds
+`review_payload_digest` to pending exact-signing state, which Machine 0.4.x
+rejects. Broker–Signer remains 1.6 and Signer state/floor remains 2. This is the
+coordinated release bump, not an additional bump for each PR. Both upgrades are
+forward-only. Take a compatible backup of Machine and Broker state before
+migration: neither the old v0.4.0 Machine nor the old v0.4.0 Broker can reopen
+state migrated to 3. Rollback requires restoring compatible Machine and Broker
+state, not lowering either floor or installing an old binary over migrated data.
 Legacy localhost credential wraps, RP IDs and user handles are preserved;
 legacy signed receipts retain their original canonical signed bytes. Old pending
 ceremonies fail on restart. After activating this state version, supported

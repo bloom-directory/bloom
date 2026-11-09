@@ -121,7 +121,25 @@ fn default_native_decimals() -> u8 {
     18
 }
 
+/// Tempo mainnet. Fees are paid in stablecoins: it has no native token, and
+/// `eth_getBalance` returns the same placeholder for every address.
+pub const TEMPO_MAINNET_CHAIN_ID: u64 = 4217;
+
+/// Tempo Moderato testnet, which also has no native token.
+pub const TEMPO_MODERATO_CHAIN_ID: u64 = 42431;
+
+/// False for a chain id with no native token, such as Tempo.
+pub fn chain_has_native_asset(chain_id: u64) -> bool {
+    !matches!(chain_id, TEMPO_MAINNET_CHAIN_ID | TEMPO_MODERATO_CHAIN_ID)
+}
+
 impl ChainSpec {
+    /// False when the chain has no native token, so `eth_getBalance` is not a
+    /// balance. Keyed by chain id so existing configs are covered.
+    pub fn has_native_asset(&self) -> bool {
+        chain_has_native_asset(self.chain_id)
+    }
+
     /// A safe default Anvil chain spec for local development.
     pub fn anvil_default() -> Self {
         ChainSpec {
@@ -154,18 +172,6 @@ impl ChainSpec {
     /// Known OP-stack chain IDs (Optimism, Base, and their testnets).
     pub fn is_known_op_stack_chain_id(chain_id: u64) -> bool {
         matches!(chain_id, 10 | 8453 | 11155420 | 84532)
-    }
-
-    /// Chains with no native token. Tempo pays fees in stablecoins, and its
-    /// `eth_getBalance` answers a placeholder near 4.24e75 rather than a
-    /// holding, so no native balance may be read or shown there.
-    pub fn is_known_tokenless_chain_id(chain_id: u64) -> bool {
-        matches!(chain_id, 4217 | 42431)
-    }
-
-    /// Whether `eth_getBalance` on this chain reports a real holding.
-    pub fn has_native_token(&self) -> bool {
-        !Self::is_known_tokenless_chain_id(self.chain_id)
     }
 
     /// Infer `op_stack` from the chain ID when the field was absent in
@@ -230,6 +236,13 @@ pub const SOLANA_MAINNET_BETA_GENESIS_HASH: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZ
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn both_tempo_chains_have_no_native_asset() {
+        assert!(!chain_has_native_asset(TEMPO_MAINNET_CHAIN_ID));
+        assert!(!chain_has_native_asset(TEMPO_MODERATO_CHAIN_ID));
+        assert!(chain_has_native_asset(1));
+    }
 
     #[test]
     fn chain_id_display_and_from() {

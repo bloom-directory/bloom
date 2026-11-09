@@ -20,6 +20,7 @@ machine_socket=""
 log_dir=""
 ready_file=""
 services_only=0
+retain_temporary_files=0
 hosted_relay=0
 install_authority_fixture="${BLOOM_TRIAD_DEV_AUTHORITY_FIXTURE:-0}"
 build_integration_petals="${BLOOM_TRIAD_DEV_BUILD_PETALS:-1}"
@@ -39,6 +40,7 @@ while [ "$#" -gt 0 ]; do
     --ceremony-port) need_value "$@"; ceremony_port_arg="$2"; ceremony_port_arg_set=1; shift 2 ;;
     --remote-upstream-port) need_value "$@"; remote_upstream_port_arg="$2"; remote_upstream_port_arg_set=1; shift 2 ;;
     --services-only) services_only=1; shift ;;
+    --retain-temporary-files) retain_temporary_files=1; shift ;;
     --hosted-relay) hosted_relay=1; shift ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -218,7 +220,9 @@ if [ -n "$mount_dir" ]; then
     umount_bin="$(command -v umount || true)"
     [ -n "$mount_nfs_bin" ] || die "Linux developer mounts require mount.nfs4"
     [ -n "$umount_bin" ] || die "Linux developer mounts require umount"
-    mount_probe_opts="actimeo=0,vers=4.1,proto=tcp,port=1,rsize=65536,wsize=65536,timeo=10"
+    # Same options the daemon mounts with, so the probe tests the privilege
+    # the real mount needs. See build_mount_opts in crates/bloom-mount/src/lib.rs.
+    mount_probe_opts="actimeo=0,sync,vers=4.1,proto=tcp,port=1,rsize=65536,wsize=65536,timeo=10"
     sudo -n -l -- "$mount_nfs_bin" -o "$mount_probe_opts" \
       "127.0.0.1:/" "$mount_dir" >/dev/null 2>&1 ||
       die "Linux developer mount privilege is not installed for $mount_dir"
@@ -334,7 +338,9 @@ if [ ! -f "${config_dir}/edge-manifest.json" ]; then
   chmod 0700 "$config_dir"
   "$bloom_bin" init triad-render-developer-enrollment \
     "$template_dir" "$config_dir" "$release_digest"
-  rm -rf -- "$template_dir"
+  if [ "$retain_temporary_files" -eq 0 ]; then
+    rm -rf -- "$template_dir"
+  fi
 fi
 
 if [ ! -e "$authority_edge_history" ]; then
@@ -545,7 +551,8 @@ cleanup() {
   done
   rm -f -- "$machine_socket"
   case "$runtime_dir" in
-    "${developer_root}/runtime."*) rm -rf -- "$runtime_dir" ;;
+    "${developer_root}/runtime."*)
+      if [ "$retain_temporary_files" -eq 0 ]; then rm -rf -- "$runtime_dir"; fi ;;
     *) printf 'refusing to remove unexpected runtime: %s\n' "$runtime_dir" >&2 ;;
   esac
   exit "$status"

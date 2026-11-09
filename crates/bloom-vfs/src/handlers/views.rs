@@ -521,7 +521,7 @@ impl ViewsHandler {
             let Some(client) = self.chains.get(chain) else {
                 continue;
             };
-            if !client.spec().has_native_token() || !seen_chains.insert(client.spec().chain_id) {
+            if !client.spec().has_native_asset() || !seen_chains.insert(client.spec().chain_id) {
                 continue;
             }
             let name = chain.clone();

@@ -331,12 +331,12 @@ fn seed_wallet_projection_fixture(home: &Path, name: &str) {
         derivation: None,
     };
     let canonical_policy = serde_jcs::to_vec(&CanonicalWalletPolicy {
+        clear_signing: None,
         wallet_id: wallet_id.clone(),
         maximum_approval_lifetime_ms: 300_000,
         allowed_petal_packages: Vec::new(),
         allowed_destinations: Vec::new(),
         required_verifiers: Vec::new(),
-        clear_signing: None,
     })
     .expect("canonicalize fixture policy");
     let policy_digest = Digest32::from_bytes(Sha256::digest(&canonical_policy).into());
@@ -2077,6 +2077,22 @@ fn wallet_import_rejects_path_names_before_broker_contact() {
 }
 
 #[test]
+fn wallet_import_rejects_wallets_control_names_before_broker_contact() {
+    let home = fresh_home();
+    let _daemon = RunningBloom::start(home.path());
+    for name in ["new", "registrations", "recover", "recoveries"] {
+        bloom_cmd(home.path())
+            .args(["wallet", "import", name])
+            .assert()
+            .failure()
+            .stderr(
+                predicate::str::contains("reserved for a /wallets control entry")
+                    .and(predicate::str::contains("ipc machine.execute").not()),
+            );
+    }
+}
+
+#[test]
 fn request_cli_dry_run_uses_vfs_lifecycle_and_body_receipt_helpers() {
     let home = fresh_home();
     seed_wallet_projection_fixture(home.path(), "alice");
@@ -2933,7 +2949,7 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         return;
     }
     // Exercise source installation of the current pinned Polymarket release.
-    let petal_ref = "a0177ae4e68f4a043df4db727fb3212e23ab7395";
+    let petal_ref = "1141037cc840127c48c06f1f4e39da78225ff188";
     let home = fresh_home();
     let home_dir = bloom_proto::HomeDir::at(home.path());
     let config = bloom_proto::Config::local_default();
@@ -2962,8 +2978,8 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         )))
         .stdout(predicate::str::contains("Building source package..."))
         .stdout(predicate::str::contains("Validating Petal package..."))
-        .stdout(predicate::str::contains("\"routes\": 109"))
-        .stdout(predicate::str::contains("routes: 109"));
+        .stdout(predicate::str::contains("\"routes\": 110"))
+        .stdout(predicate::str::contains("routes: 110"));
 
     bloom_cmd(home.path())
         .args(["petals", "ls"])
