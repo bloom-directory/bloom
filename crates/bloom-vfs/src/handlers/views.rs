@@ -1103,10 +1103,16 @@ impl ViewsHandler {
 
     async fn render_receive(&self) -> String {
         let (wallets, unavailable) = self.wallet_projections().await;
-        let (mainnets, testnets): (Vec<String>, Vec<String>) = self
-            .sorted_chains()
-            .into_iter()
-            .partition(|name| !is_test_network(name));
+        let (mainnets, testnets): (Vec<String>, Vec<String>) =
+            self.sorted_chains().into_iter().partition(|name| {
+                !is_test_network(name)
+                    && !self.chains.get(name).is_some_and(|client| {
+                        matches!(
+                            client.spec().chain_id,
+                            11155111 | 17000 | 31337 | 1337 | 84532 | 421614 | 42431
+                        )
+                    })
+            });
 
         let mut body = String::new();
         if unavailable {
@@ -1188,11 +1194,23 @@ impl ViewsHandler {
             ));
         }
         for (account, address) in &inventory.solana {
+            let networks = self.solana_chain_names();
+            let clusters = if networks.is_empty() {
+                "No Solana network configured.".to_owned()
+            } else {
+                format!(
+                    "Configured Solana networks: {}.",
+                    networks
+                        .iter()
+                        .map(|n| html_escape(n))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
             card.push_str(&format!(
                 "<article class=\"card receiving-card\"><h3>{mark}</h3>{qr}\
                  <code class=\"address\">{address}</code>\
-                 <p class=\"receiving-network\">Account <code>{account}</code>. Send on Solana only.</p>\
-                 <a class=\"external-link\" href=\"https://explorer.solana.com/address/{address}\" rel=\"noreferrer noopener\">View on Solana Explorer ↗</a></article>",
+                 <p class=\"receiving-network\">Account <code>{account}</code>. Send on Solana only. {clusters}</p></article>",
                 mark = asset_label("Solana"),
                 qr = receiving_qr(address),
                 address = html_escape(address),
@@ -1292,17 +1310,17 @@ impl ViewsHandler {
              <a href=\"#ledger\"><span class=\"mini-outcome\">◷</span><strong>{pending}</strong>\
              <span>Awaiting review</span></a>\
              <a href=\"#ledger\"><span class=\"mini-outcome\">✗</span><strong>{failed}</strong>\
-             <span>Not sent</span></a></section>"
+             <span>Stopped</span></a></section>"
         ));
 
         body.push_str(
-            "<p class=\"coverage\">Broadcast records show submission, not confirmation.</p>",
+            "<p class=\"coverage\">This page shows central EVM outbox records; separate Solana outboxes are not included. Broadcast records show submission, not confirmation.</p>",
         );
 
         if actions.is_empty() {
             body.push_str(
                 "<section class=\"callout\" id=\"ledger\"><strong>No activity yet</strong>\
-                 <p>Your transactions will appear here.</p>\
+                 <p>Central EVM outbox operations will appear here.</p>\
                  </section>",
             );
         } else {
@@ -1332,7 +1350,7 @@ impl ViewsHandler {
                 ledger.push_str("</div>");
             }
             body.push_str(&format!(
-                "<div class=\"section-head\" id=\"ledger\"><h2>Every record</h2>\
+                "<div class=\"section-head\" id=\"ledger\"><h2>Recorded operations</h2>\
                  <p>{count}, newest first</p></div>{ledger}",
                 count = count_noun(actions.len(), "operation", "operations"),
             ));
@@ -1712,6 +1730,8 @@ struct Intent {
     created_ms: Option<u64>,
     usd_value: Option<f64>,
     data_hex: Option<String>,
+    token: Option<bloom_proto::TokenRef>,
+    nft: Option<bloom_proto::NftRef>,
 }
 
 struct Action {
@@ -1764,6 +1784,12 @@ impl Action {
     /// recipient fallback.
     fn recipient(&self) -> Option<String> {
         let intent = self.intent.as_ref()?;
+        if let Some(token) = &intent.token {
+            return normalized_evm_address(&token.recipient);
+        }
+        if let Some(nft) = &intent.nft {
+            return normalized_evm_address(&nft.counterparty);
+        }
         if let Some(recipient) = intent.recipient.as_deref() {
             return normalized_evm_address(recipient);
         }
@@ -1782,7 +1808,7 @@ impl Action {
         intent.to.as_ref()?;
         Some(match intent.action_kind.as_deref() {
             Some("native_transfer") => "recipient",
-            Some("contract_call") => "contract",
+            Some("contract_call" | "erc20_transfer" | "nft_transfer") => "contract",
             _ => "unknown",
         })
     }
@@ -1839,6 +1865,24 @@ impl Action {
             return self.summary.clone();
         };
         let kind = intent.action_kind.as_deref().unwrap_or_default();
+        if let Some(token) = &intent.token {
+            return format!(
+                "Send {} {} → {}",
+                token.amount,
+                token.symbol,
+                address_label(address_book, &token.recipient)
+            );
+        }
+        if let Some(nft) = &intent.nft {
+            return format!(
+                "{:?} {} {} #{} → {}",
+                nft.action,
+                nft.amount,
+                nft.symbol,
+                nft.token_id,
+                address_label(address_book, &nft.counterparty)
+            );
+        }
         let display_amount = self.amount.as_deref().map(short_activity_amount);
         let head = match (kind, &display_amount) {
             ("native_transfer", Some(amount)) => format!("Send {amount}"),
@@ -1999,7 +2043,7 @@ impl Action {
                 }
             }
             row_fact(
-                "Value",
+                "Native value",
                 html_escape(self.amount.as_deref().unwrap_or(
                     if intent.value_wei.as_deref() == Some("0") {
                         "None — zero value"
@@ -2008,6 +2052,23 @@ impl Action {
                     },
                 )),
             );
+            if let Some(token) = &intent.token {
+                row_fact(
+                    "Token amount",
+                    html_escape(&format!("{} {}", token.amount, token.symbol)),
+                );
+                row_fact("Token contract", html_escape(&token.address));
+            }
+            if let Some(nft) = &intent.nft {
+                row_fact(
+                    "NFT",
+                    html_escape(&format!(
+                        "{:?} {} {} #{} amount {}",
+                        nft.action, nft.kind, nft.symbol, nft.token_id, nft.amount
+                    )),
+                );
+                row_fact("NFT contract", html_escape(&nft.contract));
+            }
             // The paid fee from the on-chain receipt, never the staged cap:
             // a limit is what the operation might have burned, the receipt
             // is what it did. Absent until the receipt resolves.
@@ -2086,8 +2147,18 @@ fn parse_intent(text: &str) -> Option<Intent> {
         value_wei: string("value_wei"),
         action_kind: string("action_kind"),
         created_ms: number("created_ms"),
-        usd_value: value.get("usd_value").and_then(|field| field.as_f64()),
+        usd_value: value
+            .get("valuation")
+            .and_then(|v| v.get("usd_micro"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as f64 / 1_000_000.0),
         data_hex,
+        token: value
+            .get("token")
+            .and_then(|v| serde_json::from_value(v.clone()).ok()),
+        nft: value
+            .get("nft")
+            .and_then(|v| serde_json::from_value(v.clone()).ok()),
     })
 }
 
@@ -2402,7 +2473,17 @@ fn explorer_address_link(chain_id: Option<u64>, address: &str) -> String {
 /// as a test one, never the reverse.
 fn is_test_network(chain: &str) -> bool {
     let name = chain.to_ascii_lowercase();
-    name.contains("devnet") || name.contains("testnet")
+    [
+        "devnet",
+        "testnet",
+        "sepolia",
+        "holesky",
+        "anvil",
+        "localhost",
+        "localnet",
+    ]
+    .iter()
+    .any(|part| name.contains(part))
 }
 
 fn fresh_quote(timestamp: u64, now: u64) -> bool {
@@ -2713,6 +2794,19 @@ mod tests {
                 .outcome_note()
                 .contains("Check the chain's receipt")
         );
+        let html = render(&fixture.handler, ACTIVITY_HTML).await;
+        assert!(html.contains("<span>Stopped</span>"));
+        assert!(!html.contains("<span>Not sent</span>"));
+        assert!(html.contains("separate Solana outboxes are not included"));
+    }
+
+    #[test]
+    fn typed_intent_preserves_facts_and_ignores_legacy_price() {
+        let intent = parse_intent(r#"{"action_kind":"erc20_transfer","usd_value":999,"token":{"address":"0xcontract","symbol":"USDC","decimals":6,"recipient":"0x0000000000000000000000000000000000000001","amount":"12"}}"#).unwrap();
+        assert_eq!(intent.token.unwrap().amount, "12");
+        assert_eq!(intent.usd_value, None);
+        let priced = parse_intent(r#"{"valuation":{"usd_micro":1250000}}"#).unwrap();
+        assert_eq!(priced.usd_value, Some(1.25));
     }
 
     #[tokio::test]
@@ -3611,7 +3705,14 @@ mod tests {
 
     #[test]
     fn test_networks_are_recognised_by_name() {
-        for name in ["solana-devnet", "sepolia-testnet", "Base-Devnet"] {
+        for name in [
+            "solana-devnet",
+            "sepolia",
+            "holesky",
+            "anvil",
+            "localhost",
+            "Base-Devnet",
+        ] {
             assert!(is_test_network(name), "{name} is a test network");
         }
         for name in ["ethereum", "base", "arbitrum", "solana-mainnet"] {

@@ -160,7 +160,7 @@ impl ChainSpec {
     /// `eth_getBalance` answers a placeholder near 4.24e75 rather than a
     /// holding, so no native balance may be read or shown there.
     pub fn is_known_tokenless_chain_id(chain_id: u64) -> bool {
-        matches!(chain_id, 4217)
+        matches!(chain_id, 4217 | 42431)
     }
 
     /// Whether `eth_getBalance` on this chain reports a real holding.

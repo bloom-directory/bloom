@@ -32,7 +32,7 @@ open /Volumes/bloom/views/wallets.html # macOS
 Give them the file path and let the browser render it. Do not paste the HTML
 into a transcript, and do not re-render these pages yourself: the canonical
 values live in the sibling JSON leaves
-(`wallets/<wallet>/addresses.json`, `wallets/<wallet>/chains/<chain>/balance.json`,
+(`wallets/<wallet>/<n>/holdings.json`,
 `outbox/<state>/<action>/intent.json` and `result.json`).
 
 ## What the words mean
@@ -55,8 +55,8 @@ These pages are deliberately narrow about what they claim:
   a claim that the network is a testnet or that its native asset has no value.
 - Balances cover native coins only; token holdings are not scanned. Chains
   without a native token (Tempo) are skipped.
-- Balance reads for projected accounts share one ten-second budget and eight
-  in-flight reads. A read that does not finish is omitted and named. A recent
+- Balance reads for projected accounts share one ten-second budget and up to eight
+  account workers, each reading its configured chains concurrently. A read that does not finish is omitted and named. A recent
   successful read (at most five minutes old) stands in for a failed one and is
   disclosed. Activity opens at most 256 operations in each state; older
   records are omitted and the page says coverage is incomplete.
@@ -66,9 +66,10 @@ These pages are deliberately narrow about what they claim:
 - These pages are **observations**. Nothing here approves, stages, or executes
   an action. A page that matches Bloom's visual language is still not a trusted
   authorization surface — passkeys and private input belong to Broker's own page.
-- They make no automatic network requests. The stylesheet and script are
-  served from this same mount. Following an explicit block-explorer link is
-  the reader's choice.
+- Browser assets are served from this mount. Rendering Wallets reads configured
+  RPC and price providers, exposing public addresses and consuming provider quota.
+  Rendering Activity may query receipts, exposing transaction hashes and consuming
+  RPC quota. Following a block-explorer link is the reader's choice.
 - Address and transaction links are emitted only from known chain ids and use
   no referrer.
 - An address shown here is the wallet's current projected receiving address. A
