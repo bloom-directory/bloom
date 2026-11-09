@@ -19,9 +19,6 @@ pub(crate) struct ProvisioningResult {
 pub(crate) enum ProvisioningOutcome {
     Current,
     Installed,
-    /// Replaced an older release. Signed package lineage carries the old
-    /// release's settings forward; an update outside that lineage starts empty.
-    Updated,
     /// Refused because other Petal code was running when this one would have
     /// activated; [`retry_pending`] tries it again while Machine runs.
     Busy(String),
@@ -86,13 +83,8 @@ pub(crate) fn provision_with(
             }
             let prepared = acquire(daemon, &entry, context)
                 .context(Download(format!("download default {name}")))?;
-            let updated = expected_owner.is_some();
             prepared.commit(daemon, context, Some(expected_owner))?;
-            Ok(if updated {
-                ProvisioningOutcome::Updated
-            } else {
-                ProvisioningOutcome::Installed
-            })
+            Ok(ProvisioningOutcome::Installed)
         };
         let outcome = match attempt() {
             Ok(outcome) => outcome,

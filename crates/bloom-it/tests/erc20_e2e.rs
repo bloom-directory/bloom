@@ -12,16 +12,22 @@
 //!
 //! They spawn a local `anvil` from `$PATH` (or `BLOOM_ANVIL_BIN`).
 
+use std::net::TcpListener;
+use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use bloom_evm::ChainClient;
-use bloom_it::{exact_signing_broker, exact_signing_catalog, spawn_anvil, spawn_anvil_no_mining};
+use bloom_it::{exact_signing_broker, exact_signing_catalog};
 use bloom_proto::{
     AgentAutonomyMode, ChainSpec, Policy, RawIntent, RawIntentBody, ValuationError, ValuationQuote,
 };
 use bloom_tx::tx_engine::{TxEngine, TxEngineError};
 use bloom_tx::{Outbox, PriceOracle};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{Child, Command};
+use tokio::time::timeout;
 
 /// Anvil prefunded account #0.
 const ANVIL_PK0: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -54,6 +60,77 @@ impl PriceOracle for TestPriceOracle {
     }
 }
 
+struct AnvilGuard {
+    child: Option<Child>,
+    port: u16,
+}
+
+impl AnvilGuard {
+    fn rpc_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+}
+
+impl Drop for AnvilGuard {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.child.take() {
+            let _ = c.start_kill();
+        }
+    }
+}
+
+fn pick_free_port() -> Result<u16> {
+    let l = TcpListener::bind("127.0.0.1:0")?;
+    Ok(l.local_addr()?.port())
+}
+
+fn anvil_bin() -> String {
+    std::env::var("BLOOM_ANVIL_BIN").unwrap_or_else(|_| "anvil".to_string())
+}
+
+async fn spawn_anvil(no_mining: bool) -> Result<AnvilGuard> {
+    let port = pick_free_port()?;
+    let mut cmd = Command::new(anvil_bin());
+    cmd.arg("--port")
+        .arg(port.to_string())
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--chain-id")
+        .arg("31337");
+    if no_mining {
+        // Hold txs in the mempool so we can submit a replacement.
+        cmd.arg("--no-mining");
+    }
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = cmd.spawn().context("spawn anvil")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("anvil stdout missing"))?;
+    let mut reader = BufReader::new(stdout).lines();
+    let wait = async {
+        loop {
+            match reader.next_line().await? {
+                Some(line) => {
+                    if line.contains("Listening on") {
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                }
+                None => return Err(anyhow!("anvil exited before becoming ready")),
+            }
+        }
+    };
+    timeout(Duration::from_secs(15), wait)
+        .await
+        .map_err(|_| anyhow!("timed out waiting for anvil to start"))??;
+    Ok(AnvilGuard {
+        child: Some(child),
+        port,
+    })
+}
+
 /// Mine whatever is queued on a `--no-mining` anvil.
 async fn mine_pending(rpc_url: &str) -> Result<()> {
     let response = reqwest::Client::new()
@@ -82,7 +159,7 @@ fn anvil_chain_spec(rpc_url: &str) -> ChainSpec {
 /// a `Token` error — which proves the path is wired end-to-end.
 #[tokio::test(flavor = "multi_thread")]
 async fn erc20_stage_fails_when_decimals_unreadable() -> Result<()> {
-    let anvil = spawn_anvil().await?;
+    let anvil = spawn_anvil(false).await?;
     let rpc_url = anvil.rpc_url();
     let chain = ChainClient::new(anvil_chain_spec(&rpc_url)).map_err(|e| anyhow!("chain: {e}"))?;
 
@@ -141,7 +218,7 @@ async fn erc20_stage_fails_when_decimals_unreadable() -> Result<()> {
 /// is asserted rather than assumed.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unmined_nonce_stays_replaceable_and_a_mined_one_does_not() -> Result<()> {
-    let anvil = spawn_anvil_no_mining().await?;
+    let anvil = spawn_anvil(true).await?;
     let rpc_url = anvil.rpc_url();
     let chain = ChainClient::new(anvil_chain_spec(&rpc_url)).map_err(|e| anyhow!("chain: {e}"))?;
 

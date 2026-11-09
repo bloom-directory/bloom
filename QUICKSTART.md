@@ -81,14 +81,6 @@ If Broker or Signer is unavailable, custody and signing fail promptly. Public
 reads, staging, and simulation may remain available; Machine never substitutes
 another authority path.
 
-For `main`, `bloom wallet new main` also asks you to approve its default
-policy: the persona and Petals chosen in `bloom init`, in one ceremony. Run it
-once `bloom petals ls` lists those Petals. If `main` was created another way or
-before they were installed, run `bloom wallet default-policy main` once they
-are. To start a wallet from a persona instead, run
-`bloom wallet persona <wallet> <institutional|trader|degen>`; the README's
-[Choosing a persona](./README.md#choosing-a-persona) says what each one sets.
-
 ## 3. Stage, review, and confirm
 
 For an Anvil example, first run `anvil --port 8545` in another terminal.

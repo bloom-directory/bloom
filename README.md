@@ -87,38 +87,6 @@ bloom wallet address main --profile solana
 bloom wallet address main --profile evm
 ```
 
-### Choosing a persona
-
-A persona is a starting point for a wallet's policy and Petal limits. Whichever
-you choose, every transaction still needs your approval.
-
-| Persona | Longest approval | ERC-20 transfers to any recipient | Polymarket daily buy limit |
-|---|---|---|---|
-| Institutional (default) | 30 days | No: recipients must be listed in the policy | 100 pUSD |
-| Trader | Until revoked | No: recipients must be listed in the policy | 1,000 pUSD |
-| Degen | Until revoked | Yes, for Bloom's reviewed tokens on Ethereum and Polygon | 10,000 pUSD |
-
-`bloom init` asks for `main`'s persona and Petals (`bloom init --persona
-degen` chooses without asking), and Bloom installs its catalog Petals when it
-starts. Create the wallet once `bloom petals ls` lists the Petals you chose:
-`bloom wallet new main` then asks you to approve the default policy, which
-allows all of them, in the same step. If you create the wallet first, Bloom
-proposes nothing until they are installed; then run
-`bloom wallet default-policy main` for that one approval. If a Petal stays
-missing, restart Bloom.
-
-A packaged install skips `bloom init`, so choose a persona once `main` exists:
-`bloom wallet persona main trader` (or `institutional`, `degen`) picks its
-Petals and opens that one approval.
-
-To change a wallet's persona later, run
-`bloom wallet persona <wallet> <persona>`. It is a fresh start for that wallet:
-once you approve its one ceremony, the wallet's policy is replaced and its
-Petal limits reset to the persona's. Until then nothing changes, and declining
-the ceremony changes nothing. A switch starts only once every Petal it
-chooses is installed (without a terminal to choose from, all five catalog
-Petals). Each wallet keeps its own persona.
-
 Native Solana transfers use the same wallet outbox shape as EVM transfers,
 with genesis pinning, exact-message semantic verification in Broker,
 signature-verifying simulation, explicit owner approval, and finalized
