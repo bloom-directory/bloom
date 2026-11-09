@@ -93,7 +93,6 @@ struct BrowseError {
 enum CheckoutRefusal {
     Blocked { operation_id: String },
     FormErrors,
-    UnlockPending,
     IdUsed,
 }
 
@@ -122,10 +121,6 @@ fn checkout_refusal(line: &str) -> Option<String> {
         CheckoutRefusal::FormErrors => {
             Some("The page shows form errors; fix them before payment".into())
         }
-        CheckoutRefusal::UnlockPending => Some(
-            "A saved traveler unlock is waiting for approval; finish or cancel it before payment"
-                .into(),
-        ),
         CheckoutRefusal::IdUsed => Some("Operation ID already used; check its status".into()),
         _ => None,
     }

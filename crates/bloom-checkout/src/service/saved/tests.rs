@@ -1,5 +1,7 @@
 use super::*;
-use bloom_signer_api::{Base64UrlBytes, CeremonyKind, HpkeEnvelope, legacy_local_surface};
+use bloom_signer_api::{
+    Base64UrlBytes, CeremonyKind, Digest32, HpkeEnvelope, legacy_local_surface,
+};
 use hpke::{
     Deserializable, Serializable, aead::ChaCha20Poly1305, kdf::HkdfSha256, kem::X25519HkdfSha256,
 };

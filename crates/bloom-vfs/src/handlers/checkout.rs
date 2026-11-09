@@ -436,9 +436,7 @@ mod tests {
                 let shown = listed.iter().find(|e| e.name == name);
                 let looked = handler.lookup(&path).await;
                 assert_eq!(looked.is_ok(), shown.is_some(), "{dir}/{name}");
-                let unknown = |r: &Result<_, HandlerError>| {
-                    matches!(r, Err(HandlerError::NotFound(p)) if *p == path.to_string_path())
-                };
+                let unknown = |r: &Result<_, HandlerError>| matches!(r, Err(HandlerError::NotFound(p)) if *p == path.to_string_path());
                 let write = handler.write(&path, b"{}").await;
                 match shown {
                     None => {

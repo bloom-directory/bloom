@@ -35,11 +35,10 @@ is running.
 ## Browse
 
 Write `checkout/browse/<slot>/in.json`, then read `out.json` (kept five
-minutes). Reuse the slot. Actions: `open` + `url`, `snapshot`, `back`,
-`fill_traveler`, `type_traveler`. Generic `click`, `type` and `select` are
-refused: any merchant event handler can charge a saved payment method,
-regardless of the control's label. Request a private take-over for those
-interactions. Traveler fills require their own scoped approval.
+minutes). Reuse the slot. Actions: `open` + `url`, `snapshot`, `back`.
+Generic `click`, `type` and `select` are refused: any merchant event handler
+can charge a saved payment method, regardless of the control's label. Request
+a private take-over for those interactions.
 
 - Take a fresh snapshot after every action; refs expire. Pages load in
   stages: if a control is missing or the page changed, snapshot again before
@@ -53,28 +52,10 @@ interactions. Traveler fills require their own scoped approval.
 
 ## Travelers on a booking
 
-1. Before the passenger form, write `checkout/requests/<id>/in.json` with
-   `traveler_id` and `agent_description`, and send the person the ceremony
-   URL from `status.json`. One approval unlocks that person on this website
-   for 30 minutes (`status.json` says `unlocked`). It pays nothing. Unlock each
-   passenger, payer or contact once per journey, not once per page.
-2. Send `fill_traveler` (with `traveler_id` when more than one is unlocked).
-   It fills the empty fields it recognizes and returns their names in
-   `filled_fields`. It fills one person per booking and leaves card-holder
-   fields for the payer.
-3. For a missed field, a second passenger block or a different person, send
-   `type_traveler` with `traveler_id`, a fresh `element_ref` and `field`: a
-   saved field, `phone_national` (no country code), `phone_area`,
-   `phone_local`, `born_on_day`, `born_on_month`, `born_on_year`, `born_on_dmy`
-   or `born_on_mdy`. Use the date order the field states; never guess it from
-   the site's language. Choose the phone country before area and number:
-   changing it can clear them.
-4. Snapshots show filled values as `[saved <field>]`. Check each field holds
-   the right placeholder on the seller's review step; never try to read the
-   values. While these appear, page text is limited to nearby controls.
-
-A new `open`, a handback or expiry ends the unlock. Writing the request's
-`cancel` file stops future fills; values already sent to the site stay there.
+At a passenger, payer or contact form, request a take-over whose
+`agent_description` names the saved travelers to use. The person fills them
+in the private view and pays there with a saved card, since a handback
+discards the page; you never see the values.
 
 ## Pay
 

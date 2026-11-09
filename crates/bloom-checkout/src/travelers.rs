@@ -16,7 +16,7 @@ pub(crate) struct TravelerDiscovery {
 /// The saved phone in international format, grouped by the country's
 /// numbering plan ("+54 9 294 412-3456"), so a form's area-code and number
 /// fields can each take their part. None when the number does not parse.
-pub(crate) fn formatted_phone(raw: &str) -> Option<String> {
+fn formatted_phone(raw: &str) -> Option<String> {
     let number = phonenumber::parse(None, raw).ok()?;
     phonenumber::is_valid(&number).then(|| {
         number
@@ -26,17 +26,11 @@ pub(crate) fn formatted_phone(raw: &str) -> Option<String> {
     })
 }
 
-/// A saved value, or a form of it that booking forms ask for separately.
+/// A saved value, or a phone form that booking forms ask for separately.
 pub(crate) fn derived_traveler_value(
     values: &BTreeMap<String, Zeroizing<String>>,
     field: &str,
 ) -> Option<Zeroizing<String>> {
-    let date = |range: std::ops::Range<usize>| {
-        values
-            .get("born_on")
-            .and_then(|v| v.get(range))
-            .map(|s| Zeroizing::new(s.to_owned()))
-    };
     match field {
         "phone_country" | "phone_calling_code" => {
             let raw = values.get("phone")?;
@@ -92,27 +86,6 @@ pub(crate) fn derived_traveler_value(
             } else {
                 local
             }))
-        }
-        "born_on_year" => date(0..4),
-        "born_on_month" => date(5..7),
-        "born_on_day" => date(8..10),
-        "born_on_dmy" => {
-            let born = values.get("born_on")?;
-            Some(Zeroizing::new(format!(
-                "{}/{}/{}",
-                born.get(8..10)?,
-                born.get(5..7)?,
-                born.get(0..4)?
-            )))
-        }
-        "born_on_mdy" => {
-            let born = values.get("born_on")?;
-            Some(Zeroizing::new(format!(
-                "{}/{}/{}",
-                born.get(5..7)?,
-                born.get(8..10)?,
-                born.get(0..4)?
-            )))
         }
         _ => values.get(field).cloned(),
     }
@@ -201,8 +174,7 @@ impl TravelerDiscovery {
         let mut nonce = [0; 32];
         rand::thread_rng().fill_bytes(&mut nonce);
         let binding = Digest32::from_bytes(nonce);
-        // Share private field annotations with snapshots in an isolated world;
-        // neither the merchant's scripts nor the agent can read this map.
+        // An isolated world keeps the binding from the merchant's scripts.
         let contexts = tab.cdp.contexts(&tab.session, "bloom-shopping").await?;
         let root = contexts
             .iter()
@@ -235,44 +207,6 @@ impl TravelerDiscovery {
             })
             .collect()
     }
-    /// Fill one list the agent already opened. The page decides whether the
-    /// control is a typed combobox; checkout does not format the fill script.
-    pub async fn fill_opened(
-        tab: &PrivateTab,
-        session: &str,
-        world: i64,
-        index: usize,
-        field: &str,
-        value: &str,
-        origin: &str,
-    ) -> Result<Vec<String>> {
-        use rand::RngCore;
-        let mut nonce = [0; 32];
-        rand::thread_rng().fill_bytes(&mut nonce);
-        let binding = Digest32::from_bytes(nonce);
-        let field_name: TravelerField = serde_json::from_value(json!(field))
-            .context("That saved traveler field is not available")?;
-        let prelude = format!(
-            "(()=>{{const e=globalThis.__bloomRefs?.[{index}];if(!e?.isConnected)throw Error('stale');globalThis.__bloomTravelerRefs={{document,refs:[e],nonce:{}}};return true;}})()",
-            serde_json::to_string(binding.as_str())?
-        );
-        evaluate(tab, session, world, prelude).await?;
-        let discovery = Self {
-            scope: TravelerFillScope {
-                origin: origin.to_owned(),
-                frame_origins: vec![origin.to_owned()],
-                document_binding: binding,
-                fields: vec![field_name],
-            },
-            session: session.to_owned(),
-            world,
-            mapped: json!([{ "field": field, "choose": true, "index": 0 }]),
-        };
-        let mut values = BTreeMap::new();
-        values.insert(field.to_owned(), Zeroizing::new(value.to_owned()));
-        discovery.fill(tab, &values).await
-    }
-
     pub async fn fill(
         &self,
         tab: &PrivateTab,
@@ -317,7 +251,7 @@ impl TravelerDiscovery {
         // Field names and fixed reasons only, for diagnosing site lists.
         for skipped in result["skipped"].as_array().into_iter().flatten() {
             eprintln!(
-                "traveler field left for the agent: {}",
+                "traveler field left for the person: {}",
                 skipped.as_str().unwrap_or("")
             );
         }
@@ -659,8 +593,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn custom_traveler_displays_and_radio_choices_stay_private() {
-        let (browser, server, url) = browser_at(
+    async fn custom_date_displays_and_radio_choices_are_filled() {
+        let (browser, server, _) = browser_at(
             r#"<html lang='es'><div id='expiry'>Fecha de Caducidad
               <label>Día<div role='combobox'><span></span><input id='day' aria-label='Día de vencimiento' aria-autocomplete='list' readonly></div></label>
               <label>Mes<div role='combobox'><span></span><input id='month' aria-label='Mes de vencimiento' aria-autocomplete='list' readonly></div></label>
@@ -691,61 +625,20 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let origin = url::Url::parse(&url)
-            .unwrap()
-            .origin()
-            .ascii_serialization();
-        let filled = browser
-            .fill_traveler(
-                &origin,
-                &browser.shopping_context().await,
-                &[TravelerField::DocumentExpiry, TravelerField::Gender],
-                &values,
+        let tab = browser.handoff().await.unwrap();
+        let fields = [TravelerField::DocumentExpiry, TravelerField::Gender];
+        let discovery = TravelerDiscovery::read(&tab, &fields).await.unwrap();
+        let filled = discovery.fill(&tab, &values).await.unwrap();
+        assert!(filled.contains(&"document_expiry".into()) && filled.contains(&"gender".into()));
+        let actual = tab
+            .cdp
+            .evaluate(
+                &tab.session,
+                "[...expiry.querySelectorAll('input')].map(e=>e.value).concat(document.querySelector('[value=male]').checked)".into(),
             )
             .await
             .unwrap();
-        assert!(filled.contains(&"document_expiry".into()) && filled.contains(&"gender".into()));
-        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
-        let serialized = snapshot.to_string();
-        assert!(
-            !serialized.contains("Diciembre") && !serialized.contains("2035"),
-            "{snapshot}"
-        );
-        assert!(
-            serialized.contains("[saved document_expiry_day]")
-                && serialized.contains("[saved gender]")
-        );
-        let elements = snapshot["elements"].as_array().unwrap();
-        assert!(
-            elements
-                .iter()
-                .filter(|e| e["type"] == "radio")
-                .all(|e| e.get("checked").is_none())
-        );
-        assert!(
-            elements
-                .iter()
-                .any(|e| e["label"] == "Terms accepted" && e["checked"] == true)
-        );
-        // The public fare has the same number as the saved day. It must stay
-        // readable and actionable; globally masking short date tokens is wrong.
-        let fare = elements
-            .iter()
-            .find(|e| e["label"] == "Choose fare 31")
-            .unwrap();
-        browser
-            .browse(BrowseRequest::Click {
-                element_ref: fare["ref"].as_str().unwrap().into(),
-            })
-            .await
-            .unwrap();
-        assert!(
-            browser.browse(BrowseRequest::Snapshot).await.unwrap()["elements"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|e| e["label"] == "Fare selected")
-        );
+        assert_eq!(actual, json!(["31", "12", "2035", true]));
         server.abort();
     }
 
@@ -792,195 +685,6 @@ mod tests {
         server.abort();
     }
 
-    #[tokio::test]
-    async fn a_choice_revealing_dependent_fields_is_filled_in_one_request() {
-        let (browser, server, url) = browser_at(
-            r#"<html lang='es'><label>Tipo de Documento<select id='kind'>
-              <option value=''>Seleccionar</option><option value='national_id'>DNI</option>
-            </select></label><div id='expiry' hidden>Fecha de Caducidad
-              <label>Día<input id='day' aria-label='Día de vencimiento' aria-autocomplete='list' readonly></label>
-              <label>Mes<input id='month' aria-label='Mes de vencimiento' aria-autocomplete='list' readonly></label>
-              <label>Año<input id='year' aria-label='Año de vencimiento' aria-autocomplete='list' readonly></label>
-            </div><div id='options' hidden></div><p id='accepted'></p>
-            <script>
-              kind.addEventListener('input',()=>expiry.hidden=false);
-              const values={day:['31','31'],month:['12','Diciembre'],year:['2035','2035']};
-              for(const input of expiry.querySelectorAll('input')) input.addEventListener('click',()=>{
-                const [value,label]=values[input.id];options.innerHTML='<div role="option">'+label+'</div>';
-                options.hidden=false;options.firstChild.addEventListener('click',()=>{
-                  input.value=value;input.dataset.accepted='yes';options.hidden=true;
-                  accepted.textContent=[...expiry.querySelectorAll('input')].every(e=>e.dataset.accepted==='yes')?'accepted':'';
-                });
-              });
-            </script></html>"#,
-        )
-        .await;
-        let origin = url::Url::parse(&url)
-            .unwrap()
-            .origin()
-            .ascii_serialization();
-        let values = [
-            ("document_kind".into(), Zeroizing::new("national_id".into())),
-            (
-                "document_expiry".into(),
-                Zeroizing::new("2035-12-31".into()),
-            ),
-        ]
-        .into_iter()
-        .collect();
-        let filled = browser
-            .fill_traveler(
-                &origin,
-                &browser.shopping_context().await,
-                &[TravelerField::DocumentKind, TravelerField::DocumentExpiry],
-                &values,
-            )
-            .await
-            .unwrap();
-        assert_eq!(filled, ["document_kind", "document_expiry"]);
-        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
-        assert!(snapshot["text"].as_str().unwrap().contains("accepted"));
-        server.abort();
-    }
-    #[tokio::test]
-    async fn unlocked_traveler_fills_shopping_pages_and_stays_out_of_snapshots() {
-        // The merchant echoes the name into the page, title and URL as typed.
-        let (browser, server, url) = browser_at(
-            "<div><div>Nombres</div><input name='firstName-0'></div>
-             <div><div>Apellidos</div><input name='lastName-0'></div>
-             <input type='email'><h1 id='echo'></h1><button>Continuar</button>
-             <p id='keys'></p><script>let keys=0;document.addEventListener('keyup',()=>{keys++;document.getElementById('keys').textContent='key releases '+keys;});</script>
-             <script>document.addEventListener('input',()=>{const n=document.querySelector('[name=firstName-0]').value.toUpperCase();
-               echo.textContent='Hola '+n;document.title=n;history.replaceState({},'','/?n='+n);});</script>",
-        )
-        .await;
-        let origin = url::Url::parse(&url)
-            .unwrap()
-            .origin()
-            .ascii_serialization();
-        assert_eq!(browser.shopping_origin().await.unwrap(), origin);
-        let values: BTreeMap<String, Zeroizing<String>> = [
-            ("given_name", "Syntheticname"),
-            ("family_name", "Fixturefamily"),
-            ("email", "fixture@example.com"),
-            ("phone", "5491100000000"),
-        ]
-        .into_iter()
-        .map(|(k, v)| (k.into(), Zeroizing::new(v.into())))
-        .collect();
-        browser.redact(
-            values
-                .iter()
-                .map(|(k, v)| (v.to_string(), format!("[saved {k}]"))),
-        );
-        let fields = [
-            TravelerField::GivenName,
-            TravelerField::FamilyName,
-            TravelerField::Email,
-            TravelerField::Phone,
-        ];
-        assert!(
-            browser
-                .fill_traveler(
-                    "https://elsewhere.example",
-                    &browser.shopping_context().await,
-                    &fields,
-                    &values
-                )
-                .await
-                .is_err()
-        );
-        let filled = browser
-            .fill_traveler(&origin, &browser.shopping_context().await, &fields, &values)
-            .await
-            .unwrap();
-        assert_eq!(filled, ["given_name", "family_name", "email"]);
-        // Forms that accept a value only on a key release see one per field.
-        let keys = browser.browse(BrowseRequest::Snapshot).await.unwrap()["text"].to_string();
-        assert!(keys.contains("key releases 3"), "{keys}");
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
-        // Machine accepts only the closed public response shapes.
-        serde_json::from_value::<bloom_checkout_api::BrowseResponse>(snapshot.clone()).unwrap();
-        serde_json::from_value::<bloom_checkout_api::BrowseResponse>(
-            json!({"state":"filled","filled_fields":filled}),
-        )
-        .unwrap();
-        let snapshot = snapshot.to_string();
-        assert!(snapshot.contains("Hola [saved given_name]"), "{snapshot}");
-        // Captioned fields show which saved value went where.
-        assert!(
-            snapshot.contains(
-                r#""label":"Apellidos","role":"input","type":"text","value":"[saved family_name]""#
-            ) || snapshot.contains("[saved family_name]"),
-            "{snapshot}"
-        );
-        for secret in ["syntheticname", "fixturefamily", "fixture@example.com"] {
-            assert!(
-                !snapshot.to_ascii_lowercase().contains(secret),
-                "{snapshot}"
-            );
-        }
-        // Shopping continues on the same page with fresh refs.
-        assert!(snapshot.contains("Continuar"));
-        server.abort();
-    }
-    #[tokio::test]
-    async fn saved_accented_names_stay_private_when_the_merchant_changes_case() {
-        for (name, shown, render) in [
-            ("Élodie", "élodie", "value.toLowerCase()"),
-            ("Straße", "STRASSE", "value.toUpperCase()"),
-            ("İpek", "i\u{307}pek", "value.toLowerCase()"),
-            (
-                "élodie zoë",
-                "Élodie Zoë",
-                "value.split(' ').map(word=>word[0].toUpperCase()+word.slice(1)).join(' ')",
-            ),
-        ] {
-            let (browser, server, url) = browser_at(&format!(
-                "<label>First name<input autocomplete='given-name'></label>
-                 <p id='echo'></p><button id='next'>Continue</button>
-                 <script>document.querySelector('input').addEventListener('input',event=>{{
-                   const value=event.target.value, shown={render};
-                   echo.textContent='Passenger '+shown;document.title=shown;
-                   document.getElementById('next').setAttribute('aria-label','Continue for '+shown);
-                 }});</script>"
-            ))
-            .await;
-            let origin = url::Url::parse(&url)
-                .unwrap()
-                .origin()
-                .ascii_serialization();
-            let values = [("given_name".into(), Zeroizing::new(name.to_owned()))].into();
-            browser.redact([(name.to_owned(), "[saved given_name]".into())]);
-            let filled = browser
-                .fill_traveler(
-                    &origin,
-                    &browser.shopping_context().await,
-                    &[TravelerField::GivenName],
-                    &values,
-                )
-                .await
-                .unwrap();
-            assert_eq!(filled, ["given_name"]);
-            let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
-            serde_json::from_value::<bloom_checkout_api::BrowseResponse>(snapshot.clone()).unwrap();
-            let snapshot = snapshot.to_string();
-            assert!(
-                !snapshot.contains(shown),
-                "Saved name escaped redaction: {snapshot}"
-            );
-            assert!(
-                snapshot.contains("Passenger [saved given_name]"),
-                "{snapshot}"
-            );
-            assert!(
-                snapshot.contains("Continue for [saved given_name]"),
-                "{snapshot}"
-            );
-            server.abort();
-        }
-    }
     #[tokio::test]
     async fn passport_or_id_captions_fill_only_traveler_document_fields() {
         for number_label in [
