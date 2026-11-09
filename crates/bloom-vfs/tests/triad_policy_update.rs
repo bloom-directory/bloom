@@ -2214,3 +2214,80 @@ async fn a_switch_proposal_failure_is_marked_as_the_proposal_s() {
         PetalEligibility::AwaitingPolicyApproval(_)
     ));
 }
+
+/// A read that never proposes, for a default policy that waits while a chosen
+/// Petal is not installed. With nothing pending it proposes nothing, even on
+/// the policy creation installed. With a change waiting it reports it, with
+/// its ceremony and the policy it proposes. Once the owner approves that
+/// change, the read commits it, so an approval is never left uncommitted
+/// while the Petal stays missing.
+#[tokio::test]
+async fn a_reconciled_read_reports_a_waiting_change_and_commits_an_approved_one() {
+    use bloom_vfs::handlers::ReconciledPolicy;
+
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(false);
+    let handler = eligibility_handler(temp.path(), fixture.clone());
+    let chosen = [Digest32::from_bytes([7; 32])];
+    let validated = || {
+        fixture
+            .requests
+            .lock()
+            .iter()
+            .filter(|request| matches!(request, MachineBrokerRequest::PolicyValidateUpdate(_)))
+            .count()
+    };
+
+    let ReconciledPolicy::Current(current) = handler
+        .reconciled_policy("alice", &chosen, &[], None)
+        .await
+        .unwrap()
+    else {
+        panic!("nothing waits yet");
+    };
+    assert_eq!(
+        current.version.get(),
+        bloom_vfs::handlers::wallets::CREATION_POLICY_VERSION
+    );
+    assert_eq!(validated(), 0, "the read proposes nothing");
+
+    let PetalEligibility::AwaitingPolicyApproval(proposal) = handler
+        .ensure_petal_packages_allowed("alice", &chosen, &[], None, AfterPolicyChange::Propose)
+        .await
+        .unwrap()
+    else {
+        panic!("the default policy is proposed");
+    };
+    let ReconciledPolicy::Awaiting { pending, proposed } = handler
+        .reconciled_policy("alice", &chosen, &[], None)
+        .await
+        .unwrap()
+    else {
+        panic!("the change waiting for the owner is reported");
+    };
+    assert_eq!(pending.operation_id, proposal.operation_id);
+    assert!(pending.includes_requested);
+    assert!(pending.prepare.is_some(), "with its ceremony");
+    assert_eq!(proposed.allowed_petal_packages, chosen);
+    assert_eq!(validated(), 1, "and nothing more is proposed");
+
+    // The owner approves while nothing polls.
+    fixture.complete.store(true, Ordering::SeqCst);
+    let ReconciledPolicy::Current(current) = handler
+        .reconciled_policy("alice", &chosen, &[], None)
+        .await
+        .unwrap()
+    else {
+        panic!("the approved change commits");
+    };
+    let committed: CanonicalWalletPolicy =
+        serde_json::from_slice(&current.canonical_policy.decode()).unwrap();
+    assert_eq!(committed.allowed_petal_packages, chosen);
+    assert!(
+        fixture
+            .requests
+            .lock()
+            .iter()
+            .any(|request| matches!(request, MachineBrokerRequest::PolicyCommitUpdate(_)))
+    );
+}

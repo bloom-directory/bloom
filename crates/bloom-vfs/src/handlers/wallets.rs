@@ -389,6 +389,21 @@ pub enum ProposalOutcome {
     Ended,
 }
 
+/// A wallet's policy once its retained proposals are reconciled, read
+/// without proposing anything.
+#[derive(Debug, Clone)]
+pub enum ReconciledPolicy {
+    /// A change still waits for the owner, viewed against the request, with
+    /// the policy it proposes.
+    Awaiting {
+        pending: Box<bloom_machine_client::PendingPolicyUpdate>,
+        proposed: Box<bloom_broker_api::CanonicalWalletPolicy>,
+    },
+    /// No change waits: the verified current policy, including any change
+    /// the owner approved meanwhile.
+    Current(bloom_broker_api::SignedPolicySnapshot),
+}
+
 /// The version of the restrictive policy wallet creation installs. Every
 /// committed change increments it, so only a policy at this version is still
 /// the one creation installed. An empty package list is not the same fact:
@@ -2183,6 +2198,40 @@ impl WalletsHandler {
                 other => other,
             })?
             .pending_view_where(|proposed| replacement.matches(proposed))
+    }
+
+    /// Reconcile `wallet`'s retained policy proposals, committing one the
+    /// owner approved, and report the change still waiting for the owner,
+    /// viewed against `required`, `destinations` and `lifetime`, or else the
+    /// current policy. Unlike [`Self::ensure_petal_packages_allowed`], this
+    /// never proposes anything, whatever the policy's version.
+    pub async fn reconciled_policy(
+        &self,
+        wallet: &str,
+        required: &[bloom_broker_api::Digest32],
+        destinations: &[bloom_broker_api::PolicyDestination],
+        lifetime: Option<u64>,
+    ) -> Result<ReconciledPolicy, HandlerError> {
+        self.write_permit()?;
+        let _lock = self.lock_wallet_policy_update(wallet)?;
+        match self.reconcile_policy_updates_locked(wallet).await? {
+            PolicyBaseline::Awaiting(projection) => {
+                let proposed =
+                    serde_json::from_slice(&projection.retained_policy_bytes()?).map_err(err_be)?;
+                match projection.pending_view(required, destinations, lifetime)? {
+                    bloom_machine_client::PetalEligibility::AwaitingPolicyApproval(pending) => {
+                        Ok(ReconciledPolicy::Awaiting {
+                            pending: Box::new(pending),
+                            proposed: Box::new(proposed),
+                        })
+                    }
+                    _ => Err(HandlerError::backend(
+                        "a pending policy change was not viewed as pending",
+                    )),
+                }
+            }
+            PolicyBaseline::Current(current, _) => Ok(ReconciledPolicy::Current(current)),
+        }
     }
 
     /// Read and verify `wallet`'s current policy from Broker.

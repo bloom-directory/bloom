@@ -5334,6 +5334,21 @@ impl Daemon {
             .await
     }
 
+    /// `wallet`'s policy once its retained proposals are reconciled, so a
+    /// change the owner approved meanwhile commits: the change still waiting
+    /// for the owner, or the current policy. Proposes nothing.
+    pub async fn reconciled_wallet_policy(
+        &self,
+        wallet: &str,
+        packages: &[bloom_broker_api::Digest32],
+        destinations: &[bloom_broker_api::PolicyDestination],
+        lifetime: Option<u64>,
+    ) -> Result<bloom_vfs::handlers::ReconciledPolicy, bloom_vfs::HandlerError> {
+        self.wallets
+            .reconciled_policy(wallet, packages, destinations, lifetime)
+            .await
+    }
+
     /// `wallet`'s current policy, read from Broker and verified.
     pub async fn current_wallet_policy(
         &self,

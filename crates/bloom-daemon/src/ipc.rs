@@ -527,6 +527,12 @@ impl IpcOperationContext {
         context
     }
 
+    /// How long an install under this context queues for its turn to
+    /// activate, if it does ([`Self::waiting_to_activate`]).
+    pub fn activation_wait(&self) -> Option<std::time::Duration> {
+        self.activation_wait
+    }
+
     /// Common installation seam for local, source and background installs.
     /// Verification/materialization is outside the mutation lock; cancellation
     /// and the optional expected owner are checked again at the atomic commit.

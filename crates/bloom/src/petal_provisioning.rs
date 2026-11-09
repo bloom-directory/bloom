@@ -13,6 +13,17 @@ use crate::github_source::{self, PreinstalledPetal, PreinstalledState, PreparedR
 pub(crate) struct ProvisioningResult {
     pub name: String,
     pub outcome: ProvisioningOutcome,
+    /// The installed package this attempt found for the Petal, `Some(None)`
+    /// for none, or `None` when it stopped before looking.
+    pub owner: Option<Option<String>>,
+}
+
+/// A catalog Petal to install, and, when this tries an earlier attempt
+/// again, the installed package that attempt found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Attempt {
+    pub name: String,
+    pub owner_when_tried: Option<Option<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +40,9 @@ pub(crate) enum ProvisioningOutcome {
     /// again up to [`DOWNLOAD_RETRIES`] times. A failed check of what was
     /// downloaded is [`Self::Failed`].
     DownloadFailed(String),
+    /// Not tried again: since the attempt being retried, the owner installed,
+    /// updated or uninstalled the Petal themselves, and that stands.
+    OwnerChanged,
     Failed(String),
 }
 
@@ -45,16 +59,6 @@ const DOWNLOAD_RETRIES: usize = 6;
 /// Calls that outlast it leave the install busy until the next retry.
 const QUEUE_WAIT: Duration = Duration::from_secs(3);
 
-pub(crate) fn provision(daemon: &Daemon, context: &IpcOperationContext) -> Vec<ProvisioningResult> {
-    provision_with(
-        daemon,
-        context,
-        github_source::DEFAULT_PETALS,
-        |name| github_source::preinstalled_petal(name).copied(),
-        github_source::prepare_prebuilt_release_petal,
-    )
-}
-
 pub(crate) fn provision_with(
     daemon: &Daemon,
     context: &IpcOperationContext,
@@ -62,9 +66,32 @@ pub(crate) fn provision_with(
     resolve: impl Fn(&str) -> Option<PreinstalledPetal>,
     acquire: impl Fn(&Daemon, &PreinstalledPetal, &IpcOperationContext) -> Result<PreparedReleasePetal>,
 ) -> Vec<ProvisioningResult> {
+    let attempts: Vec<Attempt> = names
+        .iter()
+        .map(|&name| Attempt {
+            name: name.to_owned(),
+            owner_when_tried: None,
+        })
+        .collect();
+    provision_attempts(daemon, context, &attempts, resolve, acquire)
+}
+
+/// [`provision_with`] for `attempts`. One that tries an earlier attempt again
+/// installs nothing once the Petal's installed package differs from what
+/// that attempt found, so a retry never undoes the owner's own install,
+/// update or uninstall made meanwhile.
+fn provision_attempts(
+    daemon: &Daemon,
+    context: &IpcOperationContext,
+    attempts: &[Attempt],
+    resolve: impl Fn(&str) -> Option<PreinstalledPetal>,
+    acquire: impl Fn(&Daemon, &PreinstalledPetal, &IpcOperationContext) -> Result<PreparedReleasePetal>,
+) -> Vec<ProvisioningResult> {
     let mut results = Vec::new();
-    for &name in names {
-        let attempt = || -> Result<ProvisioningOutcome> {
+    for tried in attempts {
+        let name = tried.name.as_str();
+        let mut owner = None;
+        let mut attempt = || -> Result<ProvisioningOutcome> {
             if context.is_cancelled() {
                 bail!("default provisioning cancelled");
             }
@@ -78,6 +105,14 @@ pub(crate) fn provision_with(
                 );
             }
             let expected_owner = daemon.petals.store().resolve_petal_owner(name)?;
+            owner = Some(expected_owner.clone());
+            if tried
+                .owner_when_tried
+                .as_ref()
+                .is_some_and(|before| *before != expected_owner)
+            {
+                return Ok(ProvisioningOutcome::OwnerChanged);
+            }
             if let Some(hash) = &expected_owner {
                 let meta = daemon.petals.store().load_meta(hash)?;
                 if github_source::classify_existing_preinstalled(&entry, &meta)?
@@ -119,6 +154,9 @@ pub(crate) fn provision_with(
             ProvisioningOutcome::DownloadFailed(error) => {
                 tracing::info!(petal = %name, %error, "petal.provisioning_download_failed");
             }
+            ProvisioningOutcome::OwnerChanged => {
+                tracing::info!(petal = %name, "petal.provisioning_owner_changed");
+            }
             ProvisioningOutcome::Failed(error) if context.is_cancelled() => {
                 tracing::info!(petal = %name, %error, "petal.provisioning_cancelled");
             }
@@ -130,8 +168,45 @@ pub(crate) fn provision_with(
         results.push(ProvisioningResult {
             name: name.to_owned(),
             outcome,
+            owner,
         });
     }
+    results
+}
+
+/// Install the catalog Petals, then try again those refused while their
+/// code ran or whose download failed, until Machine stops. `on_installed`
+/// receives the first pass's results and each retry round's, so setup's
+/// settings are written for a Petal whichever round installs it.
+pub(crate) fn provision_and_retry(
+    daemon: &Daemon,
+    context: &IpcOperationContext,
+    on_installed: impl FnMut(&[ProvisioningResult]),
+) -> Vec<ProvisioningResult> {
+    provision_and_retry_using(
+        daemon,
+        context,
+        github_source::prepare_prebuilt_release_petal,
+        on_installed,
+    )
+}
+
+/// [`provision_and_retry`] with the download supplied.
+fn provision_and_retry_using(
+    daemon: &Daemon,
+    context: &IpcOperationContext,
+    acquire: impl Fn(&Daemon, &PreinstalledPetal, &IpcOperationContext) -> Result<PreparedReleasePetal>,
+    mut on_installed: impl FnMut(&[ProvisioningResult]),
+) -> Vec<ProvisioningResult> {
+    let results = provision_with(
+        daemon,
+        context,
+        github_source::DEFAULT_PETALS,
+        |name| github_source::preinstalled_petal(name).copied(),
+        &acquire,
+    );
+    on_installed(&results);
+    retry_pending(daemon, context, &results, acquire, on_installed);
     results
 }
 
@@ -161,24 +236,27 @@ fn is_busy(error: &anyhow::Error) -> bool {
 /// ([`IpcOperationContext::waiting_to_activate`], up to [`QUEUE_WAIT`]): that
 /// Petal's running calls finish, and its calls starting meanwhile wait behind
 /// it, so agents calling it back to back cannot starve the update, while no
-/// call waits on it for long. `on_retried` receives each round's
-/// results, so setup's settings are written once a chosen Petal installs.
-pub(crate) fn retry_pending(
+/// call waits on it for long. A Petal the owner installed, updated or
+/// uninstalled since its attempt is left as they made it. `on_retried`
+/// receives each round's results, so setup's settings are written once a
+/// chosen Petal installs. `acquire` downloads a release.
+fn retry_pending(
     daemon: &Daemon,
     context: &IpcOperationContext,
     first: &[ProvisioningResult],
+    acquire: impl Fn(&Daemon, &PreinstalledPetal, &IpcOperationContext) -> Result<PreparedReleasePetal>,
     on_retried: impl FnMut(&[ProvisioningResult]),
 ) {
     let waiting = context.waiting_to_activate(QUEUE_WAIT);
     retry_pending_with(
         first,
-        |names| {
-            provision_with(
+        |attempts| {
+            provision_attempts(
                 daemon,
                 &waiting,
-                names,
+                attempts,
                 |name| github_source::preinstalled_petal(name).copied(),
-                github_source::prepare_prebuilt_release_petal,
+                &acquire,
             )
         },
         |wait| wait_unless_cancelled(context, wait),
@@ -190,7 +268,7 @@ pub(crate) fn retry_pending(
 /// once Machine is stopping.
 fn retry_pending_with(
     first: &[ProvisioningResult],
-    mut round: impl FnMut(&[&str]) -> Vec<ProvisioningResult>,
+    mut round: impl FnMut(&[Attempt]) -> Vec<ProvisioningResult>,
     mut wait: impl FnMut(Duration) -> bool,
     mut on_retried: impl FnMut(&[ProvisioningResult]),
 ) {
@@ -202,29 +280,33 @@ fn retry_pending_with(
             return;
         }
         delay = (delay * 2).min(RETRY_MAX);
-        let names: Vec<&str> = pending.iter().map(String::as_str).collect();
-        let results = round(&names);
+        let results = round(&pending);
         on_retried(&results);
         pending = pending_names(&results, &mut downloads);
     }
 }
 
-/// The Petals in `results` to try again: every busy one, and each whose
-/// download failed until it has been retried [`DOWNLOAD_RETRIES`] times.
-/// `downloads` counts the failed downloads so far.
+/// The Petals in `results` to try again, each with the installed package
+/// its attempt found: every busy one, and each whose download failed until
+/// it has been retried [`DOWNLOAD_RETRIES`] times. `downloads` counts the
+/// failed downloads so far.
 fn pending_names(
     results: &[ProvisioningResult],
     downloads: &mut HashMap<String, usize>,
-) -> Vec<String> {
+) -> Vec<Attempt> {
     let mut pending = Vec::new();
+    let again = |result: &ProvisioningResult| Attempt {
+        name: result.name.clone(),
+        owner_when_tried: result.owner.clone(),
+    };
     for result in results {
         match &result.outcome {
-            ProvisioningOutcome::Busy(_) => pending.push(result.name.clone()),
+            ProvisioningOutcome::Busy(_) => pending.push(again(result)),
             ProvisioningOutcome::DownloadFailed(error) => {
                 let failures = downloads.entry(result.name.clone()).or_default();
                 *failures += 1;
                 if *failures <= DOWNLOAD_RETRIES {
-                    pending.push(result.name.clone());
+                    pending.push(again(result));
                 } else {
                     let error = with_restart_advice(error);
                     tracing::warn!(petal = %result.name, %error, "petal.provisioning_failed");
@@ -261,7 +343,17 @@ mod tests {
         ProvisioningResult {
             name: name.to_owned(),
             outcome,
+            owner: Some(None),
         }
+    }
+
+    /// The Petals a retry round tries, joined.
+    fn joined(attempts: &[Attempt]) -> String {
+        attempts
+            .iter()
+            .map(|attempt| attempt.name.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     fn busy() -> ProvisioningOutcome {
@@ -297,7 +389,7 @@ mod tests {
         retry_pending_with(
             &first,
             |names| {
-                rounds.borrow_mut().push(names.join(","));
+                rounds.borrow_mut().push(joined(names));
                 let outcome = if rounds.borrow().len() < 3 {
                     busy()
                 } else {
@@ -305,7 +397,7 @@ mod tests {
                 };
                 names
                     .iter()
-                    .map(|name| result(name, outcome.clone()))
+                    .map(|attempt| result(&attempt.name, outcome.clone()))
                     .collect()
             },
             |wait| {
@@ -335,7 +427,10 @@ mod tests {
             &[result("enso", busy())],
             |names| {
                 rounds.set(rounds.get() + 1);
-                names.iter().map(|name| result(name, busy())).collect()
+                names
+                    .iter()
+                    .map(|attempt| result(&attempt.name, busy()))
+                    .collect()
             },
             |wait| {
                 waits.borrow_mut().push(wait.as_secs());
@@ -370,10 +465,13 @@ mod tests {
         retry_pending_with(
             &[result("enso", failed()), result("polymarket", busy())],
             |names| {
-                rounds.borrow_mut().push(names.join(","));
+                rounds.borrow_mut().push(joined(names));
                 names
                     .iter()
-                    .map(|&name| result(name, if name == "enso" { failed() } else { busy() }))
+                    .map(|attempt| {
+                        let name = attempt.name.as_str();
+                        result(name, if name == "enso" { failed() } else { busy() })
+                    })
                     .collect()
             },
             |_| rounds.borrow().len() < DOWNLOAD_RETRIES + 2,
@@ -405,7 +503,7 @@ mod tests {
                 };
                 names
                     .iter()
-                    .map(|name| result(name, outcome.clone()))
+                    .map(|attempt| result(&attempt.name, outcome.clone()))
                     .collect()
             },
             |_| true,
@@ -476,6 +574,149 @@ mod tests {
                 ProvisioningOutcome::Failed(message) if message == "default provisioning cancelled"),
             "{results:?}"
         );
+    }
+
+    /// A local package named `enso` in `root`, standing in for one the owner
+    /// installed themselves.
+    fn local_enso(root: &std::path::Path) -> std::path::PathBuf {
+        let package = root.join("enso-local");
+        for (path, bytes) in [
+            (
+                "petal.toml",
+                &br#"schema = "bloom.petal.package.v1"
+name = "enso"
+"#[..],
+            ),
+            ("README.md", &b"# enso"[..]),
+            ("AGENTS.md", &b"# enso agents"[..]),
+            (
+                "petal/enso/message.txt.wasm",
+                &include_bytes!(
+                    "../../bloom-petals/tests/fixtures/route_component_no_imports.wasm"
+                )[..],
+            ),
+        ] {
+            let file = package.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, bytes).unwrap();
+        }
+        package
+    }
+
+    /// A retry installs nothing once the owner has uninstalled, installed or
+    /// replaced the Petal since the attempt it retries, and is not tried
+    /// again; with the Petal as that attempt found it, it goes ahead.
+    #[test]
+    fn a_retry_leaves_a_petal_the_owner_changed_meanwhile() {
+        let home = tempfile::tempdir().unwrap();
+        let daemon = Daemon::from_home(bloom_proto::HomeDir::at(home.path())).unwrap();
+        let store = daemon.petals.store();
+        let context = IpcOperationContext::detached();
+        let retry = |first: ProvisioningResult| {
+            let acquired = Cell::new(0);
+            let rounds = RefCell::new(Vec::new());
+            retry_pending_with(
+                &[first],
+                |attempts| {
+                    let results = provision_attempts(
+                        &daemon,
+                        &context,
+                        attempts,
+                        |name| github_source::preinstalled_petal(name).copied(),
+                        |_, _, _| {
+                            acquired.set(acquired.get() + 1);
+                            bail!("offline fixture")
+                        },
+                    );
+                    rounds
+                        .borrow_mut()
+                        .extend(results.iter().map(|result| result.outcome.clone()));
+                    results
+                },
+                |_| true,
+                |_| {},
+            );
+            (acquired.get(), rounds.into_inner())
+        };
+        let refused = |owner: Option<String>| ProvisioningResult {
+            name: "enso".into(),
+            outcome: busy(),
+            owner: Some(owner),
+        };
+
+        // An update refused as busy, then the owner uninstalls the Petal.
+        store
+            .install_petal_package_dir(local_enso(home.path()))
+            .unwrap();
+        let hash = store.resolve_petal_owner("enso").unwrap().unwrap();
+        assert!(daemon.petals.uninstall("enso").unwrap());
+        assert_eq!(
+            retry(refused(Some(hash.clone()))),
+            (0, vec![ProvisioningOutcome::OwnerChanged])
+        );
+        // A first install refused, then the owner installs their own.
+        store
+            .install_petal_package_dir(local_enso(home.path()))
+            .unwrap();
+        assert_eq!(
+            retry(refused(None)),
+            (0, vec![ProvisioningOutcome::OwnerChanged])
+        );
+        // Unchanged since it was refused: the retry downloads the release.
+        assert!(daemon.petals.uninstall("enso").unwrap());
+        let (acquired, rounds) = retry(refused(None));
+        assert_eq!(acquired, 1);
+        assert!(
+            matches!(&rounds[..], [ProvisioningOutcome::Failed(message)] if message.contains("offline fixture")),
+            "{rounds:?}"
+        );
+    }
+
+    /// Serve's install pass hands its results on, then tries a busy install
+    /// again under a context that queues for its turn to activate, and hands
+    /// that round's results on too, so setup's settings follow either round.
+    #[test]
+    fn a_retried_install_queues_and_its_results_are_handed_on() {
+        let home = tempfile::tempdir().unwrap();
+        let daemon = Daemon::from_home(bloom_proto::HomeDir::at(home.path())).unwrap();
+        let acquired = RefCell::new(Vec::new());
+        let handed_on = RefCell::new(Vec::new());
+        provision_and_retry_using(
+            &daemon,
+            &IpcOperationContext::detached(),
+            |_, entry, context| {
+                let mut acquired = acquired.borrow_mut();
+                acquired.push((entry.name, context.activation_wait()));
+                if entry.name == "enso"
+                    && acquired.iter().filter(|(name, _)| *name == "enso").count() == 1
+                {
+                    return Err(anyhow::Error::new(bloom_petals::PetalError::Busy));
+                }
+                bail!("offline fixture")
+            },
+            |results| handed_on.borrow_mut().push(joined_results(results)),
+        );
+        let acquired = acquired.into_inner();
+        assert_eq!(acquired.len(), github_source::DEFAULT_PETALS.len() + 1);
+        assert!(
+            acquired[..github_source::DEFAULT_PETALS.len()]
+                .iter()
+                .all(|(_, wait)| wait.is_none()),
+            "the first pass does not queue: {acquired:?}"
+        );
+        assert_eq!(acquired.last(), Some(&("enso", Some(QUEUE_WAIT))));
+        assert_eq!(
+            handed_on.into_inner(),
+            [github_source::DEFAULT_PETALS.join(","), "enso".to_owned()]
+        );
+    }
+
+    fn joined_results(results: &[ProvisioningResult]) -> String {
+        results
+            .iter()
+            .map(|result| result.name.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     #[test]

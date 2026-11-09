@@ -507,6 +507,11 @@ chosen Petals:
    new` adds that creating the wallet once `bloom petals ls` lists them gets
    the policy in the same step. The wallet keeps the policy creation
    installed, so that command then proposes the whole default policy. A
+   change already proposed is settled first: one still waiting for the
+   owner is reported with its ceremony link, naming a missing Petal it
+   allows as allowed but not installed, and one the owner approved meanwhile
+   commits, so an approval is never hidden or left uncommitted while a
+   Petal is missing. A
    policy that has changed since creation is never proposed this way, so
    for it a missing Petal is only named alongside what the policy allows
    or lacks. A persona switch likewise starts only with every chosen Petal
@@ -637,7 +642,7 @@ config; the owner can explicitly apply them later.
 
 Catalog Petals are installed and updated in two places: `bloom init`
 (`ensure_preinstalled_petals`) and every `bloom serve` start
-(`petal_provisioning::provision`). `bloom serve` installs them after it is
+(`petal_provisioning::provision_and_retry`). `bloom serve` installs them after it is
 ready, so Petal code can be running, such as setup writing Polymarket's
 settings right after `bloom wallet new`. The Petal store refuses to change a
 Petal's package while that Petal's code runs (bloom#328). Each Petal has its
@@ -657,9 +662,14 @@ do, and queues for its turn to activate for up to 3 seconds by the clock:
 that Petal's calls already running finish, and its calls that start
 meanwhile wait behind it (`PetalStore::activation_permit_waiting`). So
 agents calling a Petal back to back, even several at once or through MCP,
-cannot starve its update, and none of that Petal's calls, and no Petal
-listing, waits on it for more than 3 seconds. If the Petal's running calls outlast that, it lets them go
-and tries again in its next round. A release file that fails to download is
+cannot starve its update, and none of that Petal's calls waits on it for
+more than those 3 seconds plus the activation itself. A Petal listing or
+other install waits only for its turn at the mutation lock, which any
+install or build holds while it runs. If the Petal's running calls outlast that, it lets them go
+and tries again in its next round. A retry first checks that the Petal's
+installed package is still the one its earlier attempt found: if the owner
+installed, updated or uninstalled it meanwhile, the retry stops and leaves
+it as they made it. A release file that fails to download is
 tried again on the same schedule, six times, about a minute in all; a
 failed check of what was downloaded, such as its checksum, is not, since
 another attempt cannot change it. Any other failure, or a download that
@@ -1037,7 +1047,10 @@ Automated:
   An install refused because that Petal's code was running is reported as busy and
   tried again, with a doubling wait capped at one minute, until it goes in
   or Machine stops; a failed download is tried again six times, and a failed
-  checksum is not. Any other failure says to restart Bloom, and a
+  checksum is not. A retry stops once the owner has installed, updated or
+  uninstalled that Petal since the attempt it retries, and a retry queues
+  for its turn to activate; serve hands each round's results on, so setup's
+  settings follow whichever round installs a Petal. Any other failure says to restart Bloom, and a
   cancellation does not (`crates/bloom/src/petal_provisioning.rs`). While a
   Petal's code runs, a plain install of it is refused at once; with a
   retrying install queued, a call to that Petal starting after it waits
@@ -1062,8 +1075,11 @@ Automated:
 - With a chosen Petal not installed, Machine proposes no default policy
   while one could be proposed: for a setup the owner just chose, before
   Broker is asked, and otherwise while the policy is the one creation
-  installed. The command names the missing Petals and what to run without
-  calling it skipped; a persona switch starts nothing and records no waiting
+  installed. A change already waiting for the owner is reported with its
+  ceremony instead, naming a missing Petal it allows as allowed, and one the
+  owner approved commits (`crates/bloom/src/default_policy.rs`,
+  `crates/bloom-vfs/tests/triad_policy_update.rs`). The command names the
+  missing Petals and what to run without calling it skipped; a persona switch starts nothing and records no waiting
   switch. A switch records the Petals its proposal included, and its
   ceremony lists them; a Petal it left out but installed since is named as
   not installed when it was proposed, never as not installed now or as

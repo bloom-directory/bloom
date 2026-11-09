@@ -1309,6 +1309,7 @@ pub(crate) fn apply_provisioned_settings(
             ProvisioningOutcome::Current
             | ProvisioningOutcome::Busy(_)
             | ProvisioningOutcome::DownloadFailed(_)
+            | ProvisioningOutcome::OwnerChanged
             | ProvisioningOutcome::Failed(_) => continue,
         };
         if updated {
@@ -1582,11 +1583,11 @@ fn report_left_out(
     Ok(())
 }
 
-/// Name chosen Petals that the wallet's policy allows but that are not
-/// installed, such as one uninstalled while its switch waited for approval.
+/// Name chosen Petals that `policy` allows but that are not installed, such
+/// as one uninstalled while its switch waited for approval.
 fn report_allowed_not_installed(
     output: &mut dyn Write,
-    wallet: &str,
+    policy: &str,
     allowed_not_installed: &[String],
 ) -> Result<()> {
     if allowed_not_installed.is_empty() {
@@ -1595,7 +1596,7 @@ fn report_allowed_not_installed(
     let (verb, _, _, missing) = not_installed_words(allowed_not_installed.len());
     writeln!(
         output,
-        "default_policy: {}, which {wallet}'s policy allows, {verb} not installed. Bloom installs its catalog Petals as it starts; if {missing} missing, restart Bloom",
+        "default_policy: {}, which {policy} allows, {verb} not installed. Bloom installs its catalog Petals as it starts; if {missing} missing, restart Bloom",
         petal_labels(allowed_not_installed)
     )?;
     Ok(())
@@ -1706,6 +1707,10 @@ pub(crate) enum DefaultPolicyStatus {
         /// Chosen Petals not installed yet, so not proposed and not allowed.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         not_installed: Vec<String>,
+        /// Chosen Petals this change allows by their catalog release but that
+        /// are not installed, such as one uninstalled after it was proposed.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        allowed_not_installed: Vec<String>,
         /// Chosen Petals a persona switch's proposal left out because they
         /// were not installed when it was made, though they are now.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1996,6 +2001,37 @@ fn waits_for_missing_petals(mode: DefaultPolicyMode, version: u64) -> bool {
         || version == bloom_vfs::handlers::wallets::CREATION_POLICY_VERSION
 }
 
+/// What a default-policy request with chosen Petals `not_installed` does
+/// once the wallet's policy is `reconciled`: report a change still waiting
+/// for the owner, whatever the policy's version, and propose nothing more;
+/// propose nothing while the policy is still the one wallet creation
+/// installed; otherwise carry on to report what a policy changed since lacks.
+fn missing_petals_step(
+    mode: DefaultPolicyMode,
+    reconciled: bloom_vfs::handlers::ReconciledPolicy,
+    not_installed: &[String],
+) -> ControlFlow<
+    DefaultPolicyStatus,
+    Option<(
+        bloom_machine_client::PendingPolicyUpdate,
+        bloom_broker_api::CanonicalWalletPolicy,
+    )>,
+> {
+    match reconciled {
+        bloom_vfs::handlers::ReconciledPolicy::Awaiting { pending, proposed } => {
+            ControlFlow::Continue(Some((*pending, *proposed)))
+        }
+        bloom_vfs::handlers::ReconciledPolicy::Current(current)
+            if waits_for_missing_petals(mode, current.version.get()) =>
+        {
+            ControlFlow::Break(DefaultPolicyStatus::PetalsNotInstalled {
+                not_installed: not_installed.to_vec(),
+            })
+        }
+        bloom_vfs::handlers::ReconciledPolicy::Current(_) => ControlFlow::Continue(None),
+    }
+}
+
 /// Propose `wallet`'s setup through its existing policy operation, committing
 /// a completed ceremony, and report the result. The setup is read from the
 /// config on disk, not the copy Machine loaded at startup. A persona switch
@@ -2039,16 +2075,27 @@ pub(crate) async fn advance_default_policy(
     // the owner approves it once. Until then nothing is proposed, the policy
     // stays the one wallet creation installed, and this proposes it in full
     // once they are. A wallet created first simply waits for it. A policy
-    // changed since creation is never proposed here, only reported on.
+    // changed since creation is never proposed here, only reported on. A
+    // change already proposed is reconciled first, so one still waiting is
+    // reported with its ceremony and one the owner approved commits.
+    let mut waiting = None;
     if missing_petals {
-        let current = match policy_step(daemon.current_wallet_policy(wallet).await)? {
-            ControlFlow::Continue(current) => current,
+        let reconciled = match policy_step(
+            daemon
+                .reconciled_wallet_policy(
+                    wallet,
+                    &request.packages,
+                    &destinations,
+                    request.lifetime,
+                )
+                .await,
+        )? {
+            ControlFlow::Continue(reconciled) => reconciled,
             ControlFlow::Break(status) => return Ok(status),
         };
-        if waits_for_missing_petals(mode, current.version.get()) {
-            return Ok(DefaultPolicyStatus::PetalsNotInstalled {
-                not_installed: request.not_installed,
-            });
+        match missing_petals_step(mode, reconciled, &request.not_installed) {
+            ControlFlow::Continue(pending) => waiting = pending,
+            ControlFlow::Break(status) => return Ok(status),
         }
     }
     let mut settings_pending = Vec::new();
@@ -2062,55 +2109,63 @@ pub(crate) async fn advance_default_policy(
         settings_waiting = pending.waiting;
     }
     let home = daemon.home.root();
-    let proposal = match &switch {
-        // Proposed once; a refused or expired proposal is not proposed again.
-        Some(switch) => {
-            // Proposing and recording the proposal happen under one hold of
-            // SWITCH_STATE, so a later switch either finds this one's
-            // proposal recorded, and cancels it, or finds that none was made.
-            let held = match switch.operation_id {
-                None => Some(SWITCH_STATE.lock().await),
-                Some(_) => None,
-            };
-            if held.is_some() && !switch_unchanged(home, wallet, switch)? {
-                return Ok(DefaultPolicyStatus::SwitchEnded {
-                    persona: switch_persona_name(switch).to_owned(),
-                    replaced: true,
-                });
+    // Only without a switch: a change waiting for the owner is reported, and
+    // nothing more is proposed.
+    let (waiting, waiting_proposes) = waiting.unzip();
+    let proposal = if let Some(pending) = waiting {
+        Ok(bloom_machine_client::PetalEligibility::AwaitingPolicyApproval(pending))
+    } else {
+        match &switch {
+            // Proposed once; a refused or expired proposal is not proposed again.
+            Some(switch) => {
+                // Proposing and recording the proposal happen under one hold of
+                // SWITCH_STATE, so a later switch either finds this one's
+                // proposal recorded, and cancels it, or finds that none was made.
+                let held = match switch.operation_id {
+                    None => Some(SWITCH_STATE.lock().await),
+                    Some(_) => None,
+                };
+                if held.is_some() && !switch_unchanged(home, wallet, switch)? {
+                    return Ok(DefaultPolicyStatus::SwitchEnded {
+                        persona: switch_persona_name(switch).to_owned(),
+                        replaced: true,
+                    });
+                }
+                let proposal = daemon
+                    .ensure_policy_replaced(wallet, &request.replacement(), held.is_some())
+                    .await;
+                // Only a switch not yet proposed adopts a proposal, so a recorded
+                // one, which may have committed, is never replaced.
+                if held.is_some()
+                    && let Ok(bloom_machine_client::PetalEligibility::AwaitingPolicyApproval(
+                        pending,
+                    )) = &proposal
+                    && pending.includes_requested
+                {
+                    write_pending_switch(
+                        home,
+                        wallet,
+                        &proposed_switch(switch, pending.operation_id.as_str(), &request),
+                    )?;
+                }
+                drop(held);
+                proposal
             }
-            let proposal = daemon
-                .ensure_policy_replaced(wallet, &request.replacement(), held.is_some())
-                .await;
-            // Only a switch not yet proposed adopts a proposal, so a recorded
-            // one, which may have committed, is never replaced.
-            if held.is_some()
-                && let Ok(bloom_machine_client::PetalEligibility::AwaitingPolicyApproval(pending)) =
-                    &proposal
-                && pending.includes_requested
-            {
-                write_pending_switch(
-                    home,
-                    wallet,
-                    &proposed_switch(switch, pending.operation_id.as_str(), &request),
-                )?;
+            None => {
+                daemon
+                    .ensure_default_policy(
+                        wallet,
+                        &request.packages,
+                        &destinations,
+                        request.lifetime,
+                        if mode == DefaultPolicyMode::OwnerJustChose {
+                            bloom_vfs::handlers::AfterPolicyChange::Propose
+                        } else {
+                            bloom_vfs::handlers::AfterPolicyChange::Report
+                        },
+                    )
+                    .await
             }
-            drop(held);
-            proposal
-        }
-        None => {
-            daemon
-                .ensure_default_policy(
-                    wallet,
-                    &request.packages,
-                    &destinations,
-                    request.lifetime,
-                    if mode == DefaultPolicyMode::OwnerJustChose {
-                        bloom_vfs::handlers::AfterPolicyChange::Propose
-                    } else {
-                        bloom_vfs::handlers::AfterPolicyChange::Report
-                    },
-                )
-                .await
         }
     };
     // Broker refused outright to open the switch's ceremony: nothing was
@@ -2232,6 +2287,7 @@ pub(crate) async fn advance_default_policy(
                 pending.includes_requested || switch_own,
                 &request,
                 switch.as_ref().filter(|_| switch_own),
+                waiting_proposes.as_ref(),
             )
         }
     })
@@ -2239,14 +2295,24 @@ pub(crate) async fn advance_default_policy(
 
 /// The status of policy change `operation_id` waiting for the owner, with its
 /// ceremony's link and expiry when it has one, listed by [`awaiting_listing`].
+/// With the policy the change `proposes`, read while a chosen Petal is not
+/// installed, a missing Petal whose catalog release it allows is named as
+/// allowed, not as left out of it.
 fn awaiting_owner(
     operation_id: String,
     ceremony: Option<(String, u64)>,
     proposes_chosen_petals: bool,
     request: &DefaultPolicyRequest,
     own_switch: Option<&PendingSwitch>,
+    proposes: Option<&bloom_broker_api::CanonicalWalletPolicy>,
 ) -> DefaultPolicyStatus {
     let (petals, not_installed, left_out) = awaiting_listing(request, own_switch);
+    let (allowed_not_installed, not_installed) = match proposes {
+        Some(policy) => not_installed
+            .into_iter()
+            .partition(|name| catalog_release_allowed(policy, name)),
+        None => (Vec::new(), not_installed),
+    };
     let (ceremony_url, ceremony_expires_at_ms) = ceremony.unzip();
     DefaultPolicyStatus::AwaitingOwner {
         operation_id,
@@ -2255,6 +2321,7 @@ fn awaiting_owner(
         petals,
         proposes_chosen_petals,
         not_installed,
+        allowed_not_installed,
         left_out,
     }
 }
@@ -3146,7 +3213,11 @@ impl DefaultPolicyWait {
                     not_installed,
                     "this policy does not allow {them}",
                 )?;
-                report_allowed_not_installed(output, wallet, allowed_not_installed)?;
+                report_allowed_not_installed(
+                    output,
+                    &format!("{wallet}'s policy"),
+                    allowed_not_installed,
+                )?;
                 report_left_out(
                     output,
                     wallet,
@@ -3218,7 +3289,11 @@ impl DefaultPolicyWait {
                     not_installed,
                     "its policy does not allow {them}",
                 )?;
-                report_allowed_not_installed(output, wallet, allowed_not_installed)?;
+                report_allowed_not_installed(
+                    output,
+                    &format!("{wallet}'s policy"),
+                    allowed_not_installed,
+                )?;
                 Ok(WaitStep::Stop)
             }
             DefaultPolicyStatus::SwitchEnded {
@@ -3293,6 +3368,7 @@ impl DefaultPolicyWait {
                 petals,
                 proposes_chosen_petals,
                 not_installed,
+                allowed_not_installed,
                 left_out,
             } => {
                 if !proposes_chosen_petals {
@@ -3330,6 +3406,7 @@ impl DefaultPolicyWait {
                         not_installed,
                         "this policy does not propose {them}",
                     )?;
+                    report_allowed_not_installed(output, "this policy", allowed_not_installed)?;
                     report_left_out(
                         output,
                         wallet,
@@ -4905,6 +4982,7 @@ mod tests {
             petals: vec!["polymarket".into()],
             proposes_chosen_petals: true,
             not_installed: Vec::new(),
+            allowed_not_installed: Vec::new(),
             left_out: vec!["hyperliquid".into()],
         });
         assert!(
@@ -4965,7 +5043,8 @@ mod tests {
                 Some(("http://localhost/c".into(), 7)),
                 true,
                 &request,
-                Some(&late)
+                Some(&late),
+                None
             ),
             DefaultPolicyStatus::AwaitingOwner {
                 operation_id: "op".into(),
@@ -4974,6 +5053,7 @@ mod tests {
                 petals: names(&["polymarket"]),
                 proposes_chosen_petals: true,
                 not_installed: Vec::new(),
+                allowed_not_installed: Vec::new(),
                 left_out: names(&["hyperliquid"]),
             }
         );
@@ -5278,6 +5358,7 @@ mod tests {
             petals: vec!["polymarket".into()],
             proposes_chosen_petals: true,
             not_installed: Vec::new(),
+            allowed_not_installed: Vec::new(),
             left_out: Vec::new(),
         };
         let mut wait = DefaultPolicyWait::new("trading", 30_000).for_switch();
@@ -5472,6 +5553,130 @@ mod tests {
             policy_verifying_key: bloom_broker_api::Base64UrlBytes::from_bytes(&[2; 32]),
             signer_signature: bloom_broker_api::Base64UrlBytes::from_bytes(&[3; 64]),
         }
+    }
+
+    /// With a chosen Petal not installed, a change already waiting for the
+    /// owner is reported, whatever the policy's version, so its ceremony is
+    /// never hidden; with none waiting, nothing is proposed on the policy
+    /// creation installed, and a policy changed since is reported on.
+    #[test]
+    fn a_missing_petal_never_hides_a_change_waiting_for_the_owner() {
+        use bloom_vfs::handlers::ReconciledPolicy;
+
+        let missing = vec!["feedback".to_owned()];
+        let policy = bloom_broker_api::CanonicalWalletPolicy {
+            wallet_id: bloom_broker_api::Token::new("main").unwrap(),
+            allowed_petal_packages: Vec::new(),
+            allowed_destinations: Vec::new(),
+            maximum_approval_lifetime_ms: 60_000,
+            required_verifiers: Vec::new(),
+            clear_signing: None,
+        };
+        let at = |version| {
+            let mut snapshot = snapshot_of(&policy);
+            snapshot.version = bloom_broker_api::DecimalU64::new(version);
+            ReconciledPolicy::Current(snapshot)
+        };
+        let creation = bloom_vfs::handlers::wallets::CREATION_POLICY_VERSION;
+        assert!(matches!(
+            missing_petals_step(DefaultPolicyMode::Resume, at(creation), &missing),
+            ControlFlow::Break(DefaultPolicyStatus::PetalsNotInstalled { not_installed })
+                if not_installed == missing
+        ));
+        assert!(matches!(
+            missing_petals_step(DefaultPolicyMode::Resume, at(creation + 1), &missing),
+            ControlFlow::Continue(None)
+        ));
+        let pending = bloom_machine_client::PendingPolicyUpdate {
+            operation_id: bloom_broker_api::OperationId::new("ab".repeat(32)).unwrap(),
+            ceremony_state: bloom_broker_api::CeremonyState::AwaitingUser,
+            prepare: None,
+            status_path: String::new(),
+            challenge_path: String::new(),
+            includes_requested: true,
+        };
+        for mode in [DefaultPolicyMode::Resume, DefaultPolicyMode::OwnerJustChose] {
+            assert!(matches!(
+                missing_petals_step(
+                    mode,
+                    ReconciledPolicy::Awaiting {
+                        pending: Box::new(pending.clone()),
+                        proposed: Box::new(policy.clone()),
+                    },
+                    &missing,
+                ),
+                ControlFlow::Continue(Some(_))
+            ));
+        }
+    }
+
+    /// A missing Petal that a waiting change allows by its catalog release,
+    /// such as one uninstalled after the change was proposed, is named as
+    /// allowed, never as left out of it.
+    #[test]
+    fn a_waiting_change_names_a_missing_petal_it_allows() {
+        let feedback = bloom_broker_api::Digest32::new(
+            github_source::preinstalled_petal("feedback")
+                .and_then(|entry| entry.expected_hash)
+                .unwrap()
+                .to_owned(),
+        )
+        .unwrap();
+        let request = DefaultPolicyRequest {
+            petals: vec!["polymarket".into()],
+            packages: vec![bloom_broker_api::Digest32::from_bytes([2; 32])],
+            not_installed: vec!["feedback".into(), "hyperliquid".into()],
+            ..DefaultPolicyRequest::default()
+        };
+        let mut proposed = bloom_broker_api::CanonicalWalletPolicy {
+            wallet_id: bloom_broker_api::Token::new("main").unwrap(),
+            allowed_petal_packages: vec![bloom_broker_api::Digest32::from_bytes([2; 32]), feedback],
+            allowed_destinations: Vec::new(),
+            maximum_approval_lifetime_ms: 60_000,
+            required_verifiers: Vec::new(),
+            clear_signing: None,
+        };
+        let listed =
+            |proposes: Option<&bloom_broker_api::CanonicalWalletPolicy>| match awaiting_owner(
+                "op".into(),
+                None,
+                true,
+                &request,
+                None,
+                proposes,
+            ) {
+                DefaultPolicyStatus::AwaitingOwner {
+                    not_installed,
+                    allowed_not_installed,
+                    ..
+                } => (not_installed, allowed_not_installed),
+                other => panic!("{other:?}"),
+            };
+        assert_eq!(
+            listed(Some(&proposed)),
+            (vec!["hyperliquid".to_owned()], vec!["feedback".to_owned()])
+        );
+        proposed.allowed_petal_packages.pop();
+        assert_eq!(
+            listed(Some(&proposed)),
+            (
+                vec!["feedback".to_owned(), "hyperliquid".to_owned()],
+                Vec::new()
+            )
+        );
+        assert_eq!(
+            listed(None),
+            (
+                vec!["feedback".to_owned(), "hyperliquid".to_owned()],
+                Vec::new()
+            )
+        );
+        let mut output = Vec::new();
+        report_allowed_not_installed(&mut output, "this policy", &["feedback".into()]).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "default_policy: Feedback, which this policy allows, is not installed. Bloom installs its catalog Petals as it starts; if it stays missing, restart Bloom\n"
+        );
     }
 
     fn any_recipient(chain: &str) -> bloom_broker_api::PolicyDestination {
@@ -5729,6 +5934,7 @@ mod tests {
                 petals: vec!["polymarket".into()],
                 proposes_chosen_petals: true,
                 not_installed: vec!["enso".into(), "hyperliquid".into()],
+                allowed_not_installed: Vec::new(),
                 left_out: Vec::new(),
             },
             0,
@@ -6581,6 +6787,7 @@ mod tests {
             petals: vec!["polymarket".into()],
             proposes_chosen_petals: true,
             not_installed: Vec::new(),
+            allowed_not_installed: Vec::new(),
             left_out: Vec::new(),
         };
         let encoded = serde_json::to_value(&status).unwrap();
@@ -6740,6 +6947,7 @@ mod tests {
             petals: vec!["polymarket".into(), "near-intents".into()],
             proposes_chosen_petals: true,
             not_installed: Vec::new(),
+            allowed_not_installed: Vec::new(),
             left_out: Vec::new(),
         }
     }
@@ -6798,6 +7006,7 @@ mod tests {
             petals: vec!["polymarket".into(), "near-intents".into()],
             proposes_chosen_petals: false,
             not_installed: Vec::new(),
+            allowed_not_installed: Vec::new(),
             left_out: Vec::new(),
         };
         for _ in 0..2 {

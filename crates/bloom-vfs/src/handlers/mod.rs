@@ -36,6 +36,7 @@ pub use status::StatusHandler;
 pub use tools::ToolsHandler;
 pub use wallets::{
     AfterPolicyChange, DefaultPolicyPackages, DefaultPolicySetup, PolicyReplacement,
-    ProposalOutcome, WalletsHandler, accounts_json_with_numbers, derivation_path_number,
+    ProposalOutcome, ReconciledPolicy, WalletsHandler, accounts_json_with_numbers,
+    derivation_path_number,
 };
 pub use watch::WatchHandler;
