@@ -2273,6 +2273,36 @@ mod tests {
         // And it is left exactly as it was, not healed and not rewritten.
         let after: ProvenanceCatalog =
             serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
+
+        // Still present, and still marked superseded. Asserting only that the
+        // record is unmodified would pass vacuously if the refresh dropped it
+        // or cleared its lineage, and a dropped predecessor fails an install:
+        // `check_activation` needs it, and the private-state carry-forward
+        // refuses to carry without it. Scoped to the planted class because
+        // `append_release_petal_provenance` contributes inactive records of its
+        // own, which a looser count would mistake for this one.
+        let carried = after
+            .records
+            .iter()
+            .filter(|record| {
+                matches!(record.subject, ProvenanceSubject::Petal { .. })
+                    && record.publisher != Token::new("bloom-release-pins").unwrap()
+                    && record
+                        .petal_lineage
+                        .as_ref()
+                        .is_some_and(|membership| !membership.active)
+                    && record
+                        .operation_classes
+                        .iter()
+                        .any(|class| class.operation_class == builder_class)
+            })
+            .count();
+        assert_eq!(
+            carried, retired,
+            "every inactive record the fixture planted must survive the refresh, \
+             still carrying the lineage that marks it superseded"
+        );
+
         for record in &after.records {
             let Some(membership) = &record.petal_lineage else {
                 continue;
