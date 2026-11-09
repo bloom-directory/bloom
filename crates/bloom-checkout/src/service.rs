@@ -2442,7 +2442,7 @@ pub async fn serve_api(service: Arc<CheckoutService>, path: &Path, machine_uid: 
 
 /// An error chain for the service log. Checkout's own messages and CDP
 /// method names stay; quoted text, which parsers copy from page values, does not.
-fn loggable(error: &anyhow::Error) -> String {
+pub(crate) fn loggable(error: &anyhow::Error) -> String {
     let mut out = String::new();
     for cause in error.chain() {
         if !out.is_empty() {

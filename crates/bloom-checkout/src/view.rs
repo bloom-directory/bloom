@@ -1,4 +1,4 @@
-use crate::service::{CheckoutService, SavedAction, ViewAction};
+use crate::service::{CheckoutService, SavedAction, ViewAction, loggable};
 use axum::{
     Json, Router,
     extract::State,
@@ -116,7 +116,10 @@ async fn saved(
     };
     match service.private_saved(&token, action).await {
         Ok(value) => Json(value).into_response(),
-        Err(_) => (StatusCode::CONFLICT, Json(serde_json::json!({"error":"Saved details could not be prepared. Check the page and any earlier payment; your seller session is still open."}))).into_response(),
+        Err(error) => {
+            eprintln!("checkout saved action failed: {}", loggable(&error));
+            (StatusCode::CONFLICT, Json(serde_json::json!({"error":"Saved details could not be prepared. Check the page and any earlier payment; your seller session is still open."}))).into_response()
+        }
     }
 }
 async fn frame(State(service): State<Arc<CheckoutService>>, headers: HeaderMap) -> Response {
