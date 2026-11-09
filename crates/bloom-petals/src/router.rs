@@ -21,6 +21,24 @@ use crate::host::PetalHost;
 use crate::runner::{PETAL_DOCUMENT_NAMES, PetalRunner};
 use crate::vm::{COMPONENT_NOT_A_DIR_CODE, COMPONENT_UNSUPPORTED_CODE, RunOptions};
 
+tokio::task_local! {
+    static INERT_READ: ();
+}
+
+/// Run `read` as an inert read, for a caller such as an MCP resource read
+/// that must never trigger a read that acts. A Petal route's read is checked
+/// again under that Petal's gate, so the check and the read see the same
+/// installed package: one whose read acts is refused, even if its package
+/// changed after the caller's first check.
+pub async fn inert_read<F: std::future::Future>(read: F) -> F::Output {
+    INERT_READ.scope((), read).await
+}
+
+/// Whether the current task is running an [`inert_read`].
+pub fn is_inert_read() -> bool {
+    INERT_READ.try_with(|_| ()).is_ok()
+}
+
 /// How long host-owned ancestor checks may reuse a live account observation,
 /// matching the Machine's default wallet-projection reuse window. One mounted
 /// path traversal checks the same ancestors several times; each live
@@ -446,6 +464,9 @@ impl PetalRouter {
             .runner
             .petal_route(mount, op, &path)
             .map_err(map_petal_err)?;
+        if matches!(op, DispatchOp::Read) && is_inert_read() && self.is_effect(mount, op, &path) {
+            return Err(HandlerError::PermissionDenied);
+        }
         let wallet = matched
             .params
             .iter()
@@ -1511,6 +1532,46 @@ name = "example"
             .expect("the write proceeds once the Petal is free")
             .unwrap()
             .ok();
+
+        // The stored check runs under this Petal's gate: it waits while this
+        // Petal's package changes, and not while another Petal's does.
+        let limit = std::time::Duration::from_secs(1);
+        let other = runner
+            .store()
+            .activation_permit_waiting("other", limit, || false)
+            .unwrap();
+        assert!(
+            !tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                router.write_if_absent(&path, key, b"new")
+            )
+            .await
+            .expect("another Petal's change holds nothing up")
+            .unwrap()
+        );
+        drop(other);
+        let changing = runner
+            .store()
+            .activation_permit_waiting("example", limit, || false)
+            .unwrap();
+        let writer = router.clone();
+        let mut check = tokio::spawn(async move {
+            writer
+                .write_if_absent(
+                    &VfsPath::parse("/example/operations/alice/0/submit").unwrap(),
+                    "settings/alice/venue.toml",
+                    b"new",
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut check)
+                .await
+                .is_err(),
+            "the check waits while this Petal's package changes"
+        );
+        drop(changing);
+        assert!(!check.await.unwrap().unwrap());
     }
 
     #[tokio::test]
@@ -1560,6 +1621,28 @@ name = "example"
 
         assert!(router.is_read_side_effecting(&route_path));
         assert_eq!(router.cache_ttl(&route_path), None);
+    }
+
+    /// Under an inert read, a route whose read acts is refused once that
+    /// Petal's gate is held, whatever the caller checked before; the same
+    /// read is not refused outside one.
+    #[tokio::test]
+    async fn an_inert_read_refuses_a_route_that_acts_under_the_petals_gate() {
+        let (dir, runner) = runner();
+        let package = dir.path().join("example-app");
+        write_dynamic_dir_package(&package, true);
+        runner.store().install_petal_package_dir(&package).unwrap();
+        let router = PetalRouter::new(runner, Arc::new(AccountHost));
+        let route_path = VfsPath::parse("/example/intents/alice/0").unwrap();
+        assert!(matches!(
+            inert_read(router.read(&route_path)).await,
+            Err(HandlerError::PermissionDenied)
+        ));
+        assert!(!matches!(
+            router.read(&route_path).await,
+            Err(HandlerError::PermissionDenied)
+        ));
+        assert!(!is_inert_read());
     }
 
     #[tokio::test]

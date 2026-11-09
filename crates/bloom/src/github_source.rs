@@ -2787,6 +2787,30 @@ mod tests {
             .unwrap();
     }
 
+    /// A release file curl cannot fetch is marked as a failed download,
+    /// which provisioning finds under the context it adds.
+    #[test]
+    fn a_failed_curl_download_is_marked_for_retry() {
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let error = curl_download(
+            "http://127.0.0.1:9/petal-release.json",
+            output.path(),
+            &bloom_daemon::ipc::IpcOperationContext::detached(),
+        )
+        .context("download default enso")
+        .unwrap_err();
+        assert!(
+            error.downcast_ref::<DownloadFailed>().is_some(),
+            "{error:#}"
+        );
+        assert!(
+            format!("{error:#}").starts_with(
+                "download default enso: download http://127.0.0.1:9/petal-release.json: curl failed:"
+            ),
+            "{error:#}"
+        );
+    }
+
     #[test]
     fn provisioning_attempts_each_entry_once_and_retries_only_on_next_pass() {
         use crate::petal_provisioning::{ProvisioningOutcome, provision_with};

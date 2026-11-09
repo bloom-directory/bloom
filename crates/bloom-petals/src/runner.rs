@@ -360,8 +360,8 @@ impl PetalRunner {
         )
     }
 
-    /// [`Self::install_staged_petal_package`] with the store's exclusive
-    /// permit already held, as from
+    /// [`Self::install_staged_petal_package`] with the permit to change the
+    /// package's Petal already held, as from
     /// [`crate::store::PetalStore::activation_permit_waiting`].
     pub fn install_staged_petal_package_permitted<F>(
         &self,

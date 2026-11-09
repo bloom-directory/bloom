@@ -1556,6 +1556,32 @@ fn report_not_installed(
     Ok(())
 }
 
+/// Name the chosen Petals a switch's proposal left out because they were not
+/// installed when it was made, though they are now; `effect` says what
+/// follows, with `{them}` for the Petals.
+fn report_left_out(
+    output: &mut dyn Write,
+    wallet: &str,
+    left_out: &[String],
+    effect: &str,
+) -> Result<()> {
+    if left_out.is_empty() {
+        return Ok(());
+    }
+    let (verb, them) = if left_out.len() == 1 {
+        ("was", "it")
+    } else {
+        ("were", "them")
+    };
+    writeln!(
+        output,
+        "default_policy: {}, chosen for {wallet}, {verb} not installed when this switch was proposed, so {}",
+        petal_labels(left_out),
+        effect.replace("{them}", them)
+    )?;
+    Ok(())
+}
+
 /// Name chosen Petals that the wallet's policy allows but that are not
 /// installed, such as one uninstalled while its switch waited for approval.
 fn report_allowed_not_installed(
@@ -1678,6 +1704,10 @@ pub(crate) enum DefaultPolicyStatus {
         /// Chosen Petals not installed yet, so not proposed and not allowed.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         not_installed: Vec<String>,
+        /// Chosen Petals a persona switch's proposal left out because they
+        /// were not installed when it was made, though they are now.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        left_out: Vec<String>,
     },
     /// The wallet policy allows every chosen, installed Petal.
     Applied {
@@ -1712,6 +1742,10 @@ pub(crate) enum DefaultPolicyStatus {
         /// as one uninstalled while a persona switch waited for approval.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         allowed_not_installed: Vec<String>,
+        /// Chosen Petals a persona switch's proposal left out because they
+        /// were not installed when it was made, though they are now.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        left_out: Vec<String>,
     },
     /// The policy has changed since the wallet was created and does not allow
     /// `missing`. Only a new wallet's policy is proposed, so nothing is.
@@ -1777,8 +1811,9 @@ impl DefaultPolicyMode {
 /// (decision 18): the wallet's new setup, and the policy operation that
 /// proposes it once Machine has proposed it. None of it applies until that
 /// policy commits.
+/// Fields it does not know are ignored, so an earlier build can still read
+/// a switch a later one recorded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct PendingSwitch {
     setup: WalletSetup,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1788,6 +1823,20 @@ struct PendingSwitch {
     /// since is still in it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     proposed: Option<Vec<String>>,
+}
+
+/// `switch` once Machine has proposed it as `operation_id`, from `request`:
+/// the record says which chosen Petals that proposal allows.
+fn proposed_switch(
+    switch: &PendingSwitch,
+    operation_id: &str,
+    request: &DefaultPolicyRequest,
+) -> PendingSwitch {
+    PendingSwitch {
+        setup: switch.setup.clone(),
+        operation_id: Some(operation_id.to_owned()),
+        proposed: Some(request.petals.clone()),
+    }
 }
 
 fn pending_switch_path(home: &std::path::Path, wallet: &str) -> std::path::PathBuf {
@@ -2040,11 +2089,7 @@ pub(crate) async fn advance_default_policy(
                 write_pending_switch(
                     home,
                     wallet,
-                    &PendingSwitch {
-                        setup: switch.setup.clone(),
-                        operation_id: Some(pending.operation_id.as_str().to_owned()),
-                        proposed: Some(request.petals.clone()),
-                    },
+                    &proposed_switch(switch, pending.operation_id.as_str(), &request),
                 )?;
             }
             drop(held);
@@ -2101,6 +2146,7 @@ pub(crate) async fn advance_default_policy(
                     legacy_clear_signing: refused_legacy_clear_signing(&current)?,
                     not_installed,
                     allowed_not_installed,
+                    left_out: Vec::new(),
                 }
             }
         },
@@ -2173,7 +2219,7 @@ pub(crate) async fn advance_default_policy(
                     ControlFlow::Continue(false) => {}
                 }
             }
-            let (petals, not_installed) =
+            let (petals, not_installed, left_out) =
                 awaiting_listing(&request, switch.as_ref().filter(|_| switch_own));
             DefaultPolicyStatus::AwaitingOwner {
                 operation_id: pending.operation_id.as_str().to_owned(),
@@ -2188,35 +2234,52 @@ pub(crate) async fn advance_default_policy(
                 petals,
                 proposes_chosen_petals: pending.includes_requested || switch_own,
                 not_installed,
+                left_out,
             }
         }
     })
 }
 
-/// What a policy change waiting for the owner allows, as they are told, and
-/// the chosen Petals it leaves out because they are not installed. A
-/// switch's own ceremony is described by what its proposal included, as
-/// recorded when it was made, not by which Petals are installed now; a
-/// switch recorded before Machine kept that, and any other change, by the
-/// request.
+/// What a policy change waiting for the owner allows, as they are told: what
+/// it allows, the chosen Petals it leaves out that are not installed, and,
+/// for a switch's own ceremony, those it left out because they were not
+/// installed when it was proposed, though they are now. That ceremony is
+/// described by what its proposal included, as recorded when it was made,
+/// not by which Petals are installed now; a switch recorded before Machine
+/// kept that, and any other change, by the request.
 fn awaiting_listing(
     request: &DefaultPolicyRequest,
     own_switch: Option<&PendingSwitch>,
-) -> (Vec<String>, Vec<String>) {
+) -> (Vec<String>, Vec<String>, Vec<String>) {
     match own_switch.and_then(|switch| Some((switch, switch.proposed.as_ref()?))) {
         Some((switch, proposed)) => {
             let mut listed = request.clone();
             listed.petals = proposed.clone();
-            let left_out = switch
+            let (not_installed, left_out) = switch
                 .setup
                 .petals
                 .keys()
                 .filter(|name| !proposed.contains(name))
                 .cloned()
-                .collect();
-            (listed.allowed(), left_out)
+                .partition(|name| request.not_installed.contains(name));
+            (listed.allowed(), not_installed, left_out)
         }
-        None => (request.allowed(), request.not_installed.clone()),
+        None => (request.allowed(), request.not_installed.clone(), Vec::new()),
+    }
+}
+
+/// The Petals in `not_allowed` that `switch`'s proposal left out because
+/// they were not installed when it was made, apart from the rest, which
+/// changed after the owner approved it.
+fn left_out_of_switch(
+    switch: &PendingSwitch,
+    not_allowed: Vec<String>,
+) -> (Vec<String>, Vec<String>) {
+    match &switch.proposed {
+        Some(proposed) => not_allowed
+            .into_iter()
+            .partition(|name| switch.setup.petals.contains_key(name) && !proposed.contains(name)),
+        None => (Vec::new(), not_allowed),
     }
 }
 
@@ -2255,7 +2318,7 @@ async fn applied_switch(
     current: &bloom_broker_api::SignedPolicySnapshot,
     settings_pending: Vec<String>,
 ) -> Result<DefaultPolicyStatus> {
-    let not_allowed = request.missing(current)?;
+    let (left_out, not_allowed) = left_out_of_switch(switch, request.missing(current)?);
     let (allowed_not_installed, not_installed) = split_not_installed(request, current)?;
     let settings_reset = promote_switch(daemon, wallet, switch)
         .await?
@@ -2264,7 +2327,7 @@ async fn applied_switch(
         petals: request
             .allowed()
             .into_iter()
-            .filter(|allowed| !not_allowed.contains(allowed))
+            .filter(|allowed| !not_allowed.contains(allowed) && !left_out.contains(allowed))
             .collect(),
         settings_pending,
         settings_waiting: Vec::new(),
@@ -2274,6 +2337,7 @@ async fn applied_switch(
         legacy_clear_signing: refused_legacy_clear_signing(current)?,
         not_installed,
         allowed_not_installed,
+        left_out,
     })
 }
 
@@ -3032,6 +3096,7 @@ impl DefaultPolicyWait {
                 legacy_clear_signing,
                 not_installed,
                 allowed_not_installed,
+                left_out,
             } => {
                 for message in settings_reset {
                     writeln!(output, "{message}")?;
@@ -3050,6 +3115,15 @@ impl DefaultPolicyWait {
                     "this policy does not allow {them}",
                 )?;
                 report_allowed_not_installed(output, wallet, allowed_not_installed)?;
+                report_left_out(
+                    output,
+                    wallet,
+                    left_out,
+                    &format!(
+                        "the policy you approved does not allow {{them}}. To allow {{them}}, {}",
+                        policy_update_steps(wallet, "<policy.json>")
+                    ),
+                )?;
                 if !not_allowed.is_empty() {
                     writeln!(
                         output,
@@ -3187,6 +3261,7 @@ impl DefaultPolicyWait {
                 petals,
                 proposes_chosen_petals,
                 not_installed,
+                left_out,
             } => {
                 if !proposes_chosen_petals {
                     return self.observe_unrelated(operation_id, ceremony_url, now_ms, output);
@@ -3222,6 +3297,14 @@ impl DefaultPolicyWait {
                         wallet,
                         not_installed,
                         "this policy does not propose {them}",
+                    )?;
+                    report_left_out(
+                        output,
+                        wallet,
+                        left_out,
+                        &format!(
+                            "this policy does not allow {{them}}. Once you approve it, `bloom wallet default-policy {wallet}` says how to allow {{them}}"
+                        ),
                     )?;
                     self.announced = Some(operation_id.clone());
                     if let Some(expires_at_ms) = ceremony_expires_at_ms {
@@ -3776,6 +3859,7 @@ mod tests {
                 legacy_clear_signing: false,
                 not_installed: Vec::new(),
                 allowed_not_installed: Vec::new(),
+                left_out: Vec::new(),
             },
             DefaultPolicyStatus::ChangedSinceCreation {
                 missing: vec!["polymarket".into()],
@@ -4771,6 +4855,52 @@ mod tests {
         assert!(read_pending_switch(home.path(), "trading").is_err());
     }
 
+    /// A Petal a switch's proposal left out, though installed now, is named
+    /// in the past tense with what to run, on the waiting ceremony and once
+    /// it is approved, never as not installed or as changed.
+    #[test]
+    fn a_petal_a_switch_left_out_is_named_as_such() {
+        let observe = |status: DefaultPolicyStatus| {
+            let mut wait = DefaultPolicyWait::new("main", 30_000);
+            let mut output = Vec::new();
+            wait.observe(&status, 0, &mut output).unwrap();
+            String::from_utf8(output).unwrap()
+        };
+        let waiting = observe(DefaultPolicyStatus::AwaitingOwner {
+            operation_id: "op".into(),
+            ceremony_url: Some("http://localhost/ceremony/token".into()),
+            ceremony_expires_at_ms: None,
+            petals: vec!["polymarket".into()],
+            proposes_chosen_petals: true,
+            not_installed: Vec::new(),
+            left_out: vec!["hyperliquid".into()],
+        });
+        assert!(
+            waiting.contains("Hyperliquid, chosen for main, was not installed when this switch was proposed, so this policy does not allow it. Once you approve it, `bloom wallet default-policy main` says how to allow it"),
+            "{waiting}"
+        );
+        let applied = observe(DefaultPolicyStatus::Applied {
+            petals: vec!["polymarket".into()],
+            settings_pending: Vec::new(),
+            settings_waiting: Vec::new(),
+            settings_reset: Vec::new(),
+            not_allowed: Vec::new(),
+            beyond_persona: Vec::new(),
+            legacy_clear_signing: false,
+            not_installed: Vec::new(),
+            allowed_not_installed: Vec::new(),
+            left_out: vec!["enso".into(), "hyperliquid".into()],
+        });
+        assert!(
+            applied.contains("Enso, Hyperliquid, chosen for main, were not installed when this switch was proposed, so the policy you approved does not allow them. To allow them,"),
+            "{applied}"
+        );
+        for output in [&waiting, &applied] {
+            assert!(!output.contains("is not installed"), "{output}");
+            assert!(!output.contains("changed after you approved"), "{output}");
+        }
+    }
+
     /// A switch's own ceremony is described by what its proposal included,
     /// whatever is installed now: a Petal left out when it was proposed is
     /// named as not proposed even once installed, and one uninstalled since
@@ -4794,25 +4924,64 @@ mod tests {
                 .map(|name| (*name).to_owned())
                 .collect::<Vec<_>>()
         };
-        // Proposed while Hyperliquid was missing; it is installed again now.
+        // Proposed while Hyperliquid was missing: left out, though it is
+        // installed again now; while it is still missing, not installed.
         let late = switch(Some(&["polymarket"]));
         assert_eq!(
             awaiting_listing(&request(&["hyperliquid", "polymarket"], &[]), Some(&late)),
-            (names(&["polymarket"]), names(&["hyperliquid"]))
+            (names(&["polymarket"]), Vec::new(), names(&["hyperliquid"]))
+        );
+        assert_eq!(
+            awaiting_listing(&request(&["polymarket"], &["hyperliquid"]), Some(&late)),
+            (names(&["polymarket"]), names(&["hyperliquid"]), Vec::new())
         );
         // Proposed with both; Hyperliquid was uninstalled since.
         let whole = switch(Some(&["hyperliquid", "polymarket"]));
         assert_eq!(
             awaiting_listing(&request(&["polymarket"], &["hyperliquid"]), Some(&whole)),
-            (names(&["hyperliquid", "polymarket"]), Vec::new())
+            (
+                names(&["hyperliquid", "polymarket"]),
+                Vec::new(),
+                Vec::new()
+            )
         );
         let now = request(&["polymarket"], &["hyperliquid"]);
         for own in [None, Some(&switch(None))] {
             assert_eq!(
                 awaiting_listing(&now, own),
-                (names(&["polymarket"]), names(&["hyperliquid"]))
+                (names(&["polymarket"]), names(&["hyperliquid"]), Vec::new())
             );
         }
+        // The record a proposal writes names the Petals it allows.
+        let recorded = proposed_switch(
+            &switch(None),
+            "op",
+            &request(&["polymarket"], &["hyperliquid"]),
+        );
+        assert_eq!(recorded.operation_id.as_deref(), Some("op"));
+        assert_eq!(recorded.proposed, Some(names(&["polymarket"])));
+        // A record written by a later build, with fields this one does not
+        // know, still reads.
+        let home = tempfile::tempdir().unwrap();
+        write_pending_switch(home.path(), "main", &recorded).unwrap();
+        let path = pending_switch_path(home.path(), "main");
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("later_field = true\n{text}")).unwrap();
+        assert_eq!(
+            read_pending_switch(home.path(), "main").unwrap(),
+            Some(recorded)
+        );
+        // Once approved, a Petal the proposal left out is apart from one
+        // that changed since; without a record, every one changed.
+        let missing = names(&["hyperliquid", "polymarket"]);
+        assert_eq!(
+            left_out_of_switch(&late, missing.clone()),
+            (names(&["hyperliquid"]), names(&["polymarket"]))
+        );
+        assert_eq!(
+            left_out_of_switch(&switch(None), missing.clone()),
+            (Vec::new(), missing)
+        );
     }
 
     /// A command acts on the switch it read when it began: ending it clears
@@ -4976,6 +5145,7 @@ mod tests {
             legacy_clear_signing: false,
             not_installed: Vec::new(),
             allowed_not_installed: Vec::new(),
+            left_out: Vec::new(),
         });
         assert!(
             output.starts_with("petal_settings: Polymarket reset to max_daily_usd = 1000\n"),
@@ -4993,6 +5163,7 @@ mod tests {
             petals: vec!["polymarket".into()],
             proposes_chosen_petals: true,
             not_installed: Vec::new(),
+            left_out: Vec::new(),
         };
         let mut wait = DefaultPolicyWait::new("trading", 30_000).for_switch();
         let mut output = Vec::new();
@@ -5389,6 +5560,7 @@ mod tests {
             legacy_clear_signing: false,
             not_installed,
             allowed_not_installed: Vec::new(),
+            left_out: Vec::new(),
         };
         let output = observe(applied(vec!["hyperliquid".into()]));
         assert!(
@@ -5442,6 +5614,7 @@ mod tests {
                 petals: vec!["polymarket".into()],
                 proposes_chosen_petals: true,
                 not_installed: vec!["enso".into(), "hyperliquid".into()],
+                left_out: Vec::new(),
             },
             0,
             &mut output,
@@ -5472,6 +5645,7 @@ mod tests {
                 legacy_clear_signing: false,
                 not_installed: Vec::new(),
                 allowed_not_installed: vec!["hyperliquid".into()],
+                left_out: Vec::new(),
             },
             0,
             &mut output,
@@ -5559,6 +5733,7 @@ mod tests {
             legacy_clear_signing: false,
             not_installed: Vec::new(),
             allowed_not_installed: Vec::new(),
+            left_out: Vec::new(),
         })
         .unwrap();
         assert!(applied.get("not_installed").is_none(), "{applied}");
@@ -5679,6 +5854,7 @@ mod tests {
             legacy_clear_signing: false,
             not_installed: Vec::new(),
             allowed_not_installed: Vec::new(),
+            left_out: Vec::new(),
         });
         assert!(output.contains("main allows Polymarket"), "{output}");
         assert!(
@@ -5742,6 +5918,7 @@ mod tests {
                 legacy_clear_signing: false,
                 not_installed: Vec::new(),
                 allowed_not_installed: Vec::new(),
+                left_out: Vec::new(),
             })
             .unwrap(),
             serde_json::json!({"state": "applied", "petals": []})
@@ -5782,6 +5959,7 @@ mod tests {
             legacy_clear_signing: true,
             not_installed: Vec::new(),
             allowed_not_installed: Vec::new(),
+            left_out: Vec::new(),
         };
         let note = r#"also delete "clear_signing" and every "evm-clear-signing-v1" entry"#;
 
@@ -5824,6 +6002,7 @@ mod tests {
             legacy_clear_signing: false,
             not_installed: Vec::new(),
             allowed_not_installed: Vec::new(),
+            left_out: Vec::new(),
         };
         let mut wait = DefaultPolicyWait::new("main", 30_000).for_switch();
         let mut output = Vec::new();
@@ -6272,6 +6451,7 @@ mod tests {
             petals: vec!["polymarket".into()],
             proposes_chosen_petals: true,
             not_installed: Vec::new(),
+            left_out: Vec::new(),
         };
         let encoded = serde_json::to_value(&status).unwrap();
         assert_eq!(encoded["state"], "awaiting_owner");
@@ -6309,6 +6489,7 @@ mod tests {
             legacy_clear_signing: false,
             not_installed: Vec::new(),
             allowed_not_installed: Vec::new(),
+            left_out: Vec::new(),
         };
         let value = serde_json::to_value(&applied).unwrap();
         assert_eq!(
@@ -6429,6 +6610,7 @@ mod tests {
             petals: vec!["polymarket".into(), "near-intents".into()],
             proposes_chosen_petals: true,
             not_installed: Vec::new(),
+            left_out: Vec::new(),
         }
     }
 
@@ -6463,6 +6645,7 @@ mod tests {
             legacy_clear_signing: false,
             not_installed: Vec::new(),
             allowed_not_installed: Vec::new(),
+            left_out: Vec::new(),
         };
         assert_eq!(
             wait.observe(&applied, 30, &mut output).unwrap(),
@@ -6485,6 +6668,7 @@ mod tests {
             petals: vec!["polymarket".into(), "near-intents".into()],
             proposes_chosen_petals: false,
             not_installed: Vec::new(),
+            left_out: Vec::new(),
         };
         for _ in 0..2 {
             assert_eq!(

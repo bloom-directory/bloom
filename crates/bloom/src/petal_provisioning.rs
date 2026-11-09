@@ -1,5 +1,5 @@
 //! One best-effort pass per daemon start, then retries of installs refused
-//! because other Petal code was running or whose download failed.
+//! because that Petal's code was running or whose download failed.
 //! Installation is not signing authorization.
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -22,8 +22,8 @@ pub(crate) enum ProvisioningOutcome {
     /// Replaced an older release. Signed package lineage carries the old
     /// release's settings forward; an update outside that lineage starts empty.
     Updated,
-    /// Refused because other Petal code was running when this one would have
-    /// activated; [`retry_pending`] tries it again while Machine runs.
+    /// Refused because that Petal's code was running when its package would
+    /// have changed; [`retry_pending`] tries it again while Machine runs.
     Busy(String),
     /// A release file could not be downloaded; [`retry_pending`] tries it
     /// again up to [`DOWNLOAD_RETRIES`] times. A failed check of what was
@@ -142,8 +142,8 @@ fn with_restart_advice(error: &str) -> String {
     format!("{}; restart Bloom to try again", error.trim_end())
 }
 
-/// Whether `error` is a package change refused because Petal code was
-/// running, which succeeds once the store is idle.
+/// Whether `error` is a package change refused because that Petal's code was
+/// running, which succeeds once its calls end.
 fn is_busy(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         matches!(
@@ -154,14 +154,14 @@ fn is_busy(error: &anyhow::Error) -> bool {
 }
 
 /// Try again each catalog Petal in `first` whose install was refused because
-/// other Petal code was running, such as setup writing Polymarket's settings
-/// right after `bloom wallet new`, until it installs, fails for another
-/// reason, or Machine stops. A Petal whose download failed is tried again
-/// [`DOWNLOAD_RETRIES`] times. A retry queues briefly for its turn to
-/// activate ([`IpcOperationContext::waiting_to_activate`], up to
-/// [`QUEUE_WAIT`]): running Petal calls finish, and calls starting meanwhile
-/// wait behind it, so agents calling Petals back to back cannot starve it,
-/// while no call waits on it for long. `on_retried` receives each round's
+/// that Petal's code was running, such as an update while an agent calls it,
+/// until it installs, fails for another reason, or Machine stops. A Petal
+/// whose download failed is tried again [`DOWNLOAD_RETRIES`] times. A retry
+/// queues briefly for its turn to activate
+/// ([`IpcOperationContext::waiting_to_activate`], up to [`QUEUE_WAIT`]): that
+/// Petal's running calls finish, and its calls starting meanwhile wait behind
+/// it, so agents calling it back to back cannot starve the update, while no
+/// call waits on it for long. `on_retried` receives each round's
 /// results, so setup's settings are written once a chosen Petal installs.
 pub(crate) fn retry_pending(
     daemon: &Daemon,

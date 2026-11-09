@@ -453,7 +453,7 @@ impl PetalStore {
     }
 
     /// [`Self::install_staged_petal_package_with_activation`] with the
-    /// exclusive permit already held, as from
+    /// permit to change the package's Petal already held, as from
     /// [`Self::activation_permit_waiting`].
     pub(crate) fn install_staged_with_permit<F, G>(
         &self,
@@ -1038,6 +1038,67 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = PetalStore::open(dir.path()).unwrap();
         (dir, store)
+    }
+
+    /// An install refuses a permit taken for another Petal, and changes
+    /// nothing; with the right one it goes in.
+    #[test]
+    fn an_install_needs_the_permit_for_its_own_petal() {
+        let (dir, store) = store();
+        let package = dir.path().join("echo-src");
+        write_file(
+            &package,
+            "petal.toml",
+            br#"schema = "bloom.petal.package.v1"
+name = "echo"
+"#,
+        );
+        write_file(&package, "README.md", b"# echo");
+        write_file(&package, "AGENTS.md", b"# echo agents");
+        write_file(
+            &package,
+            "petal/echo/[name].txt.wasm",
+            route_component_wasm(),
+        );
+        let staged = || {
+            store
+                .stage_petal_package(PreparedPetalPackage::from_dir(&package).unwrap())
+                .unwrap()
+        };
+        let limit = std::time::Duration::from_secs(1);
+        let wrong = store
+            .activation_permit_waiting("other", limit, || false)
+            .unwrap();
+        let error = store
+            .install_staged_with_permit(wrong, staged(), None, || Ok(()), |_| Ok(()))
+            .unwrap_err();
+        assert!(error.to_string().contains("not \"echo\""), "{error}");
+        assert_eq!(store.resolve_petal_owner("echo").unwrap(), None);
+        let right = store
+            .activation_permit_waiting("echo", limit, || false)
+            .unwrap();
+        store
+            .install_staged_with_permit(right, staged(), None, || Ok(()), |_| Ok(()))
+            .unwrap();
+        assert!(store.resolve_petal_owner("echo").unwrap().is_some());
+    }
+
+    /// Past the limit, gates nobody holds are forgotten, but one that is held
+    /// is kept, so its Petal stays excluded: a change to it still waits.
+    #[tokio::test]
+    async fn forgetting_idle_gates_keeps_held_ones() {
+        let (_dir, store) = store();
+        let running = store.execution_guard("held").await;
+        for n in 0..IDLE_GATES_KEPT * 2 {
+            drop(store.execution_guard(&format!("idle-{n}")).await);
+        }
+        assert!(store.gates.petals.lock().len() <= IDLE_GATES_KEPT + 1);
+        assert!(matches!(
+            store.activation_permit("held"),
+            Err(PetalError::Busy)
+        ));
+        drop(running);
+        store.activation_permit("held").unwrap();
     }
 
     /// Opening the store removes staging directories an earlier Machine

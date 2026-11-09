@@ -514,11 +514,12 @@ impl IpcOperationContext {
     }
 
     /// This context, for an install that queues up to `limit` for its turn
-    /// to activate. The store refuses a package change while any Petal code
-    /// runs (bloom#328); an install retrying such a refusal instead queues
-    /// for the store's permit after staging: running calls finish, calls
-    /// that start meanwhile wait behind it, so busy callers cannot starve it.
-    /// Keep `limit` short: it is how long those calls can wait. Cancelling
+    /// to activate. The store refuses to change a Petal's package while that
+    /// Petal's code runs (bloom#328); an install retrying such a refusal
+    /// instead queues for the permit to change that Petal after staging: its
+    /// running calls finish, and its calls that start meanwhile wait behind
+    /// it, so busy callers cannot starve it. Keep `limit` short: it is how
+    /// long those calls can wait. Cancelling
     /// either context cancels both.
     pub fn waiting_to_activate(&self, limit: std::time::Duration) -> Self {
         let mut context = self.clone();
@@ -1196,19 +1197,23 @@ impl IpcServer {
                 Err(e) => map_handler_err(id, e),
             },
             "read_inert" => {
-                // Installation and removal use this same guard. Keep route safety
-                // classification and execution bound to the same installed package.
-                let _mutation = self.petal_mutation.lock().await;
+                // A Petal route's safety can change with its package, so the
+                // Petal router checks it again under that Petal's own gate,
+                // which also keeps the package from changing until the read
+                // ends. Holding Machine's Petal mutation lock here instead
+                // would hold up every Petal's install for as long as the read.
                 match parse_path(&req.params) {
                     Ok(path) if self.vfs.is_read_side_effecting(&path) => Response::err(
                         id,
                         -32010,
                         "path is not an inert resource; use vfs_read deliberately",
                     ),
-                    Ok(_) => match self.do_read(&req.params, &context).await {
-                        Ok(value) => Response::ok(id, value),
-                        Err(error) => map_handler_err(id, error),
-                    },
+                    Ok(_) => {
+                        match bloom_petals::inert_read(self.do_read(&req.params, &context)).await {
+                            Ok(value) => Response::ok(id, value),
+                            Err(error) => map_handler_err(id, error),
+                        }
+                    }
                     Err(error) => map_handler_err(id, error),
                 }
             }
@@ -2916,6 +2921,7 @@ allowed = ["bloom:vfs.read"]
     struct GuardedReadHandler {
         side_effecting: AtomicBool,
         reads: AtomicUsize,
+        inert: AtomicBool,
         started: Notify,
         release: Notify,
     }
@@ -2930,17 +2936,24 @@ allowed = ["bloom:vfs.read"]
         }
         async fn read(&self, _: &VfsPath) -> Result<Vec<u8>, HandlerError> {
             self.reads.fetch_add(1, Ordering::SeqCst);
+            self.inert
+                .store(bloom_petals::is_inert_read(), Ordering::SeqCst);
             self.started.notify_one();
             self.release.notified().await;
             Ok(b"safe".to_vec())
         }
     }
 
+    /// An inert read runs as one, so the Petal router checks the route's
+    /// safety again under that Petal's own gate, and it does not hold the
+    /// Petal mutation lock: no install waits for it. A read that acts is
+    /// refused before anything runs.
     #[tokio::test]
-    async fn inert_read_serializes_safety_check_and_execution_with_package_mutation() {
+    async fn inert_read_runs_as_one_without_holding_up_installs() {
         let handler = Arc::new(GuardedReadHandler {
             side_effecting: AtomicBool::new(false),
             reads: AtomicUsize::new(0),
+            inert: AtomicBool::new(false),
             started: Notify::new(),
             release: Notify::new(),
         });
@@ -2969,24 +2982,18 @@ allowed = ["bloom:vfs.read"]
         .await
         .unwrap();
         assert!(
-            server.petal_mutation.try_lock().is_err(),
-            "package replacement must wait through execution"
+            handler.inert.load(Ordering::SeqCst),
+            "the read ran as an inert one"
+        );
+        assert!(
+            server.petal_mutation.try_lock().is_ok(),
+            "an inert read holds up no install"
         );
         handler.release.notify_one();
         assert!(pending.await.unwrap().error.is_none());
 
-        // A queued resource request must inspect the successor's safety, not
-        // the outgoing package's flag sampled before acquiring the guard.
-        let mutation = server.petal_mutation.lock().await;
-        let mut pending = read(server.clone());
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(30), &mut pending)
-                .await
-                .is_err()
-        );
         handler.side_effecting.store(true, Ordering::SeqCst);
-        drop(mutation);
-        let refused = pending.await.unwrap();
+        let refused = read(server.clone()).await.unwrap();
         assert_eq!(refused.error.unwrap().code, -32010);
         assert_eq!(handler.reads.load(Ordering::SeqCst), 1);
     }

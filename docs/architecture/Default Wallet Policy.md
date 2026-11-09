@@ -638,21 +638,23 @@ config; the owner can explicitly apply them later.
 Catalog Petals are installed and updated in two places: `bloom init`
 (`ensure_preinstalled_petals`) and every `bloom serve` start
 (`petal_provisioning::provision`). `bloom serve` installs them after it is
-ready, so other Petal code can be running, such as setup writing
-Polymarket's settings right after `bloom wallet new`. The Petal store refuses
-to change a Petal's package while that Petal's code runs (bloom#328). Each
-Petal has its own gate, so another Petal's calls never hold up an install,
-and a first install, which no call can be running, goes in at once; only an
-uninstall waits for every Petal's calls. When an install is refused, Machine
+ready, so Petal code can be running, such as setup writing Polymarket's
+settings right after `bloom wallet new`. The Petal store refuses to change a
+Petal's package while that Petal's code runs (bloom#328). Each Petal has its
+own gate, so another Petal's calls, MCP resource reads included, never hold
+up an install, and a first install, which no call can be running, goes in at
+once; an uninstall is refused while any Petal's code runs. MCP resource
+reads check that a Petal route's read does not act under that Petal's gate
+rather than Machine's Petal mutation lock. When an install is refused, Machine
 tries it again after one second, doubling the wait up to one minute and
 staying there while it runs. A retry downloads and stages the package, then
-takes Machine's Petal mutation lock in turn, as listing Petals and MCP reads
+takes Machine's Petal mutation lock in turn, as listing and managing Petals
 do, and queues for its turn to activate for up to 3 seconds by the clock:
 that Petal's calls already running finish, and its calls that start
 meanwhile wait behind it (`PetalStore::activation_permit_waiting`). So
 agents calling a Petal back to back, even several at once or through MCP,
-cannot starve its update, and no call or Petal listing waits on it for more
-than 3 seconds. If the Petal's running calls outlast that, it lets them go
+cannot starve its update, and none of that Petal's calls, and no Petal
+listing, waits on it for more than 3 seconds. If the Petal's running calls outlast that, it lets them go
 and tries again in its next round. A release file that fails to download is
 tried again on the same schedule, six times, about a minute in all; a
 failed check of what was downloaded, such as its checksum, is not, since
@@ -1028,7 +1030,7 @@ Automated:
   as awaiting the owner, is replaced by a new ceremony
   (`crates/bloom-vfs/tests/triad_policy_update.rs`).
 - Catalog provisioning reports an update separately from a fresh install.
-  An install refused because Petal code was running is reported as busy and
+  An install refused because that Petal's code was running is reported as busy and
   tried again, with a doubling wait capped at one minute, until it goes in
   or Machine stops; a failed download is tried again six times, and a failed
   checksum is not. Any other failure says to restart Bloom, and a
@@ -1037,20 +1039,27 @@ Automated:
   retrying install queued, a call to that Petal starting after it waits
   behind it for no longer than its limit, it activates as soon as the
   running call ends, and it stops when cancelled or past its limit. Another
-  Petal's calls neither hold up an install nor wait behind one. Callers that
-  hold the Petal mutation lock back to back, as MCP reads do, cannot keep a
-  plain or retrying install from it (`crates/bloom-daemon/src/ipc.rs`). The
-  store refuses a
-  package change during a Petal call with a typed busy error
-  (`crates/bloom-petals/src/runner.rs`) and removes abandoned staging when
-  opened (`crates/bloom-petals/src/store.rs`).
+  Petal's calls neither hold up an install nor wait behind one, and an MCP
+  resource read holds up no install. Callers that hold the Petal mutation
+  lock back to back cannot keep a plain or retrying install from it
+  (`crates/bloom-daemon/src/ipc.rs`). Under an inert read, a route whose read
+  acts is refused under its Petal's gate, as is a setup write's stored check
+  while that Petal's package changes (`crates/bloom-petals/src/router.rs`).
+  The store refuses a package change during a Petal call with a typed busy
+  error (`crates/bloom-petals/src/runner.rs`), refuses an install a permit
+  for another Petal, keeps every held gate when it forgets idle ones, and
+  removes abandoned staging when opened (`crates/bloom-petals/src/store.rs`).
+  A real failed `curl` download is marked for retry
+  (`crates/bloom/src/github_source.rs`).
 - With a chosen Petal not installed, Machine proposes no default policy
   while one could be proposed: for a setup the owner just chose, before
   Broker is asked, and otherwise while the policy is the one creation
   installed. The command names the missing Petals and what to run without
   calling it skipped; a persona switch starts nothing and records no waiting
-  switch. A switch's ceremony lists the Petals its proposal included, as
-  recorded when it was made. After a switch, a missing Petal its policy
+  switch. A switch records the Petals its proposal included, and its
+  ceremony lists them; a Petal it left out but installed since is named as
+  not installed when it was proposed, never as not installed now or as
+  changed, and a record with fields a build does not know still reads. After a switch, a missing Petal its policy
   allows is named as allowed, and one it does not is named with
   `bloom wallet default-policy`.
   The new status carries the list, and the others are unchanged on the
