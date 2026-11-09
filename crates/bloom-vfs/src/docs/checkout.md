@@ -35,22 +35,18 @@ is running.
 ## Browse
 
 Write `checkout/browse/<slot>/in.json`, then read `out.json` (kept five
-minutes). Reuse the slot. Actions: `open` + `url`, `snapshot`, `click` +
-`element_ref`, `type` + `element_ref` + `text`, `select` + `element_ref` +
-`value`, `back`, `fill_traveler`, `type_traveler`.
+minutes). Reuse the slot. Actions: `open` + `url`, `snapshot`, `back`,
+`fill_traveler`, `type_traveler`. Generic `click`, `type` and `select` are
+refused: any merchant event handler can charge a saved payment method,
+regardless of the control's label. Request a private take-over for those
+interactions. Traveler fills require their own scoped approval.
 
 - Take a fresh snapshot after every action; refs expire. Pages load in
   stages: if a control is missing or the page changed, snapshot again before
   calling it unavailable.
-- `type` needs an element whose `role` is `input` or `textarea`; `select`
-  needs role `select` and an option `value` from the snapshot. A label or
-  button of the same name only focuses the field: click it and snapshot.
 - `context` is the text around an element. Use it to tell apart identical
   buttons, such as fares on different flight cards or the same day in two
   months. Radio buttons and labels report `checked`.
-- Bloom blocks typing card or password data and clicking pay buttons. That
-  is the cue to request payment approval, not to work around it.
-- After Add to cart, confirm the cart changed before leaving the page.
 - Links carry `href` (no query or fragment): read a document link instead of
   clicking it. If a popup closes or downloads a file, shopping continues on the
   remaining page; take a new snapshot.
@@ -114,6 +110,8 @@ Send the ceremony URL. They work in Bloom's browser and click Done;
 `status.json` says `returned` and shopping restarts on a blank page without
 their login, cookies or the page they left: a logged-in shop could charge its
 saved payment method on any click. Reopen the shop and recheck the basket.
+The first cardless take-over enrolls a passkey without requiring a saved card
+or traveler. Complete merchant interactions in that approved private session.
 
 ## Results and recovery
 

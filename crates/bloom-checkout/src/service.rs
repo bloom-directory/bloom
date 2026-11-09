@@ -1118,6 +1118,17 @@ impl CheckoutService {
                     .await
             }
             Request::Browse { request } => {
+                if matches!(
+                    request,
+                    BrowseRequest::Click { .. }
+                        | BrowseRequest::Type { .. }
+                        | BrowseRequest::Select { .. }
+                ) {
+                    // Any merchant event handler can place an order, even on
+                    // a field or a control labelled "Continue". Only the
+                    // approved private flow may dispatch these effects.
+                    bail!("Merchant interaction requires approval; request a private take-over");
+                }
                 if matches!(request, BrowseRequest::Open { .. }) {
                     self.forget_travelers().await;
                 }
@@ -3149,6 +3160,42 @@ mod tests {
         )
         .unwrap();
         (service, browser, url, server)
+    }
+
+    #[tokio::test]
+    async fn public_merchant_events_require_approval_regardless_of_labels() {
+        let (service, browser, _, server) = shopping_service(
+            "<body><form onsubmit=\"document.title='charged';return false\"><button>Continue</button></form><button type='button' onclick=\"document.title='charged'\">Proceed</button><input oninput=\"document.title='charged'\"><select onchange=\"document.title='charged'\"><option value='a'>A</option><option value='b'>B</option></select></body>"
+        ).await;
+        let page = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        assert!(page["elements"].as_array().unwrap().len() >= 4, "{page}");
+        for element in page["elements"].as_array().unwrap() {
+            let element_ref = element["ref"].as_str().unwrap().to_owned();
+            let request = match element["role"].as_str().unwrap_or("") {
+                "input" => BrowseRequest::Type {
+                    element_ref,
+                    text: "test".into(),
+                },
+                "select" => BrowseRequest::Select {
+                    element_ref,
+                    value: "b".into(),
+                },
+                _ => BrowseRequest::Click { element_ref },
+            };
+            let error = service
+                .request(Request::Browse { request })
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("requires approval"));
+        }
+        let tab = browser.handoff().await.unwrap();
+        let title = tab
+            .cdp
+            .evaluate(&tab.session, "document.title".into())
+            .await
+            .unwrap();
+        assert_ne!(title, "charged");
+        server.abort();
     }
 
     /// An unlocked traveler on the current booking, recorded as `unlocked`.

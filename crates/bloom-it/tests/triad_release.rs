@@ -2447,7 +2447,7 @@ fn linux_installer_refuses_aws_kms_signer_configuration_before_changing_state() 
 }
 
 #[test]
-fn linux_installer_gives_congruent_uids_distinct_checkout_view_ports() {
+fn linux_installer_uses_ephemeral_checkout_ports_on_install_and_upgrade() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
     fs::create_dir(&root).unwrap();
@@ -2461,8 +2461,8 @@ fn linux_installer_gives_congruent_uids_distinct_checkout_view_ports() {
             .unwrap()
             .to_owned()
     };
-    // 1000 and 9000 share the slot 10000 + uid % 8000; reinstalling keeps
-    // each login's port.
+    // Old installations used a UID-derived port. Reinstall replaces it with
+    // zero so a stale recorded port cannot prevent service startup.
     for (uid, user) in [("1000", "alice"), ("9000", "carol"), ("1000", "alice")] {
         let installed = Command::new(&installer)
             .args(["install"])
@@ -2477,9 +2477,18 @@ fn linux_installer_gives_congruent_uids_distinct_checkout_view_ports() {
             "{}",
             String::from_utf8_lossy(&installed.stderr)
         );
-        assert_eq!(view_port("1000"), "11000");
+        assert_eq!(view_port(uid), "0");
+        if uid == "9000" {
+            let env = root.join("etc/bloom/1000/checkout.env");
+            let text = fs::read_to_string(&env).unwrap().replace(
+                "BLOOM_CHECKOUT_VIEW_PORT=0",
+                "BLOOM_CHECKOUT_VIEW_PORT=11000",
+            );
+            fs::write(env, text).unwrap();
+        }
     }
-    assert_eq!(view_port("9000"), "11001");
+    assert_eq!(view_port("1000"), "0");
+    assert_eq!(view_port("9000"), "0");
 }
 
 #[test]
@@ -2531,8 +2540,8 @@ fn linux_installer_allocates_distinct_ports_and_rejects_mixed_release_sets() {
         fstab.contains(&format!("port={alice_port},"))
             && fstab.contains(&format!("port={bob_port},"))
     );
-    // Each login's checkout view needs its own localhost port.
-    for (uid, port) in [("1000", "11000"), ("2000", "12000")] {
+    // Each process binds a free loopback port at runtime.
+    for (uid, port) in [("1000", "0"), ("2000", "0")] {
         assert!(
             fs::read_to_string(root.join(format!("etc/bloom/{uid}/checkout.env")))
                 .unwrap()
@@ -3377,7 +3386,6 @@ fn installers_expose_checkout_only_when_a_browser_is_available() {
             r#"set -Eeuo pipefail
 id() {{ echo 501; }}
 linux_checkout_browser() {{ [[ {available} == true ]] && printf /usr/bin/chromium || true; }}
-allocate_linux_checkout_view_port() {{ echo 15001; }}
 atomic_install() {{ install -m "$3" "$1" "$2"; }}
 {linux_function}
 write_linux_checkout_environment '{root}' 501

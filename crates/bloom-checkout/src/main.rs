@@ -24,7 +24,7 @@ struct Args {
     broker_uid: u32,
     #[arg(long)]
     machine_uid: u32,
-    #[arg(long)]
+    #[arg(long, default_value_t = 0)]
     view_port: u16,
     /// Exit cleanly when the session-bound Broker disappears (launchd lifecycle).
     #[arg(long)]
@@ -59,15 +59,16 @@ async fn main() -> Result<()> {
     #[cfg(not(feature = "triad-dev-harness"))]
     let flags = Vec::new();
     let browser = Browser::launch(&args.chromium, &args.profile, &flags).await?;
+    let view_listener =
+        tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, args.view_port)).await?;
+    let view_port = view_listener.local_addr()?.port();
     let service = CheckoutService::new(
         browser.clone(),
         &args.state,
         args.broker_socket,
         args.broker_uid,
-        args.view_port,
+        view_port,
     )?;
-    let view_listener =
-        tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, args.view_port)).await?;
     let api = serve_api(service.clone(), &args.socket, args.machine_uid);
     let viewer = axum::serve(view_listener, view::router(service));
     let lifecycle = async {
