@@ -1307,7 +1307,10 @@ impl IpcServer {
             return Err(HandlerError::PermissionDenied.into());
         }
         let bytes = parse_write_bytes(params)?;
-        match (self.vfs.write(&path, &bytes).await, confirm_challenge_path(&path)) {
+        match (
+            self.vfs.write(&path, &bytes).await,
+            confirm_challenge_path(&path),
+        ) {
             (Err(HandlerError::PermissionDenied), Some(challenge)) => {
                 self.await_approval(&path, &bytes, &challenge, context)
                     .await
