@@ -156,17 +156,16 @@ async function fillTraveler(page) {
   await approve(link,'fill');
   await poll(()=>privateState(page),s=>s.saved?.status?.state==='traveler_filled','traveler fill');
 }
-async function pay(page,cancel=false) {
+// The fixture's card fields sit on the seller page, not in a known payment
+// provider's frame, so Checkout must refuse to release a saved card there.
+// Saved-card payment into a provider frame is covered by test-card-checkout.mjs.
+async function payRefused(page) {
   await page.locator('#saved-card').selectOption('synthetic');
   await page.locator('#unpaid-checked').check();
   await page.locator('#pay-saved').click();
-  await page.locator('#saved-approval').waitFor({state:'visible'});
-  const state = await privateState(page);
-  const operation = state.saved.status.operation_id;
-  const publicStatus = await vfs('cat',`/checkout/requests/${operation}/status.json`);
-  assert.equal(publicStatus.ceremony_url,null);
-  await approve(await page.locator('#saved-approval').getAttribute('href'),'card',cancel);
-  return operation;
+  await page.waitForFunction(() => /could not be prepared|Check the page/.test(document.getElementById('saved-status').textContent),null,{timeout:30000});
+  assert(await page.locator('#saved-approval').isHidden());
+  assert.equal((await privateState(page)).closed,false);
 }
 try {
   assert.deepEqual(await vfs('cat','/cards/index.json'),[]);
@@ -180,34 +179,9 @@ try {
   let page = await startJourney(false);
   await fillTraveler(page);
   checkpoint('private seller selection and saved traveler fill preserve itinerary');
-  const cancelled = await pay(page,true);
-  await poll(()=>vfs('cat',`/checkout/requests/${cancelled}/status.json`),s=>s.state==='failed_before_release','cancelled payment');
+  await payRefused(page);
   assert.equal(charges,0);
-  await page.close();
-  page=await context.newPage();await page.goto(view+'/view');
-  await page.locator('#saved-card').waitFor();
-  const payment = await pay(page);
-  await poll(()=>Promise.resolve(charges),n=>n===1,'one charge');
-  assert(filled);
-  await poll(()=>privateState(page),s=>s.pages.some(p=>p.origin===bankOrigin)&&s.selected_page!==undefined,'bank popup');
-  await privateClick(page,70,45);
-  await poll(()=>vfs('cat',`/checkout/requests/${payment}/status.json`),s=>['paid','booked'].includes(s.state),'bank confirmation');
-  assert.equal((await privateState(page)).closed,false);
-  await page.screenshot({path:output+'.png'});
-  assert.equal(charges,1);
-  checkpoint('cancel and reopen preserve cart; saved-card payment and bank check submit once');
-  await page.locator('#finish').click();
-  await poll(()=>privateState(page),s=>s.closed,'close confirmed purchase');
-  page=await startJourney(true);await fillTraveler(page);
-  const interrupted=await pay(page);
-  await poll(()=>Promise.resolve(charges),n=>n===2,'second independent order');
-  await page.locator('#finish').click();
-  await poll(()=>vfs('cat',`/checkout/requests/${interrupted}/status.json`),s=>s.state==='uncertain','unknown outcome');
-  await browse({action:'open',url:merchantOrigin+'/seller'});
-  const retry=id();
-  await assert.rejects(vfs('write',`/checkout/requests/${retry}/in.json`,{card_id:'synthetic',agent_description:'Must refuse duplicate payment'}));
-  assert.equal(charges,2);
-  checkpoint('closing an interrupted payment preserves uncertainty and blocks duplicate');
+  checkpoint('saved card is never released into card fields outside a payment provider frame');
   writeFileSync(output,JSON.stringify({result:'passed',checks,syntheticCharges:charges},null,2));
 } catch (error) {
   writeFileSync(output,JSON.stringify({result:'failed',checks,error:error.message},null,2));
