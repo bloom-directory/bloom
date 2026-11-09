@@ -35,31 +35,19 @@ from the release it ships with.
 
 ## What the Guidance Covers
 
-`agent-guidance.md` ("Working with bloom") currently documents:
+Every session reads `agent-guidance.md`, so it holds only what most tasks
+need: where funds are (`holdings.json`) and what to infer when a request leaves
+something out; the authority model and where secret input belongs; account
+selection; the outbox stage/confirm loop, including the permission-denied
+confirm, `approval_challenge.json`, `ceremony_url` and the bound retry; error
+classes; what the owner sees when approving; policy updates, Sealed Approvals
+and paid HTTP; and feedback reporting.
 
-- mounting and the `bloom vfs ls`/`bloom vfs cat` facade;
-- the authority security model: reads, staging, and simulation remain
-  Machine-owned; signing uses Broker authorization and Signer-held keys; the
-  owner key is never handed to an agent or Machine;
-- the outbox stage/confirm flow;
-- pending EVM fee repair through `replace`, using a complete decimal-string
-  fee pair from the chain's mounted gas quote. IPC admits only those two
-  fields; the transaction engine preserves the call and nonce, requires
-  both caps to increase, and obtains fresh Broker authorization for the
-  replacement signing payload. The approval projection binds `retry_body`
-  and `retry_path` to that request;
-- paid HTTP under `/requests` (staging, `plan.md`, `confirm`, spend caps);
-- the mounted Sealed Approval lifecycle for the outbox confirm flow —
-  permission-denied confirm writes, `approval_challenge.json`,
-  `ceremony_url`, completed Broker approval, and retrying the bound action.
-  Solana chains dispatch through the identical
-  `wallets/<wallet>/0/chains/<chain>/outbox/...` mechanism (see
-  [`Solana Native Integration.md`](./Solana%20Native%20Integration.md)), so
-  this is no longer EVM-only;
-- discovery of installed Petal docs and route contracts;
-- optional feedback reporting through the Feedback Petal, including user opt-outs,
-  sanitization, and same-ID retries after an uncertain submission;
-- passkey policy-update custody and advisory `under_policy` semantics.
+Procedures most tasks never touch are served on demand under `docs/`:
+`README.md` (route tables), `examples.md` (command walkthroughs, contract
+deploys, local Anvil, EVM fee repair), and `wallets.md` (accounts, wallet
+creation, recovery, passkeys, delegated sessions, outbox recovery). A rule
+lives in one place; Petal-specific behavior belongs in that Petal's README.
 
 The Feedback Petal is part of the canonical default installation set. Root
 guidance allows an agent to submit one sanitized report for a distinct problem
