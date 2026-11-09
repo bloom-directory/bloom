@@ -61,6 +61,16 @@ registration because the first is waiting. Commands are in
 A localhost ceremony needs a browser on the Bloom host; an assigned HTTPS relay
 ceremony can use another device.
 
+Create a wallet only when the owner asks. `main`'s default policy, from the
+persona and Petals chosen at setup, is proposed only once every chosen Petal
+is installed: until then `bloom wallet default-policy main` names the missing
+ones and proposes nothing, and once they are installed it proposes the whole
+policy in one ceremony. `bloom wallet persona <wallet>
+<institutional|trader|degen>` replaces a wallet's policy and resets its Petal
+limits once the owner approves its ceremony, and starts only once every Petal
+it chooses is installed. Start one only when the owner asks, and forward its
+link like any other ceremony URL.
+
 ## Recovering a wallet
 
 To recover a wallet after losing its passkeys, write only its name to

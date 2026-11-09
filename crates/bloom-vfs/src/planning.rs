@@ -16,10 +16,15 @@ pub fn advisory_evm_policy(projection: &WalletProjection, chain: &str) -> Result
     }
 
     let mut policy = Policy::default();
+    // The any-recipient opt-in is not an address. Only
+    // `advisory_exact_evm_policy` reads it, keyed `evm-<chain id>`; copied
+    // here under a Bloom chain name it would opt in under a spelling Broker's
+    // sessions do not honour.
     for destination in canonical
         .allowed_destinations
         .iter()
         .filter(|destination| destination.chain.as_str() == chain)
+        .filter(|destination| destination.destination != bloom_proto::policy::ERC20_ANY_RECIPIENT)
     {
         policy
             .allowlists
@@ -42,8 +47,10 @@ pub fn advisory_evm_policy(projection: &WalletProjection, chain: &str) -> Result
 /// Reusable Petal planning must continue using `advisory_evm_policy`.
 ///
 /// The opt-in permits contract creation, which has no recipient address.
-/// The engine applies that exemption only to creation. All addressed
-/// transactions keep the canonical recipient allowlist.
+/// The engine applies that exemption only to creation. Addressed
+/// transactions keep the canonical recipient allowlist, except that an
+/// `erc20:any-recipient` entry for this chain lets the engine pass the
+/// wallet's own transfer of a curated ERC-20 token to any recipient.
 pub fn advisory_exact_evm_policy(
     projection: &WalletProjection,
     chain: &str,
@@ -56,6 +63,15 @@ pub fn advisory_exact_evm_policy(
         return Err("canonical Broker policy projection names a different wallet".into());
     }
     let mut policy = advisory_evm_policy(projection, chain)?;
+    if canonical.allowed_destinations.iter().any(|d| {
+        d.chain.as_str() == format!("evm-{chain_id}")
+            && d.destination == bloom_proto::policy::ERC20_ANY_RECIPIENT
+    }) {
+        policy
+            .allowlists
+            .recipients
+            .insert(bloom_proto::policy::ERC20_ANY_RECIPIENT.into());
+    }
     if canonical.allowed_destinations.iter().any(|destination| {
         destination.chain.as_str() == format!("evm-{chain_id}")
             && destination.destination == "exact"
@@ -142,6 +158,43 @@ mod tests {
             freshness: ProjectionFreshness::Fresh,
             verification: ProjectionVerification::AuthenticatedBroker,
         }
+    }
+
+    #[test]
+    fn a_petal_destination_entry_reaches_the_planner_unchanged() {
+        // `petal:<name>` is not an address: the planner passes it through and
+        // the policy engine matches it against the Petal that staged the
+        // transaction. It must also stop the deny-all sentinel being added.
+        let policy = advisory_evm_policy(
+            &projection(vec![PolicyDestination {
+                chain: Token::new("arbitrum").unwrap(),
+                destination: "petal:near-intents".into(),
+            }]),
+            "arbitrum",
+        )
+        .unwrap();
+        assert!(policy.allowlists.recipients.contains("petal:near-intents"));
+        assert!(
+            !policy
+                .allowlists
+                .recipients
+                .contains("__broker_policy_denies_all_destinations__")
+        );
+        // It is scoped to its chain like any other destination.
+        let elsewhere = advisory_evm_policy(
+            &projection(vec![PolicyDestination {
+                chain: Token::new("arbitrum").unwrap(),
+                destination: "petal:near-intents".into(),
+            }]),
+            "base",
+        )
+        .unwrap();
+        assert!(
+            elsewhere
+                .allowlists
+                .recipients
+                .contains("__broker_policy_denies_all_destinations__")
+        );
     }
 
     #[test]
@@ -244,6 +297,85 @@ mod tests {
                 .allowlists
                 .recipients
                 .contains("__broker_policy_denies_all_destinations__")
+        );
+    }
+    #[test]
+    fn any_erc20_recipient_opt_in_is_native_only_and_chain_bound() {
+        let p = projection(vec![PolicyDestination {
+            chain: Token::new("evm-1").unwrap(),
+            destination: bloom_proto::policy::ERC20_ANY_RECIPIENT.into(),
+        }]);
+        let marker = bloom_proto::policy::ERC20_ANY_RECIPIENT;
+        assert!(
+            advisory_exact_evm_policy(&p, "ethereum", 1)
+                .unwrap()
+                .allowlists
+                .recipients
+                .contains(marker)
+        );
+        assert!(
+            !advisory_exact_evm_policy(&p, "polygon", 137)
+                .unwrap()
+                .allowlists
+                .recipients
+                .contains(marker)
+        );
+        assert!(
+            !advisory_evm_policy(&p, "ethereum")
+                .unwrap()
+                .allowlists
+                .recipients
+                .contains(marker)
+        );
+    }
+
+    /// The opt-in is keyed `evm-<chain id>`, the spelling Broker's reviewed
+    /// sessions honour. The same string under a Bloom chain name is not an
+    /// address and opts in to nothing: a policy whose only entry on the chain
+    /// is that string still denies every recipient.
+    #[test]
+    fn a_marker_under_a_bloom_chain_name_opts_in_to_nothing() {
+        let marker = bloom_proto::policy::ERC20_ANY_RECIPIENT;
+        let p = projection(vec![PolicyDestination {
+            chain: Token::new("ethereum").unwrap(),
+            destination: marker.into(),
+        }]);
+        for policy in [
+            advisory_exact_evm_policy(&p, "ethereum", 1).unwrap(),
+            advisory_evm_policy(&p, "ethereum").unwrap(),
+        ] {
+            assert!(!policy.allowlists.recipients.contains(marker));
+            assert!(
+                policy
+                    .allowlists
+                    .recipients
+                    .contains("__broker_policy_denies_all_destinations__")
+            );
+        }
+    }
+
+    /// A Bloom chain may be named like another chain's key. The opt-in
+    /// follows the numeric chain id being planned, never a matching name.
+    #[test]
+    fn the_opt_in_follows_the_chain_id_not_a_matching_chain_name() {
+        let marker = bloom_proto::policy::ERC20_ANY_RECIPIENT;
+        let p = projection(vec![PolicyDestination {
+            chain: Token::new("evm-137").unwrap(),
+            destination: marker.into(),
+        }]);
+        assert!(
+            !advisory_exact_evm_policy(&p, "evm-137", 1)
+                .unwrap()
+                .allowlists
+                .recipients
+                .contains(marker)
+        );
+        assert!(
+            advisory_exact_evm_policy(&p, "evm-137", 137)
+                .unwrap()
+                .allowlists
+                .recipients
+                .contains(marker)
         );
     }
 }

@@ -789,6 +789,30 @@ pub enum MachineCommand {
     WalletPolicyCommit {
         operation_id: String,
     },
+    /// Propose the Petals chosen during setup for a wallet through its policy
+    /// operation, and report where that default policy stands.
+    WalletDefaultPolicy {
+        name: String,
+        /// Set only by a flow that has just recorded the owner's Petal choice,
+        /// such as browser onboarding. It proposes that choice even after the
+        /// wallet's policy has changed since creation; without it nothing is
+        /// proposed then, so a stale setup choice never restores what the
+        /// owner removed.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        owner_just_chose: bool,
+    },
+    /// Switch a wallet's persona: a fresh start for that wallet. Machine holds
+    /// the new setup and proposes it as a replacement for the wallet's
+    /// policy; once the owner approves, it saves the setup and resets each
+    /// chosen Petal's limits to the persona's. `WalletDefaultPolicy` resumes
+    /// a switch waiting for its ceremony.
+    WalletPersona {
+        name: String,
+        persona: bloom_proto::persona::PersonaPreset,
+        /// The Petals the owner chose for the wallet, with their values.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        petals: BTreeMap<String, bloom_proto::config::PetalSetupConfig>,
+    },
     WalletOutboxCancel {
         wallet: String,
         chain: String,

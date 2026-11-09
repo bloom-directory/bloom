@@ -55,6 +55,12 @@ it does not create a local wallet. Follow
 `wallets/registrations/<petname>/status.json`. Details are in
 `docs/wallets.md`.
 
+Create a wallet or switch a persona (`bloom wallet persona`) only when the
+owner asks. Either can open a policy ceremony: give the owner its full link
+like any other ceremony URL. If a command says chosen Petals are not installed
+yet, nothing was proposed: wait until `docs/petals.md` lists them, then run
+the command it names; if one stays missing, tell the owner to restart Bloom.
+
 ## The transaction loop
 
 For native transfers and Petal actions that project into the outbox:
@@ -110,6 +116,15 @@ Check its `path` and `at_ms` match your write; no record means no
 information, not success. A Petal write denied with no ceremony link: report
 the route and error rather than reinstalling, switching accounts or dropping
 fields.
+
+A Petal operation that needs a policy change answers
+`POLICY_APPROVAL_REQUIRED` with a `ceremony_url` and status path. If that
+ceremony expires unapproved, retry the operation: Machine cancels the expired
+ceremony and answers with a new `ceremony_url`. Never give the owner an
+expired URL. If the answer says another policy change is waiting, such as a
+persona switch, its link is for that change, which does not allow the
+operation: Broker opens one ceremony per wallet at a time, so tell the owner
+to approve or refuse it, then retry.
 
 ## What the owner sees when approving
 
