@@ -65,10 +65,13 @@ For native transfers and Petal actions that project into the outbox:
    never by wildcard, sequence number, `latest` or position.
 3. Write `confirm` to that entry's `confirm` file.
 4. If confirm is denied, read `policy_check.json` and `approval_challenge.json`.
-   A hard policy deny ends the action: report the refusal and stop. Only an
-   awaiting approval challenge calls for a ceremony: check its wallet, action,
-   intent and expiry, and
-   give its `ceremony_url` to the human. Poll the challenge; when `state` is
+   A hard policy deny ends execution: if your own unsigned entry remains
+   pending, write `cancel` to its `confirm` file and verify it left `pending/`
+   before reporting the refusal. This cleanup needs no additional approval.
+   For a prepare-only request, keep the draft and report the deny without
+   confirming it. Only an awaiting approval challenge calls for a ceremony:
+   check its wallet, action, intent and expiry, and give its `ceremony_url`
+   to the human. Poll the challenge; when `state` is
    `active`, write its exact `retry_body` (`confirm` when omitted) to its
    `retry_path`. The approval does not broadcast on its own. For `expired`,
    `cancelled` or `refused`, tell the human.
@@ -99,7 +102,7 @@ An error alone does not show whether an earlier operation completed.
 - **Permission denied**: on a confirm, read `approval_challenge.json`.
   Read-only targets also deny.
 - **Operation not permitted**: policy or a safety check refused it. Read
-  `policy_check.json`; report the refusal and stop. Do not change policy,
+  `policy_check.json`; follow the hard-deny cleanup above, then stop. Do not change policy,
   switch accounts, remount a read-only route or try another interface to get
   around it. A request to send funds does not authorize loosening policy.
 - **"signing outcome unknown; it may already be signed"**: retry the identical
