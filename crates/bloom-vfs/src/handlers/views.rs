@@ -2478,21 +2478,16 @@ fn explorer_address_link(chain_id: Option<u64>, address: &str) -> String {
 /// environment; callers must not label the remaining networks as mainnets.
 fn is_test_network(chain: &str) -> bool {
     let name = chain.to_ascii_lowercase();
-    [
-        "devnet",
-        "testnet",
-        "sepolia",
-        "holesky",
-        "anvil",
-        "localhost",
-        "localnet",
-    ]
-    .iter()
-    .any(|part| name.contains(part))
+    ["devnet", "testnet", "sepolia", "holesky", "anvil", "local"]
+        .iter()
+        .any(|part| name.contains(part))
 }
 
 fn is_test_chain_id(id: u64) -> bool {
-    matches!(id, 11155111 | 17000 | 31337 | 1337 | 84532 | 421614 | 42431)
+    matches!(
+        id,
+        11155111 | 17000 | 31337 | 1337 | 84532 | 11155420 | 421614 | 42431
+    )
 }
 
 fn fresh_quote(timestamp: u64, now: u64) -> bool {
@@ -3853,6 +3848,7 @@ mod tests {
             "sepolia",
             "holesky",
             "anvil",
+            "local",
             "localhost",
             "Base-Devnet",
         ] {
