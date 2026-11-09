@@ -769,34 +769,34 @@ pub(crate) mod tests {
             let mut bank_handled = false;
             for attempt in 0..60 {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                if let Some(action) = bank_action {
-                    if !bank_handled {
-                        for frame in tab
-                            .cdp
-                            .contexts(&tab.session, "bloom-test-bank")
+                if let Some(action) = bank_action
+                    && !bank_handled
+                {
+                    for frame in tab
+                        .cdp
+                        .contexts(&tab.session, "bloom-test-bank")
+                        .await
+                        .unwrap_or_default()
+                    {
+                        if !url::Url::parse(&frame.url).is_ok_and(|url| {
+                            url.host_str()
+                                .is_some_and(|host| host.ends_with(".stripe.com"))
+                        }) {
+                            continue;
+                        }
+                        let expression = format!(
+                            "(()=>{{const b=[...document.querySelectorAll('button,input[type=submit]')].find(e=>/^{action}|^{alternate}/i.test((e.innerText||e.value).trim()));if(!b)return false;b.click();return true;}})()",
+                            alternate = if action == "complete" {
+                                "authorize"
+                            } else {
+                                "fail"
+                            }
+                        );
+                        if evaluate(&tab, &frame.session, frame.world, expression)
                             .await
-                            .unwrap_or_default()
+                            .is_ok_and(|v| v == true)
                         {
-                            if !url::Url::parse(&frame.url).is_ok_and(|url| {
-                                url.host_str()
-                                    .is_some_and(|host| host.ends_with(".stripe.com"))
-                            }) {
-                                continue;
-                            }
-                            let expression = format!(
-                                "(()=>{{const b=[...document.querySelectorAll('button,input[type=submit]')].find(e=>/^{action}|^{alternate}/i.test((e.innerText||e.value).trim()));if(!b)return false;b.click();return true;}})()",
-                                alternate = if action == "complete" {
-                                    "authorize"
-                                } else {
-                                    "fail"
-                                }
-                            );
-                            if evaluate(&tab, &frame.session, frame.world, expression)
-                                .await
-                                .is_ok_and(|v| v == true)
-                            {
-                                bank_handled = true;
-                            }
+                            bank_handled = true;
                         }
                     }
                 }
@@ -1117,42 +1117,42 @@ pub(crate) mod tests {
             let mut bank_handled = false;
             for attempt in 0..60 {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                if let Some(action) = bank_action {
-                    if !bank_handled {
-                        for frame in tab
-                            .cdp
-                            .contexts(&tab.session, "bloom-test-bank")
-                            .await
-                            .unwrap_or_default()
-                        {
-                            let origin = url::Url::parse(&frame.url)
-                                .unwrap()
-                                .origin()
-                                .ascii_serialization();
-                            if !origin.ends_with(".stripe.com") {
-                                continue;
-                            }
-                            if attempt == 5 {
-                                let diagnostic = evaluate(&tab, &frame.session, frame.world, "({buttons:document.querySelectorAll('button,input[type=submit]').length,iframes:document.querySelectorAll('iframe').length,complete:[...document.querySelectorAll('button,input[type=submit]')].some(e=>/complete|authorize/i.test(e.innerText||e.value)),fail:[...document.querySelectorAll('button,input[type=submit]')].some(e=>/fail/i.test(e.innerText||e.value))})".into()).await.unwrap();
-                                eprintln!("Bank frame {origin}: {diagnostic}");
-                            }
-                            let expression = format!(
-                                r#"(()=>{{
+                if let Some(action) = bank_action
+                    && !bank_handled
+                {
+                    for frame in tab
+                        .cdp
+                        .contexts(&tab.session, "bloom-test-bank")
+                        .await
+                        .unwrap_or_default()
+                    {
+                        let origin = url::Url::parse(&frame.url)
+                            .unwrap()
+                            .origin()
+                            .ascii_serialization();
+                        if !origin.ends_with(".stripe.com") {
+                            continue;
+                        }
+                        if attempt == 5 {
+                            let diagnostic = evaluate(&tab, &frame.session, frame.world, "({buttons:document.querySelectorAll('button,input[type=submit]').length,iframes:document.querySelectorAll('iframe').length,complete:[...document.querySelectorAll('button,input[type=submit]')].some(e=>/complete|authorize/i.test(e.innerText||e.value)),fail:[...document.querySelectorAll('button,input[type=submit]')].some(e=>/fail/i.test(e.innerText||e.value))})".into()).await.unwrap();
+                            eprintln!("Bank frame {origin}: {diagnostic}");
+                        }
+                        let expression = format!(
+                            r#"(()=>{{
                           const button=[...document.querySelectorAll('button,input[type=submit]')].find(e=>/^{action}|^{alternate}/i.test((e.innerText||e.value).trim()));
                           if(!button)return false;button.click();return true;
                         }})()"#,
-                                alternate = if action == "complete" {
-                                    "authorize"
-                                } else {
-                                    "fail"
-                                }
-                            );
-                            if evaluate(&tab, &frame.session, frame.world, expression)
-                                .await
-                                .is_ok_and(|value| value == true)
-                            {
-                                bank_handled = true;
+                            alternate = if action == "complete" {
+                                "authorize"
+                            } else {
+                                "fail"
                             }
+                        );
+                        if evaluate(&tab, &frame.session, frame.world, expression)
+                            .await
+                            .is_ok_and(|value| value == true)
+                        {
+                            bank_handled = true;
                         }
                     }
                 }

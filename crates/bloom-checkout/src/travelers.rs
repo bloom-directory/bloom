@@ -289,10 +289,10 @@ impl TravelerDiscovery {
         let mut values = values.clone();
         if values.contains_key("phone") {
             for field in derived {
-                if !values.contains_key(field) {
-                    if let Some(part) = derived_traveler_value(&values, field) {
-                        values.insert(field.to_owned(), part);
-                    }
+                if !values.contains_key(field)
+                    && let Some(part) = derived_traveler_value(&values, field)
+                {
+                    values.insert(field.to_owned(), part);
                 }
             }
         }

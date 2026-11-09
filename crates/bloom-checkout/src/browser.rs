@@ -971,14 +971,14 @@ fn accessibility_text(tree: &Value) -> Result<String> {
         if !hidden.insert(id.clone()) {
             continue;
         }
-        if let Some(node) = nodes.iter().find(|n| n["nodeId"] == id) {
-            if let Some(children) = node["childIds"].as_array() {
-                queue.extend(
-                    children
-                        .iter()
-                        .filter_map(|v| v.as_str().map(str::to_owned)),
-                );
-            }
+        if let Some(node) = nodes.iter().find(|n| n["nodeId"] == id)
+            && let Some(children) = node["childIds"].as_array()
+        {
+            queue.extend(
+                children
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned)),
+            );
         }
     }
     // Text nodes repeat the name of the node that contains them.
@@ -1431,14 +1431,14 @@ mod tests {
             .unwrap();
         let snapshot = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if let Ok(snapshot) = browser.browse(BrowseRequest::Snapshot).await {
-                    if snapshot["elements"].as_array().is_some_and(|elements| {
+                if let Ok(snapshot) = browser.browse(BrowseRequest::Snapshot).await
+                    && snapshot["elements"].as_array().is_some_and(|elements| {
                         elements
                             .iter()
                             .any(|e| e["frame_origin"] != origin.as_str() && e["role"] == "input")
-                    }) {
-                        break snapshot;
-                    }
+                    })
+                {
+                    break snapshot;
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
@@ -1648,14 +1648,14 @@ mod tests {
             browser.browse(BrowseRequest::Open { url }).await.unwrap();
             let snapshot = tokio::time::timeout(std::time::Duration::from_secs(20), async {
                 loop {
-                    if let Ok(snapshot) = browser.browse(BrowseRequest::Snapshot).await {
-                        if snapshot["elements"].as_array().is_some_and(|elements| {
+                    if let Ok(snapshot) = browser.browse(BrowseRequest::Snapshot).await
+                        && snapshot["elements"].as_array().is_some_and(|elements| {
                             elements
                                 .iter()
                                 .any(|e| e["role"] == "input" || e["role"] == "select")
-                        }) {
-                            break snapshot;
-                        }
+                        })
+                    {
+                        break snapshot;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
@@ -1827,16 +1827,15 @@ mod tests {
             .unwrap();
         let popup = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if let Ok(snapshot) = browser.browse(BrowseRequest::Snapshot).await {
-                    if snapshot["url"]
+                if let Ok(snapshot) = browser.browse(BrowseRequest::Snapshot).await
+                    && snapshot["url"]
                         .as_str()
                         .is_some_and(|url| url.ends_with("/flight"))
-                        && snapshot["text"]
-                            .as_str()
-                            .is_some_and(|text| text.contains("Flight AR1554"))
-                    {
-                        break snapshot;
-                    }
+                    && snapshot["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("Flight AR1554"))
+                {
+                    break snapshot;
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }

@@ -97,10 +97,9 @@ impl CheckoutService {
             .lock()
             .as_ref()
             .filter(|s| s.parent == checkout.operation_id && s.payment)
+            && self.store.get(&previous.operation)?.state != "failed_before_release"
         {
-            if self.store.get(&previous.operation)?.state != "failed_before_release" {
-                bail!("An earlier payment may have started; do not pay again");
-            }
+            bail!("An earlier payment may have started; do not pay again");
         }
         let parent = checkout.operation_id.clone();
         let mut tab = checkout.tab.clone();

@@ -345,10 +345,10 @@ impl Cdp {
                                         });
                                     }
                                 }
-                                if let Some(id) = value["id"].as_u64() {
-                                    if let Some(reply) = replies.lock().remove(&id) {
-                                        let _ = reply.send(Ok(value));
-                                    }
+                                if let Some(id) = value["id"].as_u64()
+                                    && let Some(reply) = replies.lock().remove(&id)
+                                {
+                                    let _ = reply.send(Ok(value));
                                 }
                             }
                             frame.clear();

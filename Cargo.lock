@@ -2443,7 +2443,7 @@ dependencies = [
 [[package]]
 name = "bloom-broker-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=ae61e129cf8e582f5feb823b01c603dfea0ebbd0#ae61e129cf8e582f5feb823b01c603dfea0ebbd0"
+source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=e324635cf5453d6e8438e6349a8b79a5f8c4b56b#e324635cf5453d6e8438e6349a8b79a5f8c4b56b"
 dependencies = [
  "bech32",
  "bloom-rpc-wire",

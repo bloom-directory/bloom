@@ -773,12 +773,13 @@ impl CheckoutService {
                 .context("Unlock a saved traveler first")?
                 .clone(),
         };
-        if let Some((saved_context, saved_id)) = self.journey_filler.lock().await.clone() {
-            if saved_context == context && saved_id != selected_id {
-                bail!(
-                    "fill_traveler already filled {saved_id} on this booking; use type_traveler with the person's id for each field."
-                );
-            }
+        if let Some((saved_context, saved_id)) = self.journey_filler.lock().await.clone()
+            && saved_context == context
+            && saved_id != selected_id
+        {
+            bail!(
+                "fill_traveler already filled {saved_id} on this booking; use type_traveler with the person's id for each field."
+            );
         }
         if let Some(phone) = values.get("phone").and_then(|p| formatted_phone(p)) {
             values.insert("phone".into(), zeroize::Zeroizing::new(phone));
@@ -1040,13 +1041,13 @@ impl CheckoutService {
                     ) => Some("failed_before_release"),
                     _ => None,
                 };
-                if let Some(state) = state {
-                    if let Err(error) = store.finish_restart_cancellation(&id, state) {
-                        eprintln!(
-                            "cannot record interrupted checkout reconciliation: {}",
-                            loggable(&error)
-                        );
-                    }
+                if let Some(state) = state
+                    && let Err(error) = store.finish_restart_cancellation(&id, state)
+                {
+                    eprintln!(
+                        "cannot record interrupted checkout reconciliation: {}",
+                        loggable(&error)
+                    );
                 }
             }
             if store.restart_cancellations()?.is_empty() {
@@ -1220,12 +1221,11 @@ impl CheckoutService {
                     Mode::Site => "site",
                     Mode::TakeOver => "take_over",
                 };
-                if matches!(mode, Mode::Card | Mode::Site) {
-                    if let Ok((_, origin)) = self.browser.shopping_scope().await {
-                        if let Some(open) = self.store.unresolved(&origin)? {
-                            return Err(Refusal::Blocked(open).into());
-                        }
-                    }
+                if matches!(mode, Mode::Card | Mode::Site)
+                    && let Ok((_, origin)) = self.browser.shopping_scope().await
+                    && let Some(open) = self.store.unresolved(&origin)?
+                {
+                    return Err(Refusal::Blocked(open).into());
                 }
                 if self.store.get(&operation_id).is_ok() {
                     return Err(Refusal::IdUsed.into());
@@ -1709,10 +1709,9 @@ impl CheckoutService {
             for info in infos {
                 if info["type"] == "page"
                     && info["openerId"].as_str().is_some_and(|p| owned.contains(p))
+                    && let Some(id) = info["targetId"].as_str()
                 {
-                    if let Some(id) = info["targetId"].as_str() {
-                        owned.insert(id.to_owned());
-                    }
+                    owned.insert(id.to_owned());
                 }
             }
             if owned.len() == count {
