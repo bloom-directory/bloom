@@ -584,15 +584,17 @@ impl IpcOperationContext {
         // Take the Petal mutation lock in turn, as listing Petals and MCP
         // reads do: an install that only tried it could wait forever behind
         // readers that hold it back to back. Then a waiting install queues,
-        // briefly, for the store's permit: Petal calls already running
-        // finish, and calls starting meanwhile wait behind it for at most
-        // `activation_wait`.
+        // briefly, for the permit to change this Petal: its calls already
+        // running finish, and its calls starting meanwhile wait behind it
+        // for at most `activation_wait`. Other Petals' calls are unaffected.
         let _mutation = match &self.petal_mutation {
             Some(mutation) => Some(self.lock_petal_mutation(mutation)?),
             None => None,
         };
         let permit = match self.activation_wait {
-            Some(limit) => Some(store.activation_permit_waiting(limit, || self.is_cancelled())?),
+            Some(limit) => {
+                Some(store.activation_permit_waiting(&name, limit, || self.is_cancelled())?)
+            }
             None => None,
         };
         if self.is_cancelled() {
@@ -2478,7 +2480,7 @@ allowed = ["bloom:vfs.read"]
             })
         };
 
-        let running = runner.store().execution_guard().await;
+        let running = runner.store().execution_guard("echo").await;
         assert!(matches!(
             commit(context.clone()).await.unwrap(),
             Err(PetalError::Busy)
@@ -2488,7 +2490,7 @@ allowed = ["bloom:vfs.read"]
         let task = commit(context.waiting_to_activate(std::time::Duration::from_millis(300)));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let started = std::time::Instant::now();
-        drop(runner.store().execution_guard().await);
+        drop(runner.store().execution_guard("echo").await);
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         assert!(matches!(task.await.unwrap(), Err(PetalError::Busy)));
         assert!(
@@ -2517,7 +2519,7 @@ allowed = ["bloom:vfs.read"]
         // A call starting now waits behind the queued install.
         let store = runner.store().clone();
         let later = tokio::spawn(async move {
-            let _call = store.execution_guard().await;
+            let _call = store.execution_guard("echo").await;
             store.resolve_petal_owner("echo").unwrap()
         });
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -2532,6 +2534,46 @@ allowed = ["bloom:vfs.read"]
             later.await.unwrap().is_some(),
             "the later call ran before the install activated"
         );
+    }
+
+    /// Another Petal's calls neither hold up an install nor wait behind one:
+    /// a plain install goes in while another Petal's code runs, and with an
+    /// install queued behind this Petal's call, another Petal's call starts
+    /// at once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn other_petals_calls_neither_block_nor_wait_on_an_install() {
+        use bloom_petals::package::PreparedPetalPackage;
+        let dir = tempfile::tempdir().unwrap();
+        let runner = echo_runner(dir.path());
+        let package = echo_package(dir.path());
+        let mut context = IpcOperationContext::detached();
+        context.petal_mutation = Some(Arc::new(tokio::sync::Mutex::new(())));
+        let commit = |context: IpcOperationContext| {
+            let (runner, package) = (runner.clone(), package.clone());
+            tokio::task::spawn_blocking(move || {
+                context
+                    .commit_petal_package(
+                        &runner,
+                        PreparedPetalPackage::from_dir(&package).unwrap(),
+                        None,
+                        None,
+                    )
+                    .map(|_| ())
+            })
+        };
+        let other = runner.store().execution_guard("polymarket").await;
+        commit(context.clone()).await.unwrap().unwrap();
+        drop(other);
+
+        let running = runner.store().execution_guard("echo").await;
+        let queued = commit(context.waiting_to_activate(std::time::Duration::from_secs(30)));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let started = std::time::Instant::now();
+        drop(runner.store().execution_guard("polymarket").await);
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        assert!(!queued.is_finished());
+        drop(running);
+        queued.await.unwrap().unwrap();
     }
 
     /// Callers that take the Petal mutation lock and then run Petal code, as
@@ -2555,7 +2597,7 @@ allowed = ["bloom:vfs.read"]
                 readers.push(tokio::spawn(async move {
                     while !stop.load(Ordering::SeqCst) {
                         let _held = mutation.lock().await;
-                        let _call = store.execution_guard().await;
+                        let _call = store.execution_guard("echo").await;
                         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                     }
                 }));

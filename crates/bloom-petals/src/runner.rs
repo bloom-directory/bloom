@@ -365,7 +365,7 @@ impl PetalRunner {
     /// [`crate::store::PetalStore::activation_permit_waiting`].
     pub fn install_staged_petal_package_permitted<F>(
         &self,
-        permit: crate::store::ActivationPermit<'_>,
+        permit: crate::store::ActivationPermit,
         staged: crate::store::StagedPetalPackage,
         source: Option<crate::meta::PetalSourceProvenance>,
         commit_guard: F,
@@ -786,7 +786,7 @@ impl PetalRunner {
         trusted_params: &[(String, String)],
         account: Option<&AccountPetalContext>,
     ) -> Result<DispatchOutput, PetalError> {
-        let execution = self.store.execution_guard().await;
+        let execution = self.store.execution_guard(mount).await;
         self.dispatch_petal_route_with_execution_permit(
             mount,
             request,
@@ -811,7 +811,7 @@ impl PetalRunner {
         opts: RunOptions,
         trusted_params: &[(String, String)],
         account: Option<&AccountPetalContext>,
-        _execution: &tokio::sync::RwLockReadGuard<'_, ()>,
+        _execution: &crate::store::ExecutionGuard,
     ) -> Result<DispatchOutput, PetalError> {
         if let Some((name, _)) = request
             .ctx
@@ -1659,8 +1659,8 @@ namespaces = ["settings"]
         let data =
             crate::private_store::PrivateStore::open(runner.store().private_data_root()).unwrap();
         // This is the same shared permit dispatch holds for the guest lifetime.
-        let active = runner.store().execution_guard().await;
-        let concurrent = runner.store().execution_guard().await;
+        let active = runner.store().execution_guard("echo").await;
+        let concurrent = runner.store().execution_guard("echo").await;
         data.put(&predecessor, "settings/value", b"before", false)
             .unwrap();
         // Typed, so Machine can try a refused install again.

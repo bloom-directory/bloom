@@ -25,8 +25,9 @@ pub(crate) enum ProvisioningOutcome {
     /// Refused because other Petal code was running when this one would have
     /// activated; [`retry_pending`] tries it again while Machine runs.
     Busy(String),
-    /// The release could not be downloaded or staged; [`retry_pending`]
-    /// tries it again up to [`DOWNLOAD_RETRIES`] times.
+    /// A release file could not be downloaded; [`retry_pending`] tries it
+    /// again up to [`DOWNLOAD_RETRIES`] times. A failed check of what was
+    /// downloaded is [`Self::Failed`].
     DownloadFailed(String),
     Failed(String),
 }
@@ -86,7 +87,7 @@ pub(crate) fn provision_with(
                 }
             }
             let prepared = acquire(daemon, &entry, context)
-                .context(Download(format!("download default {name}")))?;
+                .with_context(|| format!("download default {name}"))?;
             let updated = expected_owner.is_some();
             prepared.commit(daemon, context, Some(expected_owner))?;
             Ok(if updated {
@@ -102,7 +103,11 @@ pub(crate) fn provision_with(
             Err(error) if context.is_cancelled() => {
                 ProvisioningOutcome::Failed(format!("{error:#}"))
             }
-            Err(error) if error.downcast_ref::<Download>().is_some() => {
+            Err(error)
+                if error
+                    .downcast_ref::<github_source::DownloadFailed>()
+                    .is_some() =>
+            {
                 ProvisioningOutcome::DownloadFailed(format!("{error:#}"))
             }
             Err(error) => ProvisioningOutcome::Failed(with_restart_advice(&format!("{error:#}"))),
@@ -130,22 +135,11 @@ pub(crate) fn provision_with(
     results
 }
 
-/// Context marking a failure to download or stage a release, which a later
-/// attempt can get past.
-#[derive(Debug)]
-struct Download(String);
-
-impl std::fmt::Display for Download {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
 /// Machine installs the catalog when it starts. `bloom init` and a repository
 /// install are no help on a running home: the first cannot open it, and the
 /// second builds a different package from the one the catalog pins.
 fn with_restart_advice(error: &str) -> String {
-    format!("{error}; restart Bloom to try again")
+    format!("{}; restart Bloom to try again", error.trim_end())
 }
 
 /// Whether `error` is a package change refused because Petal code was
@@ -428,23 +422,37 @@ mod tests {
         );
     }
 
-    /// A download failure is marked as one, under the attempt's context, and
-    /// gives no restart advice before its retries.
+    /// A failed download is marked for retry under the attempt's context,
+    /// with no restart advice yet; a failed check of what was downloaded,
+    /// which another attempt cannot change, fails at once with it.
     #[test]
-    fn a_failed_download_is_reported_for_retry() {
+    fn only_a_failed_download_is_reported_for_retry() {
         let home = tempfile::tempdir().unwrap();
         let daemon = Daemon::from_home(bloom_proto::HomeDir::at(home.path())).unwrap();
-        let results = provision_with(
-            &daemon,
-            &IpcOperationContext::detached(),
-            &["enso"],
-            |name| github_source::preinstalled_petal(name).copied(),
-            |_, _, _| bail!("offline"),
+        let attempt = |error: fn() -> anyhow::Error| {
+            provision_with(
+                &daemon,
+                &IpcOperationContext::detached(),
+                &["enso"],
+                |name| github_source::preinstalled_petal(name).copied(),
+                |_, _, _| Err(error()),
+            )
+            .remove(0)
+            .outcome
+        };
+        assert_eq!(
+            attempt(|| anyhow!("curl failed: offline")
+                .context(github_source::DownloadFailed::of("https://example.test/enso.tar.gz"))),
+            ProvisioningOutcome::DownloadFailed(
+                "download default enso: download https://example.test/enso.tar.gz: curl failed: offline"
+                    .into()
+            )
         );
-        assert!(
-            matches!(&results[0].outcome,
-                ProvisioningOutcome::DownloadFailed(message) if message == "download default enso: offline"),
-            "{results:?}"
+        assert_eq!(
+            attempt(|| anyhow!("checksum mismatch\n")),
+            ProvisioningOutcome::Failed(
+                "download default enso: checksum mismatch; restart Bloom to try again".into()
+            )
         );
     }
 
@@ -500,7 +508,8 @@ mod tests {
             );
             assert_eq!(results.len(), 5);
             assert!(results.iter().all(|result| matches!(&result.outcome,
-                ProvisioningOutcome::DownloadFailed(message) if message.contains("download default"))));
+                ProvisioningOutcome::Failed(message) if message.contains("download default")
+                    && message.ends_with("restart Bloom to try again"))));
         }
     }
 }

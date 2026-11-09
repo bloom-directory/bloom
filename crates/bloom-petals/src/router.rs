@@ -441,7 +441,7 @@ impl PetalRouter {
         path: String,
         body: Vec<u8>,
     ) -> Result<DispatchResponse, HandlerError> {
-        let execution = self.runner.store().execution_guard().await;
+        let execution = self.runner.store().execution_guard(mount).await;
         let matched = self
             .runner
             .petal_route(mount, op, &path)
@@ -604,7 +604,7 @@ impl PetalRouter {
         path: String,
         body: Vec<u8>,
         account: &AccountPetalContext,
-        execution: &tokio::sync::RwLockReadGuard<'_, ()>,
+        execution: &crate::store::ExecutionGuard,
     ) -> Result<DispatchResponse, HandlerError> {
         let trusted = vec![
             ("bloom.wallet".to_owned(), account.wallet.clone()),
@@ -633,7 +633,7 @@ impl PetalRouter {
         trusted_params: &[(String, String)],
         account_wallet: Option<String>,
         account: Option<&AccountPetalContext>,
-        execution: &tokio::sync::RwLockReadGuard<'_, ()>,
+        execution: &crate::store::ExecutionGuard,
     ) -> Result<DispatchResponse, HandlerError> {
         // Lookup, list, and ordinary reads are filesystem observations, not
         // security effects. Auditing them both misstates the event stream and
@@ -877,7 +877,7 @@ impl Handler for PetalRouter {
         }
         let _held = self.write_locks.exclusive(mount).await?;
         let stored = {
-            let _execution = self.runner.store().execution_guard().await;
+            let _execution = self.runner.store().execution_guard(mount).await;
             let account = self.write_account(mount, &rest).await?;
             self.runner
                 .petal_store_has(mount, &rest, account.as_ref(), key)

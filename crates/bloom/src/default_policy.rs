@@ -1783,6 +1783,11 @@ struct PendingSwitch {
     setup: WalletSetup,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     operation_id: Option<String>,
+    /// The chosen Petals that proposal allows, recorded when it was made: a
+    /// Petal uninstalled before then is left out of it, and one uninstalled
+    /// since is still in it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proposed: Option<Vec<String>>,
 }
 
 fn pending_switch_path(home: &std::path::Path, wallet: &str) -> std::path::PathBuf {
@@ -2038,6 +2043,7 @@ pub(crate) async fn advance_default_policy(
                     &PendingSwitch {
                         setup: switch.setup.clone(),
                         operation_id: Some(pending.operation_id.as_str().to_owned()),
+                        proposed: Some(request.petals.clone()),
                     },
                 )?;
             }
@@ -2167,16 +2173,8 @@ pub(crate) async fn advance_default_policy(
                     ControlFlow::Continue(false) => {}
                 }
             }
-            // A switch is proposed only with every chosen Petal installed, so
-            // its own ceremony proposes them all, even one uninstalled since.
-            let (petals, not_installed) = if switch_own {
-                let mut proposed = request.clone();
-                proposed.petals.append(&mut proposed.not_installed);
-                proposed.petals.sort();
-                (proposed.allowed(), Vec::new())
-            } else {
-                (request.allowed(), request.not_installed.clone())
-            };
+            let (petals, not_installed) =
+                awaiting_listing(&request, switch.as_ref().filter(|_| switch_own));
             DefaultPolicyStatus::AwaitingOwner {
                 operation_id: pending.operation_id.as_str().to_owned(),
                 ceremony_url: pending
@@ -2193,6 +2191,33 @@ pub(crate) async fn advance_default_policy(
             }
         }
     })
+}
+
+/// What a policy change waiting for the owner allows, as they are told, and
+/// the chosen Petals it leaves out because they are not installed. A
+/// switch's own ceremony is described by what its proposal included, as
+/// recorded when it was made, not by which Petals are installed now; a
+/// switch recorded before Machine kept that, and any other change, by the
+/// request.
+fn awaiting_listing(
+    request: &DefaultPolicyRequest,
+    own_switch: Option<&PendingSwitch>,
+) -> (Vec<String>, Vec<String>) {
+    match own_switch.and_then(|switch| Some((switch, switch.proposed.as_ref()?))) {
+        Some((switch, proposed)) => {
+            let mut listed = request.clone();
+            listed.petals = proposed.clone();
+            let left_out = switch
+                .setup
+                .petals
+                .keys()
+                .filter(|name| !proposed.contains(name))
+                .cloned()
+                .collect();
+            (listed.allowed(), left_out)
+        }
+        None => (request.allowed(), request.not_installed.clone()),
+    }
 }
 
 /// Whether the owner approved `switch`'s own proposal and it committed. A
@@ -2379,6 +2404,7 @@ pub(crate) async fn switch_persona(
             &PendingSwitch {
                 setup,
                 operation_id: None,
+                proposed: None,
             },
         )?;
     }
@@ -4718,6 +4744,7 @@ mod tests {
         let mut switch = PendingSwitch {
             setup: chosen_setup(&["polymarket"]),
             operation_id: None,
+            proposed: None,
         };
         switch.setup.persona = Some(PersonaConfig::suggested(PersonaPreset::Degen));
         write_pending_switch(home.path(), "trading", &switch).unwrap();
@@ -4726,6 +4753,7 @@ mod tests {
             Some(switch.clone())
         );
         switch.operation_id = Some("ab".repeat(32));
+        switch.proposed = Some(vec!["polymarket".into()]);
         write_pending_switch(home.path(), "trading", &switch).unwrap();
         assert_eq!(
             read_pending_switch(home.path(), "trading").unwrap(),
@@ -4743,6 +4771,50 @@ mod tests {
         assert!(read_pending_switch(home.path(), "trading").is_err());
     }
 
+    /// A switch's own ceremony is described by what its proposal included,
+    /// whatever is installed now: a Petal left out when it was proposed is
+    /// named as not proposed even once installed, and one uninstalled since
+    /// is still listed. Without a record, and for any other change, the
+    /// request is.
+    #[test]
+    fn a_switchs_ceremony_lists_what_it_proposed() {
+        let switch = |proposed: Option<&[&str]>| PendingSwitch {
+            setup: chosen_setup(&["hyperliquid", "polymarket"]),
+            operation_id: Some("ab".repeat(32)),
+            proposed: proposed.map(|names| names.iter().map(|name| (*name).to_owned()).collect()),
+        };
+        let request = |installed: &[&str], missing: &[&str]| DefaultPolicyRequest {
+            petals: installed.iter().map(|name| (*name).to_owned()).collect(),
+            not_installed: missing.iter().map(|name| (*name).to_owned()).collect(),
+            ..DefaultPolicyRequest::default()
+        };
+        let names = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>()
+        };
+        // Proposed while Hyperliquid was missing; it is installed again now.
+        let late = switch(Some(&["polymarket"]));
+        assert_eq!(
+            awaiting_listing(&request(&["hyperliquid", "polymarket"], &[]), Some(&late)),
+            (names(&["polymarket"]), names(&["hyperliquid"]))
+        );
+        // Proposed with both; Hyperliquid was uninstalled since.
+        let whole = switch(Some(&["hyperliquid", "polymarket"]));
+        assert_eq!(
+            awaiting_listing(&request(&["polymarket"], &["hyperliquid"]), Some(&whole)),
+            (names(&["hyperliquid", "polymarket"]), Vec::new())
+        );
+        let now = request(&["polymarket"], &["hyperliquid"]);
+        for own in [None, Some(&switch(None))] {
+            assert_eq!(
+                awaiting_listing(&now, own),
+                (names(&["polymarket"]), names(&["hyperliquid"]))
+            );
+        }
+    }
+
     /// A command acts on the switch it read when it began: ending it clears
     /// the file only while it still holds that switch, so a newer switch
     /// another command saved meanwhile stays.
@@ -4752,6 +4824,7 @@ mod tests {
         let mut earlier = PendingSwitch {
             setup: chosen_setup(&["polymarket"]),
             operation_id: Some("ab".repeat(32)),
+            proposed: None,
         };
         earlier.setup.persona = Some(PersonaConfig::suggested(PersonaPreset::Trader));
         let mut newer = earlier.clone();
@@ -5431,6 +5504,26 @@ mod tests {
             bloom_broker_api::Digest32::new(pinned.to_owned()).unwrap(),
         ]);
         assert!(catalog_release_allowed(&allows, "hyperliquid"));
+        // The split follows the committed policy: a missing Petal it allows
+        // is allowed, the rest are not; nothing missing reads no policy.
+        let missing = DefaultPolicyRequest {
+            not_installed: vec!["hyperliquid".into(), "polymarket".into()],
+            ..DefaultPolicyRequest::default()
+        };
+        assert_eq!(
+            split_not_installed(&missing, &snapshot_of(&allows)).unwrap(),
+            (
+                vec!["hyperliquid".to_owned()],
+                vec!["polymarket".to_owned()]
+            )
+        );
+        assert_eq!(
+            split_not_installed(&missing, &snapshot_of(&policy(Vec::new()))).unwrap(),
+            (
+                Vec::new(),
+                vec!["hyperliquid".to_owned(), "polymarket".to_owned()]
+            )
+        );
         assert!(!catalog_release_allowed(&policy(Vec::new()), "hyperliquid"));
         assert!(!catalog_release_allowed(&allows, "polymarket"));
         assert!(!catalog_release_allowed(&allows, "not-in-the-catalog"));

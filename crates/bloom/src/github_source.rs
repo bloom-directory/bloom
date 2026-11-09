@@ -1245,11 +1245,34 @@ pub(crate) fn prepare_prebuilt_release_petal(
     prepare_prebuilt_petal_archive(daemon, entry, &manifest, archive.path())
 }
 
+/// A release file that could not be downloaded, which a later attempt can
+/// get past. Checks of what was downloaded, such as its checksum, are not
+/// marked: trying again cannot change them.
+#[derive(Debug)]
+pub(crate) struct DownloadFailed(String);
+
+impl std::fmt::Display for DownloadFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "download {}", self.0)
+    }
+}
+
+impl DownloadFailed {
+    #[cfg(test)]
+    pub(crate) fn of(url: &str) -> Self {
+        Self(url.to_owned())
+    }
+}
+
 fn curl_download(
     url: &str,
     output: &Path,
     context: &bloom_daemon::ipc::IpcOperationContext,
 ) -> Result<()> {
+    curl(url, output, context).context(DownloadFailed(url.to_owned()))
+}
+
+fn curl(url: &str, output: &Path, context: &bloom_daemon::ipc::IpcOperationContext) -> Result<()> {
     let mut command = Command::new("curl");
     command
         .args([
@@ -1279,8 +1302,8 @@ fn curl_download(
     .context("download pre-installed Petal release with curl")?;
     if !result.status.success() {
         bail!(
-            "download {url} with curl failed: {}",
-            String::from_utf8_lossy(&result.stderr)
+            "curl failed: {}",
+            String::from_utf8_lossy(&result.stderr).trim_end()
         );
     }
     Ok(())
@@ -2804,7 +2827,7 @@ mod tests {
         );
         assert_eq!(calls.get(), 2);
         assert!(
-            matches!(&results[0].outcome, ProvisioningOutcome::DownloadFailed(message) if message.contains("offline"))
+            matches!(&results[0].outcome, ProvisioningOutcome::Failed(message) if message.contains("offline"))
         );
         // The fixture replaces an older installed release.
         assert_eq!(results[1].outcome, ProvisioningOutcome::Updated);
