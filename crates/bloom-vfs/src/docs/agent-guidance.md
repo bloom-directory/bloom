@@ -64,10 +64,11 @@ For native transfers and Petal actions that project into the outbox:
 2. Identify the new entry in `pending/` by its `intent.json` and `plan.md`,
    never by wildcard, sequence number, `latest` or position.
 3. Write `confirm` to that entry's `confirm` file. If the owner must
-   approve, it waits for them, then sends. If it times out, give the human
-   the ceremony link from its error and write `confirm` again. For
-   `expired`, `cancelled` or `refused`, tell the human. On a mount, confirm
-   does not wait: read `approval_challenge.json` and follow its `next`.
+   approve, its error gives the ceremony link: give it to the human, then
+   write `confirm` again, which waits for their approval and sends. Repeat
+   if it times out. For `expired`, `cancelled` or `refused`, tell the human.
+   On a mount, confirm does not wait: read `approval_challenge.json` and
+   follow its `next`.
 4. Read `sent/<id>/` or `failed/<id>/` before reporting the result.
 
 Do not restage while an approval is pending, or because a pending path

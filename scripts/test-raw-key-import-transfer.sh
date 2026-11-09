@@ -180,7 +180,7 @@ printf 'raw-import transfer e2e: importing scalar %s through the ceremony...\n' 
 import_launch="$(cli wallet import "$WALLET_NAME" --raw-private-key)"
 import_ceremony_url="$(printf '%s\n' "$import_launch" | sed -n 's/^ceremony_url: //p')"
 [ -n "$import_ceremony_url" ] || die "wallet import launch omitted ceremony_url: $import_launch"
-printf '%s\n' "$import_launch" | sed -n 's/^ceremony_url: //p' | grep -q '^http://localhost:18734/ceremony/' ||
+printf '%s\n' "$import_launch" | sed -n 's/^ceremony_url: //p' | grep -qF "${BLOOM_TRIAD_DEV_CEREMONY_ORIGIN}/ceremony/" ||
   die "import ceremony URL is not the canonical Broker origin: $import_ceremony_url"
 import_result="$("$driver_bin" complete "$import_ceremony_url" "$AUTH_SEED" \
   --sign-count 1 --raw-private-key "$TEST_RAW_KEY_B64")"
@@ -190,7 +190,8 @@ printf 'raw-import transfer e2e: imported wallet %s\n' "$wallet_id"
 # 5. Projection: authenticated Broker projection carries the imported key's
 #    exact EVM address, and wallet.accounts is the imported-scalar profile
 #    with no derived accounts.
-projection="$(cli wallet projection "$wallet_id")"
+# Broker publishes the imported wallet shortly after the ceremony completes.
+for _ in $(seq 50); do projection="$(cli wallet projection "$wallet_id" 2>/dev/null)" && break; sleep 0.2; done
 printf '%s' "$projection" | jq -e --arg wallet "$wallet_id" --arg addr "$expected_addr" '
   .wallet.wallet_id == $wallet and
   .source_protocol == "bloom.machine-broker.v1" and
@@ -231,7 +232,14 @@ printf '%s' "$policy_operation" | grep -Eq '^[0-9a-f]{64}$' ||
   die "policy update launch omitted a valid operation_id: $policy_launch"
 cli wallet commit-policy "$policy_operation" >/dev/null ||
   die "policy commit failed"
-updated_policy="$(vcat "/wallets/${wallet_id}/policy.json")"
+# The policy projection refreshes shortly after the commit.
+for _ in $(seq 50); do
+  updated_policy="$(vcat "/wallets/${wallet_id}/policy.json")"
+  printf '%s' "$updated_policy" | jq -e --arg dest "$RECIPIENT" '
+    any(.allowed_destinations[]; .destination == $dest)
+  ' >/dev/null && break
+  sleep 0.2
+done
 printf '%s' "$updated_policy" | jq -e --arg dest "$RECIPIENT" '
   any(.allowed_destinations[]; .destination == $dest)
 ' >/dev/null || die "committed policy omitted the allowlisted recipient: $updated_policy"
@@ -266,29 +274,35 @@ policy_check="$(vcat "${pending_dir}/${pending_id}/policy_check.json")"
 printf '%s' "$policy_check" | jq -e . >/dev/null || die "policy_check.json is not valid JSON"
 printf 'raw-import transfer e2e: staged pending entry %s\n' "$pending_id"
 
-# 9. Confirm waits for the owner: it stays blocked, without signing, while the
-#    ceremony is open. A second concurrent confirm must not sign again.
+# 9. The first confirm fails closed at once and names the ceremony link.
 confirm_path="${pending_dir}/${pending_id}/confirm"
-vwrite "$confirm_path" "y" >/dev/null 2>"${run_root}/confirm.err" &
-confirm_pid=$!
+if vwrite "$confirm_path" "y" >/dev/null 2>"${run_root}/confirm1.err"; then
+  die "confirm succeeded before the approval ceremony completed"
+fi
 challenge="$(wait_for_file "pending approval challenge" "${pending_dir}/${pending_id}/approval_challenge.json")"
 approval_ceremony_url="$(printf '%s' "$challenge" | jq -er '.ceremony_url')"
 printf '%s' "$challenge" | jq -e '(.approval_id | test("^[0-9a-f]{64}$")) and .state == "awaiting_ceremony"' >/dev/null ||
   die "pending approval challenge omitted its approval id or live state: $challenge"
-vwrite "$confirm_path" "y" >/dev/null 2>"${run_root}/confirm2.err" &
-confirm2_pid=$!
-sleep 1
-kill -0 "$confirm_pid" 2>/dev/null || die "confirm returned before the approval ceremony completed"
-[ "$(cast nonce --rpc-url "$rpc_url" "$expected_addr")" = "0" ] || die "a transaction was sent before approval"
+grep -qF "$approval_ceremony_url" "${run_root}/confirm1.err" ||
+  die "the first confirm's error did not name its ceremony link: $(cat "${run_root}/confirm1.err")"
 
-# 10. Completing the ceremony lets the waiting confirm sign and send.
+# 10. Confirming again waits for the owner without signing. A concurrent
+#     confirm must not sign twice. Completing the ceremony lets the waiting
+#     confirm sign and send.
+vwrite "$confirm_path" "y" >/dev/null 2>"${run_root}/confirm2.err" &
+confirm_pid=$!
+vwrite "$confirm_path" "y" >/dev/null 2>"${run_root}/confirm3.err" &
+confirm3_pid=$!
+sleep 1
+kill -0 "$confirm_pid" 2>/dev/null || die "the second confirm returned before approval: $(cat "${run_root}/confirm2.err")"
+[ "$(cast nonce --rpc-url "$rpc_url" "$expected_addr")" = "0" ] || die "a transaction was sent before approval"
 "$driver_bin" complete "$approval_ceremony_url" "$AUTH_SEED" --sign-count 3 >/dev/null ||
   die "completing the Sealed Approval ceremony failed"
-wait "$confirm_pid" || die "waiting confirm failed after approval: $(cat "${run_root}/confirm.err")"
-grep -qF "Approval required: open ${approval_ceremony_url}" "${run_root}/confirm.err" ||
-  die "waiting confirm did not show its ceremony link: $(cat "${run_root}/confirm.err")"
-wait "$confirm2_pid" || grep -q 'not found' "${run_root}/confirm2.err" ||
-  die "concurrent confirm failed unexpectedly: $(cat "${run_root}/confirm2.err")"
+confirm_ok=0
+wait "$confirm_pid" && confirm_ok=$((confirm_ok + 1))
+wait "$confirm3_pid" && confirm_ok=$((confirm_ok + 1))
+[ "$confirm_ok" -ge 1 ] ||
+  die "no waiting confirm succeeded: $(cat "${run_root}/confirm2.err" "${run_root}/confirm3.err")"
 
 # 11. The entry must reconcile into sent/ with a transaction hash.
 sent_dir="/wallets/${wallet_id}/0/chains/anvil/outbox/sent"
