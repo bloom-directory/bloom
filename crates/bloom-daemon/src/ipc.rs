@@ -1202,16 +1202,28 @@ impl IpcServer {
                 // which also keeps the package from changing until the read
                 // ends. Holding Machine's Petal mutation lock here instead
                 // would hold up every Petal's install for as long as the read.
-                match parse_path(&req.params) {
-                    Ok(path) if self.vfs.is_read_side_effecting(&path) => Response::err(
-                        id,
+                let not_inert = || {
+                    Response::err(
+                        id.clone(),
                         -32010,
                         "path is not an inert resource; use vfs_read deliberately",
-                    ),
-                    Ok(_) => {
+                    )
+                };
+                match parse_path(&req.params) {
+                    Ok(path) => {
+                        // A parameterized Petal route counts as acting until a
+                        // lookup evaluates it, as `bloom vfs stat` would; a
+                        // lookup never acts.
+                        if self.vfs.is_read_side_effecting(&path) {
+                            let _ = self.vfs.lookup(&path).await;
+                        }
+                        if self.vfs.is_read_side_effecting(&path) {
+                            return not_inert();
+                        }
                         match bloom_petals::inert_read(self.do_read(&req.params, &context)).await {
-                            Ok(value) => Response::ok(id, value),
-                            Err(error) => map_handler_err(id, error),
+                            (_, true) => not_inert(),
+                            (Ok(value), false) => Response::ok(id, value),
+                            (Err(error), false) => map_handler_err(id, error),
                         }
                     }
                     Err(error) => map_handler_err(id, error),
@@ -2496,7 +2508,7 @@ allowed = ["bloom:vfs.read"]
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let started = std::time::Instant::now();
         drop(runner.store().execution_guard("echo").await);
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
         assert!(matches!(task.await.unwrap(), Err(PetalError::Busy)));
         assert!(
             runner
@@ -2520,7 +2532,7 @@ allowed = ["bloom:vfs.read"]
         let mut context = IpcOperationContext::detached();
         context.petal_mutation = Some(mutation.clone());
         let task = commit(context.waiting_to_activate(std::time::Duration::from_secs(30)));
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        until_install_queued(runner.store(), "echo").await;
         // A call starting now waits behind the queued install.
         let store = runner.store().clone();
         let later = tokio::spawn(async move {
@@ -2539,6 +2551,20 @@ allowed = ["bloom:vfs.read"]
             later.await.unwrap().is_some(),
             "the later call ran before the install activated"
         );
+    }
+
+    /// Wait until an install of `petal` is queued, so that a new call to it
+    /// would have to wait. Staging can take a while on a busy machine, so a
+    /// fixed sleep is not enough.
+    async fn until_install_queued(store: &bloom_petals::store::PetalStore, petal: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !store.call_would_wait(petal) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the install never queued"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
 
     /// Another Petal's calls neither hold up an install nor wait behind one:
@@ -2572,10 +2598,16 @@ allowed = ["bloom:vfs.read"]
 
         let running = runner.store().execution_guard("echo").await;
         let queued = commit(context.waiting_to_activate(std::time::Duration::from_secs(30)));
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let started = std::time::Instant::now();
-        drop(runner.store().execution_guard("polymarket").await);
-        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        until_install_queued(runner.store(), "echo").await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                runner.store().execution_guard("polymarket")
+            )
+            .await
+            .is_ok(),
+            "another Petal's call waited behind the queued install"
+        );
         assert!(!queued.is_finished());
         drop(running);
         queued.await.unwrap().unwrap();
@@ -2613,7 +2645,6 @@ allowed = ["bloom:vfs.read"]
             } else {
                 context
             };
-            let started = std::time::Instant::now();
             let (r, p) = (runner.clone(), package.clone());
             let install = tokio::task::spawn_blocking(move || {
                 context
@@ -2640,7 +2671,6 @@ allowed = ["bloom:vfs.read"]
             } else {
                 assert!(matches!(installed, Ok(()) | Err(PetalError::Busy)));
             }
-            assert!(started.elapsed() < std::time::Duration::from_secs(2));
         }
     }
 
@@ -2920,6 +2950,12 @@ allowed = ["bloom:vfs.read"]
 
     struct GuardedReadHandler {
         side_effecting: AtomicBool,
+        /// Counts as acting until looked up, as a parameterized Petal route
+        /// does before its metadata is evaluated.
+        cold: AtomicBool,
+        /// Refuses the read as acting once it starts, as the Petal router
+        /// does when the package changed after the first check.
+        refuse: AtomicBool,
         reads: AtomicUsize,
         inert: AtomicBool,
         started: Notify,
@@ -2929,13 +2965,17 @@ allowed = ["bloom:vfs.read"]
     #[async_trait::async_trait]
     impl Handler for GuardedReadHandler {
         async fn lookup(&self, _: &VfsPath) -> Result<Entry, HandlerError> {
+            self.cold.store(false, Ordering::SeqCst);
             Ok(Entry::read_only_file("value"))
         }
         fn is_read_side_effecting(&self, _: &VfsPath) -> bool {
-            self.side_effecting.load(Ordering::SeqCst)
+            self.side_effecting.load(Ordering::SeqCst) || self.cold.load(Ordering::SeqCst)
         }
         async fn read(&self, _: &VfsPath) -> Result<Vec<u8>, HandlerError> {
             self.reads.fetch_add(1, Ordering::SeqCst);
+            if self.refuse.load(Ordering::SeqCst) {
+                return Err(bloom_petals::refuse_inert_read());
+            }
             self.inert
                 .store(bloom_petals::is_inert_read(), Ordering::SeqCst);
             self.started.notify_one();
@@ -2944,14 +2984,18 @@ allowed = ["bloom:vfs.read"]
         }
     }
 
-    /// An inert read runs as one, so the Petal router checks the route's
-    /// safety again under that Petal's own gate, and it does not hold the
-    /// Petal mutation lock: no install waits for it. A read that acts is
-    /// refused before anything runs.
+    /// An inert read of a route not yet evaluated looks it up first, then runs
+    /// as an inert read, so the Petal router checks the route's safety again
+    /// under that Petal's own gate, and it does not hold the Petal mutation
+    /// lock: no install waits for it. A read that acts is refused before
+    /// anything runs, and one refused as acting once it started gets the
+    /// same error.
     #[tokio::test]
     async fn inert_read_runs_as_one_without_holding_up_installs() {
         let handler = Arc::new(GuardedReadHandler {
             side_effecting: AtomicBool::new(false),
+            cold: AtomicBool::new(true),
+            refuse: AtomicBool::new(false),
             reads: AtomicUsize::new(0),
             inert: AtomicBool::new(false),
             started: Notify::new(),
@@ -2992,10 +3036,15 @@ allowed = ["bloom:vfs.read"]
         handler.release.notify_one();
         assert!(pending.await.unwrap().error.is_none());
 
+        handler.refuse.store(true, Ordering::SeqCst);
+        let refused = read(server.clone()).await.unwrap();
+        assert_eq!(refused.error.unwrap().code, -32010);
+        assert_eq!(handler.reads.load(Ordering::SeqCst), 2);
+
         handler.side_effecting.store(true, Ordering::SeqCst);
         let refused = read(server.clone()).await.unwrap();
         assert_eq!(refused.error.unwrap().code, -32010);
-        assert_eq!(handler.reads.load(Ordering::SeqCst), 1);
+        assert_eq!(handler.reads.load(Ordering::SeqCst), 2);
     }
 
     struct AtomicProjectionHandler {

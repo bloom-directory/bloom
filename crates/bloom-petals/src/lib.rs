@@ -37,7 +37,7 @@ pub use package::{PetalPackage, RouteMatch, RouteRecord, RouteSpecificity};
 pub use policy::NetPolicy;
 pub use private_store::PrivateStore;
 pub use registry::{NameRegistry, validate_name};
-pub use router::{PetalRouter, inert_read, is_inert_read};
+pub use router::{PetalRouter, inert_read, is_inert_read, refuse_inert_read};
 pub use runner::{LateVfsHost, PetalRunner, VfsHost};
 pub use store::{InstallResult, PetalStore};
 pub use vm::{PetalVm, RunOptions, RunOutput};

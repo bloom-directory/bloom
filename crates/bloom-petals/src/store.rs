@@ -147,6 +147,13 @@ impl PetalStore {
         }
     }
 
+    /// Whether a call to `petal` starting now would have to wait, because a
+    /// change to its package, or an uninstall, holds or has queued for its
+    /// gate. Public so other crates' tests can wait for an install to queue.
+    pub fn call_would_wait(&self, petal: &str) -> bool {
+        self.gates.store.try_read().is_err() || self.gates.petal(petal).try_read().is_err()
+    }
+
     /// The permit to change `petal`'s package, if none of its code runs.
     fn activation_permit(&self, petal: &str) -> Result<ActivationPermit, PetalError> {
         let store = self
@@ -1081,6 +1088,36 @@ name = "echo"
             .install_staged_with_permit(right, staged(), None, || Ok(()), |_| Ok(()))
             .unwrap();
         assert!(store.resolve_petal_owner("echo").unwrap().is_some());
+    }
+
+    /// A running call alone leaves room for more; once a change to that
+    /// Petal queues behind it, a new call would wait, and another Petal's
+    /// would not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_queued_change_makes_new_calls_wait() {
+        let (_dir, store) = store();
+        let running = store.execution_guard("echo").await;
+        assert!(!store.call_would_wait("echo"));
+        let queued = {
+            let store = store.clone();
+            tokio::task::spawn_blocking(move || {
+                store
+                    .activation_permit_waiting("echo", std::time::Duration::from_secs(30), || false)
+                    .map(|_| ())
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !store.call_would_wait("echo") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the change never queued"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(!store.call_would_wait("other"));
+        drop(running);
+        queued.await.unwrap().unwrap();
+        assert!(!store.call_would_wait("echo"));
     }
 
     /// Past the limit, gates nobody holds are forgotten, but one that is held

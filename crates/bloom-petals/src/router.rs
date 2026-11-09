@@ -22,16 +22,29 @@ use crate::runner::{PETAL_DOCUMENT_NAMES, PetalRunner};
 use crate::vm::{COMPONENT_NOT_A_DIR_CODE, COMPONENT_UNSUPPORTED_CODE, RunOptions};
 
 tokio::task_local! {
-    static INERT_READ: ();
+    static INERT_READ: std::cell::Cell<bool>;
 }
 
 /// Run `read` as an inert read, for a caller such as an MCP resource read
 /// that must never trigger a read that acts. A Petal route's read is checked
 /// again under that Petal's gate, so the check and the read see the same
 /// installed package: one whose read acts is refused, even if its package
-/// changed after the caller's first check.
-pub async fn inert_read<F: std::future::Future>(read: F) -> F::Output {
-    INERT_READ.scope((), read).await
+/// changed after the caller's first check. Returns the read's result and
+/// whether it was refused for that reason, so the caller can say so.
+pub async fn inert_read<F: std::future::Future>(read: F) -> (F::Output, bool) {
+    INERT_READ
+        .scope(std::cell::Cell::new(false), async {
+            let output = read.await;
+            (output, INERT_READ.with(std::cell::Cell::get))
+        })
+        .await
+}
+
+/// Refuse a read that acts inside an [`inert_read`], so that call reports it
+/// as one. Public so other crates' handlers and tests can refuse the same way.
+pub fn refuse_inert_read() -> HandlerError {
+    let _ = INERT_READ.try_with(|refused| refused.set(true));
+    HandlerError::PermissionDenied
 }
 
 /// Whether the current task is running an [`inert_read`].
@@ -465,7 +478,7 @@ impl PetalRouter {
             .petal_route(mount, op, &path)
             .map_err(map_petal_err)?;
         if matches!(op, DispatchOp::Read) && is_inert_read() && self.is_effect(mount, op, &path) {
-            return Err(HandlerError::PermissionDenied);
+            return Err(refuse_inert_read());
         }
         let wallet = matched
             .params
@@ -1636,13 +1649,56 @@ name = "example"
         let route_path = VfsPath::parse("/example/intents/alice/0").unwrap();
         assert!(matches!(
             inert_read(router.read(&route_path)).await,
-            Err(HandlerError::PermissionDenied)
+            (Err(HandlerError::PermissionDenied), true)
         ));
         assert!(!matches!(
             router.read(&route_path).await,
             Err(HandlerError::PermissionDenied)
         ));
         assert!(!is_inert_read());
+    }
+
+    /// A package that changes between a caller's first check and the read,
+    /// so that the route's read now acts, is caught under the Petal's gate:
+    /// the inert read is refused and reported as refused for acting.
+    #[tokio::test]
+    async fn an_inert_read_sees_a_package_that_changed_after_the_first_check() {
+        let (dir, runner) = runner();
+        let inert = dir.path().join("v1");
+        write_dynamic_dir_package(&inert, false);
+        runner.store().install_petal_package_dir(&inert).unwrap();
+        let router = PetalRouter::new(runner.clone(), Arc::new(AccountHost));
+        let vfs = Vfs::builder()
+            .mount("petals", Arc::new(router.clone()))
+            .build();
+        let path = VfsPath::parse("/petals/example/intents/alice/0").unwrap();
+        vfs.lookup(&path).await.unwrap();
+        assert!(!vfs.is_read_side_effecting(&path), "the first check passes");
+        let permit = runner
+            .store()
+            .activation_permit_waiting("example", Duration::from_secs(1), || false)
+            .unwrap();
+        let (reader, read_path) = (vfs.clone(), path.clone());
+        let mut read = tokio::spawn(async move { inert_read(reader.read(&read_path)).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut read)
+                .await
+                .is_err(),
+            "the inert read waits at the Petal's gate"
+        );
+        let acting = dir.path().join("v2");
+        write_dynamic_dir_package(&acting, true);
+        let staged = runner
+            .store()
+            .stage_petal_package(crate::package::PreparedPetalPackage::from_dir(&acting).unwrap())
+            .unwrap();
+        runner
+            .install_staged_petal_package_permitted(permit, staged, None, || Ok(()))
+            .unwrap();
+        assert!(matches!(
+            read.await.unwrap(),
+            (Err(HandlerError::PermissionDenied), true)
+        ));
     }
 
     #[tokio::test]

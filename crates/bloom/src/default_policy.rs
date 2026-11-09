@@ -1666,9 +1666,11 @@ pub(crate) fn proposes_chosen_petals_default() -> bool {
     true
 }
 
-/// Where a wallet's default policy stands, as reported by Machine.
+/// Where a wallet's default policy stands, as reported by Machine. Fields
+/// this CLI does not know are ignored, so it still reads a status from a
+/// later Machine that reports more.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "state", rename_all = "snake_case")]
 pub(crate) enum DefaultPolicyStatus {
     /// No longer produced: a chosen Petal that is not installed gives
     /// `PetalsNotInstalled`, and nothing chosen gives `NothingChosen`. Kept so
@@ -5701,6 +5703,21 @@ mod tests {
         assert!(!catalog_release_allowed(&policy(Vec::new()), "hyperliquid"));
         assert!(!catalog_release_allowed(&allows, "polymarket"));
         assert!(!catalog_release_allowed(&allows, "not-in-the-catalog"));
+    }
+
+    /// A status from a later Machine, with fields this CLI does not know,
+    /// still reads.
+    #[test]
+    fn a_status_with_fields_this_cli_does_not_know_still_reads() {
+        let status: DefaultPolicyStatus = serde_json::from_value(serde_json::json!({
+            "state": "applied",
+            "petals": ["polymarket"],
+            "reported_later": ["something new"]
+        }))
+        .unwrap();
+        assert!(
+            matches!(status, DefaultPolicyStatus::Applied { petals, .. } if petals == ["polymarket"])
+        );
     }
 
     /// The new status travels with its list; the others are unchanged on the

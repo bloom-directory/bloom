@@ -645,7 +645,11 @@ own gate, so another Petal's calls, MCP resource reads included, never hold
 up an install, and a first install, which no call can be running, goes in at
 once; an uninstall is refused while any Petal's code runs. MCP resource
 reads check that a Petal route's read does not act under that Petal's gate
-rather than Machine's Petal mutation lock. When an install is refused, Machine
+rather than Machine's Petal mutation lock. A parameterized route counts as
+acting until a lookup evaluates it, so an MCP read looks such a route up
+first, as `bloom vfs stat` would; a read refused under the gate, because the
+package changed after the first check, gets the same "not an inert
+resource" error as one refused before it ran. When an install is refused, Machine
 tries it again after one second, doubling the wait up to one minute and
 staying there while it runs. A retry downloads and stages the package, then
 takes Machine's Petal mutation lock in turn, as listing and managing Petals
@@ -1043,8 +1047,12 @@ Automated:
   resource read holds up no install. Callers that hold the Petal mutation
   lock back to back cannot keep a plain or retrying install from it
   (`crates/bloom-daemon/src/ipc.rs`). Under an inert read, a route whose read
-  acts is refused under its Petal's gate, as is a setup write's stored check
-  while that Petal's package changes (`crates/bloom-petals/src/router.rs`).
+  acts is refused under its Petal's gate, including after a package change
+  that makes it act, and is reported as refused for acting; a setup write's
+  stored check waits while that Petal's package changes
+  (`crates/bloom-petals/src/router.rs`). An MCP read of a route not yet
+  evaluated looks it up first, and any refusal for acting gets the same
+  error (`crates/bloom-daemon/src/ipc.rs`).
   The store refuses a package change during a Petal call with a typed busy
   error (`crates/bloom-petals/src/runner.rs`), refuses an install a permit
   for another Petal, keeps every held gate when it forgets idle ones, and
@@ -1059,7 +1067,8 @@ Automated:
   switch. A switch records the Petals its proposal included, and its
   ceremony lists them; a Petal it left out but installed since is named as
   not installed when it was proposed, never as not installed now or as
-  changed, and a record with fields a build does not know still reads. After a switch, a missing Petal its policy
+  changed, and a record or status with fields a build does not know still
+  reads. After a switch, a missing Petal its policy
   allows is named as allowed, and one it does not is named with
   `bloom wallet default-policy`.
   The new status carries the list, and the others are unchanged on the
