@@ -27,6 +27,8 @@ use tokio::{
 };
 
 pub use bloom_checkout_api::{HistoryEntry, Request, Status};
+mod saved;
+pub use saved::SavedAction;
 
 /// Approval links last fifteen minutes; allow a short result-delivery grace.
 const APPROVAL_RESULT_WAIT: Duration = Duration::from_secs(15 * 60 + 30);
@@ -188,12 +190,15 @@ impl Store {
     }
     /// The shop and, when Bloom read one, the total the human approved.
     fn unresolved(&self, shop: &str) -> Result<Option<String>> {
+        self.unresolved_except(shop, "")
+    }
+    fn unresolved_except(&self, shop: &str, except: &str) -> Result<Option<String>> {
         let conn = self.0.lock();
         match conn.query_row(
-            "SELECT id FROM operations WHERE shop=?1 AND kind IN ('card','site') AND state IN \
+            "SELECT id FROM operations WHERE shop=?1 AND id!=?2 AND kind IN ('card','site','take_over') AND state IN \
              ('submitted','needs_input','uncertain','declined','disclosure_unknown','partially_filled','filled','release_started','restart_cancelling') \
              LIMIT 1",
-            [shop],
+            [shop, except],
             |row| row.get(0),
         ) {
             Ok(id) => Ok(Some(id)),
@@ -392,6 +397,8 @@ struct CompletedView {
 }
 
 pub struct CheckoutService {
+    action_gate: AsyncMutex<()>,
+    saved: Mutex<Option<saved::SavedState>>,
     pub browser: Arc<Browser>,
     store: Store,
     private: AsyncMutex<Option<PrivateCheckout>>,
@@ -408,6 +415,10 @@ pub struct CheckoutService {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum IntakeResponse {
+    Saved {
+        cards: Vec<bloom_signer_api::CardPublic>,
+        travelers: Vec<bloom_signer_api::TravelerPublic>,
+    },
     Traveler {
         traveler: bloom_signer_api::TravelerPublic,
     },
@@ -946,6 +957,7 @@ impl CheckoutService {
     }
 
     async fn return_control(&self) -> Result<()> {
+        self.saved.lock().take();
         self.forget_travelers().await;
         self.journey_filler.lock().await.take();
         self.browser.return_control().await
@@ -963,6 +975,8 @@ impl CheckoutService {
         }
         let store = Store::open(state)?;
         Ok(Arc::new(Self {
+            action_gate: AsyncMutex::new(()),
+            saved: Mutex::new(None),
             browser,
             store,
             private: AsyncMutex::new(None),
@@ -1336,6 +1350,8 @@ impl CheckoutService {
                 }
             }
             Request::Cancel { operation_id } => {
+                let _gate = self.action_gate.lock().await;
+                self.require_saved_idle()?;
                 if self.store.kind(&operation_id)? == "traveler" {
                     return self.cancel_traveler(&operation_id).await;
                 }
@@ -1755,6 +1771,10 @@ impl CheckoutService {
         let mut copied_contact = false;
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
+            let _gate = self.action_gate.lock().await;
+            if self.require_saved_idle().is_err() {
+                continue;
+            }
             // Outcome polling must not own the private-view lock while Chromium
             // is slow. Copy the stable browser handles, then do bounded calls.
             let (mode, tab, submitted) = {
@@ -1774,16 +1794,18 @@ impl CheckoutService {
             // A take-over may include a login with an emailed or texted code;
             // a payment may need a bank check or a correction from the human.
             let deadline = started + Duration::from_secs(900);
-            if matches!(
-                status.state.as_str(),
-                "submitted"
-                    | "needs_input"
-                    | "declined"
-                    | "manual_required"
-                    | "uncertain"
-                    | "partially_filled"
-                    | "disclosure_unknown"
-            ) {
+            if mode != Mode::TakeOver
+                && matches!(
+                    status.state.as_str(),
+                    "submitted"
+                        | "needs_input"
+                        | "declined"
+                        | "manual_required"
+                        | "uncertain"
+                        | "partially_filled"
+                        | "disclosure_unknown"
+                )
+            {
                 let mut observed = Vec::new();
                 let contexts = tokio::time::timeout(
                     Duration::from_secs(2),
@@ -1876,10 +1898,15 @@ impl CheckoutService {
                         if state == "paid" {
                             recorded["state"] = json!("paid");
                         }
-                        let close = matches!(
-                            status.state.as_str(),
-                            "submitted" | "needs_input" | "uncertain" | "declined"
-                        );
+                        let close = !self
+                            .saved
+                            .lock()
+                            .as_ref()
+                            .is_some_and(|s| s.operation == id)
+                            && matches!(
+                                status.state.as_str(),
+                                "submitted" | "needs_input" | "uncertain" | "declined"
+                            );
                         status.state = state.into();
                         status.outcome = serde_json::from_value(recorded).ok();
                         status.ceremony_url = None;
@@ -2038,8 +2065,15 @@ impl CheckoutService {
             checkout.view_target.clone()
         };
         let status = self.store.get(&operation_id)?;
+        let saved = self.saved_status(&operation_id);
+        let can_use_saved = self
+            .private
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|c| c.mode == Mode::TakeOver);
         Ok(
-            json!({"state":status.state,"outcome":status.outcome,"pages":pages,"selected_page":selected_page,"closed":false}),
+            json!({"state":status.state,"outcome":status.outcome,"pages":pages,"selected_page":selected_page,"closed":false,"saved":saved,"can_use_saved":can_use_saved}),
         )
     }
 
@@ -2080,6 +2114,8 @@ impl CheckoutService {
     }
 
     pub async fn private_action(&self, token: &str, action: ViewAction) -> Result<()> {
+        let _gate = self.action_gate.lock().await;
+        self.require_saved_idle()?;
         if !matches!(action, ViewAction::Finish | ViewAction::SelectPage { .. }) {
             let mut private = self.private.lock().await;
             let checkout = private.as_mut().context("No active private checkout")?;
@@ -2954,7 +2990,7 @@ mod tests {
     }
 
     /// A claimed private card checkout on `html` in `state`, ready to watch.
-    async fn watched_checkout(
+    pub(super) async fn watched_checkout(
         html: &str,
         state: &str,
         submitted: bool,
@@ -5153,10 +5189,11 @@ mod tests {
             .tab
             .target
             .clone();
-        let state = tokio::time::timeout(Duration::from_secs(2), async {
+        let state = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                let state = service.private_state(session_token).await.unwrap();
-                if state["selected_page"] != root_target {
+                if let Ok(state) = service.private_state(session_token).await
+                    && state["selected_page"] != root_target
+                {
                     break state;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;

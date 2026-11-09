@@ -2,6 +2,8 @@ const screen = document.getElementById('screen');
 const status = document.getElementById('status');
 const pages = document.getElementById('pages');
 let closed = false;
+let approvalBusy = false;
+let savedRequestBusy = false;
 const sessionKey = 'bloom.checkout.session';
 let session = '';
 let frameUrl;
@@ -17,13 +19,15 @@ function closeView(message) {
   document.getElementById('controls').hidden = true;
   document.getElementById('controls').disabled = true;
   document.getElementById('text').value = '';
+  document.getElementById('saved-tools').hidden = true;
+  document.getElementById('saved-approval').removeAttribute('href');
   pages.replaceChildren();
   screen.hidden = true;
   screen.removeAttribute('src');
   if (frameUrl) { URL.revokeObjectURL(frameUrl); frameUrl = undefined; }
 }
 screen.hidden = true;
-screen.addEventListener('load', () => { if (!closed) { screen.hidden = false; document.getElementById('controls').disabled = false; } });
+screen.addEventListener('load', () => { if (!closed) { screen.hidden = false; document.getElementById('controls').disabled = approvalBusy; } });
 screen.addEventListener('error', () => {
   if (closed) return;
   screen.hidden = true;
@@ -34,6 +38,7 @@ pages.addEventListener('change',()=>act({action:'select_page',target:pages.value
 // One action at a time, so keystrokes arrive in order.
 let queue = Promise.resolve();
 function act(action) {
+  if (closed || approvalBusy || savedRequestBusy) return;
   queue = queue.then(async () => {
     if (closed) return;
     const response = await privateFetch('/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(action)});
@@ -67,6 +72,71 @@ document.getElementById('typing').addEventListener('submit', event => {
 });
 document.querySelectorAll('[data-key]').forEach(button=>button.addEventListener('click',()=>act({action:'key',key:button.dataset.key})));
 document.getElementById('finish').addEventListener('click',()=>act({action:'finish'}));
+async function savedOptions() {
+  const response = await privateFetch('/saved');
+  if (!response.ok) return;
+  const records = await response.json();
+  for (const [id, list, key] of [
+    ['saved-traveler', records.travelers, 'traveler_id'],
+    ['saved-card', records.cards, 'card_id'],
+  ]) {
+    const select = document.getElementById(id);
+    for (const item of list) {
+      const option = document.createElement('option');
+      option.value = item[key];
+      option.textContent = key === 'card_id' ? `${item.label} · ${item.brand} •••• ${item.last4}` : item.label;
+      select.append(option);
+    }
+  }
+}
+async function useSaved(action) {
+  if (closed || approvalBusy || savedRequestBusy) return;
+  savedRequestBusy = true;
+  approvalBusy = true;
+  document.getElementById('controls').disabled = true;
+  document.getElementById('saved-status').textContent = 'Preparing a fresh approval for this page…';
+  try {
+    await queue;
+    const response = await privateFetch('/saved', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify(action)});
+    if (!response.ok) throw Error('Check the page and any previous payment before trying again. Your seller session is still open.');
+    const result = await response.json();
+    showSaved({busy:true, status:result});
+    document.getElementById('unpaid-checked').checked = false;
+  } catch (error) {
+    approvalBusy = false;
+    document.getElementById('saved-status').textContent = error.message;
+  } finally { savedRequestBusy = false; }
+}
+function showSaved(saved) {
+  const link = document.getElementById('saved-approval');
+  approvalBusy = savedRequestBusy || !!saved?.busy;
+  for (const id of ['fill-traveler','pay-saved','saved-traveler','saved-card','unpaid-checked']) {
+    document.getElementById(id).disabled = approvalBusy;
+  }
+  if (!saved) { link.hidden = true; link.removeAttribute('href'); return; }
+  const state = saved.status;
+  link.hidden = !saved.busy || !state?.ceremony_url;
+  if (!link.hidden) link.href = state.ceremony_url;
+  else link.removeAttribute('href');
+  document.getElementById('saved-status').textContent = saved.busy
+    ? 'Approve or cancel in the review tab. This seller session stays open; page controls are paused.'
+    : state?.state === 'traveler_filled'
+      ? 'Traveler fields filled. Check them on the seller page before continuing.'
+      : state?.state === 'failed_before_release'
+        ? 'No saved details were filled. Correct the page or request a new approval.'
+        : 'The result is uncertain. Check the seller before attempting payment again.';
+}
+document.getElementById('fill-traveler').addEventListener('click', () => {
+  const traveler_id = document.getElementById('saved-traveler').value;
+  if (traveler_id) void useSaved({action:'traveler', traveler_id});
+});
+document.getElementById('pay-saved').addEventListener('click', () => {
+  const card_id = document.getElementById('saved-card').value;
+  const unpaid_checked = document.getElementById('unpaid-checked').checked;
+  if (card_id && unpaid_checked) void useSaved({action:'pay',card_id,unpaid_checked});
+  else document.getElementById('saved-status').textContent = 'Choose a card and check that this order has not already been paid.';
+});
 // What each state means for the person watching, in plain words.
 const describe = state => ({
   submitted: 'Payment sent once. Waiting for the site to confirm it; do not click Pay again. Finish any bank or email check here.',
@@ -86,10 +156,12 @@ async function refresh() {
       return;
     }
     const state=await response.json();status.textContent=describe(state);
+    document.getElementById('saved-tools').hidden = !state.can_use_saved;
+    showSaved(state.saved);
     if(state.state==='human_control'){
       document.getElementById('heading').textContent="Bloom's browser";
-      document.getElementById('purpose').textContent='Log in, enter a code or pass a check here. The agent cannot see this view. When you are done, hand the browser back.';
-      document.getElementById('finish').textContent='Done, hand back to the agent';
+      document.getElementById('purpose').textContent='Select your itinerary or basket here. Use saved travelers and cards above without leaving this session. The agent cannot see this view.';
+      document.getElementById('finish').textContent='Close private browser';
       document.getElementById('note').hidden=true;
     }
     if(state.state==='needs_input') {
@@ -128,6 +200,7 @@ async function openView() {
       history.replaceState(null,'','/view');
     }
     if (!session) throw Error('Approval access unavailable');
+    await savedOptions().catch(() => {});
     await refresh();
   } catch (_) {
     closeView('Private access is unavailable. Reopen the approval link in the browser you used to approve. Do not request another payment.');

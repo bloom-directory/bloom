@@ -49,6 +49,16 @@ button:hover{background:#f0eee8}
 <h1 id="heading">Complete your checkout</h1>
 <p id="status" role="status" aria-live="polite">Waiting for checkout…</p>
 </div>
+<section class="tools" id="saved-tools" aria-label="Saved travelers and cards" hidden>
+<p>Keep this seller session open while you approve saved details.</p>
+<label>Traveler <select id="saved-traveler"><option value="">Choose a saved traveler</option></select></label>
+<button type="button" id="fill-traveler">Fill saved traveler</button>
+<p><label>Card <select id="saved-card"><option value="">Choose a saved card</option></select></label></p>
+<p><label><input type="checkbox" id="unpaid-checked"> I checked the merchant's order or my bank: this order has not been paid.</label></p>
+<button type="button" id="pay-saved">Review saved-card payment</button>
+<p id="saved-status" role="status" aria-live="polite"></p>
+<a id="saved-approval" target="_blank" rel="noopener noreferrer" hidden>Review approval</a>
+</section>
 <fieldset id="controls" aria-label="Private browser controls">
 <p id="purpose">Finish a bank check or complete checkout here. The agent cannot see this view. Check the merchant and total before paying.</p>
 <div class="browser">
@@ -60,7 +70,7 @@ button:hover{background:#f0eee8}
 <form id="typing"><input id="text" type="password" autocomplete="off" aria-label="Hidden text for the selected browser field" placeholder="Type hidden text"><button>Send text</button></form>
 <div class="keys" aria-label="Browser keyboard"><button type="button" data-key="Tab">Tab</button><button type="button" data-key="Enter">Enter</button><button type="button" data-key="Backspace">Backspace</button></div>
 <div class="footer">
-<button type="button" id="finish">Close checkout and return to shopping</button>
+<button type="button" id="finish">Close private browser</button>
 <p id="note">Closing before the site confirms leaves the result unknown. Check your email and bank before paying again.</p>
 </div>
 </div>
