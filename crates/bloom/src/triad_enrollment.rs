@@ -372,32 +372,50 @@ fn refresh_developer_provenance_catalog(
         // anyway — enrolment only re-derives the package hash on disk — so the
         // override would be the only way out.
         //
-        // What makes that safe is not the flag. Broker's only per-claim reads
-        // of lineage `active` are on the scope-derived key path
-        // (`prepare_petal_key_scope` and `validate_scoped_route_lineage`); a
-        // plain Petal approval never consults it, and an inactive record's
-        // `fee_asset` still decides the claim. (`bloom-broker-api`'s
-        // `provenance.rs` reads the flag too, but as a load-time uniqueness
-        // invariant over the catalog, not to authorize anything.)
+        // What makes that safe is not the flag. A plain Petal approval never
+        // consults lineage `active` at all, and an inactive record's
+        // `fee_asset` still decides the claim. The two reads that do consult
+        // it are both on the scope-derived key path:
+        // `prepare_petal_key_scope`, once when a scoped key is prepared, and
+        // `validate_scoped_route_lineage`, per claim on that same path.
+        // (`bloom-broker-api`'s `provenance.rs` reads the flag too, in
+        // `validate_shape`, as a catalog-integrity invariant and not to
+        // authorize anything. It runs at load, from
+        // `synchronize_provenance_catalog`, and from `install_provenance`,
+        // which hands it a one-record catalog where its uniqueness half has
+        // nothing to compare.)
         //
         // The reason no claim can name a superseded package is that
         // `bloom-petals`' store resolves a Petal through a single owner
         // pointer: `write_petal_owner` flips it under the install commit, and
         // every dispatch path resolves through `resolve_petal_owner` by way of
-        // `resolve_petal_mount`, so a superseded hash stops being reachable at
-        // that rename. Not because its bytes are gone — `store.rs` deliberately
-        // keeps prior package data until the next store open so a request that
-        // resolved the old owner can finish, and `reconcile_petal_owners`
-        // deletes it later. `Runner::resolve` is the one resolver that prefers a
-        // raw hash over the owner pointer, so the superseded hash does resolve
-        // to itself inside that window; it is read-only, its one caller being
-        // the `petals.resolve` IPC, which returns a hash and executes nothing.
-        // Broker separately requires the approval's package hash to be in
-        // `allowed_petal_packages`, so reaching a superseded record's
-        // `fee_asset` would take that gate failing as well. If owner resolution
-        // ever stops being the way in — two hashes of one Petal reachable at
-        // once, or an *executing* path allowed to name a non-owner hash — this
-        // skip becomes a hole, and no test here would notice.
+        // `resolve_petal_mount`, so a superseded hash stops being newly
+        // resolvable at that rename. Not because its bytes are gone —
+        // `store.rs` deliberately keeps prior package data until the next
+        // store open so a request that resolved the old owner can finish, and
+        // `reconcile_petal_owners` deletes it later. A dispatch that resolved
+        // the old owner before the flip carries that hash into its claim, and
+        // that in-flight request is the case this skip is right for:
+        // re-deriving its record mid-flight is what would break it.
+        //
+        // Two resolvers prefer a raw hash over the owner pointer, and neither
+        // executes a Petal. `Runner::resolve` accepts any hash present in the
+        // store; its one caller is the `petals.resolve` IPC, which returns a
+        // hash and runs nothing. `resolve_uninstall_hash` is looser still — a
+        // hash prefix of twelve characters or more wins ahead of any owner or
+        // name lookup — but it only names the package `petals.uninstall` is
+        // about to remove, and produces no claim.
+        //
+        // Broker does require an approval's package hash to be in
+        // `allowed_petal_packages`, but that is not a second gate here:
+        // `policy_with_packages` only ever appends, and nothing prunes the
+        // list short of a full `default-policy` replacement under an owner
+        // ceremony, so a superseded hash stays a member indefinitely and
+        // satisfies that check as an ordinary one. This skip rests on owner
+        // resolution alone. If that ever stops being the way in — two hashes
+        // of one Petal reachable at once, or an *executing* path allowed to
+        // name a non-owner hash — it becomes a hole, and no test here would
+        // notice.
         //
         // Note also that enrolment refuses to reactivate a superseded hash
         // below, so a developer who rebuilds back to one gets a hard failure
@@ -1734,10 +1752,27 @@ mod tests {
 
     #[test]
     fn only_builder_order_petal_classes_are_catalogued_with_a_fee_asset() {
+        // Every Hyperliquid class Broker registers for message review, plus
+        // the session class and Polymarket's. Listing them individually is
+        // not enough on its own — a row added for a class absent from this
+        // list would pass — so the table's own length is pinned below.
         for class in [
             "hyperliquid.agent_action",
             "hyperliquid.order",
             "hyperliquid.approve_builder_fee",
+            "hyperliquid.approve_agent",
+            "hyperliquid.cancel",
+            "hyperliquid.cancel_by_cloid",
+            "hyperliquid.schedule_cancel",
+            "hyperliquid.update_leverage",
+            "hyperliquid.usd_send",
+            "hyperliquid.usd_class_transfer",
+            // Absent on purpose: a withdrawal's claim declares
+            // `{"kind":"none"}` and the venue's flat USDC fee is deliberately
+            // left outside it, travelling in the operation record and the
+            // signing advisory instead. Cataloguing a fee asset here would
+            // make Broker answer FEE_REQUIRED for every withdrawal.
+            "hyperliquid.withdraw",
             "polymarket.onboard",
             "polymarket.order.poly1271",
             "polymarket.relayer_batch",
@@ -1753,7 +1788,14 @@ mod tests {
         }
 
         // Hyperliquid's builder-order class is the only catalogued row, now
-        // that Polymarket's is deliberately fee-free.
+        // that Polymarket's is deliberately fee-free. Pinned by count as well
+        // as by name, so that cataloguing any further class has to come here
+        // and be argued for rather than ride in on a table edit alone.
+        assert_eq!(
+            FEE_BEARING_OPERATION_CLASSES.len(),
+            1,
+            "a new fee-bearing row needs its own case in this test"
+        );
         let class = "hyperliquid.builder_order";
         let fee = catalogued_fee_asset(class)
             .unwrap()
@@ -2203,6 +2245,24 @@ mod tests {
         );
     }
 
+    /// A developer-published Petal record the lineage marks superseded,
+    /// carrying the class the fixture plants. Both discriminators are needed
+    /// to tell one from the inactive predecessor records
+    /// `append_release_petal_provenance` contributes; see the call sites.
+    #[cfg(feature = "triad-dev-harness")]
+    fn planted_predecessor(record: &ProvenanceRecord, builder_class: &Token) -> bool {
+        matches!(record.subject, ProvenanceSubject::Petal { .. })
+            && record.publisher != Token::new("bloom-release-pins").unwrap()
+            && record
+                .petal_lineage
+                .as_ref()
+                .is_some_and(|membership| !membership.active)
+            && record
+                .operation_classes
+                .iter()
+                .any(|class| &class.operation_class == builder_class)
+    }
+
     /// A predecessor package stays in the catalog, re-signed inactive, and can
     /// never authorize anything again. A disagreement on one must not refuse
     /// the launch: the launcher runs this refresh before enrolment, and
@@ -2277,6 +2337,29 @@ mod tests {
                 .is_some(),
             "the planted class must be one the table catalogues, or this proves nothing"
         );
+
+        // Captured before the refresh so the check below compares identities
+        // and not just a count. Every consumer of a predecessor keys on
+        // identity: `check_activation` finds one by its subject package hash,
+        // and `carry_private_store` additionally requires the publisher and
+        // `lineage_id` to match before it will carry. A refresh that
+        // re-pointed a subject hash, or rewrote a publisher, would therefore
+        // drop the predecessor for both of them while leaving any count
+        // intact — and `carry_private_store` fails quietly there, returning
+        // "different_lineage" rather than an error. Serialized rather than
+        // cloned because these types are only guaranteed `Serialize` here.
+        let planted = stale
+            .records
+            .iter()
+            .filter(|record| planted_predecessor(record, &builder_class))
+            .map(|record| {
+                (
+                    serde_jcs::to_vec(&record.subject).unwrap(),
+                    serde_jcs::to_vec(&record.publisher).unwrap(),
+                    serde_jcs::to_vec(&record.petal_lineage).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
         rewrite_private_json(&catalog_path, &serde_json::to_value(&stale).unwrap()).unwrap();
 
         let template = template_dir().join("provenance-catalog.unsigned.json");
@@ -2291,30 +2374,48 @@ mod tests {
         // record is unmodified would pass vacuously if the refresh dropped it
         // or cleared its lineage, and a dropped predecessor fails an install:
         // `check_activation` needs it, and the private-state carry-forward
-        // refuses to carry without it. Scoped to the planted class because
-        // `append_release_petal_provenance` contributes inactive records of its
-        // own, which a looser count would mistake for this one.
+        // refuses to carry without it.
+        //
+        // The filter holds the count to what the fixture planted.
+        // `append_release_petal_provenance` adds inactive predecessor records
+        // of its own, many more than the fixture plants, so a bare existence
+        // probe would pass on those alone — whereas an unfiltered count fails
+        // loudly rather than quietly. Either discriminator suffices today,
+        // since no release route declares the builder class; they are kept as
+        // a pair so adding one later cannot silently widen this count.
         let carried = after
             .records
             .iter()
-            .filter(|record| {
-                matches!(record.subject, ProvenanceSubject::Petal { .. })
-                    && record.publisher != Token::new("bloom-release-pins").unwrap()
-                    && record
-                        .petal_lineage
-                        .as_ref()
-                        .is_some_and(|membership| !membership.active)
-                    && record
-                        .operation_classes
-                        .iter()
-                        .any(|class| class.operation_class == builder_class)
-            })
+            .filter(|record| planted_predecessor(record, &builder_class))
             .count();
         assert_eq!(
             carried, retired,
             "every inactive record the fixture planted must survive the refresh, \
              still carrying the lineage that marks it superseded"
         );
+
+        for (subject, publisher, lineage) in &planted {
+            let record = after
+                .records
+                .iter()
+                .find(|record| &serde_jcs::to_vec(&record.subject).unwrap() == subject)
+                .expect(
+                    "the refresh must carry every planted predecessor across \
+                     under its own subject, or `check_activation` fails the install",
+                );
+            assert_eq!(
+                &serde_jcs::to_vec(&record.publisher).unwrap(),
+                publisher,
+                "a carried predecessor must keep its publisher, or \
+                 `carry_private_store` stops recognising it and silently \
+                 declines to carry the Petal's private state"
+            );
+            assert_eq!(
+                &serde_jcs::to_vec(&record.petal_lineage).unwrap(),
+                lineage,
+                "a carried predecessor must keep its lineage, `lineage_id` included"
+            );
+        }
 
         for record in &after.records {
             let Some(membership) = &record.petal_lineage else {
