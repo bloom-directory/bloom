@@ -358,13 +358,7 @@ impl OutboxHandler {
 }
 
 fn validate_action_id(id: &str) -> Result<(), HandlerError> {
-    if id.is_empty()
-        || id == "latest"
-        || id.contains('/')
-        || id.contains('\\')
-        || id.contains('\0')
-        || id.contains("..")
-    {
+    if !bloom_proto::is_valid_action_id(id) {
         return Err(HandlerError::invalid(format!("invalid action id: {id}")));
     }
     Ok(())

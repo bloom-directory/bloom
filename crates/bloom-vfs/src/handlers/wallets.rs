@@ -2740,13 +2740,7 @@ fn outbox_err(e: OutboxError) -> HandlerError {
 /// (path traversal, the `latest` sentinel, or NUL). Real ids are
 /// `policy-update-<blake3-hex>`, so this is defense-in-depth.
 fn validate_policy_action_id(id: &str) -> Result<(), HandlerError> {
-    if id.is_empty()
-        || id == "latest"
-        || id.contains('/')
-        || id.contains('\\')
-        || id.contains('\0')
-        || id.contains("..")
-    {
+    if !bloom_proto::is_valid_action_id(id) {
         return Err(HandlerError::invalid(format!("invalid action id: {id}")));
     }
     Ok(())

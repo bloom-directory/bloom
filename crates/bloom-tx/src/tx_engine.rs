@@ -5389,7 +5389,8 @@ fn central_status(
 
 /// Rebuild a sent row's central result when a crash interrupted
 /// `write_central_evm_result`. The result is written before the status, so a
-/// status naming the hash means both are present. Without a recorded hash and
+/// status naming the wallet's hash means both are current; an older hash
+/// (from before a fee replacement) is rebuilt. Without a recorded hash and
 /// the broadcast attempt that produced it, nothing is inferred.
 pub(crate) fn repair_central_evm_result(
     outbox: &Outbox,
@@ -5400,9 +5401,12 @@ pub(crate) fn repair_central_evm_result(
     else {
         return Ok(());
     };
-    if central_status(outbox, action_id, OutboxState::Sent)?
-        .is_some_and(|status| status.contains_key("tx_hash"))
-    {
+    if central_status(outbox, action_id, OutboxState::Sent)?.is_some_and(|status| {
+        status
+            .get("tx_hash")
+            .and_then(|v| v.as_str())
+            .is_some_and(|central| central.eq_ignore_ascii_case(hash))
+    }) {
         return Ok(());
     }
     for (kind, action_kind) in [

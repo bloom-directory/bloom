@@ -239,6 +239,17 @@ pub struct StagedTx {
     pub execution_origin: Option<ExecutionOrigin>,
 }
 
+/// Whether a central action id is safe to join as one path segment: not
+/// empty, not the `latest` sentinel, and free of separators, NUL and `..`.
+pub fn is_valid_action_id(id: &str) -> bool {
+    !(id.is_empty()
+        || id == "latest"
+        || id.contains('/')
+        || id.contains('\\')
+        || id.contains('\0')
+        || id.contains(".."))
+}
+
 impl StagedTx {
     /// Validate the creation/call distinction before simulation or signing.
     /// Missing recipients on historical calls must never become deployments.

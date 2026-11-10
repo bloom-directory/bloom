@@ -545,6 +545,12 @@ impl Outbox {
         if entry.state == OutboxState::Pending {
             return Ok(());
         }
+        // A damaged id must not name a central path; skip it like an
+        // unreadable intent.
+        if !bloom_proto::is_valid_action_id(action_id) {
+            tracing::warn!(id = %entry.staged.id, %action_id, "outbox.reconcile_action_id_invalid");
+            return Ok(());
+        }
         // The central transition also repairs status.json when its rename
         // already completed. Never infer a new action from the wallet id.
         self.transition_central_action(action_id, OutboxState::Pending, entry.state)?;
@@ -2918,23 +2924,22 @@ mod tests {
         }
     }
 
-    /// A crash after the wallet move loses the central result; restart rebuilds
-    /// it from the recorded hash and attempt, once.
-    #[test]
-    fn restart_rebuilds_a_lost_central_result() {
-        let dir = tempfile::tempdir().unwrap();
-        let projection = Arc::new(MockProjection::new());
-        let outbox = Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
-        let mut staged = fake_staged("lost");
+    /// Persist a sent row whose `kind` broadcast produced `hash`.
+    fn sent_after_broadcast(
+        outbox: &Outbox,
+        id: &str,
+        kind: BroadcastAttemptKind,
+        hash: &str,
+    ) -> OutboxEntry {
+        let mut staged = fake_staged(id);
         staged.gas_price = Some("1".into());
         outbox.write_pending(&staged, "plan").unwrap();
         let mut entry = outbox.read("alice", "anvil", &staged.id).unwrap();
-        let hash = format!("0x{}", "ab".repeat(32));
         let attempt = BroadcastAttempt {
             schema: "bloom.broadcast_attempted.v1".into(),
-            tx_hash: hash.clone(),
+            tx_hash: hash.into(),
             raw_tx_blake3: String::new(),
-            raw_tx_path: BroadcastAttemptKind::Confirm.raw_name().into(),
+            raw_tx_path: kind.raw_name().into(),
             from: staged.from.clone(),
             to: staged.to.clone(),
             nonce: 0,
@@ -2944,10 +2949,10 @@ mod tests {
             private_provider: None,
         };
         outbox
-            .write_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm, &attempt)
+            .write_broadcast_attempt(&entry, kind, &attempt)
             .unwrap();
         entry.staged.status = TxStatus::Sent;
-        entry.staged.tx_hash = Some(hash.clone());
+        entry.staged.tx_hash = Some(hash.into());
         outbox
             .write_artefact(
                 &entry.dir,
@@ -2956,25 +2961,114 @@ mod tests {
             )
             .unwrap();
         outbox.transition(&entry, OutboxState::Sent).unwrap();
+        outbox.read("alice", "anvil", id).unwrap()
+    }
+
+    fn central_json(projection: &MockProjection, action_id: &str, file: &str) -> serde_json::Value {
+        serde_json::from_slice(
+            &projection
+                .read_action_file(action_id, "sent", file)
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// A crash after the wallet move loses the central result; restart rebuilds
+    /// it from the recorded hash and attempt, once.
+    #[test]
+    fn restart_rebuilds_a_lost_central_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let projection = Arc::new(MockProjection::new());
+        let outbox = Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
+        let hash = format!("0x{}", "ab".repeat(32));
+        let entry = sent_after_broadcast(&outbox, "lost", BroadcastAttemptKind::Confirm, &hash);
         let action_id = entry.staged.action_id.clone().unwrap();
         drop(outbox);
 
         let written = || projection.action_files.lock().unwrap().len();
         Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
         assert_eq!(written(), 2);
-        let read = |file: &str| -> serde_json::Value {
-            serde_json::from_slice(
-                &projection
-                    .read_action_file(&action_id, "sent", file)
-                    .unwrap(),
-            )
-            .unwrap()
-        };
+        let read = |file| central_json(&projection, &action_id, file);
         assert_eq!(read("result.json")["tx_hash"], hash);
         assert_eq!(read("result.json")["action_kind"], "evm_confirm");
         assert_eq!(read("status.json")["outcome"], "sent");
         Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
         assert_eq!(written(), 2, "a complete result is not rewritten");
+    }
+
+    /// A crash after a fee replacement updates the wallet row but before the
+    /// central result leaves the original hash centrally; restart replaces it.
+    #[test]
+    fn restart_replaces_a_stale_central_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let projection = Arc::new(MockProjection::new());
+        let outbox = Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
+        let original = format!("0x{}", "11".repeat(32));
+        let replacement = format!("0x{}", "22".repeat(32));
+        let entry = sent_after_broadcast(
+            &outbox,
+            "bumped",
+            BroadcastAttemptKind::Replacement,
+            &replacement,
+        );
+        let action_id = entry.staged.action_id.clone().unwrap();
+        for file in ["result.json", "status.json"] {
+            projection
+                .write_action_file(
+                    &action_id,
+                    "sent",
+                    file,
+                    &serde_json::to_vec(&serde_json::json!({ "tx_hash": original })).unwrap(),
+                )
+                .unwrap();
+        }
+        drop(outbox);
+
+        Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
+        let read = |file| central_json(&projection, &action_id, file);
+        assert_eq!(read("result.json")["tx_hash"], replacement);
+        assert_eq!(read("result.json")["action_kind"], "evm_replace");
+        assert_eq!(read("status.json")["tx_hash"], replacement);
+    }
+
+    /// A terminal intent whose persisted action id could escape the central
+    /// outbox is skipped without any central call; valid entries still repair.
+    #[test]
+    fn reconciliation_skips_invalid_action_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let projection = Arc::new(MockProjection::new());
+        let outbox = Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
+        let hash = format!("0x{}", "ab".repeat(32));
+        let valid = sent_after_broadcast(&outbox, "valid", BroadcastAttemptKind::Confirm, &hash);
+        let valid_id = valid.staged.action_id.clone().unwrap();
+        for (id, action_id) in [("empty", ""), ("escape", "../outside")] {
+            let mut entry = sent_after_broadcast(&outbox, id, BroadcastAttemptKind::Confirm, &hash);
+            entry.staged.action_id = Some(action_id.into());
+            outbox
+                .write_artefact(
+                    &entry.dir,
+                    "intent.json",
+                    &serde_json::to_vec(&entry.staged).unwrap(),
+                )
+                .unwrap();
+        }
+        drop(outbox);
+        projection.transitions.lock().unwrap().clear();
+        projection.action_files.lock().unwrap().clear();
+        projection.file_data.lock().unwrap().clear();
+
+        Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
+        let transitions = projection.transitions.lock().unwrap().clone();
+        assert_eq!(
+            transitions,
+            vec![(valid_id.clone(), "pending".into(), "sent".into())]
+        );
+        let files = projection.action_files.lock().unwrap().clone();
+        assert!(files.iter().all(|(action_id, _, _)| *action_id == valid_id));
+        assert_eq!(
+            central_json(&projection, &valid_id, "result.json")["tx_hash"],
+            hash
+        );
     }
 
     /// A missing or malformed terminal intent is skipped, untouched, and does
