@@ -913,7 +913,7 @@ impl WalletsHandler {
             .chain_id;
         let policy =
             crate::advisory_exact_evm_policy(&projection, chain, chain_id).map_err(err_be)?;
-        self.write_outbox_from(wallet, chain, from, &policy, chain_rest, data)
+        self.write_outbox_from(wallet, chain, from, &policy, chain_rest, data, number)
             .await
     }
 
