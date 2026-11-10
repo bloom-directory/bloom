@@ -144,6 +144,16 @@ impl Store {
             })
             .context("Unknown checkout request")
     }
+    fn description(&self, id: &str) -> Result<String> {
+        self.0
+            .lock()
+            .query_row(
+                "SELECT description FROM operations WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .context("Unknown checkout request")
+    }
     fn restart_cancellations(&self) -> Result<Vec<(String, String)>> {
         let conn = self.0.lock();
         let mut query =
@@ -1568,8 +1578,10 @@ impl CheckoutService {
             .as_ref()
             .is_some_and(|c| c.mode == Mode::TakeOver);
         let can_stay_signed_in = can_use_saved && !self.browser.has_private_traveler_data();
+        // The agent's words, shown as such: they explain the task, not facts.
+        let agent_description = self.store.description(&operation_id)?;
         Ok(
-            json!({"state":status.state,"outcome":status.outcome,"pages":pages,"selected_page":selected_page,"closed":false,"saved":saved,"can_use_saved":can_use_saved,"can_stay_signed_in":can_stay_signed_in}),
+            json!({"state":status.state,"outcome":status.outcome,"pages":pages,"selected_page":selected_page,"closed":false,"saved":saved,"can_use_saved":can_use_saved,"can_stay_signed_in":can_stay_signed_in,"agent_description":agent_description}),
         )
     }
 
@@ -2356,6 +2368,8 @@ mod tests {
             });
             let state = service.private_state(&token).await.unwrap();
             assert_eq!(state["can_stay_signed_in"], mode == Mode::TakeOver);
+            // The view shows the person what the agent asked for.
+            assert_eq!(state["agent_description"], "Fixture");
             let stay = ViewAction::Finish {
                 stay_signed_in: true,
             };
