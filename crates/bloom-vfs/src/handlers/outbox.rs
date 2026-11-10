@@ -22,6 +22,21 @@ use crate::handler::{
 };
 use crate::path::VfsPath;
 
+/// The Petal that staged an outbox entry, as `petals/<name>/`, from its
+/// `execution_origin.petal_id`. A Petal rechecks its own conditions when it
+/// confirms, so agents confirm and retry its entries through it. Bloom
+/// persists only the Petal and an opaque route id, not the route's path.
+pub fn staging_petal(petal_id: &str) -> Option<String> {
+    petal_id
+        .strip_prefix(bloom_proto::petal_identity::PETAL_ID_PREFIX)
+        .map(|name| format!("petals/{name}/"))
+}
+
+/// Where to confirm or retry an entry `petal` staged, for agent-facing text.
+pub fn through_staging_petal(petal: &str) -> String {
+    format!("through the Petal that staged this entry ({petal}; see its README)")
+}
+
 const STATES: &[&str] = &["pending", "sent", "failed"];
 const ACTION_FILES: &[&str] = &[
     "intent.json",

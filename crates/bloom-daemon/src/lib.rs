@@ -5450,6 +5450,14 @@ async fn wallet_dirs(tree: &dyn Handler, path: &str, unreadable: &mut Vec<String
     }
 }
 
+/// The Petal that staged `entry`, from the `execution_origin` in its
+/// `intent.json`. Solana and directly staged entries have none.
+async fn staging_petal(tree: &dyn Handler, entry: &str) -> Option<String> {
+    let path = VfsPath::parse(&format!("{entry}/intent.json")).ok()?;
+    let intent: serde_json::Value = serde_json::from_slice(&tree.read(&path).await.ok()?).ok()?;
+    bloom_vfs::handlers::outbox::staging_petal(intent["execution_origin"]["petal_id"].as_str()?)
+}
+
 /// One line for a pending outbox entry. `ceremony_url` is an owner
 /// capability, so it stays in the challenge file.
 async fn outbox_entry_line(tree: &dyn Handler, entry: &str) -> String {
@@ -5459,8 +5467,15 @@ async fn outbox_entry_line(tree: &dyn Handler, entry: &str) -> String {
     };
     let challenge: serde_json::Value = match read {
         Err(HandlerError::NotFound(_)) => {
+            let confirm = match staging_petal(tree, entry).await {
+                Some(petal) => format!(
+                    "confirm {}",
+                    bloom_vfs::handlers::outbox::through_staging_petal(&petal)
+                ),
+                None => "write `confirm` to its `confirm`".into(),
+            };
             return format!(
-                "- `wallets/{entry}/`: staged, not confirmed. Review its `plan.md`; write `confirm` to its `confirm` only if the owner still wants it, or `cancel` to discard it.\n"
+                "- `wallets/{entry}/`: staged, not confirmed. Review its `plan.md`; {confirm} only if the owner still wants it, or write `cancel` to its `confirm` to discard it.\n"
             );
         }
         Err(error) => {
@@ -6318,7 +6333,7 @@ mod tests {
             dirs: [
                 ("alice", vec!["0", "policy-updates"]),
                 ("alice/0/chains", vec!["base", "ethereum"]),
-                ("alice/0/chains/base/outbox/pending", vec!["tx-staged", "tx-approval", "tx-petal"]),
+                ("alice/0/chains/base/outbox/pending", vec!["tx-staged", "tx-approval", "tx-petal", "tx-petal-staged"]),
                 (
                     "alice/policy-updates/pending",
                     vec!["policy-update-1", "policy-update-expired"],
@@ -6338,6 +6353,10 @@ mod tests {
                 (
                 "alice/0/chains/base/outbox/pending/tx-approval/approval_challenge.json",
                 r#"{"state":"awaiting_ceremony","next":"Give ceremony_url to the owner.","ceremony_url":"http://127.0.0.1:18734/c#secret","retry_path":"wallets/alice/0/chains/base/outbox/pending/tx-approval/confirm"}"#,
+                ),
+                (
+                    "alice/0/chains/base/outbox/pending/tx-petal-staged/intent.json",
+                    r#"{"id":"tx-petal-staged","execution_origin":{"petal_id":"petal:pendle"}}"#,
                 ),
                 (
                 "alice/0/chains/base/outbox/pending/tx-petal/approval_challenge.json",
@@ -6374,6 +6393,17 @@ mod tests {
             !petal.contains("retry_path") && !petal.contains("`confirm`"),
             "{petal}"
         );
+        // Before any approval, the first confirm also goes through the Petal.
+        let staged = md
+            .lines()
+            .find(|line| line.contains("pending/tx-petal-staged/"))
+            .unwrap_or_else(|| panic!("{md}"));
+        assert!(
+            staged.contains("confirm through the Petal that staged this entry (petals/pendle/"),
+            "{staged}"
+        );
+        assert!(!staged.contains("write `confirm`"), "{staged}");
+        assert!(md.contains("pending/tx-staged/`: staged, not confirmed. Review its `plan.md`; write `confirm` to its `confirm`"), "{md}");
         assert!(
             md.contains("`wallets/alice/policy-updates/pending/policy-update-1/`"),
             "{md}"

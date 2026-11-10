@@ -2260,16 +2260,12 @@ fn evm_approval_challenge(
         "retry_path": format!("{outbox}/pending/{}/{control}", staged.id),
         "retry_body": retry_body,
     });
-    // A Petal rechecks its own conditions when it confirms, so a confirm of
-    // the entry it staged goes back through that Petal. Bloom persists only
-    // the Petal and an opaque route id, not the route's concrete path.
-    let petal = staged.execution_origin.as_ref().and_then(|origin| {
-        origin
-            .petal_id
-            .strip_prefix(bloom_proto::petal_identity::PETAL_ID_PREFIX)
-    });
+    let petal = staged
+        .execution_origin
+        .as_ref()
+        .and_then(|origin| crate::handlers::outbox::staging_petal(&origin.petal_id));
     if let (Some(petal), "confirm" | "confirm.override") = (petal, control) {
-        challenge["staged_by"] = format!("petals/{petal}/").into();
+        challenge["staged_by"] = petal.into();
         if let Some(object) = challenge.as_object_mut() {
             object.remove("retry_path");
             object.remove("retry_body");
@@ -2289,9 +2285,10 @@ fn reconcile_approval_challenge(
     live: Option<&bloom_broker_api::ApprovalPublicStatus>,
 ) {
     let retry = match challenge.get("staged_by").and_then(|petal| petal.as_str()) {
-        Some(petal) => {
-            format!("retry through the Petal that staged this entry ({petal}; see its README)")
-        }
+        Some(petal) => format!(
+            "retry {}",
+            crate::handlers::outbox::through_staging_petal(petal)
+        ),
         None => "write retry_body to retry_path".into(),
     };
     let (state, next) = match live {
