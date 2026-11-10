@@ -68,45 +68,26 @@ Amounts use ISO 4217 minor units. Checkout conversion and Broker's approval
 display use those exponents, not the browser's currency display precision:
 for example, HUF28,826.50 is 2882650 minor units even when CLDR normally
 displays forints without fractions.
-A card is filled only into fields hosted by a known payment provider
-(`PROVIDER_FIELD_ORIGINS`); other pages go to the private view.
+A card is filled only into reviewed provider field origins, provider page
+origins, or merchant card origins (`PROVIDER_FIELD_ORIGINS`,
+`PROVIDER_PAGE_ORIGINS`, and `MERCHANT_CARD_ORIGINS`). Other pages go to the
+private view.
 
-The approval page also shows the entered fields and, when checkout owns the
-browser, a screenshot of the order. These are human aids and are not bound to
-the approval.
+The approval page can also show entered fields and a screenshot of the order.
+Checkout omits both after saved traveler data is used, because the approval
+link is available to the agent. These aids are not bound to the approval.
 
 ## Saved booking party
 
-Checkout retains up to twelve independently approved traveler records within
-one origin/journey (nine passengers and separate payer/billing/contact roles).
-Private values remain in checkout. `fill_traveler` and `type_traveler` accept
-`traveler_id`; it is mandatory when multiple records are unlocked and must
-name an already approved record. Existing single-person JSON remains valid.
-
-Duplicate passenger forms are not filled by guessing DOM order. The agent uses
-public field references and the exact approved person's ID for each passenger
-or payer/contact field. No raw saved values are accepted from or returned to
-Machine. A new explicit open and private completion/handback clear the cache;
-expired records are refused synchronously and erased by a one-second sweep.
-Cancellation discards an outstanding recipient key or removes the unlocked
-record, durably marks the operation cancelled and cannot be reversed by a late
-release/poll result. Broker cancellation is best effort after local revocation;
-an unavailable Broker cannot preserve local fill access. Already disclosed
-page values cannot be recalled.
-Snapshot-redaction patterns use zeroizing storage and remain until the browser
-context is safely discarded, so expiry cannot expose values already in a DOM.
-Filled controls also carry private annotations in an isolated-world WeakMap;
-their public values become saved-field placeholders. This protects short date
-parts without replacing the same digits in prices or flight dates. Custom
-selected-value wrappers and saved radio groups are marked too: their labels,
-context and selection state cannot reveal the value. While those displays are
-present, text uses the masked control projection rather than a second
-accessibility outline that can repeat the selected values.
-Known numeric and English full-date renderings are redacted in review text.
-Names remain private at any length and after Unicode case changes. Short ASCII
-tokens match whole words. Filtering changes merchant text, labels and values;
-protocol keys, control references, roles, types and frame origins remain exact.
-Before payment approval, verify the itinerary, party, extras and final total.
+Machine never fills saved travelers. A merchant page that holds a saved value
+can re-encode it into any text, so no filter on page output can keep it from
+the agent. The agent requests a take-over; the person chooses a saved traveler
+in the private view and approves that one fill, bound to the page's origin,
+document and field mapping. Payment for that page also happens in the private
+view. On handback Checkout discards the browsing context, so Machine never
+observes a page that held traveler data. No raw saved values are accepted
+from or returned to Machine. Duplicate passenger forms are not filled by
+guessing DOM order: discovery refuses them and the person types privately.
 
 Phone fill derives a country and calling code from the approved international
 number. Area/local derivation accepts the library's hyphenated groups as well
@@ -123,7 +104,7 @@ and pending calls fail without replay, leaving later commands usable. When a
 page already exceeds the 30,000-character public text budget, skip generating
 its accessibility outline. If an outline still exceeds the reply bound,
 public text reuses the existing
-bounded control labels and context; private-field value filtering still applies.
+bounded control labels and context.
 Labels operating hidden native inputs retain their place alongside native
 controls, so result cards cannot crowd out the search filters.
 Public label activation also checks an associated submit/button control's
@@ -141,7 +122,7 @@ When an airline rejects Bloom's browser, the agent tries an agency selling
 the selected itinerary on Google's booking page. It reports the agency's
 price and booking terms before approval. If no listed seller works, it may
 search a known agency's normal website for the same flights, verifying actual
-airports, local dates/times, cabin and party before unlocking travelers. If
+airports, local dates/times, cabin and party before the traveler take-over. If
 no matching offer works, it gives the person the booking link. No fingerprint spoofing, automated CAPTCHA
 solving or cookie import is used.
 
@@ -153,7 +134,7 @@ inside the VFS.
 
 ## Private view
 
-The private view is an HTTP page on `localhost` served by `bloom-checkout`,
+The private view is an HTTP page on `127.0.0.1` served by `bloom-checkout`,
 opened from the approval page with a one-use capability, exchanged for a
 separate random session secret kept in the human browser's origin-scoped
 localStorage. Requests send that key explicitly in an Authorization header.
@@ -167,8 +148,8 @@ capability, session secret and screenshots never appear in VFS. Approved
 active status includes a public `view_url` pointing to `/view`; it grants no
 access without that browser's existing origin-scoped session key. It is not reachable from another device.
 
-Takeover is for login, verification or an unsupported field, not routine
-passenger entry. On handback, checkout discards the whole browsing context,
+Takeover is for login, verification, saved-traveler entry or an unsupported
+field. On handback, checkout discards the whole browsing context,
 including the login and any booking session, and resumes shopping in a fresh
 blank tab, as card and site-payment completion do. Machine's clicks are not
 an authorization boundary: page text cannot tell a harmless "Continue" from a
@@ -184,10 +165,6 @@ same rule: loopback, private, link-local, carrier-grade NAT, multicast and
 other special-use addresses are refused, and a name with any refused address
 is refused whole, so DNS rebinding cannot pick one. Only test and
 `triad-dev-harness` builds also allow loopback, for fixture merchants.
-
-Every explicit open starts a new traveler-unlock context, even on the same
-origin. An approval returned for an earlier context is discarded. Private
-traveler actions recheck context and origin while holding the browsing lock.
 
 ## Durable states and recovery
 
@@ -215,11 +192,12 @@ The operation store is written before every irreversible step:
   the reference plus a merchant-reported purchase/payment confirmation or
   issued-ticket evidence. This remains page-derived evidence, not independent
   bank settlement. An unresolved card or site payment blocks another payment
-  at its recorded shop origin, including a new operation ID. Only the person
-  clears that block: a take-over request naming the earlier operation in
-  `resolves` gets its own passkey approval, and the person's Done in that
-  private view marks it `human_checked`. Machine cannot assert it. This is a shop-wide safeguard, not independent settlement
-  or reconciliation of individual bookings.
+  at its recorded shop origin, including a new operation ID. A take-over
+  request naming the earlier operation in `resolves` gets its own passkey
+  approval so the person can inspect the shop or bank. Its Done closes the
+  view; it never clears the earlier result or permits another payment. This
+  is a shop-wide safeguard, not independent settlement or reconciliation of
+  individual bookings.
 
 `checkout/history.json` lists the 50 latest requests with mode, shop origin,
 the approved total and the current status, so an agent can avoid buying twice.

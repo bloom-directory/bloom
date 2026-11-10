@@ -9,6 +9,20 @@ use tokio::{
     time::sleep,
 };
 
+// Shared CI runners may spend tens of seconds starting Chromium. This is a
+// readiness deadline, not a sleep; report bounded child logs on failure.
+const STARTUP_BUDGET: Duration = Duration::from_secs(60);
+fn diagnostics(path: &std::path::Path) -> String {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    text.chars()
+        .rev()
+        .take(8192)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect()
+}
+
 async fn request(socket: &std::path::Path, body: serde_json::Value) -> serde_json::Value {
     let stream = UnixStream::connect(socket).await.unwrap();
     let (reader, mut writer) = stream.into_split();
@@ -64,7 +78,8 @@ async fn checkout_exits_unsuccessfully_when_its_browser_exits() {
         .to_string();
     let binary = std::env::var("NEXTEST_BIN_EXE_bloom_checkout")
         .unwrap_or_else(|_| env!("CARGO_BIN_EXE_bloom-checkout").into());
-    let spawn = || {
+    let log = root.path().join("checkout.log");
+    let spawn = |port: &str| {
         Command::new(&binary)
             .arg("--chromium")
             .arg(&wrapper)
@@ -82,29 +97,40 @@ async fn checkout_exits_unsuccessfully_when_its_browser_exits() {
                 "--machine-uid",
                 &uid,
                 "--view-port",
-                &port,
+                port,
             ])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::inherit())
+            .stderr(
+                fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log)
+                    .unwrap(),
+            )
             .kill_on_drop(true)
             .spawn()
             .unwrap()
     };
-    let mut checkout = spawn();
+    let mut checkout = spawn(&port);
     let pid = checkout.id().unwrap();
     let children_path = format!("/proc/{pid}/task/{pid}/children");
-    let ready = tokio::time::timeout(Duration::from_secs(10), async {
+    let ready = tokio::time::timeout(STARTUP_BUDGET, async {
         while !socket.exists() {
             assert!(
                 checkout.try_wait().unwrap().is_none(),
-                "checkout exited before readiness"
+                "checkout exited before readiness: {}",
+                diagnostics(&log)
             );
             sleep(Duration::from_millis(50)).await;
         }
     })
     .await;
-    assert!(ready.is_ok(), "checkout did not become ready");
+    assert!(
+        ready.is_ok(),
+        "checkout did not become ready: {}",
+        diagnostics(&log)
+    );
     // A known payment result must survive a fresh browser, even if cleanup
     // previously left shopping paused. This is this test's own synthetic store.
     let status = serde_json::json!({
@@ -137,12 +163,16 @@ async fn checkout_exits_unsuccessfully_when_its_browser_exits() {
         !exit.success(),
         "browser loss must trigger service-manager restart"
     );
-    let mut restarted = spawn();
-    let restored = tokio::time::timeout(Duration::from_secs(20), async {
+    // Another process can own the former port; installed services request
+    // zero so restart gets a new listener instead of looping on that collision.
+    let _occupied = std::net::TcpListener::bind(format!("127.0.0.1:{port}")).unwrap();
+    let mut restarted = spawn("0");
+    let restored = tokio::time::timeout(STARTUP_BUDGET, async {
         loop {
             assert!(
                 restarted.try_wait().unwrap().is_none(),
-                "checkout restart failed"
+                "checkout restart failed: {}",
+                diagnostics(&log)
             );
             // The old socket can remain briefly; wait for the new listener.
             if UnixStream::connect(&socket).await.is_ok() {
@@ -156,7 +186,7 @@ async fn checkout_exits_unsuccessfully_when_its_browser_exits() {
         }
     })
     .await
-    .expect("checkout did not restart");
+    .unwrap_or_else(|_| panic!("checkout did not restart: {}", diagnostics(&log)));
     assert_eq!(restored["state"], "booked");
     assert_eq!(restored["outcome"], status["outcome"]);
     assert_ne!(restored["paused"], true);

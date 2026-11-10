@@ -239,7 +239,7 @@
   // The words a checkout uses to say it recurs, in the languages the rest of
   // this reader already covers. A German page saying "Abonnement" is as plain
   // as an English one saying "subscription".
-  const recurring = processorRecurring ?? /\b(subscriptions?|recurring|auto.?renew(?:s|al|ing)?|renews|monthly|annually|suscripci[oó]n|abonnements?|abonament|abbonamento|assinatura|mensual(?:idad)?|mensuel(?:le)?|mensile|monatlich|j[äa]hrlich|anual|annuel(?:le)?|annuale)\b/iu.test(text);
+  const recurringWords = /\b(subscriptions?|recurring|auto(?:matic(?:ally)?)?[\s-]*renew(?:s|al|ing)?|renews|monthly|annually|suscripci[oó]n|abonnements?|abonament|abbonamento|assinatura|mensual(?:idad)?|mensuel(?:le)?|mensile|monatlich|j[äa]hrlich|anual|annuel(?:le)?|annuale)\b/iu.test(text) || /verl[äa]ngert sich automatisch/iu.test(text);
   // A trial price hides what a subscription really costs. Read the ongoing
   // price the page prints as "<amount> per <period>", and the day it starts
   // when the page writes a date no reader could take two ways. Anything less
@@ -264,6 +264,15 @@
     // Two different ongoing prices on one page is a plan chooser, not a fact.
     return found.size === 1 ? [...found.values()][0] : null;
   };
+  // Trial wording near a periodic price is recurring even without the word
+  // "subscription". Do not treat an installment offer as a trial.
+  const trialPrice = [...text.matchAll(money)].some(match => {
+    const after = text.slice(match.index + match[0].length, match.index + match[0].length + 24);
+    if (!period.test(after)) return false;
+    const context = text.slice(Math.max(0, match.index - 80), match.index + match[0].length + 80);
+    return /\b(then|trial|thereafter|danach|puis|despu[ée]s)\b/iu.test(context);
+  });
+  const recurring = processorRecurring === true || recurringWords || trialPrice;
   const months = ['january','february','march','april','may','june','july','august','september','october','november','december'];
   const iso = (year, month, day) =>
     `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;

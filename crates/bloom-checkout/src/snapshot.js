@@ -35,21 +35,7 @@
     (getComputedStyle(e).cursor === 'pointer' && (!e.parentElement || getComputedStyle(e.parentElement).cursor !== 'pointer'));
   const slotted = e => [...e.querySelectorAll('slot')].flatMap(s => s.assignedNodes({flatten: true}))
     .map(n => n.nodeType === Node.TEXT_NODE ? n.textContent : n.innerText || '').join(' ');
-  // Custom selectors render saved values beside an emptied input. Mask that
-  // display in labels and surrounding context, without hiding unrelated dates.
-  const privateDisplays = [...(globalThis.__bloomPrivateDisplays || [])].filter(e => e.isConnected);
-  const privateDisplay = e => privateDisplays.find(node => node === e || node.contains(e));
-  const placeholder = e => `[saved ${globalThis.__bloomPrivateFields.get(e)}]`;
-  const text = e => {
-    const display = privateDisplay(e);
-    if (display) return placeholder(display);
-    let shown = e.innerText || slotted(e);
-    for (const node of privateDisplays) {
-      const value = node.innerText || slotted(node);
-      if (value && e.contains(node)) shown = shown.replaceAll(value, placeholder(node));
-    }
-    return shown.replace(/\s+/g, ' ').trim();
-  };
+  const text = e => (e.innerText || slotted(e)).replace(/\s+/g, ' ').trim();
   const field = e => e.matches('input,select,textarea');
   // Some sites caption a field with text beside it instead of a <label>: use
   // the text of the smallest wrapper holding only this field.
@@ -65,11 +51,10 @@
   const pictured = e => [...e.querySelectorAll('img[alt],[title]')].map(i => i.alt || i.title).filter(Boolean).join(' ');
   const namedBy = e => (e.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
     .map(id => { const node = e.getRootNode().getElementById(id); return node ? text(node) : ''; }).join(' ').trim();
-  const label = e => privateDisplay(e) ? placeholder(privateDisplay(e)) : (namedBy(e) || e.getAttribute('aria-label') || (e.labels?.[0] && text(e.labels[0]))
+  const label = e => (namedBy(e) || e.getAttribute('aria-label') || (e.labels?.[0] && text(e.labels[0]))
     || (e.matches('input[type="button"],input[type="submit"],input[type="reset"]') ? e.value : '') || (field(e) ? '' : text(e)) || e.placeholder
     || (field(e) ? caption(e) || e.name : pictured(e)) || '').replace(/\s+/g, ' ').trim();
-  // Card and password values never leave the page; checkout redacts saved
-  // traveler values before the agent reads anything else.
+  // Card and password values never leave the page.
   const secret = BLOOM_CARD_SECRET;
   // Actions use this same live classifier, including slotted labels and
   // captions beside numeric placeholders, before inserting any public text.
@@ -116,7 +101,6 @@
   globalThis.__bloomRefs = nodes;
   const checked = e => {
     const input = e.tagName === 'LABEL' ? e.control : e;
-    if (input && privateDisplay(input)) return undefined;
     return ['checkbox', 'radio'].includes(input?.type) ? input.checked : undefined;
   };
   const elements = nodes.map(e => ({
@@ -125,16 +109,14 @@
     context: context(e),
     type: e.type || null,
     // Numeric placeholders can hide the adjacent card-field caption.
-    value: field(e) && e.type !== 'checkbox' && e.type !== 'radio' && !privateInput(e) ?
-      (e.value && globalThis.__bloomPrivateFields?.has(e) ? `[saved ${globalThis.__bloomPrivateFields.get(e)}]` : String(e.value).slice(0, 200)) : undefined,
+    value: field(e) && e.type !== 'checkbox' && e.type !== 'radio' && !privateInput(e) ? String(e.value).slice(0, 200) : undefined,
     checked: checked(e),
     // Lets an agent read a document link without opening it. Like the page
     // url, the query and fragment, which can carry tokens, are left out.
-    href: e.tagName === 'A' && !privateDisplay(e) && /^https?:$/.test(e.protocol) ? e.origin + e.pathname : undefined,
+    href: e.tagName === 'A' && /^https?:$/.test(e.protocol) ? e.origin + e.pathname : undefined,
     options: e.tagName === 'SELECT' ? [...e.options].map(o => ({value: o.value, label: o.text})) : undefined
   }));
   // Child frames are observed separately; their contents are never merged here.
   return {url: location.href === 'about:blank' ? 'about:blank' : location.origin + location.pathname,
-    elements, private_displays: privateDisplays.length > 0,
-    large_page: document.body.innerText.length > 30000};
+    elements, large_page: document.body.innerText.length > 30000};
 })()

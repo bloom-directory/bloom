@@ -2,6 +2,8 @@
 pub mod browser;
 mod cdp;
 mod discovery;
+#[cfg(target_os = "linux")]
+pub mod display;
 mod egress;
 mod hpke;
 mod scripts;

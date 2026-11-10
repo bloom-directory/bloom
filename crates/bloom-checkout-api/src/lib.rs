@@ -4,38 +4,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BrowseRequest {
-    Open {
-        url: String,
-    },
+    Open { url: String },
     Snapshot,
-    Click {
-        element_ref: String,
-    },
-    Type {
-        element_ref: String,
-        text: String,
-    },
-    Select {
-        element_ref: String,
-        value: String,
-    },
+    Click { element_ref: String },
+    Type { element_ref: String, text: String },
+    Select { element_ref: String, value: String },
     Back,
-    /// Fill the unlocked traveler's fields on this page without returning them.
-    FillTraveler {
-        /// Required when more than one saved person is unlocked for this journey.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        traveler_id: Option<String>,
-    },
-    /// Type one unlocked traveler value into an element the agent chose.
-    /// `field` is a saved field, or `phone_national` (no country code),
-    /// `phone_area`, `phone_local`,
-    /// `born_on_day`, `born_on_month`, `born_on_year`, `born_on_dmy` (DD/MM/YYYY).
-    TypeTraveler {
-        element_ref: String,
-        field: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        traveler_id: Option<String>,
-    },
 }
 
 #[derive(Deserialize, Serialize)]
@@ -47,7 +21,8 @@ pub enum Request {
     /// With `card_id`, Bloom fills that saved card. Without one, Bloom clicks
     /// the merchant's pay button and the merchant charges the payment method
     /// saved in the buyer's account there. `take_over` instead hands the
-    /// browser to the human (a login, a code) and buys nothing.
+    /// browser to the human (a login, a code, saved travelers) and buys
+    /// nothing itself.
     Checkout {
         operation_id: String,
         #[serde(default)]
@@ -56,17 +31,11 @@ pub enum Request {
         #[serde(default)]
         take_over: bool,
         /// With `take_over`, an earlier card or site checkout whose result is
-        /// unknown. The person checks the shop or bank in the private view;
-        /// only their Done there marks it checked and allows another payment
-        /// at that shop.
+        /// unknown. The approved take-over lets the person inspect the shop or
+        /// bank in the private view. Its Done never clears that uncertainty
+        /// or permits another payment at the shop.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resolves: Option<String>,
-    },
-    /// Unlock a saved traveler for the current website with one approval.
-    /// Values stay in checkout; `FillTraveler` puts them on each page.
-    Traveler {
-        operation_id: String,
-        traveler_id: String,
     },
     Status {
         operation_id: String,
@@ -176,9 +145,6 @@ pub struct Outcome {
     pub order_id: Option<String>,
     pub merchant_reported_total_minor: Option<u64>,
     pub currency: Option<String>,
-    /// Set when a person marks an unresolved result checked.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resolution: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -191,9 +157,6 @@ pub enum BrowseResponse {
 #[serde(deny_unknown_fields)]
 pub struct Action {
     pub state: String,
-    /// Field names `FillTraveler` filled; never their values.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub filled_fields: Option<Vec<String>>,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -217,8 +180,7 @@ pub struct Element {
     pub input_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub options: Option<Vec<SelectOption>>,
-    /// Field contents, except card and password fields. Unlocked traveler
-    /// values appear as `[saved <field>]`.
+    /// Field contents, except card and password fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -260,20 +222,5 @@ mod tests {
             assert_eq!(serde_json::to_value(parsed).unwrap(), entry);
         }
         assert!(serde_json::from_value::<PreparationReason>(json!("merchant text")).is_err());
-    }
-
-    #[test]
-    fn traveler_selection_keeps_single_person_json_compatible() {
-        for value in [
-            json!({"action":"fill_traveler"}),
-            json!({"action":"type_traveler","element_ref":"1:0","field":"given_name"}),
-        ] {
-            let request: BrowseRequest = serde_json::from_value(value.clone()).unwrap();
-            assert_eq!(serde_json::to_value(request).unwrap(), value);
-        }
-        let value = json!({"action":"type_traveler","element_ref":"1:0","field":"given_name","traveler_id":"saved-person-one"});
-        let request: BrowseRequest = serde_json::from_value(value.clone()).unwrap();
-        assert_eq!(serde_json::to_value(request).unwrap(), value);
-        assert!(serde_json::from_value::<BrowseRequest>(json!({"action":"fill_traveler","traveler_id":"one","values":{"given_name":"not allowed"}})).is_err());
     }
 }

@@ -24,15 +24,20 @@ struct Args {
     broker_uid: u32,
     #[arg(long)]
     machine_uid: u32,
-    #[arg(long)]
+    #[arg(long, default_value_t = 0)]
     view_port: u16,
+    /// Run Chromium as the normal browser on a private Xvfb display started
+    /// from this path, instead of headless. Linux only. Some shops refuse
+    /// headless browsers.
+    #[arg(long)]
+    xvfb: Option<PathBuf>,
     /// Exit cleanly when the session-bound Broker disappears (launchd lifecycle).
     #[arg(long)]
     follow_broker_lifecycle: bool,
     /// Shop in an ordinary browser window on the display this process is given,
     /// rather than a headless one that shops recognise and turn away. The
     /// display may be virtual, so this does not require a screen.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "xvfb")]
     browser_window: bool,
     #[cfg(feature = "triad-dev-harness")]
     #[arg(long)]
@@ -53,6 +58,8 @@ async fn main() -> Result<()> {
     let lifecycle_socket = args.broker_socket.clone();
     let lifecycle_uid = args.broker_uid;
     let follow_broker = args.follow_broker_lifecycle;
+    CheckoutService::reconcile_before_browser(&args.state, &args.broker_socket, args.broker_uid)
+        .await?;
     #[cfg(feature = "triad-dev-harness")]
     let flags = if args.fixture_allow_insecure_tls {
         vec!["--ignore-certificate-errors".into()]
@@ -61,17 +68,44 @@ async fn main() -> Result<()> {
     };
     #[cfg(not(feature = "triad-dev-harness"))]
     let flags = Vec::new();
-    let browser =
-        Browser::launch_with(&args.chromium, &args.profile, &flags, args.browser_window).await?;
+    // The display lives until Checkout exits; Chromium exits with it.
+    #[cfg(target_os = "linux")]
+    let display = match &args.xvfb {
+        Some(xvfb) => {
+            use anyhow::Context;
+            let dir = args.state.parent().context("State path has no directory")?;
+            Some(bloom_checkout::display::Display::start(xvfb, dir)?)
+        }
+        None => None,
+    };
+    #[cfg(target_os = "linux")]
+    let display_environment = display
+        .as_ref()
+        .map(|display| display.environment().to_vec())
+        .unwrap_or_default();
+    #[cfg(not(target_os = "linux"))]
+    let display_environment = match &args.xvfb {
+        Some(_) => anyhow::bail!("--xvfb is supported only on Linux"),
+        None => Vec::new(),
+    };
+    let headed = args.xvfb.is_some() || args.browser_window;
+    let browser = Browser::launch_on(
+        &args.chromium,
+        &args.profile,
+        &flags,
+        headed.then_some(display_environment.as_slice()),
+    )
+    .await?;
+    let view_listener =
+        tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, args.view_port)).await?;
+    let view_port = view_listener.local_addr()?.port();
     let service = CheckoutService::new(
         browser.clone(),
         &args.state,
         args.broker_socket,
         args.broker_uid,
-        args.view_port,
+        view_port,
     )?;
-    let view_listener =
-        tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, args.view_port)).await?;
     let api = serve_api(service.clone(), &args.socket, args.machine_uid);
     let viewer = axum::serve(view_listener, view::router(service));
     let lifecycle = async {

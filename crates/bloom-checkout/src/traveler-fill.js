@@ -3,7 +3,7 @@
   if (!binding || binding.document !== document || binding.nonce !== nonce || location.origin !== origin) throw Error('Traveler document changed');
   const normalize = s => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().trim();
   const filled = [], skipped = [];
-  // A site list that does not take the value is left for the agent's type_traveler.
+  // A site list that does not take the value is left for the person to choose.
   class Skip extends Error {}
   const shownValue = e => e.tagName === 'SELECT' ? e.selectedOptions[0]?.text || ''
     : e.value || e.getAttribute('placeholder') || e.getAttribute('aria-label') || '';
@@ -43,17 +43,10 @@
   for (const mapping of order) {
   try {
     const e=binding.refs[mapping.index];
-    // choose is decided from the element before the readonly guard: a site
-    // list is often a read-only input that checkout already opened.
-    if (mapping.choose && e) {
-      mapping.choice = e.tagName === 'INPUT';
-      mapping.listOpen = mapping.choice;
-    }
     if (!e?.isConnected || e.ownerDocument !== document || e.disabled || (e.readOnly && !mapping.choice) || !e.getClientRects().length
         || (e.autocomplete || '').split(' ').some(s=>s.startsWith('cc-')) || e.type === 'password') throw Error('Traveler field changed');
     let value=values[mapping.field];
     if (typeof value !== 'string') throw Error('Traveler field unavailable');
-    (globalThis.__bloomPrivateFields ||= new WeakMap()).set(e, mapping.field + (mapping.part ? '_' + mapping.part : ''));
     let aliases = [value];
     if (mapping.field === 'phone' && mapping.part !== 'country' && values.phone_calling_code) {
       const prefixes = phonePrefix(e);
@@ -99,7 +92,6 @@
       if (radios.length !== 1) throw new Skip(`radio ambiguous: ${radios.length} options`);
       radios[0].click();
       if (!radios[0].checked) throw new Skip('radio not checked');
-      (globalThis.__bloomPrivateDisplays ||= new Set()).add(e);
       filled.push(mapping.field);
       continue;
     }
@@ -125,10 +117,9 @@
         return found.some(optionLike) ? found.filter(optionLike) : found;
       };
       // A read-only list may already sit in the page, hidden or clipped.
-      const before = new Set(mapping.part !== 'country' && (e.readOnly || mapping.listOpen) ? [] : candidates());
+      const before = new Set(mapping.part !== 'country' && e.readOnly ? [] : candidates());
       // A month list may use numbers or names: try the number, then the name.
-      // listOpen: checkout already opened the list with a real click.
-      const attempts = mapping.listOpen ? [null] : e.readOnly ? [typed] : mapping.part === 'month' ? [typed, aliases.at(-1)]
+      const attempts = e.readOnly ? [typed] : mapping.part === 'month' ? [typed, aliases.at(-1)]
         : mapping.part === 'day' ? [typed, typed.padStart(2,'0')] : [typed];
       // A list that searches from the start of each option ("PAS - Pasaporte")
       // finds nothing for the name: last, clear the box and open the whole list.
@@ -136,9 +127,9 @@
       let option;
       for (const attempt of attempts) {
         typed = attempt ?? '';
-        if (e.readOnly && !mapping.listOpen) e.click();
+        if (e.readOnly) e.click();
         else if (attempt === null) {
-          if (!mapping.listOpen) { e.focus(); e.select(); document.execCommand('delete'); }
+          e.focus(); e.select(); document.execCommand('delete');
           // Open the list one way at a time: some toggle on each event, so
           // stop as soon as options show.
           let toggle;
@@ -180,10 +171,6 @@
       for (let a = e.parentElement, depth = 0; a && depth < 4 && !shownBeside; a = a.parentElement, depth++) {
         const shown = normalize(a.innerText);
         shownBeside = shown === chosen || aliases.some(x => normalize(x).length > 1 && normalize(x) === shown);
-        if (shownBeside) {
-          globalThis.__bloomPrivateFields.set(a, mapping.field + (mapping.part ? '_' + mapping.part : ''));
-          (globalThis.__bloomPrivateDisplays ||= new Set()).add(a);
-        }
       }
       const taken = normalize(e.value);
       // Typed text alone proves nothing: an editable list must also have closed.

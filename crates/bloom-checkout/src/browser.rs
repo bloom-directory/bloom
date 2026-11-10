@@ -18,8 +18,6 @@ struct ElementRef {
     session: String,
     world: i64,
     index: usize,
-    /// Origin of the frame holding the element when it was read.
-    origin: String,
 }
 
 struct Tab {
@@ -38,10 +36,9 @@ pub struct Browser {
     tab: Mutex<Tab>,
     revoked: AtomicBool,
     unusable: AtomicBool,
+    private_traveler_used: AtomicBool,
     #[cfg(test)]
     fixture_payment_hosts: bool,
-    /// Unlocked traveler values and their placeholders, removed from snapshots.
-    redactions: std::sync::RwLock<Vec<(zeroize::Zeroizing<String>, String)>>,
 }
 
 /// Private checkout access exists only after the public API has drained.
@@ -56,6 +53,14 @@ pub(crate) struct PrivateTab {
 }
 
 impl Browser {
+    pub(crate) fn remember_private_traveler_use(&self) {
+        self.private_traveler_used.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn has_private_traveler_data(&self) -> bool {
+        self.private_traveler_used.load(Ordering::SeqCst)
+    }
+
     pub fn needs_restart(&self) -> bool {
         self.unusable.load(Ordering::SeqCst) || self.cdp.exited()
     }
@@ -66,22 +71,24 @@ impl Browser {
         profile: &Path,
         test_flags: &[String],
     ) -> Result<Arc<Self>> {
-        Self::launch_with(executable, profile, test_flags, false).await
+        Self::launch_on(executable, profile, test_flags, None).await
     }
 
-    pub async fn launch_with(
+    /// `display` makes the browser headed: `Some(&[])` uses the display this
+    /// process inherited, and non-empty variables select a private X display.
+    pub async fn launch_on(
         executable: &Path,
         profile: &Path,
         test_flags: &[String],
-        window: bool,
+        display: Option<&[(&str, std::ffi::OsString)]>,
     ) -> Result<Arc<Self>> {
         // Fixture merchants listen on loopback in tests and developer Triads.
         Self::launch_with_egress(
             executable,
             profile,
             test_flags,
-            window,
             crate::egress::policy(cfg!(any(test, feature = "triad-dev-harness"))),
+            display,
         )
         .await
     }
@@ -90,8 +97,8 @@ impl Browser {
         executable: &Path,
         profile: &Path,
         test_flags: &[String],
-        window: bool,
         egress: crate::egress::Policy,
+        display: Option<&[(&str, std::ffi::OsString)]>,
     ) -> Result<Arc<Self>> {
         if profile.exists() {
             let metadata = std::fs::symlink_metadata(profile)?;
@@ -127,7 +134,7 @@ impl Browser {
             .any(|f| f == "--ignore-certificate-errors");
         let mut flags = crate::egress::chromium_flags(crate::egress::start(egress).await?);
         flags.extend_from_slice(test_flags);
-        let cdp = Cdp::launch(executable, profile, &flags, window)?;
+        let cdp = Cdp::launch(executable, profile, &flags, display)?;
         let tab = new_tab(&cdp, None, 1).await?;
         Ok(Arc::new(Self {
             cdp,
@@ -136,7 +143,7 @@ impl Browser {
             fixture_payment_hosts,
             revoked: AtomicBool::new(false),
             unusable: AtomicBool::new(false),
-            redactions: std::sync::RwLock::new(Vec::new()),
+            private_traveler_used: AtomicBool::new(false),
         }))
     }
 
@@ -193,11 +200,9 @@ impl Browser {
                         .as_array()
                         .context("Missing shopping elements")?;
                     let limit = if position == 0 { 300 } else { 20 };
-                    // AX can repeat custom selected values outside their input
-                    // subtree. Large pages also need no AX serialization beyond
-                    // the public text budget. Both use the control projection.
-                    let private_displays = snapshot["private_displays"] == true;
-                    let outline = if private_displays || snapshot["large_page"] == true {
+                    // Large pages need no AX serialization beyond the public
+                    // text budget; they use the control projection.
+                    let outline = if snapshot["large_page"] == true {
                         None
                     } else {
                         match self
@@ -222,11 +227,7 @@ impl Browser {
                     if let Some(outline) = outline {
                         text.push_str(&outline);
                     } else {
-                        text.push_str(if private_displays {
-                            "Saved traveler details: text is limited to the listed controls.\n"
-                        } else {
-                            "Large page: text is limited to the listed controls.\n"
-                        });
+                        text.push_str("Large page: text is limited to the listed controls.\n");
                         for element in projected.iter().take(limit) {
                             if let Some(label) = element["label"].as_str() {
                                 text.push_str(label);
@@ -252,12 +253,13 @@ impl Browser {
                             session: frame.session.clone(),
                             world: frame.world,
                             index,
-                            origin: parsed.origin().ascii_serialization(),
                         });
                         elements.push(element);
                     }
                 }
-                self.redacted(json!({"url":url,"text":text.chars().take(30000).collect::<String>(),"elements":elements}))
+                Ok(
+                    json!({"url":url,"text":text.chars().take(30000).collect::<String>(),"elements":elements}),
+                )
             }
             BrowseRequest::Back => {
                 let history = self
@@ -279,123 +281,15 @@ impl Browser {
                 Ok(json!({"state":"navigated"}))
             }
             BrowseRequest::Click { element_ref } => {
-                self.act(&mut tab, &element_ref, "click", "", None).await
+                self.act(&mut tab, &element_ref, "click", "").await
             }
             BrowseRequest::Type { element_ref, text } => {
-                self.act(&mut tab, &element_ref, "type", &text, None).await
+                self.act(&mut tab, &element_ref, "type", &text).await
             }
             BrowseRequest::Select { element_ref, value } => {
-                self.act(&mut tab, &element_ref, "select", &value, None)
-                    .await
-            }
-            BrowseRequest::FillTraveler { .. } | BrowseRequest::TypeTraveler { .. } => {
-                bail!("Unlock a saved traveler first")
+                self.act(&mut tab, &element_ref, "select", &value).await
             }
         }
-    }
-
-    /// Mask merchant strings without changing control references or protocol metadata.
-    fn redacted(&self, mut value: Value) -> Result<Value> {
-        let redactions = self.redactions.read().unwrap();
-        for (secret, label) in redactions.iter() {
-            // Explicit case conversions also cover multi-character mappings
-            // such as Straße -> STRASSE and İpek -> i + combining dot + pek.
-            let variants = [
-                secret.to_string(),
-                secret.to_uppercase(),
-                secret.to_lowercase(),
-            ];
-            // A page can echo "A\u{200b}lice": invisible characters between
-            // letters must not hide a saved value.
-            let alternatives = variants
-                .iter()
-                .map(|s| {
-                    s.chars()
-                        .map(|c| regex::escape(c.encode_utf8(&mut [0; 4])))
-                        .collect::<Vec<_>>()
-                        .join(&format!("{INVISIBLE}*"))
-                })
-                .collect::<Vec<_>>()
-                .join("|");
-            // Short ASCII names and year fragments are whole tokens, so Li
-            // does not hide "airline" and 90 does not hide part of 1990.
-            let short = secret.is_ascii() && secret.chars().count() < 3;
-            let bounded = |alternatives: &str| {
-                if short {
-                    format!(r"\b(?:{alternatives})\b")
-                } else {
-                    format!("(?:{alternatives})")
-                }
-            };
-            let pattern = regex::RegexBuilder::new(&bounded(&alternatives))
-                .case_insensitive(true)
-                .build()?;
-            // Anything still matching after compatibility normalization
-            // (full-width letters, ligatures) cannot be cut out precisely, so
-            // the whole string is withheld.
-            let residual = regex::RegexBuilder::new(&bounded(&regex::escape(&fold(secret))))
-                .case_insensitive(true)
-                .build()?;
-            let replace = |value: &mut Value| {
-                if let Value::String(text) = value {
-                    let masked = pattern
-                        .replace_all(text, regex::NoExpand(label))
-                        .into_owned();
-                    *text = if residual.is_match(&fold(&LABEL.replace_all(&masked, " "))) {
-                        label.clone()
-                    } else {
-                        masked
-                    };
-                }
-            };
-            for key in ["url", "text"] {
-                if let Some(value) = value.get_mut(key) {
-                    replace(value);
-                }
-            }
-            if let Some(elements) = value.get_mut("elements").and_then(Value::as_array_mut) {
-                for element in elements {
-                    for key in ["label", "context", "value", "href"] {
-                        if let Some(value) = element.get_mut(key) {
-                            replace(value);
-                        }
-                    }
-                    if let Some(options) = element.get_mut("options").and_then(Value::as_array_mut)
-                    {
-                        for option in options {
-                            for key in ["label", "value"] {
-                                if let Some(value) = option.get_mut(key) {
-                                    replace(value);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(value)
-    }
-
-    pub(crate) fn redact(&self, values: impl IntoIterator<Item = (String, String)>) {
-        self.redact_min(values, 3);
-    }
-
-    /// Most saved values use three characters; names and displayed birth-year
-    /// fragments also need protection when they are shorter.
-    pub(crate) fn redact_min(
-        &self,
-        values: impl IntoIterator<Item = (String, String)>,
-        min_chars: usize,
-    ) {
-        let mut redactions = self.redactions.write().unwrap();
-        redactions.extend(
-            values
-                .into_iter()
-                .filter(|(secret, _)| secret.chars().count() >= min_chars)
-                .map(|(secret, label)| (zeroize::Zeroizing::new(secret), label)),
-        );
-        // Longer values first, so a full name is replaced before its parts.
-        redactions.sort_by_key(|(secret, _)| std::cmp::Reverse(secret.len()));
     }
 
     /// Form errors the shopping page shows, read before payment is requested.
@@ -419,13 +313,6 @@ impl Browser {
         Ok(result["result"]["value"].clone())
     }
 
-    /// Distinguishes explicit journeys, including two opens on the same origin.
-    #[cfg(test)]
-    pub(crate) async fn shopping_context(&self) -> String {
-        let tab = self.tab.lock().await;
-        journey_context(&tab)
-    }
-
     #[cfg(test)]
     pub(crate) async fn shopping_origin(&self) -> Result<String> {
         let tab = self.tab.lock().await;
@@ -434,12 +321,6 @@ impl Browser {
 
     pub(crate) async fn shopping_scope(&self) -> Result<(String, String)> {
         let tab = self.tab.lock().await;
-        Ok((journey_context(&tab), self.origin(&tab).await?))
-    }
-
-    pub(crate) async fn private_shopping_scope(&self) -> Result<(String, String)> {
-        let tab = self.tab.lock().await;
-        self.available()?;
         Ok((journey_context(&tab), self.origin(&tab).await?))
     }
 
@@ -452,169 +333,7 @@ impl Browser {
         Ok(url.origin().ascii_serialization())
     }
 
-    async fn check_traveler_scope(&self, tab: &Tab, context: &str, origin: &str) -> Result<()> {
-        if journey_context(tab) != context || self.origin(tab).await? != origin {
-            bail!("Saved traveler details are unlocked for another booking or website");
-        }
-        Ok(())
-    }
-
-    /// Saved values go only into frames of the unlocked website, never into
-    /// an embedded chat, ad or other third-party frame.
-    fn check_traveler_frame(tab: &Tab, reference: &str, origin: &str) -> Result<()> {
-        let index = reference
-            .split_once(':')
-            .and_then(|(_, index)| index.parse::<usize>().ok());
-        if let Some(binding) = index.and_then(|index| tab.refs.get(index))
-            && binding.origin != origin
-        {
-            bail!(
-                "That field is in an embedded frame from another website; type it in the private view"
-            );
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn type_traveler(
-        &self,
-        reference: &str,
-        field: &str,
-        value: &str,
-        context: &str,
-        origin: &str,
-    ) -> Result<()> {
-        self.available()?;
-        let mut tab = self.tab.lock().await;
-        self.available()?;
-        self.check_traveler_scope(&tab, context, origin).await?;
-        Self::check_traveler_frame(&tab, reference, origin)?;
-        self.act(&mut tab, reference, "type", value, Some(field))
-            .await?;
-        Ok(())
-    }
-
-    /// Choose a saved traveler value in a list the agent picked (a select or a
-    /// site-drawn dropdown). The value never comes back; failure says so.
-    pub(crate) async fn choose_traveler(
-        &self,
-        reference: &str,
-        field: &str,
-        value: &str,
-        context: &str,
-        origin: &str,
-    ) -> Result<()> {
-        self.available()?;
-        let mut tab = self.tab.lock().await;
-        self.available()?;
-        self.check_traveler_scope(&tab, context, origin).await?;
-        Self::check_traveler_frame(&tab, reference, origin)?;
-        let (generation, index) = reference
-            .split_once(':')
-            .context("Invalid element reference")?;
-        if generation.parse::<u64>()? != tab.generation {
-            bail!("Stale element reference; request a new snapshot");
-        }
-        let binding = tab
-            .refs
-            .get(index.parse::<usize>()?)
-            .context("Stale element reference; request a new snapshot")?
-            .clone();
-        tab.refs.clear();
-        tab.generation += 1;
-        // Open the list the way a shopping click does: synchronously, with a
-        // user gesture. Some lists ignore clicks from later script turns.
-        let open = format!(
-            "(()=>{{const e=globalThis.__bloomRefs?.[{}];if(!e?.isConnected)throw Error('stale');e.focus();e.click();return true;}})()",
-            binding.index
-        );
-        self.cdp
-            .call(
-                Some(&binding.session),
-                "Runtime.evaluate",
-                json!({"contextId":binding.world,"expression":open,"returnByValue":true,"userGesture":true}),
-            )
-            .await?;
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        let view = PrivateTab {
-            cdp: self.cdp.clone(),
-            session: binding.session.clone(),
-            target: tab.target.clone(),
-            #[cfg(test)]
-            fixture_payment_hosts: self.fixture_payment_hosts,
-        };
-        let filled = crate::travelers::TravelerDiscovery::fill_opened(
-            &view,
-            &binding.session,
-            binding.world,
-            binding.index,
-            field,
-            value,
-            origin,
-        )
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!("That list did not take the saved value; choose it in the private view")
-        })?;
-        if !filled.iter().any(|filled_field| filled_field == field) {
-            bail!("That list did not take the saved value; choose it in the private view");
-        }
-        Ok(())
-    }
-
-    /// Fill unlocked traveler values into the shopping page. Only field names
-    /// come back; the values are never part of a response.
-    pub(crate) async fn fill_traveler(
-        &self,
-        origin: &str,
-        context: &str,
-        fields: &[bloom_signer_api::TravelerField],
-        values: &std::collections::BTreeMap<String, zeroize::Zeroizing<String>>,
-    ) -> Result<Vec<String>> {
-        self.available()?;
-        let mut tab = self.tab.lock().await;
-        self.available()?;
-        self.check_traveler_scope(&tab, context, origin).await?;
-        let view = PrivateTab {
-            cdp: self.cdp.clone(),
-            session: tab.session.clone(),
-            target: tab.target.clone(),
-            #[cfg(test)]
-            fixture_payment_hosts: self.fixture_payment_hosts,
-        };
-        tab.refs.clear();
-        tab.generation += 1;
-        let mut filled = Vec::new();
-        for pass in 0..2 {
-            let discovery = match crate::travelers::TravelerDiscovery::read(&view, fields).await {
-                Ok(discovery) => discovery,
-                Err(_) if pass > 0 => break,
-                Err(error) => return Err(error),
-            };
-            if discovery.scope.origin != origin {
-                bail!("Saved traveler details are unlocked for another website");
-            }
-            let wanted: std::collections::BTreeMap<_, _> = discovery
-                .field_names()
-                .into_iter()
-                .filter_map(|f| values.get(&f).map(|v| (f, v.clone())))
-                .collect();
-            for field in discovery.fill(&view, &wanted).await? {
-                if !filled.contains(&field) {
-                    filled.push(field);
-                }
-            }
-        }
-        Ok(filled)
-    }
-
-    async fn act(
-        &self,
-        tab: &mut Tab,
-        reference: &str,
-        kind: &str,
-        value: &str,
-        saved_field: Option<&str>,
-    ) -> Result<Value> {
+    async fn act(&self, tab: &mut Tab, reference: &str, kind: &str, value: &str) -> Result<Value> {
         let (generation, index) = reference
             .split_once(':')
             .context("Invalid element reference")?;
@@ -633,11 +352,10 @@ impl Browser {
         let index = binding.index;
         let world = binding.world;
         let expression = format!(
-            "({})({index},{},{},{})",
+            "({})({index},{},{})",
             crate::scripts::prepare(include_str!("act.js")),
             serde_json::to_string(kind)?,
-            serde_json::to_string(value)?,
-            serde_json::to_string(&saved_field)?
+            serde_json::to_string(value)?
         );
         let response = self
             .cdp
@@ -796,31 +514,52 @@ impl Browser {
     /// the merchant kept, so shopping never reopens a private session and may
     /// return to the booking site.
     pub(crate) async fn return_control(&self) -> Result<()> {
-        self.reset_shopping().await.inspect_err(|_| {
+        self.reset_shopping(false).await.inspect_err(|_| {
             self.unusable.store(true, Ordering::SeqCst);
         })
     }
 
-    async fn reset_shopping(&self) -> Result<()> {
+    /// Closes every private page but keeps the context's cookies and storage,
+    /// so the person stays signed in to the sites they used. Refused once saved
+    /// traveler values were filled: a merchant may store and redisplay them.
+    pub(crate) async fn return_control_signed_in(&self) -> Result<()> {
+        if self.has_private_traveler_data() {
+            bail!("Saved traveler details were used here; this session cannot be kept");
+        }
+        self.reset_shopping(true).await.inspect_err(|_| {
+            self.unusable.store(true, Ordering::SeqCst);
+        })
+    }
+
+    async fn reset_shopping(&self, keep_session: bool) -> Result<()> {
         let mut tab = self.tab.lock().await;
-        if let Err(error) = self
-            .cdp
-            .call(
-                None,
-                "Target.disposeBrowserContext",
-                json!({"browserContextId":tab.context}),
-            )
-            .await
+        // A headed browser quits when its last window closes, so open the
+        // replacement page before closing the private ones.
+        let fresh = new_tab(
+            &self.cdp,
+            keep_session.then(|| tab.context.clone()),
+            tab.generation + 1,
+        )
+        .await?;
+        if !keep_session
+            && let Err(error) = self
+                .cdp
+                .call(
+                    None,
+                    "Target.disposeBrowserContext",
+                    json!({"browserContextId":tab.context}),
+                )
+                .await
         {
-            // A previous attempt may have disposed the context before failing
-            // to create the replacement tab. Retry only with no contexts left.
+            // A previous attempt may have disposed it already. Retry only when
+            // the replacement is the sole context left.
             let contexts = self
                 .cdp
                 .call(None, "Target.getBrowserContexts", json!({}))
                 .await?;
             if contexts["browserContextIds"]
                 .as_array()
-                .is_none_or(|ids| !ids.is_empty())
+                .is_none_or(|ids| ids.iter().any(|id| *id != json!(fresh.context)))
             {
                 return Err(error);
             }
@@ -836,7 +575,7 @@ impl Browser {
                 .as_array()
                 .context("Missing browser targets")?
                 .iter()
-                .filter(|target| target["type"] == "page")
+                .filter(|target| target["type"] == "page" && target["targetId"] != fresh.target)
                 .collect::<Vec<_>>();
             if pages.is_empty() {
                 break;
@@ -855,10 +594,11 @@ impl Browser {
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        *tab = new_tab(&self.cdp, None, tab.generation + 1).await?;
-        // Old private pages are gone. Until then these patterns must remain so
-        // an expired traveler still present in the DOM cannot enter a snapshot.
-        self.redactions.write().unwrap().clear();
+        let journey = tab.journey + 1;
+        *tab = fresh;
+        tab.journey = journey;
+        // The pages that held saved traveler values are gone.
+        self.private_traveler_used.store(false, Ordering::SeqCst);
         self.revoked.store(false, Ordering::SeqCst);
         Ok(())
     }
@@ -921,22 +661,6 @@ async fn attach_tab(cdp: &Cdp, context: String, target: String, generation: u64)
     })
 }
 
-/// Characters a page can place inside a value without changing what a reader
-/// sees: soft hyphen, zero-width spaces and joiners, word joiner, BOM.
-const INVISIBLE: &str = r"[\p{Default_Ignorable_Code_Point}\p{Cf}]";
-static INVISIBLES: std::sync::LazyLock<regex::Regex> =
-    std::sync::LazyLock::new(|| regex::Regex::new(INVISIBLE).unwrap());
-static LABEL: std::sync::LazyLock<regex::Regex> =
-    std::sync::LazyLock::new(|| regex::Regex::new(r"\[saved [a-z_]+\]").unwrap());
-
-/// What a reader sees: compatibility forms folded, invisible characters gone.
-fn fold(text: &str) -> String {
-    use unicode_normalization::UnicodeNormalization;
-    INVISIBLES
-        .replace_all(&text.nfkc().collect::<String>(), "")
-        .to_lowercase()
-}
-
 fn shopping_url(url: &str) -> Result<url::Url> {
     let parsed = url::Url::parse(url).context("Invalid browsing URL")?;
     if !matches!(parsed.scheme(), "http" | "https")
@@ -973,14 +697,14 @@ fn accessibility_text(tree: &Value) -> Result<String> {
         if !hidden.insert(id.clone()) {
             continue;
         }
-        if let Some(node) = nodes.iter().find(|n| n["nodeId"] == id) {
-            if let Some(children) = node["childIds"].as_array() {
-                queue.extend(
-                    children
-                        .iter()
-                        .filter_map(|v| v.as_str().map(str::to_owned)),
-                );
-            }
+        if let Some(node) = nodes.iter().find(|n| n["nodeId"] == id)
+            && let Some(children) = node["childIds"].as_array()
+        {
+            queue.extend(
+                children
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned)),
+            );
         }
     }
     // Text nodes repeat the name of the node that contains them.
@@ -1037,52 +761,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn short_private_tokens_do_not_change_control_metadata_or_other_words() {
-        let root = tempfile::tempdir().unwrap();
-        let browser = Browser::launch(
-            &crate::test_chromium(),
-            &root.path().join("profile"),
-            &["--no-sandbox".into()],
-        )
-        .await
-        .unwrap();
-        browser.redact_min(
-            [
-                ("Li".into(), "[saved family_name]".into()),
-                ("90".into(), "[saved born_on_year]".into()),
-            ],
-            1,
-        );
-        let snapshot = browser
-            .redacted(json!({
-                "url":"https://airline.example/",
-                "text":"Passenger Li, year 90; choose an airline",
-                "elements":[{
-                    "ref":"90:90", "role":"li", "type":"text",
-                    "frame_origin":"https://li.example",
-                    "label":"Li", "context":"Airline review for Li",
-                    "value":"Li", "options":[{"value":"Li","label":"Li"}]
-                }]
-            }))
-            .unwrap();
-        serde_json::from_value::<bloom_checkout_api::BrowseResponse>(snapshot.clone()).unwrap();
-        assert_eq!(
-            snapshot["text"],
-            "Passenger [saved family_name], year [saved born_on_year]; choose an airline"
-        );
-        let element = &snapshot["elements"][0];
-        assert_eq!(element["ref"], "90:90");
-        assert_eq!(element["role"], "li");
-        assert_eq!(element["type"], "text");
-        assert_eq!(element["frame_origin"], "https://li.example");
-        assert_eq!(element["label"], "[saved family_name]");
-        assert_eq!(element["context"], "Airline review for [saved family_name]");
-        assert_eq!(element["value"], "[saved family_name]");
-        assert_eq!(element["options"][0]["label"], "[saved family_name]");
-        assert_eq!(element["options"][0]["value"], "[saved family_name]");
-    }
-
     /// Redirects, subresources and popups go through the same address check
     /// as the first page, so a permitted page cannot reach a local service.
     #[tokio::test]
@@ -1128,8 +806,8 @@ mod tests {
             &crate::test_chromium(),
             &root.path().join("profile"),
             &["--no-sandbox".into()],
-            false,
             Arc::new(move |address| address == shop_address),
+            None,
         )
         .await
         .unwrap();
@@ -1159,51 +837,6 @@ mod tests {
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
         local_server.abort();
         shop_server.abort();
-    }
-
-    #[tokio::test]
-    async fn invisible_or_compatibility_characters_do_not_reveal_saved_values() {
-        let root = tempfile::tempdir().unwrap();
-        let browser = Browser::launch(
-            &crate::test_chromium(),
-            &root.path().join("profile"),
-            &["--no-sandbox".into()],
-        )
-        .await
-        .unwrap();
-        browser.redact([
-            ("Alice".into(), "[saved given_name]".into()),
-            ("ada@example.com".into(), "[saved email]".into()),
-        ]);
-        let snapshot = browser
-            .redacted(json!({
-                "url":"https://shop.example/?n=A\u{200b}lice",
-                "text":"Hello A\u{200b}l\u{00ad}ice, receipt to ada@exa\u{2060}mple.com",
-                "elements":[{
-                    "ref":"1:1", "role":"input", "type":"text",
-                    "label":"\u{ff21}\u{ff4c}\u{ff49}\u{ff43}\u{ff45}", "context":"For ALI\u{feff}CE",
-                    "value":"a\u{200d}lice", "options":[{"value":"x","label":"A\u{200c}lice"}]
-                }]
-            }))
-            .unwrap();
-        assert_eq!(
-            snapshot["text"],
-            "Hello [saved given_name], receipt to [saved email]"
-        );
-        assert_eq!(
-            snapshot["url"],
-            "https://shop.example/?n=[saved given_name]"
-        );
-        let element = &snapshot["elements"][0];
-        assert_eq!(element["label"], "[saved given_name]");
-        assert_eq!(element["context"], "For [saved given_name]");
-        assert_eq!(element["value"], "[saved given_name]");
-        assert_eq!(element["options"][0]["label"], "[saved given_name]");
-        let seen = fold(&snapshot.to_string());
-        assert!(
-            !seen.contains("alice") && !seen.contains("ada@example"),
-            "{seen}"
-        );
     }
 
     #[tokio::test]
@@ -1321,155 +954,6 @@ mod tests {
         let after = browser.browse(BrowseRequest::Snapshot).await.unwrap();
         assert!(!after["text"].as_str().unwrap().contains("unsafe"));
         site.abort();
-    }
-
-    #[tokio::test]
-    async fn opening_another_booking_on_the_same_origin_invalidates_traveler_scope() {
-        let root = tempfile::tempdir().unwrap();
-        let browser = Browser::launch(
-            &crate::test_chromium(),
-            &root.path().join("profile"),
-            &["--no-sandbox".into()],
-        )
-        .await
-        .unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/", listener.local_addr().unwrap());
-        let origin = url.trim_end_matches('/');
-        let site = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                Router::new().route(
-                    "/",
-                    get(|| async { Html("<label>Given name<input name='first_name'></label>") }),
-                ),
-            )
-            .await
-            .unwrap();
-        });
-        browser
-            .browse(BrowseRequest::Open { url: url.clone() })
-            .await
-            .unwrap();
-        let old_context = browser.shopping_context().await;
-        browser
-            .browse(BrowseRequest::Open { url: url.clone() })
-            .await
-            .unwrap();
-        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
-        let reference = snapshot["elements"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|e| e["kind"] == "textbox" || e["tag"] == "input")
-            .or_else(|| snapshot["elements"].as_array().unwrap().first())
-            .unwrap()["ref"]
-            .as_str()
-            .unwrap();
-        let error = browser
-            .type_traveler(
-                reference,
-                "given_name",
-                "PRIVATE-FIXTURE",
-                &old_context,
-                origin,
-            )
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("another booking"));
-        assert!(
-            browser
-                .fill_traveler(origin, &old_context, &[], &Default::default())
-                .await
-                .is_err()
-        );
-        let value = browser
-            .cdp
-            .call(
-                Some(&browser.tab.lock().await.session),
-                "Runtime.evaluate",
-                json!({"expression":"document.querySelector('input').value","returnByValue":true}),
-            )
-            .await
-            .unwrap();
-        assert_eq!(value["result"]["value"], "");
-        site.abort();
-        let _ = site.await;
-    }
-
-    #[tokio::test]
-    async fn saved_traveler_values_never_go_into_another_origins_frame() {
-        let root = tempfile::tempdir().unwrap();
-        let browser = Browser::launch(
-            &crate::test_chromium(),
-            &root.path().join("profile"),
-            &["--no-sandbox".into()],
-        )
-        .await
-        .unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let url = format!("http://127.0.0.1:{port}/");
-        let origin = url.trim_end_matches('/').to_owned();
-        let page = format!(
-            "<label>Given name<input name='first_name'></label>\
-             <iframe src='http://localhost:{port}/chat' width=400 height=200></iframe>"
-        );
-        let site = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                Router::new()
-                    .route("/", get(move || async move { Html(page) }))
-                    .route(
-                        "/chat",
-                        get(|| async { Html("<label>Chat message<input name='chat'></label>") }),
-                    ),
-            )
-            .await
-            .unwrap();
-        });
-        browser
-            .browse(BrowseRequest::Open { url: url.clone() })
-            .await
-            .unwrap();
-        let snapshot = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if let Ok(snapshot) = browser.browse(BrowseRequest::Snapshot).await {
-                    if snapshot["elements"].as_array().is_some_and(|elements| {
-                        elements
-                            .iter()
-                            .any(|e| e["frame_origin"] != origin.as_str() && e["role"] == "input")
-                    }) {
-                        break snapshot;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .expect("cross-origin chat fixture must finish loading");
-        let context = browser.shopping_context().await;
-        let chat = snapshot["elements"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|e| e["frame_origin"] != origin.as_str() && e["role"] == "input")
-            .unwrap_or_else(|| panic!("no child frame input in {snapshot}"))["ref"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let error = browser
-            .type_traveler(&chat, "given_name", "PRIVATE-FIXTURE", &context, &origin)
-            .await
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("embedded frame from another website"),
-            "{error}"
-        );
-        site.abort();
-        let _ = site.await;
     }
 
     #[tokio::test]
@@ -1651,14 +1135,14 @@ mod tests {
             browser.browse(BrowseRequest::Open { url }).await.unwrap();
             let snapshot = tokio::time::timeout(std::time::Duration::from_secs(20), async {
                 loop {
-                    if let Ok(snapshot) = browser.browse(BrowseRequest::Snapshot).await {
-                        if snapshot["elements"].as_array().is_some_and(|elements| {
+                    if let Ok(snapshot) = browser.browse(BrowseRequest::Snapshot).await
+                        && snapshot["elements"].as_array().is_some_and(|elements| {
                             elements
                                 .iter()
                                 .any(|e| e["role"] == "input" || e["role"] == "select")
-                        }) {
-                            break snapshot;
-                        }
+                        })
+                    {
+                        break snapshot;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
@@ -1830,16 +1314,15 @@ mod tests {
             .unwrap();
         let popup = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if let Ok(snapshot) = browser.browse(BrowseRequest::Snapshot).await {
-                    if snapshot["url"]
+                if let Ok(snapshot) = browser.browse(BrowseRequest::Snapshot).await
+                    && snapshot["url"]
                         .as_str()
                         .is_some_and(|url| url.ends_with("/flight"))
-                        && snapshot["text"]
-                            .as_str()
-                            .is_some_and(|text| text.contains("Flight AR1554"))
-                    {
-                        break snapshot;
-                    }
+                    && snapshot["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("Flight AR1554"))
+                {
+                    break snapshot;
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
@@ -2465,6 +1948,33 @@ mod tests {
             )
             .await
             .unwrap();
+        browser.return_control().await.unwrap();
+        assert!(visit().await.contains("stored:|"));
+        // The person may keep the session: pages close, cookies and storage stay.
+        browser.handoff().await.unwrap();
+        browser.return_control_signed_in().await.unwrap();
+        let pages = browser
+            .cdp
+            .call(None, "Target.getTargets", json!({}))
+            .await
+            .unwrap();
+        let open = pages["targetInfos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["type"] == "page" && t["url"] != "about:blank")
+            .count();
+        assert_eq!(open, 0, "private pages must close");
+        let kept = visit().await;
+        assert!(
+            kept.contains("SyntheticPassenger") && kept.contains("booking=SyntheticBooking"),
+            "{kept}"
+        );
+        // Never after saved traveler values were filled into the merchant's pages.
+        browser.handoff().await.unwrap();
+        browser.remember_private_traveler_use();
+        assert!(browser.return_control_signed_in().await.is_err());
+        assert!(!browser.needs_restart());
         browser.return_control().await.unwrap();
         assert!(visit().await.contains("stored:|"));
         fixture.abort();

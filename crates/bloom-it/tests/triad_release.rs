@@ -18,19 +18,9 @@ fn release_script(name: &str) -> PathBuf {
     workspace().join("packaging/triad/release").join(name)
 }
 
-struct PreservedDirectory(PathBuf);
-impl PreservedDirectory {
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-fn preserved_directory() -> PreservedDirectory {
-    PreservedDirectory(tempfile::tempdir().unwrap().keep())
-}
-
 #[test]
 fn linux_checkout_upgrade_provisions_existing_logins_and_preserves_custody() {
-    let directory = preserved_directory();
+    let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
     fs::create_dir(&root).unwrap();
     let payload = make_installer_payload(directory.path());
@@ -1966,7 +1956,7 @@ fn bundle_rejects_a_service_outside_the_current_only_matrix() {
 
 #[test]
 fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() {
-    let directory = preserved_directory();
+    let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
     fs::create_dir(&root).unwrap();
     let payload = make_installer_payload(directory.path());
@@ -2457,7 +2447,7 @@ fn linux_installer_refuses_aws_kms_signer_configuration_before_changing_state() 
 }
 
 #[test]
-fn linux_installer_gives_congruent_uids_distinct_checkout_view_ports() {
+fn linux_installer_uses_ephemeral_checkout_ports_on_install_and_upgrade() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
     fs::create_dir(&root).unwrap();
@@ -2471,8 +2461,8 @@ fn linux_installer_gives_congruent_uids_distinct_checkout_view_ports() {
             .unwrap()
             .to_owned()
     };
-    // 1000 and 9000 share the slot 10000 + uid % 8000; reinstalling keeps
-    // each login's port.
+    // Old installations used a UID-derived port. Reinstall replaces it with
+    // zero so a stale recorded port cannot prevent service startup.
     for (uid, user) in [("1000", "alice"), ("9000", "carol"), ("1000", "alice")] {
         let installed = Command::new(&installer)
             .args(["install"])
@@ -2487,9 +2477,18 @@ fn linux_installer_gives_congruent_uids_distinct_checkout_view_ports() {
             "{}",
             String::from_utf8_lossy(&installed.stderr)
         );
-        assert_eq!(view_port("1000"), "11000");
+        assert_eq!(view_port(uid), "0");
+        if uid == "9000" {
+            let env = root.join("etc/bloom/1000/checkout.env");
+            let text = fs::read_to_string(&env).unwrap().replace(
+                "BLOOM_CHECKOUT_VIEW_PORT=0",
+                "BLOOM_CHECKOUT_VIEW_PORT=11000",
+            );
+            fs::write(env, text).unwrap();
+        }
     }
-    assert_eq!(view_port("9000"), "11001");
+    assert_eq!(view_port("1000"), "0");
+    assert_eq!(view_port("9000"), "0");
 }
 
 #[test]
@@ -2541,8 +2540,8 @@ fn linux_installer_allocates_distinct_ports_and_rejects_mixed_release_sets() {
         fstab.contains(&format!("port={alice_port},"))
             && fstab.contains(&format!("port={bob_port},"))
     );
-    // Each login's checkout view needs its own localhost port.
-    for (uid, port) in [("1000", "11000"), ("2000", "12000")] {
+    // Each process binds a free loopback port at runtime.
+    for (uid, port) in [("1000", "0"), ("2000", "0")] {
         assert!(
             fs::read_to_string(root.join(format!("etc/bloom/{uid}/checkout.env")))
                 .unwrap()
@@ -2553,6 +2552,13 @@ fn linux_installer_allocates_distinct_ports_and_rejects_mixed_release_sets() {
         fs::read_to_string(root.join("usr/lib/systemd/system/bloom-checkout@.service")).unwrap();
     assert!(checkout_unit.contains("--view-port ${BLOOM_CHECKOUT_VIEW_PORT}"));
     assert!(!checkout_unit.contains("18736"));
+    // Unbraced so "--xvfb <path>" becomes two arguments and empty becomes none.
+    assert!(checkout_unit.contains(" $BLOOM_CHECKOUT_DISPLAY_ARGS\n"));
+    assert!(
+        fs::read_to_string(root.join("etc/bloom/1000/checkout.env"))
+            .unwrap()
+            .contains("BLOOM_CHECKOUT_DISPLAY_ARGS=\n")
+    );
 
     let installed_binary = root.join("usr/libexec/bloom/current/bloom-broker");
     let before = fs::read(&installed_binary).unwrap();
@@ -3239,8 +3245,7 @@ fn macos_staged_lifecycle_upgrades_repairs_retains_restores_and_rejects_downgrad
         root.join("Library/Application Support/BloomTriad/config/501/signer/identity.json");
     let identity_before = fs::read(&identity).unwrap();
 
-    // Schema 1 is a supported migration source even though schema 2 remains
-    // the lowest state an old release may reopen after the upgrade commits.
+    // Schema 1 is a supported migration source for the current release.
     fs::write(
         root.join("Library/Application Support/BloomTriad/state-schema"),
         b"machine=1\nbroker=1\nsigner=1\n",
@@ -3341,7 +3346,7 @@ fn macos_staged_lifecycle_upgrades_repairs_retains_restores_and_rejects_downgrad
 
     fs::write(
         root.join("Library/Application Support/BloomTriad/state-schema"),
-        b"machine=3\nbroker=2\nsigner=2\n",
+        b"machine=4\nbroker=2\nsigner=2\n",
     )
     .unwrap();
     let downgrade = stage_macos_install_digest(&installer, &root, &candidate, &new_digest);
@@ -3363,6 +3368,131 @@ fn macos_staged_lifecycle_upgrades_repairs_retains_restores_and_rejects_downgrad
     assert!(!malformed.status.success());
     assert!(String::from_utf8_lossy(&malformed.stderr).contains("compatibility metadata"));
     assert_eq!(fs::read(&identity).unwrap(), identity_before);
+}
+
+#[test]
+fn installers_expose_checkout_only_when_a_browser_is_available() {
+    let linux = fs::read_to_string(release_script("install-linux.sh")).unwrap();
+    let start = linux.find("write_linux_checkout_environment() {").unwrap();
+    let end = start + linux[start..].find("\n}\n").unwrap() + 3;
+    let linux_function = linux[start..end].replace("[[ \"$install_root\" == / ]]", "true");
+    let mac = fs::read_to_string(release_script("install-macos.sh")).unwrap();
+    let start = mac.find("write_macos_checkout_endpoint() {").unwrap();
+    let end = start + mac[start..].find("\n}\n").unwrap() + 3;
+    let mac_function = &mac[start..end];
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("etc/bloom/501");
+    fs::create_dir_all(&config).unwrap();
+    for available in [true, false] {
+        fs::write(
+            config.join("machine.env"),
+            "BLOOM_NFS_LISTEN=old\nBLOOM_CHECKOUT_SOCKET=old\nBLOOM_CHECKOUT_UID=4\n",
+        )
+        .unwrap();
+        let harness = format!(
+            r#"set -Eeuo pipefail
+id() {{ echo 501; }}
+linux_checkout_browser() {{ [[ {available} == true ]] && printf /usr/bin/chromium || true; }}
+atomic_install() {{ install -m "$3" "$1" "$2"; }}
+{linux_function}
+write_linux_checkout_environment '{root}' 501
+config='{config}'; runtime=/run/bloom/501; BLOOM_MACOS_CHECKOUT_UID=501
+checkout_browser_available() {{ {available}; }}
+{mac_function}
+write_macos_checkout_endpoint
+"#,
+            root = root.path().display(),
+            config = config.display()
+        );
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(harness)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let machine = fs::read_to_string(config.join("machine.env")).unwrap();
+        assert!(machine.contains("BLOOM_NFS_LISTEN=old"));
+        assert_eq!(machine.contains("BLOOM_CHECKOUT_SOCKET="), available);
+        assert_eq!(config.join("checkout.json").exists(), available);
+    }
+}
+
+#[test]
+fn linux_upgrade_requests_relogin_when_checkout_group_is_new() {
+    let source = fs::read_to_string(release_script("install-linux.sh")).unwrap();
+    let start = source.find("linux_checkout_relogin_required() {").unwrap();
+    let end = start + source[start..].find("\n}\n").unwrap() + 3;
+    let function = &source[start..end];
+    for (groups, expected) in [("users", "1"), ("users bloom-machine-checkout-1000", "0")] {
+        let harness = format!(
+            r#"set -Eeuo pipefail
+release_upgrade=true; root=/; login_user=alice; login_uid=1000
+id() {{ echo '{groups}'; }}
+{function}
+linux_checkout_relogin_required
+"#
+        );
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(harness)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    }
+}
+
+#[test]
+fn macos_legacy_checkout_identity_is_persisted_before_reloading() {
+    let source = fs::read_to_string(release_script("install-macos.sh")).unwrap();
+    let start = source.find("persist_legacy_log_identity() {").unwrap();
+    let end = source.find("\nallocate_accounts() {").unwrap();
+    let functions = &source[start..end];
+    let directory = tempfile::tempdir().unwrap();
+    let harness = format!(
+        r#"set -Eeuo pipefail
+live=true; action=install; enrollment='{enrollment}'; BLOOM_RELEASE_DIGEST=candidate
+checkout_user=checkout; checkout_group=checkout; machine_checkout_group=machine; broker_checkout_group=broker; log_group=log
+created_users=''; created_groups=''
+field() {{
+  case "$2" in
+    checkout_uid) [[ -f "$enrollment" ]] && echo 301 ;;
+    checkout_gid|machine_checkout_gid|broker_checkout_gid) echo 302 ;;
+    state) echo active ;;
+    release_digest) echo old ;;
+    *) echo 501 ;;
+  esac
+}}
+allocate_checkout_accounts() {{
+  [[ ! -f "$enrollment.allocated" ]] || {{ echo 'allocated twice' >&2; return 1; }}
+  : > "$enrollment.allocated"
+  BLOOM_MACOS_CHECKOUT_UID=301; BLOOM_MACOS_CHECKOUT_GID=302
+  BLOOM_MACOS_MACHINE_CHECKOUT_GID=303; BLOOM_MACOS_BROKER_CHECKOUT_GID=304
+  created_users=' checkout'; created_groups=' checkout machine broker'
+}}
+write_enrollment() {{ : > "$enrollment"; }}
+{functions}
+load_ids
+[[ -f "$enrollment" && "$created_users" = '' && "$created_groups" = '' ]]
+load_ids
+[[ "$BLOOM_MACOS_CHECKOUT_UID" = 301 && "$BLOOM_RELEASE_DIGEST" = candidate ]]
+"#,
+        enrollment = directory.path().join("enrollment").display()
+    );
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(harness)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -5529,6 +5659,66 @@ fn macos_conformance_installs_checkout_browser_in_every_job() {
 }
 
 #[test]
+fn macos_rollback_restores_or_removes_checkout_plist() {
+    let source = fs::read_to_string(release_script("install-macos.sh")).unwrap();
+    let start = source.find("restore_macos_upgrade_state() {").unwrap();
+    let end = start + source[start..].find("\n}\n").unwrap() + 3;
+    let function = &source[start..end];
+    for had_job in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let jobs = root.join("Library/LaunchDaemons");
+        let enrollments = root.join("enrollments");
+        let transaction = dir.path().join("transaction");
+        fs::create_dir_all(&jobs).unwrap();
+        fs::create_dir_all(&enrollments).unwrap();
+        fs::create_dir_all(&transaction).unwrap();
+        fs::write(enrollments.join("501.json"), "{}").unwrap();
+        let plist = jobs.join("com.bloom.checkout.501.plist");
+        if had_job {
+            fs::write(&plist, "old").unwrap();
+        }
+        let archive = transaction.join("rollback-state.tar");
+        let entry = if had_job {
+            "Library/LaunchDaemons/com.bloom.checkout.501.plist"
+        } else {
+            "enrollments/501.json"
+        };
+        assert!(
+            Command::new("tar")
+                .current_dir(&root)
+                .args(["-cf", archive.to_str().unwrap(), entry])
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(&plist, "new").unwrap();
+        let harness = format!(
+            "set -Eeuo pipefail\nlive=false; root_prefix='{}'; enrollments='{}'; upgrade_transaction='{}'\n{}\nrestore_macos_upgrade_state\n",
+            root.display(),
+            enrollments.display(),
+            transaction.display(),
+            function
+        );
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(harness)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if had_job {
+            assert_eq!(fs::read_to_string(&plist).unwrap(), "old");
+        } else {
+            assert!(!plist.exists());
+        }
+    }
+}
+
+#[test]
 fn macos_rollback_reloads_every_login_before_reporting_a_timeout() {
     let source = fs::read_to_string(release_script("install-macos.sh")).unwrap();
     let start = source
@@ -5537,16 +5727,20 @@ fn macos_rollback_reloads_every_login_before_reporting_a_timeout() {
     let end = start + source[start..].find("\n}\n").unwrap() + 3;
     let function = &source[start..end];
     let enrollments = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let launchd = root.path().join("Library/LaunchDaemons");
+    fs::create_dir_all(&launchd).unwrap();
+    fs::write(launchd.join("com.bloom.checkout.502.plist"), "fixture").unwrap();
     for uid in ["501", "502", "503"] {
         fs::write(enrollments.path().join(format!("{uid}.json")), "{}").unwrap();
     }
     let run = |reload_all: &str, fail_signer: &str| {
         let harness = format!(
             r#"set -Eeuo pipefail
-live=true; root_prefix=/unused; release_base=/unused; containment_plist=/unused
+live=true; root_prefix='{root}'; release_base=/unused; containment_plist=/unused
 enrollments='{enrollments}'
 # A Signer that fails to load for UID $FAIL_SIGNER is a hard failure.
-reload_launchd_job() {{ [ "$2" != "com.bloom.signer.${{FAIL_SIGNER:-none}}" ]; }}
+reload_launchd_job() {{ [[ "$2" != com.bloom.checkout.* ]] || echo "load $2"; [ "$2" != "com.bloom.signer.${{FAIL_SIGNER:-none}}" ]; }}
 reload_launchagent_job() {{ echo "load $1/$2"; }}
 field() {{ echo fixture; }}
 # 501 and 503 have not answered yet; 502 is healthy.
@@ -5556,6 +5750,7 @@ reload_all_on_timeout={reload_all}
 if reload_installed_set; then echo healthy; else echo "timed_out=$health_timed_out uids=$health_timed_out_uids"; fi
 "#,
             enrollments = enrollments.path().display(),
+            root = root.path().display(),
         );
         let output = Command::new("bash")
             .arg("-c")
@@ -5567,6 +5762,10 @@ if reload_installed_set; then echo healthy; else echo "timed_out=$health_timed_o
         String::from_utf8(output.stdout).unwrap()
     };
     let rollback = run("true", "none");
+    assert!(
+        rollback.contains("load com.bloom.checkout.502"),
+        "{rollback}"
+    );
     assert!(
         rollback.contains("load 503/com.bloom.machine"),
         "{rollback}"

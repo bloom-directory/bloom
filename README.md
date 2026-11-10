@@ -8,7 +8,7 @@
   <a href="https://github.com/bloom-directory/bloom/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/bloom-directory/bloom/ci.yml?branch=master&style=flat-square&label=ci"></a>
   <a href="https://github.com/bloom-directory/bloom/releases"><img alt="Release" src="https://img.shields.io/github/v/release/bloom-directory/bloom?include_prereleases&style=flat-square"></a>
   <a href="./LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-141310?style=flat-square"></a>
-  <a href="./Cargo.toml"><img alt="Declared MSRV: 1.86" src="https://img.shields.io/badge/Declared%20MSRV%3A%201.86-a8324c?style=flat-square"></a>
+  <a href="./Cargo.toml"><img alt="Declared MSRV: 1.89" src="https://img.shields.io/badge/Declared%20MSRV%3A%201.89-a8324c?style=flat-square"></a>
 </p>
 
 <p align="center">
@@ -206,8 +206,9 @@ A fresh Bloom VFS root exposes these default entries:
   pinned [Polymarket](https://github.com/bloom-directory/bloom-petal-polymarket),
   [Hyperliquid](https://github.com/bloom-directory/bloom-petal-hyperliquid),
   [Enso](https://github.com/bloom-directory/bloom-petal-enso),
-  [Near Intents](https://github.com/bloom-directory/bloom-petal-near), and
-  [Feedback](https://github.com/bloom-directory/bloom-petal-feedback) releases.
+  [Near Intents](https://github.com/bloom-directory/bloom-petal-near),
+  [Feedback](https://github.com/bloom-directory/bloom-petal-feedback), and
+  [Safe](https://github.com/bloom-directory/bloom-petal-safe) releases.
   Tolly is excluded until its explicit-account release is available.
   Read `docs/petals.md` in the VFS for the exact installed set, mount
   directories, summaries, and declared capabilities.

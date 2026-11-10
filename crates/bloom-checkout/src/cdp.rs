@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use parking_lot::Mutex;
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -81,7 +82,7 @@ pub(crate) struct Cdp {
     sequence: AtomicU64,
 }
 
-fn pipe() -> Result<(OwnedFd, OwnedFd)> {
+pub(crate) fn pipe() -> Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0; 2];
     // Both descriptors remain private through exec except the deliberate child mapping.
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -96,7 +97,7 @@ fn pipe() -> Result<(OwnedFd, OwnedFd)> {
     Ok(pair)
 }
 
-fn child_fd(fd: &OwnedFd) -> Result<OwnedFd> {
+pub(crate) fn child_fd(fd: &OwnedFd) -> Result<OwnedFd> {
     // Keep sources above the destination pair so dup2 cannot clobber a source.
     let copy = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
     if copy < 0 {
@@ -232,24 +233,32 @@ impl Cdp {
         }
         Ok(contexts)
     }
+    /// `display` runs the ordinary browser instead of headless Chromium, which
+    /// names itself "HeadlessChrome" in every request so shops that screen for
+    /// automation refuse it. Empty variables keep the display this process
+    /// inherited, a real screen or a virtual one; non-empty ones select a
+    /// private X display.
     pub fn launch(
         executable: &Path,
         profile: &Path,
         test_flags: &[String],
-        window: bool,
+        display: Option<&[(&str, std::ffi::OsString)]>,
     ) -> Result<Arc<Self>> {
         let (command_read, command_write) = pipe()?;
         let (event_read, event_write) = pipe()?;
         let child_read = child_fd(&command_read)?;
         let child_write = child_fd(&event_write)?;
         let mut command = Command::new(executable);
-        // Headless Chromium names itself in every request it sends, as
-        // "HeadlessChrome/<version>", and shops that screen for automated
-        // browsers read that string and refuse the page. `window` runs the
-        // ordinary browser instead, on whatever display it is given, which
-        // may be a real screen or a virtual one.
-        if !window {
-            command.arg("--headless=new");
+        match display {
+            None => {
+                command.arg("--headless=new");
+            }
+            Some([]) => {}
+            Some(display) => {
+                command
+                    .arg("--ozone-platform=x11")
+                    .envs(display.iter().cloned());
+            }
         }
         command.args(["--remote-debugging-pipe","--no-first-run",
             "--no-default-browser-check","--disable-sync","--disable-breakpad",
@@ -357,10 +366,10 @@ impl Cdp {
                                         });
                                     }
                                 }
-                                if let Some(id) = value["id"].as_u64() {
-                                    if let Some(reply) = replies.lock().remove(&id) {
-                                        let _ = reply.send(Ok(value));
-                                    }
+                                if let Some(id) = value["id"].as_u64()
+                                    && let Some(reply) = replies.lock().remove(&id)
+                                {
+                                    let _ = reply.send(Ok(value));
                                 }
                             }
                             frame.clear();
@@ -386,19 +395,71 @@ impl Cdp {
     }
 
     pub async fn call(&self, session: Option<&str>, method: &str, params: Value) -> Result<Value> {
+        self.call_with_params(session, method, &params).await
+    }
+
+    pub async fn evaluate_in_world(
+        &self,
+        session: &str,
+        world: i64,
+        expression: &str,
+    ) -> Result<Value> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Params<'a> {
+            context_id: i64,
+            expression: &'a str,
+            return_by_value: bool,
+            await_promise: bool,
+        }
+        self.call_with_params(
+            Some(session),
+            "Runtime.evaluate",
+            &Params {
+                context_id: world,
+                expression,
+                return_by_value: true,
+                await_promise: true,
+            },
+        )
+        .await
+    }
+
+    async fn call_with_params<P: Serialize + Sync>(
+        &self,
+        session: Option<&str>,
+        method: &str,
+        params: &P,
+    ) -> Result<Value> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Message<'a, P> {
+            id: u64,
+            method: &'a str,
+            params: &'a P,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            session_id: Option<&'a str>,
+        }
         let id = self.sequence.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = oneshot::channel();
         self.replies.lock().insert(id, sender);
-        let mut message = json!({"id":id,"method":method,"params":params});
-        if let Some(session) = session {
-            message["sessionId"] = json!(session);
+        let message = Message {
+            id,
+            method,
+            params,
+            session_id: session,
+        };
+        let mut bytes = zeroize::Zeroizing::new(Vec::new());
+        if let Err(error) = serde_json::to_writer(&mut *bytes, &message) {
+            self.replies.lock().remove(&id);
+            return Err(error.into());
         }
-        let mut bytes = serde_json::to_vec(&message)?;
         bytes.push(0);
         if self.writer.lock().write_all(&bytes).is_err() {
             self.replies.lock().remove(&id);
             bail!("Checkout browser disconnected");
         }
+        drop(bytes);
         let response = tokio::time::timeout(Duration::from_secs(30), receiver).await;
         self.replies.lock().remove(&id);
         let value = response
@@ -453,7 +514,7 @@ mod tests {
             &crate::test_chromium(),
             &root,
             &["--no-sandbox".into()],
-            false,
+            None,
         )
         .unwrap();
         let target = cdp

@@ -1,14 +1,13 @@
-pub(crate) use crate::travelers::{derived_traveler_value, formatted_phone};
 use crate::{
     browser::{Browser, PrivateTab},
-    discovery::Discovery,
+    discovery::{BeforeFill, BeforeSubmit, Discovery},
     hpke::Recipient,
 };
 use anyhow::{Context, Result, bail};
 use bloom_checkout_api::{BrowseRequest, PreparationReason};
 use bloom_signer_api::{
     CardOperationState, CardOperationStatus, CheckoutFacts, CustodyOutputHpkeAad, CustodyResult,
-    Digest32, OperationId, RenewalPeriod, Token, TravelerFillScope,
+    OperationId, RenewalPeriod, Token,
 };
 use parking_lot::Mutex;
 use rusqlite::{Connection, params};
@@ -27,9 +26,45 @@ use tokio::{
 };
 
 pub use bloom_checkout_api::{HistoryEntry, Request, Status};
+mod saved;
+pub use saved::SavedAction;
+
+/// Marks a pre-submit page Checkout could not read.
+const UNREADABLE: &str = "\u{0}";
 
 /// Approval links last fifteen minutes; allow a short result-delivery grace.
 const APPROVAL_RESULT_WAIT: Duration = Duration::from_secs(15 * 60 + 30);
+
+#[derive(Debug)]
+enum Refusal {
+    Blocked(String),
+    FormErrors,
+    IdUsed,
+}
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Blocked(id) => write!(
+                f,
+                "{id}: payment result unknown. Ask the person to check it: request a take-over with \"resolves\": \"{id}\""
+            ),
+            Self::FormErrors => f.write_str("The page shows form errors; fix them before payment"),
+            Self::IdUsed => f.write_str("Operation ID already used; check its status"),
+        }
+    }
+}
+impl std::error::Error for Refusal {}
+impl Refusal {
+    fn response(&self) -> Value {
+        match self {
+            Self::Blocked(operation_id) => {
+                json!({"error_code":"blocked","operation_id":operation_id})
+            }
+            Self::FormErrors => json!({"error_code":"form_errors"}),
+            Self::IdUsed => json!({"error_code":"id_used"}),
+        }
+    }
+}
 
 struct Store(Mutex<Connection>);
 /// The ongoing price, period and start date to keep for a subscription. A
@@ -83,11 +118,12 @@ impl Store {
         // card was released. Restarting cannot turn that into proof of no charge.
         conn.execute("UPDATE operations SET state='uncertain',status=json_set(status,'$.state','uncertain','$.ceremony_url',NULL) WHERE state IN ('submitted','needs_input','not_submitted','manual_required','human_control')",[])?;
         conn.execute("UPDATE operations SET state='disclosure_unknown',status=json_set(status,'$.state','disclosure_unknown','$.ceremony_url',NULL) WHERE state IN ('release_started','filled','partially_filled')",[])?;
-        conn.execute("UPDATE operations SET state='failed_before_release',status=json_set(status,'$.state','failed_before_release','$.ceremony_url',NULL) WHERE state IN ('requested','preparing','awaiting_approval')",[])?;
+        // A URL is not published until awaiting_approval is committed. No
+        // earlier request can have reached the person for approval.
+        conn.execute("UPDATE operations SET state='failed_before_release',status=json_set(status,'$.state','failed_before_release','$.ceremony_url',NULL) WHERE state IN ('requested','preparing')",[])?;
+        conn.execute("UPDATE operations SET state='restart_cancelling',status=json_set(status,'$.state','restart_cancelling','$.ceremony_url',NULL) WHERE state='awaiting_approval'",[])?;
         // This process owns a fresh browser; no earlier private view can pause it.
         conn.execute("UPDATE operations SET status=json_set(status,'$.paused',json('false')) WHERE json_extract(status,'$.paused')=1",[])?;
-        // The unlocked values lived in memory. After a restart they are gone.
-        conn.execute("UPDATE operations SET state='expired',status=json_set(status,'$.state','expired','$.ceremony_url',NULL) WHERE state='unlocked'",[])?;
         Ok(Self(Mutex::new(conn)))
     }
     fn get(&self, id: &str) -> Result<Status> {
@@ -108,8 +144,16 @@ impl Store {
             })
             .context("Unknown checkout request")
     }
-    fn finish_traveler(&self, id: &str, state: &str) -> Result<()> {
-        self.0.lock().execute("UPDATE operations SET state=?2,status=json_set(status,'$.state',?2,'$.ceremony_url',NULL) WHERE id=?1 AND kind='traveler' AND state!='cancelled'",params![id,state])?;
+    fn restart_cancellations(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.0.lock();
+        let mut query =
+            conn.prepare("SELECT id,kind FROM operations WHERE state='restart_cancelling'")?;
+        let rows = query.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn finish_restart_cancellation(&self, id: &str, state: &str) -> Result<()> {
+        self.0.lock().execute("UPDATE operations SET state=?2,status=json_set(status,'$.state',?2,'$.ceremony_url',NULL) WHERE id=?1 AND state='restart_cancelling'", params![id, state])?;
         Ok(())
     }
     fn insert(&self, status: &Status, kind: &str, description: &str) -> Result<()> {
@@ -142,12 +186,15 @@ impl Store {
     }
     /// The shop and, when Bloom read one, the total the human approved.
     fn unresolved(&self, shop: &str) -> Result<Option<String>> {
+        self.unresolved_except(shop, "")
+    }
+    fn unresolved_except(&self, shop: &str, except: &str) -> Result<Option<String>> {
         let conn = self.0.lock();
         match conn.query_row(
-            "SELECT id FROM operations WHERE shop=?1 AND kind IN ('card','site') AND state IN \
-             ('submitted','needs_input','uncertain','disclosure_unknown','partially_filled','filled','release_started') \
+            "SELECT id FROM operations WHERE shop=?1 AND id!=?2 AND kind IN ('card','site','take_over') AND state IN \
+             ('submitted','needs_input','uncertain','declined','disclosure_unknown','partially_filled','filled','release_started','restart_cancelling') \
              LIMIT 1",
-            [shop],
+            [shop, except],
             |row| row.get(0),
         ) {
             Ok(id) => Ok(Some(id)),
@@ -256,7 +303,7 @@ enum Mode {
     Card,
     /// Click the merchant's pay button; the merchant charges its saved method.
     Site,
-    /// The human takes over the browser and hands it back; nothing is bought.
+    /// The human controls the browser; merchant handlers may charge.
     TakeOver,
 }
 
@@ -278,67 +325,6 @@ struct PrivateCheckout {
     /// Checkout pressed the pay button, or may have. Without this or a manual
     /// submission, no page text can make the checkout paid or booked.
     submitted: bool,
-    /// The unknown earlier checkout this take-over lets the person check.
-    resolves: Option<String>,
-}
-
-struct PendingUnlock {
-    operation_id: String,
-    traveler_id: String,
-    recipient: Recipient,
-    origin: String,
-    context: String,
-    fields: Vec<bloom_signer_api::TravelerField>,
-}
-
-struct UnlockedTraveler {
-    operation_id: String,
-    origin: String,
-    /// The unlock ends with the booking's browsing context.
-    context: String,
-    fields: Vec<bloom_signer_api::TravelerField>,
-    values: BTreeMap<String, zeroize::Zeroizing<String>>,
-    expires: tokio::time::Instant,
-}
-
-/// Drops travelers of another booking or past expiry; returns their unlock IDs.
-fn prune_travelers(
-    travelers: &mut BTreeMap<String, UnlockedTraveler>,
-    context: &str,
-    origin: &str,
-) -> Vec<String> {
-    let now = tokio::time::Instant::now();
-    let mut dropped = Vec::new();
-    travelers.retain(|_, traveler| {
-        let keep =
-            traveler.context == context && traveler.origin == origin && now < traveler.expires;
-        if !keep {
-            dropped.push(traveler.operation_id.clone());
-        }
-        keep
-    });
-    dropped
-}
-
-fn selected_traveler<'a>(
-    travelers: &'a mut BTreeMap<String, UnlockedTraveler>,
-    context: &str,
-    origin: &str,
-    id: Option<&str>,
-) -> Result<&'a UnlockedTraveler> {
-    prune_travelers(travelers, context, origin);
-    if let Some(id) = id {
-        return travelers
-            .get(id)
-            .context("Unlock that saved traveler for this booking first");
-    }
-    if travelers.len() > 1 {
-        bail!("Choose traveler_id explicitly when multiple people are unlocked");
-    }
-    travelers
-        .values()
-        .next()
-        .context("Unlock a saved traveler first")
 }
 
 struct CompletedView {
@@ -348,13 +334,13 @@ struct CompletedView {
 }
 
 pub struct CheckoutService {
+    action_gate: AsyncMutex<()>,
+    saved: Mutex<Option<saved::SavedState>>,
     pub browser: Arc<Browser>,
     store: Store,
     private: AsyncMutex<Option<PrivateCheckout>>,
-    unlocking: AsyncMutex<Option<PendingUnlock>>,
-    travelers: AsyncMutex<BTreeMap<String, UnlockedTraveler>>,
-    /// The one `fill_traveler` person for this browsing context.
-    journey_filler: AsyncMutex<Option<(String, String)>>,
+    /// The operation and its top-document text before each submission.
+    before_submit: Mutex<Option<(String, String)>>,
     completed: Mutex<Option<CompletedView>>,
     broker_socket: PathBuf,
     broker_uid: u32,
@@ -364,6 +350,10 @@ pub struct CheckoutService {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum IntakeResponse {
+    Saved {
+        cards: Vec<bloom_signer_api::CardPublic>,
+        travelers: Vec<bloom_signer_api::TravelerPublic>,
+    },
     Traveler {
         traveler: bloom_signer_api::TravelerPublic,
     },
@@ -379,473 +369,16 @@ enum IntakeResponse {
 }
 
 impl CheckoutService {
-    /// One approval unlocks a saved traveler for the shopping website. The
-    /// values stay in this process, are filled on request and are replaced by
-    /// placeholders in everything the agent reads.
-    async fn start_traveler(
-        self: &Arc<Self>,
-        operation_id: String,
-        traveler_id: String,
-    ) -> Result<Value> {
-        OperationId::new(&operation_id).map_err(|_| anyhow::anyhow!("Invalid operation ID"))?;
-        Token::new(&traveler_id).map_err(|_| anyhow::anyhow!("Invalid traveler ID"))?;
-        let mut unlocking = self.unlocking.lock().await;
-        if self.private.lock().await.is_some() || unlocking.is_some() {
-            bail!("A checkout already has private control");
-        }
-        let metadata = match self
-            .intake(json!({"method":"traveler_info","traveler_id":traveler_id}))
-            .await?
-        {
-            IntakeResponse::Traveler { traveler }
-                if traveler.traveler_id.as_str() == traveler_id =>
-            {
-                traveler
-            }
-            _ => bail!("Traveler metadata unavailable"),
-        };
-        let (context, origin) = self.browser.private_shopping_scope().await?;
-        self.forget_journey_filler_unless(&context).await;
-        {
-            let mut travelers = self.travelers.lock().await;
-            self.prune(&mut travelers, &context, &origin);
-            if travelers.contains_key(&traveler_id) {
-                bail!("That traveler is already unlocked; select their traveler_id when filling");
-            }
-        }
-        use rand::RngCore;
-        let mut nonce = [0; 32];
-        rand::thread_rng().fill_bytes(&mut nonce);
-        let scope = TravelerFillScope {
-            origin: origin.clone(),
-            frame_origins: vec![origin.clone()],
-            document_binding: Digest32::from_bytes(nonce),
-            fields: metadata.fields.clone(),
-        };
-        scope
-            .validate()
-            .map_err(|_| anyhow::anyhow!("Open the booking website before unlocking a traveler"))?;
-        let mut status = Status {
-            operation_id: operation_id.clone(),
-            state: "requested".into(),
-            ceremony_url: None,
-            filled_fields: vec![],
-            outcome: None,
-            paused: false,
-            reason: None,
-            view_url: None,
-        };
-        self.store.insert(
-            &status,
-            "traveler",
-            &format!("Unlock {} for {}", metadata.label, origin),
-        )?;
-        self.store
-            .record_order(&operation_id, Some(&origin), None, None)?;
-        let recipient = Recipient::generate();
-        let challenge_url = format!("http://localhost:{}/unlocked", self.view_port);
-        let response = self
-            .intake(
-                json!({"method":"traveler","operation_id":operation_id,"traveler_id":traveler_id,
-            "scope":scope,"recipient_key":recipient.public,"challenge_url":challenge_url}),
+    async fn approval_order_details(&self, tab: &PrivateTab) -> (Option<String>, Value) {
+        if self.browser.has_private_traveler_data() {
+            (None, json!([]))
+        } else {
+            (
+                crate::discovery::order_preview(tab).await,
+                crate::discovery::order_fields(tab).await,
             )
-            .await;
-        let Ok(IntakeResponse::Prepared { ceremony_url }) = response else {
-            self.set_state(&operation_id, "failed_before_release");
-            bail!("Traveler approval unavailable");
-        };
-        status.state = "awaiting_approval".into();
-        status.ceremony_url = Some(ceremony_url);
-        self.store.update(&status)?;
-        *unlocking = Some(PendingUnlock {
-            operation_id: operation_id.clone(),
-            traveler_id,
-            recipient,
-            origin,
-            context,
-            fields: metadata.fields,
-        });
-        let service = self.clone();
-        tokio::spawn(async move { service.finish_unlock(operation_id).await });
-        Ok(serde_json::to_value(status)?)
-    }
-
-    async fn finish_unlock(self: Arc<Self>, operation_id: String) {
-        let deadline = tokio::time::Instant::now() + APPROVAL_RESULT_WAIT;
-        loop {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            if self
-                .store
-                .get(&operation_id)
-                .is_ok_and(|status| status.state == "cancelled")
-            {
-                return;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                let _ = self.store.finish_traveler(&operation_id, "expired");
-                *self.unlocking.lock().await = None;
-                return;
-            }
-            let state = match self
-                .intake(json!({"method":"result","operation_id":operation_id}))
-                .await
-            {
-                Ok(IntakeResponse::Result {
-                    status,
-                    receipt,
-                    output_aad,
-                }) => match status.state {
-                    CardOperationState::Succeeded => {
-                        let pending = self.unlocking.lock().await.take();
-                        match self
-                            .open_unlock(pending, receipt, output_aad.map(|aad| *aad))
-                            .await
-                        {
-                            Ok(()) => return,
-                            Err(_)
-                                if self
-                                    .store
-                                    .get(&operation_id)
-                                    .is_ok_and(|status| status.state == "cancelled") =>
-                            {
-                                return;
-                            }
-                            // Released but unusable: nothing reached a page.
-                            Err(_) => "failed",
-                        }
-                    }
-                    CardOperationState::Cancelled
-                    | CardOperationState::Expired
-                    | CardOperationState::Failed
-                    | CardOperationState::Missing => "failed_before_release",
-                    _ => continue,
-                },
-                _ => continue,
-            };
-            let _ = self.store.finish_traveler(&operation_id, state);
-            *self.unlocking.lock().await = None;
-            return;
         }
     }
-
-    async fn open_unlock(
-        &self,
-        pending: Option<PendingUnlock>,
-        receipt: Option<Box<CustodyResult>>,
-        aad: Option<CustodyOutputHpkeAad>,
-    ) -> Result<()> {
-        let pending = pending.context("Traveler unlock unavailable")?;
-        // Serialize record installation with cancellation, so a late release
-        // cannot resurrect permission after cancel has returned.
-        let mut travelers = self.travelers.lock().await;
-        let mut status = self.store.consume(&pending.operation_id)?;
-        let (context, origin) = self.browser.shopping_scope().await?;
-        if context != pending.context || origin != pending.origin {
-            bail!("Booking changed during traveler approval; unlock again for this booking");
-        }
-        let receipt = receipt.context("Traveler release unavailable")?;
-        let aad = aad.context("Traveler release binding unavailable")?;
-        if receipt.custody_operation_id.as_str() != pending.operation_id
-            || aad.custody_operation_id.as_str() != pending.operation_id
-            || receipt.surface.as_ref() != Some(&aad.surface)
-        {
-            bail!("Traveler release binding mismatch");
-        }
-        let plaintext = zeroize::Zeroizing::new(
-            pending.recipient.open(
-                receipt
-                    .encrypted_browser_result
-                    .as_ref()
-                    .context("Traveler release unavailable")?,
-                &aad.canonical_bytes()
-                    .map_err(|_| anyhow::anyhow!("Traveler release binding invalid"))?,
-            )?,
-        );
-        let values: BTreeMap<String, zeroize::Zeroizing<String>> =
-            serde_json::from_slice(&plaintext)
-                .map_err(|_| anyhow::anyhow!("Invalid private traveler release"))?;
-        // Choices such as gender are not identifying; names, numbers and
-        // contact details are.
-        self.browser.redact(
-            values
-                .iter()
-                .filter(|(field, _)| !matches!(field.as_str(), "gender" | "document_kind"))
-                .map(|(field, value)| (value.to_string(), format!("[saved {field}]")))
-                .chain(
-                    [
-                        "phone_national",
-                        "phone_local",
-                        "born_on_dmy",
-                        "born_on_mdy",
-                    ]
-                    .into_iter()
-                    .filter_map(|field| {
-                        derived_traveler_value(&values, field)
-                            .map(|value| (value.to_string(), format!("[saved {field}]")))
-                    }),
-                ),
-        );
-        for field in ["born_on", "document_expiry"] {
-            if let Some(value) = values.get(field) {
-                Self::remember_sent(&self.browser, field, value);
-            }
-        }
-        status.filled_fields = values.keys().cloned().collect();
-        self.forget_journey_filler_unless(&pending.context).await;
-        self.prune(&mut travelers, &pending.context, &pending.origin);
-        travelers.insert(
-            pending.traveler_id,
-            UnlockedTraveler {
-                operation_id: pending.operation_id,
-                origin: pending.origin,
-                context: pending.context,
-                fields: pending.fields,
-                values,
-                expires: tokio::time::Instant::now() + Duration::from_secs(1800),
-            },
-        );
-        status.state = "unlocked".into();
-        self.store.update(&status)?;
-        Ok(())
-    }
-
-    async fn cancel_traveler(&self, operation_id: &str) -> Result<Value> {
-        let mut unlocking = self.unlocking.lock().await;
-        let mut travelers = self.travelers.lock().await;
-        let mut status = self.store.get(operation_id)?;
-        if !matches!(
-            status.state.as_str(),
-            "requested" | "awaiting_approval" | "release_started" | "unlocked"
-        ) {
-            return Ok(serde_json::to_value(status)?);
-        }
-        let pending = unlocking
-            .as_ref()
-            .is_some_and(|record| record.operation_id == operation_id);
-        if pending {
-            unlocking.take();
-        } // Drops the only recipient private key.
-        travelers.retain(|_, traveler| traveler.operation_id != operation_id);
-        status.state = "cancelled".into();
-        status.ceremony_url = None;
-        self.store.update(&status)?;
-        drop(travelers);
-        drop(unlocking);
-        if pending {
-            // Local revocation is already durable. If Broker is unavailable,
-            // its old ciphertext is unusable and the ceremony expires normally.
-            let _ = self
-                .intake(json!({"method":"cancel","operation_id":operation_id}))
-                .await;
-        }
-        Ok(serde_json::to_value(status)?)
-    }
-
-    async fn type_traveler(
-        &self,
-        element_ref: String,
-        field: &str,
-        traveler_id: Option<&str>,
-    ) -> Result<Value> {
-        if self.private.lock().await.is_some() {
-            bail!("A checkout already has private control");
-        }
-        let (context, origin) = self.browser.shopping_scope().await?;
-        self.forget_journey_filler_unless(&context).await;
-        let mut travelers = self.travelers.lock().await;
-        self.prune(&mut travelers, &context, &origin);
-        let traveler = selected_traveler(&mut travelers, &context, &origin, traveler_id)?;
-        let text = derived_traveler_value(&traveler.values, field)
-            .context("That saved traveler field is not available")?;
-        Self::remember_sent(&self.browser, field, &text);
-        if matches!(
-            field,
-            "gender" | "nationality" | "document_kind" | "document_country"
-        ) {
-            // A choice goes into a list: pick the option naming the saved value.
-            self.browser
-                .choose_traveler(
-                    &element_ref,
-                    field,
-                    &text,
-                    &traveler.context,
-                    &traveler.origin,
-                )
-                .await?;
-        } else {
-            self.browser
-                .type_traveler(
-                    &element_ref,
-                    field,
-                    &text,
-                    &traveler.context,
-                    &traveler.origin,
-                )
-                .await?;
-        }
-        Ok(json!({"state":"typed","filled_fields":[field]}))
-    }
-
-    async fn fill_traveler(&self, traveler_id: Option<&str>) -> Result<Value> {
-        if self.private.lock().await.is_some() {
-            bail!("A checkout already has private control");
-        }
-        let (context, origin) = self.browser.shopping_scope().await?;
-        self.forget_journey_filler_unless(&context).await;
-        let mut travelers = self.travelers.lock().await;
-        self.prune(&mut travelers, &context, &origin);
-        let traveler = selected_traveler(&mut travelers, &context, &origin, traveler_id)?;
-        let mut values = traveler.values.clone();
-        let fields = traveler.fields.clone();
-        let traveler_origin = traveler.origin.clone();
-        let traveler_context = traveler.context.clone();
-        let selected_id = match traveler_id {
-            Some(id) => id.to_owned(),
-            None => travelers
-                .keys()
-                .next()
-                .context("Unlock a saved traveler first")?
-                .clone(),
-        };
-        if let Some((saved_context, saved_id)) = self.journey_filler.lock().await.clone() {
-            if saved_context == context && saved_id != selected_id {
-                bail!(
-                    "fill_traveler already filled {saved_id} on this booking; use type_traveler with the person's id for each field."
-                );
-            }
-        }
-        if let Some(phone) = values.get("phone").and_then(|p| formatted_phone(p)) {
-            values.insert("phone".into(), zeroize::Zeroizing::new(phone));
-        }
-        for field in ["phone_national", "phone_area", "phone_local"] {
-            if let Some(part) = derived_traveler_value(&values, field) {
-                values.insert(field.into(), part);
-            }
-        }
-        Self::remember_fill(&self.browser, &values);
-        let filled = self
-            .browser
-            .fill_traveler(&traveler_origin, &traveler_context, &fields, &values)
-            .await
-            .inspect_err(|e| eprintln!("traveler fill refused: {e:#}"))?;
-        *self.journey_filler.lock().await = Some((context, selected_id));
-        Ok(json!({"state":"filled","filled_fields":filled}))
-    }
-
-    /// Every string about to be typed, including the formatted phone and the
-    /// birth year a date control shows on its own.
-    fn remember_fill(browser: &Browser, values: &BTreeMap<String, zeroize::Zeroizing<String>>) {
-        for (field, value) in values {
-            Self::remember_sent(browser, field, value);
-        }
-        for field in [
-            "born_on_year",
-            "born_on_month",
-            "born_on_day",
-            "born_on_dmy",
-            "born_on_mdy",
-        ] {
-            if values.contains_key(field) {
-                continue;
-            }
-            if let Some(part) = derived_traveler_value(values, field) {
-                Self::remember_sent(browser, field, &part);
-            }
-        }
-    }
-
-    fn remember_sent(browser: &Browser, field: &str, value: &str) {
-        if value.is_empty() {
-            return;
-        }
-        let item = (value.to_owned(), format!("[saved {field}]"));
-        // Review pages commonly spell the month rather than repeat the ISO
-        // value sent to their controls (Jetabroad: "1 Jan 1990").
-        if matches!(field, "born_on" | "document_expiry") {
-            let parts: Vec<_> = value.split('-').collect();
-            if let [year, month, day] = parts.as_slice()
-                && let (Ok(month), Ok(day)) = (month.parse::<usize>(), day.parse::<u8>())
-                && (1..=12).contains(&month)
-                && (1..=31).contains(&day)
-            {
-                let names = [
-                    "January",
-                    "February",
-                    "March",
-                    "April",
-                    "May",
-                    "June",
-                    "July",
-                    "August",
-                    "September",
-                    "October",
-                    "November",
-                    "December",
-                ];
-                let mut forms = vec![
-                    format!("{day}/{month}/{year}"),
-                    format!("{month}/{day}/{year}"),
-                    format!("{day:02}/{month:02}/{year}"),
-                    format!("{month:02}/{day:02}/{year}"),
-                    format!("{day}-{month}-{year}"),
-                    format!("{month}-{day}-{year}"),
-                    format!("{day:02}-{month:02}-{year}"),
-                    format!("{month:02}-{day:02}-{year}"),
-                ];
-                for name in [names[month - 1], &names[month - 1][..3]] {
-                    forms.extend([
-                        format!("{day} {name} {year}"),
-                        format!("{day:02} {name} {year}"),
-                        format!("{day} {name},{year}"),
-                        format!("{day:02} {name},{year}"),
-                        format!("{name} {day}, {year}"),
-                    ]);
-                }
-                browser.redact(
-                    forms
-                        .into_iter()
-                        .map(|form| (form, format!("[saved {field}]"))),
-                );
-            }
-        }
-        // Names remain identifying even when they contain only one character.
-        if matches!(field, "born_on_year" | "given_name" | "family_name") {
-            browser.redact_min([item], 1);
-        } else {
-            browser.redact([item]);
-        }
-    }
-
-    /// A new browsing context drops the person `fill_traveler` already used.
-    async fn forget_journey_filler_unless(&self, context: &str) {
-        let mut filler = self.journey_filler.lock().await;
-        if filler.as_ref().is_some_and(|(saved, _)| saved != context) {
-            *filler = None;
-        }
-    }
-
-    /// Drop travelers outside this booking or past expiry; their unlocks end.
-    fn prune(
-        &self,
-        travelers: &mut BTreeMap<String, UnlockedTraveler>,
-        context: &str,
-        origin: &str,
-    ) {
-        for id in prune_travelers(travelers, context, origin) {
-            let _ = self.store.finish_traveler(&id, "expired");
-        }
-    }
-
-    /// Drop every unlocked traveler's values and end their unlocks.
-    async fn forget_travelers(&self) {
-        let dropped = std::mem::take(&mut *self.travelers.lock().await);
-        for traveler in dropped.into_values() {
-            let _ = self
-                .store
-                .finish_traveler(&traveler.operation_id, "expired");
-        }
-    }
-
     /// An earlier card or site checkout whose result the person must check.
     async fn resolvable(&self, operation_id: &str) -> Result<Status> {
         OperationId::new(operation_id).map_err(|_| anyhow::anyhow!("Invalid operation ID"))?;
@@ -884,31 +417,8 @@ impl CheckoutService {
         Ok(status)
     }
 
-    /// Called only from the person's Done in an approved take-over.
-    async fn mark_checked(&self, operation_id: &str) -> Result<()> {
-        let mut status = self.resolvable(operation_id).await?;
-        let mut outcome = status
-            .outcome
-            .take()
-            .unwrap_or(bloom_checkout_api::Outcome {
-                state: "resolved".into(),
-                source: "human".into(),
-                confirmation_reached: false,
-                order_id: None,
-                merchant_reported_total_minor: None,
-                currency: None,
-                resolution: None,
-            });
-        outcome.resolution = Some("human_checked".into());
-        status.state = "resolved".into();
-        status.ceremony_url = None;
-        status.outcome = Some(outcome);
-        self.store.update(&status)
-    }
-
     async fn return_control(&self) -> Result<()> {
-        self.forget_travelers().await;
-        self.journey_filler.lock().await.take();
+        self.saved.lock().take();
         self.browser.return_control().await
     }
 
@@ -924,12 +434,12 @@ impl CheckoutService {
         }
         let store = Store::open(state)?;
         Ok(Arc::new(Self {
+            action_gate: AsyncMutex::new(()),
+            saved: Mutex::new(None),
             browser,
             store,
             private: AsyncMutex::new(None),
-            unlocking: AsyncMutex::new(None),
-            travelers: AsyncMutex::new(BTreeMap::new()),
-            journey_filler: AsyncMutex::new(None),
+            before_submit: Mutex::new(None),
             completed: Mutex::new(None),
             broker_socket,
             broker_uid,
@@ -937,11 +447,81 @@ impl CheckoutService {
         }))
     }
 
+    /// Revoke approvals before starting the browser or exposing the API.
+    pub async fn reconcile_before_browser(state: &Path, socket: &Path, uid: u32) -> Result<()> {
+        let store = Store::open(state)?;
+        loop {
+            let pending = match store.restart_cancellations() {
+                Ok(pending) if pending.is_empty() => return Ok(()),
+                Ok(pending) => pending,
+                Err(error) => {
+                    eprintln!(
+                        "cannot inspect interrupted checkout approvals: {}",
+                        loggable(&error)
+                    );
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+            for (id, kind) in pending {
+                let cancel =
+                    Self::intake_to(socket, uid, json!({"method":"cancel","operation_id":id}))
+                        .await;
+                let status = match cancel {
+                    Ok(IntakeResponse::Result { status, .. }) => Some(status),
+                    _ => match Self::intake_to(
+                        socket,
+                        uid,
+                        json!({"method":"result","operation_id":id}),
+                    )
+                    .await
+                    {
+                        Ok(IntakeResponse::Result { status, .. }) => Some(status),
+                        _ => None,
+                    },
+                };
+                let state = match status
+                    .filter(|status| status.operation_id.as_str() == id)
+                    .map(|status| status.state)
+                {
+                    Some(CardOperationState::Succeeded) if kind == "card" => {
+                        Some("disclosure_unknown")
+                    }
+                    Some(CardOperationState::Succeeded) if kind == "traveler" => Some("expired"),
+                    Some(
+                        CardOperationState::Succeeded
+                        | CardOperationState::Cancelled
+                        | CardOperationState::Expired
+                        | CardOperationState::Failed
+                        | CardOperationState::Missing,
+                    ) => Some("failed_before_release"),
+                    _ => None,
+                };
+                if let Some(state) = state
+                    && let Err(error) = store.finish_restart_cancellation(&id, state)
+                {
+                    eprintln!(
+                        "cannot record interrupted checkout reconciliation: {}",
+                        loggable(&error)
+                    );
+                }
+            }
+            if store.restart_cancellations()?.is_empty() {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
     async fn intake(&self, request: Value) -> Result<IntakeResponse> {
-        let stream = tokio::net::UnixStream::connect(&self.broker_socket)
+        Self::intake_to(&self.broker_socket, self.broker_uid, request).await
+    }
+
+    async fn intake_to(socket: &Path, uid: u32, request: Value) -> Result<IntakeResponse> {
+        let stream = tokio::net::UnixStream::connect(socket)
             .await
             .context("Checkout authorization service unavailable")?;
-        if stream.peer_cred()?.uid() != self.broker_uid {
+        if stream.peer_cred()?.uid() != uid {
             bail!("Checkout authorization peer rejected");
         }
         let (reader, mut writer) = stream.into_split();
@@ -966,27 +546,17 @@ impl CheckoutService {
 
     pub async fn request(self: &Arc<Self>, request: Request) -> Result<Value> {
         match request {
-            Request::Traveler {
-                operation_id,
-                traveler_id,
-            } => self.start_traveler(operation_id, traveler_id).await,
-            Request::Browse {
-                request: BrowseRequest::FillTraveler { traveler_id },
-            } => self.fill_traveler(traveler_id.as_deref()).await,
-            Request::Browse {
-                request:
-                    BrowseRequest::TypeTraveler {
-                        element_ref,
-                        field,
-                        traveler_id,
-                    },
-            } => {
-                self.type_traveler(element_ref, &field, traveler_id.as_deref())
-                    .await
-            }
             Request::Browse { request } => {
-                if matches!(request, BrowseRequest::Open { .. }) {
-                    self.forget_travelers().await;
+                if matches!(
+                    request,
+                    BrowseRequest::Click { .. }
+                        | BrowseRequest::Type { .. }
+                        | BrowseRequest::Select { .. }
+                ) {
+                    // Any merchant event handler can place an order, even on
+                    // a field or a control labelled "Continue". Only the
+                    // approved private flow may dispatch these effects.
+                    bail!(MERCHANT_APPROVAL);
                 }
                 self.browser.browse(request).await
             }
@@ -995,7 +565,7 @@ impl CheckoutService {
                 if self.private.lock().await.as_ref().is_some_and(|checkout| {
                     checkout.operation_id == operation_id && checkout.approved
                 }) {
-                    status.view_url = Some(format!("http://localhost:{}/view", self.view_port));
+                    status.view_url = Some(format!("http://127.0.0.1:{}/view", self.view_port));
                 }
                 Ok(serde_json::to_value(status)?)
             }
@@ -1025,8 +595,8 @@ impl CheckoutService {
                         let shop = self.store.shop(prior)?.unwrap_or("this shop".into());
                         let note = format!(
                             "Bloom does not know whether an earlier payment at {shop} went through. \
-                             Check the shop account, email or bank, then click Done; \
-                             only then can your agent pay there again. Agent: "
+                             Check the shop account, email or bank. Done closes the view; \
+                             it does not prove that payment failed or permit another attempt. Agent: "
                         );
                         let room = 1024usize.saturating_sub(note.len());
                         let mut end = agent_description.len().min(room);
@@ -1045,17 +615,10 @@ impl CheckoutService {
                     (None, false) => Mode::Site,
                     (None, true) => Mode::TakeOver,
                 };
-                let unlocking = self.unlocking.lock().await;
                 let mut private = self.private.lock().await;
                 if private.is_some() {
                     bail!("A checkout already has private control");
                 }
-                if unlocking.is_some() {
-                    bail!(
-                        "A saved traveler unlock is waiting for approval; finish or cancel it before payment"
-                    );
-                }
-                drop(unlocking);
                 let mut status = Status {
                     operation_id: operation_id.clone(),
                     state: "requested".into(),
@@ -1080,14 +643,7 @@ impl CheckoutService {
                             "payment refused over form errors: {}",
                             Self::form_error_count(&attention)
                         );
-                        bail!(
-                            "The page shows form errors; fix them before payment: {}",
-                            if errors.is_empty() {
-                                "a field is marked invalid".into()
-                            } else {
-                                errors.join(" / ")
-                            }
-                        );
+                        return Err(Refusal::FormErrors.into());
                     }
                 }
                 let kind = match mode {
@@ -1095,25 +651,16 @@ impl CheckoutService {
                     Mode::Site => "site",
                     Mode::TakeOver => "take_over",
                 };
-                if matches!(mode, Mode::Card | Mode::Site) {
-                    if let Ok((_, origin)) = self.browser.shopping_scope().await {
-                        if let Some(open) = self.store.unresolved(&origin)? {
-                            bail!(
-                                "{open}: payment result unknown. Ask the person to check it: request a take-over with \"resolves\": \"{open}\""
-                            );
-                        }
-                    }
+                if matches!(mode, Mode::Card | Mode::Site)
+                    && let Ok((_, origin)) = self.browser.shopping_scope().await
+                    && let Some(open) = self.store.unresolved(&origin)?
+                {
+                    return Err(Refusal::Blocked(open).into());
                 }
                 if self.store.get(&operation_id).is_ok() {
-                    bail!("Operation ID already used");
+                    return Err(Refusal::IdUsed.into());
                 }
                 let tab = self.browser.handoff().await?;
-                if let Err(error) = self.store.insert(&status, kind, &agent_description) {
-                    let _ = self.return_control().await;
-                    return Err(error);
-                }
-                status.state = "preparing".into();
-                self.store.update(&status)?;
                 let read = match mode {
                     Mode::Card => Some(Discovery::read(&tab).await),
                     Mode::Site => Some(Discovery::read_site(&tab).await),
@@ -1126,7 +673,6 @@ impl CheckoutService {
                     Some(Err(error)) => {
                         eprintln!("payment page needs the private view: {error:#}");
                         status.reason = error.downcast_ref::<PreparationReason>().copied();
-                        self.store.update(&status)?;
                         None
                     }
                     None => None,
@@ -1136,8 +682,32 @@ impl CheckoutService {
                     None => tab_url(&tab)
                         .await
                         .and_then(|url| url::Url::parse(&url).ok())
+                        .filter(|url| {
+                            matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
+                        })
                         .map(|url| url.origin().ascii_serialization()),
                 };
+                if matches!(mode, Mode::Card | Mode::Site) {
+                    let check = (|| -> Result<()> {
+                        let origin = shop
+                            .as_deref()
+                            .context("Cannot determine checkout origin")?;
+                        if let Some(open) = self.store.unresolved(origin)? {
+                            return Err(Refusal::Blocked(open).into());
+                        }
+                        Ok(())
+                    })();
+                    if let Err(error) = check {
+                        self.return_control().await?;
+                        return Err(error);
+                    }
+                }
+                if let Err(error) = self.store.insert(&status, kind, &agent_description) {
+                    let _ = self.return_control().await;
+                    return Err(error);
+                }
+                status.state = "preparing".into();
+                self.store.update(&status)?;
                 self.store.record_order(
                     &operation_id,
                     shop.as_deref(),
@@ -1150,20 +720,27 @@ impl CheckoutService {
                     (mode == Mode::Card && discovery.is_some()).then(Recipient::generate);
                 let capability = new_view_token();
                 let challenge_url = challenge_url(self.view_port, &capability);
+                // The approval URL is available to the agent. A page preview
+                // or field value may contain private traveler information.
+                let (order_preview, order_fields) = if discovery.is_some() {
+                    self.approval_order_details(&tab).await
+                } else {
+                    (None, json!([]))
+                };
                 let request = match (&discovery, &recipient) {
                     (Some(discovery), Some(recipient)) => {
                         json!({"method":"prepare","operation_id":operation_id,"card_id":card_id,
                         "facts":discovery.facts,"recipient_key":recipient.public,
                         "agent_description":agent_description,"challenge_url":challenge_url,
-                        "order_preview":crate::discovery::order_preview(&tab).await,
-                        "order_fields":crate::discovery::order_fields(&tab).await})
+                        "order_preview":order_preview,
+                        "order_fields":order_fields})
                     }
                     (Some(discovery), None) => {
                         json!({"method":"site","operation_id":operation_id,
                         "facts":discovery.facts,"agent_description":agent_description,
                         "challenge_url":challenge_url,
-                        "order_preview":crate::discovery::order_preview(&tab).await,
-                        "order_fields":crate::discovery::order_fields(&tab).await})
+                        "order_preview":order_preview,
+                        "order_fields":order_fields})
                     }
                     _ => json!({"method":"manual","operation_id":operation_id,"card_id":card_id,
                         "agent_description":agent_description,"challenge_url":challenge_url}),
@@ -1187,7 +764,6 @@ impl CheckoutService {
                             approved: false,
                             manual_submission: false,
                             submitted: false,
-                            resolves,
                         });
                         let service = self.clone();
                         tokio::spawn(async move {
@@ -1204,9 +780,8 @@ impl CheckoutService {
                 }
             }
             Request::Cancel { operation_id } => {
-                if self.store.kind(&operation_id)? == "traveler" {
-                    return self.cancel_traveler(&operation_id).await;
-                }
+                let _gate = self.action_gate.lock().await;
+                self.require_saved_idle()?;
                 let mut private = self.private.lock().await;
                 if private
                     .as_ref()
@@ -1288,6 +863,17 @@ impl CheckoutService {
                             .await;
                         if result.is_err() {
                             self.set_state(&operation_id, "disclosure_unknown");
+                        } else if self
+                            .store
+                            .get(&operation_id)
+                            .is_ok_and(|status| status.state == "failed_before_release")
+                        {
+                            if self.return_control().await.is_ok() {
+                                *private = None;
+                            } else {
+                                self.mark_paused(&operation_id);
+                            }
+                            return;
                         }
                         drop(private);
                         self.watch_outcome(operation_id).await;
@@ -1361,6 +947,8 @@ impl CheckoutService {
         };
         let mut status = self.store.consume(&checkout.operation_id)?; // Durable before plaintext.
         if checkout.mode == Mode::Site {
+            self.remember_before_submit(&checkout.operation_id, &checkout.tab)
+                .await;
             // Record the submission attempt first; a lost response must not cause a second click.
             status.state = "submitted".into();
             self.store.update(&status)?;
@@ -1368,6 +956,10 @@ impl CheckoutService {
                 Ok(true) => checkout.submitted = true,
                 Ok(false) => {
                     status.state = "needs_input".into();
+                    self.store.update(&status)?;
+                }
+                Err(error) if error.downcast_ref::<BeforeSubmit>().is_some() => {
+                    status.state = "failed_before_release".into();
                     self.store.update(&status)?;
                 }
                 Err(_) => {
@@ -1378,7 +970,12 @@ impl CheckoutService {
             }
             return Ok(());
         }
-        discovery.recheck(&checkout.tab).await?;
+        if discovery.recheck(&checkout.tab).await.is_err() {
+            // No card has been decrypted or filled at this point.
+            status.state = "failed_before_release".into();
+            self.store.update(&status)?;
+            return Ok(());
+        }
         let key = checkout
             .recipient
             .take()
@@ -1400,12 +997,13 @@ impl CheckoutService {
                 .map_err(|_| anyhow::anyhow!("Invalid release binding"))?,
         )?;
         let card = serde_json::from_slice(&plaintext).context("Invalid card release")?;
-        if discovery
+        if let Err(error) = discovery
             .fill(&checkout.tab, &card, &mut status.filled_fields)
             .await
-            .is_err()
         {
-            status.state = if status.filled_fields.is_empty() {
+            status.state = if error.downcast_ref::<BeforeFill>().is_some() {
+                "failed_before_release"
+            } else if status.filled_fields.is_empty() {
                 "disclosure_unknown"
             } else {
                 "partially_filled"
@@ -1423,6 +1021,8 @@ impl CheckoutService {
         if std::env::var_os("BLOOM_CHECKOUT_REHEARSAL_NO_SUBMIT").is_some() {
             return Ok(());
         }
+        self.remember_before_submit(&checkout.operation_id, &checkout.tab)
+            .await;
         // Record the submission attempt first; a lost response must not cause a second click.
         status.state = "submitted".into();
         self.store.update(&status)?;
@@ -1446,12 +1046,30 @@ impl CheckoutService {
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ViewAction {
-    Click { x: f64, y: f64 },
-    Type { text: String },
-    Key { key: String },
-    Scroll { x: f64, y: f64, delta_y: f64 },
-    SelectPage { target: String },
-    Finish,
+    Click {
+        x: f64,
+        y: f64,
+    },
+    Type {
+        text: String,
+    },
+    Key {
+        key: String,
+    },
+    Scroll {
+        x: f64,
+        y: f64,
+        delta_y: f64,
+    },
+    SelectPage {
+        target: String,
+    },
+    /// `stay_signed_in` keeps a take-over's cookies for later shopping. Only
+    /// the person chooses it; the agent then sees signed-in pages.
+    Finish {
+        #[serde(default)]
+        stay_signed_in: bool,
+    },
 }
 
 /// The state a card or site checkout ends in when its private view closes:
@@ -1515,7 +1133,7 @@ fn claim_view_session(
 }
 
 fn challenge_url(view_port: u16, capability: &str) -> String {
-    format!("http://localhost:{view_port}/private?token={capability}")
+    format!("http://127.0.0.1:{view_port}/private?token={capability}")
 }
 
 impl CheckoutService {
@@ -1540,10 +1158,9 @@ impl CheckoutService {
             for info in infos {
                 if info["type"] == "page"
                     && info["openerId"].as_str().is_some_and(|p| owned.contains(p))
+                    && let Some(id) = info["targetId"].as_str()
                 {
-                    if let Some(id) = info["targetId"].as_str() {
-                        owned.insert(id.to_owned());
-                    }
+                    owned.insert(id.to_owned());
                 }
             }
             if owned.len() == count {
@@ -1597,11 +1214,53 @@ impl CheckoutService {
         Ok(session)
     }
 
+    /// Records the top document's address and text just before a submission,
+    /// so success copy already on the page cannot count as its result.
+    async fn remember_before_submit(&self, id: &str, tab: &PrivateTab) {
+        let read = async {
+            let contexts = tab.cdp.contexts(&tab.session, "bloom-outcome").await?;
+            let top = contexts
+                .iter()
+                .find(|c| c.parent_id.is_none())
+                .context("Document unavailable")?;
+            let result = tab.cdp.call(Some(&top.session), "Runtime.evaluate", json!({"contextId":top.world,"returnByValue":true,
+                "expression":"(location.origin+location.pathname+'\\n'+document.body.innerText).toLowerCase()"})).await?;
+            result["result"]["value"]
+                .as_str()
+                .map(str::to_owned)
+                .context("Document text unavailable")
+        };
+        // An unreadable page leaves no success copy that can count.
+        let text = tokio::time::timeout(Duration::from_secs(2), read)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_else(|| UNREADABLE.into());
+        let mut before = self.before_submit.lock();
+        match before.as_mut() {
+            Some((saved, earlier)) if saved == id => earlier.push_str(&text),
+            _ => *before = Some((id.into(), text)),
+        }
+    }
+
+    fn new_since_submit(&self, id: &str, phrase: &str) -> bool {
+        match self.before_submit.lock().as_ref() {
+            Some((saved, text)) if saved == id => {
+                !phrase.is_empty() && !text.contains(UNREADABLE) && !text.contains(phrase)
+            }
+            _ => !phrase.is_empty(),
+        }
+    }
+
     async fn watch_outcome(&self, id: String) {
         let started = tokio::time::Instant::now();
         let mut copied_contact = false;
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
+            let _gate = self.action_gate.lock().await;
+            if self.require_saved_idle().is_err() {
+                continue;
+            }
             // Outcome polling must not own the private-view lock while Chromium
             // is slow. Copy the stable browser handles, then do bounded calls.
             let (mode, tab, submitted) = {
@@ -1621,16 +1280,18 @@ impl CheckoutService {
             // A take-over may include a login with an emailed or texted code;
             // a payment may need a bank check or a correction from the human.
             let deadline = started + Duration::from_secs(900);
-            if matches!(
-                status.state.as_str(),
-                "submitted"
-                    | "needs_input"
-                    | "declined"
-                    | "manual_required"
-                    | "uncertain"
-                    | "partially_filled"
-                    | "disclosure_unknown"
-            ) {
+            if mode != Mode::TakeOver
+                && matches!(
+                    status.state.as_str(),
+                    "submitted"
+                        | "needs_input"
+                        | "declined"
+                        | "manual_required"
+                        | "uncertain"
+                        | "partially_filled"
+                        | "disclosure_unknown"
+                )
+            {
                 let mut observed = Vec::new();
                 let contexts = tokio::time::timeout(
                     Duration::from_secs(2),
@@ -1671,18 +1332,25 @@ impl CheckoutService {
                 // Success text counts only from the top document, after checkout
                 // or the person pressed pay. "needs_input" alone may mean the
                 // pay button was never pressed.
-                let completed_allowed =
-                    status.state == "submitted" || (status.state == "needs_input" && submitted);
+                let completed_allowed = status.state == "submitted"
+                    || (matches!(
+                        status.state.as_str(),
+                        "needs_input" | "uncertain" | "declined"
+                    ) && submitted);
                 let outcome = observed
                     .iter()
                     .find_map(|(is_top, outcome)| {
+                        // Success copy the page already showed before the
+                        // submission is not evidence that it paid.
+                        let new = completed_allowed
+                            && outcome["phrase"]
+                                .as_str()
+                                .is_some_and(|phrase| self.new_since_submit(&id, phrase));
                         let terminal = match outcome["state"].as_str() {
-                            Some("booked") if *is_top && completed_allowed => Some("booked"),
+                            Some("booked") if *is_top && new => Some("booked"),
                             // Help text can say "payment failed" before anyone pays.
-                            Some("declined") if attempt || status.state == "declined" => {
-                                Some("declined")
-                            }
-                            Some("payment_phrase") if *is_top && completed_allowed => Some("paid"),
+                            Some("declined") if *is_top && attempt => Some("declined"),
+                            Some("payment_phrase") if *is_top && new => Some("paid"),
                             _ => None,
                         }?;
                         Some((terminal, outcome))
@@ -1710,10 +1378,10 @@ impl CheckoutService {
                             let _ = self.store.update(&status);
                         }
                     } else if state == "declined" {
-                        // Record the merchant decline and leave the pages up.
-                        if status.state != "declined" {
-                            status.state = "declined".into();
-                            status.outcome = serde_json::from_value((*outcome).clone()).ok();
+                        // Page text alone cannot prove that no payment occurred.
+                        if status.state != "uncertain" {
+                            status.state = "uncertain".into();
+                            status.outcome = None;
                             status.ceremony_url = None;
                             let _ = self.store.update(&status);
                         }
@@ -1722,7 +1390,18 @@ impl CheckoutService {
                         if state == "paid" {
                             recorded["state"] = json!("paid");
                         }
-                        let close = matches!(status.state.as_str(), "submitted" | "needs_input");
+                        if let Some(fields) = recorded.as_object_mut() {
+                            fields.remove("phrase");
+                        }
+                        let close = !self
+                            .saved
+                            .lock()
+                            .as_ref()
+                            .is_some_and(|s| s.operation == id)
+                            && matches!(
+                                status.state.as_str(),
+                                "submitted" | "needs_input" | "uncertain" | "declined"
+                            );
                         status.state = state.into();
                         status.outcome = serde_json::from_value(recorded).ok();
                         status.ceremony_url = None;
@@ -1750,7 +1429,7 @@ impl CheckoutService {
                 // person made must never stay usable by shopping.
                 if self.return_control().await.is_ok() {
                     let current = self.store.get(&id).map(|s| s.state).unwrap_or_default();
-                    let final_state = if mode == Mode::TakeOver {
+                    let final_state = if mode == Mode::TakeOver && current == "human_control" {
                         "returned"
                     } else {
                         closing_state(&current)
@@ -1881,8 +1560,16 @@ impl CheckoutService {
             checkout.view_target.clone()
         };
         let status = self.store.get(&operation_id)?;
+        let saved = self.saved_status(&operation_id);
+        let can_use_saved = self
+            .private
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|c| c.mode == Mode::TakeOver);
+        let can_stay_signed_in = can_use_saved && !self.browser.has_private_traveler_data();
         Ok(
-            json!({"state":status.state,"outcome":status.outcome,"pages":pages,"selected_page":selected_page,"closed":false}),
+            json!({"state":status.state,"outcome":status.outcome,"pages":pages,"selected_page":selected_page,"closed":false,"saved":saved,"can_use_saved":can_use_saved,"can_stay_signed_in":can_stay_signed_in}),
         )
     }
 
@@ -1923,6 +1610,25 @@ impl CheckoutService {
     }
 
     pub async fn private_action(&self, token: &str, action: ViewAction) -> Result<()> {
+        let _gate = self.action_gate.lock().await;
+        self.require_saved_idle()?;
+        if !matches!(
+            action,
+            ViewAction::Finish { .. } | ViewAction::SelectPage { .. }
+        ) {
+            let mut private = self.private.lock().await;
+            let checkout = private.as_mut().context("No active private checkout")?;
+            authorize_view(checkout, token)?;
+            if checkout.mode == Mode::TakeOver {
+                // Any merchant event handler can charge a saved method.
+                // Record uncertainty before dispatch, including failed calls.
+                let mut status = self.store.get(&checkout.operation_id)?;
+                status.state = "uncertain".into();
+                status.outcome = None;
+                self.store.update(&status)?;
+                checkout.manual_submission = true;
+            }
+        }
         match action {
             ViewAction::Click { x, y } => {
                 if !x.is_finite()
@@ -1958,6 +1664,7 @@ impl CheckoutService {
                         tokio::time::timeout(Duration::from_secs(2), discovery.recheck(&tab))
                             .await
                             .map_err(|_| anyhow::anyhow!("Private page is still loading"))??;
+                        self.remember_before_submit(&operation_id, &tab).await;
                         {
                             let mut private = self.private.lock().await;
                             let checkout = private
@@ -2044,6 +1751,7 @@ impl CheckoutService {
                     )
                     .await
                     .map_err(|_| anyhow::anyhow!("Private page is still loading"))??;
+                    self.remember_before_submit(&operation_id, &tab).await;
                     {
                         let mut private = self.private.lock().await;
                         let checkout = private
@@ -2129,27 +1837,32 @@ impl CheckoutService {
                 checkout.view_target = target;
                 checkout.view_session = session;
             }
-            ViewAction::Finish => {
-                let (operation_id, mode, resolves) = {
+            ViewAction::Finish { stay_signed_in } => {
+                let (operation_id, mode) = {
                     let private = self.private.lock().await;
                     let checkout = private.as_ref().context("No active private checkout")?;
                     authorize_view(checkout, token)?;
-                    (
-                        checkout.operation_id.clone(),
-                        checkout.mode,
-                        checkout.resolves.clone(),
-                    )
+                    (checkout.operation_id.clone(), checkout.mode)
                 };
+                if stay_signed_in && mode != Mode::TakeOver {
+                    bail!("Only a take-over can keep its sign-in");
+                }
                 if mode == Mode::TakeOver {
-                    self.return_control().await?;
-                    self.set_state(&operation_id, "returned");
-                    // Shopping is already back; a prior that changed meanwhile
-                    // simply stays unresolved.
-                    if let Some(prior) = resolves {
-                        if let Err(error) = self.mark_checked(&prior).await {
-                            eprintln!("earlier checkout left unresolved: {}", loggable(&error));
-                        }
+                    if stay_signed_in {
+                        self.saved.lock().take();
+                        self.browser.return_control_signed_in().await?;
+                    } else {
+                        self.return_control().await?;
                     }
+                    let current = self.store.get(&operation_id)?.state;
+                    self.set_state(
+                        &operation_id,
+                        if current == "human_control" {
+                            "returned"
+                        } else {
+                            closing_state(&current)
+                        },
+                    );
                 } else {
                     let current = self.store.get(&operation_id)?.state;
                     self.set_state(&operation_id, closing_state(&current));
@@ -2218,14 +1931,9 @@ pub async fn serve_api(service: Arc<CheckoutService>, path: &Path, machine_uid: 
                         Ok(value) => value,
                         // Browse errors are Bloom's own guidance strings; anything else
                         // (CDP or page-derived text) stays generic.
-                        Err(error) if browse => {
-                            let message = error.to_string();
-                            json!({"error": if BROWSE_ERRORS.contains(&message.as_str()) {
-                                message
-                            } else {
-                                eprintln!("checkout browse failed: {}", loggable(&error));
-                                "The page could not be read or changed; open it again or request a new snapshot".into()
-                            }})
+                        Err(error) if browse => browse_error(&error),
+                        Err(error) if error.downcast_ref::<Refusal>().is_some() => {
+                            error.downcast_ref::<Refusal>().unwrap().response()
                         }
                         Err(_) => {
                             json!({"error":"Checkout request rejected or unavailable. Check status before retrying."})
@@ -2244,7 +1952,7 @@ pub async fn serve_api(service: Arc<CheckoutService>, path: &Path, machine_uid: 
 
 /// An error chain for the service log. Checkout's own messages and CDP
 /// method names stay; quoted text, which parsers copy from page values, does not.
-fn loggable(error: &anyhow::Error) -> String {
+pub(crate) fn loggable(error: &anyhow::Error) -> String {
     let mut out = String::new();
     for cause in error.chain() {
         if !out.is_empty() {
@@ -2266,7 +1974,23 @@ fn loggable(error: &anyhow::Error) -> String {
     out.chars().take(300).collect()
 }
 
+/// The agent's view of a browse failure. Only Bloom's own guidance passes;
+/// CDP or page-derived text stays generic.
+fn browse_error(error: &anyhow::Error) -> Value {
+    let message = error.to_string();
+    json!({"error": if BROWSE_ERRORS.contains(&message.as_str()) {
+        message
+    } else {
+        eprintln!("checkout browse failed: {}", loggable(error));
+        "The page could not be read or changed; open it again or request a new snapshot".into()
+    }})
+}
+
+const MERCHANT_APPROVAL: &str =
+    "Merchant interaction requires approval; request a private take-over";
+
 const BROWSE_ERRORS: &[&str] = &[
+    MERCHANT_APPROVAL,
     "Invalid browsing URL",
     "Only ordinary HTTP(S) shopping URLs are supported",
     "Only ordinary shopping documents can be observed",
@@ -2278,14 +2002,7 @@ const BROWSE_ERRORS: &[&str] = &[
     "Input exceeds limit",
     "Checkout has private control; shopping is paused",
     "Checkout browser is restarting; check request status before another payment",
-    "Saved traveler details are unlocked for another booking or website",
-    "Choose traveler_id explicitly when multiple people are unlocked",
-    "Unlock that saved traveler for this booking first",
-    "Unlock a saved traveler first",
-    "That saved traveler field is not available",
-    "That list did not take the saved value; choose it in the private view",
     "A checkout already has private control",
-    "That field is in an embedded frame from another website; type it in the private view",
 ];
 
 #[cfg(test)]
@@ -2342,448 +2059,8 @@ mod tests {
         assert_eq!(renewal_terms(&facts()), None);
     }
 
-    #[tokio::test]
-    async fn multiple_travelers_and_a_different_payer_require_explicit_records_and_targets() {
-        let (url, server) = crate::discovery::tests::fixture(
-            "<fieldset><legend>Passenger one</legend><input aria-label='Passenger one given name' autocomplete='given-name'></fieldset>
-             <fieldset><legend>Passenger two</legend><input aria-label='Passenger two given name' autocomplete='given-name'></fieldset>
-             <fieldset><legend>Cardholder</legend><input aria-label='Payer given name' autocomplete='given-name'></fieldset>
-             <input type='email' aria-label='Contact email'><p id='echo'></p>
-             <script>document.addEventListener('input',()=>{
-               echo.textContent=Array.from(document.querySelectorAll('input'),e=>e.value).join(' ');
-             });</script>".into(),
-        ).await;
-        let root = tempfile::tempdir().unwrap();
-        let browser = Browser::launch(
-            &crate::test_chromium(),
-            &root.path().join("profile"),
-            &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
-        )
-        .await
-        .unwrap();
-        browser
-            .browse(BrowseRequest::Open { url: url.clone() })
-            .await
-            .unwrap();
-        let mut ready = false;
-        for _ in 0..100 {
-            if browser
-                .browse(BrowseRequest::Snapshot)
-                .await
-                .is_ok_and(|s| s["elements"].as_array().is_some_and(|e| e.len() == 4))
-            {
-                ready = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(ready, "fixture did not load");
-        let service = CheckoutService::new(
-            browser.clone(),
-            &root.path().join("state.db"),
-            root.path().join("unused.sock"),
-            unsafe { libc::geteuid() },
-            47999,
-        )
-        .unwrap();
-        let (context, origin) = browser.shopping_scope().await.unwrap();
-        // Cancellation remains effective even if Broker is unavailable and a
-        // delayed poll/expiry tries to publish an older lifecycle result.
-        service
-            .store
-            .insert(
-                &Status {
-                    operation_id: "pending-unlock".into(),
-                    state: "awaiting_approval".into(),
-                    ceremony_url: None,
-                    filled_fields: vec![],
-                    outcome: None,
-                    paused: false,
-                    reason: None,
-                    view_url: None,
-                },
-                "traveler",
-                "Synthetic pending unlock",
-            )
-            .unwrap();
-        *service.unlocking.lock().await = Some(PendingUnlock {
-            operation_id: "pending-unlock".into(),
-            traveler_id: "cancelled-record".into(),
-            recipient: Recipient::generate(),
-            context: context.clone(),
-            origin: origin.clone(),
-            fields: vec![],
-        });
-        assert_eq!(
-            service.cancel_traveler("pending-unlock").await.unwrap()["state"],
-            "cancelled"
-        );
-        assert!(service.unlocking.lock().await.is_none());
-        service
-            .store
-            .finish_traveler("pending-unlock", "expired")
-            .unwrap();
-        assert_eq!(
-            service.store.get("pending-unlock").unwrap().state,
-            "cancelled"
-        );
-        assert!(service.store.consume("pending-unlock").is_err());
-        // These records stand in for three independently approved releases.
-        // There is no Broker fixture here and no claim of ceremony acceptance.
-        for (id, name, email) in [
-            ("person-one", "Li", "alice@example.test"),
-            ("person-two", "李", "bob@example.test"),
-            ("payer", "FixtureCasey", "payer@example.test"),
-        ] {
-            browser.redact([
-                (name.into(), "[saved given_name]".into()),
-                (email.into(), "[saved email]".into()),
-            ]);
-            service.travelers.lock().await.insert(
-                id.into(),
-                UnlockedTraveler {
-                    operation_id: format!("{id}-unlock"),
-                    origin: origin.clone(),
-                    context: context.clone(),
-                    fields: vec![
-                        bloom_signer_api::TravelerField::GivenName,
-                        bloom_signer_api::TravelerField::Email,
-                    ],
-                    values: [
-                        ("given_name".into(), zeroize::Zeroizing::new(name.into())),
-                        ("email".into(), zeroize::Zeroizing::new(email.into())),
-                    ]
-                    .into(),
-                    expires: tokio::time::Instant::now() + Duration::from_secs(60),
-                },
-            );
-        }
-        let error = service
-            .request(Request::Browse {
-                request: BrowseRequest::FillTraveler { traveler_id: None },
-            })
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("Choose traveler_id"));
-        // Even an explicit person must not auto-fill two passenger blocks.
-        assert!(
-            service
-                .request(Request::Browse {
-                    request: BrowseRequest::FillTraveler {
-                        traveler_id: Some("person-one".into())
-                    }
-                })
-                .await
-                .is_err()
-        );
-        assert!(
-            service
-                .request(Request::Browse {
-                    request: BrowseRequest::FillTraveler {
-                        traveler_id: Some("not-approved".into())
-                    }
-                })
-                .await
-                .is_err()
-        );
-        for (id, label, field) in [
-            ("person-one", "Passenger one given name", "given_name"),
-            ("person-two", "Passenger two given name", "given_name"),
-            ("payer", "Payer given name", "given_name"),
-            ("payer", "Contact email", "email"),
-        ] {
-            let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
-            let element_ref = snapshot["elements"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|e| e["label"] == label)
-                .unwrap()["ref"]
-                .as_str()
-                .unwrap()
-                .to_owned();
-            let response = service
-                .request(Request::Browse {
-                    request: BrowseRequest::TypeTraveler {
-                        element_ref,
-                        field: field.into(),
-                        traveler_id: Some(id.into()),
-                    },
-                })
-                .await
-                .unwrap();
-            assert_eq!(response, json!({"state":"typed","filled_fields":[field]}));
-        }
-        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
-        for element in snapshot["elements"].as_array().unwrap() {
-            assert!(element["value"].as_str().unwrap().starts_with("[saved "));
-        }
-        assert!(!snapshot["text"].as_str().unwrap().contains("Li"));
-        assert!(!snapshot["text"].as_str().unwrap().contains('李'));
-        let tab = browser.handoff().await.unwrap();
-        let actual = tab
-            .cdp
-            .evaluate(
-                &tab.session,
-                "Array.from(document.querySelectorAll('input'), e => e.value)".into(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            actual,
-            json!(["Li", "李", "FixtureCasey", "payer@example.test"])
-        );
-        service
-            .store
-            .insert(
-                &Status {
-                    operation_id: "person-two-unlock".into(),
-                    state: "unlocked".into(),
-                    ceremony_url: None,
-                    filled_fields: vec![],
-                    outcome: None,
-                    paused: false,
-                    reason: None,
-                    view_url: None,
-                },
-                "traveler",
-                "Synthetic approved person",
-            )
-            .unwrap();
-        let cancelled = service
-            .request(Request::Cancel {
-                operation_id: "person-two-unlock".into(),
-            })
-            .await
-            .unwrap();
-        assert_eq!(cancelled["state"], "cancelled");
-        assert!(!service.travelers.lock().await.contains_key("person-two"));
-        service
-            .travelers
-            .lock()
-            .await
-            .get_mut("person-one")
-            .unwrap()
-            .expires = tokio::time::Instant::now();
-        assert!(service.fill_traveler(Some("person-one")).await.is_err());
-        assert!(!service.travelers.lock().await.contains_key("person-one"));
-        assert_eq!(service.travelers.lock().await.len(), 1);
-        service.return_control().await.unwrap();
-        assert!(service.travelers.lock().await.is_empty());
-        service
-            .request(Request::Browse {
-                request: BrowseRequest::Open { url },
-            })
-            .await
-            .unwrap();
-        assert!(service.fill_traveler(Some("person-one")).await.is_err());
-        assert!(service.travelers.lock().await.is_empty());
-        server.abort();
-        let _ = server.await;
-    }
-
-    #[tokio::test]
-    async fn one_fill_traveler_person_per_booking() {
-        let (url, server) = crate::discovery::tests::fixture(
-            "<div><div>Given name</div><input autocomplete='given-name'></div>
-             <div><div>Document number</div><input aria-label='Document number'></div>"
-                .into(),
-        )
-        .await;
-        let root = tempfile::tempdir().unwrap();
-        let browser = Browser::launch(
-            &crate::test_chromium(),
-            &root.path().join("profile"),
-            &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
-        )
-        .await
-        .unwrap();
-        browser
-            .browse(BrowseRequest::Open { url: url.clone() })
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let service = CheckoutService::new(
-            browser.clone(),
-            &root.path().join("state.db"),
-            root.path().join("unused.sock"),
-            unsafe { libc::geteuid() },
-            47999,
-        )
-        .unwrap();
-        let (context, origin) = browser.shopping_scope().await.unwrap();
-        for (id, name, document) in [
-            ("person-a", "FixtureAlice", None),
-            ("person-b", "FixtureBob", Some("BDOC999")),
-        ] {
-            let mut values =
-                BTreeMap::from([("given_name".into(), zeroize::Zeroizing::new(name.into()))]);
-            let mut fields = vec![bloom_signer_api::TravelerField::GivenName];
-            if let Some(document) = document {
-                values.insert(
-                    "document_number".into(),
-                    zeroize::Zeroizing::new(document.into()),
-                );
-                fields.push(bloom_signer_api::TravelerField::DocumentNumber);
-            }
-            service.travelers.lock().await.insert(
-                id.into(),
-                UnlockedTraveler {
-                    operation_id: format!("{id}-unlock"),
-                    origin: origin.clone(),
-                    context: context.clone(),
-                    fields,
-                    values,
-                    expires: tokio::time::Instant::now() + Duration::from_secs(60),
-                },
-            );
-        }
-        let filled = service.fill_traveler(Some("person-a")).await.unwrap();
-        assert_eq!(filled["filled_fields"], json!(["given_name"]));
-        let error = service
-            .fill_traveler(Some("person-b"))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            error,
-            "fill_traveler already filled person-a on this booking; use type_traveler with the person's id for each field."
-        );
-        let tab = browser.handoff().await.unwrap();
-        let values = tab
-            .cdp
-            .evaluate(
-                &tab.session,
-                "Array.from(document.querySelectorAll('input'), e => e.value)".into(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(values, json!(["FixtureAlice", ""]));
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn filled_phone_and_birth_year_appear_only_as_placeholders() {
-        let (url, server) = crate::discovery::tests::fixture(
-            "<div>Fecha de Nacimiento <select aria-label='Año'><option value=''></option><option value='1990'>1990</option><option value='1991'>1991</option></select></div>
-             <input aria-label='Teléfono'>"
-                .into(),
-        )
-        .await;
-        let root = tempfile::tempdir().unwrap();
-        let browser = Browser::launch(
-            &crate::test_chromium(),
-            &root.path().join("profile"),
-            &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
-        )
-        .await
-        .unwrap();
-        browser
-            .browse(BrowseRequest::Open { url: url.clone() })
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let service = CheckoutService::new(
-            browser.clone(),
-            &root.path().join("state.db"),
-            root.path().join("unused.sock"),
-            unsafe { libc::geteuid() },
-            47999,
-        )
-        .unwrap();
-        let (context, origin) = browser.shopping_scope().await.unwrap();
-        service.travelers.lock().await.insert(
-            "person".into(),
-            UnlockedTraveler {
-                operation_id: "person-unlock".into(),
-                origin,
-                context,
-                fields: vec![
-                    bloom_signer_api::TravelerField::Phone,
-                    bloom_signer_api::TravelerField::BornOn,
-                ],
-                values: [
-                    (
-                        "phone".into(),
-                        zeroize::Zeroizing::new("+5491123456789".into()),
-                    ),
-                    (
-                        "born_on".into(),
-                        zeroize::Zeroizing::new("1990-05-07".into()),
-                    ),
-                ]
-                .into(),
-                expires: tokio::time::Instant::now() + Duration::from_secs(60),
-            },
-        );
-        let filled = service.fill_traveler(Some("person")).await.unwrap();
-        assert!(
-            filled["filled_fields"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|field| field == "phone")
-        );
-        let formatted = formatted_phone("+5491123456789").expect("saved phone formats");
-        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
-        let text = snapshot.to_string();
-        assert!(
-            !text.contains(&formatted),
-            "formatted phone {formatted} leaked: {text}"
-        );
-        assert!(!text.contains("+5491123456789"), "raw phone leaked: {text}");
-        assert!(!text.contains("1990"), "birth year leaked: {text}");
-        assert!(text.contains("[saved phone]"), "{text}");
-        assert!(text.contains("[saved born_on_year]"), "{text}");
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn traveler_cache_drops_expired_records_and_rejects_unapproved_ids() {
-        let mut records = BTreeMap::new();
-        for (id, expired) in [("active", false), ("expired", true)] {
-            records.insert(
-                id.into(),
-                UnlockedTraveler {
-                    operation_id: format!("{id}-unlock"),
-                    origin: "https://shop.example".into(),
-                    context: "booking".into(),
-                    fields: vec![],
-                    values: BTreeMap::new(),
-                    expires: tokio::time::Instant::now()
-                        + if expired {
-                            Duration::ZERO
-                        } else {
-                            Duration::from_secs(60)
-                        },
-                },
-            );
-        }
-        assert!(
-            selected_traveler(
-                &mut records,
-                "booking",
-                "https://shop.example",
-                Some("expired")
-            )
-            .is_err()
-        );
-        assert_eq!(records.len(), 1);
-        assert!(selected_traveler(&mut records, "booking", "https://shop.example", None).is_ok());
-        assert!(
-            selected_traveler(
-                &mut records,
-                "booking",
-                "https://other.example",
-                Some("active")
-            )
-            .is_err()
-        );
-        assert!(records.is_empty());
-    }
-
     /// A claimed private card checkout on `html` in `state`, ready to watch.
-    async fn watched_checkout(
+    pub(super) async fn watched_checkout(
         html: &str,
         state: &str,
         submitted: bool,
@@ -2849,7 +2126,6 @@ mod tests {
             approved: true,
             manual_submission: false,
             submitted,
-            resolves: None,
         });
         (service, status.operation_id, token, server)
     }
@@ -2904,6 +2180,25 @@ mod tests {
         assert_eq!(watch_briefly(&service, &id).await, "needs_input");
         server.abort();
         let (service, id, _, server) = watched_checkout(page, "needs_input", true, false).await;
+        assert_eq!(watch_briefly(&service, &id).await, "paid");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn success_copy_shown_before_submission_is_not_a_result() {
+        let page = "<p>Order confirmed emails arrive within a minute.</p><button>Pay</button>";
+        let (service, id, _, server) = watched_checkout(page, "submitted", true, false).await;
+        let tab = service.private.lock().await.as_ref().unwrap().tab.clone();
+        service.remember_before_submit(&id, &tab).await;
+        assert_eq!(watch_briefly(&service, &id).await, "submitted");
+        // The merchant's own confirmation after the submission still counts.
+        tab.cdp
+            .evaluate(
+                &tab.session,
+                "document.body.innerText='Thank you for your order'".into(),
+            )
+            .await
+            .unwrap();
         assert_eq!(watch_briefly(&service, &id).await, "paid");
         server.abort();
     }
@@ -2977,109 +2272,111 @@ mod tests {
         (service, browser, url, server)
     }
 
-    /// An unlocked traveler on the current booking, recorded as `unlocked`.
-    async fn unlocked(service: &CheckoutService, id: &str, lifetime: Duration) {
-        let (context, origin) = service.browser.shopping_scope().await.unwrap();
-        let operation_id = format!("{id}-unlock");
-        service
-            .store
-            .insert(
-                &Status {
-                    operation_id: operation_id.clone(),
-                    state: "unlocked".into(),
-                    ceremony_url: None,
-                    filled_fields: vec![],
-                    outcome: None,
-                    paused: false,
-                    reason: None,
-                    view_url: None,
-                },
-                "traveler",
-                "Synthetic unlock",
-            )
-            .unwrap();
-        service.travelers.lock().await.insert(
-            id.into(),
-            UnlockedTraveler {
-                operation_id,
-                origin,
-                context,
-                fields: vec![],
-                values: BTreeMap::new(),
-                expires: tokio::time::Instant::now() + lifetime,
-            },
-        );
-    }
-
     #[tokio::test]
-    async fn dropped_traveler_values_end_their_unlock_as_expired() {
-        let (service, _browser, url, server) = shopping_service("<input>").await;
-        let state = |id: &str| service.store.get(&format!("{id}-unlock")).unwrap().state;
-        unlocked(&service, "opened", Duration::from_secs(60)).await;
-        service
-            .request(Request::Browse {
-                request: BrowseRequest::Open { url: url.clone() },
-            })
+    async fn public_merchant_events_require_approval_regardless_of_labels() {
+        let (service, browser, _, server) = shopping_service(
+            "<body><form onsubmit=\"document.title='charged';return false\"><button>Continue</button></form><button type='button' onclick=\"document.title='charged'\">Proceed</button><input oninput=\"document.title='charged'\"><select onchange=\"document.title='charged'\"><option value='a'>A</option><option value='b'>B</option></select></body>"
+        ).await;
+        let page = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        assert!(page["elements"].as_array().unwrap().len() >= 4, "{page}");
+        for element in page["elements"].as_array().unwrap() {
+            let element_ref = element["ref"].as_str().unwrap().to_owned();
+            let request = match element["role"].as_str().unwrap_or("") {
+                "input" => BrowseRequest::Type {
+                    element_ref,
+                    text: "test".into(),
+                },
+                "select" => BrowseRequest::Select {
+                    element_ref,
+                    value: "b".into(),
+                },
+                _ => BrowseRequest::Click { element_ref },
+            };
+            let error = service
+                .request(Request::Browse { request })
+                .await
+                .unwrap_err();
+            // The agent must see the refusal itself, not the generic failure.
+            assert_eq!(browse_error(&error)["error"], MERCHANT_APPROVAL);
+        }
+        let tab = browser.handoff().await.unwrap();
+        let title = tab
+            .cdp
+            .evaluate(&tab.session, "document.title".into())
             .await
             .unwrap();
-        assert_eq!(state("opened"), "expired");
-        wait_for_shopping_page(&service.browser, &url).await;
-        unlocked(&service, "old", Duration::ZERO).await;
-        assert!(
-            service
-                .request(Request::Browse {
-                    request: BrowseRequest::TypeTraveler {
-                        element_ref: "0:0".into(),
-                        field: "given_name".into(),
-                        traveler_id: Some("old".into()),
-                    },
-                })
-                .await
-                .is_err()
-        );
-        assert_eq!(state("old"), "expired");
-        unlocked(&service, "returned", Duration::from_secs(60)).await;
-        service.return_control().await.unwrap();
-        assert_eq!(state("returned"), "expired");
+        assert_ne!(title, "charged");
         server.abort();
     }
 
     #[tokio::test]
-    async fn traveler_guidance_reaches_the_agent() {
-        let mut none = BTreeMap::new();
-        let Err(error) = selected_traveler(&mut none, "booking", "https://shop.example", None)
-        else {
-            panic!("no traveler is unlocked");
-        };
-        let error = error.to_string();
-        assert!(BROWSE_ERRORS.contains(&error.as_str()), "{error}");
-        assert!(BROWSE_ERRORS.contains(&"That saved traveler field is not available"));
-    }
-
-    #[tokio::test]
-    async fn checkout_waits_for_a_pending_traveler_unlock() {
-        let (service, _browser, _, server) = shopping_service("<button>Pay</button>").await;
-        let (context, origin) = service.browser.shopping_scope().await.unwrap();
-        *service.unlocking.lock().await = Some(PendingUnlock {
-            operation_id: "pending-unlock".into(),
-            traveler_id: "person".into(),
-            recipient: Recipient::generate(),
-            context,
-            origin,
-            fields: vec![],
-        });
-        let error = service
-            .request(Request::Checkout {
-                operation_id: "e".repeat(64),
-                card_id: None,
-                agent_description: "Fixture".into(),
-                take_over: true,
-                resolves: None,
-            })
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("traveler"), "{error}");
-        assert!(service.store.get(&"e".repeat(64)).is_err());
+    async fn only_the_person_in_a_take_over_can_stay_signed_in() {
+        let (service, browser, _, server) = shopping_service("<p>Account</p>").await;
+        let parsed: ViewAction = serde_json::from_str(r#"{"action":"finish"}"#).unwrap();
+        assert!(matches!(
+            parsed,
+            ViewAction::Finish {
+                stay_signed_in: false
+            }
+        ));
+        let token = hex_token(&[46; 32]);
+        for (id, mode) in [("4", Mode::Site), ("5", Mode::TakeOver)] {
+            let tab = browser.handoff().await.unwrap();
+            let operation_id = id.repeat(64);
+            let status = Status {
+                operation_id: operation_id.clone(),
+                state: "human_control".into(),
+                ceremony_url: None,
+                filled_fields: vec![],
+                outcome: None,
+                paused: false,
+                reason: None,
+                view_url: None,
+            };
+            let kind = if mode == Mode::Site {
+                "site"
+            } else {
+                "take_over"
+            };
+            service.store.insert(&status, kind, "Fixture").unwrap();
+            *service.private.lock().await = Some(PrivateCheckout {
+                operation_id: operation_id.clone(),
+                mode,
+                view_target: tab.target.clone(),
+                view_session: tab.session.clone(),
+                seen_pages: std::collections::HashSet::from([tab.target.clone()]),
+                tab,
+                discovery: None,
+                recipient: None,
+                capability: token.clone(),
+                session: Some(token.clone()),
+                approved: true,
+                manual_submission: false,
+                submitted: false,
+            });
+            let state = service.private_state(&token).await.unwrap();
+            assert_eq!(state["can_stay_signed_in"], mode == Mode::TakeOver);
+            let stay = ViewAction::Finish {
+                stay_signed_in: true,
+            };
+            if mode == Mode::Site {
+                assert!(service.private_action(&token, stay).await.is_err());
+                service
+                    .private_action(
+                        &token,
+                        ViewAction::Finish {
+                            stay_signed_in: false,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                service.private_action(&token, stay).await.unwrap();
+                // An untouched take-over still returns cleanly.
+                assert_eq!(service.store.get(&operation_id).unwrap().state, "returned");
+            }
+            assert!(service.private.lock().await.is_none());
+        }
         server.abort();
     }
 
@@ -3110,7 +2407,14 @@ mod tests {
         assert_eq!(watch_briefly(&service, &id).await, "booked");
         assert!(service.store.get(&id).unwrap().paused);
         assert!(service.browser.needs_restart());
-        let _ = service.private_action(&token, ViewAction::Finish).await;
+        let _ = service
+            .private_action(
+                &token,
+                ViewAction::Finish {
+                    stay_signed_in: false,
+                },
+            )
+            .await;
         assert_eq!(service.store.get(&id).unwrap().state, "booked");
         server.abort();
     }
@@ -3192,7 +2496,6 @@ mod tests {
             approved: true,
             manual_submission: false,
             submitted: false,
-            resolves: None,
         });
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -3269,7 +2572,6 @@ mod tests {
             approved: true,
             manual_submission: false,
             submitted: false,
-            resolves: None,
         });
         tokio::time::timeout(
             Duration::from_secs(4),
@@ -3358,7 +2660,6 @@ mod tests {
             approved: true,
             manual_submission: false,
             submitted: false,
-            resolves: None,
         });
         let finished = tokio::time::timeout(
             Duration::from_secs(3),
@@ -3374,6 +2675,276 @@ mod tests {
             "manual_required"
         );
         assert!(service.private.lock().await.is_some());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn restart_waits_when_broker_cannot_confirm_cancellation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        let socket = directory.path().join("missing.sock");
+        let id = "d".repeat(64);
+        let store = Store::open(&path).unwrap();
+        store
+            .insert(
+                &Status {
+                    operation_id: id.clone(),
+                    state: "awaiting_approval".into(),
+                    ceremony_url: Some("http://localhost/old".into()),
+                    filled_fields: vec![],
+                    outcome: None,
+                    paused: false,
+                    reason: None,
+                    view_url: None,
+                },
+                "card",
+                "Fixture",
+            )
+            .unwrap();
+        drop(store);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                CheckoutService::reconcile_before_browser(&path, &socket, unsafe {
+                    libc::geteuid()
+                })
+            )
+            .await
+            .is_err()
+        );
+        let status = Store::open(&path).unwrap().get(&id).unwrap();
+        assert_eq!(status.state, "restart_cancelling");
+        assert!(status.ceremony_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn restart_cancels_abandoned_approvals_and_preserves_unknown_results() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        let socket = directory.path().join("broker.sock");
+        let ids = ["a".repeat(64), "b".repeat(64), "c".repeat(64)];
+        let store = Store::open(&path).unwrap();
+        for id in &ids {
+            store
+                .insert(
+                    &Status {
+                        operation_id: id.clone(),
+                        state: "awaiting_approval".into(),
+                        ceremony_url: Some("http://localhost/old".into()),
+                        filled_fields: vec![],
+                        outcome: None,
+                        paused: false,
+                        reason: None,
+                        view_url: None,
+                    },
+                    "card",
+                    "Fixture",
+                )
+                .unwrap();
+        }
+        drop(store);
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let peer = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader).read_line(&mut line).await.unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let id = request["operation_id"].as_str().unwrap();
+                let state = if id.starts_with('a') {
+                    "cancelled"
+                } else if id.starts_with('b') {
+                    "succeeded"
+                } else {
+                    "missing"
+                };
+                let response = if id.starts_with('b') && request["method"] == "cancel" {
+                    json!({"kind":"error","message":"already completed"})
+                } else {
+                    json!({"kind":"result","status":{"operation_id":id,"state":state},"receipt":null,"output_aad":null})
+                };
+                writer
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let store = Store::open(&path).unwrap();
+        for id in &ids {
+            let status = store.get(id).unwrap();
+            assert_eq!(status.state, "restart_cancelling");
+            assert!(status.ceremony_url.is_none());
+        }
+        drop(store);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            CheckoutService::reconcile_before_browser(&path, &socket, unsafe { libc::geteuid() }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.get(&ids[0]).unwrap().state, "failed_before_release");
+        assert_eq!(store.get(&ids[1]).unwrap().state, "disclosure_unknown");
+        assert_eq!(store.get(&ids[2]).unwrap().state, "failed_before_release");
+        peer.abort();
+    }
+
+    #[tokio::test]
+    async fn changed_total_stops_before_card_release_or_site_submit() {
+        for mode in [Mode::Card, Mode::Site] {
+            let (service, browser, _, server) = shopping_service(
+                "<div id='total' data-bloom-total-minor='399' data-bloom-currency='USD'>Total USD 3.99</div><input autocomplete='cc-number'><input autocomplete='cc-exp'><input autocomplete='cc-csc'><button onclick='window.paid=true'>Pay</button>",
+            ).await;
+            let tab = browser.handoff().await.unwrap();
+            let discovery = if mode == Mode::Card {
+                Discovery::read(&tab).await.unwrap()
+            } else {
+                Discovery::read_site(&tab).await.unwrap()
+            };
+            let status = Status {
+                operation_id: "changed-total".into(),
+                state: "awaiting_approval".into(),
+                ceremony_url: None,
+                filled_fields: vec![],
+                outcome: None,
+                paused: false,
+                reason: None,
+                view_url: None,
+            };
+            service
+                .store
+                .insert(
+                    &status,
+                    if mode == Mode::Card { "card" } else { "site" },
+                    "Fixture",
+                )
+                .unwrap();
+            tab.cdp
+                .evaluate(
+                    &tab.session,
+                    "document.getElementById('total').dataset.bloomTotalMinor='799'".into(),
+                )
+                .await
+                .unwrap();
+            let mut checkout = PrivateCheckout {
+                operation_id: status.operation_id.clone(),
+                mode,
+                view_target: tab.target.clone(),
+                view_session: tab.session.clone(),
+                seen_pages: std::collections::HashSet::new(),
+                tab: tab.clone(),
+                discovery: Some(discovery),
+                recipient: None,
+                capability: "fixture".into(),
+                session: None,
+                approved: true,
+                manual_submission: false,
+                submitted: false,
+            };
+            service
+                .consume_and_fill(&mut checkout, None, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                service.store.get(&status.operation_id).unwrap().state,
+                "failed_before_release"
+            );
+            assert!(!checkout.submitted);
+            assert_ne!(
+                tab.cdp
+                    .evaluate(&tab.session, "!!window.paid".into())
+                    .await
+                    .unwrap(),
+                true
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_decline_phrase_stays_unresolved_and_can_be_followed_by_success() {
+        let (service, browser, _, server) = shopping_service("<p>Payment failed</p>").await;
+        let (_, origin) = browser.shopping_scope().await.unwrap();
+        let tab = browser.handoff().await.unwrap();
+        let observer = tab.clone();
+        let status = Status {
+            operation_id: "fixture-provisional-decline".into(),
+            state: "submitted".into(),
+            ceremony_url: None,
+            filled_fields: vec![],
+            outcome: None,
+            paused: false,
+            reason: None,
+            view_url: None,
+        };
+        service.store.insert(&status, "card", "Fixture").unwrap();
+        service
+            .store
+            .record_order(&status.operation_id, Some(&origin), None, None)
+            .unwrap();
+        *service.private.lock().await = Some(PrivateCheckout {
+            operation_id: status.operation_id.clone(),
+            mode: Mode::Card,
+            view_target: tab.target.clone(),
+            view_session: tab.session.clone(),
+            seen_pages: std::collections::HashSet::from([tab.target.clone()]),
+            tab,
+            discovery: None,
+            recipient: None,
+            capability: "fixture".into(),
+            session: None,
+            approved: true,
+            manual_submission: false,
+            submitted: true,
+        });
+        let watcher = {
+            let service = service.clone();
+            let id = status.operation_id.clone();
+            tokio::spawn(async move { service.watch_outcome(id).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while service.store.get(&status.operation_id).unwrap().state != "uncertain" {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            service.store.unresolved(&origin).unwrap(),
+            Some(status.operation_id.clone())
+        );
+        // Mixed success and failure copy proves neither.
+        observer
+            .cdp
+            .evaluate(
+                &observer.session,
+                "document.body.innerText='Order confirmed. What if payment failed?'".into(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            service.store.get(&status.operation_id).unwrap().state,
+            "uncertain"
+        );
+        observer
+            .cdp
+            .evaluate(
+                &observer.session,
+                "document.body.innerText='Order confirmed'".into(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), watcher)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            service.store.get(&status.operation_id).unwrap().state,
+            "paid"
+        );
         server.abort();
     }
 
@@ -3437,7 +3008,6 @@ mod tests {
             approved: true,
             manual_submission: false,
             submitted: false,
-            resolves: None,
         });
         let finished = tokio::time::timeout(
             Duration::from_secs(3),
@@ -3494,7 +3064,6 @@ mod tests {
             approved: true,
             manual_submission: false,
             submitted: false,
-            resolves: None,
         });
         let watcher = tokio::spawn({
             let service = service.clone();
@@ -3628,7 +3197,6 @@ mod tests {
             approved: true,
             manual_submission: false,
             submitted: false,
-            resolves: None,
         });
         let started = tokio::time::Instant::now();
         let capture = {
@@ -3644,417 +3212,25 @@ mod tests {
         server.abort();
     }
     #[tokio::test]
-    async fn split_birth_dates_are_private_without_redacting_prices_or_flight_dates() {
-        let (service, browser, _, server) = shopping_service(
-            "<p>Total USD 7.05</p><p>Flight 7 May</p><p>Passenger born 7 May 1990</p><p>Jettzy Mr/07 May,1990/US</p><label>Birth day<input autocomplete='bday-day'></label><label>Birth month<select aria-label='Birth month' autocomplete='bday-month'><option value=''></option><option value='5'>May</option><option value='6'>June</option></select></label><label>Birth year<input autocomplete='bday-year'></label><input aria-label='Manual day'>",
-        ).await;
-        unlocked(&service, "fixture", Duration::from_secs(60)).await;
-        {
-            let mut travelers = service.travelers.lock().await;
-            let traveler = travelers.get_mut("fixture").unwrap();
-            traveler.fields = vec![bloom_signer_api::TravelerField::BornOn];
-            traveler.values.insert(
-                "born_on".into(),
-                zeroize::Zeroizing::new("1990-05-07".into()),
-            );
-        }
-        service.fill_traveler(Some("fixture")).await.unwrap();
-        let page = browser.browse(BrowseRequest::Snapshot).await.unwrap();
-        let manual = page["elements"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|e| e["role"] == "input" && e["label"] == "Manual day")
-            .unwrap()["ref"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        service
-            .type_traveler(manual, "born_on_day", Some("fixture"))
-            .await
-            .unwrap();
-        let page = browser.browse(BrowseRequest::Snapshot).await.unwrap();
-        for (label, expected) in [
-            ("Birth day", "[saved born_on_day]"),
-            ("Birth month", "[saved born_on_month]"),
-            ("Birth year", "[saved born_on_year]"),
-            ("Manual day", "[saved born_on_day]"),
-        ] {
-            let control = page["elements"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|e| {
-                    matches!(e["role"].as_str(), Some("input" | "select")) && e["label"] == label
-                })
-                .unwrap();
-            assert_eq!(control["value"], expected, "{label}");
-            assert!(
-                control["ref"]
-                    .as_str()
-                    .unwrap()
-                    .split_once(':')
-                    .unwrap()
-                    .0
-                    .parse::<u64>()
-                    .is_ok()
-            );
-        }
-        let text = page["text"].as_str().unwrap();
-        assert!(
-            text.contains("Total USD 7.05") && text.contains("Flight 7 May"),
-            "{text}"
-        );
-        assert!(!text.contains("combobox: Birth month"), "{text}");
-        assert!(text.contains("Passenger born [saved born_on]"), "{text}");
-        assert!(text.contains("Jettzy Mr/[saved born_on]/US"), "{text}");
+    async fn approval_details_do_not_expose_private_traveler_values() {
+        let (service, browser, _, server) =
+            shopping_service("<label>Passenger <input value='Alice Example'></label>").await;
         let tab = browser.handoff().await.unwrap();
-        let actual = tab
-            .cdp
-            .evaluate(
-                &tab.session,
-                "[...document.querySelectorAll('input,select')].map(e=>e.value)".into(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(actual, json!(["7", "5", "1990", "07"]));
+        let (_, fields) = service.approval_order_details(&tab).await;
+        assert!(fields.to_string().contains("Alice Example"));
+        browser.remember_private_traveler_use();
+        let (preview, fields) = service.approval_order_details(&tab).await;
+        assert!(preview.is_none());
+        assert_eq!(fields, json!([]));
+        // Handback discards the pages that held the values.
+        browser.return_control().await.unwrap();
+        assert!(!browser.has_private_traveler_data());
         server.abort();
     }
 
-    #[tokio::test]
-    async fn typed_traveler_values_reach_the_chosen_field_but_not_the_agent() {
-        let (url, server) = crate::discovery::tests::fixture(
-            "<div><div>Teléfono *</div><input name='n1'></div><div><div>Nacimiento</div><input name='n2'></div><label>Birthdate (MM-DD-YYYY)<input name='n3' oninput='document.getElementById(&quot;echo&quot;).textContent=this.value.replaceAll(&quot;/&quot;,&quot;-&quot;)'></label><p id='echo'></p>".into(),
-        )
-        .await;
-        let root = tempfile::tempdir().unwrap().keep();
-        let browser = Browser::launch(
-            &crate::test_chromium(),
-            &root.join("profile"),
-            &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
-        )
-        .await
-        .unwrap();
-        browser
-            .browse(BrowseRequest::Open { url: url.clone() })
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let service = CheckoutService::new(
-            browser.clone(),
-            &root.join("state.db"),
-            root.join("unused.sock"),
-            unsafe { libc::geteuid() },
-            47999,
-        )
-        .unwrap();
-        let values: BTreeMap<String, zeroize::Zeroizing<String>> =
-            [("phone", "+54 9 11 2345-6789"), ("born_on", "1990-05-07")]
-                .into_iter()
-                .map(|(k, v)| (k.into(), zeroize::Zeroizing::new(v.into())))
-                .collect();
-        assert_eq!(
-            derived_traveler_value(&values, "phone_national")
-                .unwrap()
-                .as_str(),
-            "91123456789"
-        );
-        CheckoutService::remember_fill(&browser, &values);
-        service.travelers.lock().await.insert(
-            "fixture".into(),
-            UnlockedTraveler {
-                operation_id: "fixture-unlock".into(),
-                origin: url::Url::parse(&url)
-                    .unwrap()
-                    .origin()
-                    .ascii_serialization(),
-                context: browser.shopping_context().await,
-                fields: vec![],
-                values,
-                expires: tokio::time::Instant::now() + Duration::from_secs(60),
-            },
-        );
-        for (index, field) in [
-            (0, "phone_national"),
-            (1, "born_on_dmy"),
-            (2, "born_on_mdy"),
-        ] {
-            let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
-            let element_ref = snapshot["elements"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|e| e["role"] == "input")
-                .nth(index)
-                .unwrap()["ref"]
-                .as_str()
-                .unwrap()
-                .to_owned();
-            let typed = service
-                .request(Request::Browse {
-                    request: BrowseRequest::TypeTraveler {
-                        element_ref,
-                        field: field.into(),
-                        traveler_id: None,
-                    },
-                })
-                .await
-                .unwrap();
-            assert!(!typed.to_string().contains("9112345"));
-        }
-        let snapshot = browser
-            .browse(BrowseRequest::Snapshot)
-            .await
-            .unwrap()
-            .to_string();
-        assert!(snapshot.contains("[saved phone_national]"), "{snapshot}");
-        assert!(snapshot.contains("[saved born_on_dmy]"), "{snapshot}");
-        assert!(snapshot.contains("[saved born_on_mdy]"), "{snapshot}");
-        assert!(
-            !snapshot.contains("91123456789")
-                && !snapshot.contains("07/05/1990")
-                && !snapshot.contains("05/07/1990")
-                && !snapshot.contains("05-07-")
-        );
-        // Discarding the booking context (a finished checkout) ends the unlock.
-        let tab = browser.handoff().await.unwrap();
-        let actual = tab
-            .cdp
-            .evaluate(
-                &tab.session,
-                "[...document.querySelectorAll('input')].map(e=>e.value)".into(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(actual, json!(["91123456789", "07/05/1990", "05/07/1990"]));
-        browser.return_control().await.unwrap();
-        browser.browse(BrowseRequest::Open { url }).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
-        let element_ref = snapshot["elements"][0]["ref"].as_str().unwrap().to_owned();
-        let error = service
-            .request(Request::Browse {
-                request: BrowseRequest::TypeTraveler {
-                    element_ref,
-                    field: "phone".into(),
-                    traveler_id: None,
-                },
-            })
-            .await
-            .unwrap_err();
-        assert_eq!(error.to_string(), "Unlock a saved traveler first");
-        assert!(service.travelers.lock().await.is_empty());
-        server.abort();
-    }
-    #[tokio::test]
-    async fn saved_choices_pick_their_option_in_a_chosen_list() {
-        // Shaped like JetSMART's card-holder document type.
-        let (url, server) = crate::discovery::tests::fixture(
-            "<div>Titular <div><div>Documento</div><input id='doc' readonly></div>
-             <div id='list' hidden><div class='opt'>PAS - Pasaporte</div><div class='opt'>DNI - Documento Nacional de Identidad</div></div></div>
-             <script>doc.addEventListener('click',()=>list.hidden=false);
-             for(const o of document.querySelectorAll('.opt'))o.onclick=()=>{doc.value=o.innerText.split(' ')[0];list.hidden=true;};</script>".into(),
-        )
-        .await;
-        let root = tempfile::tempdir().unwrap().keep();
-        let browser = Browser::launch(
-            &crate::test_chromium(),
-            &root.join("profile"),
-            &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
-        )
-        .await
-        .unwrap();
-        browser
-            .browse(BrowseRequest::Open { url: url.clone() })
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let service = CheckoutService::new(
-            browser.clone(),
-            &root.join("state.db"),
-            root.join("unused.sock"),
-            unsafe { libc::geteuid() },
-            47999,
-        )
-        .unwrap();
-        service.travelers.lock().await.insert(
-            "fixture".into(),
-            UnlockedTraveler {
-                operation_id: "fixture-unlock".into(),
-                origin: url::Url::parse(&url)
-                    .unwrap()
-                    .origin()
-                    .ascii_serialization(),
-                context: browser.shopping_context().await,
-                fields: vec![],
-                values: [(
-                    "document_kind".to_owned(),
-                    zeroize::Zeroizing::new("passport".to_owned()),
-                )]
-                .into(),
-                expires: tokio::time::Instant::now() + Duration::from_secs(60),
-            },
-        );
-        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
-        let element_ref = snapshot["elements"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|e| e["label"] == "Documento")
-            .unwrap()["ref"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        service
-            .request(Request::Browse {
-                request: BrowseRequest::TypeTraveler {
-                    element_ref,
-                    field: "document_kind".into(),
-                    traveler_id: None,
-                },
-            })
-            .await
-            .unwrap();
-        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
-        let documento = snapshot["elements"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|e| e["label"] == "Documento")
-            .unwrap()
-            .clone();
-        assert_eq!(documento["value"], "[saved document_kind]");
-        let tab = browser.handoff().await.unwrap();
-        assert_eq!(
-            tab.cdp
-                .evaluate(&tab.session, "document.getElementById('doc').value".into())
-                .await
-                .unwrap(),
-            "PAS"
-        );
-        server.abort();
-    }
-    #[tokio::test]
-    async fn a_list_searching_option_starts_is_opened_whole() {
-        // JetSMART's card-holder document type: an editable box that only
-        // matches the start of "PAS - Pasaporte", and a button opening the list.
-        let (url, server) = crate::discovery::tests::fixture(
-            "<div><div><div>Documento</div><div><div><input id='doc'></div></div></div><button id='toggle'></button>
-             <div id='list'></div></div>
-             <script>const all=['PAS - Pasaporte','DNI - Documento Nacional de Identidad'];
-             const show=f=>{list.innerHTML='';for(const o of all.filter(f)){const d=document.createElement('div');d.className='option';d.textContent=o;
-               d.onclick=()=>{doc.value=o.split(' ')[0];list.innerHTML='';};list.append(d);}};
-             doc.addEventListener('input',()=>show(o=>!doc.value||o.toLowerCase().startsWith(doc.value.toLowerCase())));
-             toggle.onclick=()=>list.children.length?list.innerHTML='':show(()=>true);
-             doc.addEventListener('click',()=>list.children.length?list.innerHTML='':show(()=>true));</script>".into(),
-        )
-        .await;
-        let root = tempfile::tempdir().unwrap().keep();
-        let browser = Browser::launch(
-            &crate::test_chromium(),
-            &root.join("profile"),
-            &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
-        )
-        .await
-        .unwrap();
-        browser
-            .browse(BrowseRequest::Open { url: url.clone() })
-            .await
-            .unwrap();
-        // Navigation acknowledgement is not document readiness, especially
-        // when CI runs several browser fixtures together. Observe the expected
-        // form before binding its reference; never replay a field action.
-        let snapshot = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match browser.browse(BrowseRequest::Snapshot).await {
-                    Ok(snapshot)
-                        if snapshot["url"] == url
-                            && snapshot["elements"].as_array().is_some_and(|elements| {
-                                elements.iter().any(|e| e["label"] == "Documento")
-                            }) =>
-                    {
-                        break snapshot;
-                    }
-                    Ok(_) => {}
-                    Err(error)
-                        if matches!(
-                            error.to_string().as_str(),
-                            "Only ordinary shopping documents can be observed"
-                                | "Shopping document changed; request a new snapshot"
-                        ) => {}
-                    Err(error) => panic!("Fixture snapshot failed: {error:#}"),
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("The requested fixture form must load before traveler entry");
-        let service = CheckoutService::new(
-            browser.clone(),
-            &root.join("state.db"),
-            root.join("unused.sock"),
-            unsafe { libc::geteuid() },
-            47999,
-        )
-        .unwrap();
-        service.travelers.lock().await.insert(
-            "fixture".into(),
-            UnlockedTraveler {
-                operation_id: "fixture-unlock".into(),
-                origin: url::Url::parse(&url)
-                    .unwrap()
-                    .origin()
-                    .ascii_serialization(),
-                context: browser.shopping_context().await,
-                fields: vec![],
-                values: [(
-                    "document_kind".to_owned(),
-                    zeroize::Zeroizing::new("passport".to_owned()),
-                )]
-                .into(),
-                expires: tokio::time::Instant::now() + Duration::from_secs(60),
-            },
-        );
-        let element_ref = snapshot["elements"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|e| e["label"] == "Documento")
-            .unwrap()["ref"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        service
-            .request(Request::Browse {
-                request: BrowseRequest::TypeTraveler {
-                    element_ref,
-                    field: "document_kind".into(),
-                    traveler_id: None,
-                },
-            })
-            .await
-            .unwrap();
-        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
-        let documento = snapshot["elements"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|e| e["label"] == "Documento")
-            .unwrap()
-            .clone();
-        assert_eq!(documento["value"], "[saved document_kind]");
-        let tab = browser.handoff().await.unwrap();
-        assert_eq!(
-            tab.cdp
-                .evaluate(&tab.session, "document.getElementById('doc').value".into())
-                .await
-                .unwrap(),
-            "PAS"
-        );
-        server.abort();
-    }
     #[test]
     fn saved_phones_split_by_the_numbering_plan() {
+        use crate::travelers::derived_traveler_value;
         let values = |phone: &str| -> BTreeMap<String, zeroize::Zeroizing<String>> {
             [(
                 "phone".to_owned(),
@@ -4143,7 +3319,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            error.to_string().contains("Este campo es obligatorio"),
+            error.to_string().contains("page shows form errors"),
             "{error}"
         );
         // Nothing was recorded or handed off: shopping goes on on the same page.
@@ -4151,6 +3327,72 @@ mod tests {
         assert!(browser.browse(BrowseRequest::Snapshot).await.is_ok());
         server.abort();
     }
+    #[tokio::test]
+    async fn socket_reports_blocked_shop_recovery() {
+        let (service, browser, _, server) = shopping_service("<h1>Shop</h1>").await;
+        let (_, origin) = browser.shopping_scope().await.unwrap();
+        let prior = "a".repeat(64);
+        let status = Status {
+            operation_id: prior.clone(),
+            state: "uncertain".into(),
+            ceremony_url: None,
+            filled_fields: vec![],
+            outcome: None,
+            paused: false,
+            reason: None,
+            view_url: None,
+        };
+        service.store.insert(&status, "card", "Fixture").unwrap();
+        service
+            .store
+            .record_order(&prior, Some(&origin), None, None)
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            directory.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o710),
+        )
+        .unwrap();
+        let socket = directory.path().join("checkout.sock");
+        let api = {
+            let service = service.clone();
+            let socket = socket.clone();
+            tokio::spawn(
+                async move { serve_api(service, &socket, unsafe { libc::geteuid() }).await },
+            )
+        };
+        let mut stream = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match tokio::net::UnixStream::connect(&socket).await {
+                    Ok(stream) => break stream,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let request = Request::Checkout {
+            operation_id: "b".repeat(64),
+            card_id: None,
+            agent_description: "Fixture".into(),
+            take_over: false,
+            resolves: None,
+        };
+        let mut bytes = serde_json::to_vec(&request).unwrap();
+        bytes.push(b'\n');
+        stream.write_all(&bytes).await.unwrap();
+        let mut response = String::new();
+        BufReader::new(stream)
+            .read_line(&mut response)
+            .await
+            .unwrap();
+        let result: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(result["error_code"], "blocked");
+        assert_eq!(result["operation_id"], prior);
+        api.abort();
+        server.abort();
+    }
+
     #[tokio::test]
     async fn an_unresolved_shop_blocks_the_next_checkout_until_the_person_checks_it() {
         let (shop_url, server) = crate::discovery::tests::fixture("<h1>Shop</h1>".into()).await;
@@ -4242,7 +3484,7 @@ mod tests {
             .unwrap();
         assert_eq!(unapproved["state"], "failed_before_release");
         assert_eq!(service.store.get(&prior).unwrap().state, "uncertain");
-        // The person's Done in an approved take-over is what marks it checked.
+        // Done alone cannot establish whether the earlier charge happened.
         let tab = browser.handoff().await.unwrap();
         let token = hex_token(&[45; 32]);
         service
@@ -4276,18 +3518,18 @@ mod tests {
             approved: true,
             manual_submission: false,
             submitted: false,
-            resolves: Some(prior.clone()),
         });
         service
-            .private_action(&token, ViewAction::Finish)
+            .private_action(
+                &token,
+                ViewAction::Finish {
+                    stay_signed_in: false,
+                },
+            )
             .await
             .unwrap();
         let resolved = service.store.get(&prior).unwrap();
-        assert_eq!(resolved.state, "resolved");
-        assert_eq!(
-            resolved.outcome.unwrap().resolution.as_deref(),
-            Some("human_checked")
-        );
+        assert_eq!(resolved.state, "uncertain");
         browser
             .browse(BrowseRequest::Open { url: shop_url })
             .await
@@ -4302,9 +3544,9 @@ mod tests {
                 resolves: None,
             })
             .await
-            .unwrap();
-        assert_ne!(again["state"], "uncertain");
-        assert!(service.store.get(&"c".repeat(64)).is_ok());
+            .unwrap_err();
+        assert!(again.to_string().contains(&prior));
+        assert!(service.store.get(&"c".repeat(64)).is_err());
         let pending = "d".repeat(64);
         service
             .store
@@ -4363,32 +3605,6 @@ mod tests {
         }
         let store = Store::open(&path).unwrap();
         assert_eq!(store.get("fixture").unwrap().state, "disclosure_unknown");
-    }
-
-    #[test]
-    fn unlocked_traveler_expires_on_restart() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("state.db");
-        {
-            let store = Store::open(&path).unwrap();
-            let status = Status {
-                operation_id: "unlocked-traveler".into(),
-                state: "unlocked".into(),
-                ceremony_url: Some("http://localhost/unlocked".into()),
-                filled_fields: vec!["given_name".into()],
-                outcome: None,
-                paused: false,
-                reason: None,
-                view_url: None,
-            };
-            store
-                .insert(&status, "traveler", "Fixture passenger")
-                .unwrap();
-        }
-        let store = Store::open(&path).unwrap();
-        let status = store.get("unlocked-traveler").unwrap();
-        assert_eq!(status.state, "expired");
-        assert!(status.ceremony_url.is_none());
     }
 
     #[test]
@@ -4464,7 +3680,6 @@ mod tests {
             approved: false,
             manual_submission: false,
             submitted: false,
-            resolves: None,
         });
         let router = crate::view::router(service.clone());
         let viewer = tokio::spawn(async move {
@@ -4474,7 +3689,8 @@ mod tests {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap();
-        let base = format!("http://localhost:{port}");
+        let base = format!("http://127.0.0.1:{port}");
+        assert!(challenge_url(port, &token).starts_with(&format!("{base}/private?")));
         assert!(
             service
                 .private_claim(&hex_token(&[43; 32]), None)
@@ -4606,10 +3822,11 @@ mod tests {
             .tab
             .target
             .clone();
-        let state = tokio::time::timeout(Duration::from_secs(2), async {
+        let state = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                let state = service.private_state(session_token).await.unwrap();
-                if state["selected_page"] != root_target {
+                if let Ok(state) = service.private_state(session_token).await
+                    && state["selected_page"] != root_target
+                {
                     break state;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -4693,7 +3910,12 @@ mod tests {
             .await
             .unwrap();
         service
-            .private_action(session_token, ViewAction::Finish)
+            .private_action(
+                session_token,
+                ViewAction::Finish {
+                    stay_signed_in: false,
+                },
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -4775,7 +3997,6 @@ mod tests {
             approved: true,
             manual_submission: false,
             submitted: false,
-            resolves: None,
         });
         service
             .private_action(&token, ViewAction::Click { x: 20., y: 15. })
@@ -4807,10 +4028,15 @@ mod tests {
             .await
             .unwrap();
         service
-            .private_action(&token, ViewAction::Finish)
+            .private_action(
+                &token,
+                ViewAction::Finish {
+                    stay_signed_in: false,
+                },
+            )
             .await
             .unwrap();
-        assert_eq!(service.store.get("take-over").unwrap().state, "returned");
+        assert_eq!(service.store.get("take-over").unwrap().state, "uncertain");
         // A merchant session can charge a saved payment method on any click,
         // so shopping restarts outside the person's login.
         let snapshot = browser

@@ -1,4 +1,4 @@
-use crate::service::{CheckoutService, ViewAction};
+use crate::service::{CheckoutService, SavedAction, ViewAction, loggable};
 use axum::{
     Json, Router,
     extract::State,
@@ -11,9 +11,9 @@ use std::sync::Arc;
 
 pub fn router(service: Arc<CheckoutService>) -> Router {
     Router::new().route("/private",get(page)).route("/claim",post(claim)).route("/view",get(page))
-        .route("/unlocked",get(||async {Html("<!doctype html><meta charset=utf-8><title>Bloom</title><p>Traveler details unlocked for this booking. You can close this page.</p>")}))
         .route("/view.js",get(||async {([(header::CONTENT_TYPE,"application/javascript")],include_str!("view.js"))}))
         .route("/state",get(state)).route("/frame",get(frame)).route("/action",post(action))
+        .route("/saved",get(saved_options).post(saved))
         .layer(axum::middleware::from_fn(|request:axum::extract::Request,next:axum::middleware::Next|async move {
             let mut response=next.run(request).await;
             response.headers_mut().insert(header::CACHE_CONTROL,"no-store".parse().unwrap());
@@ -28,7 +28,7 @@ fn check_origin(
     service: &CheckoutService,
     mutation: bool,
 ) -> Result<(), StatusCode> {
-    let host = format!("localhost:{}", service.view_port);
+    let host = format!("127.0.0.1:{}", service.view_port);
     if headers.get(header::HOST).and_then(|v| v.to_str().ok()) != Some(host.as_str()) {
         return Err(StatusCode::FORBIDDEN);
     }
@@ -91,6 +91,38 @@ async fn state(State(service): State<Arc<CheckoutService>>, headers: HeaderMap) 
     match service.private_state(&token).await {
         Ok(value) => Json(value).into_response(),
         Err(_) => StatusCode::GONE.into_response(),
+    }
+}
+async fn saved_options(
+    State(service): State<Arc<CheckoutService>>,
+    headers: HeaderMap,
+) -> Response {
+    let Ok(token) = token(&headers, &service, false) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    match service.private_saved_options(&token).await {
+        Ok(value) => Json(value).into_response(),
+        Err(_) => StatusCode::CONFLICT.into_response(),
+    }
+}
+async fn saved(
+    State(service): State<Arc<CheckoutService>>,
+    headers: HeaderMap,
+    Json(action): Json<SavedAction>,
+) -> Response {
+    let Ok(token) = token(&headers, &service, true) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    match service.private_saved(&token, action).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => {
+            eprintln!("checkout saved action failed: {}", loggable(&error));
+            // Reason codes are Checkout-owned constants, never page text.
+            let reason = error
+                .downcast_ref::<bloom_checkout_api::PreparationReason>()
+                .map(ToString::to_string);
+            (StatusCode::CONFLICT, Json(serde_json::json!({"error":"Saved details could not be prepared. Check the page and any earlier payment; your seller session is still open.","reason":reason}))).into_response()
+        }
     }
 }
 async fn frame(State(service): State<Arc<CheckoutService>>, headers: HeaderMap) -> Response {

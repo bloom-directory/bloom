@@ -1,6 +1,8 @@
 // A fresh developer Triad, real Broker/Signer, real ceremony JS, synthetic card.
 // Requires --checkout-fixture-tls only for the local manual/site fixtures.
 // Card release goes to Stripe's public test checkout, never a live merchant.
+// Supply a test checkout with contact/billing already set by its merchant;
+// generic agent typing is intentionally unavailable before approval.
 import assert from 'node:assert/strict';
 import {randomBytes} from 'node:crypto';
 import {spawn, spawnSync} from 'node:child_process';
@@ -16,13 +18,16 @@ const home = process.env.BLOOM_HOME;
 const endpoint = process.env.BLOOM_RPC_ENDPOINT;
 const ceremonyOrigin = process.env.BLOOM_CHECKOUT_CEREMONY_ORIGIN;
 const viewOrigin = process.env.BLOOM_CHECKOUT_VIEW_ORIGIN;
+const stripeUrl = process.env.BLOOM_CHECKOUT_STRIPE_URL;
+assert(stripeUrl?.startsWith('https://buy.stripe.com/test_'),
+  'Set BLOOM_CHECKOUT_STRIPE_URL to a test checkout with contact/billing prefilled');
 const output = process.argv[2];
 assert(binary && home && endpoint && ceremonyOrigin && viewOrigin && output,
   'Set explicit candidate binary, home, endpoint, ceremony/view origins and result path');
 assert(endpoint.startsWith('unix:'));
 assert.equal(new URL(ceremonyOrigin).hostname, 'localhost');
 assert.notEqual(new URL(ceremonyOrigin).port, '18734', 'Leave installed custody alone');
-assert.equal(new URL(viewOrigin).hostname, 'localhost');
+assert.equal(new URL(viewOrigin).hostname, '127.0.0.1');
 const require = createRequire(resolve(process.env.BLOOM_CHECKOUT_PLAYWRIGHT_ROOT || '.', 'package.json'));
 const {chromium} = require('playwright-core');
 const id = () => randomBytes(32).toString('hex');
@@ -73,21 +78,6 @@ async function browse(request) {
     }
   }
 }
-async function typeVisible(label, text, required = true) {
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const snapshot = await browse({action:'snapshot'});
-    const field = snapshot.elements.find(e => e.role === 'input' && label.test(e.label));
-    if (!field) { if (!required) return; await delay(500); continue; }
-    try { await browse({action:'type',element_ref:field.ref,text}); return; }
-    catch (error) {
-      // Stripe replaces ordinary contact controls while its frames load.
-      // Reobserve a stale binding; never retry a payment action here.
-      if (!/snapshot|stale|page could not be read or changed/i.test(error.message)) throw error;
-      await delay(500);
-    }
-  }
-  throw Error(`Contact field did not stabilize: ${label}`);
-}
 async function poll(path, states) {
   let lastState = 'unavailable';
   for (let attempt = 0; attempt < 150; attempt++) {
@@ -118,6 +108,7 @@ const server = https.createServer({key:readFileSync(join(root,'key.pem')),cert:r
   else if (url.pathname === '/ambiguous') response.end('<p>Total USD 3.99</p><form action="/done"><button>Pay</button></form><form action="/done"><button>Subscribe USD 12.00 monthly</button></form>');
   else if (url.pathname === '/installments') response.end('<p>Total USD 3.99</p><form action="/done"><label>Installments<select name="installments"><option>Choose a schedule</option></select></label><button>Pay</button></form>');
   else if (url.pathname === '/site') response.end('<h1>Fixture shop</h1><p>Order total USD 3.99</p><form action="/done"><button>Place order</button></form>');
+  else if (url.pathname === '/generic') response.end('<form action="/done"><button>Continue</button></form><button type="button" onclick="location.href=\'/done\'">Proceed</button>');
   else if (url.pathname === '/done') { fixtureSubmissions++; response.end('<h1>Order confirmed</h1><p>Order ID: FIXTURE-ONE</p><p>Total USD 3.99</p>'); }
   else if (url.pathname === '/login') response.end('<form action="/account"><input name="user" aria-label="User" style="width:90vw;height:80vh;font-size:40px"></form>');
   else if (url.pathname === '/account') response.end(`<h1>Signed in as ${(url.searchParams.get('user') || '').replace(/[^a-z]/g,'')}</h1>`);
@@ -157,6 +148,15 @@ async function checkoutStatus(operation) { return vfs('cat', `/checkout/requests
 try {
   assert.deepEqual(await vfs('cat','/cards/index.json'), [], 'Use a fresh disposable candidate');
   assert.deepEqual(await vfs('cat','/checkout/history.json'), [], 'Preserve existing shopping history');
+  await browse({action:'open',url:merchant+'generic'}); await delay(500);
+  const generic = await browse({action:'snapshot'});
+  const controls = generic.elements.filter(e => /^(Continue|Proceed)$/.test(e.label));
+  assert.equal(controls.length, 2);
+  for (const control of controls) {
+    await assert.rejects(browse({action:'click',element_ref:control.ref}), /requires approval/);
+  }
+  assert.equal(fixtureSubmissions, 0);
+  checkpoint('native and JavaScript generic submits require approval');
   for (const [path, reason] of [['manual','facts_unreadable'], ['ambiguous','payment_action_ambiguous'], ['installments','charge_terms_unreadable']]) {
     await browse({action:'open',url:merchant+path});
     await delay(500);
@@ -208,15 +208,11 @@ try {
   checkpoint('manual fallback releases no card; lost private tab reopens; shopping returns');
 
   stage = 'Stripe sandbox checkout';
-  await browse({action:'open',url:'https://buy.stripe.com/test_28o7u4eQMcaUgWk8ww'}); await delay(10000);
-  let snapshot = await browse({action:'snapshot'});
+  await browse({action:'open',url:stripeUrl}); await delay(10000);
+  const snapshot = await browse({action:'snapshot'});
   assert(snapshot.url.startsWith('https://buy.stripe.com/test_'), 'Refuse a live payment page');
-  await typeVisible(/^email$/i,'fixture-buyer@example.com');
-  await typeVisible(/postal|zip/i,'12345',false);
-  // This test buys the fixture subscription, not a separate Link account.
-  snapshot = await browse({action:'snapshot'});
   const remember = snapshot.elements.find(e => e.checked === true && /save my information.*faster checkout/i.test(e.label));
-  if (remember) await browse({action:'click',element_ref:remember.ref});
+  assert(!remember, 'Configure the test checkout without optional account signup');
   const payment = id();
   await vfs('write',`/checkout/requests/${payment}/in.json`,{card_id:'stack-card',agent_description:'Stripe public TEST subscription; synthetic card; no real funds'});
   const awaiting = await checkoutStatus(payment);

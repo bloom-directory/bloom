@@ -15,6 +15,21 @@ Anvil instance.
 
 ## Local Anvil transaction
 
+Anvil is not configured by default, and an unreachable configured chain makes
+every read under its paths wait for the endpoint to fail. Ask the operator to
+add this to `~/.bloom/config.toml`, restart Bloom, and check `ls chains/`;
+remove it when the node stops:
+
+```toml
+[chains.anvil]
+name = "anvil"
+chain_id = 31337
+rpc_urls = ["http://127.0.0.1:8545"]
+display_name = "Anvil (local)"
+native_symbol = "ETH"
+native_decimals = 18
+```
+
 ```sh
 # 1. Discover and inspect the exact inputs.
 ls "$BLOOM/chains/"

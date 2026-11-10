@@ -23,7 +23,7 @@ For the bounded mounted passkey workflow, see
 
 Run builds from the repository checkout so rustup uses the toolchain selected
 by `rust-toolchain.toml` (currently stable). The workspace manifest declares
-Rust 1.86 as its minimum version; this is separate from the selected
+Rust 1.89 as its minimum version; this is separate from the selected
 development toolchain.
 
 Keep the three repositories side by side by default:
@@ -474,12 +474,12 @@ exercise the behavior you changed.
 
 ## Preinstalled Petals
 
-Every Bloom home provisions Polymarket, Hyperliquid, Enso, Near Intents, and
-Tolly from the pinned release catalog. `bloom init` installs missing releases
-and updates older catalog releases; Machine startup also attempts provisioning
-in the background. Current verified installations are reused. Legacy
-`[petals] preinstalled` values are ignored, including empty lists, and are no
-longer written to new configs.
+Every Bloom home provisions Polymarket, Hyperliquid, Enso, Near Intents,
+Feedback, and Safe from the pinned release catalog. `bloom init` installs
+missing releases and updates older catalog releases; Machine startup also
+attempts provisioning in the background. Current verified installations are
+reused. Legacy `[petals] preinstalled` values are ignored, including empty
+lists, and are no longer written to new configs.
 
 The canonical list is `DEFAULT_PETALS` in
 [`crates/bloom/src/github_source.rs`](./crates/bloom/src/github_source.rs).
