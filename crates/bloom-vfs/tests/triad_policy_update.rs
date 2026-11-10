@@ -2239,7 +2239,7 @@ async fn a_reconciled_read_reports_a_waiting_change_and_commits_an_approved_one(
     };
 
     let ReconciledPolicy::Current(current) = handler
-        .reconciled_policy("alice", &chosen, &[], None)
+        .reconciled_policy("alice", &chosen, &[], &[], None)
         .await
         .unwrap()
     else {
@@ -2259,7 +2259,7 @@ async fn a_reconciled_read_reports_a_waiting_change_and_commits_an_approved_one(
         panic!("the default policy is proposed");
     };
     let ReconciledPolicy::Awaiting { pending, proposed } = handler
-        .reconciled_policy("alice", &chosen, &[], None)
+        .reconciled_policy("alice", &chosen, &[], &[], None)
         .await
         .unwrap()
     else {
@@ -2274,7 +2274,7 @@ async fn a_reconciled_read_reports_a_waiting_change_and_commits_an_approved_one(
     // The owner approves while nothing polls.
     fixture.complete.store(true, Ordering::SeqCst);
     let ReconciledPolicy::Current(current) = handler
-        .reconciled_policy("alice", &chosen, &[], None)
+        .reconciled_policy("alice", &chosen, &[], &[], None)
         .await
         .unwrap()
     else {
@@ -2290,4 +2290,86 @@ async fn a_reconciled_read_reports_a_waiting_change_and_commits_an_approved_one(
             .iter()
             .any(|request| matches!(request, MachineBrokerRequest::PolicyCommitUpdate(_)))
     );
+}
+
+/// A change waiting for the owner is a default-policy request's own only when
+/// it adds nothing but that request, so a change carrying the default policy
+/// plus more, such as an agent's proposal with a destination of its own, is
+/// never described to the owner as the default policy. A Petal's own use
+/// still waits on it, as its one ceremony covers that Petal. A package of a
+/// chosen Petal that is no longer installed may be the only extra.
+#[tokio::test]
+async fn a_waiting_change_carrying_more_than_the_default_policy_is_not_its_own() {
+    use bloom_vfs::handlers::ReconciledPolicy;
+
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(false);
+    let handler = eligibility_handler(temp.path(), fixture.clone());
+    let chosen = [Digest32::from_bytes([7; 32])];
+    let missing = Digest32::from_bytes([8; 32]);
+    let extra = bloom_broker_api::PolicyDestination {
+        chain: Token::new("ethereum").unwrap(),
+        destination: "0x000000000000000000000000000000000000dead".into(),
+    };
+    // Somebody else proposes the default policy plus a destination.
+    let PetalEligibility::AwaitingPolicyApproval(proposal) = handler
+        .ensure_petal_packages_allowed(
+            "alice",
+            &chosen,
+            std::slice::from_ref(&extra),
+            None,
+            AfterPolicyChange::Propose,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("the broader change is proposed");
+    };
+
+    let PetalEligibility::AwaitingPolicyApproval(pending) = handler
+        .ensure_petal_packages_allowed("alice", &chosen, &[], None, AfterPolicyChange::Report)
+        .await
+        .unwrap()
+    else {
+        panic!("the broader change waits");
+    };
+    assert_eq!(pending.operation_id, proposal.operation_id);
+    assert!(!pending.includes_requested, "not the default policy");
+    let ReconciledPolicy::Awaiting { pending, .. } = handler
+        .reconciled_policy("alice", &chosen, &[], &[], None)
+        .await
+        .unwrap()
+    else {
+        panic!("the broader change waits");
+    };
+    assert!(!pending.includes_requested, "not the default policy");
+    let PetalEligibility::AwaitingPolicyApproval(pending) = handler
+        .ensure_petal_eligibility("alice", &chosen[0])
+        .await
+        .unwrap()
+    else {
+        panic!("a Petal's own use waits on it");
+    };
+    assert!(pending.includes_requested, "its ceremony covers the Petal");
+
+    // A default policy proposed while a chosen Petal was installed is still
+    // its own once that Petal is missing, but only with that package named.
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(false);
+    let handler = eligibility_handler(temp.path(), fixture);
+    let both = [chosen[0].clone(), missing.clone()];
+    handler
+        .ensure_petal_packages_allowed("alice", &both, &[], None, AfterPolicyChange::Propose)
+        .await
+        .unwrap();
+    for (also, own) in [(&[][..], false), (std::slice::from_ref(&missing), true)] {
+        let ReconciledPolicy::Awaiting { pending, .. } = handler
+            .reconciled_policy("alice", &chosen, also, &[], None)
+            .await
+            .unwrap()
+        else {
+            panic!("the default policy waits");
+        };
+        assert_eq!(pending.includes_requested, own, "{also:?}");
+    }
 }

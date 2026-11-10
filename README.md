@@ -117,7 +117,8 @@ once you approve its one ceremony, the wallet's policy is replaced and its
 Petal limits reset to the persona's. Until then nothing changes, and declining
 the ceremony changes nothing. A switch starts only once every Petal it
 chooses is installed (without a terminal to choose from, all five catalog
-Petals). Each wallet keeps its own persona.
+Petals setup offers: every catalog Petal but Safe, which the owner allows
+with their own policy change). Each wallet keeps its own persona.
 
 Native Solana transfers use the same wallet outbox shape as EVM transfers,
 with genesis pinning, exact-message semantic verification in Broker,
@@ -238,8 +239,9 @@ A fresh Bloom VFS root exposes these default entries:
   pinned [Polymarket](https://github.com/bloom-directory/bloom-petal-polymarket),
   [Hyperliquid](https://github.com/bloom-directory/bloom-petal-hyperliquid),
   [Enso](https://github.com/bloom-directory/bloom-petal-enso),
-  [Near Intents](https://github.com/bloom-directory/bloom-petal-near), and
-  [Feedback](https://github.com/bloom-directory/bloom-petal-feedback) releases.
+  [Near Intents](https://github.com/bloom-directory/bloom-petal-near),
+  [Feedback](https://github.com/bloom-directory/bloom-petal-feedback), and
+  [Safe](https://github.com/bloom-directory/bloom-petal-safe) releases.
   Tolly is excluded until its explicit-account release is available.
   Read `docs/petals.md` in the VFS for the exact installed set, mount
   directories, summaries, and declared capabilities.

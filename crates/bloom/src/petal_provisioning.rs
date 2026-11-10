@@ -744,10 +744,11 @@ name = "enso"
                     "hyperliquid",
                     "enso",
                     "near-intents",
-                    "feedback"
+                    "feedback",
+                    "safe"
                 ]
             );
-            assert_eq!(results.len(), 5);
+            assert_eq!(results.len(), 6);
             assert!(results.iter().all(|result| matches!(&result.outcome,
                 ProvisioningOutcome::Failed(message) if message.contains("download default")
                     && message.ends_with("restart Bloom to try again"))));

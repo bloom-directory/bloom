@@ -58,8 +58,9 @@ Agreed on 2026-09-14:
    repositories are untouched.
 2. **`bloom init` opens a setup menu** where the user chooses their Petals.
    It offers Bloom's canonical Petals: Polymarket, Hyperliquid, Enso, NEAR
-   Intents, and Feedback. Bloom installs all of them for every home; the menu
-   chooses which ones `main`'s policy allows.
+   Intents, and Feedback. Bloom installs all of them for every home, with
+   Safe, which setup does not offer (decision 22); the menu chooses which
+   ones `main`'s policy allows.
 3. **Bloom's setup decides the defaults.** The menu suggests each Petal's
    settings, and the user can change them.
 4. **The default policy is for the first wallet, `main`.** Other wallets
@@ -324,6 +325,20 @@ Agreed on 2026-11-03 with the author of bloom#352 and bloom#377:
     (bloom-broker#103). The pinned Broker, `b6c27339` at Machine–Broker 1.8,
     includes it, so a Degen transfer's approval page names the recipient
     (decision 15).
+22. **Setup does not offer Safe.** Safe v0.1.0 is a canonical Petal, so
+    Bloom installs it, but no persona or default policy allows it. Safe signs
+    a Safe transaction's confirmation and stages its execution: Broker
+    refuses that signature unless the policy allows exact destinations on
+    its chain, and Machine refuses the execution unless the policy lists the
+    Safe's own address. Neither is a fixed contract setup could propose:
+    exact destinations would let any staged transaction deploy a contract,
+    and the Safe is the owner's. Allowing only Safe's package would let setup
+    say Safe is allowed while every use of it is refused, and a Safe still
+    installing would hold back the whole default policy. The owner allows
+    Safe with their own policy change. `NOT_IN_SETUP` in
+    `crates/bloom/src/default_policy.rs` lists it with the reason, and a test
+    requires every canonical Petal to be offered with its destinations,
+    offered as needing none, or listed there.
 
 ## Why it does not work today
 
@@ -511,7 +526,14 @@ chosen Petals:
    owner is reported with its ceremony link, naming a missing Petal it
    allows as allowed but not installed, and one the owner approved meanwhile
    commits, so an approval is never hidden or left uncommitted while a
-   Petal is missing. A
+   Petal is missing. A waiting change is described as the default policy
+   only when it is the current policy with nothing added but the default
+   policy, apart from the catalog release of a chosen Petal no longer
+   installed. Any other change, such as an agent's proposal of the default
+   policy plus a destination of its own, is reported as another change
+   waiting at its link, with any missing Petal named beside it, so the owner
+   is never told it is the default policy. A Petal's own first use still
+   waits on such a change, since its one ceremony covers that Petal. A
    policy that has changed since creation is never proposed this way, so
    for it a missing Petal is only named alongside what the policy allows
    or lacks. A persona switch likewise starts only with every chosen Petal
@@ -994,7 +1016,7 @@ changes come next.
 
 Automated:
 
-- The menu offers Bloom's five canonical Petals, records declines, rejects
+- The menu offers the five canonical Petals setup offers, never Safe, records declines, rejects
   invalid limits, and accepts the suggestions at the end of input. On a
   config with earlier choices it suggests exactly those choices and saved
   values. The scripted form chooses every canonical Petal on a fresh config,
@@ -1077,7 +1099,11 @@ Automated:
   Broker is asked, and otherwise while the policy is the one creation
   installed. A change already waiting for the owner is reported with its
   ceremony instead, naming a missing Petal it allows as allowed, and one the
-  owner approved commits (`crates/bloom/src/default_policy.rs`,
+  owner approved commits, for browser onboarding too. A waiting change
+  carrying more than the default policy, apart from a missing Petal's
+  catalog release, is reported as another change, with the missing Petals
+  named beside it, while a Petal's own use still waits on it
+  (`crates/bloom/src/default_policy.rs`,
   `crates/bloom-vfs/tests/triad_policy_update.rs`). The command names the
   missing Petals and what to run without calling it skipped; a persona switch starts nothing and records no waiting
   switch. A switch records the Petals its proposal included, and its
@@ -1108,7 +1134,7 @@ Automated:
   in one ceremony, and proposes nothing for a policy that already matches; a
   Trader or Degen first proposal carries the standing lifetime, which the
   default-policy path requires (`crates/bloom-vfs/tests/triad_policy_update.rs`).
-- A switch accepts only canonical Petals with valid values and known
+- A switch accepts only the Petals setup offers, with valid values and known
   settings; on approval it resets their limits over stored settings, drops
   `main`'s queued write for each Petal whose reset went in, and reports a
   failed write with its command. A waiting switch is kept apart from the
