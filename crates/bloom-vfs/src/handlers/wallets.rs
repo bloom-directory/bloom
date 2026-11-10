@@ -2520,20 +2520,10 @@ impl WalletsHandler {
             // while a chosen Petal is missing would leave that Petal out for
             // good: wait for it, as the default policy itself does.
             if !first_proposal.not_installed.is_empty() {
-                let names = first_proposal.not_installed.join(", ");
-                return Err(HandlerError::backend(format!(
-                    "{DEFAULT_POLICY_WAITING}: wallet {wallet}'s setup chose {names}, which {} not installed yet, and its first policy change allows every chosen Petal at once, so nothing was proposed. Retry this operation once `bloom petals ls` lists {}; Bloom installs its catalog Petals as it starts, and if one stays missing, restart Bloom",
-                    if first_proposal.not_installed.len() == 1 {
-                        "is"
-                    } else {
-                        "are"
-                    },
-                    if first_proposal.not_installed.len() == 1 {
-                        "it"
-                    } else {
-                        "them"
-                    },
-                )));
+                return Err(default_policy_waiting(
+                    wallet,
+                    &first_proposal.not_installed,
+                ));
             }
             additions.extend_from_slice(&first_proposal.packages);
             proposed_destinations.extend_from_slice(&first_proposal.destinations);
@@ -3478,6 +3468,34 @@ pub const POLICY_COORDINATION_BUSY: &str = "wallet policy coordination busy";
 /// no policy is proposed until it is, so the owner approves the whole setup
 /// at once.
 pub const DEFAULT_POLICY_WAITING: &str = "DEFAULT_POLICY_WAITING";
+
+/// The error a Petal's use gets while `wallet` still has the policy wallet
+/// creation installed and the Petals its setup chose named in
+/// `not_installed` are missing. It is read by agents through the Petal, so
+/// it avoids the words a Petal reads as a refusal, a missing route or a bad
+/// request ("denied", "permission", "invalid", "not found").
+pub fn default_policy_waiting(wallet: &str, not_installed: &[String]) -> HandlerError {
+    let names = not_installed.join(", ");
+    let (verb, them, stays) = if not_installed.len() == 1 {
+        ("is", "it", "it stays")
+    } else {
+        ("are", "them", "one stays")
+    };
+    HandlerError::backend(format!(
+        "{DEFAULT_POLICY_WAITING}: wallet {wallet}'s setup chose {names}, which {verb} not installed yet. Its first policy change allows every chosen Petal at once, so nothing was proposed. Retry once `docs/petals.md` lists {them}; Bloom installs its catalog Petals as it starts. If {stays} missing, tell the owner to restart Bloom, or to run `bloom wallet persona {wallet} <persona>` and leave {them} out"
+    ))
+}
+
+/// The message of a [`default_policy_waiting`] error, which a Petal must show
+/// as it is rather than as a refusal.
+pub fn default_policy_waiting_message(error: &HandlerError) -> Option<&str> {
+    match error {
+        HandlerError::Backend(message) if message.starts_with(DEFAULT_POLICY_WAITING) => {
+            Some(message)
+        }
+        _ => None,
+    }
+}
 
 /// Marks a failure of the proposal a persona switch makes, as opposed to a
 /// failure reconciling or reading the policy around it, so Machine can tell
@@ -5499,6 +5517,20 @@ mod tests {
                 verifier_digest: Digest32::from_bytes([4; 32]),
             });
         assert!(!own(&other, None), "a verifier");
+        let mut other = request.clone();
+        other.clear_signing = Some(bloom_broker_api::LegacyClearSigningPolicy {
+            catalog_id: Token::new("bloom").unwrap(),
+            trusted_keys: Vec::new(),
+            signature_threshold: 1,
+            maximum_observation_age_ms: 60_000,
+            opaque_exact_allowed: false,
+            unlimited_allowance_allowed: false,
+            verifier: bloom_broker_api::RequiredVerifier {
+                verifier_id: Token::new("clear-signing").unwrap(),
+                verifier_digest: Digest32::from_bytes([5; 32]),
+            },
+        });
+        assert!(!own(&other, None), "clear-signing rules");
     }
 
     /// A replacement keeps the policy's clear-signing rules for a Broker that

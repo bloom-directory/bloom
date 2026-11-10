@@ -126,8 +126,9 @@ persona switch, its link is for that change, which does not allow the
 operation: Broker opens one ceremony per wallet at a time, so tell the owner
 to approve or refuse it, then retry. `DEFAULT_POLICY_WAITING` means a Petal the
 owner chose during setup is still installing, and the wallet's first policy
-allows every chosen Petal at once: retry once `bloom petals ls` lists it, or
-tell the owner to restart Bloom if it stays missing.
+allows every chosen Petal at once: retry once `docs/petals.md` lists it. If it
+stays missing, tell the owner to restart Bloom, or to switch persona without
+it.
 
 ## What the owner sees when approving
 

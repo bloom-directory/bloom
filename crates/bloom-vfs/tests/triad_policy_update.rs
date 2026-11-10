@@ -46,6 +46,9 @@ struct BrokerFixture {
     complete: AtomicBool,
     lose_prepare_response_once: AtomicBool,
     unavailable_after_commit: AtomicBool,
+    /// Refuse to read the current policy, as an unavailable Broker would,
+    /// while answering everything else.
+    fail_policy_read: AtomicBool,
     prepare_refusal_once: Mutex<Option<ProtocolErrorCode>>,
     ceremony_state_override: parking_lot::Mutex<Option<CeremonyState>>,
     ceremony_expires_at_ms: AtomicU64,
@@ -164,6 +167,14 @@ impl MachineBrokerService for BrokerFixture {
                             seed_profile: WalletSeedProfile::Bip39MulticurveV1,
                             accounts: Vec::new(),
                         },
+                    ))
+                }
+                MachineBrokerRequest::PolicyRead(_)
+                    if self.fail_policy_read.load(Ordering::SeqCst) =>
+                {
+                    Err(ProtocolError::new(
+                        ProtocolErrorCode::ServiceUnavailable,
+                        "policy read unavailable",
                     ))
                 }
                 MachineBrokerRequest::PolicyRead(_) => {
@@ -336,6 +347,7 @@ fn broker_fixture_with_policy(
         complete: AtomicBool::new(false),
         lose_prepare_response_once: AtomicBool::new(lose_prepare_response_once),
         unavailable_after_commit: AtomicBool::new(false),
+        fail_policy_read: AtomicBool::new(false),
         prepare_refusal_once: Mutex::new(None),
         ceremony_state_override: parking_lot::Mutex::new(None),
         ceremony_expires_at_ms: AtomicU64::new(u64::MAX),
@@ -2438,6 +2450,74 @@ async fn a_petal_use_waits_while_a_chosen_petal_is_missing() {
     let proposed: CanonicalWalletPolicy =
         serde_json::from_slice(&fixture.state.lock().proposed_policy.clone().unwrap()).unwrap();
     assert!(proposed.allowed_petal_packages.contains(&chosen));
+
+    // Once the policy has changed since creation, setup's proposals have
+    // ended, so a missing chosen Petal holds nothing up: the Petal in use is
+    // proposed on its own.
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture_with_policy(false, policy(60_000), 2);
+    missing.lock().push("hyperliquid".to_owned());
+    let defaults: bloom_vfs::handlers::DefaultPolicyPackages = {
+        let (chosen, missing) = (chosen.clone(), missing.clone());
+        Arc::new(move |_: &str| {
+            Ok(bloom_vfs::handlers::DefaultPolicySetup {
+                packages: vec![chosen.clone()],
+                destinations: vec![setup_destination()],
+                maximum_approval_lifetime_ms: None,
+                not_installed: missing.lock().clone(),
+            })
+        })
+    };
+    let handler =
+        eligibility_handler(temp.path(), fixture.clone()).with_default_policy_packages(defaults);
+    assert!(matches!(
+        handler.ensure_petal_eligibility("alice", &requested).await,
+        Ok(PetalEligibility::AwaitingPolicyApproval(_))
+    ));
+    let proposed: CanonicalWalletPolicy =
+        serde_json::from_slice(&fixture.state.lock().proposed_policy.clone().unwrap()).unwrap();
+    assert_eq!(proposed.allowed_petal_packages, [requested]);
+}
+
+/// Whether a waiting change is the default policy is judged against the
+/// current policy, so while that cannot be read the check fails rather than
+/// guess, for a default-policy read and proposal alike. A Petal's own use
+/// still gets the waiting change, since its one ceremony covers that Petal.
+#[tokio::test]
+async fn an_unreadable_policy_never_labels_a_waiting_change() {
+    use bloom_vfs::handlers::ReconciledPolicy;
+
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(false);
+    let handler = eligibility_handler(temp.path(), fixture.clone());
+    let package = Digest32::from_bytes([7; 32]);
+    let packages = std::slice::from_ref(&package);
+    handler
+        .ensure_petal_packages_allowed("alice", packages, &[], None, AfterPolicyChange::Propose)
+        .await
+        .unwrap();
+    assert!(matches!(
+        handler
+            .reconciled_policy("alice", packages, &Default::default(), &[], None)
+            .await,
+        Ok(ReconciledPolicy::Awaiting { .. })
+    ));
+
+    fixture.fail_policy_read.store(true, Ordering::SeqCst);
+    let error = handler
+        .reconciled_policy("alice", packages, &Default::default(), &[], None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("SERVICE_UNAVAILABLE"), "{error}");
+    let error = handler
+        .ensure_petal_packages_allowed("alice", packages, &[], None, AfterPolicyChange::Propose)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("SERVICE_UNAVAILABLE"), "{error}");
+    assert!(matches!(
+        handler.ensure_petal_eligibility("alice", &package).await,
+        Ok(PetalEligibility::AwaitingPolicyApproval(_))
+    ));
 }
 
 /// A default policy proposed while a chosen Petal with destinations was

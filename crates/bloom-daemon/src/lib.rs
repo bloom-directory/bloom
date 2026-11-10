@@ -659,7 +659,7 @@ impl DaemonPetalHost {
         match wallets
             .ensure_petal_eligibility(wallet, package_hash)
             .await
-            .map_err(|error| HostError::Denied(error.to_string()))?
+            .map_err(|error| eligibility_host_error(wallet, error))?
         {
             bloom_machine_client::PetalEligibility::Allowed(_) => Ok(None),
             bloom_machine_client::PetalEligibility::AwaitingPolicyApproval(pending) => {
@@ -3935,15 +3935,81 @@ impl AccountPetalMount for AccountPetals {
     }
 }
 
+/// The error a Petal gets when its wallet's policy could not be made to allow
+/// it. A wait for the Petals chosen during setup goes back as a backend
+/// error with its message whole, for the agent to read through the Petal; a
+/// denial would reach it only as a refusal, without the Petals to wait for.
+/// Anything else is a denial.
+fn eligibility_host_error(wallet: &str, error: bloom_vfs::HandlerError) -> HostError {
+    match bloom_vfs::handlers::wallets::default_policy_waiting_message(&error) {
+        Some(message) => {
+            warn!(wallet = %wallet, reason = %message, "petal.default_policy_waiting");
+            HostError::Backend(message.to_owned())
+        }
+        None => HostError::Denied(error.to_string()),
+    }
+}
+
+/// Where Machine notes the package each chosen Petal had when it was last
+/// seen installed, one file per Petal, so a default policy proposed then is
+/// still recognised as Bloom's own once that Petal is gone. A Petal
+/// uninstalled leaves nothing in the store to tell its package by.
+fn seen_packages_dir(home: &std::path::Path) -> std::path::PathBuf {
+    home.join("default-policy-seen-packages")
+}
+
+/// Whether `name` is safe to use as a file name under [`seen_packages_dir`].
+fn plain_petal_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+/// Note `hash` as `name`'s installed package in Bloom's `home`. Best effort:
+/// without the note, a waiting default policy is at worst reported as
+/// another change. The note is replaced whole, never left half written.
+pub fn remember_seen_package(home: &std::path::Path, name: &str, hash: &str) {
+    if !plain_petal_name(name)
+        || last_seen_package(home, name).is_some_and(|seen| seen.as_str() == hash)
+    {
+        return;
+    }
+    let dir = seen_packages_dir(home);
+    let written = std::fs::create_dir_all(&dir).and_then(|()| {
+        let mut file = tempfile::NamedTempFile::new_in(&dir)?;
+        std::io::Write::write_all(&mut file, hash.as_bytes())?;
+        file.persist(dir.join(name))
+            .map(drop)
+            .map_err(|error| error.error)
+    });
+    if let Err(error) = written {
+        warn!(petal = %name, %error, "default_policy.seen_package_not_recorded");
+    }
+}
+
+/// The package [`remember_seen_package`] last noted for `name`.
+pub fn last_seen_package(home: &std::path::Path, name: &str) -> Option<bloom_broker_api::Digest32> {
+    if !plain_petal_name(name) {
+        return None;
+    }
+    let hash = std::fs::read_to_string(seen_packages_dir(home).join(name)).ok()?;
+    bloom_broker_api::Digest32::new(hash.trim().to_owned()).ok()
+}
+
 /// What a wallet's first Petal proposal also allows, from its setup: each
 /// chosen Petal that is installed, its destinations, and the persona's
 /// destinations ([`persona_policy_destinations`]) and approval lifetime
 /// ([`persona_policy_lifetime`]). A chosen Petal that is not installed is
-/// left out. One whose owner record cannot be read, or holds an invalid
-/// package hash, fails the whole setup, so the proposal stops rather than
-/// leaving that Petal out of the policy for good.
+/// listed in `not_installed`, so the proposal waits for it rather than leave
+/// it out of the policy for good; an installed one's package is noted in
+/// `home` ([`remember_seen_package`]). Only the Petals setup offers
+/// ([`bloom_proto::config::SETUP_PETALS`]) count. One whose owner record
+/// cannot be read, or holds an invalid package hash, fails the whole setup,
+/// so the proposal stops.
 fn default_policy_setup(
     store: &PetalStore,
+    home: &std::path::Path,
     chosen: &bloom_proto::config::WalletSetup,
     persona_destinations: &[bloom_broker_api::PolicyDestination],
 ) -> Result<bloom_vfs::handlers::DefaultPolicySetup, bloom_vfs::HandlerError> {
@@ -3955,8 +4021,10 @@ fn default_policy_setup(
     setup.destinations.extend_from_slice(persona_destinations);
     for name in chosen.petals.keys() {
         // Setup never offers these, so a config naming one, as only a hand
-        // edit can, allows nothing more.
-        if bloom_proto::config::PETALS_NOT_IN_SETUP.contains(&name.as_str()) {
+        // edit or a Petal since dropped from the catalog can, allows nothing
+        // more; no release installs it, so waiting for it would never end.
+        if !bloom_proto::config::SETUP_PETALS.contains(&name.as_str()) {
+            warn!(petal = %name, "default_policy.petal_not_in_setup_ignored");
             continue;
         }
         let installed = store.resolve_petal_owner(name).map_err(|error| {
@@ -3967,6 +4035,7 @@ fn default_policy_setup(
             setup.not_installed.push(name.clone());
             continue;
         };
+        remember_seen_package(home, name, &hash);
         let package = bloom_broker_api::Digest32::new(hash).map_err(|error| {
             bloom_vfs::HandlerError::backend(format!(
                 "the installed {name} Petal has an invalid package hash: {error}"
@@ -3984,6 +4053,7 @@ fn default_policy_setup(
 /// proposal.
 fn saved_default_policy_setup(
     store: &PetalStore,
+    home: &std::path::Path,
     config_path: &std::path::Path,
     wallet: &str,
 ) -> Result<bloom_vfs::handlers::DefaultPolicySetup, bloom_vfs::HandlerError> {
@@ -3993,7 +4063,12 @@ fn saved_default_policy_setup(
         ))
     })?;
     let persona_destinations = persona_policy_destinations(&config, wallet);
-    default_policy_setup(store, config.setup.wallet(wallet), &persona_destinations)
+    default_policy_setup(
+        store,
+        home,
+        config.setup.wallet(wallet),
+        &persona_destinations,
+    )
 }
 
 /// The chain ids on which Degen allows ERC-20 transfers to any
@@ -4895,8 +4970,11 @@ impl Daemon {
             // update is picked up without a restart. A config that cannot be
             // read stops the proposal.
             let config_path = home.config_path();
+            let home_root = home.root().to_path_buf();
             let store = petal_store.clone();
-            Arc::new(move |wallet: &str| saved_default_policy_setup(&store, &config_path, wallet))
+            Arc::new(move |wallet: &str| {
+                saved_default_policy_setup(&store, &home_root, &config_path, wallet)
+            })
         };
         let wallets_handler = Arc::new(
             WalletsHandler::new(
@@ -6261,31 +6339,83 @@ mod tests {
         assert!(configured_mount(&config, std::path::Path::new("/tmp/bloom-mount")).is_err());
     }
 
+    /// A wait for the Petals chosen during setup reaches the Petal whole, as a
+    /// backend error free of the words a Petal reads as a refusal or a bad
+    /// request, so the agent sees what to wait for; anything else is denied.
+    #[test]
+    fn a_wait_for_chosen_petals_reaches_the_agent_whole() {
+        let waiting = bloom_vfs::handlers::wallets::default_policy_waiting(
+            "main",
+            &["hyperliquid".to_owned()],
+        );
+        let HostError::Backend(message) = eligibility_host_error("main", waiting) else {
+            panic!("the wait must not be a denial");
+        };
+        assert!(message.starts_with("DEFAULT_POLICY_WAITING: "), "{message}");
+        assert!(message.contains("hyperliquid"), "{message}");
+        assert!(message.contains("`docs/petals.md`"), "{message}");
+        assert!(
+            message.contains("bloom wallet persona main <persona>"),
+            "{message}"
+        );
+        let lower = message.to_ascii_lowercase();
+        for word in ["denied", "permission", "invalid", "not found"] {
+            assert!(!lower.contains(word), "{word}: {message}");
+        }
+        assert!(matches!(
+            eligibility_host_error("main", bloom_vfs::HandlerError::backend("broker refused")),
+            HostError::Denied(_)
+        ));
+    }
+
     /// One chosen Petal whose owner record cannot be read fails the whole
     /// default-policy setup, rather than leaving that Petal out of the first
-    /// proposal. A chosen Petal that is not installed is simply left out.
+    /// proposal. A chosen Petal that is not installed is named, so the
+    /// proposal waits for it; an installed one's package is noted; a name
+    /// setup never offers is ignored, since nothing would ever install it.
     #[test]
     fn default_policy_setup_fails_when_an_owner_record_is_unreadable() {
         let temp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
         let store = PetalStore::open(temp.path()).unwrap();
         let mut chosen = bloom_proto::config::WalletSetup::default();
-        for name in ["hyperliquid", "polymarket", "safe"] {
+        for name in ["hyperliquid", "polymarket", "safe", "tolly", "Hyperliquid"] {
             chosen.petals.insert(name.to_owned(), Default::default());
         }
 
-        let setup = default_policy_setup(&store, &chosen, &[]).unwrap();
+        let setup = default_policy_setup(&store, home.path(), &chosen, &[]).unwrap();
         assert!(setup.packages.is_empty(), "nothing is installed yet");
         // Missing chosen Petals are named, so a Petal's use waits for them;
-        // Safe, which setup never offers, is ignored though a config names it.
+        // Safe, which setup never offers, a Petal no release installs, and a
+        // misspelt name are ignored though a config names them.
         assert_eq!(setup.not_installed, ["hyperliquid", "polymarket"]);
 
+        // Hyperliquid installed from the owner's own build: its package is
+        // noted, so it is still known once it is uninstalled.
+        let own_build = "ab".repeat(32);
+        std::fs::create_dir_all(store.package_path(&own_build).unwrap()).unwrap();
         std::fs::create_dir_all(temp.path().join("owners")).unwrap();
+        std::fs::write(
+            temp.path().join("owners/hyperliquid.json"),
+            serde_json::json!({"name": "hyperliquid", "hash": own_build}).to_string(),
+        )
+        .unwrap();
+        let setup = default_policy_setup(&store, home.path(), &chosen, &[]).unwrap();
+        assert_eq!(setup.not_installed, ["polymarket"]);
+        assert_eq!(
+            last_seen_package(home.path(), "hyperliquid").map(|seen| seen.as_str().to_owned()),
+            Some(own_build.clone())
+        );
+        remember_seen_package(home.path(), "../escape", &own_build);
+        assert!(last_seen_package(home.path(), "../escape").is_none());
+        assert!(!home.path().join("escape").exists());
+
         std::fs::write(temp.path().join("owners/polymarket.json"), b"not json").unwrap();
-        let error = default_policy_setup(&store, &chosen, &[]).unwrap_err();
+        let error = default_policy_setup(&store, home.path(), &chosen, &[]).unwrap_err();
         assert!(error.to_string().contains("polymarket"), "{error}");
         // A wallet without a setup proposes nothing beyond its request.
         assert_eq!(
-            default_policy_setup(&store, &Default::default(), &[]).unwrap(),
+            default_policy_setup(&store, home.path(), &Default::default(), &[]).unwrap(),
             bloom_vfs::handlers::DefaultPolicySetup::default()
         );
     }
@@ -6351,7 +6481,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = PetalStore::open(temp.path()).unwrap();
         let trading = config.setup.wallet("trading");
-        let setup = default_policy_setup(&store, trading, &degen).unwrap();
+        let setup = default_policy_setup(&store, temp.path(), trading, &degen).unwrap();
         assert_eq!(setup.destinations, degen);
         assert_eq!(
             setup.maximum_approval_lifetime_ms,
@@ -6372,13 +6502,13 @@ mod tests {
         let mut config = Config::local_default();
         config.save(&path).unwrap();
         assert_eq!(
-            saved_default_policy_setup(&store, &path, "trading").unwrap(),
+            saved_default_policy_setup(&store, temp.path(), &path, "trading").unwrap(),
             bloom_vfs::handlers::DefaultPolicySetup::default()
         );
         config.setup.wallet_mut("trading").persona =
             Some(PersonaConfig::suggested(PersonaPreset::Degen));
         config.save(&path).unwrap();
-        let setup = saved_default_policy_setup(&store, &path, "trading").unwrap();
+        let setup = saved_default_policy_setup(&store, temp.path(), &path, "trading").unwrap();
         assert_eq!(
             setup.destinations,
             persona_policy_destinations(&config, "trading")
@@ -6388,12 +6518,12 @@ mod tests {
             Some(bloom_proto::policy::STANDING_APPROVAL_POLICY_LIFETIME_MS)
         );
         assert_eq!(
-            saved_default_policy_setup(&store, &path, "main").unwrap(),
+            saved_default_policy_setup(&store, temp.path(), &path, "main").unwrap(),
             bloom_vfs::handlers::DefaultPolicySetup::default(),
             "another wallet's persona is not main's"
         );
         std::fs::write(&path, "not toml").unwrap();
-        assert!(saved_default_policy_setup(&store, &path, "trading").is_err());
+        assert!(saved_default_policy_setup(&store, temp.path(), &path, "trading").is_err());
     }
 
     #[test]

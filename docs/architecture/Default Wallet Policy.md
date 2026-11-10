@@ -517,8 +517,10 @@ chosen Petals:
    the policy in the same step. The wallet keeps the policy creation
    installed, so that command then proposes the whole default policy. A
    change already proposed is settled first: one still waiting for the
-   owner is reported with its ceremony link, naming a missing Petal it
-   allows as allowed but not installed, and one the owner approved meanwhile
+   owner is reported with its ceremony link, naming a missing Petal whose
+   catalog release it allows as allowed but not installed, and one it
+   allows only as the build last installed apart, since the catalog release
+   a restart installs would not be allowed; one the owner approved meanwhile
    commits, so an approval is never hidden or left uncommitted while a
    Petal is missing. A waiting change is described as the default policy
    only when it is the current policy with nothing added but the default
@@ -526,9 +528,11 @@ chosen Petals:
    installed: that Petal's destinations and its package, as the catalog
    pins it or as Machine last saw it installed. Machine notes each chosen
    Petal's installed package under `default-policy-seen-packages/` in
-   Bloom's home, since an uninstalled Petal leaves nothing in the store to
-   tell it by. If the current policy cannot be read, the check fails rather
-   than guess. Any other change, such as an agent's proposal of the default
+   Bloom's home whenever it reads the setup, for the command and for a
+   Petal's first use alike, since an uninstalled Petal leaves nothing in the
+   store to tell it by. If the current policy cannot be read, the check
+   fails rather than guess; browser onboarding then waits out a busy or
+   unavailable Broker, as a change may be waiting behind it. Any other change, such as an agent's proposal of the default
    policy plus a destination of its own, is reported as another change
    waiting at its link, with any missing Petal named beside it, so the owner
    is never told it is the default policy. A Petal's own first use still
@@ -538,10 +542,17 @@ chosen Petals:
    `DEFAULT_POLICY_WAITING`, naming the missing Petal: its proposal would
    carry the setup without that Petal, and once the owner approved it the
    policy would no longer be the one creation installed, so the missing
-   Petal would never be proposed. Setup's Petals, Safe excepted, are installed
-   as Machine starts, so this lasts until they are. A config that names a
-   Petal setup does not offer, such as Safe, as only a hand edit can, allows
-   nothing more: the request and a Petal's first proposal ignore it. A
+   Petal would never be proposed. Machine passes that error to the Petal as
+   a backend error, not a denial, so the Petal shows the agent its text,
+   and logs it. Setup's Petals are installed as Machine starts, so this
+   lasts until they are; for one that never installs, or that the owner
+   uninstalled on purpose, the way out is a persona switch that leaves it
+   out, which the error names. Only the Petals setup offers
+   (`bloom_proto::config::SETUP_PETALS`) are proposed or waited for. A
+   config that names any other, such as Safe or a Petal since dropped from
+   the catalog, as only a hand edit can, allows nothing more: the request
+   and a Petal's first proposal ignore it, since no release installs it and
+   waiting for it would never end. A
    policy that has changed since creation is never proposed this way, so
    for it a missing Petal is only named alongside what the policy allows
    or lacks. A persona switch likewise starts only with every chosen Petal
@@ -1114,10 +1125,13 @@ Automated:
   difference that makes a change somebody else's (a package or destination
   added or removed, the lifetime, the wallet, the verifiers) is checked on
   its own. A missing Petal is known by its catalog release and the package
-  Machine last saw installed, with its destinations, and Safe named in a
-  config is ignored. A Petal's use while a chosen Petal is missing proposes
-  nothing and fails with `DEFAULT_POLICY_WAITING`, then proposes the whole
-  setup once it is installed (`crates/bloom/src/default_policy.rs`,
+  Machine last saw installed, with its destinations, and a Petal setup does
+  not offer named in a config, such as Safe, is ignored. A Petal's use while
+  a chosen Petal is missing proposes nothing and fails with
+  `DEFAULT_POLICY_WAITING`, which reaches the agent whole, then proposes the
+  whole setup once it is installed; once the policy has changed, a missing
+  Petal holds nothing up. A failed policy read is reported, never guessed,
+  and a missing Petal allowed only as its last build is named apart (`crates/bloom/src/default_policy.rs`,
   `crates/bloom-daemon/src/lib.rs`, `crates/bloom-vfs/src/handlers/wallets.rs`,
   `crates/bloom-vfs/tests/triad_policy_update.rs`). The command names the
   missing Petals and what to run without calling it skipped; a persona switch starts nothing and records no waiting

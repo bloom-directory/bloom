@@ -220,6 +220,19 @@ pub const DEFAULT_POLICY_WALLET: &str = "main";
 /// say Safe is allowed while every use of it is refused.
 pub const PETALS_NOT_IN_SETUP: &[&str] = &["safe"];
 
+/// Petals setup offers, in the order `bloom init` installs them: Bloom's
+/// catalog Petals except [`PETALS_NOT_IN_SETUP`]. Only these are proposed or
+/// waited for. A config naming any other Petal, as only a hand edit or a
+/// Petal since dropped from the catalog can, allows nothing more, since no
+/// release installs it and waiting for it would never end.
+pub const SETUP_PETALS: &[&str] = &[
+    "polymarket",
+    "hyperliquid",
+    "enso",
+    "near-intents",
+    "feedback",
+];
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PetalSetupConfig {
     /// Named values substituted into the catalog's settings template.
