@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
 
 use bloom_broker_api::{
@@ -45,8 +45,6 @@ struct BrokerFixture {
     unavailable_after_commit: AtomicBool,
     prepare_refusal_once: Mutex<Option<ProtocolErrorCode>>,
     ceremony_state_override: parking_lot::Mutex<Option<CeremonyState>>,
-    ceremony_expires_at_ms: AtomicU64,
-    signed_before_cancel: AtomicBool,
     requests: parking_lot::Mutex<Vec<MachineBrokerRequest>>,
     state: parking_lot::Mutex<FixtureState>,
     baseline: SignedPolicySnapshot,
@@ -218,26 +216,13 @@ impl MachineBrokerService for BrokerFixture {
                             ceremony_kind: CeremonyKind::PolicyUpdate,
                             operation_id: OperationId::new(request.id.as_str().to_owned()).unwrap(),
                             state,
-                            expires_at_ms: DecimalU64::new(
-                                self.ceremony_expires_at_ms.load(Ordering::SeqCst),
-                            ),
+                            expires_at_ms: DecimalU64::new(u64::MAX),
                             ceremony_url: (state == CeremonyState::AwaitingUser).then(|| {
                                 "http://localhost:18734/ceremony/policy-test-secret".into()
                             }),
                             receipt_digest: (state == CeremonyState::Succeeded)
                                 .then(|| Digest32::from_bytes([8; 32])),
                         },
-                    ))
-                }
-                MachineBrokerRequest::CeremonyCancel(_)
-                    if self.signed_before_cancel.load(Ordering::SeqCst) =>
-                {
-                    // Broker's cancel first asks Signer for the outcome; one
-                    // the owner signed is committed and refuses cancellation.
-                    *self.ceremony_state_override.lock() = Some(CeremonyState::WalletCommitted);
-                    Err(ProtocolError::new(
-                        ProtocolErrorCode::OperationIdConflict,
-                        "ceremony is past the point where it can be cancelled",
                     ))
                 }
                 MachineBrokerRequest::CeremonyCancel(request) => {
@@ -325,8 +310,6 @@ fn broker_fixture(lose_prepare_response_once: bool) -> Arc<BrokerFixture> {
         unavailable_after_commit: AtomicBool::new(false),
         prepare_refusal_once: Mutex::new(None),
         ceremony_state_override: parking_lot::Mutex::new(None),
-        ceremony_expires_at_ms: AtomicU64::new(u64::MAX),
-        signed_before_cancel: AtomicBool::new(false),
         requests: parking_lot::Mutex::new(Vec::new()),
         state: parking_lot::Mutex::new(FixtureState {
             operation_id: None,
@@ -1191,8 +1174,8 @@ async fn expired_petal_policy_approval_is_replaced_on_retry() {
         panic!("owner approval must be required");
     };
 
-    // Broker still reports the unapproved ceremony as awaiting after expiry.
-    fixture.ceremony_expires_at_ms.store(1, Ordering::SeqCst);
+    // Broker's status sweep retired the unsigned ceremony at its expiry.
+    *fixture.ceremony_state_override.lock() = Some(CeremonyState::Expired);
     let PetalEligibility::AwaitingPolicyApproval(replacement) = handler
         .ensure_petal_eligibility("alice", &hash)
         .await
@@ -1203,11 +1186,6 @@ async fn expired_petal_policy_approval_is_replaced_on_retry() {
     assert_ne!(replacement.operation_id, first.operation_id);
     assert!(replacement.prepare.is_some());
     assert_eq!(prepare_count(&fixture), 2);
-    assert!(fixture.requests.lock().iter().any(|request| matches!(
-        request,
-        MachineBrokerRequest::CeremonyCancel(cancel)
-            if cancel.id.as_str() == first.operation_id.as_str()
-    )));
     let updates = temp
         .path()
         .join("machine-policy-projections/alice/policy-updates");
@@ -1220,9 +1198,6 @@ async fn expired_petal_policy_approval_is_replaced_on_retry() {
 
     // The replacement is usable: once approved, the retry commits it.
     *fixture.ceremony_state_override.lock() = None;
-    fixture
-        .ceremony_expires_at_ms
-        .store(u64::MAX, Ordering::SeqCst);
     fixture.complete.store(true, Ordering::SeqCst);
     let PetalEligibility::Allowed(snapshot) = handler
         .ensure_petal_eligibility("alice", &hash)
@@ -1239,52 +1214,6 @@ async fn expired_petal_policy_approval_is_replaced_on_retry() {
         updates
             .join("confirmed")
             .join(replacement.operation_id.as_str())
-            .exists()
-    );
-}
-
-#[tokio::test]
-async fn ceremony_signed_after_expiry_is_resumed_not_replaced() {
-    let temp = tempfile::tempdir().unwrap();
-    let fixture = broker_fixture(false);
-    let hash = Digest32::from_bytes([7; 32]);
-    let handler = eligibility_handler(temp.path(), fixture.clone());
-    let PetalEligibility::AwaitingPolicyApproval(first) = handler
-        .ensure_petal_eligibility("alice", &hash)
-        .await
-        .unwrap()
-    else {
-        panic!("owner approval must be required");
-    };
-
-    // Past its expiry, but the owner signed before Broker swept it.
-    fixture.ceremony_expires_at_ms.store(1, Ordering::SeqCst);
-    fixture.signed_before_cancel.store(true, Ordering::SeqCst);
-    let PetalEligibility::AwaitingPolicyApproval(pending) = handler
-        .ensure_petal_eligibility("alice", &hash)
-        .await
-        .unwrap()
-    else {
-        panic!("a signed ceremony must stay pending until it completes");
-    };
-    assert_eq!(pending.operation_id, first.operation_id);
-    assert_eq!(prepare_count(&fixture), 1);
-
-    // When Broker reports it succeeded, the retry commits that same change.
-    *fixture.ceremony_state_override.lock() = None;
-    fixture.complete.store(true, Ordering::SeqCst);
-    assert!(matches!(
-        handler
-            .ensure_petal_eligibility("alice", &hash)
-            .await
-            .unwrap(),
-        PetalEligibility::Allowed(_)
-    ));
-    assert_eq!(prepare_count(&fixture), 1);
-    assert!(
-        temp.path()
-            .join("machine-policy-projections/alice/policy-updates/confirmed")
-            .join(first.operation_id.as_str())
             .exists()
     );
 }

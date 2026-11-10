@@ -1933,39 +1933,14 @@ impl WalletsHandler {
                 .join(APPROVAL_CHALLENGE_FILE);
             let projection: TriadPolicyUpdateProjection = read_json(&path)?;
             let proposed_bytes = projection.retained_policy_bytes()?;
-            let mut resumed = self
+            match self
                 .resume_wallet_policy_update(wallet, &operation_id, &proposed_bytes)
-                .await;
-            // Broker reports an unapproved ceremony as awaiting the owner
-            // after its expiry until asked to act on it. Cancelling makes
-            // Broker check Signer first: a ceremony the owner already signed
-            // refuses cancellation and is resumed below, never replaced.
-            if matches!(resumed, Err(HandlerError::PermissionDenied))
-                && read_json::<TriadPolicyUpdateProjection>(&path)?
-                    .ceremony_expires_at_ms
-                    .is_some_and(|expires_at_ms| expires_at_ms.get() <= now_ms_u64())
+                .await
             {
-                if let Err(error) = broker.cancel_ceremony(projection.operation_id).await {
-                    tracing::warn!(wallet, operation_id, %error, "expired policy ceremony was not cancelled");
-                }
-                resumed = self
-                    .resume_wallet_policy_update(wallet, &operation_id, &proposed_bytes)
-                    .await;
-            }
-            match resumed {
                 Ok(()) => continue,
                 Err(HandlerError::PermissionDenied) => {
                     let projection: TriadPolicyUpdateProjection = read_json(&path)?;
                     return projection.pending_view(package_hash);
-                }
-                // A cancelled, expired or failed ceremony moved out of
-                // `pending`; propose again from the current policy.
-                Err(_)
-                    if !self
-                        .policy_update_action_dir(wallet, "pending", &operation_id)
-                        .is_dir() =>
-                {
-                    continue;
                 }
                 Err(error) => return Err(error),
             }
@@ -2254,10 +2229,8 @@ impl WalletsHandler {
                     "pending",
                     "failed",
                 )?;
-                Err(HandlerError::invalid(format!(
-                    "Broker policy ceremony is terminal: {:?}",
-                    status.state
-                )))
+                // Retired without committing; the caller proposes again.
+                Ok(())
             }
             bloom_broker_api::CeremonyState::Completed => Err(HandlerError::backend(
                 "policy_update ceremony reported the wallet-registration-only COMPLETED state",
