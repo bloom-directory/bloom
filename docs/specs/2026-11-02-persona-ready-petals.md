@@ -479,14 +479,84 @@ petal::route_file!(spec: petal::store_read_spec().caps(&["bloom:sign.status"]),
     });
 ```
 
-#### Macro decision: none
+#### Shared preparation and signing surface (2026-11-10 implementation contract)
 
-Do not add a macro. `route_file!` already generates the route. After
-`approval_read`, each `approval.json` body is three to four lines. A macro
-would save about two lines in each of six files. It would also need
-`petal-builder`'s `required_caps` parser, which reads quoted capabilities from
-the `route_file!` spec, to learn a second macro, or it would hide the
-`bloom:sign.status` capability from that check. Phase 2 adds no macro.
+The first Phase 2 implementation still duplicated load/state/renew/check glue in
+Petals. Complete that extraction in the existing SDK, Polymarket, Gasless and
+Hyperliquid PRs. This is a small runtime helper and thin expression macro, not a
+new route framework. Keep `route_file!` and its explicit capability declarations.
+
+SDK exports `PrepareMode::{Resume, ExistingOnly, RenewTerminal, RefreshZeroSpend}`,
+`prepare`, `prepare_and_sign`, and `prepared_sign!`. The functions take a mutable
+`SigningHost`, wallet, existing scope, mode, a lazy builder returning
+`(PreparedAction, C)`, and a validator of the frozen `Attempt<C>` returning
+`Result<(), SigningError>`. `prepare` returns the validated attempt;
+`prepare_and_sign` returns `(Attempt<C>, Vec<u8>)`. Both expose `SignHalt` errors.
+`prepared_sign!` is a thin named-argument expression forwarding to
+`prepare_and_sign`; it does not generate routes, capabilities or storage keys.
+Do not add another action DSL or persistence model.
+
+- Resume loads or creates once. ExistingOnly refuses a missing record without
+  building, writing or signing. Neither performs a status lookup just to sign.
+- RenewTerminal replaces only a Machine-confirmed Expired/Cancelled attempt.
+  RefreshZeroSpend additionally permits the existing explicit Signed/PackageChanged
+  `Spend::None` refresh rule. Both delegate renewal to `Attempt::renew` so its
+  concurrency and generation checks remain authoritative. No pending, approved,
+  denied, ambiguous or unknown attempt is replaced. A status error fails closed.
+- The builder is lazy: do not rebuild an existing attempt unless renewal is
+  explicitly allowed. Validate the actual persisted winner (including a concurrent
+  creator/renewal winner) before returning it or calling sign. Validator failure
+  cannot cause signing or further renewal. Creation may already have persisted
+  the record; do not imply a transaction spanning store and validation.
+- The validator retains protocol checks and, for callers preparing candidate
+  inputs outside the helper, compares those inputs with the frozen action/context.
+  A changed payload is not silently signed as the old action.
+  `Attempt::check_action(&PreparedAction)` supplies the common full-action
+  equality check with a Conflict error; protocol field checks remain local.
+  Avoid adding a separate configurable comparison framework.
+- The common macro calls `sign_or_resume` exactly once after preparation; keep
+  its outcome/error mapping and signature replay semantics. `prepare` supports
+  flows that must durably freeze an attempt before writing submission state.
+- Preserve existing scopes, record schema, operation keys and generation limit.
+  Polymarket's explicit zero-spend login cycle rollover remains Petal-owned;
+  Hyperliquid's legacy-pending-without-attempt guard remains fail-closed. Do not
+  migrate L1 Hyperliquid signing, change economic declarations, or change Broker
+  or Signer behavior in this delivery.
+
+Migrate common prepared signing paths in all three Petals onto these entry
+points. Use the macro where preparation and signing are contiguous; use `prepare`
+where a protocol state write must intervene. Retain protocol-specific validation,
+nonce handling, signature recovery, legacy recovery and venue submission phases.
+Read-only approval routes continue using `approval_read`. Do not introduce scans
+of old attempts or hide protocol recovery inside the SDK.
+
+Acceptance: SDK tests cover lazy retry, existing-only missing records, frozen
+candidate mismatch, validation of a concurrent winner, terminal renewal,
+zero-spend-only refresh, and no rotation for pending/approved/denied/ambiguous
+states or lookup errors. Assert no signing on validation failure. Consumer tests
+must preserve pending/retry identity, replay, crash/legacy guards and protocol
+signature checks. Run relevant native tests and compile/package affected routes;
+update exact SDK pins and Machine fixture integration. Report production-line
+changes separately from tests and protocol code; reduction must remove real
+local control flow, not just relocate it into another Petal file. No new PRs.
+
+The shipped shared-preparation completion pins Machine and all three consumers
+to SDK `66ac2b675aac7ea4f67ccf3b45c1d346b1f0ef37`. The existing compiled
+`prepared-attempt` fixture now exercises `prepared_sign!`; Machine CI derives
+its fixture checkout directly from the full contract dependency pin.
+
+Against the preceding consumer implementations, Hyperliquid production source
+changes by +26/-21 lines (net +5), removing the local load/open/check branch while
+adding frozen-request validation and preserving freeze-before-submission ordering.
+Polymarket changed production modules grow from 1,887 to 1,893 nonblank
+lines (net +6), because frozen-action validators and error-code preservation
+offset the removed local lifecycle branches: `load` calls fall from 2 to 0,
+`open` from 4 to 2, `state` from 4 to 1 and `renew` from 3 to 0.
+Gasless production source changes by +9/-10 lines (net -1); its new mismatch
+regression adds 31 test lines, separately. SDK production source grows by 82 lines
+for the shared preparation helpers and macro. These modest changes do not
+establish the earlier aggregate size targets. Protocol construction, nonce and
+signature checks and venue submission remain local.
 
 #### Renewal, concurrency and crashes
 
@@ -739,8 +809,9 @@ Bloom can run, and it was approved for this delivery.
 - One small SDK module of free functions and SDK-owned types:
   `eip712_action`, `erc20_spend`, `Attempt` (create-only generation records
   with frozen Petal context), `sign_or_resume`, `AttemptState`, and
-  `approval_read`. There is no workflow engine, no persisted phase cache and
-  no macro.
+  `approval_read`, and the shared preparation helpers above. A thin
+  `prepared_sign!` expression wraps the common path; there is no workflow
+  engine or persisted phase cache.
 - Machine stays the only outcome authority. Petals own their context and
   their post-signing venue phases.
 - A new operation key requires Machine to report the previous one terminal,
@@ -765,10 +836,11 @@ Bloom can run, and it was approved for this delivery.
 - Operators upgrade Petals only with no spending attempts in flight. Continuing
   across a package upgrade is deferred.
 
-#### Phase 2 implementation measurements
+#### Historical initial Phase 2 implementation measurements
 
-The implementation keeps readable explicit calls rather than adding another
-workflow abstraction to meet line-count targets. On the initial Phase 2
+The initial implementation used explicit calls and left preparation glue at
+consumer call sites. The shared preparation completion above supersedes that
+choice. On the initial Phase 2
 consumer commits, Polymarket `approval.rs` falls from 257 to 40 nonblank
 production lines (the remainder is review-intent storage and owner signature
 verification); production `route/src` falls by 331 lines. Its five prepared
