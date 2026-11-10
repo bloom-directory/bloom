@@ -96,7 +96,7 @@ you choose, every transaction still needs your approval.
 |---|---|---|---|
 | Institutional (default) | 30 days | No: recipients must be listed in the policy | 100 pUSD |
 | Trader | Until revoked | No: recipients must be listed in the policy | 1,000 pUSD |
-| Degen | Until revoked | Yes, for Bloom's reviewed tokens on Ethereum and Polygon | 10,000 pUSD |
+| Degen | Until revoked | Yes, any token on Ethereum and Polygon | 10,000 pUSD |
 
 `bloom init` asks for `main`'s persona and Petals (`bloom init --persona
 degen` chooses without asking), and Bloom installs its catalog Petals when it

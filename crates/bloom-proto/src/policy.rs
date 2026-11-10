@@ -9,54 +9,14 @@ use serde::{Deserialize, Serialize};
 
 /// Wallet policy opt-in, listed as `{"chain": "evm-<chain id>", "destination":
 /// ERC20_ANY_RECIPIENT}`, that lets Machine stage the native wallet's canonical
-/// ERC-20 transfer of a token in [`ANY_RECIPIENT_TOKENS`] to any recipient on
-/// that chain. The Degen persona proposes it. It is the same
-/// string as `bloom_broker_api::ERC20_ANY_RECIPIENT` in
-/// bloom-broker#112, whose reviewed sessions also honour it. A Broker without
-/// that change keeps it as a literal string, which matches no address.
-/// Machine never treats it as an address or a general wildcard.
+/// transfer of any ERC-20 token to any recipient on that chain. The Degen
+/// persona proposes it. The owner still approves each transfer, on a page
+/// that names its recipient. It is the same string as
+/// `bloom_broker_api::ERC20_ANY_RECIPIENT` in bloom-broker#112, whose reviewed
+/// sessions also honour it, for the tokens the owner approves in the session.
+/// A Broker without that change keeps it as a literal string, which matches no
+/// address. Machine never treats it as an address or a general wildcard.
 pub const ERC20_ANY_RECIPIENT: &str = "erc20:any-recipient";
-
-/// The ERC-20 tokens [`ERC20_ANY_RECIPIENT`] covers, by chain id: the majors
-/// Bloom curated (USDC, USDT, WETH and DAI, plus WBTC on Ethereum only).
-/// Review, not implementation shape, is the criterion — several of these are
-/// upgradeable proxies, including every USDC. They stand in until Petals
-/// declare the tokens they use (Default Wallet Policy decision 20). Broker's
-/// shared list (`bloom_broker_api::known_tokens`), which Machine resolves
-/// symbols from, is far longer; it is not used here because any contract can
-/// answer `decimals()` and run its own code under the `transfer` selector, so
-/// only a token reviewed for this counts as a standard transfer.
-pub const ANY_RECIPIENT_TOKENS: &[(u64, &str)] = &[
-    (1, "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
-    (1, "0xdac17f958d2ee523a2206206994597c13d831ec7"),
-    (1, "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"),
-    (1, "0x6b175474e89094c44da98b954eedeac495271d0f"),
-    (1, "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599"),
-    (8453, "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
-    (8453, "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2"),
-    (8453, "0x4200000000000000000000000000000000000006"),
-    (8453, "0x50c5725949a6f0c72e6c4a641f24049a917db0cb"),
-    (10, "0x0b2c639c533813f4aa9d7837caf62653d097ff85"),
-    (10, "0x94b008aa00579c1307b0ef2c499ad98a8ce58e58"),
-    (10, "0x4200000000000000000000000000000000000006"),
-    (10, "0xda10009cbd5d07dd0cecc66161fc93d7c9000da1"),
-    (42161, "0xaf88d065e77c8cc2239327c5edb3a432268e5831"),
-    (42161, "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9"),
-    (42161, "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"),
-    (42161, "0xda10009cbd5d07dd0cecc66161fc93d7c9000da1"),
-    (137, "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"),
-    (137, "0xc2132d05d31c914a87c6611c10748aeb04b58e8f"),
-    (137, "0x7ceb23fd6bc0add59e62ac25578270cff1b9f619"),
-    (137, "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063"),
-];
-
-/// Whether `address` on `chain_id` is in [`ANY_RECIPIENT_TOKENS`], compared
-/// case-insensitively.
-pub fn is_any_recipient_token(chain_id: u64, address: &str) -> bool {
-    ANY_RECIPIENT_TOKENS
-        .iter()
-        .any(|(chain, token)| *chain == chain_id && token.eq_ignore_ascii_case(address))
-}
 
 /// The maximum approval lifetime a Trader or Degen wallet policy asks for, so
 /// bloom#377's reusable permissions can last until revoked. The same value as

@@ -3987,7 +3987,7 @@ fn saved_default_policy_setup(
     default_policy_setup(store, config.setup.wallet(wallet), &persona_destinations)
 }
 
-/// The chain ids on which Degen allows curated ERC-20 transfers to any
+/// The chain ids on which Degen allows ERC-20 transfers to any
 /// recipient: Ethereum and Polygon, the EVM networks Broker's reviewed
 /// sessions support (bloom-broker#112).
 pub const ANY_RECIPIENT_CHAIN_IDS: [u64; 2] = [1, 137];
@@ -4003,7 +4003,7 @@ pub fn any_recipient_chains(
         .collect()
 }
 
-/// The configured chains on which `wallet`'s saved persona allows curated
+/// The configured chains on which `wallet`'s saved persona allows
 /// ERC-20 transfers to any recipient: [`any_recipient_chains`] for Degen, and
 /// none for any other persona.
 pub fn persona_any_recipient_chains<'a>(config: &'a Config, wallet: &str) -> Vec<&'a ChainSpec> {

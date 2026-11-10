@@ -156,10 +156,10 @@ fn persona_behaviour(preset: PersonaPreset, any_recipient_chains: &[String]) -> 
             format!("suggests larger Petal limits and lets {PERSONA_STANDING}")
         }
         PersonaPreset::Degen if any_recipient_chains.is_empty() => format!(
-            "suggests the largest Petal limits and lets {PERSONA_STANDING}; it would allow curated ERC-20 transfers to any recipient on Ethereum or Polygon, but neither is configured"
+            "suggests the largest Petal limits and lets {PERSONA_STANDING}; it would allow ERC-20 transfers to any recipient on Ethereum or Polygon, but neither is configured"
         ),
         PersonaPreset::Degen => format!(
-            "suggests the largest Petal limits, lets {PERSONA_STANDING}, and asks the wallet's policy to allow curated ERC-20 transfers to any recipient on {}",
+            "suggests the largest Petal limits, lets {PERSONA_STANDING}, and asks the wallet's policy to allow ERC-20 transfers to any recipient on {}",
             any_recipient_chains.join(" and ")
         ),
     }

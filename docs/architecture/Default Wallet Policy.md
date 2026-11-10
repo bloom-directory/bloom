@@ -202,16 +202,11 @@ Agreed on 2026-09-14:
       name, such as `ethereum`, opts in to nothing. It is required like a
       chosen Petal's destinations, and is the only addition here that does not
       come from a Petal. Machine then stages the wallet's own canonical
-      ERC-20 transfer of a token in Bloom's curated policy list
-      (`bloom_proto::policy::ANY_RECIPIENT_TOKENS`) to any recipient on those
-      chains. That list stands in until Petals declare their tokens
-      (decision 20). It covers chains 1, 10, 137, 8453 and 42161, so an
-      owner-written entry works the same way on the other three, such as
-      `evm-8453` for Base, although bloom-broker#112's sessions cover only
-      chains 1, 137 and 31337. Only the
-      exact-transaction path uses it, never a Petal, and a token outside the
-      list still needs its recipient listed, because any contract can answer
-      `decimals()` and run its own code under the `transfer` selector. A
+      transfer of any ERC-20 token to any recipient on those chains
+      (decision 20). An owner-written entry works the same way on any other
+      EVM chain, such as `evm-8453` for Base, although bloom-broker#112's
+      sessions cover only chains 1, 137 and 31337. Only the
+      exact-transaction path uses it, never a Petal. A
       Petal cannot pass its transfer off as the wallet's own: Bloom refuses a
       Petal's VFS write to a wallet's `outbox/new.tx`, so a Petal stages only
       with its own staging call, which records it as the origin. Broker
@@ -310,16 +305,15 @@ Agreed on 2026-11-03 with the author of bloom#352 and bloom#377:
     asks (Hyperliquid's asks for one day). The pinned Broker's ceremony shows
     the lifetime as a very large number of hours; bloom-broker#112 shows it
     as until revoked.
-20. **Degen's tokens are the ERC-20s its Petals declare.** Degen's
-    any-recipient rule covers only ERC-20s that the wallet's Petals declare.
-    The owner can still list specific recipients, such as their own external
-    wallet. How a Petal declares its tokens, in its package or per
-    transaction as petal#52 does, is still open; until it is settled,
-    Bloom's curated policy list (`bloom_proto::policy::ANY_RECIPIENT_TOKENS`)
-    stands in. It is deliberately not Broker's much longer shared list, which
-    Machine resolves symbols from: any contract can answer `decimals()` and run
-    its own code under the `transfer` selector, so only a token reviewed for
-    this counts as a standard transfer.
+20. **Degen can send any token.** Degen's any-recipient rule covers the
+    wallet's own canonical `transfer(recipient, amount)` of any ERC-20
+    contract, with no value attached; Machine keeps no list of tokens. A
+    contract can run its own code under the `transfer` selector, so the
+    owner's approval is what bounds it: each exact transfer is approved on a
+    page that decodes it and names the recipient (decision 21), and
+    bloom-broker#112's recurring sessions cover only the tokens the owner
+    approves in the session, up to their limits. The owner can still list
+    specific recipients, such as their own external wallet, for any persona.
 21. **The owner always sees the recipient.** Degen's entry needs a Broker
     that decodes an ERC-20 transfer and shows its recipient
     (bloom-broker#103). The pinned Broker, `b6c27339` at Machine–Broker 1.8,
@@ -917,7 +911,7 @@ owner signs.
   are two exceptions, both pinned in Bloom's source and neither an address:
   a `petal:<name>` entry (decision 14), which names the Petal, and Degen's
   `erc20:any-recipient` (decision 15). The second lifts Machine's recipient
-  check for the wallet's own curated ERC-20 transfers. Broker checks no
+  check for the wallet's own ERC-20 transfers, of any token. Broker checks no
   destination on that exact EVM approval, which carries no claim, so the
   owner's approval of each transfer is the only recipient check. The pinned
   Broker's approval page decodes the transfer and names the recipient
@@ -1161,8 +1155,8 @@ Automated:
   `bloom wallet persona`.
 - Each persona's menu choice, `--persona` and Polymarket suggestion; Degen's
   entry on configured chains and for the wallet it was chosen for; an
-  unusable saved persona set aside; staging that passes only the wallet's own curated ERC-20
-  transfer with the entry; and the planner honouring, and the leftover
+  unusable saved persona set aside; staging that passes only the wallet's own ERC-20
+  transfer, of any token, with the entry; and the planner honouring, and the leftover
   report counting, the entry only under `evm-<chain id>`.
 
 Manual, on the developer triad:
