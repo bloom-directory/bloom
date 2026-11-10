@@ -5485,8 +5485,8 @@ async fn outbox_entry_line(tree: &dyn Handler, entry: &str) -> String {
 }
 
 /// Lists each wallet's pending outbox entries and policy updates by walking
-/// the `wallets/` routes an agent would list. Prints the all-clear only when
-/// every route was read in time.
+/// the `wallets/` routes an agent would list. A listing can omit an entry it
+/// cannot read, so the empty case reports what was listed, not an all-clear.
 async fn render_pending_actions(
     tree: &dyn Handler,
     wallets: &[String],
@@ -5497,9 +5497,25 @@ async fn render_pending_actions(
         for wallet in wallets {
             let updates = format!("{wallet}/policy-updates/pending");
             for id in wallet_dirs(tree, &updates, &mut unreadable).await {
-                policy.push(format!(
-                    "- `wallets/{updates}/{id}/`: awaits the owner's approval. Read its `status.json`.\n"
-                ));
+                // Reading `status.json` reconciles a cancelled, expired or
+                // failed ceremony out of `pending/`.
+                let read = match VfsPath::parse(&format!("{updates}/{id}/status.json")) {
+                    Ok(path) => tree.read(&path).await,
+                    Err(error) => Err(HandlerError::invalid(error.to_string())),
+                };
+                match read.map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes)) {
+                    Ok(Ok(status)) if status["state"] != "pending" => {}
+                    Ok(Ok(_)) => policy.push(format!(
+                        "- `wallets/{updates}/{id}/`: awaits the owner's approval. Read its `status.json`.\n"
+                    )),
+                    Ok(Err(error)) => unreadable.push(format!(
+                        "- `wallets/{updates}/{id}/status.json` could not be parsed: {error}\n"
+                    )),
+                    Err(HandlerError::NotFound(_)) => {}
+                    Err(error) => unreadable.push(format!(
+                        "- `wallets/{updates}/{id}/status.json` could not be read: {error}\n"
+                    )),
+                }
             }
             for account in wallet_dirs(tree, wallet, &mut unreadable).await {
                 if account.parse::<u32>().is_err() {
@@ -5532,7 +5548,7 @@ async fn render_pending_actions(
         }
     }
     if md.is_empty() {
-        md.push_str("Nothing pending: no outbox entry or policy update awaits review.\n");
+        md.push_str("No outbox entry or policy update is listed as pending.\n");
     }
     md
 }
@@ -6296,13 +6312,27 @@ mod tests {
                 ("alice", vec!["0", "policy-updates"]),
                 ("alice/0/chains", vec!["base", "ethereum"]),
                 ("alice/0/chains/base/outbox/pending", vec!["tx-staged", "tx-approval"]),
-                ("alice/policy-updates/pending", vec!["policy-update-1"]),
+                (
+                    "alice/policy-updates/pending",
+                    vec!["policy-update-1", "policy-update-expired"],
+                ),
             ]
             .into(),
-            files: [(
+            files: [
+                (
+                    "alice/policy-updates/pending/policy-update-1/status.json",
+                    r#"{"state":"pending"}"#,
+                ),
+                // Its status read reconciled the expired ceremony out of pending.
+                (
+                    "alice/policy-updates/pending/policy-update-expired/status.json",
+                    r#"{"state":"failed"}"#,
+                ),
+                (
                 "alice/0/chains/base/outbox/pending/tx-approval/approval_challenge.json",
                 r#"{"state":"awaiting_ceremony","next":"Give ceremony_url to the owner.","ceremony_url":"http://127.0.0.1:18734/c#secret","retry_path":"wallets/alice/0/chains/base/outbox/pending/tx-approval/confirm"}"#,
-            )]
+                ),
+            ]
             .into(),
             broken: None,
         }
@@ -6325,11 +6355,15 @@ mod tests {
             md.contains("`wallets/alice/policy-updates/pending/policy-update-1/`"),
             "{md}"
         );
+        assert!(!md.contains("policy-update-expired"), "{md}");
         assert!(
             !md.contains("secret"),
             "the ceremony URL stays in the challenge file: {md}"
         );
-        assert!(!md.contains("Nothing pending"), "{md}");
+        assert!(
+            !md.contains("No outbox entry or policy update is listed as pending"),
+            "{md}"
+        );
     }
 
     #[tokio::test]
@@ -6340,7 +6374,7 @@ mod tests {
         assert!(
             render_pending_actions(&tree, &["alice".into()], Duration::from_secs(5))
                 .await
-                .contains("Nothing pending")
+                .contains("No outbox entry or policy update is listed as pending")
         );
 
         tree.broken = Some("alice/0/chains/ethereum/outbox/pending");
@@ -6350,7 +6384,10 @@ mod tests {
             md.contains("`wallets/alice/0/chains/ethereum/outbox/pending/` could not be read: "),
             "{md}"
         );
-        assert!(!md.contains("Nothing pending"), "{md}");
+        assert!(
+            !md.contains("No outbox entry or policy update is listed as pending"),
+            "{md}"
+        );
     }
 
     #[tokio::test]
@@ -6395,7 +6432,7 @@ mod tests {
         assert!(
             String::from_utf8(rendered)
                 .unwrap()
-                .contains("Nothing pending")
+                .contains("No outbox entry or policy update is listed as pending")
         );
     }
 
