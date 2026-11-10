@@ -1,66 +1,142 @@
 # Working with Bloom
 
-This file is the operating contract for agents using the mounted Bloom virtual
-filesystem. It is not a development guide. Treat the directory containing this
-file as the VFS root and keep all paths mount-relative.
+This is the operating contract for agents using the mounted Bloom virtual
+filesystem. Treat the directory containing this file as the VFS root and keep
+all paths mount-relative. Keep scratch files outside the mount.
 
-## Start with discovery
+`ls` the mount and read `next.md` (actions needing attention). Read on demand:
+`cat docs/README.md` lists every route, `docs/examples.md` has command
+walkthroughs (including contract deploys and local Anvil), `docs/wallets.md` covers accounts, wallet creation, recovery,
+passkeys and sessions, and `docs/petals.md` lists installed Petals. Read a
+Petal's `README.md` and `AGENTS.md` before using its routes.
 
-Do not assume a wallet, chain, Petal, or action exists. Inspect the live mount:
+## Funds and missing details
 
-```sh
-ls
-cat next.md
-cat docs/README.md
-```
+`wallets/<wallet>/<n>/holdings.json` lists an account's non-zero native and
+major token balances on every configured chain, and names any chain it could
+not read under `errors`. Read any other token at
+`chains/<chain>/addresses/<address>/tokens/<token>/`. On Solana it shows SOL
+only.
 
-`next.md` summarizes actions needing attention. Read the relevant walkthrough
-in `docs/examples.md` before using an unfamiliar write surface. For Petal work,
-use `docs/petals.md` to discover installed packages, then read that package's
-`README.md` and `AGENTS.md` before using its routes.
+Infer what Bloom state settles; ask only for what it cannot:
 
-To find where an account's funds are, read
-`wallets/<wallet>/<n>/holdings.json`. It lists the account's non-zero native
-and major token balances (USDC, USDT, DAI, WETH, WBTC and their common
-variants) on every configured chain. Anything it could not read is named
-under `errors` for that chain; the rows it did read are still listed. Read
-any other token at `chains/<chain>/addresses/<address>/tokens/<token>/`. On
-Solana chains it shows SOL only, not SPL tokens.
-
-## When the request leaves something out
-
-Infer what Bloom state settles, and ask only for what it cannot:
-
-- If there is only one wallet or account, use it.
+- With one wallet or account, use it.
 - A read that names no chain covers every chain: read `holdings.json`.
 - For a write, use the only chain where `holdings.json` shows the asset, or
   the network the Petal's documentation names as its default. If two or more
   funded chains remain, ask one question that names them.
-- If `holdings.json` lists an `errors` entry for a chain that could hold the
+- If `holdings.json` has an `errors` entry for a chain that could hold the
   asset, say so rather than treating that chain as empty.
-
-Report a failed or partially completed action as a failure, never as done.
 
 ## Authority and safety
 
-Machine exposes this VFS; Broker controls approval ceremonies and policy;
-Signer holds Bloom wallet keys and signs. Secret ceremony input belongs only
-in the Broker-hosted browser flow, never a VFS write, shell argument,
-environment variable, fixture, or log. Forward the ceremony URL to the human
-who controls the passkey.
+Machine exposes this VFS, Broker runs approval ceremonies and policy, and
+Signer holds the keys. Secret input (mnemonics, recovery secrets, passkeys)
+belongs only in the Broker-hosted browser page, never in a VFS write, shell
+argument, environment variable or log. Give the human the complete ceremony
+URL, including any `#` fragment, with host and port unchanged. Launch URLs are
+owner capabilities: keep them out of logs and Petal-visible data.
 
-Classify reads before using them:
+Every write is an operation: it may stage work, start a ceremony, spend
+reusable authority or broadcast. Read the result before retrying.
 
-- Projection and metadata reads are local public state.
-- Chain, balance, ENS, price, and status reads may contact configured services.
-  They do not authorize or broadcast a transaction, but can fail, consume
-  provider quota, or disclose the queried public identifier to that provider.
-- Petal reads follow the installed package's documentation, declared
-  capabilities, and network policy. Do not assume they are local or free.
+## Accounts
 
-Treat every write as an operation. Writes may stage work, begin a ceremony,
-consume reusable authority, or broadcast after authorization. Read the target
-directory and inspect the resulting projection before retrying or continuing.
+`wallets/<wallet>/accounts.json` lists the wallet's accounts; each entry's
+`number` is its derivation index, and `wallets/<wallet>/<n>/` is that account.
+Never select an account by list position or address alias. Stage through the
+numbered path (`wallets/<wallet>/<n>/chains/<chain>/outbox/new.tx`, using `0`
+explicitly for the first account); it fixes the sender to that account's key.
+Keep every follow-up, including Petal routes and outbox confirmations, in the
+same account.
+
+Writing a petname to `wallets/new` requests asynchronous passkey registration;
+it does not create a local wallet. Follow
+`wallets/registrations/<petname>/status.json`. Details are in
+`docs/wallets.md`.
+
+## The transaction loop
+
+For native transfers and Petal actions that project into the outbox:
+
+1. Stage once: write the body to `outbox/new.tx` (formats in
+   `docs/examples.md`) or to a Petal's `new` (its README).
+2. Identify the new entry in `pending/` by its `intent.json` and `plan.md`,
+   never by wildcard, sequence number, `latest` or position.
+3. Write `confirm` to that entry's `confirm` file.
+4. A denied confirm usually means owner approval: read the entry's
+   `approval_challenge.json`, check its wallet, action, intent and expiry, and
+   give its `ceremony_url` to the human. Poll the challenge; when `state` is
+   `active`, write its exact `retry_body` (`confirm` when omitted) to its
+   `retry_path`. The approval does not broadcast on its own. For `expired`,
+   `cancelled` or `refused`, tell the human.
+5. Read `sent/<id>/` or `failed/<id>/` before reporting the result.
+
+Do not restage while an approval is pending, or because a pending path
+disappeared: list `sent/` and `failed/` first. `confirm.override` is only for
+when the policy projection permits it and the human accepted its warning.
+
+To discard an entry never sent for signing, write `cancel` to its `confirm`
+file. On EVM the entry's own `cancel` file instead signs a same-nonce
+replacement and needs its own approval. If a signature may exist, even with
+no hash recorded, Bloom keeps the entry and its `last_error.json` says how to
+reconcile it. Never delete a signing record or reuse a nonce to force a fresh
+attempt. A `failed/` entry with `signing_unknown.json` may still be signed (an older
+Bloom released it): follow its `next` before staging that payment again.
+
+On Solana, reconcile an ambiguous send by its signature. A `sent` entry with
+`unresolved.md` and no receipt is not proof of failure: show the owner its
+signature and restage only if they confirm it did not land.
+
+## What an error means
+
+An error alone does not show whether an earlier operation completed.
+
+- **No such file or directory**: the path is absent now. An entry that left
+  `pending/` moved to `sent/` or `failed/`.
+- **Permission denied**: on a confirm, read `approval_challenge.json`.
+  Read-only targets also deny.
+- **Operation not permitted**: policy or a safety check refused it. Read
+  `policy_check.json`; repeating does not help.
+- **"signing outcome unknown; it may already be signed"**: retry the identical
+  request (same bytes, same operation id). Never rebuild it under a new id or
+  rebroadcast until the first attempt is known not to have landed.
+- **Input/output error**: on an outbox confirm, read the entry's
+  `last_error.json`. `kind: policy_approval_required` means the owner must
+  first allow that Petal through the ceremony link in `error`.
+
+A refused Petal write leaves its reason in `petals/<name>/last_error.json`.
+Check its `path` and `at_ms` match your write; no record means no
+information, not success. A Petal write denied with no ceremony link: report
+the route and error rather than reinstalling, switching accounts or dropping
+fields.
+
+## What the owner sees when approving
+
+The approval page shows Broker's review of the signing request: action,
+account, amounts, recipient and limits. Generic Petal amounts are declared by
+the installed package; Broker does not independently decode their economic effects. Before forwarding the link, tell the
+human in a sentence what you asked for, so they can cancel if the page shows
+something else. Name an unknown token only by its address and raw units,
+never a guessed ticker. Point out **No output protection**, **Spending limit:
+Unlimited**, or **Contract call Bloom cannot read** if shown. An approval
+proves what was signed, not that an order filled or funds arrived; report
+outcomes from receipts and the Petal's status files.
+
+## Policy, approvals and paid requests
+
+Replacing `wallets/<wallet>/policy.json` starts a Broker ceremony. Keep the
+exact same proposed bytes through `policy.validate_update`, approval and the
+`policy.commit_update` retry, then read
+`policy-updates/confirmed/<action_id>/status.json`. See
+`docs/examples.md`.
+
+Reusable authority is under `wallets/<wallet>/sealed-approvals/`. A Petal can
+use it but cannot create, broaden, renew or revoke it.
+
+Paid HTTP requests under `requests/` are actions: inspect the plan, payment
+protocol, maximum amount and wallet before confirming. A timeout does not
+prove non-payment; read the receipt, and never restage an unresolved payment.
 
 ## Persona sessions
 
@@ -106,408 +182,6 @@ authority for a replacement signature. Reconcile the original operation first;
 forward any required fresh ceremony to the owner. Recovering a completed
 signature after revocation authorizes no new action.
 
-## What an error means
-
-Use the error class to decide what to inspect. An error alone does not establish
-whether an earlier operation completed or whether retrying a write is safe.
-When a Petal route refuses a write under `petals/<name>/`, its reason is kept
-in `petals/<name>/last_error.json`; read it and fix the request rather than
-repeating it. The record names the `path` it describes and the `at_ms` it was
-written: a write the mount rejects before the route runs records nothing, so an
-older record left by a different attempt can still be there. Check both fields
-against the write you just made, and treat no record as no information — never
-as a write that succeeded.
-
-- **No such file or directory** — the path is absent in the requested state.
-  A discarded transfer or one that advanced out of `pending/` no longer has its
-  old pending path. Check the exact action's resulting state; absence alone
-  does not prove your write succeeded. Do not repeat an operation merely to
-  make the old path reappear.
-- **Permission denied** — access was denied. On a confirm operation this can
-  mean fresh owner approval is required; look for `approval_challenge.json` in
-  the same action directory. Read-only or unsupported write targets can also
-  deny access, so do not assume every denial starts a ceremony.
-- **Operation not permitted** — policy or a transaction safety check refused the
-  operation. Inspect `policy_check.json` where exposed and the chain's status.
-  Repeating the write does not remove the gate.
-- **"signing outcome unknown; it may already be signed"** — a signing request
-  failed in a way that does not prove no signature exists. Retry the identical
-  request (same bytes, same operation id) to reconcile it; never rebuild the
-  operation under a new identifier, and never rebroadcast, until the earlier
-  attempt is confirmed not to have landed.
-- **Invalid argument** — the target rejected what you wrote.
-- **Input/output error** — a backend or I/O operation failed. Inspect action
-  state and diagnostics before considering a retry. On an EVM outbox confirm,
-  read `last_error.json` beside the pending entry: it gives the refusal and the
-  next step. `kind: policy_approval_required` means the wallet policy must
-  first allow the Petal that staged the transaction; give the owner the
-  ceremony link in `error`, then confirm again once they approve. For a
-  possibly submitted transaction, reconcile by its recorded hash or signature;
-  never blindly restage or rebroadcast.
-
-Machine's Petal HTTP transport errors omit URL userinfo, paths and queries,
-which can contain credentials. Petals may still return upstream response bodies.
-A policy denial is one of:
-
-- `net.fetch requires https`;
-- `net.fetch disallows non-default https port <port>`;
-- `<METHOD> <host>: not allowed by effective network policy (check manifest and invocation grant)`.
-  Both `[[net.allow]]` and the invocation's runtime grant must permit the request.
-
-Transport errors read `http_fetch <send|body>: <METHOD> <host>: <cause>`, where
-the cause is the underlying DNS, connect, TLS or timeout error.
-
-If you write to a control file and then cannot find what you wrote, check
-whether the transfer moved to `sent/` or `failed/` before assuming the write
-was lost. Listing the wallet's outbox states is cheaper than re-issuing the
-write, and re-issuing a broadened version of it is how a correct action becomes
-an incorrect one.
-
-## Reporting Bloom problems
-
-If the Feedback Petal is installed, read `petals/feedback/README.md` for its
-submission format and receipt paths. You may proactively submit one concise,
-sanitized report for a distinct Bloom failure, misleading documentation, or
-missing capability that blocked the task, unless the user has disabled
-reporting. Mention a submitted report briefly when relevant; do not report
-every retry or successful operation.
-
-Write a minimal description and reproduction with placeholders. Never attach
-logs, transcripts, credentials, raw configuration, identifying local paths,
-wallet addresses, balances, transaction details, or other private user content
-automatically. Include contact details only when supplied for feedback. If the
-problem cannot be described without sensitive material, omit that material or
-ask before including it. Installation and discovery do not send feedback.
-
-Submit using `petals/feedback/submit.json`, then inspect
-`petals/feedback/receipts/<submission_id>.json`. A timeout has an unknown
-outcome: retry the same submission ID and payload rather than generating a new
-report. A received receipt confirms storage, not staff review or resolution.
-
-## Wallet and account identity
-
-Read `wallets/<wallet>/projection.json` and `accounts.json` to select the
-wallet and account. Account-sensitive operations bind the public-key
-fingerprint and derivation path. Never select by directory order, list
-position, or an address alias.
-
-`wallets/<wallet>/accounts.json` is the authenticated Broker projection of a
-BIP-39 wallet's public derived accounts. It includes public fingerprints,
-derivation paths, lifecycle state, supported suites, and chain projections; it
-never contains a mnemonic, seed, passphrase, PRF output, or private child key.
-Do not choose the first account in this list. Choose the numbered account path
-for the intended sender, including explicit account `0` when it is intended.
-
-Each entry in `accounts.json` carries a `number`, and `wallets/<wallet>/<n>/`
-is that account: `account.json` shows its EVM and Solana keys (path, address,
-fingerprint, lifecycle), and `wallets/<wallet>/<n>/chains/<chain>/...` is that
-account's chain view. A number is the derivation path itself (EVM
-`m/44'/60'/0'/0/<n>`, Solana `m/44'/501'/<n>'/0'`), so it is stable across
-restarts and reorderings. A single-key wallet is account 0.
-Outbox entries under an account are only the ones its key staged; another
-account's entry is not found there. Staging works through the numbered path
-(`wallets/<wallet>/<n>/chains/<chain>/outbox/new.tx`), which fixes the sender
-to that account's key; a body fingerprint naming another account is an error.
-Use `wallets/<wallet>/0/chains/...` explicitly to stage from account 0.
-
-Mnemonic import is an owner custody ceremony, not a mounted agent write. V1
-accepts the standard mnemonic and exposes no passphrase input;
-passphrase-protected mnemonics are unsupported. BIP-39 registration and import
-create the canonical EVM and Solana account-number-zero children together.
-
-To create another account number, write `{"request_id":"<id>"}` to
-`wallets/<wallet>/new`. The ceremony creates both the EVM and Solana keys under
-the one number Signer chooses. Reusing the same request ID resumes or returns
-that same account creation. Reading `new` reports `failed`, `expired`, or
-`cancelled` when a ceremony terminates unsuccessfully. That result remains
-attached to its request ID; write a new request ID to start another ceremony.
-
-### Account keys and sessions
-
-The files that name one key live only beneath a numbered account:
-`wallets/<wallet>/<n>/address.evm` (EVM checksummed) and
-`address.sol`, each with `.qr.svg` and `.qr.png` variants when that family is
-present, plus `public_key` for the display key. The wallet directory itself
-has no account key files; read `wallets/<wallet>/0/address.evm` for the
-canonical initial EVM account.
-
-Every key a Petal derived from one of an account's family keys is mounted at
-`wallets/<wallet>/<n>/sessions/<petal>/<key-slot>/session.json`. It reports
-the delegating owner key, the delegated key and addresses, the scope (routes,
-operation classes, suites, lifetime), the recorded approvals, and the truthful
-`signing_authority`: `pending`, `active`, `stopped`, `expired`, or
-`package_replaced` (the installed package no longer matches the scope's
-hash; `routes_known` is false then). Writing to the sibling `stop` file
-revokes the session's approvals through the Broker; it is idempotent, works
-after the Petal is uninstalled, and after it succeeds only Exact-selector
-signing for the scope's remaining operation classes may still be available
-(`eligible_exact_routes` lists those routes). Replacing or removing an
-installed package that still has active or unresolved pending sessions is refused with their mounted
-paths unless the owner passes `--force` to `petal install` or
-`petal uninstall` — the stranded sessions then read `package_replaced`, and
-their `stop` still revokes them.
-
-Session `expires_at_ms` is the expiry of the approval terms accepted by Broker,
-not the time the Petal last polled. Old records without that expiry report null
-and remain guarded until stopped or forcibly removed. Durable signing retries
-are bound to the full selected key, so accounts using the same route keep
-separate approval identities.
-
-A selected account's chains are listed at `wallets/<wallet>/<n>/chains` and
-include configured chains for the families with Broker-projected addresses —
-for account 0, use `ls wallets/<wallet>/0/chains`. Solana chains use the
-`wallets/<wallet>/<n>/chains/<chain>/outbox/...` route family described below
-(stage at `outbox/new.tx`, confirm/cancel under `outbox/pending/<id>/`,
-inspect `outbox/{pending,sent,failed}/<id>/`) — there is no separate
-Solana-specific surface to look for.
-
-Broadcasting is available on every configured EVM and Solana chain. Devnet and
-local validators are opt-in. The default `solana-mainnet` configuration includes
-the mainnet genesis pin; Solana transaction submission requires a valid pinned
-genesis. Wallet policy and the approval ceremony apply. Discover networks with
-`ls wallets/<wallet>/0/chains`.
-
-### Reading Solana balances
-
-Choose the intended Solana entry in `wallets/<wallet>/accounts.json` by its
-full fingerprint and derivation path, then use that entry's `number` as `<n>`.
-The number comes from the derivation path, not the entry's position in the list.
-Verify the same key in `wallets/<wallet>/<n>/account.json` before acting.
-
-```sh
-cat wallets/<wallet>/accounts.json
-cat wallets/<wallet>/<n>/account.json
-ls  wallets/<wallet>/<n>/chains/
-cat wallets/<wallet>/<n>/chains/<solana-chain>/address
-cat wallets/<wallet>/<n>/chains/<solana-chain>/balance
-```
-
-`address`, `balance`, `balance.raw` and `balance.json` live directly under the
-selected account's chain directory. Use `<n> = 0` only when the intended
-key belongs to account 0; Bloom never substitutes another account.
-
-A body `account_fingerprint` in `new.tx` may be a unique prefix, but it must
-name the path's own account. Transfers from account `n` belong on
-`wallets/<wallet>/<n>/chains/<chain>/outbox/new.tx`; a fingerprint naming another
-account is rejected. Fingerprints identify keys, not path segments.
-
-Listing accounts, stat-ing any leaf, and reading `address` need only Bloom's
-own projection, so they keep working when a Solana node is unreachable. Only
-`balance*` contacts the chain. If a balance read fails but `address` still
-works, inspect chain health and RPC errors before retrying.
-
-Chain health lives once per chain, not per wallet:
-
-```sh
-cat status/chains/<solana-chain>/status.json   # health, slot, genesis, broadcast posture
-cat status/chains/<solana-chain>/connected
-```
-
-`status.json` still renders when calls fail — the failed fields are `null`
-and `errors` says why. `broadcast.eligible` means an attempt is *permitted*
-(genesis verified on every endpoint); it does not promise
-a transaction will land.
-
-## Creating a wallet
-
-Writing a petname to `wallets/new` requests asynchronous passkey registration;
-it does not create a local wallet. Read
-`wallets/registrations/<petname>/status.json`, verify `requested_name`, and
-forward `ceremony_url` to the human. Wait for `ceremony_state: COMPLETED`,
-then read `result.json` and the new wallet projection. Cancel through that
-registration's `cancel` control before acceptance. Do not start a second
-registration merely because the first is waiting. Commands are in the
-wallet-creation walkthrough in `docs/examples.md`.
-
-Pass the complete Broker URL to the human, including any `#` fragment. Do not
-rewrite its hostname, scheme, or port. A localhost ceremony needs a browser on
-the Bloom host; an assigned HTTPS relay ceremony can use another device. Launch
-URLs are owner access capabilities: keep them out of logs and Petal-visible data.
-
-To recover a wallet after losing its passkeys, write only its name to
-`wallets/recover`. This starts an authenticated Broker ceremony without
-needing the wallet in Machine's cached inventory. Read
-`wallets/recoveries/<petname>/status.json`, verify `requested_name`, and
-forward the complete `ceremony_url` to the human. The recovery ID and secret,
-and the replacement passkey, belong only in the Broker-hosted Browser page;
-never place them in a VFS write, shell argument, or log. A spent one-use URL
-disappears from status while the operation remains readable and cancellable.
-After `SUCCEEDED`, read `result.json`. Recovery replaces the wallet's
-passkeys rather than adding one: the replacement becomes the wallet's only
-active passkey, and every other passkey, on any device, is revoked. Tell the
-human that their other devices can no longer approve until they add passkeys
-again (see "Adding a passkey"); `result.json` lists the active credential. A
-cancelled or expired operation can be started again with a fresh write to
-`wallets/recover`.
-
-## Check passkeys before hosted approvals
-
-A localhost passkey cannot approve on the hosted relay domain, even in the same
-browser. Before a hosted signing or policy ceremony, check `status/ceremonies.json`
-and the wallet's `passkeys/` entries (`surface` and `state`). Relay readiness does
-not mean the wallet has an active remote passkey.
-
-If the wallet has only local passkeys, explain that hosted approvals require a
-remote passkey. With the human's agreement, refer to the "Adding a passkey"
-flow below to add a remote passkey to their existing wallet.
-
-Wait for enrollment `SUCCEEDED`, verify the remote passkey is active, then resume
-the original operation with its unchanged proposal or intent.
-
-## Adding a passkey
-
-`wallets/<wallet>/passkeys/` lists the wallet's passkeys, one directory each,
-named `<created date>-<surface>-<digest>` (a 12-hex digest; a name never
-changes once listed). Each holds `surface` (`local` for
-this host's browser, `remote` for the relay), `created`, `state`,
-`credential_id`, and `name`.
-
-To add a passkey on another device, such as a phone, write the new passkey's
-surface to `new` and follow `latest`. Use `remote` unless the human asks for
-this host's browser: a remote passkey works from any device through the relay,
-while `local` only works in a browser on this host. An empty write picks
-`remote` when the relay is available and `local` otherwise.
-
-```sh
-echo remote > wallets/<wallet>/passkeys/new
-cat wallets/<wallet>/passkeys/latest/url      # forward the complete link to the human
-cat wallets/<wallet>/passkeys/latest/status   # awaiting_user, then a final state
-```
-
-Tell the human to open the link on the new device. That page gives them an
-approval link and a six-digit code: they open the approval link on a device
-that already has a passkey for the wallet (the page can share or copy it),
-check that both pages show the same code, and approve there. Bloom chooses
-which existing passkey approves: one on the new passkey's own surface when the
-wallet has it, otherwise one on the other surface. You do not choose it.
-
-When `status` stops being `awaiting_user`, tell the human what happened:
-
-- `succeeded` — the new passkey is enrolled. Name it as described below.
-- `already_registered` — nothing was added, and nothing is wrong. The new
-  device's passkey provider already holds one of this wallet's passkeys,
-  usually because passkeys sync between the human's devices (for example
-  iCloud Keychain, Google Password Manager or 1Password) or because that
-  device was registered earlier. Tell the human that device can already
-  approve for the wallet and nothing else is needed. Do not retry: another
-  attempt from that device ends the same way.
-- `cancelled` or `expired` — nothing changed. Start again with a fresh write
-  to `new` only if the human still wants the passkey.
-- `failed` — nothing changed. Offer to start again with a fresh write to
-  `new`.
-
-If the write to `new` fails with *Operation not permitted*, the wallet has no
-active passkey that could approve an addition on any usable surface, for
-example when all of its passkeys are remote and the relay is unavailable.
-Repeating the write does not help. Tell the human, and check `passkeys/` and
-the relay status.
-
-The relay status is `/status/ceremonies.json`. If its `stage` is
-`credentials_expired`, the computer was offline longer than the relay's
-renewal grace and remote approvals stay paused until the owner acts:
-`/status/ceremonies-repair.json` then holds a `repair` with a `summary` and
-the exact `command` to give the human (it needs `sudo` on this computer and
-keeps the same hostname). Localhost approvals still work. Do not retry remote
-ceremonies until the stage changes.
-
-The link is single-use: it disappears once opened, while `status` stays
-readable. Write to `latest/cancel` to abandon an enrollment. Every enrollment
-stays under `enrollments/<operation>/`. Writing `new` again while one to the
-same surface is still waiting reuses it.
-
-After enrollment succeeds, ask the human what to call the new passkey and
-write it to that passkey's `name`; `by-name/<name>` then links to it. Names
-are Machine-only labels for telling passkeys apart. They are never shown on
-ceremony pages and carry no authority, so do not use a name to decide which
-passkey approves anything.
-
-## The transaction loop
-
-Use this loop for native Machine transaction surfaces and for Petal actions that
-project into the central outbox:
-
-1. Discover the exact wallet, chain, account, and route.
-2. Stage once through the documented `new` or `new.tx` write target.
-3. List the resulting pending directory and identify the exact new action by
-   reading its `intent.json`, `plan.md`, and simulation or policy projections.
-4. Never use a wildcard, sequence number, `latest`, or list position as action
-   identity.
-5. Confirm only the exact inspected action.
-6. If approval is required, validate the challenge and hand its ceremony URL to
-   the human.
-7. After the ceremony completes, write the challenge's `retry_body` to its
-   exact `retry_path`. An omitted `retry_body` means `confirm`; serialize an
-   object as JSON. Keep a fee-repair body unchanged through approval and retry.
-8. Read the sent, failed, or receipt projection before reporting success.
-
-A confirm write may return permission denied while projecting
-`approval_challenge.json` beside the pending entry, on EVM and Solana chains
-alike. Verify the challenge's wallet, action, intent, and expiry before
-presenting its ceremony URL. This is a waiting state, not a reason to restage.
-`plan_path` and `retry_path` name the outbox the confirm was written through
-(`wallets/<wallet>/<n>/chains/...`, including `n = 0` for account 0).
-
-Reading the challenge asks Bloom for the approval's current state, so poll it
-while the human approves. `state` is `awaiting_ceremony` until they finish,
-then `active`, and `next` says what to do. As soon as `state` is `active`,
-write the exact `retry_body` to `retry_path`; the approval does not broadcast
-on its own.
-Retrying `retry_path` before then is also safe: it starts no new ceremony and
-returns permission denied again. Once the ceremony can no longer be used,
-`ceremony_url` is withdrawn. For `expired`, `cancelled` or `refused`, tell the
-human rather than retrying on your own.
-
-`bloom wallet confirm` exits 3 when owner approval is pending and 4 when
-confirmation has no recorded result yet. Exit 0 reports a recorded broadcast
-or a completed local discard. Use `--text cancel` to discard a pending entry
-that was never sent for signing; through the mount, write `cancel` to the
-entry's `confirm` file. This works for Petal-staged entries too. Writing the
-entry's own `cancel` file returns permission denied and records nothing,
-because that control signs a new same-nonce transaction. "Never broadcast" or
-an `active` approval does not prove an entry is unsigned: if a signature may
-exist, even with no hash recorded yet, Bloom keeps the entry and its
-`last_error.json` says how to reconcile it; an expired entry stays pending for
-the same reason. Discard is also refused while another operation is active. An
-unreadable signing record is not proof that nothing signed: preserve it,
-inspect Broker operation status and the chain nonce, and restore the record
-from backup before retrying. Never delete it to force a fresh attempt. A
-`failed/` entry with `signing_unknown.json` was released by an older Bloom
-although it may be signed: follow its `next` before staging that payment
-again or reusing its nonce; Petal outbox inspection reports it as
-`signing_unknown`, not `failed`. An already broadcast transaction needs `bloom
-wallet cancel` and its own approval. Dropping a reservation does not renumber
-later rows: restage with an explicit nonce to fill a gap.
-
-`confirm.override` is not a general escape hatch. Use it only when the
-inspected policy projection explicitly permits that control and the human has
-explicitly accepted the displayed warning.
-
-For Solana, check the account fingerprint, derivation path, and fee payer in
-`intent.json`; account identity remains there after submission. Correlate the
-signature in `broadcast_attempted.json` with `receipt.json` and inspect the
-outcome and confirmation status. Receipts have no account fingerprint and
-private signing sidecars are not mounted. Genesis checks must pass before
-broadcast; ambiguous sends reconcile by signature, never blind retry or
-endpoint failover. A `sent` entry with `unresolved.md` and no receipt is one
-no RPC reports after its blockhash expired; that does not prove it failed. Show
-the owner its signature to check in an explorer, and stage a new transfer only
-if they confirm it did not land. See the Solana walkthrough in
-`docs/examples.md`.
-
-## Sealed Approvals
-
-Reusable authority is Broker-owned and projected under:
-
-```text
-wallets/<wallet>/sealed-approvals/
-```
-
-Read the active approval, scope, limits, expiry, and remaining capacity before
-relying on it. A Petal may request use of a Sealed Approval, but it cannot mint,
-broaden, renew, or revoke authority itself. If fresh approval is required, use
-the central action's `approval_challenge.json` and `retry_path`; do not
-invent a Petal-local approval flow.
-
 An owner-approved persona session can cover selected native transfers and
 certified Petal actions for exact EVM/SVM accounts. Each Petal/account has an
 independent allowance per exact asset; its reviewed routes share that allowance.
@@ -522,151 +196,10 @@ ordinary owner approval. Retry the same staged action after approval; never
 restage an uncertain signature to obtain new capacity or bypass a stopped
 permission.
 
-For a native Solana transfer, the challenge is projected beside the pending
-wallet transfer instead:
+## Reporting Bloom problems
 
-```sh
-cat wallets/<wallet>/0/chains/<solana-chain>/outbox/pending/<id>/approval_challenge.json
-printf 'confirm\n' > wallets/<wallet>/0/chains/<solana-chain>/outbox/pending/<id>/confirm
-```
-
-Use the challenge's `retry_path` verbatim after the owner completes its
-`ceremony_url`; verify `tx_id`, `wallet`, `chain`, amount, destination, and
-`expiry_ms` first. `plan_path` and `retry_path` name the outbox the confirm was
-written through: `wallets/<wallet>/<n>/chains/...`, including `n = 0` for
-account 0.
-
-## Deploying EVM contracts
-
-Build with the project's normal tools. Stage a JSON/TOML intent using
-`kind: "deploy"`, complete hex initcode in `data`, and optional native `value`
-at `wallets/<wallet>/<n>/chains/<chain>/outbox/new.tx`. Append ABI-encoded constructor
-arguments and link libraries before staging; do not supply `to`. Read the
-pending entry's `plan.md` and complete its usual Broker approval flow.
-
-The predicted address depends on sender and nonce. Check the mined
-`sent/<id>/receipt.json` for success and the actual `contract_address`; a
-broadcast hash alone is not a successful deployment. Constructor ownership and
-effects are not verified. Initialization calls are separate transactions with
-their own approvals. The wallet policy must opt into the numeric chain with
-`{"chain":"evm-31337","destination":"exact"}` (replace 31337 as appropriate),
-through the normal policy-update ceremony. This permits contract creation to be
-prepared without a recipient allowlist entry; calls and sends keep their recipient
-restrictions. Every transaction still needs its own exact owner approval.
-
-For Foundry scripts, Hardhat remote accounts, and Ignition, run
-`bloom deploy --wallet <wallet> --chain <chain> rpc`. It prints an ephemeral,
-private submission URL and public sender. After owner review, explicitly run
-`bloom deploy --wallet <wallet> --chain <chain> resume <id>` for the same ID.
-Use `list` and `status <id>` to recover. Do not export signing keys into project
-files or environment variables. See `docs/examples.md` for commands.
-
-## Updating wallet policy
-
-Replacing `wallets/<wallet>/policy.json` starts a Broker ceremony. Prepare
-the complete proposal outside the mount and keep the exact same proposed bytes
-through `policy.validate_update`, human approval, and the
-`policy.commit_update` retry. Inspect the update's status and challenge under
-`policy-updates/latest/` and note its `action_id`. `latest` names only a
-pending update; after the commit, verify the committed policy and read the
-terminal status at `policy-updates/confirmed/<action_id>/status.json` (or
-`failed/<action_id>/`). Editing or reformatting the
-proposal creates a different request. Commands are in the policy-update
-walkthrough in `docs/examples.md`.
-
-## What the owner sees when approving
-
-The approval page shows Broker's own reading of the exact bytes to be signed:
-the action, account, assets and amounts, recipient and any limits it sets.
-Bloom does not take a Petal's description for this. Before forwarding the
-link, tell the human in one or two sentences what you asked for, so they can
-compare, and to cancel if the page shows anything else. Point out these if
-they appear:
-
-- **No output protection**: a swap with no enforced minimum output.
-- **Spending limit: Unlimited**: the spender can take any amount of that
-  token.
-- **Contract call Bloom cannot read**: the page shows exact bytes instead of
-  a reading. Approve only if the human expected exactly that call.
-
-An unknown token is shown by its address and raw units; never name it from a
-ticker you guessed. An approval proves what was signed, not that a quote was
-met, an order filled or funds arrived. Report outcomes from receipts and the
-Petal's status files.
-
-## Petals and paid requests
-
-Petals send Broker the complete transaction or message to sign, bound to the
-account in the route path. If a Petal write fails with a bare "permission
-denied" and no ceremony link, stop and report the route and the error; do not
-reinstall the Petal or retry. Do not work around the refusal by changing
-accounts, removing fields, or switching to a reusable or batch path. When a
-write returns a ceremony link, retry the same request after the owner
-approves.
-
-- **Enso:** same-chain swaps carry an on-chain minimum output, stated in the
-  intent's `plan.md`. Cross-chain swaps report `destination_unverified` after
-  the source transaction succeeds; Bloom does not track the destination.
-- **Polymarket:** `begin` can use a covered zero-spend login permission to
-  create exchange credentials. Under Institutional it requires exact approval.
-  Pending retries retain the original login payload. `continue` sets up the
-  deposit wallet with its own exact approval. Read `status.json` and follow
-  `next_action`; eligible BUY orders may use an active token allowance, while
-  SELL and unsupported actions retain exact review. A persona choice alone
-  activates no authority.
-- **Hyperliquid:** delegated trading sessions sign later actions without a
-  new prompt. The Petal's own session limits are local; the exchange does not
-  enforce them.
-- **Pump:** a refreshed recent blockhash keeps the existing approval; any
-  other change to the transaction needs a new one. Retry through the same Pump
-  operation. The approval permits one signature only. After signing, recover
-  that result and reconcile submission; do not request another signature with
-  a refreshed blockhash while the first transaction may still land.
-- **Venice:** a login approval grants no payment authority, and each later
-  request uses a fresh login proof.
-
-Installed application documents and public routes live under `petals/<name>/`.
-Account-dependent routes explicitly select a wallet and index, for example
-`petals/enso/intents/<wallet>/<index>/new`. Follow each package's route tree;
-there is no common synthetic wallet root. Account state is isolated; explicitly
-declared service settings are shared across accounts. Keep every follow-up in
-the selected account, including core outbox confirmation paths.
-
-Paid HTTP operations live under `requests/`. They are actions, not ordinary
-reads: inspect the request plan, selected payment protocol, maximum amount,
-wallet, and approval projection before confirming. Keep vendor-specific request
-syntax in the relevant Petal or request documentation rather than assuming a
-provider contract from this root guide.
-
-A paid request's confirm and cancel operations are serialized. Once execution
-has started, cancellation cannot undo the payment. A timeout or interrupted
-confirmation does not prove non-payment: inspect the exact request's receipt
-and merchant outcome before taking further action. Before transmission, the
-existing receipt records the full possible charge as unresolved. Unresolved
-charges remain in recorded spending, including after a restart or timeout;
-receiving a response updates the same receipt without counting it twice. Other
-requests can proceed within any remaining budget. Do not repeat an unresolved
-payment by restaging it. A failed merchant retry still counts toward recorded
-spending.
-
-## Local development chains
-
-A local Anvil node is not configured by default. Bloom reads a chain's files
-from its RPC endpoint, so a configured chain whose endpoint is unreachable
-makes every read under that chain's paths wait for the endpoint to fail.
-
-To work against a local Anvil node, ask the operator to add it to the Machine
-configuration (`~/.bloom/config.toml`) and restart Bloom:
-
-```toml
-[chains.anvil]
-name = "anvil"
-chain_id = 31337
-rpc_urls = ["http://127.0.0.1:8545"]
-display_name = "Anvil (local)"
-native_symbol = "ETH"
-native_decimals = 18
-```
-
-Then confirm it with `ls chains/`. Remove the entry when the node is no longer
-running.
+If `petals/feedback/` exists, you may submit one short report for a Bloom
+failure, misleading doc or missing capability that blocked the task, unless
+the user disabled reporting. Never include logs, credentials, addresses,
+balances, transaction details or local paths. Its `README.md` gives the
+format; on a timeout, retry the same submission ID.
