@@ -511,9 +511,22 @@ impl Outbox {
                         if !entry.file_type()?.is_dir() {
                             continue;
                         }
-                        let staged: StagedTx =
-                            serde_json::from_slice(&fs::read(entry.path().join("intent.json"))?)?;
-                        self.reconcile_terminal_action(&staged, state)?;
+                        // An unreadable record is left unrepaired, as the sweep does,
+                        // rather than keeping the whole wallet daemon from starting.
+                        let path = entry.path().join("intent.json");
+                        let staged =
+                            fs::read(&path)
+                                .map_err(|error| error.to_string())
+                                .and_then(|bytes| {
+                                    serde_json::from_slice::<StagedTx>(&bytes)
+                                        .map_err(|error| error.to_string())
+                                });
+                        match staged {
+                            Ok(staged) => self.reconcile_terminal_action(&staged, state)?,
+                            Err(error) => tracing::warn!(
+                                path = %path.display(), %error, "outbox.reconcile_entry_unreadable"
+                            ),
+                        }
                     }
                 }
             }
@@ -2884,6 +2897,31 @@ mod tests {
             assert!(Outbox::new_with_projection(dir.path(), projection.clone()).is_err());
             assert_eq!(fs::read(terminal.dir.join("intent.json")).unwrap(), bytes);
         }
+    }
+
+    /// A missing or malformed terminal intent is skipped, untouched, and does
+    /// not keep the daemon from starting or block repair of other entries.
+    #[test]
+    fn reconciliation_skips_unreadable_terminal_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let projection = Arc::new(MockProjection::new());
+        let outbox = Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
+        let staged = fake_staged("crash");
+        outbox.write_pending(&staged, "plan").unwrap();
+        let pending = outbox.read("alice", "anvil", &staged.id).unwrap();
+        let sent = outbox
+            .state_dir("alice", "anvil", OutboxState::Sent)
+            .unwrap();
+        outbox.create_dir_durable(&sent).unwrap();
+        fs::rename(&pending.dir, sent.join(&staged.id)).unwrap();
+        fs::create_dir(sent.join("missing")).unwrap();
+        fs::create_dir(sent.join("corrupt")).unwrap();
+        fs::write(sent.join("corrupt/intent.json"), "{").unwrap();
+        drop(outbox);
+        Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
+        assert_eq!(projection.transitions.lock().unwrap().len(), 1);
+        assert_eq!(fs::read(sent.join("corrupt/intent.json")).unwrap(), b"{");
+        assert!(!sent.join("missing/intent.json").exists());
     }
 
     #[test]
