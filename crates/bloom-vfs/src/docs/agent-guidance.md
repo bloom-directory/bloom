@@ -72,11 +72,13 @@ For native transfers and Petal actions that project into the outbox:
      `retry_body` (`confirm` when omitted) to its `retry_path`. The approval
      does not broadcast on its own. For `expired`, `cancelled` or `refused`,
      tell the human.
-   - Any other error: read the entry's `policy_check.json` (in
+   - **Input/output error**: read the entry's `policy_check.json` (in
      `failed/<id>/` if it moved). A `deny` outcome is final: if your entry is
      still in `pending/`, write `cancel` to its `confirm` file, then report
      the refusal. A `warn` keeps it pending: show the human the warning and
-     write `confirm` to `confirm.override` only if they accept it.
+     write `confirm` to `confirm.override` only if they accept it. Otherwise
+     read its `last_error.json`: `kind: policy_approval_required` means the
+     owner must first allow that Petal through the ceremony link in `error`.
 5. Read `sent/<id>/` or `failed/<id>/` before reporting the result.
 
 Do not restage while an approval is pending, or because a pending path
@@ -102,15 +104,13 @@ An error alone does not show whether an earlier operation completed.
   `pending/` moved to `sent/` or `failed/`.
 - **Permission denied**: on a confirm, see step 4. Read-only targets also
   deny.
-- **Operation not permitted**: policy or a safety check refused it; on a
-  confirm, see step 4. Do not change policy, switch accounts, remount a
-  read-only route or try another interface to get around it.
+- **Operation not permitted**: policy or a safety check refused it. Do not
+  change policy, switch accounts, remount a read-only route or try another
+  interface to get around it.
 - **"signing outcome unknown; it may already be signed"**: retry the identical
   request (same bytes, same operation id). Never rebuild it under a new id or
   rebroadcast until the first attempt is known not to have landed.
-- **Input/output error**: on an outbox confirm, after step 4, read the
-  entry's `last_error.json`. `kind: policy_approval_required` means the
-  owner must first allow that Petal through the ceremony link in `error`.
+- **Input/output error**: on an outbox confirm, see step 4.
 
 A refused Petal write leaves its reason in `petals/<name>/last_error.json`.
 Check its `path` and `at_ms` match your write; no record means no
