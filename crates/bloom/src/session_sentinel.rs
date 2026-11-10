@@ -501,17 +501,21 @@ mod tests {
             );
         }
         // Nothing may still be served over the socket once the sentinel is
-        // gone. The listener's descriptor is closed before the sentinel task
-        // completes, but a refused connect() is not a synchronous observation
-        // of that close on every platform: macOS keeps resolving the bound
-        // path to the closed listening socket for a few hundred microseconds,
-        // and a connect() inside that window is queued onto the dying socket
-        // and succeeds rather than being refused. That window is what made
-        // this test flaky. So assert what is observable the moment the task
-        // ends on either kind of host: where the connection is refused there
-        // is nothing left to check, and a connection the kernel still hands
-        // out has no sentinel behind it, so it is already at end of file. Only
-        // a retained listener holds one open, and the timeout catches that.
+        // gone. A refused connect() is not a synchronous observation of that.
+        // The listener's descriptor is closed before the sentinel task
+        // completes, yet with the rest of this suite running alongside, a
+        // connect() issued the moment the task ends still succeeded for
+        // 43-570us before the kernel began refusing it -- 8 of 12,000
+        // in-suite runs on Darwin 27.2 -- and that window is what made this
+        // test flaky. Treat it as an observation and not as a property of a
+        // platform: a bare close() of a listening socket refuses at once, and
+        // so does this shutdown reduced to a standalone binary, so the
+        // trigger needs the suite's pressure and is not pinned down. Linux is
+        // unmeasured here. Assert what holds either way: where the connection
+        // is refused there is nothing left to check, and a connection the
+        // kernel still hands out has no sentinel behind it, so it is already
+        // at end of file. Only a retained listener holds one open, and the
+        // timeout catches that.
         if let Ok(mut late) = tokio::net::UnixStream::connect(&socket).await {
             let served =
                 tokio::time::timeout(std::time::Duration::from_secs(1), late.read(&mut [0; 1]))
