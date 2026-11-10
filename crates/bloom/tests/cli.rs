@@ -2617,11 +2617,11 @@ fn wallet_confirm_reports_the_pending_ceremony_url() {
         + 180_000) as u64;
     let mut files = std::collections::HashMap::new();
     files.insert(
-        "/alice/0/chains/base/outbox/pending/0001-cafe/cafe.json".to_string(),
+        "/alice/7/chains/base/outbox/pending/0001-cafe/cafe.json".to_string(),
         Vec::new(),
     );
     files.insert(
-        "/alice/0/chains/base/outbox/pending/0001-cafe/approval_challenge.json".to_string(),
+        "/alice/7/chains/base/outbox/pending/0001-cafe/approval_challenge.json".to_string(),
         format!(
             "{{\"schema\":\"bloom.evm-approval-challenge/1\",\"state\":\"awaiting_ceremony\",\"ceremony_url\":\"http://localhost:18734/c/secret\",\"expiry_ms\":{expires}}}"
         )
@@ -2641,6 +2641,8 @@ fn wallet_confirm_reports_the_pending_ceremony_url() {
             "alice",
             "base",
             "0001-cafe",
+            "--account",
+            "7",
             "--text",
             "y",
         ])
