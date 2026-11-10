@@ -1182,6 +1182,7 @@ async fn default_wallet_first_proposal_allows_setup_packages_together() {
                     packages: vec![chosen.clone()],
                     destinations: vec![setup_destination()],
                     maximum_approval_lifetime_ms: None,
+                    not_installed: Vec::new(),
                 })
             } else {
                 Ok(bloom_vfs::handlers::DefaultPolicySetup::default())
@@ -1363,6 +1364,7 @@ async fn setup_packages_join_only_a_wallets_first_policy_proposal() {
                 packages: vec![chosen.clone()],
                 destinations: vec![setup_destination()],
                 maximum_approval_lifetime_ms: None,
+                not_installed: Vec::new(),
             })
         })
     };
@@ -1410,6 +1412,7 @@ async fn revoking_every_petal_does_not_bring_the_setup_proposal_back() {
             packages: vec![Digest32::from_bytes([8; 32]), Digest32::from_bytes([9; 32])],
             destinations: vec![setup_destination()],
             maximum_approval_lifetime_ms: None,
+            not_installed: Vec::new(),
         })
     });
     let handler =
@@ -1957,6 +1960,7 @@ async fn a_persona_lifetime_goes_into_the_first_proposal() {
     let defaults: bloom_vfs::handlers::DefaultPolicyPackages = Arc::new(move |_wallet: &str| {
         Ok(bloom_vfs::handlers::DefaultPolicySetup {
             maximum_approval_lifetime_ms: Some(standing),
+            not_installed: Vec::new(),
             ..Default::default()
         })
     });
@@ -2239,7 +2243,7 @@ async fn a_reconciled_read_reports_a_waiting_change_and_commits_an_approved_one(
     };
 
     let ReconciledPolicy::Current(current) = handler
-        .reconciled_policy("alice", &chosen, &[], &[], None)
+        .reconciled_policy("alice", &chosen, &Default::default(), &[], None)
         .await
         .unwrap()
     else {
@@ -2259,7 +2263,7 @@ async fn a_reconciled_read_reports_a_waiting_change_and_commits_an_approved_one(
         panic!("the default policy is proposed");
     };
     let ReconciledPolicy::Awaiting { pending, proposed } = handler
-        .reconciled_policy("alice", &chosen, &[], &[], None)
+        .reconciled_policy("alice", &chosen, &Default::default(), &[], None)
         .await
         .unwrap()
     else {
@@ -2274,7 +2278,7 @@ async fn a_reconciled_read_reports_a_waiting_change_and_commits_an_approved_one(
     // The owner approves while nothing polls.
     fixture.complete.store(true, Ordering::SeqCst);
     let ReconciledPolicy::Current(current) = handler
-        .reconciled_policy("alice", &chosen, &[], &[], None)
+        .reconciled_policy("alice", &chosen, &Default::default(), &[], None)
         .await
         .unwrap()
     else {
@@ -2336,7 +2340,7 @@ async fn a_waiting_change_carrying_more_than_the_default_policy_is_not_its_own()
     assert_eq!(pending.operation_id, proposal.operation_id);
     assert!(!pending.includes_requested, "not the default policy");
     let ReconciledPolicy::Awaiting { pending, .. } = handler
-        .reconciled_policy("alice", &chosen, &[], &[], None)
+        .reconciled_policy("alice", &chosen, &Default::default(), &[], None)
         .await
         .unwrap()
     else {
@@ -2362,9 +2366,13 @@ async fn a_waiting_change_carrying_more_than_the_default_policy_is_not_its_own()
         .ensure_petal_packages_allowed("alice", &both, &[], None, AfterPolicyChange::Propose)
         .await
         .unwrap();
-    for (also, own) in [(&[][..], false), (std::slice::from_ref(&missing), true)] {
+    for (packages, own) in [(Vec::new(), false), (vec![missing.clone()], true)] {
+        let also = bloom_vfs::handlers::PolicyExtras {
+            packages,
+            destinations: Vec::new(),
+        };
         let ReconciledPolicy::Awaiting { pending, .. } = handler
-            .reconciled_policy("alice", &chosen, also, &[], None)
+            .reconciled_policy("alice", &chosen, &also, &[], None)
             .await
             .unwrap()
         else {
@@ -2372,4 +2380,120 @@ async fn a_waiting_change_carrying_more_than_the_default_policy_is_not_its_own()
         };
         assert_eq!(pending.includes_requested, own, "{also:?}");
     }
+}
+
+/// While a Petal chosen during setup is not installed, a Petal's use on the
+/// policy wallet creation installed proposes nothing: the first committed
+/// change ends setup's proposals, so approving one then would leave the
+/// missing Petal out for good. Once it is installed, the whole setup is
+/// proposed together.
+#[tokio::test]
+async fn a_petal_use_waits_while_a_chosen_petal_is_missing() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(false);
+    let requested = Digest32::from_bytes([7; 32]);
+    let chosen = Digest32::from_bytes([8; 32]);
+    let missing = Arc::new(parking_lot::Mutex::new(vec!["hyperliquid".to_owned()]));
+    let defaults: bloom_vfs::handlers::DefaultPolicyPackages = {
+        let (chosen, missing) = (chosen.clone(), missing.clone());
+        Arc::new(move |_: &str| {
+            Ok(bloom_vfs::handlers::DefaultPolicySetup {
+                packages: vec![chosen.clone()],
+                destinations: vec![setup_destination()],
+                maximum_approval_lifetime_ms: None,
+                not_installed: missing.lock().clone(),
+            })
+        })
+    };
+    let handler =
+        eligibility_handler(temp.path(), fixture.clone()).with_default_policy_packages(defaults);
+    let Err(HandlerError::Backend(message)) =
+        handler.ensure_petal_eligibility("alice", &requested).await
+    else {
+        panic!("a Petal's use waits for the missing Petal");
+    };
+    assert!(
+        message.starts_with(bloom_vfs::handlers::wallets::DEFAULT_POLICY_WAITING),
+        "{message}"
+    );
+    assert!(message.contains("hyperliquid"), "{message}");
+    assert!(
+        !fixture
+            .requests
+            .lock()
+            .iter()
+            .any(|request| matches!(request, MachineBrokerRequest::PolicyValidateUpdate(_))),
+        "nothing is proposed"
+    );
+
+    missing.lock().clear();
+    let PetalEligibility::AwaitingPolicyApproval(pending) = handler
+        .ensure_petal_eligibility("alice", &requested)
+        .await
+        .unwrap()
+    else {
+        panic!("the whole setup is proposed once every chosen Petal is installed");
+    };
+    assert!(pending.includes_requested);
+    let proposed: CanonicalWalletPolicy =
+        serde_json::from_slice(&fixture.state.lock().proposed_policy.clone().unwrap()).unwrap();
+    assert!(proposed.allowed_petal_packages.contains(&chosen));
+}
+
+/// A default policy proposed while a chosen Petal with destinations was
+/// installed is still the request's own once that Petal is missing, with its
+/// package and destinations named as what it may also add. A destination
+/// nobody named is not.
+#[tokio::test]
+async fn a_missing_petals_destinations_keep_the_default_policy_its_own() {
+    use bloom_vfs::handlers::{PolicyExtras, ReconciledPolicy};
+
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(false);
+    let handler = eligibility_handler(temp.path(), fixture);
+    let installed = [Digest32::from_bytes([7; 32])];
+    let missing = Digest32::from_bytes([8; 32]);
+    let venue = bloom_broker_api::PolicyDestination {
+        chain: Token::new("polygon").unwrap(),
+        destination: "petal:polymarket".into(),
+    };
+    handler
+        .ensure_petal_packages_allowed(
+            "alice",
+            &[installed[0].clone(), missing.clone()],
+            std::slice::from_ref(&venue),
+            None,
+            AfterPolicyChange::Propose,
+        )
+        .await
+        .unwrap();
+    let own = |also: PolicyExtras| {
+        let handler = &handler;
+        let installed = &installed;
+        async move {
+            let ReconciledPolicy::Awaiting { pending, .. } = handler
+                .reconciled_policy("alice", installed, &also, &[], None)
+                .await
+                .unwrap()
+            else {
+                panic!("the default policy waits");
+            };
+            pending.includes_requested
+        }
+    };
+    assert!(
+        own(PolicyExtras {
+            packages: vec![missing.clone()],
+            destinations: vec![venue.clone()],
+        })
+        .await
+    );
+    assert!(
+        !own(PolicyExtras {
+            packages: vec![missing.clone()],
+            destinations: Vec::new(),
+        })
+        .await,
+        "a destination nobody named"
+    );
 }

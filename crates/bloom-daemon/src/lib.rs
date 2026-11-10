@@ -3949,15 +3949,24 @@ fn default_policy_setup(
 ) -> Result<bloom_vfs::handlers::DefaultPolicySetup, bloom_vfs::HandlerError> {
     let mut setup = bloom_vfs::handlers::DefaultPolicySetup {
         maximum_approval_lifetime_ms: persona_policy_lifetime(chosen),
+        not_installed: Vec::new(),
         ..Default::default()
     };
     setup.destinations.extend_from_slice(persona_destinations);
     for name in chosen.petals.keys() {
+        // Setup never offers these, so a config naming one, as only a hand
+        // edit can, allows nothing more.
+        if bloom_proto::config::PETALS_NOT_IN_SETUP.contains(&name.as_str()) {
+            continue;
+        }
         let installed = store.resolve_petal_owner(name).map_err(|error| {
             warn!(petal = %name, %error, "petal.default_policy_owner_unreadable");
             bloom_vfs::HandlerError::backend(format!("read the installed {name} Petal: {error}"))
         })?;
-        let Some(hash) = installed else { continue };
+        let Some(hash) = installed else {
+            setup.not_installed.push(name.clone());
+            continue;
+        };
         let package = bloom_broker_api::Digest32::new(hash).map_err(|error| {
             bloom_vfs::HandlerError::backend(format!(
                 "the installed {name} Petal has an invalid package hash: {error}"
@@ -5337,13 +5346,13 @@ impl Daemon {
     /// `wallet`'s policy once its retained proposals are reconciled, so a
     /// change the owner approved meanwhile commits: the change still waiting
     /// for the owner, or the current policy. The waiting change is this
-    /// request's own only when it adds nothing else, apart from packages in
-    /// `also`. Proposes nothing.
+    /// request's own only when it adds nothing else, apart from what `also`
+    /// names. Proposes nothing.
     pub async fn reconciled_wallet_policy(
         &self,
         wallet: &str,
         packages: &[bloom_broker_api::Digest32],
-        also: &[bloom_broker_api::Digest32],
+        also: &bloom_vfs::handlers::PolicyExtras,
         destinations: &[bloom_broker_api::PolicyDestination],
         lifetime: Option<u64>,
     ) -> Result<bloom_vfs::handlers::ReconciledPolicy, bloom_vfs::HandlerError> {
@@ -6260,12 +6269,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = PetalStore::open(temp.path()).unwrap();
         let mut chosen = bloom_proto::config::WalletSetup::default();
-        for name in ["hyperliquid", "polymarket"] {
+        for name in ["hyperliquid", "polymarket", "safe"] {
             chosen.petals.insert(name.to_owned(), Default::default());
         }
 
         let setup = default_policy_setup(&store, &chosen, &[]).unwrap();
         assert!(setup.packages.is_empty(), "nothing is installed yet");
+        // Missing chosen Petals are named, so a Petal's use waits for them;
+        // Safe, which setup never offers, is ignored though a config names it.
+        assert_eq!(setup.not_installed, ["hyperliquid", "polymarket"]);
 
         std::fs::create_dir_all(temp.path().join("owners")).unwrap();
         std::fs::write(temp.path().join("owners/polymarket.json"), b"not json").unwrap();

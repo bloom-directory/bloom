@@ -124,7 +124,10 @@ ceremony and answers with a new `ceremony_url`. Never give the owner an
 expired URL. If the answer says another policy change is waiting, such as a
 persona switch, its link is for that change, which does not allow the
 operation: Broker opens one ceremony per wallet at a time, so tell the owner
-to approve or refuse it, then retry.
+to approve or refuse it, then retry. `DEFAULT_POLICY_WAITING` means a Petal the
+owner chose during setup is still installing, and the wallet's first policy
+allows every chosen Petal at once: retry once `bloom petals ls` lists it, or
+tell the owner to restart Bloom if it stays missing.
 
 ## What the owner sees when approving
 

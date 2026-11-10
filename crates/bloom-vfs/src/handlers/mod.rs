@@ -35,7 +35,7 @@ pub use simulate::SimulateHandler;
 pub use status::StatusHandler;
 pub use tools::ToolsHandler;
 pub use wallets::{
-    AfterPolicyChange, DefaultPolicyPackages, DefaultPolicySetup, PolicyReplacement,
+    AfterPolicyChange, DefaultPolicyPackages, DefaultPolicySetup, PolicyExtras, PolicyReplacement,
     ProposalOutcome, ReconciledPolicy, WalletsHandler, accounts_json_with_numbers,
     derivation_path_number,
 };

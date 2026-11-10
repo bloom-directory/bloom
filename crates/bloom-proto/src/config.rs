@@ -207,6 +207,19 @@ impl SetupConfig {
 /// Wallet whose default policy allows the Petals chosen during setup.
 pub const DEFAULT_POLICY_WALLET: &str = "main";
 
+/// Canonical Petals setup does not offer, so no persona or default policy
+/// allows them, even when a config names one; the owner allows one with their
+/// own policy change.
+///
+/// Safe signs a Safe transaction's confirmation and stages its execution.
+/// Broker refuses that signature unless the policy allows exact destinations
+/// on its chain, and Machine refuses the execution unless the policy lists the
+/// Safe's address. Neither is a fixed contract setup could propose:
+/// exact destinations would let any staged transaction deploy a contract, and
+/// the Safe is the owner's own. Allowing only its package would let setup
+/// say Safe is allowed while every use of it is refused.
+pub const PETALS_NOT_IN_SETUP: &[&str] = &["safe"];
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PetalSetupConfig {
     /// Named values substituted into the catalog's settings template.
