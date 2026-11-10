@@ -548,9 +548,10 @@ its fixture checkout directly from the full contract dependency pin.
 Against the preceding consumer implementations, Hyperliquid production source
 changes by +26/-21 lines (net +5), removing the local load/open/check branch while
 adding frozen-request validation and preserving freeze-before-submission ordering.
-Polymarket changed production modules grow from 1,887 to 1,893 nonblank
-lines (net +6), because frozen-action validators and error-code preservation
-offset the removed local lifecycle branches: `load` calls fall from 2 to 0,
+Polymarket six changed production modules fall from 2,073 to 2,071 nonblank
+lines (net -2). The five nonprotocol modules fall from 1,887 to 1,872 (-15),
+while the shared protocol constructor adds 13; frozen-action validators and
+error-code preservation offset much of the removed lifecycle branches: `load` calls fall from 2 to 0,
 `open` from 4 to 2, `state` from 4 to 1 and `renew` from 3 to 0.
 Gasless production source changes by +9/-10 lines (net -1); its new mismatch
 regression adds 31 test lines, separately. SDK production source grows by 82 lines
