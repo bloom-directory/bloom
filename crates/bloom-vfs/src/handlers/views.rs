@@ -33,7 +33,7 @@ use bloom_prices::{CoinId, PricesClient};
 use bloom_proto::{AddressBook, checksum_address, parse_address};
 
 use super::outbox::OutboxHandler;
-use crate::handler::{Entry, Handler, HandlerError};
+use crate::handler::{Entry, EntryKind, Handler, HandlerError};
 use crate::path::VfsPath;
 
 const BLOOM_CSS: &str = include_str!("../assets/bloom.css");
@@ -92,9 +92,6 @@ const QUOTE_MAX_AGE_SECS: u64 = 3600;
 /// is the bundled, same-origin one; every page remains useful without it.
 const CSP: &str = "default-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self'; \
                    script-src 'self'; base-uri 'none'; form-action 'none'";
-
-/// Central outbox lifecycle directories, newest concern first.
-const ACTION_STATES: [&str; 3] = ["pending", "sent", "failed"];
 
 #[derive(Clone)]
 pub struct ViewsHandler {
@@ -224,13 +221,14 @@ impl ViewsHandler {
         }
     }
 
-    /// Wallet projections, degrading the way `/next.md` does: live read first,
-    /// then the cache, then an explicit "unavailable" flag. Enumerating
-    /// wallets is navigation, not an authority decision, so it never errors.
+    /// Wallet projections, degrading the way `/wallets` navigation does:
+    /// coalesced live read first, then the cache on availability failure,
+    /// then an explicit "unavailable" flag. Integrity errors never fall back
+    /// to stale cache.
     async fn wallet_projections(&self) -> (Vec<WalletProjection>, bool) {
-        match self.projections.list_wallets().await {
+        match self.projections.list_wallets_navigation().await {
             Ok(wallets) => (wallets, false),
-            Err(error) => {
+            Err(error) if error.code == bloom_broker_api::ProtocolErrorCode::ServiceUnavailable => {
                 tracing::debug!(error = %error, "views.projections_live_unavailable");
                 match self.projections.cached_wallets() {
                     Ok(mut wallets) => {
@@ -244,6 +242,10 @@ impl ViewsHandler {
                         (Vec::new(), true)
                     }
                 }
+            }
+            Err(error) => {
+                tracing::debug!(error = %error, "views.projections_unavailable");
+                (Vec::new(), true)
             }
         }
     }
@@ -335,12 +337,10 @@ impl ViewsHandler {
         portfolio
     }
 
-    /// Run every account's balance reads, `PORTFOLIO_CONCURRENCY` at a time,
-    /// within `PORTFOLIO_BUDGET`. Only that many tasks exist, however many
-    /// accounts were projected. Holdings arrive as each read finishes; the
-    /// caller sorts. An account that has not answered when the budget expires
-    /// has every network it would have read marked unavailable and is counted
-    /// in `accounts_unread`, so totals say they are partial.
+    /// Run every account-network balance read, `PORTFOLIO_CONCURRENCY` at a
+    /// time, within `PORTFOLIO_BUDGET`. Each completed chain read is recorded
+    /// immediately so budget expiry never discards finished work from a
+    /// partially read account.
     async fn read_all_balances(
         &self,
         portfolio: &mut Portfolio,
@@ -348,133 +348,165 @@ impl ViewsHandler {
         evm_chains: &[String],
         solana_chains: &[String],
     ) {
+        let mut reads = Vec::new();
+        for (job_index, job) in jobs.iter().enumerate() {
+            match job {
+                BalanceJob::Evm {
+                    wallet,
+                    account,
+                    address,
+                } => {
+                    let address_text = format!("{address:#x}");
+                    let mut seen_chains = BTreeSet::new();
+                    for chain in evm_chains {
+                        let Some(client) = self.chains.get(chain) else {
+                            continue;
+                        };
+                        if !client.spec().has_native_asset()
+                            || !seen_chains.insert(client.spec().chain_id)
+                        {
+                            continue;
+                        }
+                        reads.push(NetworkRead {
+                            job_index,
+                            wallet: wallet.clone(),
+                            account: account.clone(),
+                            address_text: address_text.clone(),
+                            chain: chain.clone(),
+                            label: self.network_label(chain),
+                            symbol: client.spec().native_symbol.clone(),
+                            kind: NetworkReadKind::Evm {
+                                client,
+                                address: *address,
+                            },
+                        });
+                    }
+                }
+                BalanceJob::Solana {
+                    wallet,
+                    account,
+                    address,
+                } => {
+                    let Some(registry) = &self.solana else {
+                        continue;
+                    };
+                    for chain in solana_chains {
+                        let Some(client) = registry.get(chain) else {
+                            continue;
+                        };
+                        reads.push(NetworkRead {
+                            job_index,
+                            wallet: wallet.clone(),
+                            account: account.clone(),
+                            address_text: address.clone(),
+                            chain: chain.clone(),
+                            label: solana_network_label(chain),
+                            symbol: "SOL".to_owned(),
+                            kind: NetworkReadKind::Solana {
+                                client,
+                                address: address.clone(),
+                            },
+                        });
+                    }
+                }
+            }
+        }
+
         let deadline = tokio::time::Instant::now() + PORTFOLIO_BUDGET;
-        let this = Arc::new(self.clone());
-        let evm: Arc<[String]> = evm_chains.into();
-        let solana: Arc<[String]> = solana_chains.into();
-        let jobs = Arc::new(jobs);
+        let reads = Arc::new(reads);
         let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let permits = Arc::new(tokio::sync::Semaphore::new(PORTFOLIO_CONCURRENCY));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut reads = tokio::task::JoinSet::new();
-        let workers = PORTFOLIO_CONCURRENCY.min(jobs.len());
+        let mut worker_set = tokio::task::JoinSet::new();
+        let workers = PORTFOLIO_CONCURRENCY.min(reads.len());
         for _ in 0..workers {
-            let (this, evm, solana, jobs, next, tx, permits) = (
-                this.clone(),
-                evm.clone(),
-                solana.clone(),
-                jobs.clone(),
-                next.clone(),
-                tx.clone(),
-                permits.clone(),
-            );
-            reads.spawn(async move {
+            let (reads, next, tx) = (reads.clone(), next.clone(), tx.clone());
+            worker_set.spawn(async move {
                 loop {
                     if tokio::time::Instant::now() >= deadline {
                         break;
                     }
                     let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if index >= jobs.len() {
+                    if index >= reads.len() {
                         break;
                     }
-                    let mut read = match &jobs[index] {
-                        BalanceJob::Evm {
-                            wallet,
-                            account,
-                            address,
-                        } => {
-                            let mut read =
-                                this.read_balances(wallet, *address, &evm, &permits).await;
-                            for holding in &mut read.holdings {
-                                holding.account.clone_from(account);
+                    let item = &reads[index];
+                    let outcome = tokio::time::timeout_at(
+                        deadline,
+                        tokio::time::timeout(BALANCE_TIMEOUT, item.fetch()),
+                    )
+                    .await;
+                    match outcome {
+                        Ok(Ok(holding)) => {
+                            if tx.send((index, holding)).is_err() {
+                                break;
                             }
-                            read
                         }
-                        BalanceJob::Solana {
-                            wallet,
-                            account,
-                            address,
-                        } => {
-                            this.read_solana_balances(wallet, account, address, &solana, &permits)
-                                .await
+                        Ok(Err(_)) => {
+                            tracing::debug!(chain = %item.chain, "views.balance_timeout");
+                            if tx.send((index, None)).is_err() {
+                                break;
+                            }
                         }
-                    };
-                    read.cached.sort();
-                    read.cached.dedup();
-                    if tx.send((index, read)).is_err() {
-                        break;
+                        Err(_) => break,
                     }
                 }
             });
         }
         drop(tx);
 
-        let mut answered = vec![false; jobs.len()];
+        let mut completed: Vec<Option<Option<Holding>>> = vec![None; reads.len()];
         loop {
-            let incoming = match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(incoming)) => Some(incoming),
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some((index, holding))) => {
+                    completed[index] = Some(holding);
+                }
                 Ok(None) => break,
                 Err(_) => {
                     tracing::debug!("views.portfolio_budget_expired");
-                    reads.abort_all();
-                    while let Ok(incoming) = rx.try_recv() {
-                        Self::record_balance(portfolio, &mut answered, incoming);
+                    worker_set.abort_all();
+                    while let Ok((index, holding)) = rx.try_recv() {
+                        completed[index] = Some(holding);
                     }
                     break;
                 }
-            };
-            if let Some(incoming) = incoming {
-                Self::record_balance(portfolio, &mut answered, incoming);
             }
         }
-        for (index, job) in jobs.iter().enumerate() {
-            if answered[index] {
-                continue;
-            }
-            let (wallet, account, address, chains) = match job {
-                BalanceJob::Evm {
-                    wallet,
-                    account,
-                    address,
-                } => (wallet, account, format!("{address:#x}"), evm_chains),
-                BalanceJob::Solana {
-                    wallet,
-                    account,
-                    address,
-                } => (wallet, account, address.clone(), solana_chains),
-            };
-            let mut has_unavailable = false;
-            for chain in chains {
-                if let Some(mut holding) = self.cached_balance(wallet, chain, &address) {
-                    holding.account = account.clone();
-                    portfolio.holdings.push(holding);
-                    portfolio
-                        .cached_balances
-                        .push((wallet.clone(), chain.clone()));
-                } else {
-                    has_unavailable = true;
-                    portfolio.unavailable.push((wallet.clone(), chain.clone()));
-                }
-            }
-            portfolio.accounts_unread += usize::from(has_unavailable);
-        }
-    }
 
-    fn record_balance(
-        portfolio: &mut Portfolio,
-        answered: &mut [bool],
-        incoming: (usize, BalanceRead),
-    ) {
-        let (index, read) = incoming;
-        answered[index] = true;
-        portfolio.holdings.extend(read.holdings);
-        portfolio.unavailable.extend(read.unavailable);
-        portfolio.cached_balances.extend(read.cached);
+        let mut unread_jobs = BTreeSet::new();
+        for (index, item) in reads.iter().enumerate() {
+            let finished = completed[index].is_some();
+            if let Some(Some(holding)) = completed[index].take() {
+                self.remember_balance(&item.wallet, &item.chain, &item.address_text, &holding);
+                portfolio.holdings.push(holding);
+            } else if let Some(mut holding) =
+                self.cached_balance(&item.wallet, &item.chain, &item.address_text)
+            {
+                holding.account = item.account.clone();
+                portfolio.holdings.push(holding);
+                portfolio
+                    .cached_balances
+                    .push((item.wallet.clone(), item.chain.clone()));
+            } else {
+                if !finished {
+                    unread_jobs.insert(item.job_index);
+                }
+                portfolio.unavailable.push(UnavailableBalance {
+                    wallet: item.wallet.clone(),
+                    account: item.account.clone(),
+                    chain: item.chain.clone(),
+                    label: item.label.clone(),
+                    symbol: item.symbol.clone(),
+                });
+            }
+        }
+        portfolio.cached_balances.sort();
+        portfolio.cached_balances.dedup();
+        portfolio.accounts_unread = unread_jobs.len();
     }
 
     /// Configured EVM chain names, one per chain id, in name order. This is
-    /// the set `read_balances` reads, so an unread account can name exactly
-    /// the networks it is missing.
+    /// the set `read_all_balances` reads, so an unread account can name
+    /// exactly the networks it is missing.
     fn distinct_evm_chains(&self) -> Vec<String> {
         let mut seen = BTreeSet::new();
         self.sorted_chains()
@@ -509,87 +541,6 @@ impl ViewsHandler {
         None
     }
 
-    /// Native balance on every configured chain for one address. The reads
-    /// run concurrently, so one slow endpoint costs a single budget rather
-    /// than the sum of them.
-    async fn read_balances(
-        &self,
-        owner: &str,
-        address: alloy::primitives::Address,
-        chains: &[String],
-        permits: &Arc<tokio::sync::Semaphore>,
-    ) -> BalanceRead {
-        let mut reads = tokio::task::JoinSet::new();
-        let mut seen_chains = BTreeSet::new();
-        for chain in chains {
-            let Some(client) = self.chains.get(chain) else {
-                continue;
-            };
-            if !client.spec().has_native_asset() || !seen_chains.insert(client.spec().chain_id) {
-                continue;
-            }
-            let name = chain.clone();
-            let permits = permits.clone();
-            reads.spawn(async move {
-                let _permit = permits.acquire().await.expect("semaphore remains open");
-                let symbol = client.spec().native_symbol.clone();
-                let decimals = client.spec().native_decimals;
-                let chain_id = client.spec().chain_id;
-                let raw = match tokio::time::timeout(BALANCE_TIMEOUT, client.balance(address)).await
-                {
-                    Ok(Ok(raw)) => Some(raw),
-                    Ok(Err(error)) => {
-                        tracing::debug!(chain = %name, error = %error, "views.balance_unavailable");
-                        None
-                    }
-                    Err(_) => {
-                        tracing::debug!(chain = %name, "views.balance_timeout");
-                        None
-                    }
-                };
-                (name, raw, symbol, decimals, chain_id)
-            });
-        }
-        let mut read = BalanceRead::default();
-        let address_text = format!("{address:#x}");
-        while let Some(joined) = reads.join_next().await {
-            let Ok((chain, raw, symbol, decimals, chain_id)) = joined else {
-                continue;
-            };
-            match raw {
-                // A zero balance is kept. "You hold nothing on Base" is an
-                // answer; dropping the row leaves the reader unable to tell
-                // it apart from a network that was never read.
-                Some(raw) => {
-                    let quantity = bloom_proto::format_units(raw, decimals);
-                    let amount = quantity.parse::<f64>().unwrap_or(0.0);
-                    let holding = Holding {
-                        label: self.network_label(&chain),
-                        wallet: owner.to_owned(),
-                        chain,
-                        price_key: native_asset_market(chain_id),
-                        account: String::new(),
-                        symbol,
-                        quantity,
-                        amount,
-                        value: None,
-                    };
-                    self.remember_balance(owner, &holding.chain, &address_text, &holding);
-                    read.holdings.push(holding);
-                }
-                None => {
-                    if let Some(holding) = self.cached_balance(owner, &chain, &address_text) {
-                        read.holdings.push(holding);
-                        read.cached.push((owner.to_owned(), chain));
-                    } else {
-                        read.unavailable.push((owner.to_owned(), chain));
-                    }
-                }
-            }
-        }
-        read
-    }
-
     /// Configured Solana chain names, sorted. Empty when no Solana registry
     /// is attached or no Solana chain is configured: Solana rows then simply
     /// do not appear.
@@ -601,89 +552,6 @@ impl ViewsHandler {
             .unwrap_or_default();
         chains.sort();
         chains
-    }
-
-    /// Native SOL balance on every configured Solana chain for one address.
-    /// Lamports become SOL at nine decimals with exact integer math; a zero
-    /// balance is kept for the same reason as on EVM. A test-network chain
-    /// carries no market key, so faucet lamports are never valued as SOL.
-    async fn read_solana_balances(
-        &self,
-        owner: &str,
-        account: &str,
-        address: &str,
-        chains: &[String],
-        permits: &Arc<tokio::sync::Semaphore>,
-    ) -> BalanceRead {
-        let Some(registry) = self.solana.clone() else {
-            return BalanceRead::default();
-        };
-        let mut reads = tokio::task::JoinSet::new();
-        for chain in chains {
-            let Some(client) = registry.get(chain) else {
-                continue;
-            };
-            let name = chain.clone();
-            let address = address.to_owned();
-            let permits = permits.clone();
-            reads.spawn(async move {
-                let _permit = permits.acquire().await.expect("semaphore remains open");
-                let lamports =
-                    match tokio::time::timeout(BALANCE_TIMEOUT, client.get_balance(&address)).await
-                    {
-                        Ok(Ok(lamports)) => Some(lamports),
-                        Ok(Err(error)) => {
-                            tracing::debug!(chain = %name, error = %error, "views.solana_balance_unavailable");
-                            None
-                        }
-                        Err(_) => {
-                            tracing::debug!(chain = %name, "views.solana_balance_timeout");
-                            None
-                        }
-                    };
-                (name, lamports)
-            });
-        }
-        let mut read = BalanceRead::default();
-        while let Some(joined) = reads.join_next().await {
-            let Ok((chain, lamports)) = joined else {
-                continue;
-            };
-            match lamports {
-                Some(raw) => {
-                    let quantity = format!("{}.{:09}", raw / 1_000_000_000, raw % 1_000_000_000);
-                    let amount = quantity.parse::<f64>().unwrap_or(0.0);
-                    // A test network's lamports are faucet funds, never SOL.
-                    let price_key = if is_test_network(&chain) {
-                        None
-                    } else {
-                        Some("coingecko:solana")
-                    };
-                    let holding = Holding {
-                        label: solana_network_label(&chain),
-                        wallet: owner.to_owned(),
-                        chain,
-                        price_key,
-                        account: account.to_owned(),
-                        symbol: "SOL".to_owned(),
-                        quantity,
-                        amount,
-                        value: None,
-                    };
-                    self.remember_balance(owner, &holding.chain, address, &holding);
-                    read.holdings.push(holding);
-                }
-                None => {
-                    if let Some(holding) = self.cached_balance(owner, &chain, address) {
-                        read.holdings.push(holding);
-                        read.cached.push((owner.to_owned(), chain));
-                    } else {
-                        read.unavailable.push((owner.to_owned(), chain));
-                    }
-                }
-            }
-        }
-        read
     }
 
     /// Value what can be valued. A native asset is priced only on a chain
@@ -699,36 +567,56 @@ impl ViewsHandler {
             .collect();
         keys.sort_unstable();
         keys.dedup();
+        if keys.is_empty() {
+            return;
+        }
 
-        let now = now_secs();
-        let mut quotes: BTreeMap<&'static str, f64> = BTreeMap::new();
+        let mut requested: Vec<(&'static str, CoinId)> = Vec::with_capacity(keys.len());
+        let mut coins: Vec<CoinId> = Vec::with_capacity(keys.len());
         for key in keys {
-            let coin = match CoinId::parse(key) {
-                Ok(coin) => coin,
+            match CoinId::parse(key) {
+                Ok(coin) => {
+                    coins.push(coin.clone());
+                    requested.push((key, coin));
+                }
                 Err(error) => {
                     tracing::debug!(key, error = %error, "views.price_key_invalid");
                     portfolio.price_coverage_gap = true;
-                    continue;
                 }
-            };
-            match tokio::time::timeout(PRICE_TIMEOUT, self.prices.current(coin)).await {
-                Ok(Ok(quote))
-                    if quote.price.is_finite()
-                        && quote.price >= 0.0
-                        && fresh_quote(quote.timestamp, now) =>
-                {
-                    quotes.insert(key, quote.price);
-                }
-                Ok(Ok(_)) => {
-                    tracing::debug!(key, "views.quote_stale");
-                    portfolio.price_coverage_gap = true;
+            }
+        }
+
+        let now = now_secs();
+        let mut quotes: BTreeMap<&'static str, f64> = BTreeMap::new();
+        if !coins.is_empty() {
+            match tokio::time::timeout(PRICE_TIMEOUT, self.prices.current_many(&coins)).await {
+                Ok(Ok(fetched)) => {
+                    for (key, coin) in requested {
+                        match fetched.get(&coin) {
+                            Some(quote)
+                                if quote.price.is_finite()
+                                    && quote.price >= 0.0
+                                    && fresh_quote(quote.timestamp, now) =>
+                            {
+                                quotes.insert(key, quote.price);
+                            }
+                            Some(_) => {
+                                tracing::debug!(key, "views.quote_stale");
+                                portfolio.price_coverage_gap = true;
+                            }
+                            None => {
+                                tracing::debug!(key, "views.price_missing");
+                                portfolio.price_coverage_gap = true;
+                            }
+                        }
+                    }
                 }
                 Ok(Err(error)) => {
-                    tracing::debug!(key, error = %error, "views.price_unavailable");
+                    tracing::debug!(error = %error, "views.price_unavailable");
                     portfolio.price_coverage_gap = true;
                 }
                 Err(_) => {
-                    tracing::debug!(key, "views.price_timeout");
+                    tracing::debug!("views.price_timeout");
                     portfolio.price_coverage_gap = true;
                 }
             }
@@ -736,6 +624,9 @@ impl ViewsHandler {
 
         let mut priced_total = 0.0_f64;
         for holding in &mut portfolio.holdings {
+            if !holding.is_funded() {
+                continue;
+            }
             let Some(key) = holding.price_key else {
                 continue;
             };
@@ -752,10 +643,28 @@ impl ViewsHandler {
     /// Reached through the outbox handler's own trait, so this page cannot
     /// drift from what `/outbox` reports.
     async fn actions(&self) -> (Vec<Action>, bool) {
-        let mut actions = Vec::new();
         let mut incomplete = false;
-        for state in ACTION_STATES {
-            let mut listing = match Handler::list(&*self.outbox, &state_path(state)).await {
+        let mut state_entries = match Handler::list(&*self.outbox, &VfsPath::root()).await {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::debug!(error = %error, "views.outbox_root_unavailable");
+                return (Vec::new(), true);
+            }
+        };
+        // Scan non-terminal states before terminal ones so an operation moving
+        // from `pending` to `sent` or `failed` during the scan is observed in
+        // its final state and deduplicated cleanly.
+        state_entries.retain(|entry| entry.kind == EntryKind::Dir);
+        state_entries.sort_by(|a, b| {
+            action_state_rank(&a.name)
+                .cmp(&action_state_rank(&b.name))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+
+        let mut by_id: BTreeMap<String, (Action, bool, bool)> = BTreeMap::new();
+        for state_entry in state_entries {
+            let state = state_entry.name;
+            let mut listing = match Handler::list(&*self.outbox, &state_path(&state)).await {
                 Ok(entries) => entries,
                 Err(error) => {
                     tracing::debug!(state = %state, error = %error, "views.outbox_list_unavailable");
@@ -775,23 +684,24 @@ impl ViewsHandler {
                         .ok()
                         .map(|since| since.as_millis() as u64)
                 });
+                let mut entry_incomplete = false;
                 let plan = self
-                    .action_file(state, &id, "plan.md", &mut incomplete)
+                    .action_file(&state, &id, "plan.md", &mut entry_incomplete)
                     .await;
                 let status = self
-                    .action_file(state, &id, "status.json", &mut incomplete)
+                    .action_file(&state, &id, "status.json", &mut entry_incomplete)
                     .await;
                 let intent = self
-                    .action_file(state, &id, "intent.json", &mut incomplete)
+                    .action_file(&state, &id, "intent.json", &mut entry_incomplete)
                     .await
                     .as_deref()
                     .and_then(parse_intent);
                 // The broadcast hash is the result's own field; `status.json`
                 // repeats it. Either answers, and neither invents one.
                 let result = self
-                    .action_file(state, &id, "result.json", &mut incomplete)
+                    .action_file(&state, &id, "result.json", &mut entry_incomplete)
                     .await;
-                let tx_hash = result
+                let raw_tx_hash = result
                     .as_deref()
                     .and_then(|text| json_field(text, "tx_hash"))
                     .or_else(|| {
@@ -799,11 +709,33 @@ impl ViewsHandler {
                             .as_deref()
                             .and_then(|text| json_field(text, "tx_hash"))
                     });
+                if raw_tx_hash.as_deref().is_some_and(|h| !is_valid_tx_hash(h)) {
+                    entry_incomplete = true;
+                }
+                let tx_hash = raw_tx_hash.filter(|h| is_valid_tx_hash(h));
                 // A challenge proves a ceremony was prepared, not its outcome.
                 let awaited_approval = self
-                    .action_file(state, &id, "approval_challenge.json", &mut incomplete)
+                    .action_file(
+                        &state,
+                        &id,
+                        "approval_challenge.json",
+                        &mut entry_incomplete,
+                    )
                     .await
                     .is_some();
+                // Every staged operation writes `plan.md` and `status.json`. If
+                // either vanished while reading this directory, the record moved
+                // or is incomplete.
+                let core_complete = plan.is_some() && status.is_some();
+                let any_present = core_complete
+                    || plan.is_some()
+                    || status.is_some()
+                    || intent.is_some()
+                    || result.is_some()
+                    || awaited_approval;
+                if !core_complete {
+                    entry_incomplete = true;
+                }
                 let chain = intent
                     .as_ref()
                     .and_then(|i| i.chain.clone())
@@ -821,7 +753,7 @@ impl ViewsHandler {
                             wei,
                         )
                     });
-                actions.push(Action {
+                let candidate = Action {
                     summary: plan.as_deref().map(plan_summary).unwrap_or_else(|| {
                         format!("Operation {}", id.split('-').next().unwrap_or(&id))
                     }),
@@ -837,11 +769,28 @@ impl ViewsHandler {
                     fee: None,
                     awaited_approval,
                     intent,
-                    id,
-                    state,
+                    id: id.clone(),
+                    state: state.clone(),
                     modified_ms,
-                });
+                };
+                match by_id.get(&id) {
+                    Some((existing, existing_complete, _))
+                        if (*existing_complete, action_state_rank(&existing.state))
+                            > (core_complete, action_state_rank(&candidate.state)) => {}
+                    _ => {
+                        if any_present {
+                            by_id.insert(id, (candidate, core_complete, entry_incomplete));
+                        } else {
+                            incomplete = true;
+                        }
+                    }
+                }
             }
+        }
+        let mut actions = Vec::with_capacity(by_id.len());
+        for (_, (action, _, entry_incomplete)) in by_id {
+            incomplete |= entry_incomplete;
+            actions.push(action);
         }
         // Newest first, by when the intent was created rather than when its
         // directory was last touched: a retry must not reorder history.
@@ -966,14 +915,15 @@ impl ViewsHandler {
         let total: f64 = funded.iter().filter_map(|h| h.value).sum();
 
         let mut body = String::new();
-        let current_native = if !portfolio.holdings.iter().any(|h| !h.is_off_market())
-            || priced.is_empty() && !funded.is_empty()
+        let current_native = if !priced.is_empty() {
+            money(Some(total))
+        } else if funded.is_empty()
+            && off_market.is_empty()
+            && portfolio.holdings.iter().any(|h| !h.is_off_market())
         {
-            "—".to_owned()
-        } else if funded.is_empty() {
             "$0.00".to_owned()
         } else {
-            money(Some(total))
+            "—".to_owned()
         };
         body.push_str(&format!(
             "<section class=\"inventory-summary\"><div>\
@@ -990,7 +940,10 @@ impl ViewsHandler {
             } else {
                 ""
             },
-            partial = if !portfolio.unavailable.is_empty() || portfolio.price_coverage_gap {
+            partial = if !portfolio.unavailable.is_empty()
+                || portfolio.price_coverage_gap
+                || !off_market.is_empty()
+            {
                 " · partial"
             } else {
                 ""
@@ -1015,32 +968,38 @@ impl ViewsHandler {
                 .copied()
                 .filter(|holding| holding.wallet == wallet.id)
                 .collect();
+            let wallet_unavailable: Vec<&UnavailableBalance> = portfolio
+                .unavailable
+                .iter()
+                .filter(|entry| entry.wallet == wallet.id)
+                .collect();
             let wallet_total: f64 = wallet_funded.iter().filter_map(|h| h.value).sum();
+            let wallet_has_unpriced_funded =
+                wallet_funded.iter().any(|h| h.value.is_none()) || !wallet_off_market.is_empty();
             let subtitle = if wallet_funded.iter().any(|h| h.value.is_some()) {
                 money(Some(wallet_total))
-            } else if wallet_funded.is_empty() {
-                if !portfolio
-                    .holdings
-                    .iter()
-                    .any(|h| h.wallet == wallet.id && !h.is_off_market())
-                {
-                    "—".to_owned()
-                } else {
-                    "$0.00".to_owned()
-                }
-            } else {
+            } else if !wallet_funded.is_empty() || !wallet_off_market.is_empty() {
                 "No priced balance".to_owned()
+            } else if portfolio
+                .holdings
+                .iter()
+                .any(|h| h.wallet == wallet.id && !h.is_off_market())
+            {
+                "$0.00".to_owned()
+            } else {
+                "—".to_owned()
             };
             let wallet_holdings: Vec<&Holding> = portfolio
                 .holdings
                 .iter()
                 .filter(|holding| holding.wallet == wallet.id)
                 .collect();
-            let unavailable_count = portfolio
-                .unavailable
+            let answered_networks = wallet_holdings
                 .iter()
-                .filter(|(id, _)| id == &wallet.id)
-                .count();
+                .map(|holding| holding.chain.as_str())
+                .collect::<BTreeSet<_>>()
+                .len();
+            let unavailable_count = wallet_unavailable.len();
             body.push_str(&format!(
                 "<details class=\"wallet-card directory-entry\" id=\"wallet-{id}\"><summary class=\"directory-row\">\
                  <span class=\"directory-icon\" aria-hidden=\"true\">▱</span>\
@@ -1057,9 +1016,13 @@ impl ViewsHandler {
                 subtitle = html_escape(&subtitle),
                 address = html_escape(wallet.address.as_deref().unwrap_or("Unavailable")),
                 short_address = html_escape(&short_hex(wallet.address.as_deref().unwrap_or("Unavailable"))),
-                partial = if unavailable_count > 0 { " · partial" } else { "" },
+                partial = if unavailable_count > 0 || wallet_has_unpriced_funded {
+                    " · partial"
+                } else {
+                    ""
+                },
                 kind = html_escape(&wallet.kind),
-                answered = wallet_holdings.len(),
+                answered = answered_networks,
                 unavailable = if unavailable_count == 0 {
                     String::new()
                 } else {
@@ -1092,15 +1055,27 @@ impl ViewsHandler {
 
             // An empty network is reported, not dropped: otherwise "you hold
             // nothing on Base" is indistinguishable from "Base was not read".
-            // The count carries that distinction; the names add nothing.
             if !wallet_empty.is_empty() {
+                let empty_networks = wallet_empty
+                    .iter()
+                    .map(|holding| holding.chain.as_str())
+                    .collect::<BTreeSet<_>>()
+                    .len();
                 body.push_str(&format!(
-                    "<p class=\"muted\">Empty on {}.</p>",
-                    html_escape(&count_noun(
-                        wallet_empty.len(),
-                        "read network",
-                        "read networks"
-                    )),
+                    "<details><summary class=\"muted\">Empty on {summary}.</summary>\
+                     {table}</details>",
+                    summary =
+                        html_escape(&count_noun(empty_networks, "read network", "read networks")),
+                    table =
+                        holdings_table(&wallet_empty, "Zero native balances read through Bloom.",),
+                ));
+            }
+            if !wallet_unavailable.is_empty() {
+                body.push_str(&format!(
+                    "<details><summary class=\"muted\">Unavailable · {count}</summary>\
+                     {table}</details>",
+                    count = wallet_unavailable.len(),
+                    table = unavailable_table(&wallet_unavailable),
                 ));
             }
             body.push_str("</div></details>");
@@ -1305,14 +1280,24 @@ impl ViewsHandler {
     async fn render_activity(&self) -> String {
         let (mut actions, incomplete) = self.actions().await;
         self.resolve_fees(&mut actions).await;
-        let counts = |state: &str| actions.iter().filter(|a| a.state == state).count();
-        let (sent, pending, failed) = (counts("sent"), counts("pending"), counts("failed"));
+        let broadcast = actions
+            .iter()
+            .filter(|a| a.state == "sent" && a.tx_hash.is_some())
+            .count();
+        let sent_without_hash = actions
+            .iter()
+            .filter(|a| a.state == "sent" && a.tx_hash.is_none())
+            .count();
+        let pending = actions.iter().filter(|a| a.state == "pending").count();
+        let failed = actions.iter().filter(|a| a.state == "failed").count();
 
         let mut body = String::new();
-        body.push_str(activity_coverage_notice(incomplete));
+        body.push_str(activity_coverage_notice(
+            incomplete || sent_without_hash > 0,
+        ));
         body.push_str(&format!(
             "<section class=\"outcome-overview\" aria-label=\"Outcome summary\">\
-             <a href=\"#ledger\"><span class=\"mini-outcome\">↗</span><strong>{sent}</strong>\
+             <a href=\"#ledger\"><span class=\"mini-outcome\">↗</span><strong>{broadcast}</strong>\
              <span>Broadcast</span></a>\
              <a href=\"#ledger\"><span class=\"mini-outcome\">◷</span><strong>{pending}</strong>\
              <span>Awaiting review</span></a>\
@@ -1421,11 +1406,20 @@ struct WalletSummary {
     kind: String,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct UnavailableBalance {
+    wallet: String,
+    account: String,
+    chain: String,
+    label: String,
+    symbol: String,
+}
+
 #[derive(Default)]
 struct Portfolio {
     holdings: Vec<Holding>,
-    /// `(wallet, chain)` pairs whose balance could not be read.
-    unavailable: Vec<(String, String)>,
+    /// Account-network reads whose balance could not be read.
+    unavailable: Vec<UnavailableBalance>,
     wallets: Vec<WalletSummary>,
     projections_unavailable: bool,
     /// Accounts whose balance reads had not finished when the page's
@@ -1436,13 +1430,6 @@ struct Portfolio {
     cached_balances: Vec<(String, String)>,
     price_coverage_gap: bool,
     stale: bool,
-}
-
-#[derive(Default)]
-struct BalanceRead {
-    holdings: Vec<Holding>,
-    unavailable: Vec<(String, String)>,
-    cached: Vec<(String, String)>,
 }
 
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
@@ -1483,6 +1470,97 @@ enum BalanceJob {
     },
 }
 
+struct NetworkRead {
+    job_index: usize,
+    wallet: String,
+    account: String,
+    address_text: String,
+    chain: String,
+    label: String,
+    symbol: String,
+    kind: NetworkReadKind,
+}
+
+enum NetworkReadKind {
+    Evm {
+        client: bloom_evm::ChainClient,
+        address: alloy::primitives::Address,
+    },
+    Solana {
+        client: bloom_solana::SolanaClient,
+        address: String,
+    },
+}
+
+impl NetworkRead {
+    async fn fetch(&self) -> Option<Holding> {
+        match &self.kind {
+            NetworkReadKind::Evm { client, address } => {
+                let raw = match client.balance(*address).await {
+                    Ok(raw) => raw,
+                    Err(error) => {
+                        tracing::debug!(chain = %self.chain, error = %error, "views.balance_unavailable");
+                        return None;
+                    }
+                };
+                let decimals = client.spec().native_decimals;
+                let chain_id = client.spec().chain_id;
+                let quantity = bloom_proto::format_units(raw, decimals);
+                let amount = quantity.parse::<f64>().unwrap_or(0.0);
+                Some(Holding {
+                    label: self.label.clone(),
+                    wallet: self.wallet.clone(),
+                    chain: self.chain.clone(),
+                    price_key: native_asset_market(chain_id),
+                    account: self.account.clone(),
+                    symbol: self.symbol.clone(),
+                    quantity,
+                    amount,
+                    value: None,
+                })
+            }
+            NetworkReadKind::Solana { client, address } => {
+                let raw = match client.get_balance(address).await {
+                    Ok(lamports) => lamports,
+                    Err(error) => {
+                        tracing::debug!(chain = %self.chain, error = %error, "views.solana_balance_unavailable");
+                        return None;
+                    }
+                };
+                let quantity = format!("{}.{:09}", raw / 1_000_000_000, raw % 1_000_000_000);
+                let amount = quantity.parse::<f64>().unwrap_or(0.0);
+                // Only positively identified Solana Mainnet (pinned to mainnet
+                // genesis and verified on live funded reads) receives the
+                // SOL market key; custom/test clusters remain unpriced.
+                let is_mainnet_sol = if is_test_network(&self.chain)
+                    || client.configured_genesis()
+                        != Some(bloom_proto::SOLANA_MAINNET_BETA_GENESIS_HASH)
+                {
+                    false
+                } else if raw > 0 {
+                    client
+                        .verify_genesis()
+                        .await
+                        .is_ok_and(|g| g == bloom_proto::SOLANA_MAINNET_BETA_GENESIS_HASH)
+                } else {
+                    true
+                };
+                Some(Holding {
+                    label: self.label.clone(),
+                    wallet: self.wallet.clone(),
+                    chain: self.chain.clone(),
+                    price_key: is_mainnet_sol.then_some("coingecko:solana"),
+                    account: self.account.clone(),
+                    symbol: self.symbol.clone(),
+                    quantity,
+                    amount,
+                    value: None,
+                })
+            }
+        }
+    }
+}
+
 /// One table of holdings, with every cell labelled for a narrow screen.
 fn holdings_table(rows: &[&Holding], caption: &str) -> String {
     let cells: String = rows
@@ -1514,6 +1592,33 @@ fn holdings_table(rows: &[&Holding], caption: &str) -> String {
          <th class=\"numeric\" scope=\"col\">Value</th></tr></thead>\
          <tbody>{cells}</tbody></table></div>",
         caption = html_escape(caption),
+    )
+}
+
+fn unavailable_table(rows: &[&UnavailableBalance]) -> String {
+    let cells: String = rows
+        .iter()
+        .map(|entry| {
+            format!(
+                "<tr><td data-label=\"Asset\"><span class=\"asset-label\">\
+                 <span><strong>{symbol}</strong><small>Balance unavailable</small></span></span></td>\
+                 <td data-label=\"Network\">{label}</td>\
+                 <td class=\"numeric money\" data-label=\"Value\">Unavailable</td></tr>",
+                symbol = html_escape(&entry.symbol),
+                label = asset_label(&if entry.account.is_empty() {
+                    entry.label.clone()
+                } else {
+                    format!("{} · {}", entry.label, entry.account)
+                }),
+            )
+        })
+        .collect();
+    format!(
+        "<div class=\"table-wrap\"><table class=\"holdings-table\">\
+         <caption>Balances that could not be read and are excluded from totals.</caption>\
+         <thead><tr><th scope=\"col\">Asset / quantity</th><th scope=\"col\">Network</th>\
+         <th class=\"numeric\" scope=\"col\">Value</th></tr></thead>\
+         <tbody>{cells}</tbody></table></div>"
     )
 }
 
@@ -1559,7 +1664,7 @@ impl Portfolio {
             let mut names: Vec<&str> = self
                 .unavailable
                 .iter()
-                .map(|(_, chain)| chain.as_str())
+                .map(|entry| entry.chain.as_str())
                 .collect();
             names.sort();
             names.dedup();
@@ -1743,7 +1848,7 @@ struct Intent {
 
 struct Action {
     id: String,
-    state: &'static str,
+    state: String,
     modified_ms: Option<u64>,
     summary: String,
     wallet: Option<String>,
@@ -1763,6 +1868,21 @@ struct Action {
     fee: Option<String>,
     /// Whether this operation reached an approval ceremony.
     awaited_approval: bool,
+}
+
+fn action_state_rank(state: &str) -> u8 {
+    match state {
+        "pending" => 0,
+        "sent" | "failed" => 2,
+        _ => 1,
+    }
+}
+
+fn is_valid_tx_hash(hash: &str) -> bool {
+    let Some(hex) = hash.strip_prefix("0x") else {
+        return false;
+    };
+    hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 impl Action {
@@ -1821,7 +1941,7 @@ impl Action {
     }
 
     fn status_class(&self) -> &'static str {
-        match self.state {
+        match self.state.as_str() {
             "sent" => "status-success",
             "failed" => "status-failed",
             _ => "status-pending",
@@ -1829,8 +1949,9 @@ impl Action {
     }
 
     fn glyph(&self) -> &'static str {
-        match self.state {
-            "sent" => "✓",
+        match self.state.as_str() {
+            "sent" if self.tx_hash.is_some() => "✓",
+            "sent" => "!",
             "failed" => "!",
             _ => "◷",
         }
@@ -1839,10 +1960,11 @@ impl Action {
     /// The outcome, stated as narrowly as the records support. "Failed" is
     /// not "reverted": absence of a receipt or hash cannot prove no broadcast.
     fn label(&self) -> &'static str {
-        match self.state {
-            "sent" => "✓ Broadcast",
+        match self.state.as_str() {
+            "sent" if self.tx_hash.is_some() => "✓ Broadcast",
+            "sent" => "Sent · no hash recorded",
             "failed" if self.tx_hash.is_some() => "✗ Stopped · transaction hash recorded",
-            "failed" if self.awaited_approval => "✗ Approval interrupted",
+            "failed" if self.awaited_approval => "✗ Stopped · approval outcome unknown",
             "failed" => "✗ No broadcast recorded",
             _ => "◷ Staged · needs you",
         }
@@ -1912,7 +2034,7 @@ impl Action {
     /// Why this row reads the way it does. The distinction that matters is
     /// what Bloom recorded; chain settlement requires a receipt.
     fn outcome_note(&self) -> &'static str {
-        match self.state {
+        match self.state.as_str() {
             "sent" if self.tx_hash.is_some() => {
                 "Bloom broadcast this and kept the hash. Broadcast is not settled: read the \
                  chain's own receipt for the final outcome."
@@ -3258,24 +3380,31 @@ mod tests {
             },
         );
 
-        let read = fixture
+        let mut portfolio = Portfolio::default();
+        fixture
             .handler
-            .read_balances(
-                "alice",
-                address,
+            .read_all_balances(
+                &mut portfolio,
+                vec![BalanceJob::Evm {
+                    wallet: "alice".into(),
+                    account: String::new(),
+                    address,
+                }],
                 &["ethereum".into()],
-                &Arc::new(tokio::sync::Semaphore::new(PORTFOLIO_CONCURRENCY)),
+                &[],
             )
             .await;
 
-        assert!(read.unavailable.is_empty(), "recent observation is usable");
-        assert_eq!(read.cached, vec![("alice".into(), "ethereum".into())]);
-        assert_eq!(read.holdings.len(), 1);
-        assert_eq!(read.holdings[0].quantity, "1.25");
-        let portfolio = Portfolio {
-            cached_balances: read.cached,
-            ..Portfolio::default()
-        };
+        assert!(
+            portfolio.unavailable.is_empty(),
+            "recent observation is usable"
+        );
+        assert_eq!(
+            portfolio.cached_balances,
+            vec![("alice".into(), "ethereum".into())]
+        );
+        assert_eq!(portfolio.holdings.len(), 1);
+        assert_eq!(portfolio.holdings[0].quantity, "1.25");
         assert!(portfolio.notices().contains("Using recent balances"));
 
         let key = BalanceCacheKey::new("alice", "ethereum", &address_text);
@@ -3625,7 +3754,10 @@ mod tests {
             !html.contains("reverted"),
             "nothing here is evidence of a revert: {html}"
         );
-        assert!(html.contains("Approval interrupted"), "{html}");
+        assert!(
+            html.contains("Stopped · approval outcome unknown"),
+            "{html}"
+        );
         assert!(
             html.contains("does not establish whether approval or broadcast completed"),
             "{html}"
@@ -4003,5 +4135,442 @@ mod tests {
         let html = render(&fixture.handler, WALLETS_HTML).await;
         assert!(!html.contains("4242424242"), "{html}");
         assert!(!html.contains("Tempo"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn price_batches_distinct_market_keys_into_one_request() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = requests.clone();
+        let now = now_secs();
+        let body = format!(
+            "{{\"coins\":{{\
+             \"coingecko:ethereum\":{{\"price\":2500.0,\"timestamp\":{now}}},\
+             \"coingecko:binancecoin\":{{\"price\":600.0,\"timestamp\":{stale}}}\
+             }}}}",
+            stale = now.saturating_sub(QUOTE_MAX_AGE_SECS + 10),
+        );
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let mut fixture = fixture();
+        fixture.handler.prices = Arc::new(bloom_prices::PricesClient::with_base_url(url));
+        let mut portfolio = Portfolio {
+            holdings: vec![
+                Holding {
+                    wallet: "alice".into(),
+                    chain: "ethereum".into(),
+                    account: String::new(),
+                    price_key: Some("coingecko:ethereum"),
+                    label: "Ethereum".into(),
+                    symbol: "ETH".into(),
+                    quantity: "2".into(),
+                    amount: 2.0,
+                    value: None,
+                },
+                Holding {
+                    wallet: "alice".into(),
+                    chain: "bsc".into(),
+                    account: String::new(),
+                    price_key: Some("coingecko:binancecoin"),
+                    label: "BNB Smart Chain".into(),
+                    symbol: "BNB".into(),
+                    quantity: "1".into(),
+                    amount: 1.0,
+                    value: None,
+                },
+                Holding {
+                    wallet: "alice".into(),
+                    chain: "solana-mainnet".into(),
+                    account: "m/44'/501'/0'/0'".into(),
+                    price_key: Some("coingecko:solana"),
+                    label: "Solana Mainnet".into(),
+                    symbol: "SOL".into(),
+                    quantity: "3".into(),
+                    amount: 3.0,
+                    value: None,
+                },
+            ],
+            ..Portfolio::default()
+        };
+
+        fixture.handler.price(&mut portfolio).await;
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "all distinct market keys must be fetched in one batched request"
+        );
+        assert_eq!(portfolio.holdings[0].value, Some(5000.0));
+        assert_eq!(
+            portfolio.holdings[1].value, None,
+            "stale quote must not value BNB"
+        );
+        assert_eq!(
+            portfolio.holdings[2].value, None,
+            "omitted quote must leave SOL unpriced"
+        );
+        assert!(portfolio.price_coverage_gap);
+    }
+
+    #[tokio::test]
+    async fn unknown_solana_cluster_is_not_priced_as_mainnet_sol() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const SOLANA: &str = "7Ec4G7dS8v8Y5JvVX8E5S7jvk8eJzEqJqgWkpz6xA4r9";
+        let rpc_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rpc_url = format!("http://{}", rpc_listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = rpc_listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body = if req.contains("getGenesisHash") {
+                    r#"{"jsonrpc":"2.0","result":"11111111111111111111111111111111","id":1}"#
+                } else {
+                    r#"{"jsonrpc":"2.0","result":{"context":{"slot":1},"value":2000000000},"id":1}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let price_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let price_url = format!("http://{}", price_listener.local_addr().unwrap());
+        let now = now_secs();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = price_listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let body = format!(
+                    "{{\"coins\":{{\"coingecko:solana\":{{\"price\":150.0,\"timestamp\":{now}}}}}}}"
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let fixture = fixture();
+        let mut projection = fixture
+            .handler
+            .projections
+            .list_wallets()
+            .await
+            .unwrap()
+            .remove(0);
+        projection.accounts = bloom_broker_api::WalletAccountsPublic {
+            wallet_id: bloom_broker_api::Token::new("alice").unwrap(),
+            seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+            accounts: vec![solana_numbered_account(SOLANA)],
+        };
+        let solana = bloom_solana::SolanaChainRegistry::new();
+        solana.add(
+            bloom_solana::SolanaClient::build(&bloom_proto::SolanaSpec {
+                name: "validator-a".into(),
+                endpoints: vec![bloom_proto::EndpointSpec {
+                    url: rpc_url,
+                    weight: 100,
+                    cu_per_sec: None,
+                    max_rps: None,
+                    http_only: true,
+                }],
+                expected_genesis_base58: None,
+            })
+            .unwrap(),
+        );
+        let handler = ViewsHandler::new(
+            crate::test_support::wallet_projection_reader_from(projection),
+            ChainRegistry::default(),
+            bloom_prices::PricesClient::with_base_url(price_url),
+            fixture.handler.outbox,
+        )
+        .with_solana_reads(solana);
+
+        let html = render(&handler, WALLETS_HTML).await;
+        assert!(html.contains("validator-a"), "{html}");
+        assert!(html.contains("Unpriced balances · 1"), "{html}");
+        assert!(
+            !html.contains("$300.00"),
+            "custom Solana cluster must not be priced as mainnet SOL: {html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wallet_projections_use_navigation_and_reject_integrity_errors() {
+        struct IntegrityErrorReader {
+            nav_calls: Arc<std::sync::atomic::AtomicUsize>,
+            cached: Vec<WalletProjection>,
+        }
+
+        #[async_trait]
+        impl WalletProjectionReader for IntegrityErrorReader {
+            async fn list_wallets(
+                &self,
+            ) -> Result<Vec<WalletProjection>, bloom_broker_api::ProtocolError> {
+                panic!("views must call list_wallets_navigation rather than list_wallets");
+            }
+
+            async fn list_wallets_navigation(
+                &self,
+            ) -> Result<Vec<WalletProjection>, bloom_broker_api::ProtocolError> {
+                self.nav_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(bloom_broker_api::ProtocolError::new(
+                    bloom_broker_api::ProtocolErrorCode::BackendInvalidRequest,
+                    "corrupted projection signature",
+                ))
+            }
+
+            async fn get_wallet(
+                &self,
+                _wallet_id: &bloom_broker_api::Token,
+            ) -> Result<WalletProjection, bloom_broker_api::ProtocolError> {
+                unreachable!()
+            }
+
+            fn cached_wallets(
+                &self,
+            ) -> Result<Vec<WalletProjection>, bloom_broker_api::ProtocolError> {
+                Ok(self.cached.clone())
+            }
+        }
+
+        let fixture = fixture();
+        let cached = fixture.handler.projections.list_wallets().await.unwrap();
+        let nav_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler = ViewsHandler::new(
+            Arc::new(IntegrityErrorReader {
+                nav_calls: nav_calls.clone(),
+                cached,
+            }),
+            ChainRegistry::default(),
+            bloom_prices::PricesClient::with_base_url("http://127.0.0.1:1"),
+            fixture.handler.outbox,
+        );
+
+        let html = render(&handler, WALLETS_HTML).await;
+        assert_eq!(nav_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            html.contains("Wallet data unavailable"),
+            "integrity failure must not silently serve cached projections: {html}"
+        );
+        assert!(!html.contains("id=\"wallet-alice\""), "{html}");
+    }
+
+    #[tokio::test]
+    async fn zero_and_unavailable_account_network_pairs_render_explicitly_and_do_not_zero_unpriced_funds()
+     {
+        let fixture = fixture_with_unreachable_chains();
+        let mut projection = fixture
+            .handler
+            .projections
+            .list_wallets()
+            .await
+            .unwrap()
+            .remove(0);
+        let second_account = evm_numbered_account(2);
+        let second_address = second_account.chain_projections[0].address.clone();
+        projection.accounts = bloom_broker_api::WalletAccountsPublic {
+            wallet_id: bloom_broker_api::Token::new("alice").unwrap(),
+            seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+            accounts: vec![second_account],
+        };
+        let primary_address = ADDRESS.parse::<alloy::primitives::Address>().unwrap();
+        let primary_text = format!("{primary_address:#x}");
+        let second_parsed = second_address
+            .parse::<alloy::primitives::Address>()
+            .unwrap();
+        let second_text = format!("{second_parsed:#x}");
+
+        let chains = ChainRegistry::default();
+        for (name, chain_id, display) in [
+            ("ethereum", 1u64, "Ethereum"),
+            ("base", 8453, "Base"),
+            ("robinhood", 4663, "Robinhood Chain"),
+        ] {
+            chains.add(
+                bloom_evm::ChainClient::new(bloom_proto::ChainSpec {
+                    name: name.into(),
+                    chain_id,
+                    rpc_urls: vec!["http://127.0.0.1:1".into()],
+                    rpc_endpoints: Vec::new(),
+                    etherscan_api_url: None,
+                    display_name: Some(display.to_owned()),
+                    native_symbol: "ETH".into(),
+                    native_decimals: 18,
+                    legacy_tx: false,
+                    op_stack: false,
+                })
+                .unwrap(),
+            );
+        }
+        let handler = ViewsHandler::new(
+            crate::test_support::wallet_projection_reader_from(projection),
+            chains,
+            bloom_prices::PricesClient::with_base_url("http://127.0.0.1:1"),
+            fixture.handler.outbox,
+        );
+        // Primary account has 0 ETH on Ethereum and 0 ETH on Base; numbered
+        // account has 0 ETH on Ethereum, 1.5 ETH on off-market Robinhood Chain,
+        // and Base is left uncached so it fails as Unavailable.
+        for (address_text, account, chain, label, quantity, amount, price_key) in [
+            (
+                primary_text.as_str(),
+                "",
+                "ethereum",
+                "Ethereum",
+                "0",
+                0.0,
+                Some("coingecko:ethereum"),
+            ),
+            (
+                primary_text.as_str(),
+                "",
+                "base",
+                "Base",
+                "0",
+                0.0,
+                Some("coingecko:ethereum"),
+            ),
+            (
+                second_text.as_str(),
+                "m/44'/60'/0'/0/2",
+                "ethereum",
+                "Ethereum",
+                "0",
+                0.0,
+                Some("coingecko:ethereum"),
+            ),
+            (
+                second_text.as_str(),
+                "m/44'/60'/0'/0/2",
+                "robinhood",
+                "Robinhood Chain",
+                "1.5",
+                1.5,
+                None,
+            ),
+        ] {
+            handler.remember_balance(
+                "alice",
+                chain,
+                address_text,
+                &Holding {
+                    wallet: "alice".into(),
+                    chain: chain.into(),
+                    account: account.into(),
+                    price_key,
+                    label: label.into(),
+                    symbol: "ETH".into(),
+                    quantity: quantity.into(),
+                    amount,
+                    value: None,
+                },
+            );
+        }
+
+        let html = render(&handler, WALLETS_HTML).await;
+        // Finding 7: positive off-market funds alongside zero on-market funds
+        // must never make the top summary or wallet subtitle claim $0.00.
+        assert!(
+            !html.contains("<strong>$0.00</strong>"),
+            "positive unpriced funds must not render a $0.00 headline: {html}"
+        );
+        assert!(
+            html.contains("<strong>No priced balance</strong>"),
+            "{html}"
+        );
+        // Finding 11: 4 account-network holdings across 3 distinct networks
+        // count as 3 networks answered, not 4.
+        assert!(
+            html.contains("3 networks answered · 2 unavailable"),
+            "{html}"
+        );
+        // Finding 5: both per-account zero rows and per-account unavailable
+        // rows appear explicitly in the wallet card.
+        assert!(html.contains("Empty on 2 read networks."), "{html}");
+        assert!(
+            html.contains("Ethereum · m/44&#39;/60&#39;/0&#39;/0/2"),
+            "numbered account zero-balance row must be rendered: {html}"
+        );
+        assert!(
+            html.contains("Base · m/44&#39;/60&#39;/0&#39;/0/2"),
+            "numbered account unavailable row must be rendered: {html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_action_across_states_deduplicates_to_final_state_and_hashless_sent_is_not_broadcast()
+     {
+        let fixture = fixture();
+        // Simulate an action observed in both `pending` and `sent` during a
+        // transition, plus a second `sent` record that kept no tx_hash.
+        stage(
+            &fixture,
+            "pending",
+            "evm-transition",
+            "# Moving transfer\n\nChain: ethereum (id 1)\n",
+        );
+        stage_files(
+            &fixture,
+            "sent",
+            "evm-transition",
+            "# Moving transfer\n\nChain: ethereum (id 1)\n",
+            &[(
+                "result.json",
+                "{\"tx_hash\":\"0x4b81a384e07d30624b9dc420b0f1c12e4f9a1d3cf027bdd4a1ab868225eb1748\"}",
+            )],
+        );
+        stage(
+            &fixture,
+            "sent",
+            "evm-no-hash",
+            "# Hashless send\n\nChain: ethereum (id 1)\n",
+        );
+        // An empty directory with missing core files marks coverage incomplete.
+        std::fs::create_dir_all(fixture.outbox_root.join("pending").join("evm-vanished")).unwrap();
+
+        let (actions, incomplete) = fixture.handler.actions().await;
+        assert!(incomplete, "vanished record must mark coverage incomplete");
+        assert_eq!(
+            actions.iter().filter(|a| a.id == "evm-transition").count(),
+            1,
+            "transitioning operation must appear once"
+        );
+        let transitioned = actions.iter().find(|a| a.id == "evm-transition").unwrap();
+        assert_eq!(transitioned.state, "sent");
+        assert_eq!(transitioned.label(), "✓ Broadcast");
+
+        let hashless = actions.iter().find(|a| a.id == "evm-no-hash").unwrap();
+        assert_eq!(hashless.label(), "Sent · no hash recorded");
+
+        let html = render(&fixture.handler, ACTIVITY_HTML).await;
+        assert!(
+            html.contains("<strong>1</strong><span>Broadcast</span>"),
+            "only the record with a valid tx_hash counts as Broadcast: {html}"
+        );
+        assert!(html.contains("Sent · no hash recorded"), "{html}");
+        assert!(html.contains("Activity coverage incomplete"), "{html}");
     }
 }
