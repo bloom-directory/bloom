@@ -70,12 +70,23 @@ impl Browser {
         profile: &Path,
         test_flags: &[String],
     ) -> Result<Arc<Self>> {
+        Self::launch_on(executable, profile, test_flags, &[]).await
+    }
+
+    /// `display` holds the X display variables for a headed browser.
+    pub async fn launch_on(
+        executable: &Path,
+        profile: &Path,
+        test_flags: &[String],
+        display: &[(&str, std::ffi::OsString)],
+    ) -> Result<Arc<Self>> {
         // Fixture merchants listen on loopback in tests and developer Triads.
         Self::launch_with_egress(
             executable,
             profile,
             test_flags,
             crate::egress::policy(cfg!(any(test, feature = "triad-dev-harness"))),
+            display,
         )
         .await
     }
@@ -85,6 +96,7 @@ impl Browser {
         profile: &Path,
         test_flags: &[String],
         egress: crate::egress::Policy,
+        display: &[(&str, std::ffi::OsString)],
     ) -> Result<Arc<Self>> {
         if profile.exists() {
             let metadata = std::fs::symlink_metadata(profile)?;
@@ -120,7 +132,7 @@ impl Browser {
             .any(|f| f == "--ignore-certificate-errors");
         let mut flags = crate::egress::chromium_flags(crate::egress::start(egress).await?);
         flags.extend_from_slice(test_flags);
-        let cdp = Cdp::launch(executable, profile, &flags)?;
+        let cdp = Cdp::launch(executable, profile, &flags, display)?;
         let tab = new_tab(&cdp, None, 1).await?;
         Ok(Arc::new(Self {
             cdp,
@@ -500,21 +512,34 @@ impl Browser {
     /// the merchant kept, so shopping never reopens a private session and may
     /// return to the booking site.
     pub(crate) async fn return_control(&self) -> Result<()> {
-        self.reset_shopping().await.inspect_err(|_| {
+        self.reset_shopping(false).await.inspect_err(|_| {
             self.unusable.store(true, Ordering::SeqCst);
         })
     }
 
-    async fn reset_shopping(&self) -> Result<()> {
+    /// Closes every private page but keeps the context's cookies and storage,
+    /// so the person stays signed in to the sites they used. Refused once saved
+    /// traveler values were filled: a merchant may store and redisplay them.
+    pub(crate) async fn return_control_signed_in(&self) -> Result<()> {
+        if self.has_private_traveler_data() {
+            bail!("Saved traveler details were used here; this session cannot be kept");
+        }
+        self.reset_shopping(true).await.inspect_err(|_| {
+            self.unusable.store(true, Ordering::SeqCst);
+        })
+    }
+
+    async fn reset_shopping(&self, keep_session: bool) -> Result<()> {
         let mut tab = self.tab.lock().await;
-        if let Err(error) = self
-            .cdp
-            .call(
-                None,
-                "Target.disposeBrowserContext",
-                json!({"browserContextId":tab.context}),
-            )
-            .await
+        if !keep_session
+            && let Err(error) = self
+                .cdp
+                .call(
+                    None,
+                    "Target.disposeBrowserContext",
+                    json!({"browserContextId":tab.context}),
+                )
+                .await
         {
             // A previous attempt may have disposed the context before failing
             // to create the replacement tab. Retry only with no contexts left.
@@ -559,7 +584,10 @@ impl Browser {
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        *tab = new_tab(&self.cdp, None, tab.generation + 1).await?;
+        let journey = tab.journey + 1;
+        let context = keep_session.then(|| tab.context.clone());
+        *tab = new_tab(&self.cdp, context, tab.generation + 1).await?;
+        tab.journey = journey;
         // The pages that held saved traveler values are gone.
         self.private_traveler_used.store(false, Ordering::SeqCst);
         self.revoked.store(false, Ordering::SeqCst);
@@ -770,6 +798,7 @@ mod tests {
             &root.path().join("profile"),
             &["--no-sandbox".into()],
             Arc::new(move |address| address == shop_address),
+            &[],
         )
         .await
         .unwrap();
@@ -1910,6 +1939,33 @@ mod tests {
             )
             .await
             .unwrap();
+        browser.return_control().await.unwrap();
+        assert!(visit().await.contains("stored:|"));
+        // The person may keep the session: pages close, cookies and storage stay.
+        browser.handoff().await.unwrap();
+        browser.return_control_signed_in().await.unwrap();
+        let pages = browser
+            .cdp
+            .call(None, "Target.getTargets", json!({}))
+            .await
+            .unwrap();
+        let open = pages["targetInfos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["type"] == "page" && t["url"] != "about:blank")
+            .count();
+        assert_eq!(open, 0, "private pages must close");
+        let kept = visit().await;
+        assert!(
+            kept.contains("SyntheticPassenger") && kept.contains("booking=SyntheticBooking"),
+            "{kept}"
+        );
+        // Never after saved traveler values were filled into the merchant's pages.
+        browser.handoff().await.unwrap();
+        browser.remember_private_traveler_use();
+        assert!(browser.return_control_signed_in().await.is_err());
+        assert!(!browser.needs_restart());
         browser.return_control().await.unwrap();
         assert!(visit().await.contains("stored:|"));
         fixture.abort();

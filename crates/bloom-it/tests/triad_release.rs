@@ -2552,6 +2552,13 @@ fn linux_installer_allocates_distinct_ports_and_rejects_mixed_release_sets() {
         fs::read_to_string(root.join("usr/lib/systemd/system/bloom-checkout@.service")).unwrap();
     assert!(checkout_unit.contains("--view-port ${BLOOM_CHECKOUT_VIEW_PORT}"));
     assert!(!checkout_unit.contains("18736"));
+    // Unbraced so "--xvfb <path>" becomes two arguments and empty becomes none.
+    assert!(checkout_unit.contains(" $BLOOM_CHECKOUT_DISPLAY_ARGS\n"));
+    assert!(
+        fs::read_to_string(root.join("etc/bloom/1000/checkout.env"))
+            .unwrap()
+            .contains("BLOOM_CHECKOUT_DISPLAY_ARGS=\n")
+    );
 
     let installed_binary = root.join("usr/libexec/bloom/current/bloom-broker");
     let before = fs::read(&installed_binary).unwrap();

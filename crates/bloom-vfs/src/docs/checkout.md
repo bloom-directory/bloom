@@ -90,9 +90,11 @@ For a login, code, captcha or bot check, write a request with
 Send the ceremony URL. They work in Bloom's browser and click Done.
 Any interaction may charge a shop-saved method, so the result remains
 `uncertain` unless merchant evidence establishes an outcome. An untouched
-view can return as `returned`. Shopping restarts on a blank page without
-their login, cookies or the page they left: a logged-in shop could charge its
-saved payment method on any click. Reopen the shop and recheck the basket.
+view can return as `returned`. Shopping restarts on a blank page, without the
+page they left. It also loses their login unless they choose to stay signed in
+(not offered after a saved traveler was filled); you then see signed-in pages.
+If a shop needs a login to browse, say so in `agent_description`. Reopen the
+shop and recheck the basket.
 The first cardless take-over enrolls a passkey without requiring a saved card
 or traveler. Complete merchant interactions in that approved private session.
 

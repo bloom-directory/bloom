@@ -74,6 +74,7 @@ document.getElementById('typing').addEventListener('submit', event => {
 });
 document.querySelectorAll('[data-key]').forEach(button=>button.addEventListener('click',()=>act({action:'key',key:button.dataset.key})));
 document.getElementById('finish').addEventListener('click',()=>act({action:'finish'}));
+document.getElementById('stay-signed-in').addEventListener('click',()=>act({action:'finish',stay_signed_in:true}));
 async function savedOptions() {
   const response = await privateFetch('/saved');
   if (!response.ok) return;
@@ -166,6 +167,7 @@ async function refresh() {
     }
     const state=await response.json();status.textContent=describe(state);
     document.getElementById('saved-tools').hidden = !state.can_use_saved;
+    for (const id of ['stay-signed-in', 'stay-note']) document.getElementById(id).hidden = !state.can_stay_signed_in;
     showSaved(state.saved);
     if(state.state==='human_control'){
       document.getElementById('heading').textContent="Bloom's browser";

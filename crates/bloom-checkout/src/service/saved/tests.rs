@@ -178,7 +178,12 @@ async fn traveler_approval_keeps_private_session_and_never_exposes_review_url() 
     );
     assert!(
         service
-            .private_action(&token, ViewAction::Finish)
+            .private_action(
+                &token,
+                ViewAction::Finish {
+                    stay_signed_in: false
+                }
+            )
             .await
             .is_err()
     );
@@ -361,7 +366,12 @@ async fn approved_payment_submits_once_and_keeps_confirmation_private() {
             .is_err()
     );
     service
-        .private_action(&token, ViewAction::Finish)
+        .private_action(
+            &token,
+            ViewAction::Finish {
+                stay_signed_in: false,
+            },
+        )
         .await
         .unwrap();
     assert!(matches!(

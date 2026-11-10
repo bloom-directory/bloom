@@ -1046,12 +1046,30 @@ impl CheckoutService {
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ViewAction {
-    Click { x: f64, y: f64 },
-    Type { text: String },
-    Key { key: String },
-    Scroll { x: f64, y: f64, delta_y: f64 },
-    SelectPage { target: String },
-    Finish,
+    Click {
+        x: f64,
+        y: f64,
+    },
+    Type {
+        text: String,
+    },
+    Key {
+        key: String,
+    },
+    Scroll {
+        x: f64,
+        y: f64,
+        delta_y: f64,
+    },
+    SelectPage {
+        target: String,
+    },
+    /// `stay_signed_in` keeps a take-over's cookies for later shopping. Only
+    /// the person chooses it; the agent then sees signed-in pages.
+    Finish {
+        #[serde(default)]
+        stay_signed_in: bool,
+    },
 }
 
 /// The state a card or site checkout ends in when its private view closes:
@@ -1549,8 +1567,9 @@ impl CheckoutService {
             .await
             .as_ref()
             .is_some_and(|c| c.mode == Mode::TakeOver);
+        let can_stay_signed_in = can_use_saved && !self.browser.has_private_traveler_data();
         Ok(
-            json!({"state":status.state,"outcome":status.outcome,"pages":pages,"selected_page":selected_page,"closed":false,"saved":saved,"can_use_saved":can_use_saved}),
+            json!({"state":status.state,"outcome":status.outcome,"pages":pages,"selected_page":selected_page,"closed":false,"saved":saved,"can_use_saved":can_use_saved,"can_stay_signed_in":can_stay_signed_in}),
         )
     }
 
@@ -1593,7 +1612,10 @@ impl CheckoutService {
     pub async fn private_action(&self, token: &str, action: ViewAction) -> Result<()> {
         let _gate = self.action_gate.lock().await;
         self.require_saved_idle()?;
-        if !matches!(action, ViewAction::Finish | ViewAction::SelectPage { .. }) {
+        if !matches!(
+            action,
+            ViewAction::Finish { .. } | ViewAction::SelectPage { .. }
+        ) {
             let mut private = self.private.lock().await;
             let checkout = private.as_mut().context("No active private checkout")?;
             authorize_view(checkout, token)?;
@@ -1815,15 +1837,23 @@ impl CheckoutService {
                 checkout.view_target = target;
                 checkout.view_session = session;
             }
-            ViewAction::Finish => {
+            ViewAction::Finish { stay_signed_in } => {
                 let (operation_id, mode) = {
                     let private = self.private.lock().await;
                     let checkout = private.as_ref().context("No active private checkout")?;
                     authorize_view(checkout, token)?;
                     (checkout.operation_id.clone(), checkout.mode)
                 };
+                if stay_signed_in && mode != Mode::TakeOver {
+                    bail!("Only a take-over can keep its sign-in");
+                }
                 if mode == Mode::TakeOver {
-                    self.return_control().await?;
+                    if stay_signed_in {
+                        self.saved.lock().take();
+                        self.browser.return_control_signed_in().await?;
+                    } else {
+                        self.return_control().await?;
+                    }
                     let current = self.store.get(&operation_id)?.state;
                     self.set_state(
                         &operation_id,
@@ -2280,6 +2310,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_the_person_in_a_take_over_can_stay_signed_in() {
+        let (service, browser, _, server) = shopping_service("<p>Account</p>").await;
+        let parsed: ViewAction = serde_json::from_str(r#"{"action":"finish"}"#).unwrap();
+        assert!(matches!(
+            parsed,
+            ViewAction::Finish {
+                stay_signed_in: false
+            }
+        ));
+        let token = hex_token(&[46; 32]);
+        for (id, mode) in [("4", Mode::Site), ("5", Mode::TakeOver)] {
+            let tab = browser.handoff().await.unwrap();
+            let operation_id = id.repeat(64);
+            let status = Status {
+                operation_id: operation_id.clone(),
+                state: "human_control".into(),
+                ceremony_url: None,
+                filled_fields: vec![],
+                outcome: None,
+                paused: false,
+                reason: None,
+                view_url: None,
+            };
+            let kind = if mode == Mode::Site {
+                "site"
+            } else {
+                "take_over"
+            };
+            service.store.insert(&status, kind, "Fixture").unwrap();
+            *service.private.lock().await = Some(PrivateCheckout {
+                operation_id: operation_id.clone(),
+                mode,
+                view_target: tab.target.clone(),
+                view_session: tab.session.clone(),
+                seen_pages: std::collections::HashSet::from([tab.target.clone()]),
+                tab,
+                discovery: None,
+                recipient: None,
+                capability: token.clone(),
+                session: Some(token.clone()),
+                approved: true,
+                manual_submission: false,
+                submitted: false,
+            });
+            let state = service.private_state(&token).await.unwrap();
+            assert_eq!(state["can_stay_signed_in"], mode == Mode::TakeOver);
+            let stay = ViewAction::Finish {
+                stay_signed_in: true,
+            };
+            if mode == Mode::Site {
+                assert!(service.private_action(&token, stay).await.is_err());
+                service
+                    .private_action(
+                        &token,
+                        ViewAction::Finish {
+                            stay_signed_in: false,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                service.private_action(&token, stay).await.unwrap();
+                // An untouched take-over still returns cleanly.
+                assert_eq!(service.store.get(&operation_id).unwrap().state, "returned");
+            }
+            assert!(service.private.lock().await.is_none());
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn a_failed_handoff_leaves_no_requested_checkout() {
         let (service, browser, _, server) = shopping_service("<button>Pay</button>").await;
         let _held = browser.handoff().await.unwrap();
@@ -2306,7 +2407,14 @@ mod tests {
         assert_eq!(watch_briefly(&service, &id).await, "booked");
         assert!(service.store.get(&id).unwrap().paused);
         assert!(service.browser.needs_restart());
-        let _ = service.private_action(&token, ViewAction::Finish).await;
+        let _ = service
+            .private_action(
+                &token,
+                ViewAction::Finish {
+                    stay_signed_in: false,
+                },
+            )
+            .await;
         assert_eq!(service.store.get(&id).unwrap().state, "booked");
         server.abort();
     }
@@ -3412,7 +3520,12 @@ mod tests {
             submitted: false,
         });
         service
-            .private_action(&token, ViewAction::Finish)
+            .private_action(
+                &token,
+                ViewAction::Finish {
+                    stay_signed_in: false,
+                },
+            )
             .await
             .unwrap();
         let resolved = service.store.get(&prior).unwrap();
@@ -3797,7 +3910,12 @@ mod tests {
             .await
             .unwrap();
         service
-            .private_action(session_token, ViewAction::Finish)
+            .private_action(
+                session_token,
+                ViewAction::Finish {
+                    stay_signed_in: false,
+                },
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -3910,7 +4028,12 @@ mod tests {
             .await
             .unwrap();
         service
-            .private_action(&token, ViewAction::Finish)
+            .private_action(
+                &token,
+                ViewAction::Finish {
+                    stay_signed_in: false,
+                },
+            )
             .await
             .unwrap();
         assert_eq!(service.store.get("take-over").unwrap().state, "uncertain");

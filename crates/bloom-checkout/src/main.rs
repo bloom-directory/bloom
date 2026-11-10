@@ -26,6 +26,11 @@ struct Args {
     machine_uid: u32,
     #[arg(long, default_value_t = 0)]
     view_port: u16,
+    /// Run Chromium as the normal browser on a private Xvfb display started
+    /// from this path, instead of headless. Linux only. Some shops refuse
+    /// headless browsers.
+    #[arg(long)]
+    xvfb: Option<PathBuf>,
     /// Exit cleanly when the session-bound Broker disappears (launchd lifecycle).
     #[arg(long)]
     follow_broker_lifecycle: bool,
@@ -58,7 +63,28 @@ async fn main() -> Result<()> {
     };
     #[cfg(not(feature = "triad-dev-harness"))]
     let flags = Vec::new();
-    let browser = Browser::launch(&args.chromium, &args.profile, &flags).await?;
+    // The display lives until Checkout exits; Chromium exits with it.
+    #[cfg(target_os = "linux")]
+    let display = match &args.xvfb {
+        Some(xvfb) => {
+            use anyhow::Context;
+            let dir = args.state.parent().context("State path has no directory")?;
+            Some(bloom_checkout::display::Display::start(xvfb, dir)?)
+        }
+        None => None,
+    };
+    #[cfg(target_os = "linux")]
+    let display_environment = display
+        .as_ref()
+        .map(|display| display.environment().to_vec())
+        .unwrap_or_default();
+    #[cfg(not(target_os = "linux"))]
+    let display_environment = match &args.xvfb {
+        Some(_) => anyhow::bail!("--xvfb is supported only on Linux"),
+        None => Vec::new(),
+    };
+    let browser =
+        Browser::launch_on(&args.chromium, &args.profile, &flags, &display_environment).await?;
     let view_listener =
         tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, args.view_port)).await?;
     let view_port = view_listener.local_addr()?.port();

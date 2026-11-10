@@ -82,7 +82,7 @@ pub(crate) struct Cdp {
     sequence: AtomicU64,
 }
 
-fn pipe() -> Result<(OwnedFd, OwnedFd)> {
+pub(crate) fn pipe() -> Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0; 2];
     // Both descriptors remain private through exec except the deliberate child mapping.
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -97,7 +97,7 @@ fn pipe() -> Result<(OwnedFd, OwnedFd)> {
     Ok(pair)
 }
 
-fn child_fd(fd: &OwnedFd) -> Result<OwnedFd> {
+pub(crate) fn child_fd(fd: &OwnedFd) -> Result<OwnedFd> {
     // Keep sources above the destination pair so dup2 cannot clobber a source.
     let copy = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
     if copy < 0 {
@@ -233,13 +233,27 @@ impl Cdp {
         }
         Ok(contexts)
     }
-    pub fn launch(executable: &Path, profile: &Path, test_flags: &[String]) -> Result<Arc<Self>> {
+    /// `display` holds the X display variables for a headed browser; without
+    /// it Chromium runs headless.
+    pub fn launch(
+        executable: &Path,
+        profile: &Path,
+        test_flags: &[String],
+        display: &[(&str, std::ffi::OsString)],
+    ) -> Result<Arc<Self>> {
         let (command_read, command_write) = pipe()?;
         let (event_read, event_write) = pipe()?;
         let child_read = child_fd(&command_read)?;
         let child_write = child_fd(&event_write)?;
         let mut command = Command::new(executable);
-        command.args(["--headless=new","--remote-debugging-pipe","--no-first-run",
+        if display.is_empty() {
+            command.arg("--headless=new");
+        } else {
+            command
+                .arg("--ozone-platform=x11")
+                .envs(display.iter().cloned());
+        }
+        command.args(["--remote-debugging-pipe","--no-first-run",
             "--no-default-browser-check","--disable-sync","--disable-breakpad",
             "--disable-crash-reporter","--disable-extensions","--disable-component-extensions-with-background-pages",
             "--force-device-scale-factor=1","--window-size=1280,900",
@@ -489,7 +503,13 @@ mod tests {
     #[tokio::test]
     async fn oversized_reply_does_not_disable_later_browser_commands() {
         let root = tempfile::tempdir().unwrap().keep();
-        let cdp = Cdp::launch(&crate::test_chromium(), &root, &["--no-sandbox".into()]).unwrap();
+        let cdp = Cdp::launch(
+            &crate::test_chromium(),
+            &root,
+            &["--no-sandbox".into()],
+            &[],
+        )
+        .unwrap();
         let target = cdp
             .call(None, "Target.createTarget", json!({"url":"about:blank"}))
             .await
