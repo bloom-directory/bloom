@@ -18,6 +18,7 @@ use bloom_machine_client::{
 use bloom_proto::{AddressBook, HomeDir, HomeWritePermit};
 use bloom_tx::{outbox::Outbox, tx_engine::TxEngine};
 use bloom_vfs::{Handler, HandlerError, VfsPath, handlers::wallets::WalletsHandler};
+use parking_lot::Mutex;
 use sha2::{Digest as _, Sha256};
 
 #[path = "support/m2_exact_production_routes.rs"]
@@ -41,6 +42,8 @@ struct BrokerFixture {
     available: AtomicBool,
     complete: AtomicBool,
     lose_prepare_response_once: AtomicBool,
+    unavailable_after_commit: AtomicBool,
+    prepare_refusal_once: Mutex<Option<ProtocolErrorCode>>,
     ceremony_state_override: parking_lot::Mutex<Option<CeremonyState>>,
     requests: parking_lot::Mutex<Vec<MachineBrokerRequest>>,
     state: parking_lot::Mutex<FixtureState>,
@@ -56,7 +59,8 @@ impl BrokerFixture {
             canonical_policy: Base64UrlBytes::from_bytes(state.proposed_policy.as_ref().unwrap()),
             policy_digest: state.proposed_digest.clone().unwrap(),
             policy_signing_key_id: Token::new("policy-key").unwrap(),
-            policy_verifying_key: Base64UrlBytes::from_bytes(&[4; 32]),
+            // A commit re-signs with the wallet's pinned policy key.
+            policy_verifying_key: Base64UrlBytes::from_bytes(&[2; 32]),
             signer_signature: Base64UrlBytes::from_bytes(&[5; 64]),
         }
     }
@@ -167,6 +171,14 @@ impl MachineBrokerService for BrokerFixture {
                     };
                     Ok(MachineBrokerResponse::PolicyRead(snapshot))
                 }
+                MachineBrokerRequest::PolicyValidateUpdate(_)
+                    if self.prepare_refusal_once.lock().is_some() =>
+                {
+                    Err(ProtocolError::new(
+                        self.prepare_refusal_once.lock().take().unwrap(),
+                        "another ceremony is open for this wallet",
+                    ))
+                }
                 MachineBrokerRequest::PolicyValidateUpdate(request) => {
                     self.state.lock().operation_id = Some(request.operation_id.clone());
                     self.state.lock().proposed_policy =
@@ -248,6 +260,9 @@ impl MachineBrokerService for BrokerFixture {
                     }))
                 }
                 MachineBrokerRequest::PolicyCommitUpdate(request) => {
+                    if self.unavailable_after_commit.load(Ordering::SeqCst) {
+                        self.available.store(false, Ordering::SeqCst);
+                    }
                     let committed = self.committed_snapshot();
                     let authority_diff_digest =
                         self.state.lock().authority_diff_digest.clone().unwrap();
@@ -271,6 +286,7 @@ impl MachineBrokerService for BrokerFixture {
 
 fn policy(maximum_approval_lifetime_ms: u64) -> CanonicalWalletPolicy {
     CanonicalWalletPolicy {
+        clear_signing: None,
         wallet_id: Token::new("alice").unwrap(),
         maximum_approval_lifetime_ms,
         allowed_petal_packages: Vec::new(),
@@ -282,7 +298,6 @@ fn policy(maximum_approval_lifetime_ms: u64) -> CanonicalWalletPolicy {
             verifier_id: Token::new("human").unwrap(),
             verifier_digest: Digest32::from_bytes([4; 32]),
         }],
-        clear_signing: None,
     }
 }
 
@@ -292,6 +307,8 @@ fn broker_fixture(lose_prepare_response_once: bool) -> Arc<BrokerFixture> {
         available: AtomicBool::new(true),
         complete: AtomicBool::new(false),
         lose_prepare_response_once: AtomicBool::new(lose_prepare_response_once),
+        unavailable_after_commit: AtomicBool::new(false),
+        prepare_refusal_once: Mutex::new(None),
         ceremony_state_override: parking_lot::Mutex::new(None),
         requests: parking_lot::Mutex::new(Vec::new()),
         state: parking_lot::Mutex::new(FixtureState {
@@ -489,6 +506,70 @@ async fn vfs_policy_prepare_response_loss_reconciles_the_persisted_operation_id(
     ));
 }
 
+/// A rate-limited prepare opened no ceremony, so nothing may stay pending:
+/// a pending row with no ceremony could not be cancelled and would block
+/// every later policy write.
+#[tokio::test]
+async fn vfs_policy_rate_limited_prepare_leaves_nothing_pending() {
+    for code in [
+        ProtocolErrorCode::CeremonyRateLimited,
+        ProtocolErrorCode::QuotaExceeded,
+        ProtocolErrorCode::PolicyBaselineStale,
+    ] {
+        check_policy_prepare_refusal(code).await;
+    }
+}
+
+async fn check_policy_prepare_refusal(code: ProtocolErrorCode) {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(false);
+    *fixture.prepare_refusal_once.lock() = Some(code);
+    let service: Arc<dyn MachineBrokerService> = fixture.clone();
+    let home = HomeDir::at(temp.path().join("home"));
+    let handler = WalletsHandler::new(
+        bloom_evm::ChainRegistry::default(),
+        TxEngine::new(Outbox::new(temp.path().join("outbox")).unwrap(), 60_000),
+        AddressBook::default(),
+        projection_reader(
+            temp.path().join("cache/rate-limit-wallets.json"),
+            Some(MachineBrokerClient::new(service.clone())),
+        ),
+        temp.path().join("machine-policy-projections"),
+    )
+    .with_broker(Some(MachineBrokerClient::new(service)))
+    .with_home_write_permit(Arc::new(HomeWritePermit::acquire(&home).unwrap()));
+    let write_path = VfsPath::parse("alice/policy.json").unwrap();
+    let proposed = serde_json::to_vec_pretty(&policy(120_000)).unwrap();
+    let updates = temp
+        .path()
+        .join("machine-policy-projections/alice/policy-updates");
+
+    let refused = handler.write(&write_path, &proposed).await.unwrap_err();
+    assert!(matches!(refused, HandlerError::Backend(_)), "{refused:?}");
+    assert_eq!(
+        std::fs::read_dir(updates.join("pending")).unwrap().count(),
+        0
+    );
+    assert_eq!(
+        std::fs::read_dir(updates.join("failed")).unwrap().count(),
+        1
+    );
+
+    if code == ProtocolErrorCode::QuotaExceeded {
+        // Respect the client's 250ms quota backoff before retrying.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+
+    assert!(matches!(
+        handler.write(&write_path, &proposed).await,
+        Err(HandlerError::PermissionDenied)
+    ));
+    assert_eq!(
+        std::fs::read_dir(updates.join("pending")).unwrap().count(),
+        1
+    );
+}
+
 #[tokio::test]
 async fn vfs_policy_write_of_the_current_policy_stages_nothing() {
     let temp = tempfile::tempdir().unwrap();
@@ -670,6 +751,12 @@ async fn vfs_policy_write_prepares_then_commits_only_with_completed_custody_rece
             MachineBrokerRequest::CeremonyStatus(_),
             MachineBrokerRequest::CustodyResult(_),
             MachineBrokerRequest::PolicyCommitUpdate(_),
+            // The commit refreshes the wallet so staging sees the new policy.
+            MachineBrokerRequest::WalletGetPublic(_),
+            MachineBrokerRequest::KeyListPublic(_),
+            MachineBrokerRequest::CredentialListPublic(_),
+            MachineBrokerRequest::PolicyRead(_),
+            MachineBrokerRequest::WalletAccounts(_),
             MachineBrokerRequest::WalletGetPublic(_),
             MachineBrokerRequest::KeyListPublic(_),
             MachineBrokerRequest::CredentialListPublic(_),
@@ -677,6 +764,119 @@ async fn vfs_policy_write_prepares_then_commits_only_with_completed_custody_rece
             MachineBrokerRequest::WalletAccounts(_)
         ]
     ));
+}
+
+/// bloom#354: staging reads the wallet's cached navigation projection, which
+/// production reuses for up to a second. A stage straight after a committed
+/// policy update must see the new policy, not the observation taken before it.
+#[tokio::test]
+async fn vfs_policy_commit_refreshes_the_cached_wallet_projection() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(false);
+    let service: Arc<dyn MachineBrokerService> = fixture.clone();
+    let broker = MachineBrokerClient::new(service);
+    let home = HomeDir::at(temp.path().join("home"));
+    let reader = Arc::new(
+        CachedWalletProjectionReader::new(
+            Some(broker.clone()),
+            FileProjectionStore::new(temp.path().join("cache/wallets.json")),
+        )
+        .unwrap()
+        .with_max_age(std::time::Duration::from_secs(60)),
+    );
+    let handler = WalletsHandler::new(
+        bloom_evm::ChainRegistry::default(),
+        TxEngine::new(Outbox::new(temp.path().join("outbox")).unwrap(), 60_000),
+        AddressBook::default(),
+        reader.clone(),
+        temp.path().join("machine-policy-projections"),
+    )
+    .with_broker(Some(broker))
+    .with_home_write_permit(Arc::new(HomeWritePermit::acquire(&home).unwrap()));
+    let write_path = VfsPath::parse("alice/policy.json").unwrap();
+    let proposed = serde_json::to_vec_pretty(&policy(120_000)).unwrap();
+    let alice = Token::new("alice").unwrap();
+
+    assert!(matches!(
+        handler.write(&write_path, &proposed).await,
+        Err(HandlerError::PermissionDenied)
+    ));
+    let before = reader.get_wallet_navigation(&alice).await.unwrap();
+    assert_eq!(before.policy.version.get(), 1);
+
+    fixture.complete.store(true, Ordering::SeqCst);
+    handler.write(&write_path, &proposed).await.unwrap();
+    let after = reader.get_wallet_navigation(&alice).await.unwrap();
+    assert_eq!(after.policy.version.get(), 2);
+    assert_eq!(after.policy, fixture.committed_snapshot());
+}
+
+/// If the post-commit refresh fails, the committed write still succeeds, but
+/// the next navigation read must observe Broker instead of reusing the
+/// pre-commit projection.
+#[tokio::test]
+async fn vfs_policy_commit_refresh_failure_does_not_leave_stale_policy_fresh() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(false);
+    let service: Arc<dyn MachineBrokerService> = fixture.clone();
+    let broker = MachineBrokerClient::new(service);
+    let home = HomeDir::at(temp.path().join("home"));
+    let reader = Arc::new(
+        CachedWalletProjectionReader::new(
+            Some(broker.clone()),
+            FileProjectionStore::new(temp.path().join("cache/wallets.json")),
+        )
+        .unwrap()
+        .with_max_age(std::time::Duration::from_secs(60)),
+    );
+    let handler = WalletsHandler::new(
+        bloom_evm::ChainRegistry::default(),
+        TxEngine::new(Outbox::new(temp.path().join("outbox")).unwrap(), 60_000),
+        AddressBook::default(),
+        reader.clone(),
+        temp.path().join("machine-policy-projections"),
+    )
+    .with_broker(Some(broker))
+    .with_home_write_permit(Arc::new(HomeWritePermit::acquire(&home).unwrap()));
+    let write_path = VfsPath::parse("alice/policy.json").unwrap();
+    let proposed = serde_json::to_vec_pretty(&policy(120_000)).unwrap();
+    let alice = Token::new("alice").unwrap();
+
+    assert!(matches!(
+        handler.write(&write_path, &proposed).await,
+        Err(HandlerError::PermissionDenied)
+    ));
+    let before = reader.get_wallet_navigation(&alice).await.unwrap();
+    assert_eq!(before.policy.version.get(), 1);
+
+    fixture.complete.store(true, Ordering::SeqCst);
+    fixture
+        .unavailable_after_commit
+        .store(true, Ordering::SeqCst);
+    handler.write(&write_path, &proposed).await.unwrap();
+
+    // While Broker stays unavailable, staging's reads must not fall back to
+    // the cached pre-commit policy.
+    for result in [
+        reader.get_wallet_navigation(&alice).await,
+        reader.get_wallet(&alice).await,
+    ] {
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("changed since its cached projection"),
+            "{error:?}"
+        );
+    }
+
+    fixture
+        .unavailable_after_commit
+        .store(false, Ordering::SeqCst);
+    fixture.available.store(true, Ordering::SeqCst);
+    let after = reader.get_wallet_navigation(&alice).await.unwrap();
+    assert_eq!(after.policy.version.get(), 2);
+    assert_eq!(after.policy, fixture.committed_snapshot());
 }
 
 #[tokio::test]
@@ -948,5 +1148,72 @@ async fn petal_eligibility_recovers_lost_prepare_and_commits_after_restart() {
             .filter(|r| matches!(r, MachineBrokerRequest::PolicyCommitUpdate(_)))
             .count(),
         1
+    );
+}
+
+fn prepare_count(fixture: &BrokerFixture) -> usize {
+    fixture
+        .requests
+        .lock()
+        .iter()
+        .filter(|r| matches!(r, MachineBrokerRequest::PolicyValidateUpdate(_)))
+        .count()
+}
+
+#[tokio::test]
+async fn expired_petal_policy_approval_is_replaced_on_retry() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(false);
+    let hash = Digest32::from_bytes([7; 32]);
+    let handler = eligibility_handler(temp.path(), fixture.clone());
+    let PetalEligibility::AwaitingPolicyApproval(first) = handler
+        .ensure_petal_eligibility("alice", &hash)
+        .await
+        .unwrap()
+    else {
+        panic!("owner approval must be required");
+    };
+
+    // Broker's status sweep retired the unsigned ceremony at its expiry.
+    *fixture.ceremony_state_override.lock() = Some(CeremonyState::Expired);
+    let PetalEligibility::AwaitingPolicyApproval(replacement) = handler
+        .ensure_petal_eligibility("alice", &hash)
+        .await
+        .unwrap()
+    else {
+        panic!("an expired approval must be replaced");
+    };
+    assert_ne!(replacement.operation_id, first.operation_id);
+    assert!(replacement.prepare.is_some());
+    assert_eq!(prepare_count(&fixture), 2);
+    let updates = temp
+        .path()
+        .join("machine-policy-projections/alice/policy-updates");
+    assert!(
+        updates
+            .join("failed")
+            .join(first.operation_id.as_str())
+            .exists()
+    );
+
+    // The replacement is usable: once approved, the retry commits it.
+    *fixture.ceremony_state_override.lock() = None;
+    fixture.complete.store(true, Ordering::SeqCst);
+    let PetalEligibility::Allowed(snapshot) = handler
+        .ensure_petal_eligibility("alice", &hash)
+        .await
+        .unwrap()
+    else {
+        panic!("the approved replacement must commit");
+    };
+    assert_eq!(
+        snapshot.canonical_policy.decode(),
+        serde_jcs::to_vec(&policy_with_package(&policy(60_000), &hash)).unwrap()
+    );
+    assert!(
+        updates
+            .join("confirmed")
+            .join(replacement.operation_id.as_str())
+            .exists()
     );
 }

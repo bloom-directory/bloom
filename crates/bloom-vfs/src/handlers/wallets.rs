@@ -26,6 +26,7 @@
 //! - `wallets/<wallet>/<n>/address.sol`                             — the account's Solana address, if it has a Solana key
 //! - `wallets/<wallet>/<n>/address.sol.qr.{svg,png}`                — scannable QR images of that address
 //! - `wallets/<wallet>/<n>/public_key`                              — canonical public key hex (EVM key, else Solana)
+//! - `wallets/<wallet>/<n>/holdings.json`                           — non-zero native and major-token balances on every chain
 //! - `wallets/<wallet>/<n>/chains/<chain>/{balance,balance.raw,balance.json}` — native balance of account n
 //! - `wallets/<wallet>/<n>/chains/<evm-chain>/nonce`
 //! - `wallets/<wallet>/<n>/chains/<evm-chain>/{pending_external.jsonl,nonce_conflicts.json}` — mempool views of account n's address
@@ -54,6 +55,23 @@ use accounts::accounts_json_with_numbers as render_accounts_json;
 pub use accounts::{
     ACCOUNT_KEY_FILES, accounts_json_with_numbers, derivation_path_number, parse_account_segment,
 };
+
+/// Control entries `/wallets` lists beside the wallets, and whether each is a
+/// directory. The root listing is built from this table, so no wallet may
+/// take these names and wallet inventories skip exactly these.
+pub const WALLET_CONTROL_ENTRIES: [(&str, bool); 4] = [
+    ("new", false),
+    ("registrations", true),
+    ("recover", false),
+    ("recoveries", true),
+];
+
+/// Whether `name` is one of `WALLET_CONTROL_ENTRIES` rather than a wallet.
+pub fn is_wallet_control_entry(name: &str) -> bool {
+    WALLET_CONTROL_ENTRIES
+        .iter()
+        .any(|(entry, _)| *entry == name)
+}
 
 use async_trait::async_trait;
 use bloom_broker_api::ProtocolErrorCode;
@@ -750,10 +768,8 @@ impl WalletsHandler {
             }
         };
         let requested_name = request.name.as_str();
-        if matches!(
-            requested_name,
-            "new" | "registrations" | "recover" | "recoveries"
-        ) || requested_name.is_empty()
+        if is_wallet_control_entry(requested_name)
+            || requested_name.is_empty()
             || requested_name.len() > 64
             || !requested_name.chars().all(|character| {
                 character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
@@ -1144,10 +1160,8 @@ impl WalletsHandler {
             }
         };
         let requested_name = request.name.as_str();
-        if matches!(
-            requested_name,
-            "new" | "registrations" | "recover" | "recoveries"
-        ) || requested_name.is_empty()
+        if is_wallet_control_entry(requested_name)
+            || requested_name.is_empty()
             || requested_name.len() > 64
             || !requested_name.chars().all(|character| {
                 character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
@@ -2109,7 +2123,7 @@ impl WalletsHandler {
             let prepared = broker
                 .validate_policy_update(projection.request(proposed_bytes))
                 .await
-                .map_err(|error| HandlerError::backend(error.to_string()))?;
+                .map_err(|error| self.policy_prepare_refused(wallet, operation_id, error))?;
             projection.adopt_prepare(prepared)?;
             write_atomic_json(&projection_path, &projection)?;
             return Err(HandlerError::PermissionDenied);
@@ -2188,6 +2202,19 @@ impl WalletsHandler {
                     "pending",
                     "confirmed",
                 )?;
+                // Staging reads the cached wallet projection. Observe the new
+                // policy now, or a stage in the next second keeps the old
+                // verdict and its entry is refused at confirm (bloom#354).
+                // If that read fails, drop the cached observation so the next
+                // stage observes Broker rather than the superseded policy.
+                if let Err(error) = self.wallet_projection_authority(wallet).await {
+                    tracing::warn!(wallet, %error, "policy committed; wallet refresh failed");
+                    if let Some(projections) = &self.wallet_projections {
+                        projections
+                            .invalidate_wallet(&wallet_id)
+                            .map_err(|error| HandlerError::backend(error.to_string()))?;
+                    }
+                }
                 Ok(())
             }
             bloom_broker_api::CeremonyState::Cancelled
@@ -2202,10 +2229,8 @@ impl WalletsHandler {
                     "pending",
                     "failed",
                 )?;
-                Err(HandlerError::invalid(format!(
-                    "Broker policy ceremony is terminal: {:?}",
-                    status.state
-                )))
+                // Retired without committing; the caller proposes again.
+                Ok(())
             }
             bloom_broker_api::CeremonyState::Completed => Err(HandlerError::backend(
                 "policy_update ceremony reported the wallet-registration-only COMPLETED state",
@@ -2347,7 +2372,7 @@ impl WalletsHandler {
         let prepared = broker
             .validate_policy_update(projection.request(&proposed_bytes))
             .await
-            .map_err(|error| HandlerError::backend(error.to_string()))?;
+            .map_err(|error| self.policy_prepare_refused(wallet, operation_id.as_str(), error))?;
         projection.adopt_prepare(prepared)?;
         write_atomic_json(&projection_path, &projection)?;
         Err(HandlerError::PermissionDenied)
@@ -2421,11 +2446,27 @@ impl WalletsHandler {
         self.policy_update_state_dir(wallet, state).join(action_id)
     }
 
-    /// Atomically move an action between lifecycle states (e.g. `pending` →
-    /// `confirmed` once the approved policy is installed). Best-effort: a
-    /// failure is logged but never overrides an already-decided install/error
-    /// outcome. In production the Broker/Signer receipt is authoritative and
-    /// this move changes only Machine's workflow projection.
+    /// A definitive prepare refusal means the Broker opened no ceremony, so
+    /// the pending proposal has nothing to approve or cancel. Left in
+    /// `pending/` it would block every later policy write; move it to
+    /// `failed/` and return the Broker's reason.
+    fn policy_prepare_refused(
+        &self,
+        wallet: &str,
+        operation_id: &str,
+        error: bloom_broker_api::ProtocolError,
+    ) -> HandlerError {
+        if error.code != ProtocolErrorCode::ServiceUnavailable
+            && let Err(io) =
+                self.policy_update_transition(wallet, operation_id, "pending", "failed")
+        {
+            return HandlerError::from(io);
+        }
+        HandlerError::backend(error.to_string())
+    }
+
+    /// Atomically move Machine's workflow projection between lifecycle states.
+    /// The Broker/Signer receipt remains authoritative.
     fn policy_update_transition(
         &self,
         wallet: &str,
@@ -2654,6 +2695,12 @@ impl WalletsHandler {
 
 fn err_be(e: impl std::fmt::Display) -> HandlerError {
     HandlerError::backend(e.to_string())
+}
+
+/// The refusal for a write waiting on owner approval, naming the entry's
+/// public challenge. It never carries the ceremony link: errors are logged.
+fn approval_pending(outbox: &str, id: &str) -> HandlerError {
+    HandlerError::ApprovalPending(format!("{outbox}/pending/{id}/{APPROVAL_CHALLENGE_FILE}"))
 }
 
 /// Render the newest pending entry as a `pending/<id>` symlink target.
@@ -3373,6 +3420,11 @@ impl Handler for WalletsHandler {
     fn cache_ttl(&self, path: &VfsPath) -> Option<std::time::Duration> {
         // Chain leaves exist only under a numbered account.
         match path.segments() {
+            [_, number, leaf]
+                if parse_account_segment(number).is_some() && leaf == "holdings.json" =>
+            {
+                Some(super::balances::LIVE_BALANCE_TTL)
+            }
             [_, number, s, _, leaf]
                 if parse_account_segment(number).is_some()
                     && s == "chains"
@@ -3907,10 +3959,13 @@ impl WalletsHandler {
                 .into_iter()
                 .map(|projection| Entry::dir(projection.wallet.wallet_id.as_str()))
                 .collect();
-            out.push(Entry::writable_file("new"));
-            out.push(Entry::dir("registrations"));
-            out.push(Entry::writable_file("recover"));
-            out.push(Entry::dir("recoveries"));
+            out.extend(WALLET_CONTROL_ENTRIES.iter().map(|(name, is_dir)| {
+                if *is_dir {
+                    Entry::dir(name)
+                } else {
+                    Entry::writable_file(name)
+                }
+            }));
             return Ok(out);
         }
         if segs[0] == "recoveries" {
@@ -4249,6 +4304,14 @@ impl WalletsHandler {
                     )
                     .map_err(solana_outbox_err)?;
                 require_pinned(&entry.staged, id)?;
+                // As on EVM, `cancel` written to confirm discards the entry
+                // instead of signing it.
+                if confirm_text.eq_ignore_ascii_case("cancel") {
+                    return engine
+                        .cancel(wallet, id)
+                        .await
+                        .map_err(|e| HandlerError::backend(e.to_string()));
+                }
                 // Re-select the exact account this transfer was staged
                 // against. Resolving the wallet's children again would let a
                 // second active child sign a message staged for the first.
@@ -4325,7 +4388,7 @@ impl WalletsHandler {
                             .outbox()
                             .write_approval_challenge(&entry, &challenge)
                             .map_err(solana_outbox_err)?;
-                        Err(HandlerError::PermissionDenied)
+                        Err(approval_pending(&outbox_path, id))
                     }
                     bloom_solana_tx::signing::SolanaSignOutcome::Signed { .. } => {
                         engine
@@ -4442,6 +4505,8 @@ impl WalletsHandler {
     /// resolved from that address by the transaction engine, so a stage from
     /// account 1 can never be signed by account 0. The pending controls are
     /// fenced to the same sender, so there is no unfenced outbox write.
+    /// `account` is the mounted number a pending-approval error points back at.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn write_outbox_from(
         &self,
         wallet: &str,
@@ -4450,8 +4515,10 @@ impl WalletsHandler {
         policy: &Policy,
         rest: &[String],
         data: &[u8],
+        account: u32,
     ) -> Result<(), HandlerError> {
         let scope = from.to_string();
+        let outbox = format!("wallets/{wallet}/{account}/chains/{chain}/outbox");
         let client = self
             .chains
             .get(chain)
@@ -4543,7 +4610,7 @@ impl WalletsHandler {
                         )
                         .await
                         .map_err(|e| match e {
-                            TxEngineError::ApprovalRequired(_) => HandlerError::PermissionDenied,
+                            TxEngineError::ApprovalRequired(_) => approval_pending(&outbox, id),
                             other => err_be(other),
                         })
                 }
@@ -4552,7 +4619,7 @@ impl WalletsHandler {
                     Ok(_staged) => Ok(()),
                     // A pending owner approval has its own projection,
                     // approval_challenge.json; anything else is recorded.
-                    Err(HandlerError::PermissionDenied) => Err(HandlerError::PermissionDenied),
+                    Err(error @ HandlerError::ApprovalPending(_)) => Err(error),
                     Err(error) => {
                         record_confirm_error(&entry_dir, wallet, id, &error, None);
                         Err(error)
@@ -4614,7 +4681,7 @@ impl WalletsHandler {
                     .await
                     .map(|_| ())
                     .map_err(|error| match error {
-                        TxEngineError::ApprovalRequired(_) => HandlerError::PermissionDenied,
+                        TxEngineError::ApprovalRequired(_) => approval_pending(&outbox, id),
                         other => err_be(other),
                     })
             }
@@ -4987,6 +5054,37 @@ mod tests {
         }
     }
 
+    /// Counts live authority reads so a test can tell a refresh happened.
+    struct CountingProjection(WalletProjection, std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl WalletProjectionReader for CountingProjection {
+        async fn list_wallets(
+            &self,
+        ) -> Result<Vec<WalletProjection>, bloom_broker_api::ProtocolError> {
+            Ok(vec![self.0.clone()])
+        }
+
+        async fn get_wallet(
+            &self,
+            _wallet_id: &Token,
+        ) -> Result<WalletProjection, bloom_broker_api::ProtocolError> {
+            Ok(self.0.clone())
+        }
+
+        async fn get_wallet_authority(
+            &self,
+            _wallet_id: &Token,
+        ) -> Result<WalletProjection, bloom_broker_api::ProtocolError> {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.0.clone())
+        }
+
+        fn cached_wallets(&self) -> Result<Vec<WalletProjection>, bloom_broker_api::ProtocolError> {
+            Ok(vec![self.0.clone()])
+        }
+    }
+
     fn static_projection_value(address: Address) -> WalletProjection {
         let wallet_id = token("alice");
         let key_ref = KeyRef {
@@ -4998,12 +5096,12 @@ mod tests {
             derivation: None,
         };
         let canonical = serde_jcs::to_vec(&CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: wallet_id.clone(),
             maximum_approval_lifetime_ms: 300_000,
             allowed_petal_packages: Vec::new(),
             allowed_destinations: Vec::new(),
             required_verifiers: Vec::new(),
-            clear_signing: None,
         })
         .unwrap();
         let policy_digest = Digest32::from_bytes(sha2::Sha256::digest(&canonical).into());
@@ -5079,12 +5177,12 @@ mod tests {
             }),
         };
         let canonical = serde_jcs::to_vec(&CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: wallet_id.clone(),
             maximum_approval_lifetime_ms: 300_000,
             allowed_petal_packages: Vec::new(),
             allowed_destinations: Vec::new(),
             required_verifiers: Vec::new(),
-            clear_signing: None,
         })
         .unwrap();
         let policy_digest = Digest32::from_bytes(sha2::Sha256::digest(&canonical).into());
@@ -5442,7 +5540,12 @@ mod tests {
         });
         let broker = MachineBrokerClient::new(shared_service.clone());
         let mut handler = f.handler.with_broker(Some(broker));
-        handler.wallet_projections = Some(bip39_projection(f.wallet_addr, accounts));
+        let projection = Arc::new(CountingProjection(
+            bip39_projection_value(f.wallet_addr, accounts),
+            Default::default(),
+        ));
+        handler.wallet_projections = Some(projection.clone());
+        let authority_reads = || projection.1.load(std::sync::atomic::Ordering::SeqCst);
         let w = &f.wallet_name;
 
         // The write starts one ceremony and stores a pending request.
@@ -5479,12 +5582,16 @@ mod tests {
         // returned paths.
         *shared_service.state.lock().unwrap() = bloom_broker_api::CeremonyState::Succeeded;
 
+        let reads_before = authority_reads();
         let status: serde_json::Value =
             serde_json::from_slice(&handler.read(&vfs(format!("/{w}/new"))).await.unwrap())
                 .unwrap();
         assert_eq!(status["requests"][0]["state"], "created");
         assert_eq!(status["requests"][0]["number"], 2);
         assert_eq!(status["requests"][0]["already_created"], true);
+        // Reporting the account refreshes the wallet projection, so a
+        // navigation read straight after it cannot reuse a pre-ceremony view.
+        assert_eq!(authority_reads(), reads_before + 1);
 
         // The prepared request carried the multi-family list and terms.
         let prepared = shared_service.prepared.lock().unwrap().clone().unwrap();
@@ -5839,7 +5946,6 @@ mod tests {
             expires_ms: u128::MAX,
             status: bloom_proto::TxStatus::Pending,
             action_kind: bloom_proto::TxActionKind::Unknown,
-            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,
@@ -6281,6 +6387,31 @@ value = "0""#
                 .unwrap();
             assert_eq!(sink.mode, 0o644, "{path}/restage must be writable");
         }
+
+        // `cancel` written to confirm discards the entry; it never signs.
+        handler
+            .write(
+                &vfs(format!(
+                    "/{w}/0/chains/solana-devnet/outbox/pending/sol-zero/confirm"
+                )),
+                b"cancel\n",
+            )
+            .await
+            .unwrap();
+        let names = |state: &'static str| {
+            let handler = handler.clone();
+            async move {
+                handler
+                    .list(&vfs(format!("/{w}/0/chains/solana-devnet/outbox/{state}")))
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|entry| entry.name)
+                    .collect::<Vec<String>>()
+            }
+        };
+        assert!(names("pending").await.is_empty());
+        assert!(names("failed").await.contains(&"sol-zero".to_string()));
     }
 
     /// A crash after the move to `failed/` but before the intent rewrite
@@ -7129,6 +7260,87 @@ value = "0""#,
     /// A stub Broker service: the Solana outbox read path never reaches it,
     /// so every method is a catch-all error.
     struct StubBroker;
+
+    #[tokio::test]
+    async fn policy_json_preserves_legacy_authority_until_explicit_removal_review() {
+        struct PolicyBroker {
+            baseline: SignedPolicySnapshot,
+            prepared: Mutex<Option<bloom_broker_api::PolicyUpdateRequest>>,
+        }
+        impl bloom_broker_api::MachineBrokerService for PolicyBroker {
+            fn dispatch<'a>(
+                &'a self,
+                request: MachineBrokerRequest,
+            ) -> bloom_broker_api::ServiceFuture<'a, MachineBrokerResponse> {
+                Box::pin(async move {
+                    match request {
+                        MachineBrokerRequest::PolicyRead(_) => {
+                            Ok(MachineBrokerResponse::PolicyRead(self.baseline.clone()))
+                        }
+                        MachineBrokerRequest::PolicyValidateUpdate(request) => {
+                            *self.prepared.lock().unwrap() = Some(request.clone());
+                            Ok(MachineBrokerResponse::PolicyValidateUpdate(
+                                bloom_broker_api::PolicyUpdatePrepareResponse {
+                                    operation_id: request.operation_id,
+                                    ceremony_kind: bloom_broker_api::CeremonyKind::PolicyUpdate,
+                                    ceremony_url: "https://example.invalid/legacy-removal-review"
+                                        .into(),
+                                    ceremony_expires_at_ms: DecimalU64::new(u64::MAX),
+                                    review_manifest_digest: digest(90),
+                                },
+                            ))
+                        }
+                        other => panic!("unexpected policy request: {other:?}"),
+                    }
+                })
+            }
+        }
+        let f = make_handler();
+        let mut vector: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../bloom-machine-client/tests/fixtures/legacy-policy-removal.json"
+        ))
+        .unwrap();
+        for field in ["current", "proposed"] {
+            vector[field]["wallet_id"] = serde_json::json!(f.wallet_name);
+        }
+        let current: CanonicalWalletPolicy =
+            serde_json::from_value(vector["current"].clone()).unwrap();
+        let proposed: CanonicalWalletPolicy =
+            serde_json::from_value(vector["proposed"].clone()).unwrap();
+        let bytes = serde_jcs::to_vec(&current).unwrap();
+        let mut projection = static_projection_value(f.wallet_addr);
+        projection.policy.canonical_policy = Base64UrlBytes::from_bytes(&bytes);
+        projection.policy.policy_digest = Digest32::from_bytes(sha2::Sha256::digest(&bytes).into());
+        let broker = Arc::new(PolicyBroker {
+            baseline: projection.policy.clone(),
+            prepared: Mutex::new(None),
+        });
+        let home = bloom_proto::HomeDir::at(f._tmp.path());
+        let handler = f
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(broker.clone())))
+            .with_projection_reader(Arc::new(StaticProjection(projection)))
+            .with_home_write_permit(Arc::new(HomeWritePermit::acquire(&home).unwrap()));
+        let path = VfsPath::parse(&format!("/{}/policy.json", f.wallet_name)).unwrap();
+        assert_eq!(handler.read(&path).await.unwrap(), bytes);
+        let proposed_bytes = serde_jcs::to_vec(&proposed).unwrap();
+        assert!(matches!(
+            handler.write(&path, &proposed_bytes).await,
+            Err(HandlerError::PermissionDenied)
+        ));
+        let prepared = broker.prepared.lock().unwrap().clone().unwrap();
+        assert_eq!(prepared.proposed_canonical_policy.decode(), proposed_bytes);
+        assert_eq!(
+            prepared.authority_diff_digest.as_str(),
+            "65f348e08a8ded736ad13843456a1afbaacf16bf5518147b1d7d900f703e7401"
+        );
+        assert_eq!(
+            handler.read(&path).await.unwrap(),
+            bytes,
+            "staging must not remove signed policy authority"
+        );
+    }
+
     impl bloom_broker_api::MachineBrokerService for StubBroker {
         fn dispatch<'a>(
             &'a self,
@@ -7829,7 +8041,6 @@ value = "0""#,
             expires_ms: u128::MAX,
             status: bloom_proto::TxStatus::Pending,
             action_kind: bloom_proto::TxActionKind::Unknown,
-            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,
@@ -8977,15 +9188,16 @@ value = "0""#,
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
+            evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-            safe_review_payloads: Vec::new(),
             evm_review_payloads: Vec::new(),
+            safe_review_payloads: Vec::new(),
+            message_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
             petal_use_claim: None,
             system_use_claim: None,
-            requested_review_mode: None,
         };
         let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
         f.handler
@@ -9027,15 +9239,16 @@ value = "0""#,
                 .handler
                 .with_broker(Some(MachineBrokerClient::new(broker.clone())));
             let request = ApprovalPrepareRequest {
+                evm_reported_token: None,
                 surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-                safe_review_payloads: Vec::new(),
                 evm_review_payloads: Vec::new(),
+                safe_review_payloads: Vec::new(),
+                message_review_payloads: Vec::new(),
                 operation_id: OperationId::from_bytes([30; 32]),
                 terms: approval_terms("alice", None),
                 canonical_plan_facts_digest: digest(31),
                 petal_use_claim: None,
                 system_use_claim: None,
-                requested_review_mode: None,
             };
             let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
             f.handler
@@ -9062,15 +9275,16 @@ value = "0""#,
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
+            evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-            safe_review_payloads: Vec::new(),
             evm_review_payloads: Vec::new(),
+            safe_review_payloads: Vec::new(),
+            message_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
             petal_use_claim: None,
             system_use_claim: None,
-            requested_review_mode: None,
         };
         let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
         f.handler
@@ -9096,15 +9310,16 @@ value = "0""#,
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker)));
         let request = ApprovalPrepareRequest {
+            evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
-            safe_review_payloads: Vec::new(),
             evm_review_payloads: Vec::new(),
+            safe_review_payloads: Vec::new(),
+            message_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
             petal_use_claim: None,
             system_use_claim: None,
-            requested_review_mode: None,
         };
         let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
 
@@ -10370,6 +10585,81 @@ value = "0""#,
     }
 
     #[tokio::test]
+    async fn confirm_and_override_cancel_preserve_possible_signatures() {
+        for marker in ["hash", "broadcast", "dispatched", "malformed"] {
+            for control in ["confirm", "confirm.override"] {
+                let mut f = make_handler_with_chain(true);
+                f.handler.home_write_permit = Some(Arc::new(
+                    HomeWritePermit::acquire(&bloom_proto::HomeDir::at(f._tmp.path())).unwrap(),
+                ));
+                seed_pending(&f, "0001-test");
+                let entry = f
+                    .handler
+                    .tx_engine
+                    .outbox
+                    .read(&f.wallet_name, "anvil", "0001-test")
+                    .unwrap();
+                match marker {
+                    "hash" => {
+                        let mut staged = entry.staged.clone();
+                        staged.tx_hash = Some(format!("0x{}", "11".repeat(32)));
+                        std::fs::write(
+                            entry.dir.join("intent.json"),
+                            serde_json::to_vec(&staged).unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    "broadcast" => {
+                        std::fs::write(
+                            entry.dir.join("broadcast_attempted.json"),
+                            serde_json::to_vec(&serde_json::json!({
+                                "schema": "bloom.broadcast_attempted.v1", "tx_hash": "signed",
+                                "raw_tx_blake3": "digest", "raw_tx_path": "raw_tx",
+                                "from": entry.staged.from, "to": null, "nonce": 0,
+                                "chain_id": 31337, "created_ms": 0, "transport": "public_rpc"
+                            }))
+                            .unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    "dispatched" => {
+                        let digest = "11".repeat(32);
+                        std::fs::write(entry.dir.join("ceremony.json"), serde_json::to_vec(&serde_json::json!({
+                            "schema": "bloom.machine-evm-signing.1", "action_id": "test",
+                            "payload_digest": digest, "claimed_hash": digest,
+                            "provenance_digest": digest, "canonical_plan_facts_digest": digest,
+                            "approval_operation_id": digest, "signing_operation_id": digest,
+                            "request_nonce": "11".repeat(16), "issued_at_ms": "1", "expires_at_ms": "2",
+                            "sign_dispatched": true
+                        })).unwrap()).unwrap();
+                    }
+                    _ => std::fs::write(entry.dir.join("ceremony.json"), b"invalid").unwrap(),
+                }
+                let path = VfsPath::parse(&format!(
+                    "/{}/0/chains/anvil/outbox/pending/0001-test/{control}",
+                    f.wallet_name
+                ))
+                .unwrap();
+                let error = f.handler.write(&path, b"cancel").await.unwrap_err();
+                if marker != "malformed" {
+                    assert!(
+                        error.to_string().contains("cannot discard"),
+                        "{marker}: {error}"
+                    );
+                }
+                let retained = f
+                    .handler
+                    .tx_engine
+                    .outbox
+                    .read(&f.wallet_name, "anvil", "0001-test")
+                    .unwrap();
+                assert_eq!(retained.state, OutboxState::Pending, "{marker}/{control}");
+                assert!(!retained.dir.join("cancel.txt").exists());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn normal_confirm_open_preserves_body_control_semantics() {
         let f = make_handler_with_chain(true);
         let p = VfsPath::parse(&format!(
@@ -11392,6 +11682,426 @@ value = "0""#,
                 Err(HandlerError::NotFound(_))
             ),
             "wallet-root chains must be absent"
+        );
+    }
+
+    /// An EVM node for chain id 1 holding no ETH and 2.5 USDC, whose DAI
+    /// `balanceOf` fails. Returns its URL and a count of requests served.
+    async fn spawn_usdc_only_evm_node() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        spawn_holdings_node(
+            1,
+            0,
+            |symbol| match symbol {
+                "USDC" => Some(2_500_000),
+                "DAI" => None,
+                _ => Some(0),
+            },
+            std::time::Duration::ZERO,
+        )
+        .await
+    }
+
+    /// An EVM node for `chain_id` whose native balance is `native` and whose
+    /// holdings-token balances come from `held` by symbol (`None` reverts).
+    /// Every balance read waits `delay`. Returns its URL and a request count.
+    async fn spawn_holdings_node(
+        chain_id: u64,
+        native: u64,
+        held: fn(&str) -> Option<u64>,
+        delay: std::time::Duration,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        spawn_holdings_node_with(chain_id, native, held, Arc::new(move |_| delay), false).await
+    }
+
+    type HoldingsDelay = dyn Fn(Option<&str>) -> std::time::Duration + Send + Sync;
+
+    /// `delay` gets the token symbol a call reads, or `None` for other calls.
+    /// With `multicall`, the node answers Multicall3 `aggregate3`; without
+    /// it, Multicall3 has no code there and answers at once.
+    async fn spawn_holdings_node_with(
+        chain_id: u64,
+        native: u64,
+        held: fn(&str) -> Option<u64>,
+        delay: Arc<HoldingsDelay>,
+        multicall: bool,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let tokens: Arc<Vec<(String, Option<u64>, String)>> = Arc::new(
+            accounts::holdings_tokens(chain_id)
+                .into_iter()
+                .map(|(address, symbol, _)| (format!("{address:#x}"), held(&symbol), symbol))
+                .collect(),
+        );
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = served.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let tokens = tokens.clone();
+                let delay = delay.clone();
+                tokio::spawn(async move {
+                    let mut bytes = Vec::new();
+                    let mut chunk = [0; 4096];
+                    let request: serde_json::Value = loop {
+                        let len = socket.read(&mut chunk).await.unwrap_or(0);
+                        if len == 0 {
+                            return;
+                        }
+                        bytes.extend_from_slice(&chunk[..len]);
+                        if let Some((_, body)) =
+                            String::from_utf8_lossy(&bytes).split_once("\r\n\r\n")
+                            && let Ok(request) = serde_json::from_str(body)
+                        {
+                            break request;
+                        }
+                    };
+                    let word = |value: u64| format!("0x{value:064x}");
+                    let to = request["params"][0]["to"].as_str().unwrap_or_default();
+                    let method = request["method"].as_str().unwrap_or_default();
+                    let token = tokens.iter().find(|(a, ..)| a.eq_ignore_ascii_case(to));
+                    let multicall3 =
+                        to.eq_ignore_ascii_case(&format!("{:#x}", bloom_evm::MULTICALL3));
+                    if multicall3 && !multicall {
+                        let body =
+                            serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":"0x"})
+                                .to_string();
+                        let _ = socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+                        return;
+                    }
+                    if method != "eth_chainId" {
+                        tokio::time::sleep(delay(token.map(|(.., symbol)| symbol.as_str()))).await;
+                    }
+                    let result = match method {
+                        "eth_chainId" => serde_json::json!(format!("{chain_id:#x}")),
+                        "eth_getBalance" => serde_json::json!(format!("{native:#x}")),
+                        "eth_call" if multicall3 => {
+                            use alloy::sol_types::SolCall;
+                            use bloom_evm::IMulticall3::{Call3Result, aggregate3Call};
+                            let params = &request["params"][0];
+                            let input = params["input"].as_str().or(params["data"].as_str());
+                            let input = hex::decode(input.unwrap().trim_start_matches("0x"));
+                            let calls = aggregate3Call::abi_decode(&input.unwrap()).unwrap().calls;
+                            let results: Vec<Call3Result> = calls
+                                .iter()
+                                .map(|call| {
+                                    let target = format!("{:#x}", call.target);
+                                    let held = tokens
+                                        .iter()
+                                        .find(|(a, ..)| a.eq_ignore_ascii_case(&target))
+                                        .and_then(|(_, held, _)| *held);
+                                    Call3Result {
+                                        success: held.is_some(),
+                                        returnData: held
+                                            .map(|value| {
+                                                alloy::primitives::U256::from(value)
+                                                    .to_be_bytes::<32>()
+                                                    .to_vec()
+                                            })
+                                            .unwrap_or_default()
+                                            .into(),
+                                    }
+                                })
+                                .collect();
+                            serde_json::json!(format!(
+                                "0x{}",
+                                hex::encode(aggregate3Call::abi_encode_returns(&results))
+                            ))
+                        }
+                        "eth_call" if token.is_some_and(|(_, held, _)| held.is_none()) => {
+                            let body = serde_json::json!({"jsonrpc":"2.0","id":request["id"],
+                                "error":{"code":3,"message":"execution reverted"}})
+                            .to_string();
+                            let _ = socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+                            return;
+                        }
+                        "eth_call" => {
+                            serde_json::json!(word(
+                                token.and_then(|(_, held, _)| *held).unwrap_or(0)
+                            ))
+                        }
+                        method => panic!("unexpected holdings RPC {method}"),
+                    };
+                    let body =
+                        serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result})
+                            .to_string();
+                    let _ = socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+                });
+            }
+        });
+        (endpoint, served)
+    }
+
+    /// `<n>/holdings.json` reads every chain the account lists: zero
+    /// balances are left out, known tokens are included, and a chain that
+    /// cannot be reached is recorded under `errors` instead of failing the
+    /// whole read.
+    #[tokio::test]
+    async fn holdings_list_nonzero_balances_and_record_unreachable_chains() {
+        let f = make_handler();
+        let chain = |name: &str, chain_id: u64, url: String| {
+            bloom_evm::ChainClient::new(bloom_proto::ChainSpec {
+                name: name.into(),
+                chain_id,
+                rpc_urls: vec![url],
+                rpc_endpoints: Vec::new(),
+                etherscan_api_url: None,
+                display_name: None,
+                native_symbol: "ETH".into(),
+                native_decimals: 18,
+                legacy_tx: false,
+                op_stack: false,
+            })
+            .unwrap()
+        };
+        let (ethereum, served) = spawn_usdc_only_evm_node().await;
+        f.handler.chains.add(chain("ethereum", 1, ethereum));
+        f.handler
+            .chains
+            .add(chain("arc", 5042002, "http://127.0.0.1:1".into()));
+        let accounts = vec![
+            derived_account(
+                bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+                "m/44'/60'/0'/0/0",
+                0xaa,
+                &format!("{:#x}", f.wallet_addr),
+            ),
+            derived_account(
+                bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                "m/44'/501'/0'/0'",
+                0xbb,
+                &bs58::encode([0xbb_u8; 32]).into_string(),
+            ),
+        ];
+        let handler = f
+            .handler
+            .clone()
+            .with_projection_reader(bip39_projection(f.wallet_addr, accounts))
+            .with_solana_reads(solana_read_registry(spawn_solana_node().await));
+        let w = &f.wallet_name;
+
+        // Listing the account and looking the file up (what `ls -l` asks
+        // the handler for) read no chain.
+        let listed = handler.list(&vfs(format!("/{w}/0"))).await.unwrap();
+        assert!(listed.iter().any(|entry| entry.name == "holdings.json"));
+        handler
+            .lookup(&vfs(format!("/{w}/0/holdings.json")))
+            .await
+            .unwrap();
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let body = handler
+            .read(&vfs(format!("/{w}/0/holdings.json")))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let held: Vec<(&str, &str, &str)> = v["holdings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| {
+                (
+                    h["chain"].as_str().unwrap(),
+                    h["symbol"].as_str().unwrap(),
+                    h["display"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            held,
+            [
+                ("ethereum", "USDC", "2.5 USDC"),
+                ("solana-devnet", "SOL", "1.5 SOL"),
+            ],
+            "zero ETH and zero tokens must be omitted: {v}"
+        );
+        // The unreachable chain names its unread native asset; the failed DAI
+        // read keeps the rest of ethereum's holdings.
+        let errors = v["errors"].as_object().unwrap();
+        assert_eq!(
+            errors.keys().collect::<Vec<_>>(),
+            ["arc", "ethereum"],
+            "{v}"
+        );
+        assert_eq!(errors["arc"], "could not read ETH", "{v}");
+        assert_eq!(errors["ethereum"], "could not read DAI", "{v}");
+    }
+
+    fn holdings_chain(name: &str, chain_id: u64, url: String) -> bloom_evm::ChainClient {
+        bloom_evm::ChainClient::new(bloom_proto::ChainSpec {
+            name: name.into(),
+            chain_id,
+            rpc_urls: vec![url],
+            rpc_endpoints: Vec::new(),
+            etherscan_api_url: None,
+            display_name: None,
+            native_symbol: "ETH".into(),
+            native_decimals: 18,
+            legacy_tx: false,
+            op_stack: false,
+        })
+        .unwrap()
+    }
+
+    async fn read_holdings(f: &Fixture) -> serde_json::Value {
+        let handler = f.handler.clone().with_projection_reader(bip39_projection(
+            f.wallet_addr,
+            vec![derived_account(
+                bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+                "m/44'/60'/0'/0/0",
+                0xaa,
+                &format!("{:#x}", f.wallet_addr),
+            )],
+        ));
+        let body = handler
+            .read(&vfs(format!("/{}/0/holdings.json", f.wallet_name)))
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// The token reads hold at most `HOLDINGS_CONCURRENCY` calls in flight
+    /// and stop at the chain deadline: rows read by then are kept and the
+    /// rest are named, rather than the whole chain being dropped.
+    #[tokio::test]
+    async fn slow_holdings_keep_completed_rows_and_name_the_rest() {
+        let f = make_handler();
+        // 2 s per read: native at 2 s, four tokens at 4 s, the rest past 5 s.
+        let (url, _) =
+            spawn_holdings_node(1, 1, |_| Some(1), std::time::Duration::from_secs(2)).await;
+        f.handler.chains.add(holdings_chain("ethereum", 1, url));
+        let tokens = accounts::holdings_tokens(1);
+        assert!(tokens.len() > 4, "{} tokens", tokens.len());
+        let v = read_holdings(&f).await;
+        let symbols: Vec<&str> = v["holdings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["symbol"].as_str().unwrap())
+            .collect();
+        let read: Vec<&str> = tokens[..4].iter().map(|(_, s, _)| s.as_str()).collect();
+        assert_eq!(symbols, [&["ETH"][..], &read].concat(), "{v}");
+        let unread: Vec<&str> = tokens[4..].iter().map(|(_, s, _)| s.as_str()).collect();
+        assert_eq!(
+            v["errors"]["ethereum"],
+            format!("timed out; could not read {}", unread.join(", ")),
+            "{v}"
+        );
+    }
+
+    /// A slow first token must not hide later tokens that finished in time.
+    #[tokio::test]
+    async fn a_slow_token_does_not_hide_later_completed_tokens() {
+        let f = make_handler();
+        let tokens = accounts::holdings_tokens(1);
+        let slow = tokens[0].1.clone();
+        let delay = Arc::new(move |symbol: Option<&str>| {
+            if symbol == Some(slow.as_str()) {
+                std::time::Duration::from_secs(30)
+            } else {
+                std::time::Duration::ZERO
+            }
+        });
+        let (url, _) = spawn_holdings_node_with(1, 1, |_| Some(1), delay, false).await;
+        f.handler.chains.add(holdings_chain("ethereum", 1, url));
+        let v = read_holdings(&f).await;
+        let symbols: Vec<&str> = v["holdings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["symbol"].as_str().unwrap())
+            .collect();
+        let rest: Vec<&str> = tokens[1..].iter().map(|(_, s, _)| s.as_str()).collect();
+        assert_eq!(symbols, [&["ETH"][..], &rest].concat(), "{v}");
+        assert_eq!(
+            v["errors"]["ethereum"],
+            format!("timed out; could not read {}", tokens[0].1),
+            "{v}"
+        );
+    }
+
+    /// With Multicall3, a chain costs one native read and one token batch,
+    /// not one request per token, and a failed token in the batch is named.
+    #[tokio::test]
+    async fn holdings_read_tokens_in_one_multicall_request() {
+        let f = make_handler();
+        let tokens = accounts::holdings_tokens(1);
+        assert!(tokens.iter().any(|(_, s, _)| s == "USDC"), "{tokens:?}");
+        let (url, served) = spawn_holdings_node_with(
+            1,
+            1,
+            |symbol| (symbol != "USDC").then_some(1),
+            Arc::new(|_| std::time::Duration::ZERO),
+            true,
+        )
+        .await;
+        f.handler.chains.add(holdings_chain("ethereum", 1, url));
+        let before = served.load(std::sync::atomic::Ordering::SeqCst);
+        let v = read_holdings(&f).await;
+        let symbols: Vec<&str> = v["holdings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["symbol"].as_str().unwrap())
+            .collect();
+        let rest: Vec<&str> = tokens
+            .iter()
+            .map(|(_, s, _)| s.as_str())
+            .filter(|s| *s != "USDC")
+            .collect();
+        assert_eq!(symbols, [&["ETH"][..], &rest].concat(), "{v}");
+        assert_eq!(v["errors"]["ethereum"], "could not read USDC", "{v}");
+        // eth_chainId, eth_getBalance and one aggregate3.
+        let requests = served.load(std::sync::atomic::Ordering::SeqCst) - before;
+        assert!(requests <= 3, "{requests} requests");
+    }
+
+    /// Tempo has no native token: holdings skip the native read rather than
+    /// failing the chain, and still list its token balances.
+    #[tokio::test]
+    async fn tempo_holdings_list_tokens_without_a_native_row() {
+        let tempo = bloom_proto::chain::TEMPO_MAINNET_CHAIN_ID;
+        let tokens = accounts::holdings_tokens(tempo);
+        assert!(
+            tokens.iter().any(|(_, symbol, _)| symbol == "pathUSD"),
+            "{tokens:?}"
+        );
+        let f = make_handler();
+        // eth_getBalance would answer a nonzero placeholder if it were read.
+        let (url, _) =
+            spawn_holdings_node(tempo, u64::MAX, |_| Some(3_000_000), Default::default()).await;
+        f.handler.chains.add(holdings_chain("tempo", tempo, url));
+        let v = read_holdings(&f).await;
+        let symbols: Vec<&str> = v["holdings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["symbol"].as_str().unwrap())
+            .collect();
+        let expected: Vec<&str> = tokens.iter().map(|(_, s, _)| s.as_str()).collect();
+        assert_eq!(symbols, expected, "{v}");
+        assert!(v["errors"].as_object().unwrap().is_empty(), "{v}");
+    }
+
+    /// A chain with nothing Bloom knows to read reports that instead of
+    /// looking checked and empty.
+    #[tokio::test]
+    async fn holdings_name_a_chain_with_nothing_to_read() {
+        let testnet = bloom_proto::chain::TEMPO_MODERATO_CHAIN_ID;
+        assert!(accounts::holdings_tokens(testnet).is_empty());
+        let f = make_handler();
+        let (url, _) = spawn_holdings_node(testnet, u64::MAX, |_| None, Default::default()).await;
+        f.handler
+            .chains
+            .add(holdings_chain("tempo-testnet", testnet, url));
+        let v = read_holdings(&f).await;
+        assert!(v["holdings"].as_array().unwrap().is_empty(), "{v}");
+        assert!(
+            v["errors"]["tempo-testnet"]
+                .as_str()
+                .unwrap()
+                .contains("no balances checked"),
+            "{v}"
         );
     }
 
