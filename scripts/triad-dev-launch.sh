@@ -973,4 +973,8 @@ else
     sleep 1
   done
 fi
-wait "$machine_pid"
+# Stop the whole Triad when any child service exits, so a supervisor such as
+# a systemd user unit can restart it.
+# shellcheck disable=SC2086 # checkout_pid is empty without Checkout.
+wait -n "$session_pid" "$machine_pid" $checkout_pid || true
+die "a Triad service exited"
