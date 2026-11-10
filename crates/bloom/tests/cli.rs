@@ -3044,8 +3044,44 @@ impl Handler for ServingHandler {
         Err(match &self.write_error {
             HandlerError::NotFound(what) => HandlerError::NotFound(what.clone()),
             HandlerError::Backend(what) => HandlerError::Backend(what.clone()),
+            HandlerError::ApprovalPending(what) => HandlerError::ApprovalPending(what.clone()),
+            HandlerError::OperationNotPermitted => HandlerError::OperationNotPermitted,
             _ => HandlerError::PermissionDenied,
         })
+    }
+}
+
+/// A confirm refused while owner approval is pending names the challenge to
+/// read over IPC; a hard denial still reads differently.
+#[test]
+fn vfs_write_names_the_approval_challenge_while_owner_approval_is_pending() {
+    let home = fresh_home();
+    let outbox = "wallets/alice/0/chains/base/outbox/pending/0001-feed";
+    for (error, expected) in [
+        (
+            HandlerError::ApprovalPending(format!("{outbox}/approval_challenge.json")),
+            format!(
+                "permission denied: owner approval pending; read {outbox}/approval_challenge.json"
+            ),
+        ),
+        (
+            HandlerError::OperationNotPermitted,
+            "operation not permitted".to_owned(),
+        ),
+    ] {
+        let handler = Arc::new(ServingHandler {
+            write_error: error,
+            ..ServingHandler::default()
+        });
+        let vfs = bloom_vfs::Vfs::builder().mount("wallets", handler).build();
+        let (server, server_thread) = spawn_ipc_server(home.path(), vfs);
+        bloom_cmd(home.path())
+            .args(["vfs", "write", &format!("/{outbox}/confirm"), "--data", "y"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(expected))
+            .stderr(predicate::str::contains("ceremony_url").not());
+        stop_ipc_server(server, server_thread);
     }
 }
 
