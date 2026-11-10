@@ -2701,15 +2701,18 @@ impl TxEngine {
         self.outbox
             .transition(&entry, crate::outbox::OutboxState::Sent)?;
         if let Some(action_id) = staged.action_id.as_deref() {
-            self.write_central_evm_result(EvmCentralResult {
-                action_id,
-                state: OutboxState::Sent,
-                outcome: "sent",
-                tx_hash,
-                nonce: staged.nonce,
-                signing_hash: &signing_hash,
-                action_kind: EvmOutboxActionKind::Confirm.action_kind(),
-            })?;
+            write_central_evm_result(
+                &self.outbox,
+                EvmCentralResult {
+                    action_id,
+                    state: OutboxState::Sent,
+                    outcome: "sent",
+                    tx_hash,
+                    nonce: staged.nonce,
+                    signing_hash: &signing_hash,
+                    action_kind: EvmOutboxActionKind::Confirm.action_kind(),
+                },
+            )?;
         }
 
         Ok(staged)
@@ -2915,72 +2918,23 @@ impl TxEngine {
             && let Err(error) = self
                 .build_unsigned_evm_tx(&staged, chain)
                 .and_then(|unsigned| {
-                    self.write_central_evm_result(EvmCentralResult {
-                        action_id,
-                        state: OutboxState::Sent,
-                        outcome: "sent",
-                        tx_hash,
-                        nonce: staged.nonce,
-                        signing_hash: &Self::unsigned_signing_hash(&unsigned),
-                        action_kind: action_kind.action_kind(),
-                    })
+                    write_central_evm_result(
+                        &self.outbox,
+                        EvmCentralResult {
+                            action_id,
+                            state: OutboxState::Sent,
+                            outcome: "sent",
+                            tx_hash,
+                            nonce: staged.nonce,
+                            signing_hash: &Self::unsigned_signing_hash(&unsigned),
+                            action_kind: action_kind.action_kind(),
+                        },
+                    )
                 })
         {
             warn!(id = %staged.id, %action_id, %error, "tx.central_result_unwritten");
         }
         Ok(staged)
-    }
-
-    fn write_central_evm_result(&self, central: EvmCentralResult<'_>) -> Result<(), TxEngineError> {
-        let result = serde_json::json!({
-            "schema": "bloom.evm_execution_result.v1",
-            "action_id": central.action_id,
-            "state": central.state.dirname(),
-            "outcome": central.outcome,
-            "action_kind": central.action_kind,
-            "tx_hash": format!("{:#x}", central.tx_hash),
-            "nonce": central.nonce,
-            "signing_hash": format!("{:#x}", central.signing_hash),
-            "created_ms": now_ms(),
-        });
-        let mut status = self.central_status_base(central.action_id, central.state)?;
-        let status_obj = status.as_object_mut().expect("central status is object");
-        status_obj.insert("outcome".into(), serde_json::json!(central.outcome));
-        status_obj.insert(
-            "tx_hash".into(),
-            serde_json::json!(format!("{:#x}", central.tx_hash)),
-        );
-        status_obj.insert("action_kind".into(), serde_json::json!(central.action_kind));
-        self.outbox.write_central_action_artifact(
-            central.action_id,
-            central.state,
-            "result.json",
-            &serde_json::to_vec_pretty(&result).unwrap(),
-        )?;
-        self.outbox.write_central_action_artifact(
-            central.action_id,
-            central.state,
-            "status.json",
-            &serde_json::to_vec_pretty(&status).unwrap(),
-        )?;
-        Ok(())
-    }
-
-    fn central_status_base(
-        &self,
-        action_id: &str,
-        state: OutboxState,
-    ) -> Result<serde_json::Value, TxEngineError> {
-        let mut status = self
-            .outbox
-            .read_central_action_artifact(action_id, state, "status.json")?
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-            .filter(|value| value.is_object())
-            .unwrap_or_else(|| serde_json::json!({}));
-        let status_obj = status.as_object_mut().expect("central status is object");
-        status_obj.insert("action_id".into(), serde_json::json!(action_id));
-        status_obj.insert("state".into(), serde_json::json!(state.dirname()));
-        Ok(status)
     }
 
     fn write_reconcile_ambiguous(
@@ -5382,6 +5336,101 @@ fn protocol_signing_error(error: bloom_broker_api::ProtocolError) -> TxEngineErr
         bloom_broker_api::RetryClass::Never => TxEngineError::ApprovalDenied(reason),
         _ => TxEngineError::ApprovalServiceUnavailable(reason),
     }
+}
+
+fn write_central_evm_result(
+    outbox: &Outbox,
+    central: EvmCentralResult<'_>,
+) -> Result<(), TxEngineError> {
+    let result = serde_json::json!({
+        "schema": "bloom.evm_execution_result.v1",
+        "action_id": central.action_id,
+        "state": central.state.dirname(),
+        "outcome": central.outcome,
+        "action_kind": central.action_kind,
+        "tx_hash": format!("{:#x}", central.tx_hash),
+        "nonce": central.nonce,
+        "signing_hash": format!("{:#x}", central.signing_hash),
+        "created_ms": now_ms(),
+    });
+    let mut status = central_status(outbox, central.action_id, central.state)?.unwrap_or_default();
+    status.insert("action_id".into(), serde_json::json!(central.action_id));
+    status.insert("state".into(), serde_json::json!(central.state.dirname()));
+    status.insert("outcome".into(), serde_json::json!(central.outcome));
+    status.insert(
+        "tx_hash".into(),
+        serde_json::json!(format!("{:#x}", central.tx_hash)),
+    );
+    status.insert("action_kind".into(), serde_json::json!(central.action_kind));
+    outbox.write_central_action_artifact(
+        central.action_id,
+        central.state,
+        "result.json",
+        &serde_json::to_vec_pretty(&result).unwrap(),
+    )?;
+    outbox.write_central_action_artifact(
+        central.action_id,
+        central.state,
+        "status.json",
+        &serde_json::to_vec_pretty(&status).unwrap(),
+    )?;
+    Ok(())
+}
+
+fn central_status(
+    outbox: &Outbox,
+    action_id: &str,
+    state: OutboxState,
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>, TxEngineError> {
+    Ok(outbox
+        .read_central_action_artifact(action_id, state, "status.json")?
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok()))
+}
+
+/// Rebuild a sent row's central result when a crash interrupted
+/// `write_central_evm_result`. The result is written before the status, so a
+/// status naming the hash means both are present. Without a recorded hash and
+/// the broadcast attempt that produced it, nothing is inferred.
+pub(crate) fn repair_central_evm_result(
+    outbox: &Outbox,
+    entry: &crate::outbox::OutboxEntry,
+) -> Result<(), TxEngineError> {
+    let staged = &entry.staged;
+    let (Some(action_id), Some(hash)) = (staged.action_id.as_deref(), staged.tx_hash.as_deref())
+    else {
+        return Ok(());
+    };
+    if central_status(outbox, action_id, OutboxState::Sent)?
+        .is_some_and(|status| status.contains_key("tx_hash"))
+    {
+        return Ok(());
+    }
+    for (kind, action_kind) in [
+        (BroadcastAttemptKind::Confirm, EvmOutboxActionKind::Confirm),
+        (
+            BroadcastAttemptKind::Replacement,
+            EvmOutboxActionKind::Replace,
+        ),
+    ] {
+        if outbox
+            .read_broadcast_attempt(entry, kind)?
+            .is_some_and(|attempt| attempt.tx_hash.eq_ignore_ascii_case(hash))
+        {
+            return write_central_evm_result(
+                outbox,
+                EvmCentralResult {
+                    action_id,
+                    state: OutboxState::Sent,
+                    outcome: "sent",
+                    tx_hash: parse_tx_hash(hash)?,
+                    nonce: staged.nonce,
+                    signing_hash: &TxEngine::unsigned_signing_hash(&unsigned_evm_tx(staged)?),
+                    action_kind: action_kind.action_kind(),
+                },
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The unsigned EVM transaction a staged plan signs.

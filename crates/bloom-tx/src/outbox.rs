@@ -487,7 +487,7 @@ impl Outbox {
 
     /// Repair wallet-first transitions interrupted before the central projection.
     /// Run before serving requests; this only updates projections, never transactions.
-    pub fn reconcile_terminal_actions(&self) -> Result<(), OutboxError> {
+    fn reconcile_terminal_actions(&self) -> Result<(), OutboxError> {
         for wallet in fs::read_dir(&self.inner.root)? {
             let wallet = wallet?;
             if !wallet.file_type()?.is_dir()
@@ -522,7 +522,11 @@ impl Outbox {
                                         .map_err(|error| error.to_string())
                                 });
                         match staged {
-                            Ok(staged) => self.reconcile_terminal_action(&staged, state)?,
+                            Ok(staged) => self.reconcile_terminal_action(&OutboxEntry {
+                                state,
+                                staged,
+                                dir: entry.path(),
+                            })?,
                             Err(error) => tracing::warn!(
                                 path = %path.display(), %error, "outbox.reconcile_entry_unreadable"
                             ),
@@ -534,17 +538,21 @@ impl Outbox {
         Ok(())
     }
 
-    fn reconcile_terminal_action(
-        &self,
-        staged: &StagedTx,
-        state: OutboxState,
-    ) -> Result<(), OutboxError> {
-        if state != OutboxState::Pending
-            && let Some(action_id) = &staged.action_id
+    fn reconcile_terminal_action(&self, entry: &OutboxEntry) -> Result<(), OutboxError> {
+        let Some(action_id) = &entry.staged.action_id else {
+            return Ok(());
+        };
+        if entry.state == OutboxState::Pending {
+            return Ok(());
+        }
+        // The central transition also repairs status.json when its rename
+        // already completed. Never infer a new action from the wallet id.
+        self.transition_central_action(action_id, OutboxState::Pending, entry.state)?;
+        if entry.state == OutboxState::Sent
+            && let Err(error) = crate::tx_engine::repair_central_evm_result(self, entry)
         {
-            // The central transition also repairs status.json when its rename
-            // already completed. Never infer a new action from the wallet id.
-            self.transition_central_action(action_id, OutboxState::Pending, state)?;
+            // As at send time, the sent row stays the record.
+            tracing::warn!(id = %entry.staged.id, %action_id, %error, "tx.central_result_unwritten");
         }
         Ok(())
     }
@@ -1075,7 +1083,7 @@ impl Outbox {
         new_state: OutboxState,
     ) -> Result<PathBuf, OutboxError> {
         if entry.state == new_state {
-            self.reconcile_terminal_action(&entry.staged, new_state)?;
+            self.reconcile_terminal_action(entry)?;
             return Ok(entry.dir.clone());
         }
         let target_parent = self.state_dir(&entry.staged.wallet, &entry.staged.chain, new_state)?;
@@ -2781,6 +2789,7 @@ mod tests {
         transitions: Mutex<Vec<(String, String, String)>>, // (id, from, to)
         fail_transition: Mutex<Option<String>>,
         action_files: Mutex<Vec<(String, String, String)>>,
+        file_data: Mutex<std::collections::HashMap<String, Vec<u8>>>,
     }
 
     impl MockProjection {
@@ -2791,6 +2800,7 @@ mod tests {
                 transitions: Mutex::new(vec![]),
                 fail_transition: Mutex::new(None),
                 action_files: Mutex::new(vec![]),
+                file_data: Mutex::new(Default::default()),
             }
         }
     }
@@ -2841,8 +2851,12 @@ mod tests {
             action_id: &str,
             state: &str,
             file: &str,
-            _data: &[u8],
+            data: &[u8],
         ) -> Result<(), String> {
+            self.file_data
+                .lock()
+                .unwrap()
+                .insert(format!("{action_id}/{state}/{file}"), data.to_vec());
             self.action_files.lock().unwrap().push((
                 action_id.to_string(),
                 state.to_string(),
@@ -2853,11 +2867,16 @@ mod tests {
 
         fn read_action_file(
             &self,
-            _action_id: &str,
-            _state: &str,
-            _file: &str,
+            action_id: &str,
+            state: &str,
+            file: &str,
         ) -> Result<Vec<u8>, String> {
-            Err("not found".into())
+            self.file_data
+                .lock()
+                .unwrap()
+                .get(&format!("{action_id}/{state}/{file}"))
+                .cloned()
+                .ok_or_else(|| "not found".into())
         }
     }
 
@@ -2897,6 +2916,65 @@ mod tests {
             assert!(Outbox::new_with_projection(dir.path(), projection.clone()).is_err());
             assert_eq!(fs::read(terminal.dir.join("intent.json")).unwrap(), bytes);
         }
+    }
+
+    /// A crash after the wallet move loses the central result; restart rebuilds
+    /// it from the recorded hash and attempt, once.
+    #[test]
+    fn restart_rebuilds_a_lost_central_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let projection = Arc::new(MockProjection::new());
+        let outbox = Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
+        let mut staged = fake_staged("lost");
+        staged.gas_price = Some("1".into());
+        outbox.write_pending(&staged, "plan").unwrap();
+        let mut entry = outbox.read("alice", "anvil", &staged.id).unwrap();
+        let hash = format!("0x{}", "ab".repeat(32));
+        let attempt = BroadcastAttempt {
+            schema: "bloom.broadcast_attempted.v1".into(),
+            tx_hash: hash.clone(),
+            raw_tx_blake3: String::new(),
+            raw_tx_path: BroadcastAttemptKind::Confirm.raw_name().into(),
+            from: staged.from.clone(),
+            to: staged.to.clone(),
+            nonce: 0,
+            chain_id: staged.chain_id,
+            created_ms: 1,
+            transport: BroadcastTransport::PublicRpc,
+            private_provider: None,
+        };
+        outbox
+            .write_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm, &attempt)
+            .unwrap();
+        entry.staged.status = TxStatus::Sent;
+        entry.staged.tx_hash = Some(hash.clone());
+        outbox
+            .write_artefact(
+                &entry.dir,
+                "intent.json",
+                &serde_json::to_vec(&entry.staged).unwrap(),
+            )
+            .unwrap();
+        outbox.transition(&entry, OutboxState::Sent).unwrap();
+        let action_id = entry.staged.action_id.clone().unwrap();
+        drop(outbox);
+
+        let written = || projection.action_files.lock().unwrap().len();
+        Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
+        assert_eq!(written(), 2);
+        let read = |file: &str| -> serde_json::Value {
+            serde_json::from_slice(
+                &projection
+                    .read_action_file(&action_id, "sent", file)
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(read("result.json")["tx_hash"], hash);
+        assert_eq!(read("result.json")["action_kind"], "evm_confirm");
+        assert_eq!(read("status.json")["outcome"], "sent");
+        Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
+        assert_eq!(written(), 2, "a complete result is not rewritten");
     }
 
     /// A missing or malformed terminal intent is skipped, untouched, and does

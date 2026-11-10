@@ -217,6 +217,12 @@ impl CentralOutbox {
             status = serde_json::json!({});
         }
         let obj = status.as_object_mut().expect("status is object");
+        // A restart re-runs every terminal transition; leave settled records alone.
+        if obj.get("action_id").and_then(|v| v.as_str()) == Some(action_id)
+            && obj.get("state").and_then(|v| v.as_str()) == Some(state)
+        {
+            return Ok(());
+        }
         obj.insert("action_id".to_string(), serde_json::json!(action_id));
         obj.insert("state".to_string(), serde_json::json!(state));
         write_durable(
@@ -807,6 +813,14 @@ mod tests {
             serde_json::from_slice(&h.read(&status_path).await.unwrap()).unwrap();
         assert_eq!(status["state"], "sent");
         assert!(h.outbox.transition("act-none", "pending", "sent").is_err());
+
+        // A settled action is not rewritten, so an unwritable one still passes.
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = h.outbox.action_dir("sent", "act-split");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let repeated = h.outbox.transition("act-split", "pending", "sent");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        repeated.unwrap();
     }
 
     #[tokio::test]
