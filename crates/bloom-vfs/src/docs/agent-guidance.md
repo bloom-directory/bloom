@@ -63,23 +63,24 @@ For native transfers and Petal actions that project into the outbox:
    `docs/examples.md`) or to a Petal's `new` (its README).
 2. Identify the new entry in `pending/` by its `intent.json` and `plan.md`,
    never by wildcard, sequence number, `latest` or position.
-3. Write `confirm` to that entry's `confirm` file.
-4. If confirm is denied, read `policy_check.json` and `approval_challenge.json`.
-   A hard policy deny ends execution: if your own unsigned entry remains
-   pending, write `cancel` to its `confirm` file and verify it left `pending/`
-   before reporting the refusal. This cleanup needs no additional approval.
-   For a prepare-only request, keep the draft and report the deny without
-   confirming it. Only an awaiting approval challenge calls for a ceremony:
-   check its wallet, action, intent and expiry, and give its `ceremony_url`
-   to the human. Poll the challenge; when `state` is
-   `active`, write its exact `retry_body` (`confirm` when omitted) to its
-   `retry_path`. The approval does not broadcast on its own. For `expired`,
-   `cancelled` or `refused`, tell the human.
+3. If the human asked only to prepare it, stop and report the entry.
+   Otherwise write `confirm` to that entry's `confirm` file.
+4. If confirm fails:
+   - **Operation not permitted**: read the entry's `policy_check.json` (in
+     `failed/` if it moved). A `deny` outcome is final: if your entry is
+     still in `pending/`, write `cancel` to its `confirm` file, then report
+     the refusal. A `warn` keeps it pending: show the human the warning and
+     write `confirm` to `confirm.override` only if they accept it.
+   - **Permission denied**: read `approval_challenge.json`, check its wallet,
+     action, intent and expiry, and give its `ceremony_url` to the human.
+     Poll the challenge; when `state` is `active`, write its exact
+     `retry_body` (`confirm` when omitted) to its `retry_path`. The approval
+     does not broadcast on its own. For `expired`, `cancelled` or `refused`,
+     tell the human.
 5. Read `sent/<id>/` or `failed/<id>/` before reporting the result.
 
 Do not restage while an approval is pending, or because a pending path
-disappeared: list `sent/` and `failed/` first. `confirm.override` is only for
-when the policy projection permits it and the human accepted its warning.
+disappeared: list `sent/` and `failed/` first.
 
 To discard an entry never sent for signing, write `cancel` to its `confirm`
 file. On EVM the entry's own `cancel` file instead signs a same-nonce
@@ -99,12 +100,11 @@ An error alone does not show whether an earlier operation completed.
 
 - **No such file or directory**: the path is absent now. An entry that left
   `pending/` moved to `sent/` or `failed/`.
-- **Permission denied**: on a confirm, read `approval_challenge.json`.
-  Read-only targets also deny.
-- **Operation not permitted**: policy or a safety check refused it. Read
-  `policy_check.json`; follow the hard-deny cleanup above, then stop. Do not change policy,
-  switch accounts, remount a read-only route or try another interface to get
-  around it. A request to send funds does not authorize loosening policy.
+- **Permission denied**: on a confirm, see step 4. Read-only targets also
+  deny.
+- **Operation not permitted**: policy or a safety check refused it; on a
+  confirm, see step 4. Do not change policy, switch accounts, remount a
+  read-only route or try another interface to get around it.
 - **"signing outcome unknown; it may already be signed"**: retry the identical
   request (same bytes, same operation id). Never rebuild it under a new id or
   rebroadcast until the first attempt is known not to have landed.

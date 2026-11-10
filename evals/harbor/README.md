@@ -134,11 +134,12 @@ whole thing before a release: it builds the Machine from the ref with the
 Broker and Signer the release matrix pins, smokes them, then runs every task
 with every agent and reports reward, tool calls, tokens and time against the
 baseline. A failed trial runs once more. It fails on a smoke failure, a
-missing result, an agent that cannot authenticate, a regression against
+missing result, an agent that cannot authenticate, any `evm-transfer-denied`
+failure (baseline or not), a regression against
 the baseline, or a task that passed in both but took more than 1.5 times the
 baseline's tool calls. To accept a slower run on purpose, dispatch with
-`allow_slower` or add the `evals-allow-slower` label to the PR; the report
-lists the slower tasks either way. It
+`allow_slower` or add the `evals-allow-slower` label to the PR; that waives
+only slowness, and the report lists the slower tasks either way. It
 runs on `release-proposal/*` PRs and by dispatch.
 Model credentials are repository secrets, OAuth where the agent supports it:
 `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) or `ANTHROPIC_API_KEY`;
