@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# Provision the hosted ceremony relay for one installed Bloom login and wait
+# until its remote ceremony surface is effective.
+#
+# The installer runs this inside its existing root step, and the packaged
+# bloom-relay-provision@.service runs it when a login session brings the
+# Signer up. It never elevates itself and never asks for a credential: it
+# requires root and talks to the installed Signer's administration socket.
+#
+# Rerunning it is safe. Signer resumes the same installation assignment, keeps
+# the same ACME operation, and re-issues only what is missing.
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+usage: bloom-relay-provision LOGIN_UID
+EOF
+  exit 64
+}
+
+[[ $# -eq 1 ]] || usage
+login_uid="$1"
+[[ "$login_uid" =~ ^[1-9][0-9]*$ ]] || {
+  echo "LOGIN_UID must be a positive decimal UID" >&2
+  exit 64
+}
+[[ "$(id -u)" == "0" ]] || {
+  echo "bloom-relay-provision must run as root" >&2
+  exit 77
+}
+
+script_dir="$(cd -- "$(dirname -- "$0")" && pwd -P)"
+signer="$script_dir/current/bloom-signer"
+[[ -x "$signer" ]] || {
+  echo "the installed Bloom Signer is missing" >&2
+  exit 66
+}
+
+admin_socket="/run/bloom/$login_uid/signer/admin/admin.sock"
+socket_wait="${BLOOM_RELAY_PROVISION_SOCKET_WAIT_SECONDS:-30}"
+timeout="${BLOOM_RELAY_PROVISION_TIMEOUT_SECONDS:-600}"
+poll="${BLOOM_RELAY_PROVISION_POLL_SECONDS:-5}"
+for wait_setting in "$socket_wait" "$timeout" "$poll"; do
+  [[ "$wait_setting" =~ ^[0-9]+$ ]] || {
+    echo "invalid relay provisioning wait configuration" >&2
+    exit 64
+  }
+done
+
+# Read one top-level field from Signer's status document. Signer prints
+# indented JSON, so a top-level key is the only one at two spaces.
+status_field() {
+  local document="$1" key="$2"
+  printf '%s\n' "$document" | awk -v key="$key" '
+    index($0, "  \"" key "\":") == 1 {
+      value = $0
+      sub("^  \"" key "\":[[:space:]]*", "", value)
+      sub(",$", "", value)
+      gsub(/^"|"$/, "", value)
+      print value
+      found = 1
+      exit
+    }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+# The remote surface is effective only when the installation asked for it and
+# the certificate and the relay route are both ready.
+relay_ready() {
+  local document="$1" desired effective tls_ready routing_ready
+  desired="$(status_field "$document" desired_mode || true)"
+  effective="$(status_field "$document" effective_mode || true)"
+  tls_ready="$(status_field "$document" remote_tls_ready || true)"
+  routing_ready="$(status_field "$document" remote_routing_ready || true)"
+  [[ "$desired" == "remote_enabled" && "$effective" == "remote_enabled" &&
+    "$tls_ready" == "true" && "$routing_ready" == "true" ]]
+}
+
+status_file="$(mktemp)"
+error_file="$(mktemp)"
+cleanup() {
+  rm -f -- "$status_file" "$error_file"
+}
+trap cleanup EXIT
+
+socket_deadline=$((SECONDS + socket_wait))
+while [[ ! -S "$admin_socket" ]]; do
+  if (( SECONDS >= socket_deadline )); then
+    echo "Bloom Signer is not running for login $login_uid; the hosted ceremony relay is provisioned when that login session starts." >&2
+    exit 75
+  fi
+  sleep 1
+done
+
+deadline=$((SECONDS + timeout))
+echo "Preparing the hosted ceremony relay (up to ${timeout}s; DNS and certificate issuance can take several minutes)..." >&2
+provisioned=false
+retry_provision=false
+while :; do
+  if "$signer" admin status --login-uid "$login_uid" >"$status_file" 2>"$error_file" &&
+    relay_ready "$(cat "$status_file")"; then
+    echo "Hosted ceremony relay is ready." >&2
+    exit 0
+  fi
+
+  if [[ "$provisioned" == false || "$retry_provision" == true ]]; then
+    if "$signer" admin provision --login-uid "$login_uid" >/dev/null 2>"$error_file"; then
+      provisioned=true
+      retry_provision=false
+    elif grep -Fq "Broker ACME account URI is pending; retry provision after account creation" "$error_file"; then
+      # Broker has not published its ACME account yet. Provisioning again once
+      # it has is the documented recovery.
+      provisioned=true
+      retry_provision=true
+    elif grep -Fq "remote certificate and routing are pending; retry status or provision" "$error_file"; then
+      # The hostname is bound and issuance is in flight. Status alone settles
+      # it, so do not ask the relay for another assignment.
+      provisioned=true
+      retry_provision=false
+    else
+      cat "$error_file" >&2
+      retry_provision=true
+    fi
+  fi
+
+  if (( SECONDS >= deadline )); then
+    echo "Hosted ceremony relay is still provisioning after ${timeout}s; it will be retried automatically." >&2
+    exit 75
+  fi
+  sleep "$poll"
+done

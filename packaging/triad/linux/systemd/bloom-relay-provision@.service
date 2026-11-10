@@ -1,0 +1,60 @@
+[Unit]
+Description=Provision the Bloom hosted ceremony relay for login UID %i
+After=bloom-broker@%i.service bloom-signer@%i.service
+ConditionPathExists=/run/bloom/%i/session/session.sock
+# This unit runs once per authenticated session, and provisioning is
+# idempotent. The default rate limit would let several quick logins exhaust
+# the burst and block the attempt that actually matters.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+Restart=on-failure
+RestartSec=30s
+TimeoutStartSec=800s
+# Provisioning allocates the relay hostname and the scoped Broker
+# credentials, so it runs with the installer authority rather than as the
+# login principal or as Broker. It never elevates itself and never prompts.
+ExecStart=/usr/libexec/bloom/bloom-relay-provision %i
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bloom-relay-provision-%i
+Environment=BLOOM_LOG_OUTPUT=json-stderr
+# This unit starts when the login session authenticates, so the Signer may
+# still be bringing its administration socket up. Wait for it rather than
+# failing the first time.
+Environment=BLOOM_RELAY_PROVISION_SOCKET_WAIT_SECONDS=120
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+LimitCORE=0
+RestrictNamespaces=yes
+# The relay control endpoint, the ACME directory and DNS are reachable over
+# the network, and the Signer administration socket is a local Unix socket.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Provisioning writes the root-owned administration state and installs the
+# Broker-owned relay credentials, so it chowns files it does not own and
+# writes into a directory owned by the Broker principal. Those three
+# capabilities are exactly what that requires and nothing more.
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+AmbientCapabilities=
+# The administration state and the Broker relay credential directory live
+# under the login's state root. Provisioning stages a file in the
+# administration state and renames it into the Broker directory, so both
+# must be writable within one mount.
+ReadWritePaths=/var/lib/bloom/%i
+
+[Install]
+WantedBy=multi-user.target

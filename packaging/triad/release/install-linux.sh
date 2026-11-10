@@ -64,8 +64,10 @@ atomic_install() {
 
 provision_linux_remote_ceremonies() {
   local login_uid="$1"
-  if ! /usr/libexec/bloom/current/bloom-signer admin provision --login-uid "$login_uid"; then
-    echo "Remote ceremony provisioning is incomplete; localhost remains available. Retry: sudo /usr/libexec/bloom/current/bloom-signer admin provision --login-uid $login_uid" >&2
+  # The path and installer submit the same systemd job, never parallel helpers.
+  if [[ -S "/run/bloom/$login_uid/session/session.sock" ]] &&
+    ! systemctl start --no-block "bloom-relay-provision@$login_uid.service"; then
+    echo "Remote ceremony provisioning could not be queued; localhost remains available." >&2
   fi
 }
 
@@ -731,6 +733,9 @@ linux_upgrade_unit_paths() {
     usr/lib/systemd/system/bloom-broker@.service \
     usr/lib/systemd/system/bloom-signer@.service \
     usr/lib/systemd/system/bloom-session@.path \
+    usr/libexec/bloom/bloom-relay-provision \
+    usr/lib/systemd/system/bloom-relay-provision@.path \
+    usr/lib/systemd/system/bloom-relay-provision@.service \
     usr/lib/systemd/system/bloom-signer-rpc@.socket \
     usr/lib/systemd/system/bloom-signer-control@.socket \
     usr/lib/systemd/system/bloom-broker-rpc@.socket \
@@ -838,6 +843,16 @@ restore_linux_upgrade_units() {
     relatives+=("$relative")
   done < "$manifest"
   while IFS= read -r tracked; do
+    # Older schema-2/3 snapshots predate both relay templates. Their absence
+    # means these files did not exist at snapshot time, not corruption.
+    if [[ ("$tracked" == usr/lib/systemd/system/bloom-relay-provision@.* ||
+      "$tracked" == usr/libexec/bloom/bloom-relay-provision) &&
+      " $covered " != *" usr/libexec/bloom/bloom-relay-provision "* &&
+      " $covered " != *" usr/lib/systemd/system/bloom-relay-provision@.path "* &&
+      " $covered " != *" usr/lib/systemd/system/bloom-relay-provision@.service "* ]]; then
+      states+=("absent"); modes+=("-"); relatives+=("$tracked")
+      continue
+    fi
     [[ " $covered " == *" $tracked "* ]] || {
       echo "Linux upgrade unit snapshot does not cover the tracked unit set" >&2
       return 65
@@ -893,6 +908,12 @@ stop_linux_release_set() {
         DBUS_SESSION_BUS_ADDRESS="unix:path=$user_runtime/bus" \
         systemctl --user stop bloom-machine.service bloom-session.service \
         2>/dev/null || true
+    fi
+    # Disable before stopping the worker so it cannot be retriggered during
+    # release switching or leave an enabled dangling path after rollback.
+    if [[ -f "$install_root/usr/lib/systemd/system/bloom-relay-provision@.path" ]]; then
+      systemctl disable --now "bloom-relay-provision@$uid.path" || stop_status=1
+      systemctl stop "bloom-relay-provision@$uid.service" || stop_status=1
     fi
     systemctl stop "bloom-session@$uid.path" 2>/dev/null || true
     systemctl stop "bloom-broker-ceremony@$uid.socket" 2>/dev/null || true
@@ -1013,6 +1034,14 @@ start_linux_release_set() {
       start_status=1
       continue
     fi
+    # The relay provisions itself when the login's session starts, so an
+    # upgraded installation provisions without the user running anything.
+    if [[ -f "$install_root/usr/lib/systemd/system/bloom-relay-provision@.path" ]] &&
+      ! systemctl enable --now "bloom-relay-provision@$uid.path"; then
+      echo "Bloom Linux release could not start the relay provisioning path for UID $uid" >&2
+      start_status=1
+      continue
+    fi
     if [[ -S "$user_runtime/bus" ]]; then
       if ! runuser -u "$user" -- env \
         XDG_RUNTIME_DIR="$user_runtime" \
@@ -1029,6 +1058,9 @@ start_linux_release_set() {
       fi
     fi
     require_linux_triad_health "$install_root" "$uid" "$user" "$digest" || start_status=1
+    if [[ -f "$install_root/usr/lib/systemd/system/bloom-relay-provision@.path" ]]; then
+      provision_linux_remote_ceremonies "$uid"
+    fi
   done
   return "$start_status"
 }
@@ -1465,11 +1497,14 @@ case "$action" in
       installer/linux/config/provenance-catalog.unsigned.json \
       installer/linux/bin/bloom \
       installer/linux/bin/bloom-uninstall \
+      installer/linux/bin/bloom-relay-provision \
       installer/linux/sysusers.d/bloom-login.conf.in \
       installer/linux/tmpfiles.d/bloom-login.conf.in \
       installer/linux/systemd/bloom-broker-ceremony@.socket \
       installer/linux/systemd/bloom-broker-ceremony-ipv6@.socket \
       installer/linux/systemd/bloom-session@.path \
+      installer/linux/systemd/bloom-relay-provision@.path \
+      installer/linux/systemd/bloom-relay-provision@.service \
       installer/linux/systemd/bloom-broker@.service.in \
       installer/linux/systemd/bloom-signer@.service.in \
       installer/linux/systemd-user/bloom-session.service \
@@ -1596,6 +1631,10 @@ case "$action" in
       "$root/usr/bin/bloom-uninstall" \
       0755
     atomic_install \
+      "$payload/installer/linux/bin/bloom-relay-provision" \
+      "$root/usr/libexec/bloom/bloom-relay-provision" \
+      0755
+    atomic_install \
       "$payload/installer/release/install-linux.sh" \
       "$root/usr/libexec/bloom/bloom-linux-maintenance" \
       0755
@@ -1629,6 +1668,14 @@ case "$action" in
     atomic_install \
       "$payload/installer/linux/systemd/bloom-session@.path" \
       "$unit_root/bloom-session@.path" \
+      0644
+    atomic_install \
+      "$payload/installer/linux/systemd/bloom-relay-provision@.path" \
+      "$unit_root/bloom-relay-provision@.path" \
+      0644
+    atomic_install \
+      "$payload/installer/linux/systemd/bloom-relay-provision@.service" \
+      "$unit_root/bloom-relay-provision@.service" \
       0644
     for obsolete_socket in \
       bloom-signer-rpc \
@@ -1854,6 +1901,10 @@ case "$action" in
       else
         systemctl enable --now "bloom-session@$login_uid.path"
       fi
+      # The relay provisions itself when the login's session brings the
+      # Signer up, so a standard setup never leaves remote ceremony
+      # provisioning to the user.
+      systemctl enable --now "bloom-relay-provision@$login_uid.path"
       provision_linux_remote_ceremonies "$login_uid"
       printf '%s\n' \
         "BLOOM_BIN=/usr/bin/bloom" \
@@ -1941,6 +1992,7 @@ case "$action" in
         "bloom-broker-ceremony@$login_uid.socket" \
         "bloom-broker-ceremony-ipv6@$login_uid.socket" \
         "bloom-session@$login_uid.path" \
+        "bloom-relay-provision@$login_uid.path" \
         2>/dev/null || true
       systemctl disable \
         "bloom-broker@$login_uid.service" \
@@ -1949,13 +2001,16 @@ case "$action" in
       systemctl stop \
         "bloom-broker@$login_uid.service" \
         "bloom-signer@$login_uid.service" \
+        "bloom-relay-provision@$login_uid.service" \
         2>/dev/null || true
       for stopped_unit in \
         "bloom-broker-ceremony@$login_uid.socket" \
         "bloom-broker-ceremony-ipv6@$login_uid.socket" \
         "bloom-session@$login_uid.path" \
+        "bloom-relay-provision@$login_uid.path" \
         "bloom-broker@$login_uid.service" \
-        "bloom-signer@$login_uid.service"
+        "bloom-signer@$login_uid.service" \
+        "bloom-relay-provision@$login_uid.service"
       do
         if systemctl is-active --quiet "$stopped_unit"; then
           echo "refusing to uninstall while $stopped_unit is still active" >&2
@@ -2052,6 +2107,8 @@ case "$action" in
         "$root/usr/lib/systemd/system/bloom-broker-ceremony@.socket" \
         "$root/usr/lib/systemd/system/bloom-broker-ceremony-ipv6@.socket" \
         "$root/usr/lib/systemd/system/bloom-session@.path" \
+        "$root/usr/lib/systemd/system/bloom-relay-provision@.path" \
+        "$root/usr/lib/systemd/system/bloom-relay-provision@.service" \
         "$root/usr/lib/systemd/user/bloom-machine.service" \
         "$root/usr/lib/systemd/user/bloom-session.service"
     fi
@@ -2066,7 +2123,8 @@ case "$action" in
     if [[ "$active_enrollment" == false && "$retained_custody" == false ]]; then
       rm -f -- \
         "$root/usr/bin/bloom-uninstall" \
-        "$root/usr/libexec/bloom/bloom-linux-maintenance"
+        "$root/usr/libexec/bloom/bloom-linux-maintenance" \
+        "$root/usr/libexec/bloom/bloom-relay-provision"
       rm -rf -- "$root/usr/libexec/bloom/releases"
       rmdir "$root/usr/libexec/bloom" "$root/etc/bloom" \
         2>/dev/null || true
