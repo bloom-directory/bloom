@@ -6057,6 +6057,39 @@ mod tests {
         assert_eq!(one, ["from-account-one"]);
     }
 
+    #[tokio::test]
+    async fn batch_account_fence_checks_sender_and_allows_sent_recovery() {
+        let f = make_handler_with_chain(true);
+        let (projection, _, evm1) = two_account_projection(&f);
+        seed_pending_from(&f, "from-account-one", &evm1, 2_000);
+        let handler = f.handler.clone().with_projection_reader(projection);
+        let w = &f.wallet_name;
+        for sent in [false, true] {
+            if sent {
+                let entry = handler
+                    .tx_engine
+                    .outbox
+                    .read(w, "anvil", "from-account-one")
+                    .unwrap();
+                handler
+                    .tx_engine
+                    .outbox
+                    .transition(&entry, OutboxState::Sent)
+                    .unwrap();
+            }
+            handler
+                .require_outbox_account(w, 1, "anvil", "from-account-one")
+                .await
+                .unwrap();
+            assert!(matches!(
+                handler
+                    .require_outbox_account(w, 0, "anvil", "from-account-one")
+                    .await,
+                Err(HandlerError::NotFound(_))
+            ));
+        }
+    }
+
     /// The S4 regression: a write under account 0 to `confirm`,
     /// `confirm.override`, `replace`, or `cancel` on another account's
     /// entry returns NotFound and issues no Broker request of any kind —

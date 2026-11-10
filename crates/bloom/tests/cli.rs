@@ -572,6 +572,7 @@ impl bloom_daemon::ipc::BatchConfirmationService for FixedBatchConfirmation {
                 "signer_receipt_digest": "signer-receipt-digest",
                 "broker_receipt_digest": "broker-receipt-digest",
                 "wallet": request.wallet,
+                "account": request.account,
                 "txs": request.txs,
                 "confirmation_text": request.text,
             }))
@@ -2885,6 +2886,7 @@ fn wallet_cancel_uses_daemon_owned_machine_command_while_home_lock_is_live() {
         serde_json::json!([{
             "command": "wallet_outbox_cancel",
             "wallet": "alice",
+            "account": 0,
             "chain": "base",
             "id": "0001-deadbeef",
             "text": "approve"
@@ -2922,11 +2924,63 @@ fn wallet_replace_uses_daemon_owned_machine_command_while_home_lock_is_live() {
         serde_json::json!([{
             "command": "wallet_outbox_replace",
             "wallet": "alice",
+            "account": 0,
             "chain": "base",
             "id": "0001-deadbeef",
             "intent": intent
         }])
     );
+}
+
+#[test]
+fn wallet_recovery_commands_preserve_selected_account() {
+    let home = fresh_home();
+    let commands = Arc::new(RecordingMachineCommands::default());
+    let (server, server_thread) = spawn_machine_ipc_server(home.path(), commands.clone());
+    for command in ["cancel", "replace"] {
+        let mut cmd = bloom_cmd(home.path());
+        cmd.args(["wallet", command, "alice", "base", "tx-1", "--account", "7"]);
+        if command == "replace" {
+            cmd.args([
+                "--intent",
+                r#"{"max_fee_per_gas":"100","max_priority_fee_per_gas":"1"}"#,
+            ]);
+        }
+        cmd.assert().success();
+    }
+    stop_ipc_server(server, server_thread);
+    let recorded = serde_json::to_value(commands.commands()).unwrap();
+    assert_eq!(recorded.as_array().unwrap().len(), 2);
+    for command in recorded.as_array().unwrap() {
+        assert_eq!(command["account"], 7);
+        assert_eq!(command["wallet"], "alice");
+        assert_eq!(command["chain"], "base");
+        assert_eq!(command["id"], "tx-1");
+    }
+}
+
+#[test]
+fn wallet_account_range_is_checked_before_ipc() {
+    let home = fresh_home();
+    for command in ["stage", "confirm", "cancel", "replace", "confirm-batch"] {
+        for account in ["2147483648", "4294967295"] {
+            let mut cmd = bloom_cmd(home.path());
+            cmd.args(["wallet", command, "alice"]);
+            if command == "confirm-batch" {
+                cmd.arg("base:tx-1");
+            } else {
+                cmd.arg("base");
+                if command != "stage" {
+                    cmd.arg("tx-1");
+                }
+            }
+            cmd.args(["--account", account])
+                .assert()
+                .code(2)
+                .stderr(predicate::str::contains("invalid value"))
+                .stderr(predicate::str::contains("2147483647"));
+        }
+    }
 }
 
 #[test]
@@ -2985,6 +3039,27 @@ fn wallet_confirm_batch_uses_canonical_ipc_and_prints_authority_receipts() {
         .stdout(predicate::str::contains("broker-receipt-digest"))
         .stdout(predicate::str::contains("\"confirmation_text\": \"y\""));
 
+    stop_ipc_server(server, server_thread);
+}
+
+#[test]
+fn wallet_confirm_batch_preserves_account_including_upper_boundary() {
+    let home = fresh_home();
+    let (server, server_thread) = spawn_batch_ipc_server(home.path());
+    for account in ["7", "2147483647"] {
+        bloom_cmd(home.path())
+            .args([
+                "wallet",
+                "confirm-batch",
+                "alice",
+                "base:tx-1",
+                "--account",
+                account,
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(format!("\"account\": {account}")));
+    }
     stop_ipc_server(server, server_thread);
 }
 

@@ -3484,6 +3484,9 @@ impl ipc::BatchConfirmationService for CanonicalBatchConfirmation {
             if !(1..=32).contains(&request.txs.len()) {
                 return Err("transaction batch must contain 1 to 32 children".into());
             }
+            if request.account >= (1_u32 << 31) {
+                return Err("account must be between 0 and 2147483647".into());
+            }
             let wallet_id = bloom_broker_api::Token::new(request.wallet.clone())
                 .map_err(|error| format!("invalid wallet ID: {error}"))?;
             let projection = self
@@ -3509,6 +3512,10 @@ impl ipc::BatchConfirmationService for CanonicalBatchConfirmation {
                         "transaction batch contains duplicate ref '{reference}'"
                     ));
                 }
+                self.wallets
+                    .require_outbox_account(&request.wallet, request.account, chain_name, id)
+                    .await
+                    .map_err(|error| error.to_string())?;
                 self.wallets
                     .require_outbox_petal_eligibility(&request.wallet, chain_name, id)
                     .await

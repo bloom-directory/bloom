@@ -435,6 +435,8 @@ impl Response {
 #[serde(deny_unknown_fields)]
 pub struct BatchConfirmIpcRequest {
     pub wallet: String,
+    #[serde(default)]
+    pub account: u32,
     pub txs: Vec<String>,
     pub text: String,
 }
@@ -736,12 +738,16 @@ pub enum MachineCommand {
     },
     WalletOutboxCancel {
         wallet: String,
+        #[serde(default)]
+        account: u32,
         chain: String,
         id: String,
         text: String,
     },
     WalletOutboxReplace {
         wallet: String,
+        #[serde(default)]
+        account: u32,
         chain: String,
         id: String,
         intent: String,
@@ -1196,8 +1202,21 @@ impl IpcServer {
                         return Response::err(id, -32602, format!("invalid params: {error}"));
                     }
                 };
-                if serde_json::to_value(&command).expect("Machine command serializes") != req.params
-                {
+                let mut params = req.params;
+                // Legacy recovery calls omit the account and mean account zero.
+                // Preserve the exact-field check for all other parameters.
+                if matches!(
+                    command,
+                    MachineCommand::WalletOutboxCancel { .. }
+                        | MachineCommand::WalletOutboxReplace { .. }
+                ) {
+                    params
+                        .as_object_mut()
+                        .expect("command parameters are an object")
+                        .entry("account")
+                        .or_insert(json!(0));
+                }
+                if serde_json::to_value(&command).expect("Machine command serializes") != params {
                     return Response::err(id, -32602, "invalid params: unknown fields");
                 }
                 match service.execute(command).await {
@@ -3400,6 +3419,7 @@ summary = "Demo app used by IPC tests."
                 method: "confirm_batch".into(),
                 params: serde_json::to_value(BatchConfirmIpcRequest {
                     wallet: "minnow".into(),
+                    account: 0,
                     txs: vec!["base:first".into(), "base:second".into()],
                     text: "override".into(),
                 })
