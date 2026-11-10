@@ -500,10 +500,26 @@ mod tests {
                 "logout retained an authenticated channel"
             );
         }
-        assert!(
-            tokio::net::UnixStream::connect(&socket).await.is_err(),
-            "logout retained the listener"
-        );
+        // Nothing may still be served over the socket once the sentinel is
+        // gone. The listener's descriptor is closed before the sentinel task
+        // completes, but a refused connect() is not a synchronous observation
+        // of that close on every platform: macOS keeps resolving the bound
+        // path to the closed listening socket for a few hundred microseconds,
+        // and a connect() inside that window is queued onto the dying socket
+        // and succeeds rather than being refused. That window is what made
+        // this test flaky. So assert what is observable the moment the task
+        // ends on either kind of host: where the connection is refused there
+        // is nothing left to check, and a connection the kernel still hands
+        // out has no sentinel behind it, so it is already at end of file. Only
+        // a retained listener holds one open, and the timeout catches that.
+        if let Ok(mut late) = tokio::net::UnixStream::connect(&socket).await {
+            let served =
+                tokio::time::timeout(std::time::Duration::from_secs(1), late.read(&mut [0; 1]))
+                    .await
+                    .expect("logout retained the listener");
+            // Reset counts as closed too; only a readable byte means served.
+            assert!(!matches!(served, Ok(1..)), "logout retained the listener");
+        }
     }
 
     #[test]
