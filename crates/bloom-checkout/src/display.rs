@@ -239,6 +239,20 @@ mod tests {
             .await
             .unwrap();
         assert!(shot["data"].as_str().is_some_and(|data| data.len() > 100));
+        // A headed browser quits when its last window closes; both handbacks
+        // close every private page and must leave a usable browser.
+        drop(tab);
+        browser.return_control_signed_in().await.unwrap();
+        browser.handoff().await.unwrap();
+        browser.return_control().await.unwrap();
+        assert!(!browser.needs_restart());
+        assert_eq!(
+            browser
+                .browse(crate::browser::BrowseRequest::Snapshot)
+                .await
+                .unwrap()["url"],
+            "about:blank"
+        );
         server.abort();
     }
 }

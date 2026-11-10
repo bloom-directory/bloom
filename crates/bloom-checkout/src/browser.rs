@@ -531,6 +531,14 @@ impl Browser {
 
     async fn reset_shopping(&self, keep_session: bool) -> Result<()> {
         let mut tab = self.tab.lock().await;
+        // A headed browser quits when its last window closes, so open the
+        // replacement page before closing the private ones.
+        let fresh = new_tab(
+            &self.cdp,
+            keep_session.then(|| tab.context.clone()),
+            tab.generation + 1,
+        )
+        .await?;
         if !keep_session
             && let Err(error) = self
                 .cdp
@@ -541,15 +549,15 @@ impl Browser {
                 )
                 .await
         {
-            // A previous attempt may have disposed the context before failing
-            // to create the replacement tab. Retry only with no contexts left.
+            // A previous attempt may have disposed it already. Retry only when
+            // the replacement is the sole context left.
             let contexts = self
                 .cdp
                 .call(None, "Target.getBrowserContexts", json!({}))
                 .await?;
             if contexts["browserContextIds"]
                 .as_array()
-                .is_none_or(|ids| !ids.is_empty())
+                .is_none_or(|ids| ids.iter().any(|id| *id != json!(fresh.context)))
             {
                 return Err(error);
             }
@@ -565,7 +573,7 @@ impl Browser {
                 .as_array()
                 .context("Missing browser targets")?
                 .iter()
-                .filter(|target| target["type"] == "page")
+                .filter(|target| target["type"] == "page" && target["targetId"] != fresh.target)
                 .collect::<Vec<_>>();
             if pages.is_empty() {
                 break;
@@ -585,8 +593,7 @@ impl Browser {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         let journey = tab.journey + 1;
-        let context = keep_session.then(|| tab.context.clone());
-        *tab = new_tab(&self.cdp, context, tab.generation + 1).await?;
+        *tab = fresh;
         tab.journey = journey;
         // The pages that held saved traveler values are gone.
         self.private_traveler_used.store(false, Ordering::SeqCst);
