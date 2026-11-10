@@ -9046,7 +9046,7 @@ value = "0""#,
             approved["next"]
                 .as_str()
                 .unwrap()
-                .contains("retry_path now"),
+                .contains("Now write retry_body to retry_path"),
             "{approved}"
         );
 

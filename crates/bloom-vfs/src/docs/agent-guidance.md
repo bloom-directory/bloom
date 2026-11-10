@@ -57,10 +57,11 @@ it does not create a local wallet. Follow
 
 ## The transaction loop
 
-For native transfers and Petal actions that project into the outbox:
+For outbox transactions:
 
 1. Stage once: write the body to `outbox/new.tx` (formats in
-   `docs/examples.md`) or to a Petal's `new` (its README).
+   `docs/examples.md`) or to a Petal's `new`, then confirm where its README
+   says.
 2. Identify the new entry in `pending/` by its `intent.json` and `plan.md`,
    never by wildcard, sequence number, `latest` or position.
 3. Write `confirm` to that entry's `confirm` file.

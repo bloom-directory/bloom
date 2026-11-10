@@ -2242,7 +2242,7 @@ fn evm_approval_challenge(
             .as_u64()
             .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
     });
-    Ok(serde_json::json!({
+    let mut challenge = serde_json::json!({
         "schema": "bloom.evm-approval-challenge/1",
         "action_id": signing.get("action_id"),
         "tx_id": staged.id,
@@ -2259,7 +2259,23 @@ fn evm_approval_challenge(
         "plan_path": format!("{outbox}/pending/{}/{plan}", staged.id),
         "retry_path": format!("{outbox}/pending/{}/{control}", staged.id),
         "retry_body": retry_body,
-    }))
+    });
+    // A Petal rechecks its own conditions when it confirms, so a confirm of
+    // the entry it staged goes back through that Petal. Bloom persists only
+    // the Petal and an opaque route id, not the route's concrete path.
+    let petal = staged.execution_origin.as_ref().and_then(|origin| {
+        origin
+            .petal_id
+            .strip_prefix(bloom_proto::petal_identity::PETAL_ID_PREFIX)
+    });
+    if let (Some(petal), "confirm" | "confirm.override") = (petal, control) {
+        challenge["staged_by"] = format!("petals/{petal}/").into();
+        if let Some(object) = challenge.as_object_mut() {
+            object.remove("retry_path");
+            object.remove("retry_body");
+        }
+    }
+    Ok(challenge)
 }
 
 /// Applies Broker's live approval status to a projected challenge. While the
@@ -2272,11 +2288,19 @@ fn reconcile_approval_challenge(
     challenge: &mut serde_json::Value,
     live: Option<&bloom_broker_api::ApprovalPublicStatus>,
 ) {
+    let retry = match challenge.get("staged_by").and_then(|petal| petal.as_str()) {
+        Some(petal) => {
+            format!("retry through the Petal that staged this entry ({petal}; see its README)")
+        }
+        None => "write retry_body to retry_path".into(),
+    };
     let (state, next) = match live {
-        Some(status) => approval_next_step(status.state),
+        Some(status) => approval_next_step(status.state, &retry),
         None => (
             "unknown",
-            "Bloom could not read this approval's state. Writing retry_body to retry_path is safe and reports it.",
+            format!(
+                "Bloom could not read this approval's state. It is safe to {retry}; that reports it."
+            ),
         ),
     };
     let Some(object) = challenge.as_object_mut() else {
@@ -2303,35 +2327,36 @@ fn reconcile_approval_challenge(
 }
 
 /// What the approval's live Broker state means for the agent holding the
-/// challenge, as `(state, next)`.
+/// challenge, as `(state, next)`. `retry` says how to retry the confirm.
 fn approval_next_step(
     state: bloom_broker_api::ApprovalLifecycleState,
-) -> (&'static str, &'static str) {
+    retry: &str,
+) -> (&'static str, String) {
     use bloom_broker_api::ApprovalLifecycleState as S;
     match state {
         S::Prepared | S::AwaitingCeremony => (
             "awaiting_ceremony",
-            "Give ceremony_url to the owner. As soon as they approve, write retry_body to retry_path. Retrying earlier is safe: it starts no new ceremony and returns permission denied again.",
+            format!("Give ceremony_url to the owner. As soon as they approve, {retry}. Retrying earlier is safe: it starts no new ceremony and returns permission denied again."),
         ),
         S::Active => (
             "active",
-            "The owner approved. Write retry_body to retry_path now to sign and broadcast.",
+            format!("The owner approved. Now {retry} to sign and broadcast."),
         ),
         S::Exhausted => (
             "exhausted",
-            "This approval has been used. Read the transaction's outbox state before doing anything else.",
+            "This approval has been used. Read the transaction's outbox state before doing anything else.".into(),
         ),
         S::Expired => (
             "expired",
-            "This approval expired unused. Ask the owner before writing retry_body to retry_path again, which starts over or says why it cannot.",
+            format!("This approval expired unused. Ask the owner whether to retry; if so, {retry}, which starts over or says why it cannot."),
         ),
         S::Cancelled => (
             "cancelled",
-            "This approval was cancelled unused. Ask the owner before writing retry_body to retry_path again, which starts over or says why it cannot.",
+            format!("This approval was cancelled unused. Ask the owner whether to retry; if so, {retry}, which starts over or says why it cannot."),
         ),
         S::Orphaned | S::Revoked | S::Failed => (
             "refused",
-            "This approval can no longer authorize the transaction. Tell the owner; do not retry it.",
+            "This approval can no longer authorize the transaction. Tell the owner; do not retry it.".into(),
         ),
     }
 }
@@ -2475,6 +2500,72 @@ mod tests {
             "canonical_plan_facts_digest": hex::encode(sha2::Sha256::digest(serde_jcs::to_vec(&replacement).unwrap())),
         });
         assert!(evm_approval_challenge(&entry, &changed_signing, root).is_err());
+    }
+
+    #[test]
+    fn petal_staged_challenge_retries_through_its_petal() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = bloom_tx::Outbox::new(directory.path().join("outbox")).unwrap();
+        let staged = |id: &str, origin: Option<serde_json::Value>| {
+            let staged: bloom_proto::StagedTx = serde_json::from_value(serde_json::json!({
+                "id": id, "wallet": "main", "chain": "arbitrum", "chain_id": 42161,
+                "from": "0x1111111111111111111111111111111111111111",
+                "to": "0x2222222222222222222222222222222222222222",
+                "value_wei": "0", "data_hex": "0x12345678", "nonce": 1,
+                "gas_limit": 84000, "max_fee_per_gas": "50000000000",
+                "max_priority_fee_per_gas": "2500000000", "policy_checks": [],
+                "created_ms": 1, "expires_ms": 10000, "status": "pending",
+                "action_kind": "contract_call", "execution_origin": origin
+            }))
+            .unwrap();
+            outbox.write_pending(&staged, "plan").unwrap();
+            outbox.read("main", "arbitrum", id).unwrap()
+        };
+        let root = "wallets/main/0/chains/arbitrum/outbox";
+        let active = |challenge: &mut serde_json::Value| {
+            let status = bloom_broker_api::ApprovalPublicStatus {
+                approval_id: bloom_broker_api::Digest32::from_bytes([7; 32]),
+                wallet_id: bloom_broker_api::Token::new("main").unwrap(),
+                state: bloom_broker_api::ApprovalLifecycleState::Active,
+                effective_claim_assurance: None,
+                ceremony_url: None,
+                ceremony_expires_at_ms: None,
+            };
+            reconcile_approval_challenge(challenge, Some(&status));
+            challenge["next"].as_str().unwrap().to_owned()
+        };
+
+        // Confirming the raw entry would skip the Petal's confirm-time checks.
+        let petal = staged(
+            "buy",
+            Some(serde_json::json!({
+                "petal_id": "petal:pendle", "petal_digest": "ab".repeat(32),
+                "petal_version": "v1-package", "route_id": "r000003"
+            })),
+        );
+        let signing = serde_json::json!({ "action_id": "42161:buy:confirm" });
+        let mut challenge = evm_approval_challenge(&petal, &signing, root).unwrap();
+        assert!(challenge.get("retry_path").is_none(), "{challenge}");
+        assert!(challenge.get("retry_body").is_none(), "{challenge}");
+        assert_eq!(challenge["staged_by"], "petals/pendle/");
+        let next = active(&mut challenge);
+        assert!(
+            next.contains("retry through the Petal that staged this entry (petals/pendle/"),
+            "{next}"
+        );
+        assert!(!next.contains("retry_path"), "{next}");
+
+        // An entry staged directly through the wallet outbox keeps its control.
+        let direct = staged("send", None);
+        let signing = serde_json::json!({ "action_id": "42161:send:confirm" });
+        let mut challenge = evm_approval_challenge(&direct, &signing, root).unwrap();
+        assert_eq!(
+            challenge["retry_path"],
+            format!("{root}/pending/send/confirm")
+        );
+        assert!(challenge.get("staged_by").is_none());
+        let next = active(&mut challenge);
+        assert!(next.contains("write retry_body to retry_path"), "{next}");
     }
 
     #[test]

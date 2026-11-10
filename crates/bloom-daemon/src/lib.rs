@@ -5476,11 +5476,18 @@ async fn outbox_entry_line(tree: &dyn Handler, entry: &str) -> String {
         None | Some(serde_json::Value::Null) => "confirm".into(),
         Some(body) => body.to_string(),
     };
+    // A Petal-staged entry retries through its Petal, which `next` names.
+    let retry = match field("staged_by") {
+        Some(_) => String::new(),
+        None => format!(
+            " `retry_path`: `{}`; `retry_body`: `{retry_body}`.",
+            field("retry_path").unwrap_or("its `confirm`")
+        ),
+    };
     format!(
-        "- `wallets/{entry}/`: owner approval `{}`. {} `retry_path`: `{}`; `retry_body`: `{retry_body}`. `ceremony_url` is in its `approval_challenge.json`.\n",
+        "- `wallets/{entry}/`: owner approval `{}`. {}{retry} `ceremony_url` is in its `approval_challenge.json`.\n",
         field("state").unwrap_or("unknown"),
         field("next").unwrap_or(""),
-        field("retry_path").unwrap_or("its `confirm`"),
     )
 }
 
@@ -6311,7 +6318,7 @@ mod tests {
             dirs: [
                 ("alice", vec!["0", "policy-updates"]),
                 ("alice/0/chains", vec!["base", "ethereum"]),
-                ("alice/0/chains/base/outbox/pending", vec!["tx-staged", "tx-approval"]),
+                ("alice/0/chains/base/outbox/pending", vec!["tx-staged", "tx-approval", "tx-petal"]),
                 (
                     "alice/policy-updates/pending",
                     vec!["policy-update-1", "policy-update-expired"],
@@ -6332,6 +6339,10 @@ mod tests {
                 "alice/0/chains/base/outbox/pending/tx-approval/approval_challenge.json",
                 r#"{"state":"awaiting_ceremony","next":"Give ceremony_url to the owner.","ceremony_url":"http://127.0.0.1:18734/c#secret","retry_path":"wallets/alice/0/chains/base/outbox/pending/tx-approval/confirm"}"#,
                 ),
+                (
+                "alice/0/chains/base/outbox/pending/tx-petal/approval_challenge.json",
+                r#"{"state":"active","next":"The owner approved. Now retry through the Petal that staged this entry (petals/pendle/; see its README) to sign and broadcast.","staged_by":"petals/pendle/"}"#,
+                ),
             ]
             .into(),
             broken: None,
@@ -6351,6 +6362,18 @@ mod tests {
         );
         assert!(md.contains("`wallets/alice/0/chains/base/outbox/pending/tx-approval/`: owner approval `awaiting_ceremony`"), "{md}");
         assert!(md.contains("`retry_path`: `wallets/alice/0/chains/base/outbox/pending/tx-approval/confirm`; `retry_body`: `confirm`"), "{md}");
+        let petal = md
+            .lines()
+            .find(|line| line.contains("pending/tx-petal/"))
+            .unwrap_or_else(|| panic!("{md}"));
+        assert!(
+            petal.contains("(petals/pendle/; see its README)"),
+            "{petal}"
+        );
+        assert!(
+            !petal.contains("retry_path") && !petal.contains("`confirm`"),
+            "{petal}"
+        );
         assert!(
             md.contains("`wallets/alice/policy-updates/pending/policy-update-1/`"),
             "{md}"

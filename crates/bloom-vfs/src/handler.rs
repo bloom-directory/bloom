@@ -191,7 +191,7 @@ pub enum HandlerError {
     /// path of the public `approval_challenge.json`; never its ceremony link,
     /// because error text is logged.
     #[error(
-        "permission denied: owner approval pending; read {0} and poll its state; when active, write retry_body (confirm when omitted) to retry_path; when expired, cancelled or refused, tell the owner"
+        "permission denied: owner approval pending; read {0} and poll its state; when active, do what its next says; when expired, cancelled or refused, tell the owner"
     )]
     ApprovalPending(String),
     #[error("invalid input: {0}")]
