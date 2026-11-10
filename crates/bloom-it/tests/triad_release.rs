@@ -4745,6 +4745,155 @@ fn install_linux_logins(root: &Path, payload: &Path, logins: &[(&str, &str)]) {
     }
 }
 
+#[test]
+fn linux_retained_reinstall_handles_removed_services_and_preserves_custody() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let payload = make_installer_payload(&directory.path().join("payload"));
+    install_linux_logins(&root, &payload, &[("1000", "alice")]);
+    let custody = root.join("var/lib/bloom/1000/signer/wallet-custody");
+    fs::create_dir_all(custody.parent().unwrap()).unwrap();
+    fs::write(&custody, b"retained fixture custody").unwrap();
+    let uninstalled = Command::new(release_script("install-linux.sh"))
+        .args(["uninstall", "--retain-custody"])
+        .arg(&root)
+        .arg("1000")
+        .output()
+        .unwrap();
+    assert!(
+        uninstalled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&uninstalled.stderr)
+    );
+    for service in ["broker", "signer"] {
+        assert!(
+            !root
+                .join(format!("usr/lib/systemd/system/bloom-{service}@.service"))
+                .exists()
+        );
+    }
+    let harness = write_linux_live_harness(
+        directory.path(),
+        r#"
+systemctl() {
+  printf '%s\n' "$*" >> "$log"
+  local unit="$2" template="$root/usr/lib/systemd/system/${2%@*}@.service"
+  case "$1:${3:-}" in
+    show:--property=LoadState)
+      if [[ -f "$template" ]]; then echo loaded; else echo not-found; fi ;;
+    show:--property=ActiveState) echo inactive ;;
+    stop:*) [[ -f "$template" ]] || { echo "Unit $unit not loaded" >&2; return 5; } ;;
+    *) return 64 ;;
+  esac
+}
+stop_linux_service_if_present bloom-broker@1000.service
+stop_linux_service_if_present bloom-signer@1000.service
+"#,
+    );
+    let log = directory.path().join("stop.log");
+    let stopped = Command::new(&harness)
+        .arg(release_script("install-linux.sh"))
+        .arg(&root)
+        .arg(&log)
+        .output()
+        .unwrap();
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert!(
+        !fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .any(|line| line.starts_with("stop "))
+    );
+    let installed = run_linux_installer(
+        &root,
+        &["install", "1000", "alice", payload.to_str().unwrap()],
+    );
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    assert_eq!(fs::read(&custody).unwrap(), b"retained fixture custody");
+    assert!(root.join("etc/bloom/enrollments/1000.json").is_file());
+    assert!(!root.join("etc/bloom/retained/1000.json").exists());
+    for service in ["broker", "signer"] {
+        assert!(
+            root.join(format!("usr/lib/systemd/system/bloom-{service}@.service"))
+                .is_file()
+        );
+    }
+    // The live reinstall dispatch must use the tested stop behavior for both services.
+    let installer = fs::read_to_string(release_script("install-linux.sh")).unwrap();
+    assert!(
+        installer.contains("stop_linux_service_if_present \"bloom-broker@$login_uid.service\"")
+    );
+    assert!(
+        installer.contains("stop_linux_service_if_present \"bloom-signer@$login_uid.service\"")
+    );
+}
+
+#[test]
+fn linux_reinstall_service_stop_only_skips_missing_inactive_units() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let harness = write_linux_live_harness(
+        directory.path(),
+        r#"
+systemctl() {
+  printf '%s\n' "$*" >> "$log"
+  case "$1:${3:-}" in
+    show:--property=LoadState)
+      [[ "$arg1" != query-failed ]] || return 9
+      echo "$arg1" ;;
+    show:--property=ActiveState)
+      [[ "$arg2" != query-failed ]] || return 10
+      echo "$arg2" ;;
+    stop:*) return "$arg3" ;;
+    *) return 64 ;;
+  esac
+}
+stop_linux_service_if_present bloom-broker@1000.service
+"#,
+    );
+    for (load, active, stop, expected, calls_stop) in [
+        ("not-found", "inactive", "5", 0, false),
+        ("loaded", "active", "0", 0, true),
+        ("loaded", "inactive", "7", 7, true),
+        ("not-found", "active", "7", 7, true),
+        ("query-failed", "inactive", "0", 9, false),
+        ("not-found", "query-failed", "0", 10, false),
+        ("error", "inactive", "7", 7, true),
+    ] {
+        let log = directory.path().join(format!("{load}-{active}-{stop}.log"));
+        let output = Command::new(&harness)
+            .arg(release_script("install-linux.sh"))
+            .arg(&root)
+            .arg(&log)
+            .args([load, active, stop])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "{load}/{active}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .any(|line| line.starts_with("stop ")),
+            calls_stop
+        );
+    }
+}
+
 /// Rollback runs with errexit suspended. Starting and stopping the release
 /// set must still report a failure from any login, not only the last one,
 /// and a rollback whose first login stays unhealthy must keep the

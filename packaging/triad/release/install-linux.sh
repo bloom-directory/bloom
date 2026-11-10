@@ -875,6 +875,21 @@ restore_linux_upgrade_units() {
   done
 }
 
+# A retained-custody uninstall removes the shared unit definitions. Stopping
+# those absent services is unnecessary and systemctl returns an error for it.
+# Do not hide failures for loaded services, or a missing unit that is still active.
+stop_linux_service_if_present() {
+  local unit="$1" load_state active_state
+  load_state="$(systemctl show "$unit" --property=LoadState --value)" || return
+  if [[ "$load_state" == not-found ]]; then
+    active_state="$(systemctl show "$unit" --property=ActiveState --value)" || return
+    if [[ "$active_state" == inactive ]]; then
+      return 0
+    fi
+  fi
+  systemctl stop "$unit"
+}
+
 # Checked explicitly and aggregated across logins: rollback runs with
 # errexit suspended, where only the last command's status would otherwise
 # be reported, and restoring units under a still-running service is unsafe.
@@ -1585,8 +1600,8 @@ case "$action" in
       systemctl stop "bloom-session@$login_uid.path" 2>/dev/null || true
       systemctl stop "bloom-broker-ceremony@$login_uid.socket" 2>/dev/null || true
       systemctl stop "bloom-broker-ceremony-ipv6@$login_uid.socket" 2>/dev/null || true
-      systemctl stop "bloom-broker@$login_uid.service"
-      systemctl stop "bloom-signer@$login_uid.service"
+      stop_linux_service_if_present "bloom-broker@$login_uid.service"
+      stop_linux_service_if_present "bloom-signer@$login_uid.service"
     fi
 
     binary_root="$root/usr/libexec/bloom/current"
