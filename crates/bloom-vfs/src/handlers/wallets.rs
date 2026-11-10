@@ -2229,10 +2229,8 @@ impl WalletsHandler {
                     "pending",
                     "failed",
                 )?;
-                Err(HandlerError::invalid(format!(
-                    "Broker policy ceremony is terminal: {:?}",
-                    status.state
-                )))
+                // Retired without committing; the caller proposes again.
+                Ok(())
             }
             bloom_broker_api::CeremonyState::Completed => Err(HandlerError::backend(
                 "policy_update ceremony reported the wallet-registration-only COMPLETED state",
