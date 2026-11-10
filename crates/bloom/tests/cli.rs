@@ -1951,6 +1951,55 @@ fn wallet_stage_without_daemon_fails_before_local_parsing() {
 }
 
 #[test]
+fn concurrent_wallet_stages_return_distinct_ids_on_selected_account() {
+    let home = fresh_home();
+    let handler = RecordingWriteHandler::new();
+    let vfs = bloom_vfs::Vfs::builder()
+        .mount("wallets", handler.clone())
+        .build();
+    let (server, server_thread) = spawn_ipc_server(home.path(), vfs);
+    let clients = (0..2)
+        .map(|_| {
+            let home = home.path().to_path_buf();
+            std::thread::spawn(move || {
+                let output = bloom_cmd(&home)
+                    .args([
+                        "wallet",
+                        "stage",
+                        "alice",
+                        "base",
+                        "--account",
+                        "7",
+                        "--intent",
+                        "send 1 wei to alice",
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                String::from_utf8(output.stdout).unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut ids = clients
+        .into_iter()
+        .map(|client| client.join().unwrap())
+        .collect::<Vec<_>>();
+    ids.sort();
+    assert_eq!(ids, ["tx-1\n", "tx-2\n"]);
+    assert!(
+        handler
+            .writes()
+            .iter()
+            .all(|(path, _)| path == "/alice/7/chains/base/outbox/new.tx")
+    );
+    stop_ipc_server(server, server_thread);
+}
+
+#[test]
 fn wallet_list_ignores_legacy_keystore_without_a_broker_projection() {
     let home = fresh_home();
     seed_legacy_wallet_fixture(home.path(), "alice");
