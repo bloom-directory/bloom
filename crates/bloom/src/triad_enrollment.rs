@@ -1368,16 +1368,43 @@ mod tests {
     use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
     use std::os::unix::fs::PermissionsExt as _;
 
-    /// Building the fixture Petal rewrites its package artifacts in place, so
-    /// tests that build it must not run concurrently.
-    static FIXTURE_PETAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn template_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
             .unwrap()
             .join("packaging/triad/macos/config")
+    }
+
+    /// A private copy of the authority fixture. Enrollment rebuilds package
+    /// artifacts in place, and other test processes read the shared fixture.
+    fn fixture_petal(directory: &Path) -> PathBuf {
+        let petal_dir = directory.join("petal");
+        copy_dir(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/triad-authority-petal"),
+            &petal_dir,
+        );
+        petal_dir
+    }
+
+    /// A generated developer config root owned by the current user.
+    fn developer_root(directory: &Path) -> (PathBuf, u32) {
+        let output = directory.join("config");
+        fs::create_dir(&output).unwrap();
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o700)).unwrap();
+        let owner = rustix::process::geteuid().as_raw();
+        let plan = EnrollmentPlan {
+            template_dir: template_dir(),
+            output_dir: output.clone(),
+            login_uid: 1_001,
+            broker_uid: 1_002,
+            signer_uid: 1_003,
+            session_socket_gid: 1_004,
+            release_digest: "44".repeat(32),
+        };
+        generate_for_owner(&plan, owner).unwrap();
+        (output, owner)
     }
 
     fn copy_dir(source: &Path, target: &Path) {
@@ -1469,29 +1496,9 @@ mod tests {
     #[cfg(feature = "triad-dev-harness")]
     #[test]
     fn developer_catalog_refresh_replaces_stale_release_pins_and_keeps_developer_records() {
-        let _fixture = FIXTURE_PETAL
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
         let directory = tempfile::tempdir().unwrap();
-        let output = directory.path().join("config");
-        fs::create_dir(&output).unwrap();
-        fs::set_permissions(&output, fs::Permissions::from_mode(0o700)).unwrap();
-        let owner = rustix::process::geteuid().as_raw();
-        let plan = EnrollmentPlan {
-            template_dir: template_dir(),
-            output_dir: output.clone(),
-            login_uid: 1_001,
-            broker_uid: 1_002,
-            signer_uid: 1_003,
-            session_socket_gid: 1_004,
-            release_digest: "44".repeat(32),
-        };
-        generate_for_owner(&plan, owner).unwrap();
-        let petal_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .unwrap()
-            .join("tests/fixtures/triad-authority-petal");
+        let (output, owner) = developer_root(directory.path());
+        let petal_dir = fixture_petal(directory.path());
         let developer_hash = PreparedPetalPackage::from_dir(&petal_dir).unwrap().hash;
         enroll_developer_petal_provenance(&output, &petal_dir, owner).unwrap();
         let catalog_path = output.join("provenance-catalog.json");
@@ -1575,34 +1582,48 @@ mod tests {
     }
 
     #[test]
+    fn developer_enrollment_carries_the_manifest_fee_asset_into_provenance() {
+        let directory = tempfile::tempdir().unwrap();
+        let (output, owner) = developer_root(directory.path());
+        let petal_dir = fixture_petal(directory.path());
+        let manifest = fs::read_to_string(petal_dir.join("petal.toml")).unwrap();
+        let manifest = manifest.replace(
+            "[sign]\n",
+            "[sign]\nfee_asset = { chain = \"solana\", asset = \"native\" }\n",
+        );
+        fs::write(petal_dir.join("petal.toml"), manifest).unwrap();
+
+        enroll_developer_petal_provenance(&output, &petal_dir, owner).unwrap();
+        let package_hash = PreparedPetalPackage::from_dir(&petal_dir).unwrap().hash;
+        let catalog: ProvenanceCatalog =
+            serde_json::from_slice(&fs::read(output.join("provenance-catalog.json")).unwrap())
+                .unwrap();
+        catalog.validate_shape().unwrap();
+        let fee = ProvenanceFeeAsset {
+            chain: Token::new("solana").unwrap(),
+            asset: "native".into(),
+        };
+        let classes = catalog
+            .records
+            .iter()
+            .filter(|record| matches!(&record.subject,
+                ProvenanceSubject::Petal { package_hash: hash, .. } if hash.as_str() == package_hash))
+            .flat_map(|record| &record.operation_classes)
+            .collect::<Vec<_>>();
+        assert!(!classes.is_empty());
+        assert!(
+            classes
+                .iter()
+                .all(|class| class.fee_asset.as_ref() == Some(&fee))
+        );
+    }
+
+    #[test]
     fn enrolled_linux_petal_satisfies_the_machine_active_lineage_gate() {
-        let _fixture = FIXTURE_PETAL
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
         validate_developer_caller(1000, "linux").unwrap();
         let directory = tempfile::tempdir().unwrap();
-        let output = directory.path().join("config");
-        fs::create_dir(&output).unwrap();
-        fs::set_permissions(&output, fs::Permissions::from_mode(0o700)).unwrap();
-        let owner = rustix::process::geteuid().as_raw();
-        let plan = EnrollmentPlan {
-            template_dir: template_dir(),
-            output_dir: output.clone(),
-            login_uid: 1_001,
-            broker_uid: 1_002,
-            signer_uid: 1_003,
-            session_socket_gid: 1_004,
-            release_digest: "44".repeat(32),
-        };
-        generate_for_owner(&plan, owner).unwrap();
-        // Enrollment rebuilds the package artifacts in place, so enroll a copy
-        // rather than rewriting the shared fixture under other tests.
-        let petal_dir = directory.path().join("petal");
-        copy_dir(
-            &Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../tests/fixtures/triad-authority-petal"),
-            &petal_dir,
-        );
+        let (output, owner) = developer_root(directory.path());
+        let petal_dir = fixture_petal(directory.path());
         enroll_developer_petal_provenance(&output, &petal_dir, owner).unwrap();
         let package = PreparedPetalPackage::from_dir(&petal_dir).unwrap();
         let first: ProvenanceCatalog =
