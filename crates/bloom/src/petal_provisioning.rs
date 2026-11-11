@@ -14,9 +14,6 @@ pub(crate) struct ProvisioningResult {
 pub(crate) enum ProvisioningOutcome {
     Current,
     Installed,
-    /// Replaced an older release. Signed package lineage carries the old
-    /// release's settings forward; an update outside that lineage starts empty.
-    Updated,
     Failed(String),
 }
 
@@ -64,13 +61,8 @@ pub(crate) fn provision_with(
             let prepared = acquire(daemon, &entry, context).with_context(|| {
                 format!("acquire default {name}; retry with `bloom init` or `bloom petals install`")
             })?;
-            let updated = expected_owner.is_some();
             prepared.commit(daemon, context, Some(expected_owner))?;
-            Ok(if updated {
-                ProvisioningOutcome::Updated
-            } else {
-                ProvisioningOutcome::Installed
-            })
+            Ok(ProvisioningOutcome::Installed)
         };
         let outcome = match attempt() {
             Ok(outcome) => outcome,
@@ -119,10 +111,11 @@ mod tests {
                     "hyperliquid",
                     "enso",
                     "near-intents",
-                    "feedback"
+                    "feedback",
+                    "safe"
                 ]
             );
-            assert_eq!(results.len(), 5);
+            assert_eq!(results.len(), 6);
             assert!(results.iter().all(|result| matches!(&result.outcome,
                 ProvisioningOutcome::Failed(message) if message.contains("acquire default"))));
         }

@@ -4,7 +4,7 @@ This is the operating contract for agents using the mounted Bloom virtual
 filesystem. Treat the directory containing this file as the VFS root and keep
 all paths mount-relative. Keep scratch files outside the mount.
 
-`ls` the mount and read `next.md` (actions needing attention). Read on demand:
+`ls` the mount and read `next.md` (pending outbox entries, approvals and policy updates). Read on demand:
 `cat docs/README.md` lists every route, `docs/examples.md` has command
 walkthroughs (including contract deploys and local Anvil), `docs/wallets.md` covers accounts, wallet creation, recovery,
 passkeys and sessions, and `docs/petals.md` lists installed Petals. Read a
@@ -110,15 +110,6 @@ Check its `path` and `at_ms` match your write; no record means no
 information, not success. A Petal write denied with no ceremony link: report
 the route and error rather than reinstalling, switching accounts or dropping
 fields.
-
-A Petal operation that needs a policy change answers
-`POLICY_APPROVAL_REQUIRED` with a `ceremony_url` and status path. If that
-ceremony expires unapproved, retry the operation: Machine cancels the expired
-ceremony and answers with a new `ceremony_url`. Never give the owner an
-expired URL. If the answer says another policy change is waiting, such as a
-persona switch, its link is for that change, which does not allow the
-operation: Broker opens one ceremony per wallet at a time, so tell the owner
-to approve or refuse it, then retry.
 
 ## What the owner sees when approving
 

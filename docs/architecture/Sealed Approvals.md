@@ -97,6 +97,13 @@ trusted signing registration must declare that class to trigger Safe review.
 An arbitrary EIP-712 preimage under another signing class receives that class's
 ordinary exact review; Machine cannot identify a Safe transaction from its
 hash alone. Correctly registering the Safe Petal is part of this boundary.
+
+The default catalog installs Safe v0.1.0 from its pinned release archive.
+Its signed release-lineage record authorizes route `r000020` for
+`safe.transaction.confirm`; the installer checks that declaration against the
+archive's route metadata. Installation makes the Petal available, while wallet
+policy eligibility and an exact owner approval still govern each signature.
+
 The Petal supplies one canonical Safe review envelope alongside the exact EIP-712
 preimage. Machine accepts and forwards that envelope only for this operation
 class, requires it for that class on the single-payload exact path, and refuses

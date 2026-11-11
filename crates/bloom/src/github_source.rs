@@ -27,6 +27,7 @@ pub(crate) const DEFAULT_PETALS: &[&str] = &[
     "enso",
     "near-intents",
     "feedback",
+    "safe",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,8 +46,6 @@ pub(crate) struct PreinstalledPetal {
     pub release_sequence: u64,
     pub predecessor_package_hashes: &'static [&'static str],
     pub authority_routes: &'static [PetalAuthorityRoute],
-    /// Settings `bloom init` writes into this Petal's own settings route.
-    pub setup: Option<&'static PetalSetupTemplate>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,63 +54,10 @@ pub(crate) struct PetalAuthorityRoute {
     pub operation_classes: &'static [&'static str],
 }
 
-/// A settings file setup writes through the Petal's own route. Bloom only
-/// substitutes the owner's values; the Petal owns the format and enforcement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PetalSetupTemplate {
-    /// Petal-relative route; `{wallet}` is the default-policy wallet.
-    pub path: &'static str,
-    /// File body; each `{name}` is replaced by the value of that name.
-    pub body: &'static str,
-    pub values: &'static [PetalSetupValue],
-    /// The key the releases in `releases` store the route's settings under,
-    /// in the account's partition and as the host stores it, namespace
-    /// included; `{wallet}` is the default-policy wallet. A setup write goes
-    /// ahead only to one of those releases and only while nothing is stored
-    /// there, so settings saved by the owner or anyone else stay, even ones
-    /// that read like the default. Pin a new key with each release that moves
-    /// its settings.
-    pub store_key: &'static str,
-    /// Package hashes of the releases checked to store these settings under
-    /// `store_key`: the catalog release (`expected_hash`) and earlier ones a
-    /// home may still have installed while it updates. A setup write made to
-    /// an earlier one is carried to the catalog release by the signed package
-    /// lineage.
-    pub releases: &'static [&'static str],
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PetalSetupValue {
-    pub name: &'static str,
-    pub prompt: &'static str,
-    pub default: &'static str,
-}
-
-const POLYMARKET_SETUP: PetalSetupTemplate = PetalSetupTemplate {
-    path: "settings/{wallet}/0/venue.toml",
-    body: "enabled = true\nmax_daily_usd = \"{max_daily_usd}\"\n",
-    values: &[PetalSetupValue {
-        name: "max_daily_usd",
-        prompt: "Polymarket daily buy limit in pUSD",
-        default: "100",
-    }],
-    // `venue_config_key` in these releases, under the Petal SDK's `state`
-    // namespace, which its `store_get` and `store_put` add to every key.
-    store_key: "state/settings/{wallet}/venue.toml",
-    // v0.1.6 (pinned by Bloom v0.4.0), v0.1.8, v0.2.0, and v0.2.1, the
-    // release this catalog pins. `venue_config_key` is byte-identical across
-    // all four, so one `store_key` covers them. v0.2.0 landed on master while this branch
-    // still pinned v0.1.8, and the two edits are far enough apart in this file
-    // that git merged both without a conflict: the catalog moved to v0.2.0
-    // while this list did not, so `write_petal_settings` refused the only
-    // release Bloom installs. Keep this list and `expected_hash` in step.
-    releases: &[
-        "0f365cd7f613129f73ce66fb07256c8a42c4e70abbb77721804dbd6df85b96b5",
-        "6eb2065e8558f3761399fcb0516731a600fdb0b49974c8ed0808abd38fde7db4",
-        "17a50dda0894b7b7e5757033806f8ec31523575438419ea1330b731a2c6c5d14",
-        "036cce365ff7cfe5c3e35754fc4c15097576c6251eb2277b890cdae673b234fd",
-    ],
-};
+const SAFE_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[PetalAuthorityRoute {
+    route_id: "r000020",
+    operation_classes: &["safe.transaction.confirm"],
+}];
 
 const BASELINE_POLYMARKET_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
     PetalAuthorityRoute {
@@ -505,6 +451,10 @@ pub(crate) fn release_lineage_predecessors(name: &str) -> &'static [ReleaseLinea
         "5f26e7bbf7f507cfcf4c13645cf9f4f0c903d769c201e3e9d1f5c914b14fa2a3",
         &[],
     )];
+    const SAFE: &[ReleaseLineagePredecessor] = &[baseline(
+        "578ad00feced6178caf565e6cc6c8b66ec7a9886b2bf457864cc81fc881666f3",
+        SAFE_AUTHORITY_ROUTES,
+    )];
     const TOLLY: &[ReleaseLineagePredecessor] = &[baseline(
         "f50f9f6f55eca103c11ed40d424311c6e5863ff5046231f57f58822d1aac6709",
         &[],
@@ -515,6 +465,7 @@ pub(crate) fn release_lineage_predecessors(name: &str) -> &'static [ReleaseLinea
         "enso" => ENSO,
         "near-intents" => NEAR_INTENTS,
         "feedback" => FEEDBACK,
+        "safe" => SAFE,
         "tolly" => TOLLY,
         _ => &[],
     }
@@ -540,7 +491,6 @@ const PREINSTALLED_POLYMARKET: PreinstalledPetal = PreinstalledPetal {
         "17a50dda0894b7b7e5757033806f8ec31523575438419ea1330b731a2c6c5d14",
     ],
     authority_routes: POLYMARKET_AUTHORITY_ROUTES,
-    setup: Some(&POLYMARKET_SETUP),
 };
 
 const PREINSTALLED_HYPERLIQUID: PreinstalledPetal = PreinstalledPetal {
@@ -562,7 +512,6 @@ const PREINSTALLED_HYPERLIQUID: PreinstalledPetal = PreinstalledPetal {
         "d811c181c7ec469026335c9265d7019a520d8d9d882b302064278cf1138d2db2",
     ],
     authority_routes: HYPERLIQUID_AUTHORITY_ROUTES,
-    setup: None,
 };
 
 const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
@@ -583,7 +532,6 @@ const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
         "a498727c1e9ba6f4385ca7514c2ef59236b6234b234b6e1920cb21358ea3b057",
     ],
     authority_routes: &[],
-    setup: None,
 };
 
 const PREINSTALLED_FEEDBACK: PreinstalledPetal = PreinstalledPetal {
@@ -601,7 +549,23 @@ const PREINSTALLED_FEEDBACK: PreinstalledPetal = PreinstalledPetal {
     release_sequence: 1,
     predecessor_package_hashes: &[],
     authority_routes: &[],
-    setup: None,
+};
+
+const PREINSTALLED_SAFE: PreinstalledPetal = PreinstalledPetal {
+    name: "safe",
+    repository: "https://github.com/bloom-directory/bloom-petal-safe",
+    commit: "9bf737753c7cd13ff136a0aeacf9b748b5763760",
+    release_tag: "v0.1.0",
+    archive: "safe-v0.1.0.petal.tar.gz",
+    expected_hash: Some("578ad00feced6178caf565e6cc6c8b66ec7a9886b2bf457864cc81fc881666f3"),
+    archive_sha256: "3f1b592ccafbed856d8ec0fb0ddea5cbc896ba91cbba827a51b1f554a1fb60bf",
+    tooling_commit: "2beed2ff344ce2b0c112e07096027e1ae0404007",
+    petal_abi: "bloom.petal-host/payload-signing-v1",
+    default_eligible: true,
+    lineage_id: None,
+    release_sequence: 1,
+    predecessor_package_hashes: &[],
+    authority_routes: SAFE_AUTHORITY_ROUTES,
 };
 
 const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
@@ -622,7 +586,6 @@ const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
         "e6ffbfdc96c5fa9b5fe5b62dc0c373b2522fb31d216a5a33ea2e1dab21c082a0",
     ],
     authority_routes: &[],
-    setup: None,
 };
 
 const PREINSTALLED_GASLESS: PreinstalledPetal = PreinstalledPetal {
@@ -640,7 +603,6 @@ const PREINSTALLED_GASLESS: PreinstalledPetal = PreinstalledPetal {
     release_sequence: 0,
     predecessor_package_hashes: &[],
     authority_routes: &[],
-    setup: None,
 };
 
 const PREINSTALLED_PRIVACY_POOLS: PreinstalledPetal = PreinstalledPetal {
@@ -658,7 +620,6 @@ const PREINSTALLED_PRIVACY_POOLS: PreinstalledPetal = PreinstalledPetal {
     release_sequence: 0,
     predecessor_package_hashes: &[],
     authority_routes: &[],
-    setup: None,
 };
 
 const PREINSTALLED_VENICE_X402: PreinstalledPetal = PreinstalledPetal {
@@ -676,7 +637,6 @@ const PREINSTALLED_VENICE_X402: PreinstalledPetal = PreinstalledPetal {
     release_sequence: 0,
     predecessor_package_hashes: &[],
     authority_routes: &[],
-    setup: None,
 };
 
 const PREINSTALLED_TOLLY: PreinstalledPetal = PreinstalledPetal {
@@ -694,7 +654,6 @@ const PREINSTALLED_TOLLY: PreinstalledPetal = PreinstalledPetal {
     release_sequence: 1,
     predecessor_package_hashes: &[],
     authority_routes: &[],
-    setup: None,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1506,6 +1465,7 @@ pub(crate) fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPeta
         "hyperliquid" => Some(&PREINSTALLED_HYPERLIQUID),
         "near-intents" => Some(&PREINSTALLED_NEAR_INTENTS),
         "feedback" => Some(&PREINSTALLED_FEEDBACK),
+        "safe" => Some(&PREINSTALLED_SAFE),
         "enso" => Some(&PREINSTALLED_ENSO),
         "gasless" => Some(&PREINSTALLED_GASLESS),
         "privacy-pools" => Some(&PREINSTALLED_PRIVACY_POOLS),
@@ -1517,13 +1477,14 @@ pub(crate) fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPeta
 
 /// Bundled releases whose signed lineage also controls private-state
 /// carry-forward. Non-authority Petals receive a lineage-only catalog record.
-pub(crate) fn release_lineage_petals() -> [&'static PreinstalledPetal; 5] {
+pub(crate) fn release_lineage_petals() -> [&'static PreinstalledPetal; 6] {
     [
         &PREINSTALLED_POLYMARKET,
         &PREINSTALLED_HYPERLIQUID,
         &PREINSTALLED_ENSO,
         &PREINSTALLED_NEAR_INTENTS,
         &PREINSTALLED_FEEDBACK,
+        &PREINSTALLED_SAFE,
     ]
 }
 
@@ -2286,6 +2247,7 @@ mod tests {
             "hyperliquid",
             "near-intents",
             "feedback",
+            "safe",
             "enso",
             "gasless",
             "privacy-pools",
@@ -2300,7 +2262,7 @@ mod tests {
                 entry.default_eligible,
                 matches!(
                     name,
-                    "polymarket" | "hyperliquid" | "enso" | "near-intents" | "feedback"
+                    "polymarket" | "hyperliquid" | "enso" | "near-intents" | "feedback" | "safe"
                 )
             );
         }
@@ -2463,7 +2425,6 @@ mod tests {
             release_sequence: 0,
             predecessor_package_hashes: &[],
             authority_routes: &[],
-            setup: None,
         }
     }
 
@@ -2806,8 +2767,7 @@ mod tests {
         assert!(
             matches!(&results[0].outcome, ProvisioningOutcome::Failed(message) if message.contains("offline"))
         );
-        // The fixture replaces an older installed release.
-        assert_eq!(results[1].outcome, ProvisioningOutcome::Updated);
+        assert_eq!(results[1].outcome, ProvisioningOutcome::Installed);
         let results = provision_with(
             &daemon,
             &context,
@@ -3047,7 +3007,6 @@ mod tests {
             release_sequence: 0,
             predecessor_package_hashes: &[],
             authority_routes: &[],
-            setup: None,
         };
         let release = PetalReleaseManifest {
             schema: "bloom.petal.release.v1".into(),

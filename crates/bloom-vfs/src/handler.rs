@@ -187,6 +187,13 @@ pub enum HandlerError {
     PermissionDenied,
     #[error("operation not permitted")]
     OperationNotPermitted,
+    /// A write refused until the owner approves its ceremony. Carries the VFS
+    /// path of the public `approval_challenge.json`; never its ceremony link,
+    /// because error text is logged.
+    #[error(
+        "permission denied: owner approval pending; read {0} and poll its state; when active, write retry_body (confirm when omitted) to retry_path; when expired, cancelled or refused, tell the owner"
+    )]
+    ApprovalPending(String),
     #[error("invalid input: {0}")]
     Invalid(String),
     #[error("unsupported: {0}")]
@@ -239,25 +246,6 @@ pub trait Handler: Send + Sync {
     async fn write(&self, path: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
         let _ = path;
         Err(HandlerError::PermissionDenied)
-    }
-
-    /// Write `data` to `path` only while the handler stores nothing under
-    /// `key` for it, and report whether it wrote. What is stored decides,
-    /// not what `path` reads: a file may read the same default whether its
-    /// value is missing or was saved that way. The check and the write must
-    /// be one step against every other write this handler accepts for
-    /// `path`, which [`crate::WriteLocks`] provides. Default: unsupported,
-    /// writing nothing.
-    async fn write_if_absent(
-        &self,
-        path: &VfsPath,
-        _key: &str,
-        _data: &[u8],
-    ) -> Result<bool, HandlerError> {
-        Err(HandlerError::Unsupported(format!(
-            "conditional write to {}",
-            path.to_string_path()
-        )))
     }
 
     /// Prepare for a write-open before any bytes are accepted by the mount.

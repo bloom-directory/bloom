@@ -688,10 +688,17 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
     let numbered_outbox = "wallets/alice/1/chains/solana-local/outbox";
     let numbered_confirm =
         VfsPath::parse(&format!("/{numbered_outbox}/pending/{numbered_id}/confirm")).unwrap();
-    let refused = daemon.vfs.write(&numbered_confirm, b"y\n").await;
+    let refused = daemon
+        .vfs
+        .write(&numbered_confirm, b"y\n")
+        .await
+        .expect_err("confirm must fail closed before owner approval")
+        .to_string();
     assert!(
-        refused.is_err(),
-        "confirm must fail closed before owner approval"
+        refused.contains(&format!(
+            "owner approval pending; read {numbered_outbox}/pending/{numbered_id}/approval_challenge.json"
+        )) && !refused.contains("http"),
+        "{refused}"
     );
     let challenge = read_json(
         &daemon,

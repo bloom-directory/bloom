@@ -59,6 +59,7 @@ use bloom_tx::outbox::{CentralActionIdentity, CentralOutboxProjection, Outbox, O
 use bloom_tx::tx_engine::{
     ConfirmBatchResult, ConfirmBatchTarget, Eip1559FeeOverrides, TxEngine, TxEngineError,
 };
+use bloom_vfs::handler::{EntryKind, Handler, HandlerError};
 use bloom_vfs::handlers::outbox::StagedPetalIdentity;
 use bloom_vfs::handlers::status::{MempoolBackendStatus, PrivateRpcBackendStatus};
 use bloom_vfs::handlers::wallets::{AccountPetalContext, AccountPetalMount, AccountSessionEntry};
@@ -665,10 +666,6 @@ impl DaemonPetalHost {
             bloom_machine_client::PetalEligibility::AwaitingPolicyApproval(pending) => {
                 Ok(Some(pending))
             }
-            // Not produced here: this request is proposed at any version.
-            bloom_machine_client::PetalEligibility::ChangedSinceCreation(_) => Err(
-                HostError::Denied("wallet policy does not allow this Petal package".into()),
-            ),
         }
     }
 
@@ -3935,155 +3932,9 @@ impl AccountPetalMount for AccountPetals {
     }
 }
 
-/// What a wallet's first Petal proposal also allows, from its setup: each
-/// chosen Petal that is installed, its destinations, and the persona's
-/// destinations ([`persona_policy_destinations`]) and approval lifetime
-/// ([`persona_policy_lifetime`]). A chosen Petal that is not installed is
-/// left out. One whose owner record cannot be read, or holds an invalid
-/// package hash, fails the whole setup, so the proposal stops rather than
-/// leaving that Petal out of the policy for good.
-fn default_policy_setup(
-    store: &PetalStore,
-    chosen: &bloom_proto::config::WalletSetup,
-    persona_destinations: &[bloom_broker_api::PolicyDestination],
-) -> Result<bloom_vfs::handlers::DefaultPolicySetup, bloom_vfs::HandlerError> {
-    let mut setup = bloom_vfs::handlers::DefaultPolicySetup {
-        maximum_approval_lifetime_ms: persona_policy_lifetime(chosen),
-        ..Default::default()
-    };
-    setup.destinations.extend_from_slice(persona_destinations);
-    for name in chosen.petals.keys() {
-        let installed = store.resolve_petal_owner(name).map_err(|error| {
-            warn!(petal = %name, %error, "petal.default_policy_owner_unreadable");
-            bloom_vfs::HandlerError::backend(format!("read the installed {name} Petal: {error}"))
-        })?;
-        let Some(hash) = installed else { continue };
-        let package = bloom_broker_api::Digest32::new(hash).map_err(|error| {
-            bloom_vfs::HandlerError::backend(format!(
-                "the installed {name} Petal has an invalid package hash: {error}"
-            ))
-        })?;
-        setup.packages.push(package);
-        setup.destinations.extend(default_policy_destinations(name));
-    }
-    Ok(setup)
-}
-
-/// [`default_policy_setup`] for `wallet`, from the config on disk now, not a
-/// copy taken when Machine started: an approved persona switch saves a
-/// wallet's setup while Machine runs. A config that cannot be read stops the
-/// proposal.
-fn saved_default_policy_setup(
-    store: &PetalStore,
-    config_path: &std::path::Path,
-    wallet: &str,
-) -> Result<bloom_vfs::handlers::DefaultPolicySetup, bloom_vfs::HandlerError> {
-    let config = Config::load(config_path).map_err(|error| {
-        bloom_vfs::HandlerError::backend(format!(
-            "read {wallet}'s setup before proposing its policy: {error}"
-        ))
-    })?;
-    let persona_destinations = persona_policy_destinations(&config, wallet);
-    default_policy_setup(store, config.setup.wallet(wallet), &persona_destinations)
-}
-
-/// The chain ids on which Degen allows curated ERC-20 transfers to any
-/// recipient: Ethereum and Polygon, the EVM networks Broker's reviewed
-/// sessions support (bloom-broker#112).
-pub const ANY_RECIPIENT_CHAIN_IDS: [u64; 2] = [1, 137];
-
-/// The configured chains with an id in [`ANY_RECIPIENT_CHAIN_IDS`], in that
-/// order. A chain id configured twice is listed once.
-pub fn any_recipient_chains(
-    chains: &std::collections::BTreeMap<String, ChainSpec>,
-) -> Vec<&ChainSpec> {
-    ANY_RECIPIENT_CHAIN_IDS
-        .iter()
-        .filter_map(|id| chains.values().find(|chain| chain.chain_id == *id))
-        .collect()
-}
-
-/// The configured chains on which `wallet`'s saved persona allows curated
-/// ERC-20 transfers to any recipient: [`any_recipient_chains`] for Degen, and
-/// none for any other persona.
-pub fn persona_any_recipient_chains<'a>(config: &'a Config, wallet: &str) -> Vec<&'a ChainSpec> {
-    setup_any_recipient_chains(&config.chains, config.setup.wallet(wallet))
-}
-
-/// [`persona_any_recipient_chains`] for `setup`, which may not be saved yet,
-/// such as a persona switch waiting for its ceremony.
-pub fn setup_any_recipient_chains<'a>(
-    chains: &'a std::collections::BTreeMap<String, ChainSpec>,
-    setup: &bloom_proto::config::WalletSetup,
-) -> Vec<&'a ChainSpec> {
-    if !setup
-        .persona
-        .as_ref()
-        .is_some_and(|persona| persona.preset == bloom_proto::persona::PersonaPreset::Degen)
-    {
-        return Vec::new();
-    }
-    any_recipient_chains(chains)
-}
-
-/// What `wallet`'s saved persona adds to its policy:
-/// [`bloom_proto::policy::ERC20_ANY_RECIPIENT`] on each of
-/// [`persona_any_recipient_chains`], keyed `evm-<chain id>`. Each such
-/// transfer is still an exact owner approval until reviewed sessions can sign
-/// them (bloom-broker#112). Institutional and Trader add nothing here.
-pub fn persona_policy_destinations(
-    config: &Config,
-    wallet: &str,
-) -> Vec<bloom_broker_api::PolicyDestination> {
-    setup_policy_destinations(&config.chains, config.setup.wallet(wallet))
-}
-
-/// [`persona_policy_destinations`] for `setup`, which may not be saved yet.
-pub fn setup_policy_destinations(
-    chains: &std::collections::BTreeMap<String, ChainSpec>,
-    setup: &bloom_proto::config::WalletSetup,
-) -> Vec<bloom_broker_api::PolicyDestination> {
-    setup_any_recipient_chains(chains, setup)
-        .into_iter()
-        .filter_map(|chain| {
-            Some(bloom_broker_api::PolicyDestination {
-                chain: bloom_broker_api::Token::new(format!("evm-{}", chain.chain_id)).ok()?,
-                destination: bloom_proto::policy::ERC20_ANY_RECIPIENT.into(),
-            })
-        })
-        .collect()
-}
-
-/// The approval lifetime a wallet's persona asks of its policy beyond what
-/// wallet creation installs: the standing lifetime for Trader and Degen
-/// (decision 19). None for Institutional or a wallet without a persona,
-/// whose policy keeps the lifetime it has.
-pub fn persona_policy_lifetime(setup: &bloom_proto::config::WalletSetup) -> Option<u64> {
-    setup
-        .persona
-        .as_ref()
-        .map(bloom_proto::persona::PersonaConfig::approval_lifetime_ms)
-        .filter(|lifetime| *lifetime != bloom_proto::policy::CREATION_APPROVAL_LIFETIME_MS)
-}
-
-/// The fixed contracts a chosen Petal transacts with, as Broker policy
-/// destinations. The table lives in Bloom's source, never in config.
-fn default_policy_destinations(name: &str) -> Vec<bloom_broker_api::PolicyDestination> {
-    bloom_proto::petal_destinations::for_petal(name)
-        .iter()
-        .filter_map(|destination| {
-            Some(bloom_broker_api::PolicyDestination {
-                chain: bloom_broker_api::Token::new(destination.chain.to_owned()).ok()?,
-                destination: destination.destination.to_owned(),
-            })
-        })
-        .collect()
-}
-
 /// All wired-up state the daemon owns. Cheap to clone (everything is
 /// behind Arc/clone-safe inner types).
 #[derive(Clone)]
-
 pub struct Daemon {
     deployment_locks: Arc<deployment::DeploymentLocks>,
     pub home: HomeDir,
@@ -4869,26 +4720,6 @@ impl Daemon {
             })),
         );
 
-        // Build the petals runtime: content-addressed store under
-        // `~/.bloom/petals/store`, name registry under
-        // `~/.bloom/petals/registry`, and a wasmtime engine. Petal
-        // packages are exposed under `petals/`.
-        let petals_root = home.root().join("petals");
-        let petal_store = PetalStore::open(petals_root.join("store"))
-            .map_err(|e| DaemonError::Audit(format!("petals store: {e}")))?;
-
-        // A wallet's first Petal proposal also allows every installed Petal
-        // its setup chose, and its persona's destinations and lifetime.
-        let default_policy_packages: bloom_vfs::handlers::DefaultPolicyPackages = {
-            // Read from disk on each call, not from the copy Machine loaded at
-            // startup: a persona switch saves a wallet's setup while Machine
-            // runs. Installed hashes are resolved on each call too, so a Petal
-            // update is picked up without a restart. A config that cannot be
-            // read stops the proposal.
-            let config_path = home.config_path();
-            let store = petal_store.clone();
-            Arc::new(move |wallet: &str| saved_default_policy_setup(&store, &config_path, wallet))
-        };
         let wallets_handler = Arc::new(
             WalletsHandler::new(
                 chains.clone(),
@@ -4902,9 +4733,16 @@ impl Daemon {
             .with_home_write_permit_opt(home_write_permit.clone())
             .with_mempool_indexes(mempool_indexes.clone())
             .with_solana(solana_engines)
-            .with_solana_reads(solana_chain_registry.clone())
-            .with_default_policy_packages(default_policy_packages),
+            .with_solana_reads(solana_chain_registry.clone()),
         );
+
+        // Build the petals runtime: content-addressed store under
+        // `~/.bloom/petals/store`, name registry under
+        // `~/.bloom/petals/registry`, and a wasmtime engine. Petal
+        // packages are exposed under `petals/`.
+        let petals_root = home.root().join("petals");
+        let petal_store = PetalStore::open(petals_root.join("store"))
+            .map_err(|e| DaemonError::Audit(format!("petals store: {e}")))?;
         let petal_registry = Arc::new(
             NameRegistry::open(petals_root.join("registry"))
                 .map_err(|e| DaemonError::Audit(format!("petals registry: {e}")))?,
@@ -5040,9 +4878,11 @@ impl Daemon {
         // Answers: what wallets need attention, what confirms are pending,
         // what risk data is stale.
         let next_wallet_projections = wallet_projections.clone();
+        let next_wallet_tree = wallets_handler.clone();
         vfs_builder = vfs_builder.with_root_dynamic_async("next.md", move || {
             let projections = next_wallet_projections.clone();
-            async move { render_next_actions(projections.as_ref()).await }
+            let wallet_tree = next_wallet_tree.clone();
+            async move { render_next_actions(projections.as_ref(), wallet_tree.as_ref()).await }
         });
 
         let vfs = vfs_builder
@@ -5288,71 +5128,6 @@ impl Daemon {
         self.machine_broker.clone()
     }
 
-    /// Propose every package in `packages`, every destination in
-    /// `destinations` and the approval `lifetime` together through the
-    /// wallet's existing policy operation. `Allowed` means the policy allows
-    /// all of them. Once the policy has
-    /// changed since creation, they are proposed only when `after_change` is
-    /// [`bloom_vfs::handlers::AfterPolicyChange::Propose`].
-    pub async fn ensure_default_policy(
-        &self,
-        wallet: &str,
-        packages: &[bloom_broker_api::Digest32],
-        destinations: &[bloom_broker_api::PolicyDestination],
-        lifetime: Option<u64>,
-        after_change: bloom_vfs::handlers::AfterPolicyChange,
-    ) -> Result<bloom_machine_client::PetalEligibility, bloom_vfs::HandlerError> {
-        self.wallets
-            .ensure_petal_packages_allowed(wallet, packages, destinations, lifetime, after_change)
-            .await
-    }
-
-    /// Replace what setup chose in `wallet`'s policy with `replacement`,
-    /// after the owner switched its persona. `Allowed` means the policy
-    /// already matches it. Without `may_propose`, nothing new is proposed.
-    pub async fn ensure_policy_replaced(
-        &self,
-        wallet: &str,
-        replacement: &bloom_vfs::handlers::PolicyReplacement,
-        may_propose: bool,
-    ) -> Result<bloom_machine_client::PetalEligibility, bloom_vfs::HandlerError> {
-        self.wallets
-            .ensure_policy_replaced(wallet, replacement, may_propose)
-            .await
-    }
-
-    /// Cancel a policy proposal Machine made for `wallet`, such as an earlier
-    /// persona switch, and say what became of it: one the owner approved
-    /// before the cancel reached Broker commits instead.
-    pub async fn cancel_policy_proposal(
-        &self,
-        wallet: &str,
-        operation_id: &str,
-    ) -> Result<bloom_vfs::handlers::ProposalOutcome, bloom_vfs::HandlerError> {
-        self.wallets
-            .cancel_policy_proposal(wallet, operation_id)
-            .await
-    }
-
-    /// `wallet`'s current policy, read from Broker and verified.
-    pub async fn current_wallet_policy(
-        &self,
-        wallet: &str,
-    ) -> Result<bloom_broker_api::SignedPolicySnapshot, bloom_vfs::HandlerError> {
-        self.wallets.current_policy(wallet).await
-    }
-
-    /// What became of a policy proposal Machine made for `wallet`.
-    pub async fn policy_proposal_outcome(
-        &self,
-        wallet: &str,
-        operation_id: &str,
-    ) -> Result<bloom_vfs::handlers::ProposalOutcome, bloom_vfs::HandlerError> {
-        self.wallets
-            .policy_proposal_outcome(wallet, operation_id)
-            .await
-    }
-
     /// Idempotent: ensure background workers are running. Already
     /// invoked by [`from_home`] when a tokio runtime is available; call
     /// this after entering an async context if construction happened
@@ -5593,12 +5368,17 @@ fn configured_mount(
     })
 }
 
-async fn render_next_actions(projections: &dyn WalletProjectionReader) -> Vec<u8> {
-    render_next_actions_with_timeout(projections, WALLET_PROJECTION_LIVE_TIMEOUT).await
+async fn render_next_actions(
+    projections: &dyn WalletProjectionReader,
+    wallet_tree: &dyn Handler,
+) -> Vec<u8> {
+    render_next_actions_with_timeout(projections, wallet_tree, WALLET_PROJECTION_LIVE_TIMEOUT).await
 }
 
+/// Renders `/next.md`. `wallet_tree` is the handler mounted at `wallets/`.
 async fn render_next_actions_with_timeout(
     projections: &dyn WalletProjectionReader,
+    wallet_tree: &dyn Handler,
     live_timeout: Duration,
 ) -> Vec<u8> {
     let mut md = String::from("# Next Actions\n\n");
@@ -5637,11 +5417,140 @@ async fn render_next_actions_with_timeout(
         md.push('\n');
     }
 
-    if !wallet_projection_unavailable && stale_wallets.is_empty() {
-        md.push_str("No wallets with pending actions.\n\n");
-        md.push_str("All policies are signed and no outbox confirms await review.\n");
+    if wallet_projection_unavailable {
+        md.push_str("Outboxes and policy updates were not checked.\n");
+    } else {
+        let wallet_ids: Vec<String> = wallets
+            .iter()
+            .map(|projection| projection.wallet.wallet_id.as_str().to_owned())
+            .collect();
+        md.push_str(&render_pending_actions(wallet_tree, &wallet_ids, live_timeout).await);
     }
     md.into_bytes()
+}
+
+/// Child directories of `wallets/<path>`. A missing path has none; any other
+/// failure goes to `unreadable`, so next.md never reports it as empty.
+async fn wallet_dirs(tree: &dyn Handler, path: &str, unreadable: &mut Vec<String>) -> Vec<String> {
+    let listed = match VfsPath::parse(path) {
+        Ok(parsed) => tree.list(&parsed).await,
+        Err(error) => Err(HandlerError::invalid(error.to_string())),
+    };
+    match listed {
+        Ok(entries) => entries
+            .into_iter()
+            .filter(|entry| entry.kind == EntryKind::Dir)
+            .map(|entry| entry.name)
+            .collect(),
+        Err(HandlerError::NotFound(_)) => Vec::new(),
+        Err(error) => {
+            unreadable.push(format!("- `wallets/{path}/` could not be read: {error}\n"));
+            Vec::new()
+        }
+    }
+}
+
+/// One line for a pending outbox entry. `ceremony_url` is an owner
+/// capability, so it stays in the challenge file.
+async fn outbox_entry_line(tree: &dyn Handler, entry: &str) -> String {
+    let read = match VfsPath::parse(&format!("{entry}/approval_challenge.json")) {
+        Ok(path) => tree.read(&path).await,
+        Err(error) => Err(HandlerError::invalid(error.to_string())),
+    };
+    let challenge: serde_json::Value = match read {
+        Err(HandlerError::NotFound(_)) => {
+            return format!(
+                "- `wallets/{entry}/`: staged, not confirmed. Review its `plan.md`; write `confirm` to its `confirm` only if the owner still wants it, or `cancel` to discard it.\n"
+            );
+        }
+        Err(error) => {
+            return format!(
+                "- `wallets/{entry}/`: its `approval_challenge.json` could not be read: {error}\n"
+            );
+        }
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+    };
+    let field = |name: &str| challenge.get(name).and_then(|value| value.as_str());
+    let retry_body = match challenge.get("retry_body") {
+        Some(serde_json::Value::String(body)) => body.clone(),
+        None | Some(serde_json::Value::Null) => "confirm".into(),
+        Some(body) => body.to_string(),
+    };
+    format!(
+        "- `wallets/{entry}/`: owner approval `{}`. {} `retry_path`: `{}`; `retry_body`: `{retry_body}`. `ceremony_url` is in its `approval_challenge.json`.\n",
+        field("state").unwrap_or("unknown"),
+        field("next").unwrap_or(""),
+        field("retry_path").unwrap_or("its `confirm`"),
+    )
+}
+
+/// Lists each wallet's pending outbox entries and policy updates by walking
+/// the `wallets/` routes an agent would list. A listing can omit an entry it
+/// cannot read, so the empty case reports what was listed, not an all-clear.
+async fn render_pending_actions(
+    tree: &dyn Handler,
+    wallets: &[String],
+    timeout: Duration,
+) -> String {
+    let (mut outbox, mut policy, mut unreadable) = (Vec::new(), Vec::new(), Vec::new());
+    let scan = async {
+        for wallet in wallets {
+            let updates = format!("{wallet}/policy-updates/pending");
+            for id in wallet_dirs(tree, &updates, &mut unreadable).await {
+                // Reading `status.json` reconciles a cancelled, expired or
+                // failed ceremony out of `pending/`.
+                let read = match VfsPath::parse(&format!("{updates}/{id}/status.json")) {
+                    Ok(path) => tree.read(&path).await,
+                    Err(error) => Err(HandlerError::invalid(error.to_string())),
+                };
+                match read.map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes)) {
+                    Ok(Ok(status)) if status["state"] != "pending" => {}
+                    Ok(Ok(_)) => policy.push(format!(
+                        "- `wallets/{updates}/{id}/`: awaits the owner's approval. Read its `status.json`.\n"
+                    )),
+                    Ok(Err(error)) => unreadable.push(format!(
+                        "- `wallets/{updates}/{id}/status.json` could not be parsed: {error}\n"
+                    )),
+                    Err(HandlerError::NotFound(_)) => {}
+                    Err(error) => unreadable.push(format!(
+                        "- `wallets/{updates}/{id}/status.json` could not be read: {error}\n"
+                    )),
+                }
+            }
+            for account in wallet_dirs(tree, wallet, &mut unreadable).await {
+                if account.parse::<u32>().is_err() {
+                    continue;
+                }
+                let chains = format!("{wallet}/{account}/chains");
+                for chain in wallet_dirs(tree, &chains, &mut unreadable).await {
+                    let pending = format!("{chains}/{chain}/outbox/pending");
+                    for id in wallet_dirs(tree, &pending, &mut unreadable).await {
+                        outbox.push(outbox_entry_line(tree, &format!("{pending}/{id}")).await);
+                    }
+                }
+            }
+        }
+    };
+    if tokio::time::timeout(timeout, scan).await.is_err() {
+        unreadable.push(format!(
+            "- The check stopped after {}s; list `outbox/pending/` and `policy-updates/pending/` directly.\n",
+            timeout.as_secs_f32()
+        ));
+    }
+    let mut md = String::new();
+    for (title, lines) in [
+        ("Pending Outbox Entries", outbox),
+        ("Pending Policy Updates", policy),
+        ("Not Checked", unreadable),
+    ] {
+        if !lines.is_empty() {
+            md.push_str(&format!("## {title}\n\n{}\n", lines.concat()));
+        }
+    }
+    if md.is_empty() {
+        md.push_str("No outbox entry or policy update is listed as pending.\n");
+    }
+    md
 }
 
 fn run_expiry_sweep_once(
@@ -6234,138 +6143,6 @@ mod tests {
         assert!(configured_mount(&config, std::path::Path::new("/tmp/bloom-mount")).is_err());
     }
 
-    /// One chosen Petal whose owner record cannot be read fails the whole
-    /// default-policy setup, rather than leaving that Petal out of the first
-    /// proposal. A chosen Petal that is not installed is simply left out.
-    #[test]
-    fn default_policy_setup_fails_when_an_owner_record_is_unreadable() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = PetalStore::open(temp.path()).unwrap();
-        let mut chosen = bloom_proto::config::WalletSetup::default();
-        for name in ["hyperliquid", "polymarket"] {
-            chosen.petals.insert(name.to_owned(), Default::default());
-        }
-
-        let setup = default_policy_setup(&store, &chosen, &[]).unwrap();
-        assert!(setup.packages.is_empty(), "nothing is installed yet");
-
-        std::fs::create_dir_all(temp.path().join("owners")).unwrap();
-        std::fs::write(temp.path().join("owners/polymarket.json"), b"not json").unwrap();
-        let error = default_policy_setup(&store, &chosen, &[]).unwrap_err();
-        assert!(error.to_string().contains("polymarket"), "{error}");
-        // A wallet without a setup proposes nothing beyond its request.
-        assert_eq!(
-            default_policy_setup(&store, &Default::default(), &[]).unwrap(),
-            bloom_vfs::handlers::DefaultPolicySetup::default()
-        );
-    }
-
-    /// Degen opts a wallet into ERC-20 transfers to any recipient on each
-    /// configured network Broker sessions support, for the wallet it was
-    /// chosen for. Trader and Degen ask for the standing approval lifetime;
-    /// Institutional asks for none.
-    #[test]
-    fn a_wallets_persona_adds_its_own_entries_and_lifetime() {
-        use bloom_proto::persona::{PersonaConfig, PersonaPreset};
-
-        let mut config = Config::local_default();
-        assert!(
-            persona_policy_destinations(&config, "main").is_empty(),
-            "no persona"
-        );
-        for preset in [PersonaPreset::Custodian, PersonaPreset::Trader] {
-            config.setup.main_mut().persona = Some(PersonaConfig::suggested(preset));
-            assert!(
-                persona_policy_destinations(&config, "main").is_empty(),
-                "{preset:?}"
-            );
-        }
-        assert_eq!(
-            persona_policy_lifetime(config.setup.main()),
-            Some(bloom_proto::policy::STANDING_APPROVAL_POLICY_LIFETIME_MS),
-            "Trader"
-        );
-        config.setup.main_mut().persona = Some(PersonaConfig::suggested(PersonaPreset::Custodian));
-        assert_eq!(persona_policy_lifetime(config.setup.main()), None);
-        assert_eq!(persona_policy_lifetime(config.setup.wallet("none")), None);
-
-        // Degen on one wallet only: the other keeps none.
-        config.setup.wallet_mut("trading").persona =
-            Some(PersonaConfig::suggested(PersonaPreset::Degen));
-        assert!(persona_policy_destinations(&config, "main").is_empty());
-        let degen = persona_policy_destinations(&config, "trading");
-        let entries: Vec<(&str, &str)> = degen
-            .iter()
-            .map(|d| (d.chain.as_str(), d.destination.as_str()))
-            .collect();
-        assert_eq!(
-            entries,
-            [
-                ("evm-1", bloom_proto::policy::ERC20_ANY_RECIPIENT),
-                ("evm-137", bloom_proto::policy::ERC20_ANY_RECIPIENT),
-            ]
-        );
-        let names: Vec<&str> = persona_any_recipient_chains(&config, "trading")
-            .iter()
-            .map(|chain| chain.name.as_str())
-            .collect();
-        assert_eq!(names, ["ethereum", "polygon"]);
-        // A network that is not configured gets no entry.
-        let mut one_chain = config.clone();
-        one_chain.chains.retain(|_, chain| chain.chain_id != 137);
-        assert_eq!(
-            persona_policy_destinations(&one_chain, "trading"),
-            degen[..1]
-        );
-
-        let temp = tempfile::tempdir().unwrap();
-        let store = PetalStore::open(temp.path()).unwrap();
-        let trading = config.setup.wallet("trading");
-        let setup = default_policy_setup(&store, trading, &degen).unwrap();
-        assert_eq!(setup.destinations, degen);
-        assert_eq!(
-            setup.maximum_approval_lifetime_ms,
-            Some(bloom_proto::policy::STANDING_APPROVAL_POLICY_LIFETIME_MS)
-        );
-    }
-
-    /// A wallet's first proposal reads its setup from the config on disk each
-    /// time, so a setup saved after Machine started is the one proposed, and
-    /// an unreadable config stops the proposal.
-    #[test]
-    fn the_first_proposal_reads_the_saved_setup_each_time() {
-        use bloom_proto::persona::{PersonaConfig, PersonaPreset};
-
-        let temp = tempfile::tempdir().unwrap();
-        let store = PetalStore::open(temp.path().join("store")).unwrap();
-        let path = temp.path().join("config.toml");
-        let mut config = Config::local_default();
-        config.save(&path).unwrap();
-        assert_eq!(
-            saved_default_policy_setup(&store, &path, "trading").unwrap(),
-            bloom_vfs::handlers::DefaultPolicySetup::default()
-        );
-        config.setup.wallet_mut("trading").persona =
-            Some(PersonaConfig::suggested(PersonaPreset::Degen));
-        config.save(&path).unwrap();
-        let setup = saved_default_policy_setup(&store, &path, "trading").unwrap();
-        assert_eq!(
-            setup.destinations,
-            persona_policy_destinations(&config, "trading")
-        );
-        assert_eq!(
-            setup.maximum_approval_lifetime_ms,
-            Some(bloom_proto::policy::STANDING_APPROVAL_POLICY_LIFETIME_MS)
-        );
-        assert_eq!(
-            saved_default_policy_setup(&store, &path, "main").unwrap(),
-            bloom_vfs::handlers::DefaultPolicySetup::default(),
-            "another wallet's persona is not main's"
-        );
-        std::fs::write(&path, "not toml").unwrap();
-        assert!(saved_default_policy_setup(&store, &path, "trading").is_err());
-    }
-
     #[test]
     fn batch_approval_requirement_preserves_owner_launch_fields() {
         let value = batch_confirmation_result_json(Err(TxEngineError::ApprovalRequired(
@@ -6493,13 +6270,133 @@ mod tests {
         }
     }
 
+    /// A `wallets/` tree: directory listings, file bodies, and one path
+    /// whose listing fails.
+    #[derive(Default)]
+    struct WalletTreeFixture {
+        dirs: std::collections::HashMap<&'static str, Vec<&'static str>>,
+        files: std::collections::HashMap<&'static str, &'static str>,
+        broken: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl Handler for WalletTreeFixture {
+        async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+            Err(HandlerError::not_found(path.to_string_path()))
+        }
+
+        async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            let key = path.segments().join("/");
+            if self.broken == Some(key.as_str()) {
+                return Err(HandlerError::backend("disk unreadable"));
+            }
+            let names = self
+                .dirs
+                .get(key.as_str())
+                .ok_or_else(|| HandlerError::not_found(key.clone()))?;
+            Ok(names.iter().map(|name| Entry::dir(name)).collect())
+        }
+
+        async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            let key = path.segments().join("/");
+            self.files
+                .get(key.as_str())
+                .map(|body| body.as_bytes().to_vec())
+                .ok_or_else(|| HandlerError::not_found(key))
+        }
+    }
+
+    fn alice_tree() -> WalletTreeFixture {
+        WalletTreeFixture {
+            dirs: [
+                ("alice", vec!["0", "policy-updates"]),
+                ("alice/0/chains", vec!["base", "ethereum"]),
+                ("alice/0/chains/base/outbox/pending", vec!["tx-staged", "tx-approval"]),
+                (
+                    "alice/policy-updates/pending",
+                    vec!["policy-update-1", "policy-update-expired"],
+                ),
+            ]
+            .into(),
+            files: [
+                (
+                    "alice/policy-updates/pending/policy-update-1/status.json",
+                    r#"{"state":"pending"}"#,
+                ),
+                // Its status read reconciled the expired ceremony out of pending.
+                (
+                    "alice/policy-updates/pending/policy-update-expired/status.json",
+                    r#"{"state":"failed"}"#,
+                ),
+                (
+                "alice/0/chains/base/outbox/pending/tx-approval/approval_challenge.json",
+                r#"{"state":"awaiting_ceremony","next":"Give ceremony_url to the owner.","ceremony_url":"http://127.0.0.1:18734/c#secret","retry_path":"wallets/alice/0/chains/base/outbox/pending/tx-approval/confirm"}"#,
+                ),
+            ]
+            .into(),
+            broken: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn next_actions_lists_pending_entries_and_approvals() {
+        let md =
+            render_pending_actions(&alice_tree(), &["alice".into()], Duration::from_secs(5)).await;
+
+        assert!(
+            md.contains(
+                "`wallets/alice/0/chains/base/outbox/pending/tx-staged/`: staged, not confirmed"
+            ),
+            "{md}"
+        );
+        assert!(md.contains("`wallets/alice/0/chains/base/outbox/pending/tx-approval/`: owner approval `awaiting_ceremony`"), "{md}");
+        assert!(md.contains("`retry_path`: `wallets/alice/0/chains/base/outbox/pending/tx-approval/confirm`; `retry_body`: `confirm`"), "{md}");
+        assert!(
+            md.contains("`wallets/alice/policy-updates/pending/policy-update-1/`"),
+            "{md}"
+        );
+        assert!(!md.contains("policy-update-expired"), "{md}");
+        assert!(
+            !md.contains("secret"),
+            "the ceremony URL stays in the challenge file: {md}"
+        );
+        assert!(
+            !md.contains("No outbox entry or policy update is listed as pending"),
+            "{md}"
+        );
+    }
+
+    #[tokio::test]
+    async fn next_actions_reports_unreadable_outbox_instead_of_nothing_pending() {
+        let mut tree = alice_tree();
+        tree.dirs.remove("alice/0/chains/base/outbox/pending");
+        tree.dirs.remove("alice/policy-updates/pending");
+        assert!(
+            render_pending_actions(&tree, &["alice".into()], Duration::from_secs(5))
+                .await
+                .contains("No outbox entry or policy update is listed as pending")
+        );
+
+        tree.broken = Some("alice/0/chains/ethereum/outbox/pending");
+        let md = render_pending_actions(&tree, &["alice".into()], Duration::from_secs(5)).await;
+        assert!(md.contains("## Not Checked"), "{md}");
+        assert!(
+            md.contains("`wallets/alice/0/chains/ethereum/outbox/pending/` could not be read: "),
+            "{md}"
+        );
+        assert!(
+            !md.contains("No outbox entry or policy update is listed as pending"),
+            "{md}"
+        );
+    }
+
     #[tokio::test]
     async fn next_actions_refreshes_wallet_projections_before_rendering() {
         let projections = ProjectionRefreshFixture {
             calls: std::sync::atomic::AtomicUsize::new(0),
         };
 
-        let rendered = render_next_actions(&projections).await;
+        let rendered = render_next_actions(&projections, &WalletTreeFixture::default()).await;
 
         assert_eq!(
             projections.calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -6519,8 +6416,12 @@ mod tests {
             cached_calls: std::sync::atomic::AtomicUsize::new(0),
         };
 
-        let rendered =
-            render_next_actions_with_timeout(&projections, Duration::from_millis(10)).await;
+        let rendered = render_next_actions_with_timeout(
+            &projections,
+            &WalletTreeFixture::default(),
+            Duration::from_millis(10),
+        )
+        .await;
 
         assert_eq!(
             projections
@@ -6531,7 +6432,7 @@ mod tests {
         assert!(
             String::from_utf8(rendered)
                 .unwrap()
-                .contains("No wallets with pending actions.")
+                .contains("No outbox entry or policy update is listed as pending")
         );
     }
 
