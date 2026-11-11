@@ -2284,7 +2284,8 @@ fn reconcile_approval_challenge(
     challenge: &mut serde_json::Value,
     live: Option<&bloom_broker_api::ApprovalPublicStatus>,
 ) {
-    let retry = match challenge.get("staged_by").and_then(|petal| petal.as_str()) {
+    let petal = challenge.get("staged_by").and_then(|petal| petal.as_str());
+    let retry = match petal {
         Some(petal) => format!(
             "retry {}",
             crate::handlers::outbox::through_staging_petal(petal)
@@ -2292,7 +2293,7 @@ fn reconcile_approval_challenge(
         None => "write retry_body to retry_path".into(),
     };
     let (state, next) = match live {
-        Some(status) => approval_next_step(status.state, &retry),
+        Some(status) => approval_next_step(status.state, &retry, petal.is_none()),
         None => (
             "unknown",
             format!(
@@ -2324,16 +2325,22 @@ fn reconcile_approval_challenge(
 }
 
 /// What the approval's live Broker state means for the agent holding the
-/// challenge, as `(state, next)`. `retry` says how to retry the confirm.
+/// challenge, as `(state, next)`. `retry` says how to retry the confirm;
+/// `direct` means it is the entry's own confirm, which waits over IPC.
 fn approval_next_step(
     state: bloom_broker_api::ApprovalLifecycleState,
     retry: &str,
+    direct: bool,
 ) -> (&'static str, String) {
     use bloom_broker_api::ApprovalLifecycleState as S;
     match state {
         S::Prepared | S::AwaitingCeremony => (
             "awaiting_ceremony",
-            format!("Give ceremony_url to the owner. As soon as they approve, {retry}. Retrying earlier is safe: it starts no new ceremony and returns permission denied again."),
+            if direct {
+                "Give ceremony_url to the owner, then write retry_body to retry_path. Through bloom vfs write or MCP it waits for their approval and sends; on a mount it is denied until they approve, so write it again after. Neither starts a new ceremony.".into()
+            } else {
+                format!("Give ceremony_url to the owner. As soon as they approve, {retry}. Retrying earlier is safe: it starts no new ceremony and returns permission denied again.")
+            },
         ),
         S::Active => (
             "active",
