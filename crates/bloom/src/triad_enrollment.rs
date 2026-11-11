@@ -10,12 +10,10 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
-#[cfg(any(test, feature = "triad-dev-harness"))]
-use bloom_broker_api::ProvenanceFeeAsset;
 use bloom_broker_api::{
     Base64UrlBytes, DecimalU64, Digest32, PROVENANCE_RECORD_SIGNATURE_DOMAIN,
-    PetalLineageMembership, ProvenanceCatalog, ProvenanceOperationClass, ProvenanceRecord,
-    ProvenanceSubject, Token,
+    PetalLineageMembership, ProvenanceCatalog, ProvenanceFeeAsset, ProvenanceOperationClass,
+    ProvenanceRecord, ProvenanceSubject, Token,
 };
 #[cfg(any(test, feature = "triad-dev-harness"))]
 use bloom_petals::package::build_petal_package_dir;
@@ -1133,8 +1131,19 @@ fn append_release_petal_provenance_for_entries(
                 &old_predecessors,
                 false,
                 old.authority_routes,
+                // Inactive records authorize nothing, so they carry no fee.
+                None,
             )?;
         }
+        let fee_asset = entry
+            .fee_asset
+            .map(|fee| -> Result<_> {
+                Ok(ProvenanceFeeAsset {
+                    chain: Token::new(fee.chain)?,
+                    asset: fee.asset.into(),
+                })
+            })
+            .transpose()?;
         append_release_lineage_record(
             catalog,
             signing_key,
@@ -1146,6 +1155,7 @@ fn append_release_petal_provenance_for_entries(
             &predecessors,
             true,
             entry.authority_routes,
+            fee_asset.as_ref(),
         )?;
     }
     catalog.validate_shape()?;
@@ -1174,6 +1184,7 @@ fn append_release_lineage_record(
     predecessors: &[Digest32],
     active: bool,
     authority_routes: &[crate::github_source::PetalAuthorityRoute],
+    fee_asset: Option<&ProvenanceFeeAsset>,
 ) -> Result<()> {
     #[derive(Serialize)]
     struct LineageStatement<'a> {
@@ -1228,7 +1239,7 @@ fn append_release_lineage_record(
                 .map(|class| {
                     Ok(ProvenanceOperationClass {
                         operation_class: Token::new(*class)?,
-                        fee_asset: None,
+                        fee_asset: fee_asset.cloned(),
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -1537,6 +1548,7 @@ mod tests {
             &[],
             true,
             &[],
+            None,
         )
         .unwrap();
         rewrite_private_json(&catalog_path, &serde_json::to_value(&stale).unwrap()).unwrap();
@@ -1875,6 +1887,47 @@ mod tests {
             error.to_string().contains("has no recorded release"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn release_provenance_records_the_pinned_fee_asset_on_the_active_release_only() {
+        let current = crate::github_source::preinstalled_petal("polymarket").unwrap();
+        let fee_bearing = crate::github_source::PreinstalledPetal {
+            fee_asset: Some(crate::github_source::ReleaseFeeAsset {
+                chain: "solana",
+                asset: "native",
+            }),
+            ..*current
+        };
+        let mut catalog = ProvenanceCatalog {
+            schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
+            records: vec![],
+        };
+        append_release_petal_provenance_for_entries(
+            &mut catalog,
+            &Token::new("installer-key").unwrap(),
+            &SigningKey::from_bytes(&[17; 32]),
+            &[&fee_bearing],
+        )
+        .unwrap();
+        let fee = ProvenanceFeeAsset {
+            chain: Token::new("solana").unwrap(),
+            asset: "native".into(),
+        };
+        let (active, inactive): (Vec<_>, Vec<_>) = catalog
+            .records
+            .iter()
+            .filter(|record| !record.operation_classes.is_empty())
+            .partition(|record| record.petal_lineage.as_ref().unwrap().active);
+        assert!(!active.is_empty() && !inactive.is_empty());
+        let all_fees = |records: &[&ProvenanceRecord], expected: Option<&ProvenanceFeeAsset>| {
+            records
+                .iter()
+                .flat_map(|record| &record.operation_classes)
+                .all(|class| class.fee_asset.as_ref() == expected)
+        };
+        assert!(all_fees(&active, Some(&fee)));
+        assert!(all_fees(&inactive, None));
     }
 
     #[test]

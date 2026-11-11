@@ -103,7 +103,8 @@ fee_asset = { chain = "solana", asset = "native" }
 Each signing claim must then declare its fee in that asset, and the Broker
 counts it against the approval's value limits. Omit `fee_asset` when signatures
 pay no chain fee; claims must then declare no fee. Developer enrollment reads
-this field; release provenance does not yet.
+this field. A pre-installed release pins the same `fee_asset` in
+`crates/bloom/src/github_source.rs`; install refuses a package that differs.
 
 Child-key operation classes are distinct from the signing intent used
 immediately by the route that requests the key. Declare each delegated class on

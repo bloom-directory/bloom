@@ -3929,6 +3929,11 @@ fn validate_sign_policy(
             "Petal package [sign].fee_asset asset must be non-empty".into(),
         ));
     }
+    if fee_asset.is_some() && allowed_sign_intents.is_empty() {
+        return Err(PetalError::InvalidWasm(
+            "Petal package [sign].fee_asset requires [sign].allowed_intents".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -7056,6 +7061,14 @@ namespaces = ["fixture-public"]
             error
                 .to_string()
                 .contains("[sign].fee_asset asset must be non-empty"),
+            "{error}"
+        );
+
+        let error = validate_sign_policy(&BTreeSet::new(), &BTreeSet::new(), Some(&fee))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("[sign].fee_asset requires [sign].allowed_intents"),
             "{error}"
         );
     }

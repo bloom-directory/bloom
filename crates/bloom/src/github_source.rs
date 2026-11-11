@@ -46,6 +46,15 @@ pub(crate) struct PreinstalledPetal {
     pub release_sequence: u64,
     pub predecessor_package_hashes: &'static [&'static str],
     pub authority_routes: &'static [PetalAuthorityRoute],
+    /// The package's `[sign].fee_asset`. Install refuses a package that
+    /// declares a different one, and release provenance records it.
+    pub fee_asset: Option<ReleaseFeeAsset>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReleaseFeeAsset {
+    pub chain: &'static str,
+    pub asset: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -491,6 +500,7 @@ const PREINSTALLED_POLYMARKET: PreinstalledPetal = PreinstalledPetal {
         "17a50dda0894b7b7e5757033806f8ec31523575438419ea1330b731a2c6c5d14",
     ],
     authority_routes: POLYMARKET_AUTHORITY_ROUTES,
+    fee_asset: None,
 };
 
 const PREINSTALLED_HYPERLIQUID: PreinstalledPetal = PreinstalledPetal {
@@ -512,6 +522,7 @@ const PREINSTALLED_HYPERLIQUID: PreinstalledPetal = PreinstalledPetal {
         "d811c181c7ec469026335c9265d7019a520d8d9d882b302064278cf1138d2db2",
     ],
     authority_routes: HYPERLIQUID_AUTHORITY_ROUTES,
+    fee_asset: None,
 };
 
 const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
@@ -532,6 +543,7 @@ const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
         "a498727c1e9ba6f4385ca7514c2ef59236b6234b234b6e1920cb21358ea3b057",
     ],
     authority_routes: &[],
+    fee_asset: None,
 };
 
 const PREINSTALLED_FEEDBACK: PreinstalledPetal = PreinstalledPetal {
@@ -549,6 +561,7 @@ const PREINSTALLED_FEEDBACK: PreinstalledPetal = PreinstalledPetal {
     release_sequence: 1,
     predecessor_package_hashes: &[],
     authority_routes: &[],
+    fee_asset: None,
 };
 
 const PREINSTALLED_SAFE: PreinstalledPetal = PreinstalledPetal {
@@ -566,6 +579,7 @@ const PREINSTALLED_SAFE: PreinstalledPetal = PreinstalledPetal {
     release_sequence: 1,
     predecessor_package_hashes: &[],
     authority_routes: SAFE_AUTHORITY_ROUTES,
+    fee_asset: None,
 };
 
 const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
@@ -586,6 +600,7 @@ const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
         "e6ffbfdc96c5fa9b5fe5b62dc0c373b2522fb31d216a5a33ea2e1dab21c082a0",
     ],
     authority_routes: &[],
+    fee_asset: None,
 };
 
 const PREINSTALLED_GASLESS: PreinstalledPetal = PreinstalledPetal {
@@ -603,6 +618,7 @@ const PREINSTALLED_GASLESS: PreinstalledPetal = PreinstalledPetal {
     release_sequence: 0,
     predecessor_package_hashes: &[],
     authority_routes: &[],
+    fee_asset: None,
 };
 
 const PREINSTALLED_PRIVACY_POOLS: PreinstalledPetal = PreinstalledPetal {
@@ -620,6 +636,7 @@ const PREINSTALLED_PRIVACY_POOLS: PreinstalledPetal = PreinstalledPetal {
     release_sequence: 0,
     predecessor_package_hashes: &[],
     authority_routes: &[],
+    fee_asset: None,
 };
 
 const PREINSTALLED_VENICE_X402: PreinstalledPetal = PreinstalledPetal {
@@ -637,6 +654,7 @@ const PREINSTALLED_VENICE_X402: PreinstalledPetal = PreinstalledPetal {
     release_sequence: 0,
     predecessor_package_hashes: &[],
     authority_routes: &[],
+    fee_asset: None,
 };
 
 const PREINSTALLED_TOLLY: PreinstalledPetal = PreinstalledPetal {
@@ -654,6 +672,7 @@ const PREINSTALLED_TOLLY: PreinstalledPetal = PreinstalledPetal {
     release_sequence: 1,
     predecessor_package_hashes: &[],
     authority_routes: &[],
+    fee_asset: None,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1494,6 +1513,17 @@ fn validate_release_authority(
 ) -> Result<()> {
     if !entry.default_eligible {
         return Ok(());
+    }
+    let declared_fee = package
+        .route_index
+        .sign_fee_asset
+        .as_ref()
+        .map(|fee| (fee.chain.as_str(), fee.asset.as_str()));
+    if declared_fee != entry.fee_asset.map(|fee| (fee.chain, fee.asset)) {
+        bail!(
+            "pre-installed Petal {} fee asset differs from the release declaration",
+            entry.name
+        );
     }
     let declared = entry
         .authority_routes
@@ -2404,6 +2434,33 @@ mod tests {
         assert!(error.contains("authority differs"), "{error}");
     }
 
+    #[test]
+    fn eligible_release_requires_its_pinned_fee_asset() {
+        let mut release = build_near_release("fee-check");
+        let unpinned = *preinstalled_petal("near-intents").unwrap();
+        let pinned = PreinstalledPetal {
+            fee_asset: Some(ReleaseFeeAsset {
+                chain: "solana",
+                asset: "native",
+            }),
+            ..unpinned
+        };
+        let error = validate_release_authority(&pinned, &release.package)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("fee asset differs"), "{error}");
+
+        release.package.route_index.sign_fee_asset = Some(bloom_broker_api::ProvenanceFeeAsset {
+            chain: bloom_broker_api::Token::new("solana").unwrap(),
+            asset: "native".into(),
+        });
+        validate_release_authority(&pinned, &release.package).unwrap();
+        let error = validate_release_authority(&unpinned, &release.package)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("fee asset differs"), "{error}");
+    }
+
     fn near_catalog_entry(
         commit: &'static str,
         release_tag: &'static str,
@@ -2425,6 +2482,7 @@ mod tests {
             release_sequence: 0,
             predecessor_package_hashes: &[],
             authority_routes: &[],
+            fee_asset: None,
         }
     }
 
@@ -3007,6 +3065,7 @@ mod tests {
             release_sequence: 0,
             predecessor_package_hashes: &[],
             authority_routes: &[],
+            fee_asset: None,
         };
         let release = PetalReleaseManifest {
             schema: "bloom.petal.release.v1".into(),
