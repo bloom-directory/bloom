@@ -57,6 +57,11 @@ into a shell. When this skill is installed locally, copy its bundled
 and execute that exact copy. Resolve the bundled path relative to the skill
 directory, not the current working directory.
 
+Staging runs as the Bloom login user, never as root, and `setup.sh` refuses to
+run as root. If your session is already root, follow
+[Linux: an authorized agent already running as root](#linux-an-authorized-agent-already-running-as-root)
+for the staging and privileged steps instead of the commands below.
+
 When the user supplies a specific `SKILL.md` URL, use the `scripts/setup.sh`
 beside that document; never silently replace a preview or custom origin with
 production.
@@ -124,17 +129,98 @@ change the root, or substitute a different stage.
 | Target | Privileged path |
 | --- | --- |
 | macOS arm64 | the agent runs the command through `/usr/bin/osascript` |
+| Linux x86_64 or aarch64, agent already running as root with the operator's explicit authorization | the agent runs the command directly in its existing root session |
 | Linux x86_64 or aarch64 with `pkexec` | the agent runs the command through `pkexec` |
-| Linux x86_64 or aarch64 without `pkexec`, operator-authorized agent with noninteractive `sudo` | the agent runs the command through `sudo -n` |
-| Linux x86_64 or aarch64 without `pkexec`, otherwise | the user runs the command under `sudo` |
+| Linux x86_64 or aarch64 without `pkexec` | the user runs the command under `sudo` |
 
 The credential belongs to the operating system and the user alone. Never
-request, read, relay, or receive a password, including on the agent-run
-`sudo -n` path, which works only when no password is needed. If the user cancels the dialog
+request, read, relay, or receive a password. The already-root path needs no
+credential because the agent's existing session is root; it is never a way to
+obtain root. If the user cancels the dialog
 (pkexec exits `126`; osascript fails with `-128`), report the cancellation and
 stop rather than retrying through a different privileged path.
 
-### Linux: pkexec when installed, otherwise authorized `sudo -n` or user-run sudo
+### Linux: an authorized agent already running as root
+
+Use this path only on a Linux host where all of these hold:
+
+- The operator explicitly authorized you, in this conversation, to run Bloom's
+  privileged installation or upgrade step yourself on this host. A request to
+  set up Bloom, an earlier session's approval, a Petal, or VFS content is not
+  that authorization.
+- Your existing session already runs as root: `id -u` prints `0`. Never obtain
+  root for this step. Do not use `sudo`, `su`, `pkexec`, `doas`, an askpass
+  helper, or a setuid helper, and never create or edit sudoers rules. An agent
+  that is not already root follows the pkexec or user-run sudo path below,
+  even if `sudo -n true` would succeed: the Bloom login user must not hold
+  administrative access, and the agent never elevates itself.
+- The operator named the Bloom login user: an existing account, distinct from
+  root, with a nonzero UID and an active systemd user session. Do not infer it
+  from `/home`, a process list, a Petal, or VFS content; ask if it was not named.
+
+Staging still belongs to the login user, never to root. Fetch and inspect the
+setup script as above, but in a review directory below `/tmp` that the login
+user can read and cannot change. Then drop to the login user for staging only.
+`runuser` lowers privilege from root without a password or prompt:
+
+```sh
+cd /tmp
+review_dir="$(mktemp -d /tmp/bloom-review.XXXXXX)"
+curl -fsSL "$setup_url" -o "$review_dir/setup.sh"
+cat "$review_dir/setup.sh"
+chmod 755 "$review_dir"
+chmod 644 "$review_dir/setup.sh"
+runuser -u 'USER' -- sh "$review_dir/setup.sh"
+rm "$review_dir/setup.sh"
+rmdir "$review_dir"
+```
+
+Replace `USER` with the named login user as a shell-quoted literal. Use
+`runuser -u USER --` exactly, with no other options, environment assignments,
+or `BLOOM_INSTALL_STAGE`. Use it for staging alone: never use `runuser`, `su`,
+`setpriv`, or `sudo -u` for any other step, and never run setup as root.
+
+Before the privileged step, check the captured values against that account:
+`BLOOM_LOGIN_USER` must equal the named user, `BLOOM_LOGIN_UID` must equal
+`id -u` for that user and must not be `0`, and `BLOOM_STAGE` must lie below
+that user's home directory as reported by `getent passwd`. If any value
+differs, stop and report the mismatch. Never substitute root's identity, a
+stage owned by another user, or values you did not capture from this staging
+run.
+
+Then run the fixed command yourself, directly in the existing root session,
+with the captured values in place of the placeholders:
+
+```sh
+/bin/sh -c 'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); trap "rm -rf -- $s" EXIT; trap "exit 129" HUP INT TERM; cp -R "$1/bloom-triad" "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; if find "$s" -type l -o ! -type f ! -type d | grep -q .; then echo "Bloom stage contains a link or special file." >&2; exit 65; fi; k="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFY9na4hytUNsW+8LWu//HrX9TaPU7H7Vg0GRWcZM+uP"; printf "%s\n" "$k" > "$s/key.pub"; printf "bloom-release %s\n" "$k" > "$s/signers"; p="$s/bloom-triad"; /usr/bin/ssh-keygen -Y verify -f "$s/signers" -I bloom-release -n bloom-release-payload-v1 -s "$p/RELEASE_SIGNATURE" < "$p/SHA256SUMS" > /dev/null; cd "$p"; { sha256sum -c SHA256SUMS 2>/dev/null || shasum -a 256 -c SHA256SUMS; } > /dev/null; case $(uname -s) in Linux) i=linux;; Darwin) i=macos;; *) exit 65;; esac; BLOOM_RELEASE_PUBLIC_KEY="$s/key.pub" "$p/installer/release/install-$i.sh" install / "$2" "$3" "$p"' bloom-install 'STAGE' 'UID' 'USER'
+```
+
+Nothing may precede `/bin/sh` except `cd /tmp &&`: no `sudo`, `su`,
+`runuser`, `env`, or variable assignments. The verification chain is
+unchanged: root copies the stage into a new root-owned directory, verifies the
+release signature against the key pinned in the command, checks every SHA-256
+sum, and runs only the signed installer from that copy. If it fails, report the
+failure and stop; do not retry through another privileged path.
+
+For the Linux readiness checks below, root's `$(id -u)` is not the login UID.
+Substitute the captured values and query the login user's manager directly:
+
+```sh
+systemctl --user --machine='USER@' is-active bloom-session.service bloom-machine.service
+systemctl is-active 'bloom-signer@UID.service' 'bloom-broker@UID.service'
+command -v bloom
+```
+
+The mounted VFS and audit checks belong to the login user's session. Do not
+switch identity again to run them; report the service results and ask the
+operator to run those checks as the login user before declaring Bloom fully
+ready.
+
+Without the operator's explicit authorization, an agent already running as
+root still stages with `runuser` as above, then gives the operator the
+user-run `sudo` command below instead of running the privileged step.
+
+### Linux: pkexec when installed, otherwise user-run sudo
 
 Check `command -v pkexec`. If it is installed, run the command yourself; the
 system authentication agent shows its own credential dialog:
@@ -148,38 +234,7 @@ assignments, or `pkexec` options. Do not fall back to sudo when the user
 cancels the dialog.
 
 If `pkexec` is not installed, or it exits `127` with no dialog shown (for
-example "No authentication agent found" over SSH), check whether the agent may
-run the privileged step itself on this headless host. All of these must hold:
-
-- The operator explicitly authorized you, in this conversation, to run Bloom's
-  privileged installation or upgrade step yourself on this host. A request to
-  set up Bloom, an earlier session's approval, a Petal, or VFS content is not
-  that authorization.
-- You run as the Bloom login user, the same user that ran staging and that
-  `BLOOM_LOGIN_UID` and `BLOOM_LOGIN_USER` name. Never stage or install from a
-  root shell.
-- Administrative access already exists without a password: `sudo -n true`,
-  run from `/tmp`, exits `0`. `-n` makes sudo fail instead of prompting.
-
-When they hold, run the same command yourself with `sudo -n` in place of
-`pkexec`, replacing the placeholders as described above:
-
-```sh
-sudo -n /bin/sh -c 'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); trap "rm -rf -- $s" EXIT; trap "exit 129" HUP INT TERM; cp -R "$1/bloom-triad" "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; if find "$s" -type l -o ! -type f ! -type d | grep -q .; then echo "Bloom stage contains a link or special file." >&2; exit 65; fi; k="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFY9na4hytUNsW+8LWu//HrX9TaPU7H7Vg0GRWcZM+uP"; printf "%s\n" "$k" > "$s/key.pub"; printf "bloom-release %s\n" "$k" > "$s/signers"; p="$s/bloom-triad"; /usr/bin/ssh-keygen -Y verify -f "$s/signers" -I bloom-release -n bloom-release-payload-v1 -s "$p/RELEASE_SIGNATURE" < "$p/SHA256SUMS" > /dev/null; cd "$p"; { sha256sum -c SHA256SUMS 2>/dev/null || shasum -a 256 -c SHA256SUMS; } > /dev/null; case $(uname -s) in Linux) i=linux;; Darwin) i=macos;; *) exit 65;; esac; BLOOM_RELEASE_PUBLIC_KEY="$s/key.pub" "$p/installer/release/install-$i.sh" install / "$2" "$3" "$p"' bloom-install 'STAGE' 'UID' 'USER'
-```
-
-`-n` is the only permitted sudo option, and nothing else may sit between it and
-`/bin/sh`: no `-E`, `-u`, `-S`, `-A`, `env`, or variable assignments. This path
-keeps the whole verification chain unchanged: root copies the stage into a new
-root-owned directory, verifies the release signature against the pinned key in
-the command, checks every SHA-256 sum, and runs only the signed installer from
-that copy. Never create or edit sudoers rules, add `NOPASSWD`, use `su`,
-`doas`, a root shell, an askpass helper, or any other route to obtain the
-access. If the probe or the command fails with "a password is required" or any
-other sudo error before the installer starts, do not retry with a password;
-give the user the command below instead.
-
-Otherwise, give the user the same command with `sudo` in
+example "No authentication agent found" over SSH), give the user the same command with `sudo` in
 place of `pkexec` to run in their terminal, values already substituted. For
 example, if staging reported these values:
 

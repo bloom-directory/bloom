@@ -137,9 +137,9 @@ const config: UnifiedConfig = {
     { platform: 'linux-pkexec', platformContext: 'Linux x86_64 or aarch64 with pkexec installed' },
     { platform: 'linux-sudo', platformContext: 'Linux x86_64 or aarch64 without pkexec' },
     {
-      platform: 'linux-sudo-authorized',
+      platform: 'linux-root-authorized',
       platformContext:
-        'Headless Linux x86_64 or aarch64 without pkexec. The operator has explicitly authorized you to run Bloom\'s privileged installation step yourself on this host, you run as the Bloom login user, and `sudo -n true` exits 0',
+        'Headless Linux x86_64 or aarch64 without pkexec. Your session already runs as root (`id -u` prints 0). The operator named the Bloom login user: the separate non-root account `bloom`, which has an active systemd user session. The operator has explicitly authorized you to run Bloom\'s privileged installation step yourself on this host',
     },
   ].map((vars) => ({
     description: `Fresh setup: ${vars.platformContext}`,

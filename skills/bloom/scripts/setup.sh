@@ -6,9 +6,10 @@ set -eu
 # This script downloads, verifies, and stages the latest published stable Bloom triad
 # release for the current platform. It never elevates privilege, never handles
 # a password, and never starts a Bloom service. After staging it prints the
-# captured values for one narrow, reviewed privileged handoff (pkexec/osascript;
-# on Linux without pkexec, operator-authorized agent-run `sudo -n` or user-run
-# sudo).
+# captured values for one narrow, reviewed privileged handoff (pkexec/osascript,
+# user-run sudo as a Linux fallback, or an operator-authorized agent that already
+# runs as root). It stages for the login user that runs it and refuses to run as
+# root; a root agent runs it as the Bloom login user with `runuser -u USER --`.
 #
 # Supported production targets and their signed release artifacts:
 #
@@ -325,6 +326,12 @@ main() {
     fi
   }
   trap cleanup EXIT HUP INT TERM
+
+  if [ "$login_uid" = 0 ]; then
+    printf '%s\n' \
+      "Bloom setup stages for the Bloom login user and will not run as root. From a root session, run it as that user: runuser -u USER -- sh setup.sh" >&2
+    exit 1
+  fi
 
   resolve_triad_target
   require_triad_environment
