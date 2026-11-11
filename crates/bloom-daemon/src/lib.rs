@@ -59,6 +59,7 @@ use bloom_tx::outbox::{CentralActionIdentity, CentralOutboxProjection, Outbox, O
 use bloom_tx::tx_engine::{
     ConfirmBatchResult, ConfirmBatchTarget, Eip1559FeeOverrides, TxEngine, TxEngineError,
 };
+use bloom_vfs::handler::{EntryKind, Handler, HandlerError};
 use bloom_vfs::handlers::outbox::StagedPetalIdentity;
 use bloom_vfs::handlers::status::{MempoolBackendStatus, PrivateRpcBackendStatus};
 use bloom_vfs::handlers::wallets::{AccountPetalContext, AccountPetalMount, AccountSessionEntry};
@@ -4877,9 +4878,11 @@ impl Daemon {
         // Answers: what wallets need attention, what confirms are pending,
         // what risk data is stale.
         let next_wallet_projections = wallet_projections.clone();
+        let next_wallet_tree = wallets_handler.clone();
         vfs_builder = vfs_builder.with_root_dynamic_async("next.md", move || {
             let projections = next_wallet_projections.clone();
-            async move { render_next_actions(projections.as_ref()).await }
+            let wallet_tree = next_wallet_tree.clone();
+            async move { render_next_actions(projections.as_ref(), wallet_tree.as_ref()).await }
         });
 
         let vfs = vfs_builder
@@ -5365,12 +5368,17 @@ fn configured_mount(
     })
 }
 
-async fn render_next_actions(projections: &dyn WalletProjectionReader) -> Vec<u8> {
-    render_next_actions_with_timeout(projections, WALLET_PROJECTION_LIVE_TIMEOUT).await
+async fn render_next_actions(
+    projections: &dyn WalletProjectionReader,
+    wallet_tree: &dyn Handler,
+) -> Vec<u8> {
+    render_next_actions_with_timeout(projections, wallet_tree, WALLET_PROJECTION_LIVE_TIMEOUT).await
 }
 
+/// Renders `/next.md`. `wallet_tree` is the handler mounted at `wallets/`.
 async fn render_next_actions_with_timeout(
     projections: &dyn WalletProjectionReader,
+    wallet_tree: &dyn Handler,
     live_timeout: Duration,
 ) -> Vec<u8> {
     let mut md = String::from("# Next Actions\n\n");
@@ -5409,11 +5417,140 @@ async fn render_next_actions_with_timeout(
         md.push('\n');
     }
 
-    if !wallet_projection_unavailable && stale_wallets.is_empty() {
-        md.push_str("No wallets with pending actions.\n\n");
-        md.push_str("All policies are signed and no outbox confirms await review.\n");
+    if wallet_projection_unavailable {
+        md.push_str("Outboxes and policy updates were not checked.\n");
+    } else {
+        let wallet_ids: Vec<String> = wallets
+            .iter()
+            .map(|projection| projection.wallet.wallet_id.as_str().to_owned())
+            .collect();
+        md.push_str(&render_pending_actions(wallet_tree, &wallet_ids, live_timeout).await);
     }
     md.into_bytes()
+}
+
+/// Child directories of `wallets/<path>`. A missing path has none; any other
+/// failure goes to `unreadable`, so next.md never reports it as empty.
+async fn wallet_dirs(tree: &dyn Handler, path: &str, unreadable: &mut Vec<String>) -> Vec<String> {
+    let listed = match VfsPath::parse(path) {
+        Ok(parsed) => tree.list(&parsed).await,
+        Err(error) => Err(HandlerError::invalid(error.to_string())),
+    };
+    match listed {
+        Ok(entries) => entries
+            .into_iter()
+            .filter(|entry| entry.kind == EntryKind::Dir)
+            .map(|entry| entry.name)
+            .collect(),
+        Err(HandlerError::NotFound(_)) => Vec::new(),
+        Err(error) => {
+            unreadable.push(format!("- `wallets/{path}/` could not be read: {error}\n"));
+            Vec::new()
+        }
+    }
+}
+
+/// One line for a pending outbox entry. `ceremony_url` is an owner
+/// capability, so it stays in the challenge file.
+async fn outbox_entry_line(tree: &dyn Handler, entry: &str) -> String {
+    let read = match VfsPath::parse(&format!("{entry}/approval_challenge.json")) {
+        Ok(path) => tree.read(&path).await,
+        Err(error) => Err(HandlerError::invalid(error.to_string())),
+    };
+    let challenge: serde_json::Value = match read {
+        Err(HandlerError::NotFound(_)) => {
+            return format!(
+                "- `wallets/{entry}/`: staged, not confirmed. Review its `plan.md`; write `confirm` to its `confirm` only if the owner still wants it, or `cancel` to discard it.\n"
+            );
+        }
+        Err(error) => {
+            return format!(
+                "- `wallets/{entry}/`: its `approval_challenge.json` could not be read: {error}\n"
+            );
+        }
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+    };
+    let field = |name: &str| challenge.get(name).and_then(|value| value.as_str());
+    let retry_body = match challenge.get("retry_body") {
+        Some(serde_json::Value::String(body)) => body.clone(),
+        None | Some(serde_json::Value::Null) => "confirm".into(),
+        Some(body) => body.to_string(),
+    };
+    format!(
+        "- `wallets/{entry}/`: owner approval `{}`. {} `retry_path`: `{}`; `retry_body`: `{retry_body}`. `ceremony_url` is in its `approval_challenge.json`.\n",
+        field("state").unwrap_or("unknown"),
+        field("next").unwrap_or(""),
+        field("retry_path").unwrap_or("its `confirm`"),
+    )
+}
+
+/// Lists each wallet's pending outbox entries and policy updates by walking
+/// the `wallets/` routes an agent would list. A listing can omit an entry it
+/// cannot read, so the empty case reports what was listed, not an all-clear.
+async fn render_pending_actions(
+    tree: &dyn Handler,
+    wallets: &[String],
+    timeout: Duration,
+) -> String {
+    let (mut outbox, mut policy, mut unreadable) = (Vec::new(), Vec::new(), Vec::new());
+    let scan = async {
+        for wallet in wallets {
+            let updates = format!("{wallet}/policy-updates/pending");
+            for id in wallet_dirs(tree, &updates, &mut unreadable).await {
+                // Reading `status.json` reconciles a cancelled, expired or
+                // failed ceremony out of `pending/`.
+                let read = match VfsPath::parse(&format!("{updates}/{id}/status.json")) {
+                    Ok(path) => tree.read(&path).await,
+                    Err(error) => Err(HandlerError::invalid(error.to_string())),
+                };
+                match read.map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes)) {
+                    Ok(Ok(status)) if status["state"] != "pending" => {}
+                    Ok(Ok(_)) => policy.push(format!(
+                        "- `wallets/{updates}/{id}/`: awaits the owner's approval. Read its `status.json`.\n"
+                    )),
+                    Ok(Err(error)) => unreadable.push(format!(
+                        "- `wallets/{updates}/{id}/status.json` could not be parsed: {error}\n"
+                    )),
+                    Err(HandlerError::NotFound(_)) => {}
+                    Err(error) => unreadable.push(format!(
+                        "- `wallets/{updates}/{id}/status.json` could not be read: {error}\n"
+                    )),
+                }
+            }
+            for account in wallet_dirs(tree, wallet, &mut unreadable).await {
+                if account.parse::<u32>().is_err() {
+                    continue;
+                }
+                let chains = format!("{wallet}/{account}/chains");
+                for chain in wallet_dirs(tree, &chains, &mut unreadable).await {
+                    let pending = format!("{chains}/{chain}/outbox/pending");
+                    for id in wallet_dirs(tree, &pending, &mut unreadable).await {
+                        outbox.push(outbox_entry_line(tree, &format!("{pending}/{id}")).await);
+                    }
+                }
+            }
+        }
+    };
+    if tokio::time::timeout(timeout, scan).await.is_err() {
+        unreadable.push(format!(
+            "- The check stopped after {}s; list `outbox/pending/` and `policy-updates/pending/` directly.\n",
+            timeout.as_secs_f32()
+        ));
+    }
+    let mut md = String::new();
+    for (title, lines) in [
+        ("Pending Outbox Entries", outbox),
+        ("Pending Policy Updates", policy),
+        ("Not Checked", unreadable),
+    ] {
+        if !lines.is_empty() {
+            md.push_str(&format!("## {title}\n\n{}\n", lines.concat()));
+        }
+    }
+    if md.is_empty() {
+        md.push_str("No outbox entry or policy update is listed as pending.\n");
+    }
+    md
 }
 
 fn run_expiry_sweep_once(
@@ -6133,13 +6270,133 @@ mod tests {
         }
     }
 
+    /// A `wallets/` tree: directory listings, file bodies, and one path
+    /// whose listing fails.
+    #[derive(Default)]
+    struct WalletTreeFixture {
+        dirs: std::collections::HashMap<&'static str, Vec<&'static str>>,
+        files: std::collections::HashMap<&'static str, &'static str>,
+        broken: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl Handler for WalletTreeFixture {
+        async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+            Err(HandlerError::not_found(path.to_string_path()))
+        }
+
+        async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            let key = path.segments().join("/");
+            if self.broken == Some(key.as_str()) {
+                return Err(HandlerError::backend("disk unreadable"));
+            }
+            let names = self
+                .dirs
+                .get(key.as_str())
+                .ok_or_else(|| HandlerError::not_found(key.clone()))?;
+            Ok(names.iter().map(|name| Entry::dir(name)).collect())
+        }
+
+        async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            let key = path.segments().join("/");
+            self.files
+                .get(key.as_str())
+                .map(|body| body.as_bytes().to_vec())
+                .ok_or_else(|| HandlerError::not_found(key))
+        }
+    }
+
+    fn alice_tree() -> WalletTreeFixture {
+        WalletTreeFixture {
+            dirs: [
+                ("alice", vec!["0", "policy-updates"]),
+                ("alice/0/chains", vec!["base", "ethereum"]),
+                ("alice/0/chains/base/outbox/pending", vec!["tx-staged", "tx-approval"]),
+                (
+                    "alice/policy-updates/pending",
+                    vec!["policy-update-1", "policy-update-expired"],
+                ),
+            ]
+            .into(),
+            files: [
+                (
+                    "alice/policy-updates/pending/policy-update-1/status.json",
+                    r#"{"state":"pending"}"#,
+                ),
+                // Its status read reconciled the expired ceremony out of pending.
+                (
+                    "alice/policy-updates/pending/policy-update-expired/status.json",
+                    r#"{"state":"failed"}"#,
+                ),
+                (
+                "alice/0/chains/base/outbox/pending/tx-approval/approval_challenge.json",
+                r#"{"state":"awaiting_ceremony","next":"Give ceremony_url to the owner.","ceremony_url":"http://127.0.0.1:18734/c#secret","retry_path":"wallets/alice/0/chains/base/outbox/pending/tx-approval/confirm"}"#,
+                ),
+            ]
+            .into(),
+            broken: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn next_actions_lists_pending_entries_and_approvals() {
+        let md =
+            render_pending_actions(&alice_tree(), &["alice".into()], Duration::from_secs(5)).await;
+
+        assert!(
+            md.contains(
+                "`wallets/alice/0/chains/base/outbox/pending/tx-staged/`: staged, not confirmed"
+            ),
+            "{md}"
+        );
+        assert!(md.contains("`wallets/alice/0/chains/base/outbox/pending/tx-approval/`: owner approval `awaiting_ceremony`"), "{md}");
+        assert!(md.contains("`retry_path`: `wallets/alice/0/chains/base/outbox/pending/tx-approval/confirm`; `retry_body`: `confirm`"), "{md}");
+        assert!(
+            md.contains("`wallets/alice/policy-updates/pending/policy-update-1/`"),
+            "{md}"
+        );
+        assert!(!md.contains("policy-update-expired"), "{md}");
+        assert!(
+            !md.contains("secret"),
+            "the ceremony URL stays in the challenge file: {md}"
+        );
+        assert!(
+            !md.contains("No outbox entry or policy update is listed as pending"),
+            "{md}"
+        );
+    }
+
+    #[tokio::test]
+    async fn next_actions_reports_unreadable_outbox_instead_of_nothing_pending() {
+        let mut tree = alice_tree();
+        tree.dirs.remove("alice/0/chains/base/outbox/pending");
+        tree.dirs.remove("alice/policy-updates/pending");
+        assert!(
+            render_pending_actions(&tree, &["alice".into()], Duration::from_secs(5))
+                .await
+                .contains("No outbox entry or policy update is listed as pending")
+        );
+
+        tree.broken = Some("alice/0/chains/ethereum/outbox/pending");
+        let md = render_pending_actions(&tree, &["alice".into()], Duration::from_secs(5)).await;
+        assert!(md.contains("## Not Checked"), "{md}");
+        assert!(
+            md.contains("`wallets/alice/0/chains/ethereum/outbox/pending/` could not be read: "),
+            "{md}"
+        );
+        assert!(
+            !md.contains("No outbox entry or policy update is listed as pending"),
+            "{md}"
+        );
+    }
+
     #[tokio::test]
     async fn next_actions_refreshes_wallet_projections_before_rendering() {
         let projections = ProjectionRefreshFixture {
             calls: std::sync::atomic::AtomicUsize::new(0),
         };
 
-        let rendered = render_next_actions(&projections).await;
+        let rendered = render_next_actions(&projections, &WalletTreeFixture::default()).await;
 
         assert_eq!(
             projections.calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -6159,8 +6416,12 @@ mod tests {
             cached_calls: std::sync::atomic::AtomicUsize::new(0),
         };
 
-        let rendered =
-            render_next_actions_with_timeout(&projections, Duration::from_millis(10)).await;
+        let rendered = render_next_actions_with_timeout(
+            &projections,
+            &WalletTreeFixture::default(),
+            Duration::from_millis(10),
+        )
+        .await;
 
         assert_eq!(
             projections
@@ -6171,7 +6432,7 @@ mod tests {
         assert!(
             String::from_utf8(rendered)
                 .unwrap()
-                .contains("No wallets with pending actions.")
+                .contains("No outbox entry or policy update is listed as pending")
         );
     }
 

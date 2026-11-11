@@ -4,7 +4,7 @@ This is the operating contract for agents using the mounted Bloom virtual
 filesystem. Treat the directory containing this file as the VFS root and keep
 all paths mount-relative. Keep scratch files outside the mount.
 
-`ls` the mount and read `next.md` (actions needing attention). Read on demand:
+`ls` the mount and read `next.md` (pending outbox entries, approvals and policy updates). Read on demand:
 `cat docs/README.md` lists every route, `docs/examples.md` has command
 walkthroughs (including contract deploys and local Anvil), `docs/wallets.md` covers accounts, wallet creation, recovery,
 passkeys and sessions, and `docs/petals.md` lists installed Petals. Read a
@@ -66,12 +66,12 @@ For native transfers and Petal actions that project into the outbox:
 3. If the human asked only to prepare it, stop and report the entry.
    Otherwise write `confirm` to that entry's `confirm` file.
 4. If confirm fails:
-   - **Permission denied**: read `approval_challenge.json`, check its wallet,
-     action, intent and expiry, and give its `ceremony_url` to the human.
-     Poll the challenge; when `state` is `active`, write its exact
-     `retry_body` (`confirm` when omitted) to its `retry_path`. The approval
-     does not broadcast on its own. For `expired`, `cancelled` or `refused`,
-     tell the human.
+   - **Permission denied**: the owner must approve. Give the human the
+     ceremony link from the error, then write `confirm` again: it waits for
+     their approval and sends. Repeat if it times out. On a mount it does not
+     wait: read `approval_challenge.json`, check its wallet, action, intent
+     and expiry, and follow its `next`. For `expired`, `cancelled` or
+     `refused`, tell the human.
    - **Input/output error**: read the entry's `policy_check.json` (in
      `failed/<id>/` if it moved). A `deny` outcome is final: if your entry is
      still in `pending/`, write `cancel` to its `confirm` file, then report
