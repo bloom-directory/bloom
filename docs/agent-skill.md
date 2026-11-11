@@ -10,6 +10,9 @@ existing-session use and new-install guidance when changing it. The
 [skill evals](../evals/skills/README.md) grade new-install responses; CI runs
 their deterministic `check`, and model runs are manual. Keep setup's
 signature checks and platform-specific privileged handoff intact.
+`scripts/test-headless-setup.sh` covers the script's headless Linux login
+resolution and checks that every documented elevation still runs the one fixed
+root script.
 
 ## Website
 

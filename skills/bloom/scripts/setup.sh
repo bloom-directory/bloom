@@ -9,6 +9,9 @@ set -eu
 # captured values for one narrow, reviewed privileged handoff (pkexec/osascript,
 # or user-run sudo as a Linux fallback).
 #
+# Run as root on Linux it first resolves the non-root Bloom login user and
+# re-runs itself as that login; see the headless section below.
+#
 # Supported production targets and their signed release artifacts:
 #
 #   Linux x86_64   bloom-triad-linux-x86_64.tar.gz    claim linux
@@ -143,6 +146,426 @@ require_triad_environment() {
       fi
       ;;
   esac
+}
+
+# Headless Linux staging as the Bloom login user.
+#
+# An authorized agent on a headless Linux host already holds administrative
+# access but has no interactive login to stage as, and Machine never runs as
+# root. Run as root, this script resolves which non-root login Bloom belongs
+# to, prepares that login's systemd user session, and re-runs itself unchanged
+# as that login. It still never elevates, never installs, never touches wallet
+# state, and the privileged installer still verifies its own root-owned copy.
+#
+#   BLOOM_LOGIN_USER=<login>        use this existing non-root login
+#   BLOOM_PREPARE_LOGIN_USER=1      authorize creating the dedicated "bloom"
+#                                   login when this host has no Bloom login
+#   BLOOM_SYSTEM_ROOT=<dir>         test-only: any root other than / resolves
+#                                   the login, reports the plan, and changes
+#                                   nothing
+
+headless_default_login=bloom
+
+headless_blocker() {
+  printf 'Bloom headless setup blocker: %s\n' "$1" >&2
+  exit 1
+}
+
+headless_record_field() {
+  # headless_record_field FILE KEY KIND: one scalar from a single-line Linux
+  # enrollment record, which only the privileged installer writes.
+  case "$3" in
+    string)
+      sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" |
+        awk 'NR == 1 { print }'
+      ;;
+    *)
+      sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$1" |
+        awk 'NR == 1 { print }'
+      ;;
+  esac
+}
+
+headless_verify_login() {
+  # headless_verify_login NAME [UID]: confirm NAME is a real non-root login in
+  # this host's password database, optionally at an exact UID. Sets
+  # headless_user, headless_uid, headless_home, and headless_shell.
+  # Disagreement fails closed.
+  verify_name=$1
+  verify_uid=${2:-}
+  headless_verify_detail=
+  # The privileged Linux installer's own login-name charset.
+  case "$verify_name" in
+    ''|[!a-z_]*|*[!a-z0-9_-]*) return 1 ;;
+  esac
+  verify_entry=$(getent passwd "$verify_name" 2>/dev/null) || return 1
+  verify_entry=$(printf '%s\n' "$verify_entry" | awk 'NR == 1 { print }')
+  IFS=: read -r entry_name entry_password entry_uid entry_gid entry_comment \
+    entry_home entry_shell <<HEADLESS_PASSWD_ENTRY
+$verify_entry
+HEADLESS_PASSWD_ENTRY
+  [ "$entry_name" = "$verify_name" ] || return 1
+  case "$entry_uid" in
+    ''|*[!0-9]*|0) return 1 ;;
+  esac
+  if [ -n "$verify_uid" ] && [ "$entry_uid" != "$verify_uid" ]; then
+    return 1
+  fi
+  case "$entry_home" in
+    /) return 1 ;;
+    /*) ;;
+    *) return 1 ;;
+  esac
+  # The privileged installer resolves this login's home by UID, so a second
+  # account sharing the UID would be installed for instead of this one. An
+  # aliased UID is ambiguous: fail closed rather than pick one.
+  verify_uid_entry=$(getent passwd "$entry_uid" 2>/dev/null) || return 1
+  verify_uid_name=$(printf '%s\n' "$verify_uid_entry" |
+    awk -F: 'NR == 1 { print $1 }')
+  if [ "$verify_uid_name" != "$entry_name" ]; then
+    headless_verify_detail="UID $entry_uid is shared with $verify_uid_name"
+    return 1
+  fi
+  headless_user=$entry_name
+  headless_uid=$entry_uid
+  headless_home=$entry_home
+  headless_shell=$entry_shell
+  return 0
+}
+
+headless_require_adoptable_login() {
+  # A login Bloom is adopting for the first time has to be a real interactive
+  # login. Bloom's own Broker and Signer principals and other system accounts
+  # are created with a no-login shell, so an account that only shares the name
+  # is reported instead of adopted. An existing enrollment or retained custody
+  # record is authority on its own and is never re-judged here.
+  case "$headless_shell" in
+    */nologin|*/false)
+      headless_blocker "$headless_user is not an interactive login on this host (login shell $headless_shell); set BLOOM_LOGIN_USER to the login Bloom should run as"
+      ;;
+  esac
+  if [ ! -d "$headless_home" ]; then
+    headless_blocker "$headless_user has no home directory at $headless_home; set BLOOM_LOGIN_USER to the login Bloom should run as"
+  fi
+}
+
+headless_pair_names() {
+  pair_names=
+  for pair in $1; do
+    if [ -n "$pair_names" ]; then
+      pair_names="$pair_names, "
+    fi
+    pair_names="$pair_names${pair%:*}"
+  done
+  printf '%s' "$pair_names"
+}
+
+headless_known_logins() {
+  # The logins this host already knows: active enrollments, and custody
+  # retained by an uninstall. An unrecognized record stops the run. The
+  # privileged installer's own validation is what is mirrored here: the
+  # schema it writes, the state its directory means, and a record whose
+  # login UID is the one its file name claims.
+  headless_active=
+  headless_retained=
+  for record_directory in enrollments retained; do
+    if [ "$record_directory" = enrollments ]; then
+      expected_state=active
+    else
+      expected_state=retained
+    fi
+    for record in "$headless_etc/$record_directory"/*.json; do
+      if [ -L "$record" ] || { [ -e "$record" ] && [ ! -f "$record" ]; }; then
+        headless_blocker "unrecognized Bloom enrollment record: $record"
+      fi
+      if [ ! -f "$record" ]; then
+        continue
+      fi
+      record_schema=$(headless_record_field "$record" schema string)
+      record_state=$(headless_record_field "$record" state string)
+      record_user=$(headless_record_field "$record" login_user string)
+      record_uid=$(headless_record_field "$record" login_uid number)
+      record_name=${record##*/}
+      record_name=${record_name%.json}
+      if [ "$record_schema" != bloom.linux-enrollment.1 ]; then
+        headless_blocker "unrecognized Bloom enrollment record schema: $record"
+      fi
+      if [ "$record_state" != "$expected_state" ]; then
+        headless_blocker "unrecognized Bloom enrollment record: $record"
+      fi
+      case "$record_user" in
+        ''|[!a-z_]*|*[!a-z0-9_-]*)
+          headless_blocker "Bloom enrollment record names an invalid login: $record"
+          ;;
+      esac
+      case "$record_uid" in
+        ''|*[!0-9]*|0)
+          headless_blocker "Bloom enrollment record names an invalid login UID: $record"
+          ;;
+      esac
+      if [ "$record_uid" != "$record_name" ]; then
+        headless_blocker "Bloom enrollment record names login UID $record_uid: $record"
+      fi
+      if [ "$record_state" = active ]; then
+        headless_active="$headless_active $record_user:$record_uid"
+      else
+        headless_retained="$headless_retained $record_user:$record_uid"
+      fi
+    done
+  done
+}
+
+headless_prepare_login() {
+  # Only reached with explicit authorization and no Bloom login on the host.
+  headless_user=$headless_default_login
+  headless_uid=
+  headless_home=
+  headless_created=$headless_default_login
+  if [ "$headless_live" != 1 ]; then
+    return 0
+  fi
+  if ! command -v useradd >/dev/null 2>&1; then
+    headless_blocker \
+      "useradd is required to prepare the dedicated '$headless_default_login' login"
+  fi
+  if ! useradd --create-home --shell /bin/sh --comment "Bloom login" \
+    "$headless_default_login"
+  then
+    headless_blocker \
+      "could not create the dedicated '$headless_default_login' login"
+  fi
+  if ! headless_verify_login "$headless_default_login"; then
+    headless_blocker \
+      "the dedicated '$headless_default_login' login is not a usable non-root login${headless_verify_detail:+: $headless_verify_detail}"
+  fi
+  headless_require_adoptable_login
+}
+
+resolve_headless_login() {
+  requested_login=${BLOOM_LOGIN_USER:-}
+  if [ -n "$requested_login" ]; then
+    case "$requested_login" in
+      [!a-z_]*|*[!a-z0-9_-]*)
+        headless_blocker "BLOOM_LOGIN_USER is not a valid login name: $requested_login"
+        ;;
+    esac
+  fi
+  headless_known_logins
+  headless_created=
+  selected=
+  if [ -n "$headless_active" ]; then
+    # Upgrade: Bloom is already installed for a login. Reuse exactly that
+    # login; never create or substitute another one.
+    headless_source=enrolled
+    for pair in $headless_active; do
+      if [ -n "$requested_login" ] && [ "$requested_login" != "${pair%:*}" ]; then
+        continue
+      fi
+      if [ -n "$selected" ]; then
+        headless_blocker "this host has more than one enrolled Bloom login ($(headless_pair_names "$headless_active")); set BLOOM_LOGIN_USER to the one to upgrade"
+      fi
+      selected=$pair
+    done
+    if [ -z "$selected" ]; then
+      headless_blocker "Bloom is enrolled for $(headless_pair_names "$headless_active") on this host, not $requested_login; upgrade the enrolled login instead of replacing it"
+    fi
+  elif [ -n "$requested_login" ]; then
+    headless_source=existing
+    selected="$requested_login:"
+    for pair in $headless_retained; do
+      if [ "${pair%:*}" != "$requested_login" ]; then
+        continue
+      fi
+      if [ "$headless_source" = retained ]; then
+        headless_blocker "this host has more than one retained Bloom custody record for $requested_login; nothing was changed"
+      fi
+      # Reinstalling for a login whose custody an uninstall retained: bind the
+      # recorded UID, and report it as retained rather than as a plain first
+      # install for a login that happens to exist.
+      headless_source=retained
+      selected=$pair
+    done
+  elif [ -n "$headless_retained" ]; then
+    headless_blocker "Bloom custody is retained for $(headless_pair_names "$headless_retained") on this host; set BLOOM_LOGIN_USER to that login to reinstall for it rather than preparing another"
+  elif getent passwd "$headless_default_login" >/dev/null 2>&1; then
+    # An account already holds the dedicated name. Adopt it only if it is a
+    # usable login; never fall through to creating or substituting another.
+    headless_source=existing
+    selected="$headless_default_login:"
+  elif [ "${BLOOM_PREPARE_LOGIN_USER:-}" = 1 ]; then
+    headless_source=prepared
+  else
+    headless_blocker "this host has no Bloom login user: set BLOOM_LOGIN_USER to an existing non-root login, or rerun with BLOOM_PREPARE_LOGIN_USER=1 to create the dedicated '$headless_default_login' login"
+  fi
+
+  # Creating the dedicated login, and enabling a lingering systemd user
+  # session for any login, is only ever done with this authorization.
+  if [ "${BLOOM_PREPARE_LOGIN_USER:-}" = 1 ]; then
+    headless_session_prepare=1
+  fi
+
+  if [ "$headless_source" = prepared ]; then
+    headless_prepare_login
+    return 0
+  fi
+  if ! headless_verify_login "${selected%:*}" "${selected#*:}"; then
+    case "$headless_source" in
+      enrolled|retained)
+        headless_blocker "the $headless_source Bloom login ${selected%:*} (UID ${selected#*:}) does not match this host's password database; nothing was changed${headless_verify_detail:+: $headless_verify_detail}"
+        ;;
+    esac
+    headless_blocker "${selected%:*} is not a usable non-root login on this host${headless_verify_detail:+: $headless_verify_detail}"
+  fi
+  if [ "$headless_source" = existing ]; then
+    headless_require_adoptable_login
+  fi
+}
+
+resolve_headless_tmpdir() {
+  # Staging runs as the Bloom login, which may not be able to write the
+  # TMPDIR this process inherited.
+  headless_tmpdir=
+  headless_home_tmpdir=
+  if [ -n "$headless_home" ]; then
+    headless_home_tmpdir="$headless_home/.cache/bloom/tmp"
+  fi
+  for candidate in "${TMPDIR:-}" /tmp /var/tmp "$headless_home_tmpdir"; do
+    if [ -z "$candidate" ]; then
+      continue
+    fi
+    case "$candidate" in
+      /*) ;;
+      *) continue ;;
+    esac
+    case "$candidate" in
+      *'
+'*) continue ;;
+    esac
+    if [ "$candidate" = "$headless_home_tmpdir" ]; then
+      runuser -u "$headless_user" -- /bin/sh -c '
+        mkdir -p "$1" && chmod 700 "$1"
+      ' bloom-headless-tmpdir "$candidate" >/dev/null 2>&1 || continue
+    fi
+    if runuser -u "$headless_user" -- /bin/sh -c '
+      probe=$(mktemp -d "$1/bloom-tmpdir-probe.XXXXXX") && rmdir "$probe"
+    ' bloom-headless-tmpdir "$candidate" >/dev/null 2>&1
+    then
+      headless_tmpdir=$candidate
+      return 0
+    fi
+  done
+  headless_blocker "no temporary directory is writable by $headless_user (tried ${TMPDIR:+$TMPDIR, }/tmp, /var/tmp${headless_home_tmpdir:+, $headless_home_tmpdir})"
+}
+
+report_headless_tmpdir() {
+  # Readiness checks run as this login too, so report the directory it can
+  # actually write rather than leaving them to guess one.
+  if [ -n "$headless_tmpdir" ]; then
+    printf 'BLOOM_HEADLESS_TMPDIR=%s\n' "$headless_tmpdir"
+  fi
+}
+
+start_headless_login_session() {
+  if [ "$headless_live" != 1 ]; then
+    return 0
+  fi
+  if [ -S "/run/user/$headless_uid/bus" ]; then
+    return 0
+  fi
+  if [ "$headless_session_prepare" != 1 ]; then
+    # Lingering is persistent state on an account Bloom did not prepare.
+    headless_blocker "$headless_user has no systemd user session at /run/user/$headless_uid/bus: start that login's session, or rerun with BLOOM_PREPARE_LOGIN_USER=1 to authorize a lingering one for it"
+  fi
+  for required_command in loginctl sleep; do
+    if ! command -v "$required_command" >/dev/null 2>&1; then
+      headless_blocker \
+        "$required_command is required to start the Bloom login's systemd user session"
+    fi
+  done
+  if ! loginctl enable-linger "$headless_user" >/dev/null 2>&1; then
+    headless_blocker \
+      "could not enable a lingering systemd user session for $headless_user"
+  fi
+  headless_waited=0
+  while [ ! -S "/run/user/$headless_uid/bus" ]; do
+    if [ "$headless_waited" -ge 30 ]; then
+      headless_blocker "no systemd user session appeared for $headless_user at /run/user/$headless_uid/bus"
+    fi
+    sleep 1
+    headless_waited=$((headless_waited + 1))
+  done
+}
+
+stage_as_headless_login() {
+  headless_user=
+  headless_uid=
+  headless_home=
+  headless_shell=
+  headless_tmpdir=
+  headless_session_prepare=0
+  headless_verify_detail=
+  system_root=${BLOOM_SYSTEM_ROOT:-/}
+  case "$system_root" in
+    /*) ;;
+    *) headless_blocker "BLOOM_SYSTEM_ROOT must be an absolute path" ;;
+  esac
+  if [ "$system_root" = / ]; then
+    headless_live=1
+    headless_etc=/etc/bloom
+  else
+    headless_live=0
+    if [ ! -d "$system_root" ]; then
+      headless_blocker "BLOOM_SYSTEM_ROOT is not a directory: $system_root"
+    fi
+    headless_etc="${system_root%/}/etc/bloom"
+  fi
+  for required_command in env getent runuser sed; do
+    if ! command -v "$required_command" >/dev/null 2>&1; then
+      headless_blocker "$required_command is required to stage Bloom as its login user"
+    fi
+  done
+  if [ ! -f "$0" ] || [ ! -r "$0" ]; then
+    headless_blocker \
+      "run this script from a file path so it can be re-run as the Bloom login user"
+  fi
+
+  resolve_headless_login
+  if [ "$headless_live" = 1 ] || [ -z "$headless_created" ]; then
+    resolve_headless_tmpdir
+  fi
+
+  if [ "$headless_live" != 1 ]; then
+    printf 'BLOOM_HEADLESS_PLAN=1\n'
+    printf 'BLOOM_HEADLESS_LOGIN=%s\n' "$headless_source"
+    if [ -n "$headless_created" ]; then
+      printf 'BLOOM_HEADLESS_CREATE_LOGIN=%s\n' "$headless_created"
+    fi
+    if [ "$headless_session_prepare" = 1 ]; then
+      printf 'BLOOM_HEADLESS_PREPARE_SESSION=1\n'
+    fi
+    printf 'BLOOM_LOGIN_USER=%s\n' "$headless_user"
+    if [ -n "$headless_uid" ]; then
+      printf 'BLOOM_LOGIN_UID=%s\n' "$headless_uid"
+      printf 'BLOOM_LOGIN_HOME=%s\n' "$headless_home"
+    fi
+    report_headless_tmpdir
+    exit 0
+  fi
+
+  start_headless_login_session
+  printf 'BLOOM_HEADLESS_LOGIN=%s\n' "$headless_source"
+  report_headless_tmpdir
+  # Re-run these exact bytes as the Bloom login, with only that login's
+  # environment. Root opens the script; the login user never needs to read it.
+  exec runuser -u "$headless_user" -- env -i \
+    HOME="$headless_home" \
+    LOGNAME="$headless_user" \
+    PATH="${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}" \
+    TMPDIR="$headless_tmpdir" \
+    USER="$headless_user" \
+    XDG_RUNTIME_DIR="/run/user/$headless_uid" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$headless_uid/bus" \
+    /bin/sh -s < "$0"
 }
 
 resolve_latest_release() {
@@ -326,6 +749,11 @@ main() {
   trap cleanup EXIT HUP INT TERM
 
   resolve_triad_target
+  if [ "$os" = Linux ] && [ "$login_uid" = 0 ]; then
+    # Either re-runs this script as the Bloom login user or stops with a
+    # blocker; it never stages for root.
+    stage_as_headless_login
+  fi
   require_triad_environment
   resolve_latest_release
   stage_triad

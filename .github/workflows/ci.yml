@@ -75,6 +75,11 @@ jobs:
         run: scripts/test-ceremony-port-concurrency-cases.sh
       - name: Run release-notes generator cases
         run: scripts/test-release-notes.sh
+      # Headless Linux login resolution in the reviewed setup script
+      # (fixture system root and stubbed password database; creates no
+      # account, starts no session, stages no release).
+      - name: Run headless setup cases
+        run: scripts/test-headless-setup.sh
 
   clippy:
     name: clippy

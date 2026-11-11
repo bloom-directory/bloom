@@ -139,6 +139,14 @@ uses no relay infrastructure: `scripts/test-triad-dev-hosted-relay.sh`. CI runs
 it in the static checks job. `BLOOM_TRIAD_DEV_RELAY_TIMEOUT_SECONDS` controls
 the hosted launcher wait and defaults to 300 seconds.
 
+The skill's reviewed setup script resolves the Bloom login user when an
+authorized agent stages as root on a headless Linux host. Its cases run against
+a fixture system root with a stubbed password database and create no account,
+session, or stage: `scripts/test-headless-setup.sh`. CI runs it in the static
+checks and skill-eval jobs. The live steps it does not cover — creating the
+dedicated login, enabling linger, and the re-run as that login — need a
+disposable host.
+
 For an already provisioned disposable hosted-relay Triad, run:
 
 ```sh

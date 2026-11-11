@@ -8,7 +8,8 @@ A request to set up Bloom authorizes installing the signed Bloom software,
 read-only chain access, and starting the components required for an active Bloom
 session. Bloom is a triad: Machine runs as the login user while Broker and Signer
 run as isolated service principals, under systemd on Linux and under launchd on
-macOS. Setup therefore authorizes enabling those packaged Bloom services, but it
+macOS. Setup therefore authorizes enabling those packaged Bloom services, and on
+a headless Linux host the login user and systemd user session they need, but it
 never authorizes the agent to handle a sudo password, a polkit credential, or a
 macOS administrator credential, or to broaden the reviewed privileged command.
 
@@ -32,8 +33,11 @@ artifacts:
 The script verifies both the archive and internal payload signatures against
 Bloom's reviewed release key, verifies their SHA-256 manifests, checks the
 platform claim, and stages the payload below `~/.cache/bloom/install`. It does
-not execute the staged release or invoke sudo. Resolve `releases/latest` only once
-and keep every artifact download on the resolved tag; do not use moving
+not execute the staged release or invoke sudo. Run as root on Linux it first
+resolves the Bloom login user and re-runs itself as that login, as
+[Headless Linux](#headless-linux-the-authorized-agent-runs-the-handoff)
+describes. Resolve `releases/latest` only once and keep every artifact
+download on the resolved tag; do not use moving
 `releases/latest/download` URLs or substitute one platform's artifact for the
 other. If discovery, download, or verification fails, stop and report the failure;
 never fall back to an older release or cached payload.
@@ -82,7 +86,10 @@ Inspect the complete downloaded script before execution. It should contact only 
 Bloom repository's GitHub latest-release URL and the resolved release downloads,
 write only to a temporary directory and the reported
 user-owned staging directory, and perform no wallet, transaction, sudo, or
-service action. If it matches, run:
+service action. Its one root-only path is the headless Linux login resolution
+below: as root it may create the dedicated `bloom` login and enable that
+login's systemd user session, when that was authorized, and then re-runs
+itself as that login. If it matches, run:
 
 ```sh
 sh "$review_dir/setup.sh"
@@ -157,6 +164,55 @@ sudo /bin/sh -c 'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); trap "rm
 Use the actual captured values, not the example values. The user types their
 sudo password into their own terminal.
 
+### Headless Linux: the authorized agent runs the handoff
+
+A headless host has no authentication agent and often nobody at a terminal, so
+`pkexec` exits `127` without showing a dialog. When the agent already holds the
+administrative access this step needs — it runs as root, or `sudo -n true`
+succeeds — it runs the same fixed command itself. Nothing is relaxed: the same
+reviewed `setup.sh`, the same resolved release, the same signature, checksum,
+and root-owned-copy verification, and the same three values. If elevation would
+prompt for a password, do not answer it; hand the user the `sudo` command above
+and stop.
+
+Run the reviewed staging as root. Machine never runs as root, so on Linux
+`setup.sh` first resolves which non-root login Bloom belongs to, using
+`getent passwd` and the privileged installer's own enrollment records, and then
+stages as that login:
+
+- **Upgrade.** It reuses the login recorded in `/etc/bloom/enrollments`,
+  verified against this host's password database, and preserves that login's
+  existing installation, data, and configuration. It never creates a
+  replacement login. If the host has more than one enrolled login, or custody
+  retained by an uninstall, it stops and names them; add
+  `BLOOM_LOGIN_USER=<login>` to choose one of them.
+- **First install.** Add `BLOOM_LOGIN_USER=<login>` to use an existing non-root
+  login. With no Bloom login on the host and no `BLOOM_LOGIN_USER`, it stops
+  unless `BLOOM_PREPARE_LOGIN_USER=1` authorizes creating the dedicated `bloom`
+  login and its lingering systemd user session. It adopts an existing `bloom`
+  login, never an unrelated account, and never stages for root.
+
+```sh
+BLOOM_PREPARE_LOGIN_USER=1 sh "$review_dir/setup.sh"
+```
+
+Staging reports `BLOOM_HEADLESS_LOGIN=enrolled`, `=existing`, or `=prepared`
+ahead of the usual captured values, and gives that login a temporary directory
+it can write even when the inherited `TMPDIR` is one it cannot. An unmet
+prerequisite is reported as a `Bloom headless setup blocker:` line; report that
+blocker and stop rather than working around it.
+
+Then run the identical fixed command with the captured values substituted as
+before. As root, run it with no elevation prefix at all:
+
+```sh
+/bin/sh -c 'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); trap "rm -rf -- $s" EXIT; trap "exit 129" HUP INT TERM; cp -R "$1/bloom-triad" "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; if find "$s" -type l -o ! -type f ! -type d | grep -q .; then echo "Bloom stage contains a link or special file." >&2; exit 65; fi; k="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFY9na4hytUNsW+8LWu//HrX9TaPU7H7Vg0GRWcZM+uP"; printf "%s\n" "$k" > "$s/key.pub"; printf "bloom-release %s\n" "$k" > "$s/signers"; p="$s/bloom-triad"; /usr/bin/ssh-keygen -Y verify -f "$s/signers" -I bloom-release -n bloom-release-payload-v1 -s "$p/RELEASE_SIGNATURE" < "$p/SHA256SUMS" > /dev/null; cd "$p"; { sha256sum -c SHA256SUMS 2>/dev/null || shasum -a 256 -c SHA256SUMS; } > /dev/null; case $(uname -s) in Linux) i=linux;; Darwin) i=macos;; *) exit 65;; esac; BLOOM_RELEASE_PUBLIC_KEY="$s/key.pub" "$p/installer/release/install-$i.sh" install / "$2" "$3" "$p"' bloom-install 'STAGE' 'UID' 'USER'
+```
+
+If the agent is not root but `sudo -n true` succeeds, prefix exactly `sudo -n`
+and nothing else. Do not add environment, arguments, or a different root, and
+do not retry a password-prompting elevation through another path.
+
 ### macOS: the agent runs osascript
 
 Run the command yourself through `/usr/bin/osascript`; macOS shows its own
@@ -208,6 +264,43 @@ than declaring readiness. The packaged Linux mount is the only persistence this
 setup authorizes; do not create additional systemd, launchd, cron, shell-profile
 auto-start, or restart configuration.
 
+Also require matching CLI and daemon versions, which `bloom --version` prints
+together. `bloom-daemon unavailable` or `bloom-daemon incompatible` is a failed
+check, not readiness.
+
+When the agent staged as root for another login, run every check as that login,
+with a writable `TMPDIR`, and read the service units for its UID. Substitute
+the captured `BLOOM_LOGIN_USER` and `BLOOM_LOGIN_UID` as shell-quoted literals,
+as for the privileged command; staging's output is still not evaluated:
+
+```sh
+login_user='USER'
+login_uid='UID'
+bloom_login() {
+  runuser -u "$login_user" -- env \
+    HOME="$(getent passwd "$login_user" | cut -d: -f6)" \
+    TMPDIR=/tmp \
+    XDG_RUNTIME_DIR="/run/user/$login_uid" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$login_uid/bus" "$@"
+}
+bloom_login systemctl --user is-active bloom-session.service bloom-machine.service
+systemctl is-active "bloom-signer@$login_uid.service" "bloom-broker@$login_uid.service"
+bloom_login bloom --version
+```
+
+`BLOOM_RELOGIN_REQUIRED=1` after `BLOOM_HEADLESS_LOGIN=prepared` means the user
+manager this run started predates Bloom's groups. Restart that one prepared
+login's session, wait for `/run/user/$login_uid/bus` again, and recheck:
+
+```sh
+loginctl disable-linger "$login_user"
+loginctl enable-linger "$login_user"
+```
+
+Never do that to a login a human or another workload is using, and never for
+`BLOOM_HEADLESS_LOGIN=enrolled` or `=existing`: report that the login needs a
+fresh session instead.
+
 ### macOS post-install readiness
 
 On macOS, an active GUI login session is required and validated by the privileged
@@ -244,6 +337,10 @@ cat "$BLOOM_MOUNT/AGENTS.md"
 cat "$BLOOM_MOUNT/status/daemon.json"
 bloom audit status
 ```
+
+On a headless host, run these through the `bloom_login` wrapper above; the
+mount belongs to the Bloom login, not to root. The daemon's `version` in
+`status/daemon.json` is the version `bloom --version` must agree with.
 
 Require `mutation_degradation: null` for readiness. Poll startup effects for up to 30 seconds.
 Once idle, allow one restart of the existing packaged Machine as a workaround, not a root-cause fix.

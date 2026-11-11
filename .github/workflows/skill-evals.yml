@@ -38,3 +38,8 @@ jobs:
       # Grader fixtures and config validation only; no model calls.
       - name: Check onboarding grader and configs
         run: npm run check
+      # Fixture cases for the reviewed setup script's headless Linux login
+      # resolution; it changes no account, session, or installed state.
+      - name: Run headless setup cases
+        working-directory: ${{ github.workspace }}
+        run: scripts/test-headless-setup.sh
