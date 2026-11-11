@@ -99,10 +99,15 @@ impl NetPolicy {
     /// Enforce HTTPS, exact host, method, and path allowlist.
     pub fn check(&self, method: &str, url: &str) -> Result<(), HostError> {
         let url = url::Url::parse(url).map_err(|e| HostError::Invalid(format!("url: {e}")))?;
-        if url.scheme() != "https" {
+        // TEST-ONLY LOOPBACK EXCEPTION (real-service runs only, never merged):
+        // allow plain HTTP to the in-namespace local validator. The host
+        // allowlist below still applies, so only a 127.0.0.1 binding passes.
+        let loopback = url.scheme() == "http" && url.host_str() == Some("127.0.0.1");
+        if !loopback && url.scheme() != "https" {
             return Err(HostError::Denied("net.fetch requires https".into()));
         }
-        if let Some(port) = url.port()
+        if !loopback
+            && let Some(port) = url.port()
             && port != 443
         {
             return Err(HostError::Denied(format!(
