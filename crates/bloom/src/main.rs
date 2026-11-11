@@ -9,6 +9,7 @@
 mod commands {
     pub mod qr;
 }
+mod default_policy;
 mod deploy;
 mod github_source;
 mod macos_runtime;
@@ -1286,6 +1287,9 @@ fn machine_command_event_fields(
             Some(operation_id.clone()),
             MachineCommandEventClass::DurableMutation,
         ),
+        MachineCommand::WalletDefaultPolicy { .. } => {
+            ("default_policy", None, MachineCommandEventClass::Prepared)
+        }
         MachineCommand::WalletOutboxCancel { id, .. } => (
             "wallet_outbox_cancel",
             Some(id.clone()),
@@ -1781,6 +1785,25 @@ async fn execute_machine_command(
         }
         MachineCommand::WalletPolicyCommit { operation_id } => {
             commit_policy_update(home, machine_broker()?, operation_id).await?
+        }
+        MachineCommand::WalletDefaultPolicy {
+            name,
+            owner_just_chose,
+            observe_only,
+        } => {
+            validate_wallet_name(&name).map_err(|error| {
+                machine_error(
+                    MachineErrorKind::InvalidParams,
+                    format!("wallet name must be a safe single path segment: {error:#}"),
+                )
+            })?;
+            let status = default_policy::advance_default_policy(
+                daemon,
+                &name,
+                default_policy::DefaultPolicyMode::of_command(owner_just_chose, observe_only),
+            )
+            .await?;
+            format!("{}\n", serde_json::to_string(&status)?)
         }
         MachineCommand::WalletOutboxCancel {
             wallet,
@@ -2900,6 +2923,9 @@ enum WalletCmd {
         #[arg(long)]
         local: bool,
     },
+    /// Approve the default policy for a wallet: one policy ceremony that allows
+    /// the Petals chosen during setup. `new` and `import` run it for `main`.
+    DefaultPolicy { name: String },
     /// Convert a staged v1 passkey wallet into Signer-owned Triad custody.
     /// The receipt contains public binding data only; Machine never opens the
     /// legacy wallet directory.
@@ -3521,6 +3547,10 @@ async fn machine_command(
 
 async fn call_machine_command(endpoint: &ResolvedEndpoint, command: MachineCommand) -> Result<()> {
     let output = machine_command(endpoint, command).await?;
+    print_machine_command_output(&output)
+}
+
+fn print_machine_command_output(output: &MachineCommandOutput) -> Result<()> {
     std::io::Write::write_all(&mut std::io::stdout(), output.stdout.as_bytes())?;
     std::io::Write::write_all(&mut std::io::stderr(), output.stderr.as_bytes())?;
     if output.exit_code != 0 {
@@ -3761,7 +3791,26 @@ async fn run(cli: Cli) -> Result<()> {
             if !structured_service_output() {
                 eprintln!("{ALPHA_DISCLOSURE}");
             }
-            let (_home_permit, d) = build_write_daemon(home.clone()).context("init daemon")?;
+            let (_home_permit, mut d) = build_write_daemon(home.clone()).context("init daemon")?;
+            // Building the daemon writes a default config when none exists, and
+            // `bloom serve` does the same, so the file's presence says nothing
+            // about setup. The marker is saved only together with the choices.
+            let first_setup = !d.config.setup.complete;
+            if first_setup {
+                if !structured_service_output() && default_policy::interactive_setup_available() {
+                    default_policy::run_setup_menu(
+                        d.config.setup.main_mut(),
+                        &mut std::io::stdin().lock(),
+                        &mut std::io::stdout(),
+                    )?;
+                } else {
+                    default_policy::accept_setup_suggestions(d.config.setup.main_mut());
+                }
+                d.config.setup.complete = true;
+                d.config
+                    .save(&d.home.config_path())
+                    .context("save setup choices")?;
+            }
             let preinstalled = github_source::ensure_preinstalled_petals(&home, &d)
                 .context("provision canonical pre-installed Petals")?;
             println!("home: {}", d.home.root().display());
@@ -3954,13 +4003,11 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Wallet(WalletCmd::New { name, local }) => {
-            call_machine_command(
+            default_policy::create_wallet_then_default_policy(
                 &client_endpoint,
-                MachineCommand::WalletCustody {
-                    name,
-                    kind: MachineCustodyKind::New,
-                    local,
-                },
+                name,
+                MachineCustodyKind::New,
+                local,
             )
             .await
         }
@@ -3969,13 +4016,21 @@ async fn run(cli: Cli) -> Result<()> {
             raw_private_key,
             local,
         }) => {
-            call_machine_command(
+            default_policy::create_wallet_then_default_policy(
                 &client_endpoint,
-                MachineCommand::WalletCustody {
-                    name,
-                    kind: wallet_import_kind(raw_private_key),
-                    local,
-                },
+                name,
+                wallet_import_kind(raw_private_key),
+                local,
+            )
+            .await
+        }
+        Cmd::Wallet(WalletCmd::DefaultPolicy { name }) => {
+            // Wait out a policy lock another command holds; a ceremony this
+            // command opens extends the deadline to its own expiry.
+            default_policy::wait_for_default_policy(
+                &client_endpoint,
+                &name,
+                current_unix_ms().saturating_add(default_policy::POLICY_LOCK_GRACE_MS),
             )
             .await
         }
@@ -4506,7 +4561,11 @@ async fn run(cli: Cli) -> Result<()> {
                 let context = ready_context.clone();
                 *ready_provisioning.lock().expect("provisioning handle") =
                     Some(tokio::task::spawn_blocking(move || {
-                        petal_provisioning::provision(&daemon, &context)
+                        // Machine is already serving, so a Petal's code can be
+                        // running when its update would activate, and a
+                        // download can fail. Those installs are tried again
+                        // rather than left out.
+                        petal_provisioning::provision_and_retry(&daemon, &context, |_| {})
                     }));
             }));
             // Start audited and durable background effects only after every

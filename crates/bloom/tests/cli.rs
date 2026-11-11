@@ -954,6 +954,95 @@ fn init_ignores_legacy_preinstalled_opt_out() {
         ));
 }
 
+/// Setup is recorded when it finishes, not inferred from the config file:
+/// `bloom serve` writes a default config before any `bloom init`, and an
+/// empty `[setup.petals]` is a valid choice rather than "never asked".
+#[test]
+fn init_runs_setup_once_even_when_the_config_already_exists() {
+    let home = fresh_home();
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    home_dir.ensure().unwrap();
+    // What `bloom serve` leaves behind when it starts before any `bloom init`.
+    bloom_proto::Config::local_default()
+        .save(&home_dir.config_path())
+        .unwrap();
+    let init = |home: &Path| {
+        bloom_cmd(home)
+            .env("HTTPS_PROXY", "http://127.0.0.1:1")
+            .env("https_proxy", "http://127.0.0.1:1")
+            .env("NO_PROXY", "")
+            .env("no_proxy", "")
+            .arg("init")
+            .assert()
+            // Setup is saved before Petal provisioning, which is offline here.
+            .failure()
+            .stderr(predicate::str::contains(
+                "provision canonical pre-installed Petals",
+            ));
+    };
+
+    init(home.path());
+    let mut config = bloom_proto::Config::load(&home_dir.config_path()).unwrap();
+    assert!(config.setup.complete);
+    assert!(
+        config.setup.main().petals.contains_key("hyperliquid"),
+        "non-interactive setup records the catalog's suggestions: {:?}",
+        config.setup.main().petals
+    );
+
+    // The owner's choice was "none of them"; a later run must keep it.
+    config.setup.main_mut().petals.clear();
+    config.save(&home_dir.config_path()).unwrap();
+    init(home.path());
+    let config = bloom_proto::Config::load(&home_dir.config_path()).unwrap();
+    assert!(config.setup.complete);
+    assert!(
+        config.setup.main().petals.is_empty(),
+        "{:?}",
+        config.setup.main().petals
+    );
+}
+
+/// Choices recorded before setup finished, as by a run that stopped
+/// part-way, are kept when `bloom init` runs setup again: a declined Petal
+/// stays declined.
+#[test]
+fn init_setup_on_an_existing_config_keeps_earlier_choices() {
+    let home = fresh_home();
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    home_dir.ensure().unwrap();
+    let mut config = bloom_proto::Config::local_default();
+    config
+        .setup
+        .main_mut()
+        .petals
+        .insert("polymarket".into(), Default::default());
+    assert!(!config.setup.complete);
+    config.save(&home_dir.config_path()).unwrap();
+
+    bloom_cmd(home.path())
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("https_proxy", "http://127.0.0.1:1")
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .arg("init")
+        .assert()
+        // Setup is saved before Petal provisioning, which is offline here.
+        .failure()
+        .stderr(predicate::str::contains(
+            "provision canonical pre-installed Petals",
+        ));
+
+    let config = bloom_proto::Config::load(&home_dir.config_path()).unwrap();
+    assert!(config.setup.complete);
+    assert_eq!(
+        config.setup.main().petals.keys().collect::<Vec<_>>(),
+        ["polymarket"],
+        "declined Petals were added back: {:?}",
+        config.setup.main().petals
+    );
+}
+
 #[test]
 fn vfs_write_help_exposes_no_unlock_or_secret_flags() {
     let home = fresh_home();

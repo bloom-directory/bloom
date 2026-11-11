@@ -13,7 +13,7 @@
 //! (write-to-tempfile + rename); reads are unbuffered. The store does
 //! not validate that the bytes are valid wasm — that's the VM's job.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -39,7 +39,39 @@ const ROUTE_INDEX: &str = "route-index.json";
 #[derive(Debug, Clone)]
 pub struct PetalStore {
     base: PathBuf,
-    execution_gate: Arc<tokio::sync::RwLock<()>>,
+    gates: Arc<ExecutionGates>,
+}
+
+/// What keeps Petal code and package changes apart (bloom#328). Each Petal
+/// has its own gate: its calls share it, and a change to its package takes it
+/// alone, so one Petal's calls never hold up another Petal's install. Under
+/// them, a gate for the whole store, which calls and installs share and an
+/// uninstall takes alone.
+#[derive(Debug, Default)]
+struct ExecutionGates {
+    store: Arc<tokio::sync::RwLock<()>>,
+    petals: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>,
+}
+
+/// Past this many Petal gates, those nobody holds are forgotten, so names
+/// that were only looked up do not accumulate.
+const IDLE_GATES_KEPT: usize = 64;
+
+impl ExecutionGates {
+    fn petal(&self, name: &str) -> Arc<tokio::sync::RwLock<()>> {
+        let mut petals = self.petals.lock();
+        if petals.len() >= IDLE_GATES_KEPT {
+            petals.retain(|_, gate| Arc::strong_count(gate) > 1);
+        }
+        petals.entry(name.to_owned()).or_default().clone()
+    }
+}
+
+/// A running Petal call's share of the gates: a change to that Petal's
+/// package, or an uninstall, waits until it is dropped.
+pub struct ExecutionGuard {
+    _petal: tokio::sync::OwnedRwLockReadGuard<()>,
+    _store: tokio::sync::OwnedRwLockReadGuard<()>,
 }
 
 /// Verified package materialized privately before taking the install mutation lock.
@@ -59,6 +91,41 @@ pub struct InstallResult {
     pub already_present: bool,
 }
 
+/// The permit for changing one Petal's package: none of that Petal's code
+/// runs while it is held.
+pub struct ActivationPermit {
+    petal: String,
+    _gate: tokio::sync::OwnedRwLockWriteGuard<()>,
+    _store: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+/// How old an abandoned staging directory must be before a store opening
+/// removes it: far longer than any install takes to stage and activate, so
+/// one still in use by a running Machine is never touched.
+const STALE_STAGING: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Remove `.install-*` staging directories under `packages` that a Machine
+/// stopped mid-install left behind. Failures are only logged.
+fn sweep_stale_staging(packages: &Path) {
+    let Ok(entries) = std::fs::read_dir(packages) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let stale = entry.file_name().to_string_lossy().starts_with(".install-")
+            && entry.metadata().is_ok_and(|meta| {
+                meta.is_dir()
+                    && meta
+                        .modified()
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age >= STALE_STAGING)
+            });
+        if stale && let Err(error) = std::fs::remove_dir_all(entry.path()) {
+            tracing::warn!(path = %entry.path().display(), %error, "petal.stale_staging_not_removed");
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AppOwner {
@@ -67,15 +134,101 @@ struct AppOwner {
 }
 
 impl PetalStore {
-    /// Hold from before route selection through guest completion. Ordinary
-    /// invocations share this permit; package activation never waits on a guest.
-    pub(crate) async fn execution_guard(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
-        self.execution_gate.read().await
+    /// Hold from before route selection through guest completion of a call
+    /// to `petal`. Calls share this permit; package activation never waits
+    /// on a guest. Public so other crates' tests can stand in for a running
+    /// Petal call.
+    pub async fn execution_guard(&self, petal: &str) -> ExecutionGuard {
+        let store = self.gates.store.clone().read_owned().await;
+        let petal = self.gates.petal(petal).read_owned().await;
+        ExecutionGuard {
+            _petal: petal,
+            _store: store,
+        }
     }
 
-    fn mutation_guard(&self) -> Result<tokio::sync::RwLockWriteGuard<'_, ()>, PetalError> {
-        self.execution_gate.try_write().map_err(|_| {
-            PetalError::vm("Petal execution is in progress; retry the package change when idle")
+    /// Whether a call to `petal` starting now would have to wait, because a
+    /// change to its package, or an uninstall, holds or has queued for its
+    /// gate. Public so other crates' tests can wait for an install to queue.
+    pub fn call_would_wait(&self, petal: &str) -> bool {
+        self.gates.store.try_read().is_err() || self.gates.petal(petal).try_read().is_err()
+    }
+
+    /// The permit to change `petal`'s package, if none of its code runs.
+    fn activation_permit(&self, petal: &str) -> Result<ActivationPermit, PetalError> {
+        let store = self
+            .gates
+            .store
+            .clone()
+            .try_read_owned()
+            .map_err(|_| PetalError::Busy)?;
+        let gate = self
+            .gates
+            .petal(petal)
+            .try_write_owned()
+            .map_err(|_| PetalError::Busy)?;
+        Ok(ActivationPermit {
+            petal: petal.to_owned(),
+            _gate: gate,
+            _store: store,
+        })
+    }
+
+    /// Queue for the permit to change `petal`'s package, for up to `limit`.
+    /// That Petal's calls already running finish first; its calls that start
+    /// meanwhile wait behind it, since Tokio's lock is fair, so busy callers
+    /// cannot starve the change. Other Petals' calls neither wait nor hold
+    /// it up. Gives [`PetalError::Busy`] when the running calls outlast
+    /// `limit`, and stops soon after `cancelled` says so. Waits only within a
+    /// multi-threaded Tokio runtime, as in Machine; elsewhere it takes the
+    /// permit only if it is free.
+    pub fn activation_permit_waiting(
+        &self,
+        petal: &str,
+        limit: std::time::Duration,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<ActivationPermit, PetalError> {
+        // Waiting needs a runtime whose timers run while this thread blocks.
+        let runtime = match tokio::runtime::Handle::try_current() {
+            Ok(runtime)
+                if runtime.runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread =>
+            {
+                runtime
+            }
+            _ => return self.activation_permit(petal),
+        };
+        // Only an uninstall takes the store's gate alone, and only if it is
+        // free, so this never waits behind a queue.
+        let store = self
+            .gates
+            .store
+            .clone()
+            .try_read_owned()
+            .map_err(|_| PetalError::Busy)?;
+        let gate = self.gates.petal(petal);
+        tokio::task::block_in_place(|| {
+            runtime.block_on(async {
+                let deadline = tokio::time::Instant::now() + limit;
+                let write = gate.write_owned();
+                tokio::pin!(write);
+                loop {
+                    tokio::select! {
+                        guard = &mut write => return Ok(ActivationPermit {
+                            petal: petal.to_owned(),
+                            _gate: guard,
+                            _store: store,
+                        }),
+                        () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
+                            if cancelled() {
+                                return Err(PetalError::vm("Petal install cancelled"));
+                            }
+                            if tokio::time::Instant::now() >= deadline {
+                                return Err(PetalError::Busy);
+                            }
+                        }
+                    }
+                }
+            })
         })
     }
 
@@ -87,9 +240,10 @@ impl PetalStore {
         std::fs::create_dir_all(base.join(META))?;
         std::fs::create_dir_all(base.join(PACKAGES))?;
         std::fs::create_dir_all(base.join(OWNERS))?;
+        sweep_stale_staging(&base.join(PACKAGES));
         let store = Self {
             base,
-            execution_gate: Arc::new(tokio::sync::RwLock::new(())),
+            gates: Arc::default(),
         };
         store.reconcile_petal_owners()?;
         Ok(store)
@@ -301,8 +455,32 @@ impl PetalStore {
         F: Fn() -> Result<(), PetalError>,
         G: Fn(&PetalMeta) -> Result<(), PetalError>,
     {
-        let _execution = self.mutation_guard()?;
+        let permit = self.activation_permit(&staged.package.name)?;
+        self.install_staged_with_permit(permit, staged, source, commit_guard, prepare_state)
+    }
+
+    /// [`Self::install_staged_petal_package_with_activation`] with the
+    /// permit to change the package's Petal already held, as from
+    /// [`Self::activation_permit_waiting`].
+    pub(crate) fn install_staged_with_permit<F, G>(
+        &self,
+        permit: ActivationPermit,
+        staged: StagedPetalPackage,
+        source: Option<PetalSourceProvenance>,
+        commit_guard: F,
+        prepare_state: G,
+    ) -> Result<(InstallResult, PetalMeta, RouteIndex), PetalError>
+    where
+        F: Fn() -> Result<(), PetalError>,
+        G: Fn(&PetalMeta) -> Result<(), PetalError>,
+    {
         let StagedPetalPackage { package, directory } = staged;
+        if permit.petal != package.name {
+            return Err(PetalError::vm(format!(
+                "the activation permit is for Petal {:?}, not {:?}",
+                permit.petal, package.name
+            )));
+        }
         let hash = package.hash.clone();
         let package_path = self.package_path_unchecked(&hash);
         let already_present = package_path.exists();
@@ -682,7 +860,7 @@ impl PetalStore {
     /// before the removes, and a non-NotFound IO error between the two
     /// unlinks can leave the store with only one of the two files.
     pub fn uninstall(&self, hash: &str) -> Result<bool, PetalError> {
-        let _execution = self.mutation_guard()?;
+        let _all = self.gates.store.try_write().map_err(|_| PetalError::Busy)?;
         validate_hash_arg(hash)?;
         self.remove_petal_owner_for_hash(hash)?;
         self.remove_package_data(hash)
@@ -867,6 +1045,128 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = PetalStore::open(dir.path()).unwrap();
         (dir, store)
+    }
+
+    /// An install refuses a permit taken for another Petal, and changes
+    /// nothing; with the right one it goes in.
+    #[test]
+    fn an_install_needs_the_permit_for_its_own_petal() {
+        let (dir, store) = store();
+        let package = dir.path().join("echo-src");
+        write_file(
+            &package,
+            "petal.toml",
+            br#"schema = "bloom.petal.package.v1"
+name = "echo"
+"#,
+        );
+        write_file(&package, "README.md", b"# echo");
+        write_file(&package, "AGENTS.md", b"# echo agents");
+        write_file(
+            &package,
+            "petal/echo/[name].txt.wasm",
+            route_component_wasm(),
+        );
+        let staged = || {
+            store
+                .stage_petal_package(PreparedPetalPackage::from_dir(&package).unwrap())
+                .unwrap()
+        };
+        let limit = std::time::Duration::from_secs(1);
+        let wrong = store
+            .activation_permit_waiting("other", limit, || false)
+            .unwrap();
+        let error = store
+            .install_staged_with_permit(wrong, staged(), None, || Ok(()), |_| Ok(()))
+            .unwrap_err();
+        assert!(error.to_string().contains("not \"echo\""), "{error}");
+        assert_eq!(store.resolve_petal_owner("echo").unwrap(), None);
+        let right = store
+            .activation_permit_waiting("echo", limit, || false)
+            .unwrap();
+        store
+            .install_staged_with_permit(right, staged(), None, || Ok(()), |_| Ok(()))
+            .unwrap();
+        assert!(store.resolve_petal_owner("echo").unwrap().is_some());
+    }
+
+    /// A running call alone leaves room for more; once a change to that
+    /// Petal queues behind it, a new call would wait, and another Petal's
+    /// would not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_queued_change_makes_new_calls_wait() {
+        let (_dir, store) = store();
+        let running = store.execution_guard("echo").await;
+        assert!(!store.call_would_wait("echo"));
+        let queued = {
+            let store = store.clone();
+            tokio::task::spawn_blocking(move || {
+                store
+                    .activation_permit_waiting("echo", std::time::Duration::from_secs(30), || false)
+                    .map(|_| ())
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !store.call_would_wait("echo") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the change never queued"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(!store.call_would_wait("other"));
+        drop(running);
+        queued.await.unwrap().unwrap();
+        assert!(!store.call_would_wait("echo"));
+    }
+
+    /// Past the limit, gates nobody holds are forgotten, but one that is held
+    /// is kept, so its Petal stays excluded: a change to it still waits.
+    #[tokio::test]
+    async fn forgetting_idle_gates_keeps_held_ones() {
+        let (_dir, store) = store();
+        let running = store.execution_guard("held").await;
+        for n in 0..IDLE_GATES_KEPT * 2 {
+            drop(store.execution_guard(&format!("idle-{n}")).await);
+        }
+        assert!(store.gates.petals.lock().len() <= IDLE_GATES_KEPT + 1);
+        assert!(matches!(
+            store.activation_permit("held"),
+            Err(PetalError::Busy)
+        ));
+        drop(running);
+        store.activation_permit("held").unwrap();
+    }
+
+    /// Opening the store removes staging directories an earlier Machine
+    /// left behind an hour or more ago, and nothing else: not a recent one
+    /// that may still be in use, a file, or another directory.
+    #[test]
+    fn opening_removes_only_abandoned_staging() {
+        let dir = TempDir::new().unwrap();
+        let packages = dir.path().join(PACKAGES);
+        let made = |name: &str, age: std::time::Duration, is_dir: bool| {
+            let path = packages.join(name);
+            if is_dir {
+                std::fs::create_dir_all(path.join("petal")).unwrap();
+            } else {
+                std::fs::write(&path, b"x").unwrap();
+            }
+            std::fs::File::open(&path)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - age)
+                .unwrap();
+            path
+        };
+        std::fs::create_dir_all(&packages).unwrap();
+        let hour = STALE_STAGING;
+        let abandoned = made(".install-old", hour * 2, true);
+        let recent = made(".install-new", std::time::Duration::from_secs(60), true);
+        let file = made(".install-file", hour * 2, false);
+        let other = made("kept", hour * 2, true);
+        PetalStore::open(dir.path()).unwrap();
+        assert!(!abandoned.exists());
+        assert!(recent.exists() && file.exists() && other.exists());
     }
 
     #[test]

@@ -61,6 +61,9 @@ pub struct Config {
     /// upper bound.
     #[serde(default)]
     pub petals: PetalsConfig,
+    /// What `bloom init` setup chose.
+    #[serde(default, skip_serializing_if = "SetupConfig::is_empty")]
+    pub setup: SetupConfig,
     #[serde(default)]
     pub mempool: BTreeMap<String, MempoolChainConfig>,
     #[serde(default)]
@@ -101,6 +104,99 @@ pub struct PetalsConfig {
     #[serde(default)]
     pub runtime: BTreeMap<String, PetalRuntimeConfig>,
 }
+
+/// What setup chose, as the top-level `[setup]` table. It is not part of
+/// `[petals]`: a Bloom release refuses unknown keys there, but ignores an
+/// unknown top-level table, so a home this setup ran on still starts with an
+/// older Bloom. Unknown keys are ignored here for the same reason, so a later
+/// Bloom's additions never stop this one from starting.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SetupConfig {
+    /// Written when `bloom init` finished. This, not an empty `main`, is what
+    /// tells a later run that setup already happened: declining every Petal
+    /// is a valid choice, and `bloom serve` or an interrupted menu can leave a
+    /// config with no choices in it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub complete: bool,
+    /// Each wallet's setup, by wallet name: `bloom init` writes `main`'s.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub wallets: BTreeMap<String, WalletSetup>,
+}
+
+/// One wallet's setup: the Petals its default policy allows. Bloom
+/// provisions its catalog Petals regardless; the wallet's default policy
+/// proposes exactly these. Nothing here grants authority.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalletSetup {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub petals: BTreeMap<String, PetalSetupConfig>,
+}
+
+/// One chosen Petal, as `[setup.wallets.<wallet>.petals.<name>]`. It holds
+/// nothing yet; a table, rather than a list of names, leaves room for
+/// per-Petal choices without changing the layout.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PetalSetupConfig {}
+
+/// The setup of a wallet that has none.
+static NO_WALLET_SETUP: WalletSetup = WalletSetup {
+    petals: BTreeMap::new(),
+};
+
+impl SetupConfig {
+    fn is_empty(&self) -> bool {
+        !self.complete && self.wallets.is_empty()
+    }
+
+    /// `wallet`'s setup, empty when it has none.
+    pub fn wallet(&self, wallet: &str) -> &WalletSetup {
+        self.wallets.get(wallet).unwrap_or(&NO_WALLET_SETUP)
+    }
+
+    /// `wallet`'s setup, to change.
+    pub fn wallet_mut(&mut self, wallet: &str) -> &mut WalletSetup {
+        self.wallets.entry(wallet.to_owned()).or_default()
+    }
+
+    /// The default wallet's setup, which `bloom init` chooses.
+    pub fn main(&self) -> &WalletSetup {
+        self.wallet(DEFAULT_POLICY_WALLET)
+    }
+
+    /// The default wallet's setup, to change.
+    pub fn main_mut(&mut self) -> &mut WalletSetup {
+        self.wallet_mut(DEFAULT_POLICY_WALLET)
+    }
+}
+
+/// Wallet whose default policy allows the Petals chosen during setup.
+pub const DEFAULT_POLICY_WALLET: &str = "main";
+
+/// Catalog Petals setup does not offer, so no default policy allows them,
+/// even when a config names one; the owner allows one with their own policy
+/// change.
+///
+/// Safe signs a Safe transaction's confirmation and stages its execution.
+/// Broker refuses that signature unless the policy allows exact destinations
+/// on its chain, and Machine refuses the execution unless the policy lists the
+/// Safe's address. Neither is a fixed contract setup could propose:
+/// exact destinations would let any staged transaction deploy a contract, and
+/// the Safe is the owner's own. Allowing only its package would let setup
+/// say Safe is allowed while every use of it is refused.
+pub const PETALS_NOT_IN_SETUP: &[&str] = &["safe"];
+
+/// Petals setup offers, in the order `bloom init` installs them: Bloom's
+/// catalog Petals except [`PETALS_NOT_IN_SETUP`]. Only these are proposed or
+/// waited for. A config naming any other Petal, as only a hand edit or a
+/// Petal since dropped from the catalog can, allows nothing more, since no
+/// release installs it and waiting for it would never end.
+pub const SETUP_PETALS: &[&str] = &[
+    "polymarket",
+    "hyperliquid",
+    "enso",
+    "near-intents",
+    "feedback",
+];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PetalRuntimeConfig {
@@ -462,6 +558,7 @@ impl Config {
             )]),
             etherscan: None,
             petals: PetalsConfig::default(),
+            setup: SetupConfig::default(),
             mempool: BTreeMap::new(),
             private_rpc: BTreeMap::new(),
             backends: BackendsConfig::default(),
@@ -1680,5 +1777,97 @@ rpc_urls = ["https://mainnet.optimism.io"]
             !cfg.chains["ethereum"].op_stack,
             "ethereum should not be op_stack"
         );
+    }
+    #[test]
+    fn setup_completion_is_written_only_once_recorded() {
+        let mut cfg = Config::local_default();
+        assert!(!cfg.setup.complete);
+        let encoded = toml::to_string_pretty(&cfg).unwrap();
+        assert!(!encoded.contains("[setup"), "{encoded}");
+
+        // Petal tables alone do not mean setup finished.
+        cfg.setup
+            .main_mut()
+            .petals
+            .insert("hyperliquid".into(), PetalSetupConfig::default());
+        let decoded: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        assert!(decoded.setup.main().petals.contains_key("hyperliquid"));
+        assert!(!decoded.setup.complete);
+
+        cfg.setup.complete = true;
+        let decoded: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        assert!(decoded.setup.complete);
+    }
+
+    /// Each wallet keeps its own setup; a wallet without one reads as empty.
+    #[test]
+    fn each_wallet_keeps_its_own_setup() {
+        let mut cfg = Config::local_default();
+        cfg.setup.complete = true;
+        cfg.setup
+            .main_mut()
+            .petals
+            .insert("hyperliquid".into(), PetalSetupConfig::default());
+        cfg.setup
+            .wallet_mut("trading")
+            .petals
+            .insert("polymarket".into(), PetalSetupConfig::default());
+        let td = tempdir().unwrap();
+        let path = td.path().join("config.toml");
+        cfg.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.setup.wallets, cfg.setup.wallets);
+        assert!(loaded.setup.main().petals.contains_key("hyperliquid"));
+        assert!(
+            !loaded
+                .setup
+                .wallet("trading")
+                .petals
+                .contains_key("hyperliquid")
+        );
+        assert_eq!(loaded.setup.wallet("savings"), &WalletSetup::default());
+    }
+
+    /// Setup's choices sit outside `[petals]`, whose unknown keys a Bloom
+    /// release refuses, so going back to a release still loads the config.
+    /// Keys a later Bloom adds under a chosen Petal are ignored.
+    #[test]
+    fn setup_choices_stay_out_of_the_table_releases_refuse_unknown_keys_in() {
+        let mut cfg = Config::local_default();
+        cfg.setup.complete = true;
+        cfg.setup
+            .main_mut()
+            .petals
+            .insert("polymarket".into(), PetalSetupConfig::default());
+        let encoded = toml::to_string_pretty(&cfg).unwrap();
+        let document: toml::Value = toml::from_str(&encoded).unwrap();
+        assert_eq!(
+            document["petals"]
+                .as_table()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            ["runtime"],
+            "{encoded}"
+        );
+        // A release's `[petals]` table: only these keys, unknown ones refused.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct ReleasePetals {
+            #[serde(default)]
+            preinstalled: Vec<String>,
+            #[serde(default)]
+            runtime: BTreeMap<String, PetalRuntimeConfig>,
+        }
+        document["petals"]
+            .clone()
+            .try_into::<ReleasePetals>()
+            .unwrap();
+        let later: Config = toml::from_str(&format!(
+            "{encoded}\n[setup.wallets.main.petals.polymarket.values]\nmax_daily_usd = \"100\"\n"
+        ))
+        .unwrap();
+        assert!(later.setup.main().petals.contains_key("polymarket"));
     }
 }

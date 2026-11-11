@@ -21,6 +21,37 @@ use crate::host::PetalHost;
 use crate::runner::{PETAL_DOCUMENT_NAMES, PetalRunner};
 use crate::vm::{COMPONENT_NOT_A_DIR_CODE, COMPONENT_UNSUPPORTED_CODE, RunOptions};
 
+tokio::task_local! {
+    static INERT_READ: std::cell::Cell<bool>;
+}
+
+/// Run `read` as an inert read, for a caller such as an MCP resource read
+/// that must never trigger a read that acts. A Petal route's read is checked
+/// again under that Petal's gate, so the check and the read see the same
+/// installed package: one whose read acts is refused, even if its package
+/// changed after the caller's first check. Returns the read's result and
+/// whether it was refused for that reason, so the caller can say so.
+pub async fn inert_read<F: std::future::Future>(read: F) -> (F::Output, bool) {
+    INERT_READ
+        .scope(std::cell::Cell::new(false), async {
+            let output = read.await;
+            (output, INERT_READ.with(std::cell::Cell::get))
+        })
+        .await
+}
+
+/// Refuse a read that acts inside an [`inert_read`], so that call reports it
+/// as one. Public so other crates' handlers and tests can refuse the same way.
+pub fn refuse_inert_read() -> HandlerError {
+    let _ = INERT_READ.try_with(|refused| refused.set(true));
+    HandlerError::PermissionDenied
+}
+
+/// Whether the current task is running an [`inert_read`].
+pub fn is_inert_read() -> bool {
+    INERT_READ.try_with(|_| ()).is_ok()
+}
+
 /// How long host-owned ancestor checks may reuse a live account observation,
 /// matching the Machine's default wallet-projection reuse window. One mounted
 /// path traversal checks the same ancestors several times; each live
@@ -79,6 +110,10 @@ pub struct PetalRouter {
     runtime_petals: BTreeMap<String, PetalRuntimeConfig>,
     audit: Option<Arc<AuditLog>>,
     audit_effect_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Writes to each Petal share its lock; a conditional write holds it
+    /// alone. Keyed by Petal rather than path, so a route reached by two
+    /// paths is still covered. A Petal cannot write under `petals/`, so its
+    /// own callbacks never wait on these.
     account_contexts: Arc<Mutex<AccountContextCache>>,
     account_context_reuse: Duration,
     last_errors: Arc<Mutex<BTreeMap<String, LastWriteError>>>,
@@ -435,11 +470,14 @@ impl PetalRouter {
         path: String,
         body: Vec<u8>,
     ) -> Result<DispatchResponse, HandlerError> {
-        let execution = self.runner.store().execution_guard().await;
+        let execution = self.runner.store().execution_guard(mount).await;
         let matched = self
             .runner
             .petal_route(mount, op, &path)
             .map_err(map_petal_err)?;
+        if matches!(op, DispatchOp::Read) && is_inert_read() && self.is_effect(mount, op, &path) {
+            return Err(refuse_inert_read());
+        }
         let wallet = matched
             .params
             .iter()
@@ -540,7 +578,7 @@ impl PetalRouter {
         path: String,
         body: Vec<u8>,
         account: &AccountPetalContext,
-        execution: &tokio::sync::RwLockReadGuard<'_, ()>,
+        execution: &crate::store::ExecutionGuard,
     ) -> Result<DispatchResponse, HandlerError> {
         let trusted = vec![
             ("bloom.wallet".to_owned(), account.wallet.clone()),
@@ -569,7 +607,7 @@ impl PetalRouter {
         trusted_params: &[(String, String)],
         account_wallet: Option<String>,
         account: Option<&AccountPetalContext>,
-        execution: &tokio::sync::RwLockReadGuard<'_, ()>,
+        execution: &crate::store::ExecutionGuard,
     ) -> Result<DispatchResponse, HandlerError> {
         // Lookup, list, and ordinary reads are filesystem observations, not
         // security effects. Auditing them both misstates the event stream and
@@ -978,6 +1016,7 @@ fn map_petal_err(e: PetalError) -> HandlerError {
             HandlerError::Backend(format!("capability denied: petal={petal} cap={cap}"))
         }
         PetalError::Vm(s) => HandlerError::Backend(format!("vm: {s}")),
+        PetalError::Busy => HandlerError::Backend(PetalError::Busy.to_string()),
         PetalError::Io(e) => HandlerError::Io(e),
         PetalError::Serde(s) => HandlerError::Backend(format!("serde: {s}")),
         PetalError::ModeCapMismatch { mode, cap } => HandlerError::invalid(format!(
@@ -1318,6 +1357,11 @@ name = "example"
         );
     }
 
+    /// A conditional write checks whether the Petal stores the key in the
+    /// route's account partition, never writes the Petal root or its
+    /// documents, and holds the Petal alone: it gives up while a write to the
+    /// Petal runs, and an ordinary write waits for it. Its failures never
+    /// replace the error record an agent's write left.
     #[tokio::test]
     async fn explicit_account_directory_uses_guest_metadata() {
         let (dir, runner) = runner();
@@ -1365,6 +1409,71 @@ name = "example"
 
         assert!(router.is_read_side_effecting(&route_path));
         assert_eq!(router.cache_ttl(&route_path), None);
+    }
+
+    /// Under an inert read, a route whose read acts is refused once that
+    /// Petal's gate is held, whatever the caller checked before; the same
+    /// read is not refused outside one.
+    #[tokio::test]
+    async fn an_inert_read_refuses_a_route_that_acts_under_the_petals_gate() {
+        let (dir, runner) = runner();
+        let package = dir.path().join("example-app");
+        write_dynamic_dir_package(&package, true);
+        runner.store().install_petal_package_dir(&package).unwrap();
+        let router = PetalRouter::new(runner, Arc::new(AccountHost));
+        let route_path = VfsPath::parse("/example/intents/alice/0").unwrap();
+        assert!(matches!(
+            inert_read(router.read(&route_path)).await,
+            (Err(HandlerError::PermissionDenied), true)
+        ));
+        assert!(!matches!(
+            router.read(&route_path).await,
+            Err(HandlerError::PermissionDenied)
+        ));
+        assert!(!is_inert_read());
+    }
+
+    /// A package that changes between a caller's first check and the read,
+    /// so that the route's read now acts, is caught under the Petal's gate:
+    /// the inert read is refused and reported as refused for acting.
+    #[tokio::test]
+    async fn an_inert_read_sees_a_package_that_changed_after_the_first_check() {
+        let (dir, runner) = runner();
+        let inert = dir.path().join("v1");
+        write_dynamic_dir_package(&inert, false);
+        runner.store().install_petal_package_dir(&inert).unwrap();
+        let router = PetalRouter::new(runner.clone(), Arc::new(AccountHost));
+        let vfs = Vfs::builder()
+            .mount("petals", Arc::new(router.clone()))
+            .build();
+        let path = VfsPath::parse("/petals/example/intents/alice/0").unwrap();
+        vfs.lookup(&path).await.unwrap();
+        assert!(!vfs.is_read_side_effecting(&path), "the first check passes");
+        let permit = runner
+            .store()
+            .activation_permit_waiting("example", Duration::from_secs(1), || false)
+            .unwrap();
+        let (reader, read_path) = (vfs.clone(), path.clone());
+        let mut read = tokio::spawn(async move { inert_read(reader.read(&read_path)).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut read)
+                .await
+                .is_err(),
+            "the inert read waits at the Petal's gate"
+        );
+        let acting = dir.path().join("v2");
+        write_dynamic_dir_package(&acting, true);
+        let staged = runner
+            .store()
+            .stage_petal_package(crate::package::PreparedPetalPackage::from_dir(&acting).unwrap())
+            .unwrap();
+        runner
+            .install_staged_petal_package_permitted(permit, staged, None, || Ok(()))
+            .unwrap();
+        assert!(matches!(
+            read.await.unwrap(),
+            (Err(HandlerError::PermissionDenied), true)
+        ));
     }
 
     #[tokio::test]
