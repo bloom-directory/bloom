@@ -304,7 +304,10 @@ Agreed on 2026-11-03 with the author of bloom#352 and bloom#377:
     than 90 days, and a Petal-scoped key may last as long as its own scope
     asks (Hyperliquid's asks for one day). The pinned Broker's ceremony shows
     the lifetime as a very large number of hours; bloom-broker#112 shows it
-    as until revoked.
+    as until revoked. So this merges after bloom-broker#112 and bloom#377,
+    once the Broker pin includes #112, and Trader and Degen are never shipped
+    against a Broker that would read their lifetime as hours and their
+    any-recipient entry as an address that matches nothing.
 20. **Degen can send any token.** Degen's any-recipient rule covers the
     wallet's own canonical `transfer(recipient, amount)` of any ERC-20
     contract, with no value attached; Machine keeps no list of tokens. A
@@ -631,9 +634,13 @@ still exists:
 
 - **`bloom wallet default-policy main`** picks up where the command stopped.
   It shows a ceremony that is still open, or opens a new one after expiry.
-  The Broker reports an expired ceremony as awaiting the owner until asked to
-  act on it, so Machine cancels a proposal past its expiry and proposes again.
-  A waiting command never announces a ceremony that has already expired.
+  Broker owns a ceremony's expiry: it retires an expired one when Machine
+  next reads its status, and Machine then proposes again; Machine never
+  judges expiry by its own clock or cancels on that account. A waiting
+  command never announces a ceremony that has already expired, and once it
+  has announced one it proposes nothing more: if that ceremony ends without
+  the owner's approval, the command stops and says so, so an owner who
+  leaves the link is not handed a new one every few minutes.
   It proposes only while `main`'s policy is still the one wallet creation
   installed. Once any change has been committed, it reports which chosen
   Petals the policy does not allow and proposes nothing, so a Petal or
@@ -1077,12 +1084,13 @@ Automated:
 - Chosen Petals round-trip through `config.toml`, and an edited value that
   is not a positive amount cannot change a Petal's settings file.
 - The wait announces each ceremony once, stops when the policy is applied,
-  never announces a ceremony that has already expired, and polls quietly
-  while another command holds the wallet's policy lock.
+  never announces a ceremony that has already expired, proposes nothing
+  once it has announced one and stops when that one ends unapproved, and
+  polls quietly while another command holds the wallet's policy lock.
 - One policy ceremony allows every chosen package, and packages are added
   once, in order. A chosen Petal whose install record cannot be read stops
-  the first proposal instead of being left out of it. An expired proposal, including one the Broker still reports
-  as awaiting the owner, is replaced by a new ceremony
+  the first proposal instead of being left out of it. A proposal Broker
+  retired at its expiry is replaced by a new ceremony on the next request
   (`crates/bloom-vfs/tests/triad_policy_update.rs`).
 - Catalog provisioning reports an update separately from a fresh install.
   An install refused because that Petal's code was running is reported as busy and

@@ -2520,10 +2520,7 @@ impl WalletsHandler {
             // while a chosen Petal is missing would leave that Petal out for
             // good: wait for it, as the default policy itself does.
             if !first_proposal.not_installed.is_empty() {
-                return Err(default_policy_waiting(
-                    wallet,
-                    &first_proposal.not_installed,
-                ));
+                return Err(default_policy_waiting(&first_proposal.not_installed));
             }
             additions.extend_from_slice(&first_proposal.packages);
             proposed_destinations.extend_from_slice(&first_proposal.destinations);
@@ -2556,18 +2553,11 @@ impl WalletsHandler {
                 .join(APPROVAL_CHALLENGE_FILE);
             let projection: TriadPolicyUpdateProjection = read_json(&path)?;
             let proposed_bytes = projection.retained_policy_bytes()?;
-            let mut resumed = self
+            // Broker owns a ceremony's expiry: it retires an expired one when
+            // asked its status, and resuming then moves it out of `pending`.
+            let resumed = self
                 .resume_wallet_policy_update(wallet, &operation_id, &proposed_bytes)
                 .await;
-            if matches!(resumed, Err(HandlerError::PermissionDenied))
-                && self
-                    .cancel_expired_policy_ceremony(wallet, &operation_id)
-                    .await?
-            {
-                resumed = self
-                    .resume_wallet_policy_update(wallet, &operation_id, &proposed_bytes)
-                    .await;
-            }
             match resumed {
                 Ok(()) => continue,
                 Err(HandlerError::PermissionDenied) => {
@@ -2656,32 +2646,6 @@ impl WalletsHandler {
                 "fresh policy proposal unexpectedly committed without owner consent",
             )),
         }
-    }
-
-    /// The Broker reports an expired ceremony as awaiting the owner until asked
-    /// to act on it. Cancel a pending policy ceremony past its expiry so the
-    /// next status read is terminal; returns whether the Broker accepted.
-    async fn cancel_expired_policy_ceremony(
-        &self,
-        wallet: &str,
-        operation_id: &str,
-    ) -> Result<bool, HandlerError> {
-        let projection: TriadPolicyUpdateProjection = read_json(
-            self.policy_update_action_dir(wallet, "pending", operation_id)
-                .join(APPROVAL_CHALLENGE_FILE),
-        )?;
-        if !projection
-            .ceremony_expires_at_ms
-            .as_ref()
-            .is_some_and(|expires_at_ms| expires_at_ms.get() <= now_ms_u64())
-        {
-            return Ok(false);
-        }
-        Ok(self
-            .broker()?
-            .cancel_ceremony(projection.operation_id)
-            .await
-            .is_ok())
     }
 
     /// Gate an explicit caller operation without treating policy completion as submission.
@@ -3473,12 +3437,14 @@ pub const POLICY_COORDINATION_BUSY: &str = "wallet policy coordination busy";
 /// at once.
 pub const DEFAULT_POLICY_WAITING: &str = "DEFAULT_POLICY_WAITING";
 
-/// The error a Petal's use gets while `wallet` still has the policy wallet
+/// The error a Petal's use gets while the wallet still has the policy wallet
 /// creation installed and the Petals its setup chose named in
 /// `not_installed` are missing. It is read by agents through the Petal, so
 /// it avoids the words a Petal reads as a refusal, a missing route or a bad
-/// request ("denied", "permission", "invalid", "not found").
-pub fn default_policy_waiting(wallet: &str, not_installed: &[String]) -> HandlerError {
+/// request ("denied", "permission", "invalid", "not found"). It names only
+/// setup's own Petals, never the wallet, whose name the owner chose and
+/// could contain one of them.
+pub fn default_policy_waiting(not_installed: &[String]) -> HandlerError {
     let names = not_installed.join(", ");
     let (verb, them, stays) = if not_installed.len() == 1 {
         ("is", "it", "it stays")
@@ -3486,7 +3452,7 @@ pub fn default_policy_waiting(wallet: &str, not_installed: &[String]) -> Handler
         ("are", "them", "one stays")
     };
     HandlerError::backend(format!(
-        "{DEFAULT_POLICY_WAITING}: wallet {wallet}'s setup chose {names}, which {verb} not installed yet. Its first policy change allows every chosen Petal at once, so nothing was proposed. Retry once `docs/petals.md` lists {them}; Bloom installs its catalog Petals as it starts. If {stays} missing, tell the owner to restart Bloom, or to run `bloom wallet persona {wallet} <persona>` and leave {them} out"
+        "{DEFAULT_POLICY_WAITING}: this wallet's setup chose {names}, which {verb} not installed yet. Its first policy change allows every chosen Petal at once, so nothing was proposed. Retry once `docs/petals.md` lists {them}; Bloom installs its catalog Petals as it starts. If {stays} missing, tell the owner to restart Bloom, or to run `bloom wallet persona <wallet> <persona>` and leave {them} out"
     ))
 }
 
@@ -3499,6 +3465,12 @@ pub fn default_policy_waiting_message(error: &HandlerError) -> Option<&str> {
         }
         _ => None,
     }
+}
+
+/// Whether `error` says another command holds the wallet's policy lock, so
+/// the same operation succeeds once it finishes.
+pub fn is_policy_coordination_busy(error: &HandlerError) -> bool {
+    matches!(error, HandlerError::Backend(message) if message.starts_with(POLICY_COORDINATION_BUSY))
 }
 
 /// Marks a failure of the proposal a persona switch makes, as opposed to a

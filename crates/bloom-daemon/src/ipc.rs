@@ -822,6 +822,12 @@ pub enum MachineCommand {
         /// owner removed.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         owner_just_chose: bool,
+        /// Set by a command waiting on a ceremony it has already announced:
+        /// settle and report, committing a change the owner approved, but
+        /// propose nothing, so an owner who leaves the link is not handed a
+        /// new one each time it expires.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        observe_only: bool,
     },
     /// Switch a wallet's persona: a fresh start for that wallet. Machine holds
     /// the new setup and proposes it as a replacement for the wallet's

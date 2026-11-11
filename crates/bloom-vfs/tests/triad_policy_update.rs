@@ -1684,43 +1684,6 @@ async fn expired_default_policy_proposal_is_replaced_by_a_new_ceremony() {
     );
 }
 
-#[tokio::test]
-async fn policy_ceremony_past_expiry_is_cancelled_and_replaced() {
-    let temp = tempfile::tempdir().unwrap();
-    let fixture = broker_fixture(false);
-    let packages = [Digest32::from_bytes([7; 32]), Digest32::from_bytes([8; 32])];
-    let handler = eligibility_handler(temp.path(), fixture.clone());
-    let PetalEligibility::AwaitingPolicyApproval(first) = handler
-        .ensure_petal_packages_allowed("alice", &packages, &[], None, AfterPolicyChange::Report)
-        .await
-        .unwrap()
-    else {
-        panic!("owner approval must be required");
-    };
-
-    // The Broker still reports the ceremony as awaiting the owner after expiry.
-    fixture.ceremony_expires_at_ms.store(1, Ordering::SeqCst);
-    let PetalEligibility::AwaitingPolicyApproval(replacement) = handler
-        .ensure_petal_packages_allowed("alice", &packages, &[], None, AfterPolicyChange::Report)
-        .await
-        .unwrap()
-    else {
-        panic!("a ceremony past its expiry must be replaced");
-    };
-    assert_ne!(replacement.operation_id, first.operation_id);
-    assert!(fixture.requests.lock().iter().any(|request| matches!(
-        request,
-        MachineBrokerRequest::CeremonyCancel(cancel)
-            if cancel.id.as_str() == first.operation_id.as_str()
-    )));
-    assert!(
-        temp.path()
-            .join("machine-policy-projections/alice/policy-updates/failed")
-            .join(first.operation_id.as_str())
-            .exists()
-    );
-}
-
 /// A destination the setup Petals contribute, as the catalog does: Enso's
 /// router on Polygon.
 fn setup_destination() -> bloom_broker_api::PolicyDestination {

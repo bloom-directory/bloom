@@ -657,20 +657,10 @@ impl DaemonPetalHost {
         let Some(wallets) = self.wallets.as_ref() else {
             return Ok(None);
         };
-        match wallets
-            .ensure_petal_eligibility(wallet, package_hash)
-            .await
-            .map_err(|error| eligibility_host_error(wallet, error))?
-        {
-            bloom_machine_client::PetalEligibility::Allowed(_) => Ok(None),
-            bloom_machine_client::PetalEligibility::AwaitingPolicyApproval(pending) => {
-                Ok(Some(pending))
-            }
-            // Not produced here: this request is proposed at any version.
-            bloom_machine_client::PetalEligibility::ChangedSinceCreation(_) => Err(
-                HostError::Denied("wallet policy does not allow this Petal package".into()),
-            ),
-        }
+        petal_eligibility_outcome(
+            wallet,
+            wallets.ensure_petal_eligibility(wallet, package_hash).await,
+        )
     }
 
     fn with_provenance_catalog(
@@ -3936,19 +3926,44 @@ impl AccountPetalMount for AccountPetals {
     }
 }
 
-/// The error a Petal gets when its wallet's policy could not be made to allow
-/// it. A wait for the Petals chosen during setup goes back as a backend
-/// error with its message whole, for the agent to read through the Petal; a
-/// denial would reach it only as a refusal, without the Petals to wait for.
-/// Anything else is a denial.
-fn eligibility_host_error(wallet: &str, error: bloom_vfs::HandlerError) -> HostError {
-    match bloom_vfs::handlers::wallets::default_policy_waiting_message(&error) {
-        Some(message) => {
-            warn!(wallet = %wallet, reason = %message, "petal.default_policy_waiting");
-            HostError::Backend(message.to_owned())
+/// What a Petal's use of `wallet` does with its eligibility: go on when the
+/// policy allows it, wait on a policy change, or fail with
+/// [`eligibility_host_error`].
+fn petal_eligibility_outcome(
+    wallet: &str,
+    eligibility: Result<bloom_machine_client::PetalEligibility, bloom_vfs::HandlerError>,
+) -> Result<Option<bloom_machine_client::PendingPolicyUpdate>, HostError> {
+    match eligibility.map_err(|error| eligibility_host_error(wallet, error))? {
+        bloom_machine_client::PetalEligibility::Allowed(_) => Ok(None),
+        bloom_machine_client::PetalEligibility::AwaitingPolicyApproval(pending) => {
+            Ok(Some(pending))
         }
-        None => HostError::Denied(error.to_string()),
+        // Not produced here: this request is proposed at any version.
+        bloom_machine_client::PetalEligibility::ChangedSinceCreation(_) => Err(HostError::Denied(
+            "wallet policy does not allow this Petal package".into(),
+        )),
     }
+}
+
+/// The error a Petal gets when its wallet's policy could not be made to allow
+/// it. What clears up on a retry goes back as a backend error whose message
+/// the Petal shows the agent whole: a wait for the Petals chosen during
+/// setup, or another command holding the wallet's policy for a moment. A
+/// denial would reach the agent only as a refusal, and some Petals answer it
+/// by asking the owner instead. Anything else is a denial.
+fn eligibility_host_error(wallet: &str, error: bloom_vfs::HandlerError) -> HostError {
+    if let Some(message) = bloom_vfs::handlers::wallets::default_policy_waiting_message(&error) {
+        warn!(wallet = %wallet, reason = %message, "petal.default_policy_waiting");
+        return HostError::Backend(message.to_owned());
+    }
+    if bloom_vfs::handlers::wallets::is_policy_coordination_busy(&error) {
+        warn!(wallet = %wallet, reason = %error, "petal.policy_coordination_busy");
+        return HostError::Backend(format!(
+            "{}: another command is changing this wallet's policy; retry this operation in a few seconds",
+            bloom_vfs::handlers::wallets::POLICY_COORDINATION_BUSY
+        ));
+    }
+    HostError::Denied(error.to_string())
 }
 
 /// Where Machine notes the package each chosen Petal had when it was last
@@ -6481,18 +6496,17 @@ mod tests {
     /// request, so the agent sees what to wait for; anything else is denied.
     #[test]
     fn a_wait_for_chosen_petals_reaches_the_agent_whole() {
-        let waiting = bloom_vfs::handlers::wallets::default_policy_waiting(
-            "main",
-            &["hyperliquid".to_owned()],
-        );
-        let HostError::Backend(message) = eligibility_host_error("main", waiting) else {
+        let waiting =
+            bloom_vfs::handlers::wallets::default_policy_waiting(&["hyperliquid".to_owned()]);
+        let Err(HostError::Backend(message)) = petal_eligibility_outcome("main", Err(waiting))
+        else {
             panic!("the wait must not be a denial");
         };
         assert!(message.starts_with("DEFAULT_POLICY_WAITING: "), "{message}");
         assert!(message.contains("hyperliquid"), "{message}");
         assert!(message.contains("`docs/petals.md`"), "{message}");
         assert!(
-            message.contains("bloom wallet persona main <persona>"),
+            message.contains("bloom wallet persona <wallet> <persona>"),
             "{message}"
         );
         let lower = message.to_ascii_lowercase();
@@ -6503,6 +6517,21 @@ mod tests {
             eligibility_host_error("main", bloom_vfs::HandlerError::backend("broker refused")),
             HostError::Denied(_)
         ));
+        // Another command holding the wallet's policy is a retry, not a refusal.
+        let busy = bloom_vfs::HandlerError::backend(format!(
+            "{}; retry: Resource temporarily unavailable (os error 35)",
+            bloom_vfs::handlers::wallets::POLICY_COORDINATION_BUSY
+        ));
+        let Err(HostError::Backend(message)) =
+            petal_eligibility_outcome("denied-wallet", Err(busy))
+        else {
+            panic!("a busy policy must not be a denial");
+        };
+        assert!(message.contains("retry this operation"), "{message}");
+        let lower = message.to_ascii_lowercase();
+        for word in ["denied", "permission", "invalid", "not found"] {
+            assert!(!lower.contains(word), "{word}: {message}");
+        }
     }
 
     /// One chosen Petal whose owner record cannot be read fails the whole

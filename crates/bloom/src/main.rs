@@ -1792,6 +1792,7 @@ async fn execute_machine_command(
         MachineCommand::WalletDefaultPolicy {
             name,
             owner_just_chose,
+            observe_only,
         } => {
             validate_wallet_name(&name).map_err(|error| {
                 machine_error(
@@ -1802,7 +1803,7 @@ async fn execute_machine_command(
             let status = default_policy::advance_default_policy(
                 daemon,
                 &name,
-                default_policy::DefaultPolicyMode::of_command(owner_just_chose),
+                default_policy::DefaultPolicyMode::of_command(owner_just_chose, observe_only),
             )
             .await?;
             format!("{}\n", serde_json::to_string(&status)?)

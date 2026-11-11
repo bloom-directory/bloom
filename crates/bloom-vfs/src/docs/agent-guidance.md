@@ -119,8 +119,8 @@ fields.
 
 A Petal operation that needs a policy change answers
 `POLICY_APPROVAL_REQUIRED` with a `ceremony_url` and status path. If that
-ceremony expires unapproved, retry the operation: Machine cancels the expired
-ceremony and answers with a new `ceremony_url`. Never give the owner an
+ceremony expires unapproved, retry the operation: Broker retires the expired
+ceremony and Machine answers with a new `ceremony_url`. Never give the owner an
 expired URL. If the answer says another policy change is waiting, such as a
 persona switch, its link is for that change, which does not allow the
 operation: Broker opens one ceremony per wallet at a time, so tell the owner

@@ -24,8 +24,8 @@ pub(crate) const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_
 /// the wallet's policy lock before telling the owner to try again.
 pub(crate) const POLICY_LOCK_GRACE_MS: u64 = 30_000;
 
-/// How long a waiting command keeps polling a ceremony past its expiry while
-/// Machine cancels it and proposes a replacement.
+/// How long a waiting command keeps polling a ceremony past its expiry,
+/// before Broker reports it retired.
 const EXPIRED_CEREMONY_GRACE_MS: u64 = 30_000;
 
 /// Name shown in the setup menu and in messages.
@@ -149,13 +149,13 @@ fn persona_behaviour(preset: PersonaPreset, any_recipient_chains: &[String]) -> 
     match preset {
         PersonaPreset::Custodian => "suggests each Petal's usual limits".to_owned(),
         PersonaPreset::Trader => {
-            format!("suggests larger Petal limits and lets {PERSONA_STANDING}")
+            format!("suggests larger Petal limits and allows {PERSONA_STANDING}")
         }
         PersonaPreset::Degen if any_recipient_chains.is_empty() => format!(
-            "suggests the largest Petal limits and lets {PERSONA_STANDING}; it would allow ERC-20 transfers to any recipient on Ethereum or Polygon, but neither is configured"
+            "suggests the largest Petal limits and allows {PERSONA_STANDING}; it would allow ERC-20 transfers to any recipient on Ethereum or Polygon, but neither is configured"
         ),
         PersonaPreset::Degen => format!(
-            "suggests the largest Petal limits, lets {PERSONA_STANDING}, and asks the wallet's policy to allow ERC-20 transfers to any recipient on {}",
+            "suggests the largest Petal limits, allows {PERSONA_STANDING}, and asks the wallet's policy to allow ERC-20 transfers to any recipient on {}",
             any_recipient_chains.join(" and ")
         ),
     }
@@ -1756,6 +1756,9 @@ pub(crate) enum DefaultPolicyStatus {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         left_out: Vec<String>,
     },
+    /// The ceremony a waiting command announced ended without the owner's
+    /// approval, expired or refused, and nothing was proposed in its place.
+    ProposalEnded,
     /// The wallet policy allows every chosen, installed Petal.
     Applied {
         petals: Vec<String>,
@@ -1841,12 +1844,19 @@ pub(crate) enum DefaultPolicyMode {
     Resume,
     /// Propose it whatever the policy's version: the owner has just chosen it.
     OwnerJustChose,
+    /// Propose nothing: settle and report, committing a change the owner
+    /// approved. A command waiting on a ceremony it has announced asks this,
+    /// so once that ceremony ends unapproved it stops rather than handing
+    /// the owner a new one.
+    Observe,
 }
 
 impl DefaultPolicyMode {
     /// The mode a `WalletDefaultPolicy` Machine command asks for.
-    pub(crate) fn of_command(owner_just_chose: bool) -> Self {
-        if owner_just_chose {
+    pub(crate) fn of_command(owner_just_chose: bool, observe_only: bool) -> Self {
+        if observe_only {
+            Self::Observe
+        } else if owner_just_chose {
             Self::OwnerJustChose
         } else {
             Self::Resume
@@ -1948,6 +1958,20 @@ fn remove_pending_switch(home: &std::path::Path, wallet: &str) -> Result<()> {
 /// while it still holds that switch, so a newer switch another command saved
 /// meanwhile is never overwritten, cleared or applied in its place.
 static SWITCH_STATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// `recorded`, `wallet`'s waiting switch now, when it is `read`, which was
+/// not yet proposed, proposed since by another command: the same setup, now
+/// with its proposal. A different setup is a later switch that replaced it.
+fn proposed_meanwhile(
+    read: &PendingSwitch,
+    recorded: Option<PendingSwitch>,
+) -> Option<PendingSwitch> {
+    recorded.filter(|recorded| {
+        read.operation_id.is_none()
+            && recorded.setup == read.setup
+            && recorded.operation_id.is_some()
+    })
+}
 
 /// Whether `wallet`'s waiting switch is still `expected`. The caller holds
 /// [`SWITCH_STATE`].
@@ -2133,7 +2157,7 @@ pub(crate) async fn advance_default_policy(
 ) -> Result<DefaultPolicyStatus> {
     let config = bloom_proto::Config::load(&daemon.home.config_path())
         .with_context(|| format!("read {wallet}'s setup"))?;
-    let switch = read_pending_switch(daemon.home.root(), wallet)?;
+    let mut switch = read_pending_switch(daemon.home.root(), wallet)?;
     let setup = switch
         .as_ref()
         .map_or_else(|| config.setup.wallet(wallet), |switch| &switch.setup);
@@ -2192,16 +2216,27 @@ pub(crate) async fn advance_default_policy(
         return Ok(status);
     }
     let home = daemon.home.root();
+    // Proposing and recording a switch's proposal happen under one hold of
+    // SWITCH_STATE, so a later switch either finds this one's proposal
+    // recorded, and cancels it, or finds that none was made.
+    let mut held = None;
+    if let Some(read) = switch
+        .as_ref()
+        .filter(|switch| switch.operation_id.is_none())
+    {
+        held = Some(SWITCH_STATE.lock().await);
+        // Another command may have proposed this same switch since it was
+        // read, as one still waiting on an earlier switch does when Broker
+        // briefly refused this one's first proposal: carry on with that
+        // proposal rather than call this switch replaced.
+        if let Some(recorded) = proposed_meanwhile(read, read_pending_switch(home, wallet)?) {
+            switch = Some(recorded);
+            held = None;
+        }
+    }
     let proposal = match &switch {
         // Proposed once; a refused or expired proposal is not proposed again.
         Some(switch) => {
-            // Proposing and recording the proposal happen under one hold of
-            // SWITCH_STATE, so a later switch either finds this one's
-            // proposal recorded, and cancels it, or finds that none was made.
-            let held = match switch.operation_id {
-                None => Some(SWITCH_STATE.lock().await),
-                Some(_) => None,
-            };
             if held.is_some() && !switch_unchanged(home, wallet, switch)? {
                 return Ok(DefaultPolicyStatus::SwitchEnded {
                     persona: switch_persona_name(switch).to_owned(),
@@ -2226,6 +2261,28 @@ pub(crate) async fn advance_default_policy(
             }
             drop(held);
             proposal
+        }
+        // A waiting command that announced its ceremony proposes nothing: a
+        // change still waiting is reported, one the owner approved commits,
+        // and one that ended unapproved ends the wait.
+        None if mode == DefaultPolicyMode::Observe => {
+            match request.reconciled(daemon, wallet).await {
+                Ok(bloom_vfs::handlers::ReconciledPolicy::Awaiting { pending, .. }) => {
+                    Ok(bloom_machine_client::PetalEligibility::AwaitingPolicyApproval(*pending))
+                }
+                Ok(bloom_vfs::handlers::ReconciledPolicy::Current(current)) => {
+                    if request.allowed_by(&current)? {
+                        Ok(bloom_machine_client::PetalEligibility::Allowed(current))
+                    } else if current.version.get()
+                        != bloom_vfs::handlers::wallets::CREATION_POLICY_VERSION
+                    {
+                        Ok(bloom_machine_client::PetalEligibility::ChangedSinceCreation(current))
+                    } else {
+                        return Ok(DefaultPolicyStatus::ProposalEnded);
+                    }
+                }
+                Err(error) => Err(error),
+            }
         }
         None => {
             daemon
@@ -2991,7 +3048,7 @@ fn petals_not_allowed(
 pub(crate) const PERSONA_TRANSFERS: &str = "ERC-20 transfers to any recipient";
 
 /// How the default policy names Trader's and Degen's approval lifetime.
-pub(crate) const PERSONA_STANDING: &str = "approvals last until revoked";
+pub(crate) const PERSONA_STANDING: &str = "approvals that last until revoked";
 
 /// What the default policy asks of a wallet's policy: each chosen, installed
 /// Petal's package and destinations, and the saved persona's entries. All of
@@ -3062,6 +3119,23 @@ impl DefaultPolicyRequest {
                 .iter()
                 .any(|package| policy.allowed_petal_packages.contains(package))
         })
+    }
+
+    /// Whether `current` allows all of this request: every package and
+    /// destination, and the persona's lifetime when it asks for one.
+    fn allowed_by(&self, current: &bloom_broker_api::SignedPolicySnapshot) -> Result<bool> {
+        let policy = decode_policy(current)?;
+        Ok(self
+            .packages
+            .iter()
+            .all(|package| policy.allowed_petal_packages.contains(package))
+            && self
+                .destinations()
+                .iter()
+                .all(|destination| policy.allowed_destinations.contains(destination))
+            && self
+                .lifetime
+                .is_none_or(|lifetime| policy.maximum_approval_lifetime_ms == lifetime))
     }
 
     /// Every destination the request needs: the Petals', then the persona's.
@@ -3237,9 +3311,11 @@ impl DefaultPolicyWait {
         }
     }
 
-    /// Wait for one persona switch, which Machine proposes once.
-    pub(crate) fn for_switch(mut self) -> Self {
+    /// Wait for one persona switch to `persona`, which Machine proposes
+    /// once: a new ceremony for it means starting the switch again.
+    pub(crate) fn for_switch(mut self, persona: &str) -> Self {
         self.one_switch = true;
+        self.resume = format!("bloom wallet persona {} {persona}", self.wallet);
         self
     }
 
@@ -3247,6 +3323,12 @@ impl DefaultPolicyWait {
     pub(crate) fn for_new_wallet(mut self) -> Self {
         self.creating_wallet = true;
         self
+    }
+
+    /// Whether this wait has announced a ceremony, so Machine must propose
+    /// nothing more for it ([`DefaultPolicyMode::Observe`]).
+    pub(crate) fn announced_ceremony(&self) -> bool {
+        self.announced.is_some()
     }
 
     /// Whether the announced policy ceremony has expired. Checked after a
@@ -3259,7 +3341,7 @@ impl DefaultPolicyWait {
         let (wallet, resume) = (&self.wallet, &self.resume);
         writeln!(
             output,
-            "default_policy: the approval for {wallet} expired; run `{resume}` for a new one"
+            "default_policy: the approval for {wallet} ended without your approval, as it expired or was refused, so nothing changed; run `{resume}` for a new one"
         )?;
         Ok(())
     }
@@ -3319,10 +3401,10 @@ impl DefaultPolicyWait {
         let resume = &self.resume;
         match status {
             DefaultPolicyStatus::PetalsNotInstalled { not_installed } => {
-                let (verb, _, done, missing) = not_installed_words(not_installed.len());
+                let (verb, them, done, missing) = not_installed_words(not_installed.len());
                 writeln!(
                     output,
-                    "default_policy: {}, chosen for {wallet}, {verb} not installed yet, so Bloom proposes nothing for {wallet}'s default policy until every chosen Petal is: the default policy allows them all in one approval. Once {done} installed, run `{resume}`. Bloom installs its catalog Petals as it starts; if {missing} missing, restart Bloom",
+                    "default_policy: {}, chosen for {wallet}, {verb} not installed yet, so Bloom proposes nothing for {wallet}'s default policy until every chosen Petal is: the default policy allows them all in one approval. Once {done} installed, run `{resume}`. Bloom installs its catalog Petals as it starts; if {missing} missing, restart Bloom, or to go on without {them}, run `bloom wallet persona {wallet} <institutional|trader|degen>` and leave {them} out",
                     petal_labels(not_installed)
                 )?;
                 if self.creating_wallet {
@@ -3513,6 +3595,10 @@ impl DefaultPolicyWait {
             }
             // Another command holds the policy lock. Keep asking, but never
             // past the deadline: the lock holder may outlive this command.
+            DefaultPolicyStatus::ProposalEnded => {
+                self.report_expired(output)?;
+                Ok(WaitStep::Stop)
+            }
             DefaultPolicyStatus::Busy => {
                 if now_ms < self.deadline_ms {
                     return Ok(WaitStep::Poll);
@@ -3559,8 +3645,8 @@ impl DefaultPolicyWait {
                     )?;
                     return Ok(WaitStep::Stop);
                 }
-                // Machine cancels a ceremony past its expiry on the next poll and
-                // proposes a replacement; never hand out a dead link.
+                // Broker retires a ceremony past its expiry when next asked;
+                // never hand out a dead link.
                 if let Some(expires_at_ms) = ceremony_expires_at_ms.filter(|at| now_ms >= *at) {
                     if now_ms < expires_at_ms.saturating_add(EXPIRED_CEREMONY_GRACE_MS) {
                         return Ok(WaitStep::Poll);
@@ -3671,6 +3757,7 @@ async fn poll_default_policy(
             bloom_daemon::ipc::MachineCommand::WalletDefaultPolicy {
                 name: wallet.to_owned(),
                 owner_just_chose: false,
+                observe_only: wait.announced_ceremony(),
             },
         )
         .await?;
@@ -3748,7 +3835,7 @@ pub(crate) async fn run_persona_switch(
         wallet,
         crate::current_unix_ms().saturating_add(POLICY_LOCK_GRACE_MS),
     )
-    .for_switch();
+    .for_switch(persona_name(preset));
     if wait.observe(&status, crate::current_unix_ms(), &mut std::io::stdout())? == WaitStep::Stop {
         return Ok(());
     }
@@ -5581,7 +5668,7 @@ mod tests {
             build_not_installed: Vec::new(),
             left_out: Vec::new(),
         };
-        let mut wait = DefaultPolicyWait::new("trading", 30_000).for_switch();
+        let mut wait = DefaultPolicyWait::new("trading", 30_000).for_switch("trader");
         let mut output = Vec::new();
         assert_eq!(
             wait.observe(&pending("first"), 10, &mut output).unwrap(),
@@ -6199,6 +6286,12 @@ mod tests {
                 && output.contains("if one stays missing, restart Bloom"),
             "{output}"
         );
+        // One that never installs, or that the owner removed, is left out by
+        // switching persona.
+        assert!(
+            output.contains("to go on without them, run `bloom wallet persona main <institutional|trader|degen>` and leave them out"),
+            "{output}"
+        );
         assert!(!output.contains("bloom petals ls"), "{output}");
         assert!(!output.contains("skipped"), "{output}");
         let created = observe(&both, true);
@@ -6502,6 +6595,7 @@ mod tests {
             policy_destinations("polymarket").unwrap()
         );
         let extras = request.extras();
+        assert_eq!(extras.destinations, request.missing_petal_destinations);
         assert!(extras.packages.contains(&own_build));
         assert!(
             extras
@@ -6771,7 +6865,7 @@ mod tests {
             allowed_not_installed: Vec::new(),
             left_out: Vec::new(),
         };
-        let mut wait = DefaultPolicyWait::new("main", 30_000).for_switch();
+        let mut wait = DefaultPolicyWait::new("main", 30_000).for_switch("trader");
         let mut output = Vec::new();
         assert_eq!(
             wait.observe(&status, 0, &mut output).unwrap(),
@@ -7283,6 +7377,7 @@ mod tests {
         let resume = MachineCommand::WalletDefaultPolicy {
             name: "main".into(),
             owner_just_chose: false,
+            observe_only: false,
         };
         assert_eq!(
             serde_json::to_value(&resume).unwrap(),
@@ -7299,6 +7394,7 @@ mod tests {
             serde_json::to_value(MachineCommand::WalletDefaultPolicy {
                 name: "main".into(),
                 owner_just_chose: true,
+                observe_only: false,
             })
             .unwrap(),
             serde_json::json!({
@@ -7308,12 +7404,30 @@ mod tests {
             })
         );
         assert_eq!(
-            DefaultPolicyMode::of_command(false),
+            DefaultPolicyMode::of_command(false, false),
             DefaultPolicyMode::Resume
         );
         assert_eq!(
-            DefaultPolicyMode::of_command(true),
+            DefaultPolicyMode::of_command(true, false),
             DefaultPolicyMode::OwnerJustChose
+        );
+        // A command waiting on the ceremony it announced proposes nothing.
+        assert_eq!(
+            DefaultPolicyMode::of_command(false, true),
+            DefaultPolicyMode::Observe
+        );
+        assert_eq!(
+            serde_json::to_value(MachineCommand::WalletDefaultPolicy {
+                name: "main".into(),
+                owner_just_chose: false,
+                observe_only: true,
+            })
+            .unwrap(),
+            serde_json::json!({
+                "command": "wallet_default_policy",
+                "name": "main",
+                "observe_only": true
+            })
         );
         // The switch itself names the persona, and the Petals only when any
         // are chosen.
@@ -7383,6 +7497,42 @@ mod tests {
             build_not_installed: Vec::new(),
             left_out: Vec::new(),
         }
+    }
+
+    /// A missing Petal allowed only as its last build is named apart when the
+    /// default policy's ceremony is announced, and beside another change.
+    #[test]
+    fn a_missing_own_build_is_named_on_the_announcement_and_beside_another_change() {
+        let with_build = |proposes_chosen_petals: bool| DefaultPolicyStatus::AwaitingOwner {
+            operation_id: "op".into(),
+            ceremony_url: Some("http://localhost:18734/ceremony/op".into()),
+            ceremony_expires_at_ms: Some(5_000),
+            petals: vec!["polymarket".into()],
+            proposes_chosen_petals,
+            not_installed: Vec::new(),
+            allowed_not_installed: Vec::new(),
+            build_not_installed: vec!["hyperliquid".into()],
+            left_out: Vec::new(),
+        };
+        let mut output = Vec::new();
+        DefaultPolicyWait::new("main", 1_000)
+            .observe(&with_build(true), 10, &mut output)
+            .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("default_policy_url: "), "{output}");
+        assert!(
+            output.contains(
+                "Hyperliquid, which this policy allows only as the build last installed, is not installed"
+            ),
+            "{output}"
+        );
+        let mut output = Vec::new();
+        DefaultPolicyWait::new("main", 1_000)
+            .observe(&with_build(false), 10, &mut output)
+            .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("another policy change"), "{output}");
+        assert!(output.contains("Hyperliquid"), "{output}");
     }
 
     #[test]
@@ -7618,6 +7768,45 @@ mod tests {
         );
     }
 
+    /// A switch another command proposed after this one read it is the same
+    /// switch, carried on with that proposal; a different setup replaced it.
+    #[test]
+    fn a_switch_proposed_meanwhile_is_carried_on_not_called_replaced() {
+        let institutional = PendingSwitch {
+            setup: WalletSetup {
+                persona: Some(PersonaConfig::suggested(PersonaPreset::Custodian)),
+                ..chosen_setup(&["polymarket"])
+            },
+            operation_id: None,
+            proposed: None,
+        };
+        let proposed = PendingSwitch {
+            operation_id: Some("ab".repeat(32)),
+            proposed: Some(vec!["polymarket".into()]),
+            ..institutional.clone()
+        };
+        assert_eq!(
+            proposed_meanwhile(&institutional, Some(proposed.clone())),
+            Some(proposed.clone())
+        );
+        // Still unproposed, gone, or replaced by another setup: not adopted.
+        assert_eq!(
+            proposed_meanwhile(&institutional, Some(institutional.clone())),
+            None
+        );
+        assert_eq!(proposed_meanwhile(&institutional, None), None);
+        let trader = PendingSwitch {
+            setup: WalletSetup {
+                persona: Some(PersonaConfig::suggested(PersonaPreset::Trader)),
+                ..chosen_setup(&["polymarket"])
+            },
+            ..proposed.clone()
+        };
+        assert_eq!(proposed_meanwhile(&institutional, Some(trader)), None);
+        // A switch already proposed is never swapped for another record.
+        assert_eq!(proposed_meanwhile(&proposed, Some(proposed.clone())), None);
+    }
+
     #[test]
     fn wait_stops_at_expiry_without_announcing_a_replacement() {
         let mut wait = DefaultPolicyWait::new("main", 1_000);
@@ -7629,6 +7818,27 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("run `bloom wallet default-policy main` for a new one"));
         assert_eq!(output.matches("default_policy_url: ").count(), 1);
+        // Once announced, the wait asks Machine to propose nothing more, and a
+        // ceremony that ended unapproved ends it without a new link.
+        assert!(wait.announced_ceremony());
+        let mut output = Vec::new();
+        assert_eq!(
+            wait.observe(&DefaultPolicyStatus::ProposalEnded, 30, &mut output)
+                .unwrap(),
+            WaitStep::Stop
+        );
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("ended without your approval"), "{output}");
+        assert!(!output.contains("default_policy_url: "), "{output}");
+        // A switch is started again, not resumed through the default policy.
+        let switch = DefaultPolicyWait::new("main", 1_000).for_switch("degen");
+        let mut output = Vec::new();
+        switch.report_expired(&mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.contains("run `bloom wallet persona main degen` for a new one"),
+            "{output}"
+        );
     }
 
     #[test]
