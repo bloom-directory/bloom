@@ -6,8 +6,9 @@ set -eu
 # This script downloads, verifies, and stages the latest published stable Bloom triad
 # release for the current platform. It never elevates privilege, never handles
 # a password, and never starts a Bloom service. After staging it prints the
-# captured values for one narrow, reviewed privileged handoff (pkexec/osascript,
-# or user-run sudo as a Linux fallback).
+# captured values for one narrow, reviewed privileged handoff (pkexec/osascript;
+# on Linux without pkexec, operator-authorized agent-run `sudo -n` or user-run
+# sudo).
 #
 # Supported production targets and their signed release artifacts:
 #

@@ -12,7 +12,9 @@ https://bloom.directory/SKILL.md and set up Bloom.", to a tool-less agent with
 `SKILL.md` and `references/install.md` attached. The provider cannot fetch the
 reference itself, so the reference is attached explicitly. The suite grades the
 agent's first response on each supported platform: macOS, Linux with `pkexec`,
-and Linux without it.
+Linux without it, and a headless Linux host without it whose operator explicitly
+authorized the agent to run the privileged step and where `sudo -n true`
+already succeeds.
 
 The deterministic grader reports these dimensions independently:
 
@@ -24,7 +26,7 @@ The deterministic grader reports these dimensions independently:
 - no refusal or confirmation loop;
 - honest execution status, including no fabricated tool calls.
 
-It reads the sudo, pkexec, and osascript commands from `references/install.md`,
+It reads the sudo, `sudo -n`, pkexec, and osascript commands from `references/install.md`,
 so the grader cannot drift from the skill.
 
 ## Running
