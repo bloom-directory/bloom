@@ -154,10 +154,14 @@ temporary per-user systemd socket units for Broker and Signer; an active
 systemd user manager is required. Paths embedded in those units may contain
 only ASCII letters, digits, and `_./:@+-`.
 
-Linux also uses the reviewed `linux-chrony-nts` trusted-time profile. The host
-clock must already be synchronized through the production two-source NTS
-configuration; the developer harness does not replace it with unauthenticated
-NTP.
+On Linux the launcher writes the trusted-time source `linux-chrony-nts`. That
+is a legacy wire name kept for rollback compatibility; the runtime reads it as
+the `linux-system-clock` source described in the
+[Linux packaging README](./packaging/triad/linux/README.md): Bloom uses the
+ordinary host wall clock and guards it against backward steps. No Chrony, NTS
+or second time source is required. Keep the host clock synchronized as usual;
+a clock stepped backwards freezes Broker and Signer mutations until wall time
+catches up.
 
 The launcher writes public connection settings to
 `/tmp/bloom-triad-logs/triad.env`. Source that file only in the terminal meant
@@ -303,6 +307,11 @@ The examples use fixed paths. Before running another candidate, give it a
 distinct developer root, Machine home, socket, log directory, ready file,
 mountpoint, and ceremony port. Suffixing each path with a candidate name is
 sufficient for state isolation.
+
+For disposable authorization tests, `--retain-temporary-files` keeps the
+launcher's generated template and runtime directories for diagnosis. Shutdown
+still stops only that candidate's services and removes its ready file and
+Machine socket. The test runner uses this option without recursive cleanup.
 
 Each candidate also needs its own ceremony port so two complete development
 triads, including passkey ceremonies, can run side by side while the installed
@@ -465,12 +474,12 @@ exercise the behavior you changed.
 
 ## Preinstalled Petals
 
-Every Bloom home provisions Polymarket, Hyperliquid, Enso, Near Intents, and
-Tolly from the pinned release catalog. `bloom init` installs missing releases
-and updates older catalog releases; Machine startup also attempts provisioning
-in the background. Current verified installations are reused. Legacy
-`[petals] preinstalled` values are ignored, including empty lists, and are no
-longer written to new configs.
+Every Bloom home provisions Polymarket, Hyperliquid, Enso, Near Intents,
+Feedback, and Safe from the pinned release catalog. `bloom init` installs
+missing releases and updates older catalog releases; Machine startup also
+attempts provisioning in the background. Current verified installations are
+reused. Legacy `[petals] preinstalled` values are ignored, including empty
+lists, and are no longer written to new configs.
 
 The canonical list is `DEFAULT_PETALS` in
 [`crates/bloom/src/github_source.rs`](./crates/bloom/src/github_source.rs).
@@ -486,7 +495,8 @@ developer launcher does the same on every launch
 records such as locally enrolled Petals. A long-lived developer root therefore
 picks up new pinned releases on its next launch. An installation without
 source provenance (a manual local install of a default Petal) is never
-replaced: uninstall it first, then relaunch.
+replaced: uninstall it first, then relaunch. It is reused while its package
+hash equals the pinned release's hash.
 
 ## General local operation
 

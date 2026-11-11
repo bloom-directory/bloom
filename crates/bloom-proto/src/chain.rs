@@ -121,7 +121,25 @@ fn default_native_decimals() -> u8 {
     18
 }
 
+/// Tempo mainnet. Fees are paid in stablecoins: it has no native token, and
+/// `eth_getBalance` returns the same placeholder for every address.
+pub const TEMPO_MAINNET_CHAIN_ID: u64 = 4217;
+
+/// Tempo Moderato testnet, which also has no native token.
+pub const TEMPO_MODERATO_CHAIN_ID: u64 = 42431;
+
+/// False for a chain id with no native token, such as Tempo.
+pub fn chain_has_native_asset(chain_id: u64) -> bool {
+    !matches!(chain_id, TEMPO_MAINNET_CHAIN_ID | TEMPO_MODERATO_CHAIN_ID)
+}
+
 impl ChainSpec {
+    /// False when the chain has no native token, so `eth_getBalance` is not a
+    /// balance. Keyed by chain id so existing configs are covered.
+    pub fn has_native_asset(&self) -> bool {
+        chain_has_native_asset(self.chain_id)
+    }
+
     /// A safe default Anvil chain spec for local development.
     pub fn anvil_default() -> Self {
         ChainSpec {
@@ -218,6 +236,13 @@ pub const SOLANA_MAINNET_BETA_GENESIS_HASH: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZ
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn both_tempo_chains_have_no_native_asset() {
+        assert!(!chain_has_native_asset(TEMPO_MAINNET_CHAIN_ID));
+        assert!(!chain_has_native_asset(TEMPO_MODERATO_CHAIN_ID));
+        assert!(chain_has_native_asset(1));
+    }
 
     #[test]
     fn chain_id_display_and_from() {

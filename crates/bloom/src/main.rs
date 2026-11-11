@@ -1407,7 +1407,8 @@ fn machine_error_from_handler(error: &bloom_vfs::HandlerError, message: String) 
     let kind = match error {
         bloom_vfs::HandlerError::NotFound(_) => MachineErrorKind::NotFound,
         bloom_vfs::HandlerError::PermissionDenied
-        | bloom_vfs::HandlerError::OperationNotPermitted => MachineErrorKind::PermissionDenied,
+        | bloom_vfs::HandlerError::OperationNotPermitted
+        | bloom_vfs::HandlerError::ApprovalPending(_) => MachineErrorKind::PermissionDenied,
         bloom_vfs::HandlerError::Invalid(_)
         | bloom_vfs::HandlerError::NotADir(_)
         | bloom_vfs::HandlerError::NotAFile(_)
@@ -1691,6 +1692,20 @@ async fn execute_machine_command(
                     format!("requested wallet name must be a safe single path segment: {error:#}"),
                 )
             })?;
+            // `/wallets` lists control entries under these names, so a wallet
+            // created with one would be hidden. Registration refuses them in
+            // the VFS; import creates a wallet here.
+            if matches!(
+                kind,
+                MachineCustodyKind::Import | MachineCustodyKind::ImportRawPrivateKey
+            ) && bloom_vfs::handlers::wallets::is_wallet_control_entry(name.as_str())
+            {
+                return Err(machine_error(
+                    MachineErrorKind::InvalidParams,
+                    format!("'{name}' is reserved for a /wallets control entry; choose another wallet name"),
+                )
+                .into());
+            }
             if kind == MachineCustodyKind::New {
                 launch_wallet_registration_via_vfs(&daemon.vfs, &name, local).await?
             } else {
@@ -2962,12 +2977,14 @@ enum WalletCmd {
         #[arg(long, default_value = "y")]
         text: String,
     },
-    /// Submit a same-nonce replacement request from a new intent body.
+    /// Repair the fees of a pending EIP-1559 tx the node refused, keeping its
+    /// nonce and call.
     Replace {
         wallet: String,
         chain: String,
         id: String,
-        /// Replacement intent body (JSON, TOML, or shell-style). If omitted, read stdin.
+        /// Exactly `{"max_fee_per_gas":"<wei>","max_priority_fee_per_gas":"<wei>"}`;
+        /// any other body is refused. If omitted, read stdin.
         #[arg(long)]
         intent: Option<String>,
     },

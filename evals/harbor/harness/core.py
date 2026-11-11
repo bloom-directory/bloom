@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import os
 import signal
 import time
@@ -38,8 +37,28 @@ AGENTS: dict[str, AgentSpec] = {
     # Model ids are the API's, not the marketing names: "sonnet-5" is rejected
     # with a 404 unrecognized_model, which surfaces as an errored Harbor trial
     # rather than a configuration error.
-    "claude": AgentSpec("claude-code", "claude-sonnet-5"),
-    "codex": AgentSpec("codex", "gpt-5.6-terra"),
+    # Release runs use mid-tier models: they cost less, and a weaker model
+    # exposes missing docs a stronger one reads past. Opus runs on request.
+    "claude-opus": AgentSpec("claude-code", "claude-opus-5-5"),
+    "claude-sonnet": AgentSpec("claude-code", "claude-sonnet-5-5"),
+    # Codex and Pi run mid-tier models on subscription logins, not the
+    # strongest each offers.
+    "codex": AgentSpec("codex", "gpt-5.6-sol"),
+    "opencode": AgentSpec("opencode", "deepseek/deepseek-flash"),
+    "pi": AgentSpec("pi", "kimi-coding/k3"),
+}
+
+AGENT_VERSIONS = {
+    "claude-code": "2.1.245",
+    "codex": "0.149.1",
+    "opencode": "1.18.26",
+    "pi": "1.4.0",
+}
+
+# Agents Harbor runs through a local subclass.
+IMPORT_PATHS = {
+    "opencode": "harness.image_opencode:ImageOpenCode",
+    "pi": "harness.image_pi:ImagePi",
 }
 
 REASONING_EFFORT_ENV = "BLOOM_EVAL_REASONING_EFFORT"
@@ -69,21 +88,19 @@ class EvalRunContext:
     mounts: Sequence[Mapping[str, Any]]
     agent_env: Mapping[str, str]
     verifier_env: Mapping[str, str]
+    host_verifier_root: Path | None = None
+    clarification: bool = False
 
 
 class EvalDefinition(ABC):
     """Trusted host-side lifecycle for one kind of Harbor evaluation.
 
-    New evaluations implement this interface while reusing locking, agent setup,
+    New evaluations implement this interface while reusing agent setup,
     Harbor job construction, result handling, signals, and cleanup.
     """
 
     name: str
-
-    @property
-    @abstractmethod
-    def lock_path(self) -> Path:
-        """Global lock that serializes this live side-effect domain."""
+    failed: bool = False
 
     @abstractmethod
     def preflight(self) -> None:
@@ -141,6 +158,7 @@ async def run_harbor_job(context: EvalRunContext, agent: AgentSpec) -> Any:
     shared_env.update(agent.env)
     effort = reasoning_effort(agent.harbor_name)
     agent_kwargs = {"reasoning_effort": effort} if effort is not None else {}
+    agent_kwargs["version"] = AGENT_VERSIONS[agent.harbor_name]
     config = JobConfig(
         job_name=context.job_name,
         jobs_dir=context.jobs_dir,
@@ -149,7 +167,8 @@ async def run_harbor_job(context: EvalRunContext, agent: AgentSpec) -> Any:
         retry=RetryConfig(max_retries=0),
         agents=[
             AgentConfig(
-                name=agent.harbor_name,
+                name=None if agent.harbor_name in IMPORT_PATHS else agent.harbor_name,
+                import_path=IMPORT_PATHS.get(agent.harbor_name),
                 model_name=agent.model,
                 n_concurrent=1,
                 env=shared_env,
@@ -158,9 +177,21 @@ async def run_harbor_job(context: EvalRunContext, agent: AgentSpec) -> Any:
         ],
         environment=EnvironmentConfig(
             type=EnvironmentType.DOCKER,
+            import_path="harness.environment:BloomDockerEnvironment",
             mounts=list(context.mounts),
         ),
-        verifier=VerifierConfig(env=dict(context.verifier_env)),
+        verifier=VerifierConfig(
+            env=dict(context.verifier_env),
+            import_path="harness.host_verifier:HostProjectionVerifier"
+            if context.host_verifier_root
+            else None,
+            kwargs={
+                "mount_root": str(context.host_verifier_root),
+                "clarification": context.clarification,
+            }
+            if context.host_verifier_root
+            else {},
+        ),
         tasks=[TaskConfig(path=context.task_dir)],
     )
     job = await Job.create(config)
@@ -178,19 +209,28 @@ def _agent_spec(name: str) -> AgentSpec:
             f"unsupported agent {name!r}; choose: {', '.join(AGENTS)}"
         ) from error
 
-    if name == "claude":
-        if not (os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_CODE_OAUTH_TOKEN")):
-            raise EvalError(
-                "Claude auth is missing; set ANTHROPIC_API_KEY or "
-                "CLAUDE_CODE_OAUTH_TOKEN"
-            )
-        if os.getenv("CLAUDE_CODE_OAUTH_TOKEN") and not os.getenv("ANTHROPIC_API_KEY"):
-            return AgentSpec(spec.harbor_name, spec.model, {"CLAUDE_FORCE_OAUTH": "1"})
+    if spec.harbor_name == "claude-code" and not (
+        os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_CODE_OAUTH_TOKEN")
+    ):
+        raise EvalError(
+            "Claude auth is missing; set ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN"
+        )
     if name == "codex" and not os.getenv("OPENAI_API_KEY"):
         auth_file = Path.home() / ".codex" / "auth.json"
         if not auth_file.is_file():
             raise EvalError("Codex auth is missing")
-        return AgentSpec(spec.harbor_name, spec.model, {"CODEX_FORCE_AUTH_JSON": "1"})
+        # Harbor treats AUTH-named env values as secrets and replaces every
+        # occurrence in artifacts. A flag of "1" corrupts numeric JSON fields.
+        return AgentSpec(
+            spec.harbor_name, spec.model, {"CODEX_AUTH_JSON_PATH": str(auth_file)}
+        )
+    if name == "pi":
+        # Never default to ~/.pi: the agent refreshes the OAuth login it is
+        # given, which can sign out the copy it came from.
+        auth = os.getenv("PI_AUTH_JSON_PATH")
+        if not auth or not Path(auth).is_file():
+            raise EvalError("Pi auth is missing; set PI_AUTH_JSON_PATH")
+        return AgentSpec(spec.harbor_name, spec.model, {"PI_AUTH_JSON_PATH": auth})
     return spec
 
 
@@ -199,73 +239,58 @@ def run_eval(
     agent_name: str,
     *,
     harbor_runner: HarborRunner = run_harbor_job,
-    acquire_lock: bool = True,
     phase_timings: dict[str, float] | None = None,
     evidence: EvalEvidence | None = None,
 ) -> Any:
     """Execute one provisioned eval and guarantee outer cleanup."""
-    agent = _agent_spec(agent_name)
-    definition.lock_path.parent.mkdir(parents=True, exist_ok=True)
+    agent = (
+        _agent_spec(agent_name)
+        if harbor_runner is run_harbor_job
+        else AGENTS[agent_name]
+    )
     timings = phase_timings if phase_timings is not None else {}
     evidence = evidence if evidence is not None else EvalEvidence()
+    started = time.monotonic()
+    definition.preflight()
+    timings["preflight_seconds"] = time.monotonic() - started
+    run_error: BaseException | None = None
+    result: Any | None = None
+    previous_term_handler = signal.getsignal(signal.SIGTERM)
 
-    def execute() -> Any:
+    def terminate(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt("received SIGTERM")
+
+    signal.signal(signal.SIGTERM, terminate)
+    try:
         started = time.monotonic()
-        definition.preflight()
-        timings["preflight_seconds"] = time.monotonic() - started
-        provision_started = False
-        run_error: BaseException | None = None
-        result: Any | None = None
-        previous_term_handler = signal.getsignal(signal.SIGTERM)
-
-        def terminate(_signum: int, _frame: object) -> None:
-            raise KeyboardInterrupt("received SIGTERM")
-
-        signal.signal(signal.SIGTERM, terminate)
+        context = definition.provision(agent_name)
+        timings["authority_provisioning_seconds"] = time.monotonic() - started
+        started = time.monotonic()
+        result = asyncio.run(harbor_runner(context, agent))
+        evidence.result = result
+        timings["harbor_seconds"] = time.monotonic() - started
+        definition.validate_result(result)
+    except BaseException as error:  # noqa: BLE001 -- cleanup must cover interrupts
+        run_error = error
+        definition.failed = True
+    finally:
+        signal.signal(signal.SIGTERM, previous_term_handler)
+        started = time.monotonic()
         try:
-            provision_started = True
-            started = time.monotonic()
-            context = definition.provision(agent_name)
-            timings["authority_provisioning_seconds"] = time.monotonic() - started
-            started = time.monotonic()
-            result = asyncio.run(harbor_runner(context, agent))
-            evidence.result = result
-            timings["harbor_seconds"] = time.monotonic() - started
-            definition.validate_result(result)
-        except BaseException as error:  # noqa: BLE001 -- cleanup must cover interrupts
-            run_error = error
+            definition.cleanup()
+            evidence.cleanup_succeeded = True
+        except BaseException as cleanup_error:
+            evidence.cleanup_succeeded = False
+            evidence.cleanup_error = str(cleanup_error)
+            if run_error is not None:
+                raise EvalError(
+                    f"evaluation failed ({run_error}); cleanup also failed: "
+                    f"{cleanup_error}"
+                ) from cleanup_error
+            raise
         finally:
-            signal.signal(signal.SIGTERM, previous_term_handler)
-            if provision_started:
-                started = time.monotonic()
-                try:
-                    definition.cleanup()
-                    evidence.cleanup_succeeded = True
-                    timings["session_cleanup_seconds"] = time.monotonic() - started
-                except BaseException as cleanup_error:
-                    evidence.cleanup_succeeded = False
-                    evidence.cleanup_error = str(cleanup_error)
-                    timings["session_cleanup_seconds"] = time.monotonic() - started
-                    if run_error is not None:
-                        raise EvalError(
-                            f"evaluation failed ({run_error}); cleanup also failed: "
-                            f"{cleanup_error}"
-                        ) from cleanup_error
-                    raise
+            timings["session_cleanup_seconds"] = time.monotonic() - started
 
-        if run_error is not None:
-            raise run_error
-        return result
-
-    if not acquire_lock:
-        return execute()
-
-    with definition.lock_path.open("a+") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise EvalError(
-                f"another {definition.name} eval holds {definition.lock_path}"
-            ) from error
-
-        return execute()
+    if run_error is not None:
+        raise run_error
+    return result
