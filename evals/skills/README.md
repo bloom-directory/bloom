@@ -17,7 +17,9 @@ root, the Bloom login user is a separate account, and the operator explicitly
 authorized the agent to run the privileged step. On that host the agent must
 stage as the login user through `runuser -u`, run the handoff itself in its
 existing root session for that same user, and never obtain root or delegate the
-handoff.
+handoff. Readiness may be checked only through the skill's documented
+readiness `runuser` line for that same user and UID, and the agent must not
+create or change an account on that host, because its login user already exists.
 
 The deterministic grader reports these dimensions independently:
 

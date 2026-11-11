@@ -9,7 +9,8 @@ set -eu
 # captured values for one narrow, reviewed privileged handoff (pkexec/osascript,
 # user-run sudo as a Linux fallback, or an operator-authorized agent that already
 # runs as root). It stages for the login user that runs it and refuses to run as
-# root; a root agent runs it as the Bloom login user with `runuser -u USER --`.
+# root; a root agent runs it as the Bloom login user with
+# `runuser -u USER -- env -u BLOOM_INSTALL_STAGE TMPDIR=/tmp`.
 #
 # Supported production targets and their signed release artifacts:
 #
@@ -147,6 +148,32 @@ require_triad_environment() {
   esac
 }
 
+# Check, before any download, that this login can write both its home, where
+# the stage lives, and its temporary directory. A root session that switches
+# to the login user can pass along its own TMPDIR.
+require_staging_space() {
+  case "$HOME" in
+    /*) ;;
+    *)
+      printf '%s\n' "HOME must be an absolute path." >&2
+      exit 1
+      ;;
+  esac
+  if [ "$HOME" = / ]; then
+    printf '%s\n' "Bloom will not stage an installation below the filesystem root." >&2
+    exit 1
+  fi
+  if [ ! -d "$HOME" ] || [ ! -w "$HOME" ] || [ ! -x "$HOME" ]; then
+    printf '%s\n' "HOME must be a directory $login_user can write: $HOME" >&2
+    exit 1
+  fi
+  tmp_parent=${TMPDIR:-/tmp}
+  if [ ! -d "$tmp_parent" ] || [ ! -w "$tmp_parent" ] || [ ! -x "$tmp_parent" ]; then
+    printf '%s\n' "TMPDIR must be a directory $login_user can write: $tmp_parent" >&2
+    exit 1
+  fi
+}
+
 resolve_latest_release() {
   # Resolve GitHub's latest stable release once, then use that tag for every
   # download. Never mix assets fetched through a moving latest/download URL.
@@ -183,17 +210,6 @@ stage_triad() {
   expected_platform_claim="$production_platform_claim"
   install_stage=${BLOOM_INSTALL_STAGE:-"$HOME/.cache/bloom/install/$triad_release_tag-$platform_slug"}
 
-  case "$HOME" in
-    /*) ;;
-    *)
-      printf '%s\n' "HOME must be an absolute path." >&2
-      exit 1
-      ;;
-  esac
-  if [ "$HOME" = / ]; then
-    printf '%s\n' "Bloom will not stage an installation below the filesystem root." >&2
-    exit 1
-  fi
   case "$install_stage" in
     "$HOME"/*) ;;
     *)
@@ -209,7 +225,7 @@ stage_triad() {
       ;;
   esac
 
-  tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/bloom-triad-setup.XXXXXX")
+  tmp_dir=$(mktemp -d "$tmp_parent/bloom-triad-setup.XXXXXX")
   staged_new="$install_stage.new.$$"
   allowed_signers="$tmp_dir/allowed_signers"
   public_key="$tmp_dir/bloom-release-v1.pub"
@@ -329,10 +345,11 @@ main() {
 
   if [ "$login_uid" = 0 ]; then
     printf '%s\n' \
-      "Bloom setup stages for the Bloom login user and will not run as root. From a root session, run it as that user: runuser -u USER -- sh setup.sh" >&2
+      "Bloom setup stages for the Bloom login user and will not run as root. From a root session, run it as that user: runuser -u USER -- env -u BLOOM_INSTALL_STAGE TMPDIR=/tmp sh setup.sh" >&2
     exit 1
   fi
 
+  require_staging_space
   resolve_triad_target
   require_triad_environment
   resolve_latest_release

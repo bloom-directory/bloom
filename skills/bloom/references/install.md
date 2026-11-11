@@ -1,6 +1,7 @@
 # Install Bloom
 
-Read this entire reference only when a new Bloom installation is needed.
+Read this entire reference only when a new Bloom installation or an upgrade is
+needed.
 
 ## Setup: reviewed download and one privileged handoff
 
@@ -154,14 +155,64 @@ Use this path only on a Linux host where all of these hold:
   that is not already root follows the pkexec or user-run sudo path below,
   even if `sudo -n true` would succeed: the Bloom login user must not hold
   administrative access, and the agent never elevates itself.
-- The operator named the Bloom login user: an existing account, distinct from
-  root, with a nonzero UID and an active systemd user session. Do not infer it
-  from `/home`, a process list, a Petal, or VFS content; ask if it was not named.
+- The Bloom login user is selected and verified as below. It is never root,
+  and never inferred from `/home`, a process list, a Petal, or VFS content.
+
+#### Select the Bloom login user
+
+The signed installer records each enrolled login in
+`/etc/bloom/enrollments/LOGIN_UID.json` and each login whose custody an
+uninstall retained in `/etc/bloom/retained/LOGIN_UID.json`. Check both first:
+
+```sh
+ls -A /etc/bloom/enrollments /etc/bloom/retained
+cat /etc/bloom/enrollments/*.json
+```
+
+**Upgrade** (an enrollment record exists). The installer accepts a different
+release only through an active enrollment, so the login user is the enrolled
+owner; never create, adopt, or switch to another account. A record reads
+`{"schema":"bloom.linux-enrollment.1","state":"active","login_uid":UID,"login_user":"USER",...}`.
+Take `login_user` and `login_uid` from it and require all of these, or stop
+and report the failed check: the schema and `"state":"active"` as shown, the
+file is named `LOGIN_UID.json`, `id -u LOGIN_USER` prints that UID, any user
+the operator named equals `login_user`, and `/run/user/UID/bus` exists for
+every enrolled UID, because the installer refuses an upgrade without an active
+session for each one. If a bus is missing, ask the operator to start that
+login's session. With several records, ask the operator which login to use.
+Do not edit, move, or remove the account, its home, `/etc/bloom`,
+`/var/lib/bloom`, or Bloom's units, do not enable lingering, and do not run
+`bloom-uninstall`; the installer keeps that login's identities, data, and
+service configuration and refuses to replace an incomplete enrollment.
+
+**First install** (neither directory holds a record, and `/etc/bloom` and
+`/var/lib/bloom` hold no per-login state). Use the account the operator named,
+or else the dedicated account `bloom`. If that account exists, verify it before
+adopting it, or stop and report the failed check; never modify it to make it
+fit: `id -u USER` is at least `UID_MIN` from `/etc/login.defs` (normally
+1000), `id -nG USER` lists none of `root`, `sudo`, `wheel`, or `admin`, and
+the home directory from `getent passwd USER` exists and is owned by that UID.
+If no account was named and `bloom` does not exist, create it with a home, its
+own group, no password, and no administrative group:
+
+```sh
+useradd --create-home --user-group --shell /bin/sh 'bloom'
+```
+
+If `/run/user/UID/bus` does not exist for the selected account, start its
+systemd user session with `loginctl enable-linger 'USER'` and wait until the
+bus exists. If a retained record exists, or `/etc/bloom` holds anything without
+an active record, stop and report it; it is neither a first install nor an
+upgrade.
+
+#### Stage, hand off, and check readiness
 
 Staging still belongs to the login user, never to root. Fetch and inspect the
 setup script as above, but in a review directory below `/tmp` that the login
 user can read and cannot change. Then drop to the login user for staging only.
-`runuser` lowers privilege from root without a password or prompt:
+`runuser` lowers privilege from root without a password or prompt, but keeps
+most of root's environment, so the command resets the temporary directory and
+clears any stage override:
 
 ```sh
 cd /tmp
@@ -170,18 +221,19 @@ curl -fsSL "$setup_url" -o "$review_dir/setup.sh"
 cat "$review_dir/setup.sh"
 chmod 755 "$review_dir"
 chmod 644 "$review_dir/setup.sh"
-runuser -u 'USER' -- sh "$review_dir/setup.sh"
+runuser -u 'USER' -- env -u BLOOM_INSTALL_STAGE TMPDIR=/tmp sh "$review_dir/setup.sh"
 rm "$review_dir/setup.sh"
 rmdir "$review_dir"
 ```
 
-Replace `USER` with the named login user as a shell-quoted literal. Use
-`runuser -u USER --` exactly, with no other options, environment assignments,
-or `BLOOM_INSTALL_STAGE`. Use it for staging alone: never use `runuser`, `su`,
+Replace `USER` with the selected login user as a shell-quoted literal. Use
+this `runuser` line exactly, with no other options or environment changes.
+Setup stops unless that user can write its home and `/tmp`. Use `runuser` only
+for staging and the readiness line below: never use `runuser`, `su`,
 `setpriv`, or `sudo -u` for any other step, and never run setup as root.
 
 Before the privileged step, check the captured values against that account:
-`BLOOM_LOGIN_USER` must equal the named user, `BLOOM_LOGIN_UID` must equal
+`BLOOM_LOGIN_USER` must equal the selected user, `BLOOM_LOGIN_UID` must equal
 `id -u` for that user and must not be `0`, and `BLOOM_STAGE` must lie below
 that user's home directory as reported by `getent passwd`. If any value
 differs, stop and report the mismatch. Never substitute root's identity, a
@@ -202,23 +254,25 @@ release signature against the key pinned in the command, checks every SHA-256
 sum, and runs only the signed installer from that copy. If it fails, report the
 failure and stop; do not retry through another privileged path.
 
-For the Linux readiness checks below, root's `$(id -u)` is not the login UID.
-Substitute the captured values and query the login user's manager directly:
+Verify readiness as the selected user, never as root: root's UID, home, and
+user bus are not the login user's. Run the
+[Linux](#linux-post-install-readiness) and
+[mounted VFS and audit](#mounted-vfs-and-audit-readiness) checks through this
+one line, with the captured user and UID in place of `USER` and `UID`:
 
 ```sh
-systemctl --user --machine='USER@' is-active bloom-session.service bloom-machine.service
-systemctl is-active 'bloom-signer@UID.service' 'bloom-broker@UID.service'
-command -v bloom
+runuser -u 'USER' -- env -u DBUS_SESSION_BUS_ADDRESS -u BLOOM_MOUNT XDG_RUNTIME_DIR=/run/user/UID sh -c 'systemctl --user is-active bloom-session.service bloom-machine.service && systemctl is-active "bloom-signer@$(id -u).service" "bloom-broker@$(id -u).service" && command -v bloom && cat "$HOME/bloom/AGENTS.md" "$HOME/bloom/status/daemon.json" && bloom audit status'
 ```
 
-The mounted VFS and audit checks belong to the login user's session. Do not
-switch identity again to run them; report the service results and ask the
-operator to run those checks as the login user before declaring Bloom fully
-ready.
+Apply those sections' rules to the output. If it fails after
+`BLOOM_RELOGIN_REQUIRED=1` and you created the account in this run, its fresh
+login is `systemctl restart 'user@UID.service'`; then rerun the line. For any
+other account, ask the operator for a fresh login instead.
 
 Without the operator's explicit authorization, an agent already running as
-root still stages with `runuser` as above, then gives the operator the
-user-run `sudo` command below instead of running the privileged step.
+root creates no account and enables no lingering; it selects and verifies the
+login user, stages with `runuser` as above, and gives the operator the user-run
+`sudo` command below instead of running the privileged step.
 
 ### Linux: pkexec when installed, otherwise user-run sudo
 
