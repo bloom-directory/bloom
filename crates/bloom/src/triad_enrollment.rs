@@ -296,7 +296,7 @@ pub fn run_developer_provenance_refresh(template: &Path, config_dir: &Path) -> R
     refresh_developer_provenance_catalog(template, &config_dir, uid)
 }
 
-#[cfg(feature = "triad-dev-harness")]
+#[cfg(any(test, feature = "triad-dev-harness"))]
 fn refresh_developer_provenance_catalog(
     template: &Path,
     config_dir: &Path,
@@ -1504,7 +1504,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "triad-dev-harness")]
     #[test]
     fn developer_catalog_refresh_replaces_stale_release_pins_and_keeps_developer_records() {
         let directory = tempfile::tempdir().unwrap();
