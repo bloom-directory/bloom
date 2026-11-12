@@ -175,7 +175,9 @@ pub enum TxEngineError {
     InvalidTxStatus { id: String, status: String },
     #[error("dependency '{dep_id}' not satisfied: {reason}")]
     DependencyNotSatisfied { dep_id: String, reason: String },
-    #[error("pre-broadcast simulation reverted: {reason} — write 'override' to broadcast anyway")]
+    #[error(
+        "pre-broadcast simulation reverted: {reason} — inspect the request and revert reason; rebuild malformed calldata before retrying"
+    )]
     SimulationReverted { reason: String },
     #[error(
         "nonce gap: tx for {from} uses nonce {staged} but the account's next on-chain nonce is {chain_next} — the node would queue it behind the missing nonce(s) and it could never mine.{blocking} Broadcast the earlier transaction, or discard it and restage with the explicit missing `nonce`. Discarding alone does not renumber this transaction."
@@ -5570,12 +5572,15 @@ fn insufficient_native_funds_check(
 }
 
 /// Approve amount: accepts `"max"` (alias for 2^256 - 1) or a decimal
-/// integer string. Empty falls through to max so the common case
-/// (`{"kind":"approve","token":"…","spender":"…"}`) doesn't require a
-/// magic constant.
+/// integer string in raw token units. Unlimited approval must be explicit.
 fn parse_approve_amount(s: &str) -> Result<U256, String> {
     let t = s.trim();
-    if t.is_empty() || t.eq_ignore_ascii_case("max") {
+    if t.is_empty() {
+        return Err(
+            "amount is required: use raw token units, 0 to revoke, or max for unlimited".into(),
+        );
+    }
+    if t.eq_ignore_ascii_case("max") {
         return Ok(U256::MAX);
     }
     U256::from_str_radix(t, 10).map_err(|e| format!("invalid uint256 '{s}': {e}"))
@@ -5713,6 +5718,22 @@ const _PARSE_UNITS: fn(&str, u8) -> Result<U256, bloom_proto::units::UnitError> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_approval_amounts_and_simulation_guidance() {
+        for amount in ["", " ", "1.5", "-1"] {
+            assert!(super::parse_approve_amount(amount).is_err());
+        }
+        assert_eq!(super::parse_approve_amount("0").unwrap(), U256::ZERO);
+        assert_eq!(super::parse_approve_amount("max").unwrap(), U256::MAX);
+        assert_eq!(super::parse_approve_amount("123").unwrap(), U256::from(123));
+        let error = super::TxEngineError::SimulationReverted {
+            reason: "contract paused".into(),
+        }
+        .to_string();
+        assert!(error.contains("contract paused"));
+        assert!(error.contains("inspect the request"));
+        assert!(!error.contains("override"));
+    }
     use std::{
         sync::atomic::{AtomicBool, Ordering},
         time::Duration,
