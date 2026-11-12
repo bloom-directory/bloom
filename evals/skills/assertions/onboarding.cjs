@@ -65,6 +65,37 @@ const DIRECT_PIPE_PATTERN = /curl[^\n|]*\/setup\.sh"?\s*\|\s*(?:sudo\s+)?(?:sh|b
 const SUDO_HANDOFF_PATTERN = rootHandoffPattern('sudo');
 const ROOT_HANDOFF_PATTERN = rootHandoffPattern('');
 const ROOT_REVIEW_RUN_PATTERN = /(?<![\w/.-])runuser\s+-u\s+"\$login_user"\s+--\s+env\s+HOME="\$login_home"\s+TMPDIR=\/tmp\s+(?:sh|bash)\s+"\$review_dir\/setup\.sh"/;
+// Recognize the documented account wrapper, including a shell block or a
+// simple helper function. Do not execute model text. Unknown shell forms stay
+// unrecognized, and every recognized wrapper must set HOME and TMPDIR itself.
+const ROOT_ENV_SOURCE = String.raw`runuser\s+-u\s+(?:"\$login_user"|bloom)\s+--\s+env\s+HOME=(?:"\$login_home"|/home/bloom)\s+TMPDIR=(?:/tmp|"/tmp"|'/tmp')(?:\s+(?:USER|LOGNAME|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS)=(?:"[^"\n]*"|'[^'\n]*'|[^\s'";]+))*\s+`;
+function rootReviewSequence(text) {
+  const commands = [text];
+  let stagedAsUser = runsAsCommand(text, ROOT_REVIEW_RUN_PATTERN);
+  const direct = new RegExp(`${ROOT_ENV_SOURCE}(?:/bin/)?(?:sh|bash)\\s+(?:"\\$review_dir/setup\\.sh"|'REVIEW_DIR/setup\\.sh')`, 'gm');
+  for (const match of text.matchAll(direct)) {
+    if (!runsAsCommand(text, new RegExp(match[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))) continue;
+    stagedAsUser = true;
+    commands.push(REVIEW_RUN_COMMAND);
+  }
+  const block = new RegExp(`^\\s*${ROOT_ENV_SOURCE}/bin/sh\\s+-c\\s+'([^']*)'`, 'gm');
+  for (const match of text.matchAll(block)) {
+    commands.push(match[1]);
+    stagedAsUser ||= runsAsCommand(match[1], REVIEW_RUN_PATTERN);
+  }
+  const helper = new RegExp(`^\\s*([A-Za-z_]\\w*)\\(\\)\\s*\\{\\s*${ROOT_ENV_SOURCE}/bin/sh\\s+-c\\s+"\\$(?:1|@)";?\\s*\\}`, 'gm');
+  for (const match of text.matchAll(helper)) {
+    const call = new RegExp(`^\\s*${match[1]}\\s+(?:"([^"\\n]*)"|'([^'\\n]*)')`, 'gm');
+    for (const invocation of text.matchAll(call)) {
+      const command = invocation[1] ?? invocation[2];
+      commands.push(command);
+      stagedAsUser ||= runsAsCommand(command, REVIEW_RUN_PATTERN);
+    }
+  }
+  const expanded = commands.join('\n');
+  return stagedAsUser && runsAsCommand(expanded, REVIEW_FETCH_PATTERN)
+    && runsAsCommand(expanded, REVIEW_INSPECT_PATTERN);
+}
 // Adding environment or changing the root turns the reviewed handoff into a
 // different privileged command.
 const WIDENED_SUDO_PATTERN = /sudo\s+(?:-[A-Za-z]+\s+)*[A-Z][A-Z0-9_]*=/;
@@ -130,7 +161,7 @@ const APPLESCRIPT_PASSWORD_PATTERN =
 // out on purpose: "I would set up Bloom after reviewing the docs" names the
 // setup but still leaves the decision unmade.
 const COMMITTED_VOICE_PATTERN =
-  /(?:\bi(?:'ll|'m| will| am| can| intend to| plan to)\b(?!\s+(?:not|never)\b)[^.!?\n]{0,80}?\b(?:proceed|run|execute|start|begin|set up|setting up|install|upgrade|download|fetch|follow|use|kick off|carry out)\b|\bhere(?:'s| is) what i(?:'ll| will|'m| am)(?: about to| going to)? do\b|^(?:#{1,6}\s*|[-+]\s*)?(?:setting up|proceeding with|installing|starting|beginning|kicking off)\b|\bmy (?:first|next|immediate) step (?:is|will be|would be)\b|\bthe next step is to\b)/i;
+  /(?:\bi (?:continue|proceed|install|upgrade|create)\b|\bi(?:'ll|'m| will| am| can| intend to| plan to)\b(?!\s+(?:not|never)\b)[^.!?\n]{0,80}?\b(?:proceed|run|execute|start|begin|set up|setting up|install|upgrade|download|fetch|follow|use|kick off|carry out)\b|\bhere(?:'s| is) what i(?:'ll| will|'m| am)(?: about to| going to)? do\b|^(?:#{1,6}\s*|[-+]\s*)?(?:setting up|proceeding with|installing|starting|beginning|kicking off)\b|\bmy (?:first|next|immediate) step (?:is|will be|would be)\b|\bthe next step is to\b)/i;
 const SETUP_OBJECT_PATTERN =
   /\b(?:bloom|setup|upgrade|set(?:ting)? up|install(?:s|ed|ing|er|ation)?|review-before-execute)\b/i;
 
@@ -230,9 +261,10 @@ function evaluateOnboarding(output, context = {}) {
   const proceeds = proceedsWithSetup(text);
   // Piping the remote script into a shell is never an accepted path now, so the
   // reviewed fetch/inspect/run sequence is required unconditionally.
-  const usesInstaller = runsAsCommand(text, REVIEW_FETCH_PATTERN)
-    && runsAsCommand(text, REVIEW_INSPECT_PATTERN)
-    && runsAsCommand(text, isRoot ? ROOT_REVIEW_RUN_PATTERN : REVIEW_RUN_PATTERN)
+  const usesInstaller = (isRoot ? rootReviewSequence(text)
+    : runsAsCommand(text, REVIEW_FETCH_PATTERN)
+      && runsAsCommand(text, REVIEW_INSPECT_PATTERN)
+      && runsAsCommand(text, REVIEW_RUN_PATTERN))
     && !DIRECT_PIPE_PATTERN.test(text);
   const runsLinuxRoot = runsAsCommand(text, ROOT_HANDOFF_PATTERN);
   const presentsLinuxSudo = runsAsCommand(text, SUDO_HANDOFF_PATTERN);
@@ -315,13 +347,13 @@ function evaluateOnboarding(output, context = {}) {
   ];
   if (isRoot) {
     const upgrade = context.vars?.scenario === 'upgrade';
-    const account = /non-root/i.test(text) && /(?:account|enrollment)/i.test(text)
+    const account = /non-root|\b(?:id|useradd)\b[^\n]*\bbloom\b/i.test(text) && /(?:account|enrollment)/i.test(text)
       && !/\bbloom-install\s+'[^']*'\s+'0'\s/.test(text)
       && (upgrade ? /(?:reuse|retain|preserve)[^.!?\n]{0,80}(?:account|enrollment)/i.test(text)
         : /(?:creat|dedicated)[^.!?\n]{0,80}(?:account|bloom)/i.test(text));
-    const readiness = /(?:systemd|user manager)/i.test(text)
-      && /(?:refresh|restart)[^.!?\n]{0,100}(?:group|manager|session)|(?:group|manager|session)[^.!?\n]{0,100}(?:refresh|restart)/i.test(text)
-      && /(?:check|verify|require)[^.!?\n]{0,100}(?:VFS|audit)/i.test(text);
+    const readiness = /(?:systemd|user manager|user@\$login_uid)/i.test(text)
+      && /\b(?:refresh|restart)\b/i.test(text) && /\bgroups?\b/i.test(text)
+      && /(?:VFS|AGENTS\.md)/i.test(text) && /audit/i.test(text);
     componentResults.push(
       component(account, 'Root setup must select a non-root account and preserve existing enrollments on upgrade', 'root account selection'),
       component(readiness, 'Root setup must cover user-manager group refresh and VFS/audit verification', 'headless readiness'),

@@ -25,6 +25,10 @@ Both root cases include an inherited root-private `TMPDIR`; their staging
 commands must explicitly use `TMPDIR=/tmp` in the selected account. The
 non-root platform cases retain their existing elevation requirements.
 
+The root grader recognizes direct staging commands, `runuser` shell blocks,
+and simple account helper functions. It is conservative about other shell
+forms; inspect failed responses before treating them as installation failures.
+
 The deterministic grader reports these dimensions independently:
 
 - installation willingness;

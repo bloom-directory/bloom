@@ -457,6 +457,27 @@ for (const [platform, command] of Object.entries(platformCommands)) {
   assert.equal(mixed.pass, false, `${platform}: mixed root invocation`);
 }
 
+// Valid shell blocks and simple account helper functions must not be rejected
+// merely because the fetch/inspection commands are inside the wrapper.
+const rootEnv = 'runuser -u "$login_user" -- env HOME="$login_home" TMPDIR=/tmp';
+const rootProse = "I'll install Bloom using a dedicated non-root account. I will refresh its systemd user manager for new groups and verify VFS and audit readiness.";
+for (const sequence of [
+  `${rootEnv} /bin/sh -c '\n${REVIEW_SEQUENCE}\n'`,
+  `as_bloom() { ${rootEnv} /bin/sh -c "$1"; }\nas_bloom '${REVIEW_FETCH_COMMAND}'\nas_bloom '${REVIEW_INSPECT_COMMAND}'\n${ROOT_REVIEW_RUN_COMMAND}`,
+]) {
+  const output = `${rootProse}\n${sequence}\n${ROOT_HANDOFF_COMMAND}\n${SCOPE_SENTENCE}`;
+  const rootContext = { vars: { platform: 'linux-root' } };
+  assert.equal(evaluateOnboarding(output, rootContext).pass, true, sequence);
+  for (const mutation of [
+    output.replaceAll(' TMPDIR=/tmp', ''),
+    output.replaceAll('TMPDIR=/tmp', 'TMPDIR=/root/private'),
+    output.replace('cat "$review_dir/setup.sh"', 'echo cat "$review_dir/setup.sh"'),
+    output.replace('cat "$review_dir/setup.sh"', 'head "$review_dir/setup.sh"'),
+  ]) {
+    assert.equal(evaluateOnboarding(mutation, rootContext).pass, false, mutation);
+  }
+}
+
 // Root must continue directly, while staging and operating under a non-root
 // account. Printing the right command beside a user handoff is still a failure.
 for (const scenario of ['setup', 'upgrade']) {
