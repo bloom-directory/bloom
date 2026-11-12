@@ -1287,9 +1287,17 @@ fn machine_command_event_fields(
             Some(operation_id.clone()),
             MachineCommandEventClass::DurableMutation,
         ),
-        MachineCommand::WalletDefaultPolicy { .. } => {
-            ("default_policy", None, MachineCommandEventClass::Prepared)
-        }
+        // A waiting command's poll after its ceremony is announced proposes
+        // nothing, so it is logged as a read, not every two seconds.
+        MachineCommand::WalletDefaultPolicy { observe_only, .. } => (
+            "default_policy",
+            None,
+            if *observe_only {
+                MachineCommandEventClass::Read
+            } else {
+                MachineCommandEventClass::Prepared
+            },
+        ),
         MachineCommand::WalletOutboxCancel { id, .. } => (
             "wallet_outbox_cancel",
             Some(id.clone()),
@@ -1786,11 +1794,7 @@ async fn execute_machine_command(
         MachineCommand::WalletPolicyCommit { operation_id } => {
             commit_policy_update(home, machine_broker()?, operation_id).await?
         }
-        MachineCommand::WalletDefaultPolicy {
-            name,
-            owner_just_chose,
-            observe_only,
-        } => {
+        MachineCommand::WalletDefaultPolicy { name, observe_only } => {
             validate_wallet_name(&name).map_err(|error| {
                 machine_error(
                     MachineErrorKind::InvalidParams,
@@ -1800,7 +1804,7 @@ async fn execute_machine_command(
             let status = default_policy::advance_default_policy(
                 daemon,
                 &name,
-                default_policy::DefaultPolicyMode::of_command(owner_just_chose, observe_only),
+                default_policy::DefaultPolicyMode::of_command(observe_only),
             )
             .await?;
             format!("{}\n", serde_json::to_string(&status)?)
@@ -3807,8 +3811,10 @@ async fn run(cli: Cli) -> Result<()> {
                     default_policy::accept_setup_suggestions(d.config.setup.main_mut());
                 }
                 d.config.setup.complete = true;
+                // Only `[setup]` is written: the rest of the owner's config,
+                // comments included, stays as they wrote it.
                 d.config
-                    .save(&d.home.config_path())
+                    .save_setup(&d.home.config_path())
                     .context("save setup choices")?;
             }
             let preinstalled = github_source::ensure_preinstalled_petals(&home, &d)
@@ -4565,7 +4571,7 @@ async fn run(cli: Cli) -> Result<()> {
                         // running when its update would activate, and a
                         // download can fail. Those installs are tried again
                         // rather than left out.
-                        petal_provisioning::provision_and_retry(&daemon, &context, |_| {})
+                        petal_provisioning::provision_and_retry(&daemon, &context)
                     }));
             }));
             // Start audited and durable background effects only after every

@@ -4022,8 +4022,9 @@ fn saved_default_policy_setup(
 }
 
 /// The fixed contracts a chosen Petal transacts with, as Broker policy
-/// destinations. The table lives in Bloom's source, never in config.
-fn default_policy_destinations(name: &str) -> Vec<bloom_broker_api::PolicyDestination> {
+/// destinations. The table lives in Bloom's source, never in config, and a
+/// test checks every entry is a valid destination, so none is dropped here.
+pub fn default_policy_destinations(name: &str) -> Vec<bloom_broker_api::PolicyDestination> {
     bloom_proto::petal_destinations::for_petal(name)
         .iter()
         .filter_map(|destination| {
@@ -4038,7 +4039,6 @@ fn default_policy_destinations(name: &str) -> Vec<bloom_broker_api::PolicyDestin
 /// All wired-up state the daemon owns. Cheap to clone (everything is
 /// behind Arc/clone-safe inner types).
 #[derive(Clone)]
-
 pub struct Daemon {
     deployment_locks: Arc<deployment::DeploymentLocks>,
     pub home: HomeDir,
@@ -5246,19 +5246,17 @@ impl Daemon {
 
     /// Propose every package in `packages` and every destination in
     /// `destinations` together through the wallet's existing policy
-    /// operation. `Allowed` means the policy allows
-    /// all of them. Once the policy has
-    /// changed since creation, they are proposed only when `after_change` is
-    /// [`bloom_vfs::handlers::AfterPolicyChange::Propose`].
+    /// operation. `Allowed` means the policy allows all of them. Only the
+    /// policy wallet creation installed is added to: once it has changed,
+    /// nothing is proposed.
     pub async fn ensure_default_policy(
         &self,
         wallet: &str,
         packages: &[bloom_broker_api::Digest32],
         destinations: &[bloom_broker_api::PolicyDestination],
-        after_change: bloom_vfs::handlers::AfterPolicyChange,
     ) -> Result<bloom_machine_client::PetalEligibility, bloom_vfs::HandlerError> {
         self.wallets
-            .ensure_petal_packages_allowed(wallet, packages, destinations, after_change)
+            .ensure_petal_packages_allowed(wallet, packages, destinations)
             .await
     }
 
@@ -5275,14 +5273,6 @@ impl Daemon {
         self.wallets
             .reconciled_policy(wallet, packages, destinations)
             .await
-    }
-
-    /// `wallet`'s current policy, read from Broker and verified.
-    pub async fn current_wallet_policy(
-        &self,
-        wallet: &str,
-    ) -> Result<bloom_broker_api::SignedPolicySnapshot, bloom_vfs::HandlerError> {
-        self.wallets.current_policy(wallet).await
     }
 
     /// Idempotent: ensure background workers are running. Already
@@ -6364,25 +6354,50 @@ mod tests {
         // misspelt name are ignored though a config names them.
         assert_eq!(setup.not_installed, ["hyperliquid", "polymarket"]);
 
-        // Hyperliquid installed: its package and destinations are proposed.
-        let hash = "ab".repeat(32);
-        std::fs::create_dir_all(store.package_path(&hash).unwrap()).unwrap();
+        // Installed: each package is proposed, with the destinations its
+        // transactions need: none for Hyperliquid, `petal:polymarket` on
+        // Polygon for Polymarket.
         std::fs::create_dir_all(temp.path().join("owners")).unwrap();
-        std::fs::write(
-            temp.path().join("owners/hyperliquid.json"),
-            serde_json::json!({"name": "hyperliquid", "hash": hash}).to_string(),
-        )
-        .unwrap();
+        let install = |name: &str, hash: &str| {
+            std::fs::create_dir_all(store.package_path(hash).unwrap()).unwrap();
+            std::fs::write(
+                temp.path().join("owners").join(format!("{name}.json")),
+                serde_json::json!({"name": name, "hash": hash}).to_string(),
+            )
+            .unwrap();
+        };
+        install("hyperliquid", &"ab".repeat(32));
         let setup = default_policy_setup(&store, &chosen).unwrap();
         assert_eq!(setup.not_installed, ["polymarket"]);
         assert_eq!(
             setup.packages,
-            [bloom_broker_api::Digest32::new(hash).unwrap()]
+            [bloom_broker_api::Digest32::new("ab".repeat(32)).unwrap()]
         );
+        assert!(setup.destinations.is_empty());
+        install("polymarket", &"cd".repeat(32));
+        let setup = default_policy_setup(&store, &chosen).unwrap();
+        assert!(setup.not_installed.is_empty());
+        assert_eq!(setup.packages.len(), 2);
         assert_eq!(
             setup.destinations,
-            default_policy_destinations("hyperliquid")
+            default_policy_destinations("polymarket")
         );
+        assert!(
+            setup
+                .destinations
+                .contains(&bloom_broker_api::PolicyDestination {
+                    chain: bloom_broker_api::Token::new("polygon").unwrap(),
+                    destination: "petal:polymarket".into(),
+                })
+        );
+        // Every catalog destination is a valid one, so none is dropped.
+        for name in bloom_proto::config::SETUP_PETALS {
+            assert_eq!(
+                default_policy_destinations(name).len(),
+                bloom_proto::petal_destinations::for_petal(name).len(),
+                "{name}"
+            );
+        }
 
         std::fs::write(temp.path().join("owners/polymarket.json"), b"not json").unwrap();
         let error = default_policy_setup(&store, &chosen).unwrap_err();

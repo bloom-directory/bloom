@@ -368,17 +368,18 @@ enum ListMode {
 
 /// The `petal:<name>` allow-list entry covering this transaction, if any.
 /// Petal names are case-sensitive (`Near-Intents` and `near-intents` are two
-/// Petals), so the entry must name exactly the Petal that staged it.
+/// Petals), and Broker compares the entry byte for byte, so it must name
+/// exactly the Petal that staged it, with nothing trimmed.
 fn petal_destination_entry(policy: &Policy, ctx: &AddressContext) -> Option<String> {
-    let staged_by = ctx.staged_by_petal.as_deref()?.trim();
-    if staged_by.is_empty() || !staged_by.starts_with("petal:") {
+    let staged_by = ctx.staged_by_petal.as_deref()?;
+    if !staged_by.starts_with("petal:") || staged_by == "petal:" {
         return None;
     }
     policy
         .allowlists
         .recipients
         .iter()
-        .find(|entry| entry.trim() == staged_by)
+        .find(|entry| entry.as_str() == staged_by)
         .cloned()
 }
 
@@ -589,10 +590,14 @@ mod tests {
 
     #[test]
     fn a_petal_entry_covers_only_the_petal_it_names_exactly() {
-        // Another Petal whose name differs only in case is a different Petal.
+        // Another Petal whose name differs only in case is a different Petal,
+        // and nothing is trimmed: Broker compares the entry byte for byte.
         for (entry, origin) in [
             ("petal:near-intents", "petal:Near-Intents"),
             ("petal:NEAR-INTENTS", "petal:near-intents"),
+            (" petal:near-intents", "petal:near-intents"),
+            ("petal:near-intents", "petal:near-intents "),
+            ("petal:", "petal:"),
         ] {
             assert!(
                 has_hard_violation(&evaluate(

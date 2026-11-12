@@ -1003,6 +1003,34 @@ fn init_runs_setup_once_even_when_the_config_already_exists() {
     );
 }
 
+/// On a home whose config predates setup, `bloom init` adds `[setup]` and
+/// leaves the rest of the owner's config as they wrote it, comments included.
+#[test]
+fn init_keeps_an_existing_hand_edited_config() {
+    let home = fresh_home();
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    home_dir.ensure().unwrap();
+    bloom_proto::Config::local_default()
+        .save(&home_dir.config_path())
+        .unwrap();
+    let original = std::fs::read_to_string(home_dir.config_path()).unwrap();
+    let edited = format!("# my RPC notes: keep this\n{original}");
+    std::fs::write(home_dir.config_path(), &edited).unwrap();
+    bloom_cmd(home.path())
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("https_proxy", "http://127.0.0.1:1")
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .arg("init")
+        .assert()
+        // Setup is saved before Petal provisioning, which is offline here.
+        .failure();
+    let after = std::fs::read_to_string(home_dir.config_path()).unwrap();
+    assert!(after.starts_with(&edited), "{after}");
+    let config = bloom_proto::Config::load(&home_dir.config_path()).unwrap();
+    assert!(config.setup.complete);
+}
+
 /// Choices recorded before setup finished, as by a run that stopped
 /// part-way, are kept when `bloom init` runs setup again: a declined Petal
 /// stays declined.

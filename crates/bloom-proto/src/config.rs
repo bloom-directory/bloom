@@ -105,6 +105,24 @@ pub struct PetalsConfig {
     pub runtime: BTreeMap<String, PetalRuntimeConfig>,
 }
 
+/// Replace the file at `path`, or the file a symbolic link there points to,
+/// with `bytes` in one step: a sibling is written, synced and renamed over
+/// it, with the replaced file's permissions.
+fn replace_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let target = std::fs::canonicalize(path)?;
+    let directory = target.parent().unwrap_or_else(|| Path::new("."));
+    let mut sibling = tempfile::NamedTempFile::new_in(directory)?;
+    sibling
+        .as_file()
+        .set_permissions(std::fs::metadata(&target)?.permissions())?;
+    sibling.write_all(bytes)?;
+    sibling.as_file().sync_all()?;
+    sibling.persist(&target).map_err(|error| error.error)?;
+    Ok(())
+}
+
 /// What setup chose, as the top-level `[setup]` table. It is not part of
 /// `[petals]`: a Bloom release refuses unknown keys there, but ignores an
 /// unknown top-level table, so a home this setup ran on still starts with an
@@ -580,6 +598,48 @@ impl Config {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(path, s)?;
+        Ok(())
+    }
+
+    /// Save only `[setup]` into the config at `path`, leaving everything else
+    /// in the file as its owner wrote it, comments and layout included. The
+    /// file is replaced in one step, keeping its permissions, so a crash
+    /// leaves the old config whole; a symbolic link at `path` is kept and the
+    /// file it points to is replaced. Without a file there, the whole config
+    /// is saved.
+    pub fn save_setup(&self, path: &Path) -> Result<(), ConfigError> {
+        let existing = match std::fs::read_to_string(path) {
+            Ok(existing) => existing,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return self.save(path),
+            Err(error) => return Err(error.into()),
+        };
+        let mut document: toml_edit::DocumentMut = existing
+            .parse()
+            .map_err(|error| ConfigError::Invalid(format!("{error}")))?;
+        #[derive(Serialize)]
+        struct Setup<'a> {
+            #[serde(skip_serializing_if = "SetupConfig::is_empty")]
+            setup: &'a SetupConfig,
+        }
+        // Appended after everything else rather than merged in, so no table
+        // of the owner's moves.
+        document.remove("setup");
+        let mut text = document.to_string().trim_end().to_owned();
+        text.push('\n');
+        let setup = toml::to_string_pretty(&Setup { setup: &self.setup })?;
+        if !setup.trim().is_empty() {
+            text.push('\n');
+            text.push_str(&setup);
+        }
+        // What is written must load back as this setup.
+        let saved: Config = toml::from_str(&text)?;
+        if saved.setup.wallets != self.setup.wallets || saved.setup.complete != self.setup.complete
+        {
+            return Err(ConfigError::Invalid(
+                "the saved [setup] does not read back as written".into(),
+            ));
+        }
+        replace_file(path, text.as_bytes())?;
         Ok(())
     }
 
@@ -1869,5 +1929,60 @@ rpc_urls = ["https://mainnet.optimism.io"]
         ))
         .unwrap();
         assert!(later.setup.main().petals.contains_key("polymarket"));
+    }
+    /// Saving setup into an existing config changes only `[setup]`: the
+    /// owner's comments and every other setting stay as they wrote them,
+    /// a link to the config stays a link, and its permissions are kept.
+    #[cfg(unix)]
+    #[test]
+    fn saving_setup_keeps_the_rest_of_the_config_as_written() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let td = tempdir().unwrap();
+        let real = td.path().join("dotfiles").join("bloom.toml");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        let written = format!(
+            "# my RPC notes: keep this\n{}",
+            toml::to_string_pretty(&Config::local_default()).unwrap()
+        );
+        std::fs::write(&real, &written).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let path = td.path().join("config.toml");
+        std::os::unix::fs::symlink(&real, &path).unwrap();
+
+        let mut cfg = Config::load(&path).unwrap();
+        cfg.setup.complete = true;
+        cfg.setup
+            .main_mut()
+            .petals
+            .insert("polymarket".into(), PetalSetupConfig::default());
+        cfg.save_setup(&path).unwrap();
+        let saved = std::fs::read_to_string(&real).unwrap();
+        assert!(saved.starts_with(&written), "{saved}");
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let loaded = Config::load(&path).unwrap();
+        assert!(loaded.setup.complete);
+        assert!(loaded.setup.main().petals.contains_key("polymarket"));
+        let names: Vec<String> = std::fs::read_dir(real.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, ["bloom.toml"], "no sibling is left behind");
+
+        // Saving again replaces `[setup]` rather than adding another.
+        cfg.setup.main_mut().petals.clear();
+        cfg.save_setup(&path).unwrap();
+        let saved = std::fs::read_to_string(&real).unwrap();
+        assert_eq!(saved.matches("[setup]").count(), 1, "{saved}");
+        assert!(Config::load(&path).unwrap().setup.main().petals.is_empty());
     }
 }

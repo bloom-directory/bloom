@@ -815,13 +815,6 @@ pub enum MachineCommand {
     /// operation, and report where that default policy stands.
     WalletDefaultPolicy {
         name: String,
-        /// Set only by a flow that has just recorded the owner's Petal choice,
-        /// such as browser onboarding. It proposes that choice even after the
-        /// wallet's policy has changed since creation; without it nothing is
-        /// proposed then, so a stale setup choice never restores what the
-        /// owner removed.
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        owner_just_chose: bool,
         /// Set by a command waiting on a ceremony it has already announced:
         /// settle and report, committing a change the owner approved, but
         /// propose nothing, so an owner who leaves the link is not handed a

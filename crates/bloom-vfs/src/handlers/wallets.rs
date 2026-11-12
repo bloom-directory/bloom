@@ -347,14 +347,15 @@ pub trait AccountPetalMount: Send + Sync {
         slot: &str,
     ) -> Result<(), HandlerError>;
 }
-/// What a default-policy request does once the wallet's policy has changed
-/// since wallet creation. A named type rather than a `bool`, so another flag
-/// passed in the same position does not compile.
+/// What a request does once the wallet's policy has changed since wallet
+/// creation. A named type rather than a `bool`, so another flag passed in the
+/// same position does not compile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AfterPolicyChange {
-    /// Report what the policy lacks and propose nothing.
+enum AfterPolicyChange {
+    /// Report what the policy lacks and propose nothing: the default policy,
+    /// so nothing the owner removed is proposed again.
     Report,
-    /// Propose it: the owner has just chosen it.
+    /// Propose it: a Petal's own use, which asks only for its package.
     Propose,
 }
 
@@ -389,11 +390,9 @@ pub struct DefaultPolicySetup {
 /// without proposing anything.
 #[derive(Debug, Clone)]
 pub enum ReconciledPolicy {
-    /// A change still waits for the owner, viewed against the request, with
-    /// the policy it proposes.
+    /// A change still waits for the owner, viewed against the request.
     Awaiting {
         pending: Box<bloom_machine_client::PendingPolicyUpdate>,
-        proposed: Box<bloom_broker_api::CanonicalWalletPolicy>,
     },
     /// No change waits: the verified current policy, including any change
     /// the owner approved meanwhile.
@@ -416,11 +415,11 @@ fn includes(
 
 /// Whether `proposed` is `current` with nothing but a default-policy request
 /// added: it keeps everything `current` allows, adds only packages from
-/// `required` and destinations from `destinations`, and changes nothing
-/// else. A change
-/// that also carries anything more, such as an agent's proposal of the
-/// default policy plus a destination of its own, is somebody else's, so it is
-/// never presented to the owner as the default policy.
+/// `required` and destinations from `destinations`, changes nothing else, and
+/// adds something. A change that also carries anything more, such as an
+/// agent's proposal of the default policy plus a destination of its own, is
+/// somebody else's, and so is one that changes nothing, so neither is ever
+/// presented to the owner as the default policy.
 fn adds_only(
     current: &bloom_broker_api::CanonicalWalletPolicy,
     proposed: &bloom_broker_api::CanonicalWalletPolicy,
@@ -441,7 +440,8 @@ fn adds_only(
         && proposed.allowed_destinations.iter().all(|destination| {
             current.allowed_destinations.contains(destination) || destinations.contains(destination)
         });
-    packages_only
+    proposed != current
+        && packages_only
         && destinations_only
         && proposed.maximum_approval_lifetime_ms == current.maximum_approval_lifetime_ms
         && proposed.wallet_id == current.wallet_id
@@ -2086,17 +2086,13 @@ impl WalletsHandler {
         // is the Broker policy version, not the package list: once the owner
         // has committed any change, later proposals add only the requested
         // package, so a Petal the owner removed is never proposed again behind
-        // another.
-        let setup = match &self.default_policy_packages {
-            Some(defaults) => defaults(wallet),
-            None => Ok(DefaultPolicySetup::default()),
-        };
+        // another. The setup is read only when that first proposal is made.
         self.ensure_policy_allows(
             wallet,
             std::slice::from_ref(package_hash),
             std::slice::from_ref(package_hash),
             &[],
-            setup.as_ref(),
+            self.default_policy_packages.as_ref(),
             AfterPolicyChange::Propose,
             WaitingMatch::Includes,
         )
@@ -2105,17 +2101,15 @@ impl WalletsHandler {
 
     /// Drive a wallet's default policy: propose every package and destination
     /// together through the existing policy operation. `Allowed` means the
-    /// policy allows all of them. Once any change has been committed, nothing
-    /// is proposed unless `after_change` is [`AfterPolicyChange::Propose`]
-    /// because the owner has just chosen these again, so a Petal or destination
-    /// the owner removed is reported as `ChangedSinceCreation` instead of being
-    /// proposed again.
+    /// policy allows all of them. Only the policy wallet creation installed
+    /// is added to: once any change has been committed, nothing is proposed,
+    /// so a Petal or destination the owner removed is reported as
+    /// `ChangedSinceCreation` instead of being proposed again.
     pub async fn ensure_petal_packages_allowed(
         &self,
         wallet: &str,
         packages: &[bloom_broker_api::Digest32],
         destinations: &[bloom_broker_api::PolicyDestination],
-        after_change: AfterPolicyChange,
     ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
         if packages.is_empty() {
             return Err(HandlerError::invalid("no packages to allow"));
@@ -2125,8 +2119,8 @@ impl WalletsHandler {
             packages,
             packages,
             destinations,
-            Ok(&DefaultPolicySetup::default()),
-            after_change,
+            None,
+            AfterPolicyChange::Report,
             WaitingMatch::Only,
         )
         .await
@@ -2149,8 +2143,6 @@ impl WalletsHandler {
         let _lock = self.lock_wallet_policy_update(wallet)?;
         match self.reconcile_policy_updates_locked(wallet).await? {
             PolicyBaseline::Awaiting(projection) => {
-                let proposed =
-                    serde_json::from_slice(&projection.retained_policy_bytes()?).map_err(err_be)?;
                 // Whether the waiting change is the request's own is judged
                 // against the current policy, so a failed read is reported,
                 // never guessed.
@@ -2159,7 +2151,6 @@ impl WalletsHandler {
                     bloom_machine_client::PetalEligibility::AwaitingPolicyApproval(pending) => {
                         Ok(ReconciledPolicy::Awaiting {
                             pending: Box::new(pending),
-                            proposed: Box::new(proposed),
                         })
                     }
                     _ => Err(HandlerError::backend(
@@ -2171,15 +2162,6 @@ impl WalletsHandler {
         }
     }
 
-    /// Read and verify `wallet`'s current policy from Broker.
-    pub async fn current_policy(
-        &self,
-        wallet: &str,
-    ) -> Result<bloom_broker_api::SignedPolicySnapshot, HandlerError> {
-        let _lock = self.lock_wallet_policy_update(wallet)?;
-        Ok(self.current_policy_locked(wallet).await?.0)
-    }
-
     #[allow(clippy::too_many_arguments)]
     async fn ensure_policy_allows(
         &self,
@@ -2187,11 +2169,11 @@ impl WalletsHandler {
         required: &[bloom_broker_api::Digest32],
         additions: &[bloom_broker_api::Digest32],
         destinations: &[bloom_broker_api::PolicyDestination],
-        // Added only while the policy is still the one wallet creation
-        // installed, so one ceremony makes every chosen Petal usable instead
-        // of gating each one. If it could not be read, nothing is proposed
-        // while that is the case.
-        first_proposal: Result<&DefaultPolicySetup, &HandlerError>,
+        // Reads what is added only while the policy is still the one wallet
+        // creation installed and does not allow the request, so one ceremony
+        // makes every chosen Petal usable instead of gating each one. If it
+        // cannot be read, nothing is proposed while that is the case.
+        first_proposal: Option<&DefaultPolicyPackages>,
         // Whether to propose the request once the policy is no longer the one
         // wallet creation installed.
         after_change: AfterPolicyChange,
@@ -2260,7 +2242,9 @@ impl WalletsHandler {
         // for so a pending change is judged against the request alone.
         let mut proposed_destinations = destinations.to_vec();
         if creation_policy {
-            let first_proposal = first_proposal.map_err(|error| {
+            let first_proposal = first_proposal
+                .map_or_else(|| Ok(DefaultPolicySetup::default()), |read| read(wallet))
+                .map_err(|error| {
                 HandlerError::backend(format!(
                     "the Petals chosen during setup could not be read, so no policy was proposed for wallet {wallet}: {error}"
                 ))
@@ -5188,7 +5172,10 @@ mod tests {
         request.allowed_petal_packages.push(asked.clone());
         request.allowed_destinations.push(destination("0x02"));
         assert!(own(&request));
-        assert!(own(&current), "adding nothing is still the request");
+        assert!(
+            !own(&current),
+            "a change that adds nothing is not the request"
+        );
 
         let mut more = request.clone();
         more.allowed_petal_packages

@@ -29,6 +29,7 @@ alloy.workspace = true
 dirs.workspace = true
 url.workspace = true
 fs2.workspace = true
+tempfile.workspace = true
+toml_edit.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true

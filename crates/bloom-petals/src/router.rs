@@ -110,10 +110,6 @@ pub struct PetalRouter {
     runtime_petals: BTreeMap<String, PetalRuntimeConfig>,
     audit: Option<Arc<AuditLog>>,
     audit_effect_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Writes to each Petal share its lock; a conditional write holds it
-    /// alone. Keyed by Petal rather than path, so a route reached by two
-    /// paths is still covered. A Petal cannot write under `petals/`, so its
-    /// own callbacks never wait on these.
     account_contexts: Arc<Mutex<AccountContextCache>>,
     account_context_reuse: Duration,
     last_errors: Arc<Mutex<BTreeMap<String, LastWriteError>>>,
@@ -1357,11 +1353,6 @@ name = "example"
         );
     }
 
-    /// A conditional write checks whether the Petal stores the key in the
-    /// route's account partition, never writes the Petal root or its
-    /// documents, and holds the Petal alone: it gives up while a write to the
-    /// Petal runs, and an ordinary write waits for it. Its failures never
-    /// replace the error record an agent's write left.
     #[tokio::test]
     async fn explicit_account_directory_uses_guest_metadata() {
         let (dir, runner) = runner();

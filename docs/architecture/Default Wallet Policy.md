@@ -1,8 +1,8 @@
 # Default Wallet Policy
 
-**Status:** implemented in `feat/default-policy-core`. Personas, persona
-switching and Petal settings written from setup follow in
-`feat/default-policy`, after bloom-broker#112 and bloom#377.
+**Status:** implemented. Personas, persona switching and Petal settings
+written from setup follow separately (bloom-directory/bloom#465), after
+bloom-directory/bloom-broker#112 and bloom-directory/bloom#377.
 **Audience:** Bloom engineers, Petal authors, and implementation agents
 
 A new Bloom user should go from installing Bloom to using their Petals by
@@ -54,7 +54,9 @@ created before setup existed, or a packaged install that never runs
    If a chosen Petal is missing then, the use proposes nothing and fails with
    `DEFAULT_POLICY_WAITING`, naming it: its proposal would carry the setup
    without that Petal, and once approved, the policy would no longer be the
-   creation one, so the missing Petal would never be proposed. Machine passes
+   creation one, so the missing Petal would never be proposed. The setup is
+   read only for that first proposal: a use the policy already allows reads
+   nothing of it. Machine passes
    that error to the Petal as a backend error, not a denial, so the Petal
    shows the agent its text, and logs it.
 5. **Only setup's Petals.** Only the Petals setup offers
@@ -79,7 +81,9 @@ so a home setup ran on still starts with an older Bloom. `complete` records
 that setup finished, so declining every Petal stays a valid, remembered
 choice. Each chosen Petal is a table
 (`[setup.wallets.main.petals.polymarket]`) so later per-Petal choices fit
-without changing the layout.
+without changing the layout. `bloom init` writes only `[setup]`, appended to
+the config in one atomic replace, so the rest of the owner's config, comments
+included, stays as they wrote it.
 
 ### The request
 

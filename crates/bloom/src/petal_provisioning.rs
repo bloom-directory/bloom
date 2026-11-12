@@ -175,22 +175,23 @@ fn provision_attempts(
 }
 
 /// Install the catalog Petals, then try again those refused while their
-/// code ran or whose download failed, until Machine stops. `on_installed`
-/// receives the first pass's results and each retry round's.
+/// code ran or whose download failed, until Machine stops. Returns the first
+/// pass's results.
 pub(crate) fn provision_and_retry(
     daemon: &Daemon,
     context: &IpcOperationContext,
-    on_installed: impl FnMut(&[ProvisioningResult]),
 ) -> Vec<ProvisioningResult> {
     provision_and_retry_using(
         daemon,
         context,
         github_source::prepare_prebuilt_release_petal,
-        on_installed,
+        |_| {},
     )
 }
 
-/// [`provision_and_retry`] with the download supplied.
+/// [`provision_and_retry`] with the download supplied. `on_installed`
+/// receives the first pass's results and each retry round's, so tests can
+/// follow the rounds.
 fn provision_and_retry_using(
     daemon: &Daemon,
     context: &IpcOperationContext,
@@ -237,7 +238,8 @@ fn is_busy(error: &anyhow::Error) -> bool {
 /// it, so agents calling it back to back cannot starve the update, while no
 /// call waits on it for long. A Petal the owner installed, updated or
 /// uninstalled since its attempt is left as they made it. `on_retried`
-/// receives each round's results. `acquire` downloads a release.
+/// receives each round's results, for tests to follow. `acquire` downloads a
+/// release.
 fn retry_pending(
     daemon: &Daemon,
     context: &IpcOperationContext,
@@ -670,11 +672,10 @@ name = "enso"
         );
     }
 
-    /// Serve's install pass hands its results on, then tries a busy install
-    /// again under a context that queues for its turn to activate, and hands
-    /// that round's results on too.
+    /// Serve's install pass tries a busy install again under a context that
+    /// queues for its turn to activate, and both rounds' results are seen.
     #[test]
-    fn a_retried_install_queues_and_its_results_are_handed_on() {
+    fn a_retried_install_queues_for_its_turn() {
         let home = tempfile::tempdir().unwrap();
         let daemon = Daemon::from_home(bloom_proto::HomeDir::at(home.path())).unwrap();
         let acquired = RefCell::new(Vec::new());

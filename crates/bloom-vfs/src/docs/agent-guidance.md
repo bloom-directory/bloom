@@ -121,8 +121,9 @@ A Petal operation that needs a policy change answers
 ceremony expires unapproved, retry the operation: Broker retires the expired
 ceremony and Machine answers with a new `ceremony_url`. Never give the owner an
 expired URL. If the answer says another policy change is waiting, its link is
-for that change, which does not allow the operation: Broker opens one ceremony per wallet at a time, so tell the owner
-to approve or refuse it, then retry. `DEFAULT_POLICY_WAITING` means a Petal the
+for that change, which does not allow the operation: Broker opens one ceremony
+per wallet at a time, so tell the owner to approve or refuse it, then retry.
+`DEFAULT_POLICY_WAITING` means a Petal the
 owner chose during setup is still installing, and the wallet's first policy
 allows every chosen Petal at once: retry once `docs/petals.md` lists it. If it
 stays missing, tell the owner to restart Bloom, or to leave it out of setup.
