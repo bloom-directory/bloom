@@ -239,11 +239,16 @@ pub struct StagedTx {
     pub execution_origin: Option<ExecutionOrigin>,
 }
 
-/// Whether a central action id is safe to join as one path segment: not
-/// empty, not the `latest` sentinel, and free of separators, NUL and `..`.
+/// Whether a central action id is safe to join as one path segment: exactly
+/// one normal component, not the `latest` sentinel, and free of separators,
+/// NUL and `..`.
 pub fn is_valid_action_id(id: &str) -> bool {
-    !(id.is_empty()
-        || id == "latest"
+    use std::path::{Component, Path};
+    let mut parts = Path::new(id).components();
+    matches!(
+        (parts.next(), parts.next()),
+        (Some(Component::Normal(_)), None)
+    ) && !(id == "latest"
         || id.contains('/')
         || id.contains('\\')
         || id.contains('\0')
@@ -501,6 +506,14 @@ impl PlanRender {
 mod tests {
     use super::*;
     use crate::policy::{PolicyCheck, PolicyOutcome};
+
+    #[test]
+    fn action_id_must_be_one_normal_path_segment() {
+        for id in [".", "..", "", "a/b", "a/", "latest", "a\\b", "a\0b"] {
+            assert!(!is_valid_action_id(id), "{id:?} accepted");
+        }
+        assert!(is_valid_action_id("act-01"));
+    }
 
     fn base_eth_send() -> StagedTx {
         StagedTx {

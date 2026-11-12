@@ -3041,7 +3041,7 @@ mod tests {
         let hash = format!("0x{}", "ab".repeat(32));
         let valid = sent_after_broadcast(&outbox, "valid", BroadcastAttemptKind::Confirm, &hash);
         let valid_id = valid.staged.action_id.clone().unwrap();
-        for (id, action_id) in [("empty", ""), ("escape", "../outside")] {
+        for (id, action_id) in [("empty", ""), ("dot", "."), ("escape", "../outside")] {
             let mut entry = sent_after_broadcast(&outbox, id, BroadcastAttemptKind::Confirm, &hash);
             entry.staged.action_id = Some(action_id.into());
             outbox
