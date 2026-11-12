@@ -293,12 +293,12 @@ pub fn run_developer_provenance_refresh(template: &Path, config_dir: &Path) -> R
     validate_developer_caller(uid, std::env::consts::OS)?;
     let config_dir =
         fs::canonicalize(config_dir).context("canonicalize developer triad config directory")?;
-    // Notes are returned rather than printed from inside the refresh. Printing
-    // them there announced changes a later conflict discarded, because the
-    // refusal happens only after the whole catalog has been walked; returning
-    // them means nothing is announced that was not written.
-    for note in refresh_developer_provenance_catalog(template, &config_dir, uid)? {
-        eprintln!("note: {note}");
+    // Each line carries its own severity word: `note:` for a change that was
+    // saved, `warning:` for a disagreement the refresh left alone. They are
+    // returned rather than printed from inside the refresh so the tests can
+    // assert on them without capturing stderr.
+    for line in refresh_developer_provenance_catalog(template, &config_dir, uid)? {
+        eprintln!("{line}");
     }
     Ok(())
 }
@@ -357,85 +357,33 @@ fn refresh_developer_provenance_catalog(
     // has to stay null unless its class joins the table.
     //
     // Healing a stale `None` is the point of the loop, and it proceeds with a
-    // note on stderr. Overwriting a value the record was already signed with
-    // is the opposite and is refused rather than performed, whether this build
-    // catalogues that class differently or not at all: one of the record and
-    // the table is stale, the refresh cannot tell which, and re-signing on a
-    // guess denies the Petal's claims — `FEE_NOT_ALLOWED` where the value was
-    // cleared, `FEE_ASSET_MISMATCH` where it was replaced — leaving Broker's
-    // refusal at claim time as the only symptom. Refusing makes the operator
-    // choose, and the choice is targeted: re-enrolling that Petal re-derives
-    // its records from the table. There is deliberately no blanket override —
-    // one flag rewriting every disagreeing record at once would clear
-    // unrelated ones along with the intended one.
+    // note on stderr. A value the record was already signed with is never
+    // overwritten — not cleared, not replaced — because one of the record and
+    // the table is stale and the refresh cannot tell which. Re-signing on a
+    // guess denies the Petal's claims: `FEE_NOT_ALLOWED` where the value was
+    // cleared, `FEE_ASSET_MISMATCH` where it was replaced. So the record is
+    // left exactly as signed and the disagreement is reported instead.
+    //
+    // Reported, not refused. An earlier revision aborted the refresh on any
+    // disagreement, which meant one stale record stopped every launch — the
+    // launcher runs this before enrolment, so there was no way through it from
+    // inside the launcher at all. Warning keeps what refusing was for, which
+    // is that a record must never silently disagree with the table, without
+    // holding a developer hostage to a record no claim in their session will
+    // touch. The failure the warning prevents is a Broker denial at claim time
+    // with nothing pointing back here.
+    //
+    // Lineage `active` is not consulted. A superseded record's `fee_asset`
+    // still decides a claim that names its package hash, so there is no reason
+    // to treat one differently, and nothing here overwrites a signed value in
+    // either case. (No claim can name a superseded hash in practice:
+    // `bloom-petals`' store flips a single owner pointer under the install
+    // commit, and every dispatch path resolves through `resolve_petal_owner`.
+    // That is why the distinction stopped being worth its machinery.)
     let mut developer_records = developer_records;
-    let mut conflicts = Vec::new();
     let mut notes = Vec::new();
+    let mut warnings = Vec::new();
     for record in &mut developer_records {
-        // Enrolment keeps a Petal's predecessor packages in the catalog,
-        // re-signed with `active: false`. A disagreement on one is not worth
-        // refusing a launch over, because re-enrolling could not clear it
-        // anyway — enrolment only re-derives the package hash on disk — so
-        // recreating the developer root would be the only way out.
-        //
-        // What makes that safe is not the flag. A plain Petal approval never
-        // consults lineage `active` at all, and an inactive record's
-        // `fee_asset` still decides the claim. The two reads that do consult
-        // it are both on the scope-derived key path:
-        // `prepare_petal_key_scope`, once when a scoped key is prepared, and
-        // `validate_scoped_route_lineage`, per claim on that same path.
-        // (`bloom-broker-api`'s `provenance.rs` reads the flag too, in
-        // `validate_shape`, as a catalog-integrity invariant and not to
-        // authorize anything. It runs at load, from
-        // `synchronize_provenance_catalog`, and from `install_provenance`,
-        // which hands it a one-record catalog where its uniqueness half has
-        // nothing to compare.)
-        //
-        // The reason no claim can name a superseded package is that
-        // `bloom-petals`' store resolves a Petal through a single owner
-        // pointer: `write_petal_owner` flips it under the install commit, and
-        // every dispatch path resolves through `resolve_petal_owner` by way of
-        // `resolve_petal_mount`, so a superseded hash stops being newly
-        // resolvable at that rename. Not because its bytes are gone —
-        // `store.rs` deliberately keeps prior package data until the next
-        // store open so a request that resolved the old owner can finish, and
-        // `reconcile_petal_owners` deletes it later. A dispatch that resolved
-        // the old owner before the flip carries that hash into its claim, and
-        // that in-flight request is the case this skip is right for:
-        // re-deriving its record mid-flight is what would break it.
-        //
-        // Two resolvers prefer a raw hash over the owner pointer, and neither
-        // executes a Petal. `Runner::resolve` accepts any hash present in the
-        // store; its one caller is the `petals.resolve` IPC, which returns a
-        // hash and runs nothing. `resolve_uninstall_hash` is looser still — a
-        // hash prefix of twelve characters or more wins ahead of any owner or
-        // name lookup — but it only names the package `petals.uninstall` is
-        // about to remove, and produces no claim.
-        //
-        // Broker does require an approval's package hash to be in
-        // `allowed_petal_packages`, but that is not a second gate here:
-        // `policy_with_packages` only ever appends, and nothing prunes the
-        // list short of a full `default-policy` replacement under an owner
-        // ceremony, so a superseded hash stays a member indefinitely and
-        // satisfies that check as an ordinary one. This skip rests on owner
-        // resolution alone. If that ever stops being the way in — two hashes
-        // of one Petal reachable at once, or an *executing* path allowed to
-        // name a non-owner hash — it becomes a hole, and no test here would
-        // notice.
-        //
-        // Note also that enrolment refuses to reactivate a superseded hash
-        // below, so a developer who rebuilds back to one gets a hard failure
-        // there and no healing here.
-        //
-        // A record carrying no lineage at all, such as the authority fixture
-        // the launcher injects, is treated as live.
-        if record
-            .petal_lineage
-            .as_ref()
-            .is_some_and(|membership| !membership.active)
-        {
-            continue;
-        }
         if matches!(record.subject, ProvenanceSubject::Petal { .. }) {
             let (package_hash, route) = match &record.subject {
                 ProvenanceSubject::Petal {
@@ -449,15 +397,15 @@ fn refresh_developer_provenance_catalog(
                 if derived == class.fee_asset {
                     continue;
                 }
-                // Any overwrite of a value the record was signed with, not
-                // only clearing it. A record that matched its Petal before the
-                // refresh stops matching after, and whether the symptom is
-                // FEE_NOT_ALLOWED (cleared) or FEE_ASSET_MISMATCH (replaced
-                // with a different chain or asset) the Petal is equally broken.
+                // Any disagreement, not only a clearing one. A record that
+                // matched its Petal before the refresh would stop matching
+                // after, and whether the symptom is FEE_NOT_ALLOWED (cleared)
+                // or FEE_ASSET_MISMATCH (replaced with a different chain or
+                // asset) the Petal is equally broken.
                 if class.fee_asset.is_some() {
-                    conflicts.push(format!(
-                        "route {route} of package {package_hash} class {} is signed with \
-                         {:?} but this build derives {:?}",
+                    warnings.push(format!(
+                        "warning: route {route} of package {package_hash} class {} is \
+                         signed with {:?} but this build derives {:?}; left as signed",
                         class.operation_class.as_str(),
                         class.fee_asset,
                         derived,
@@ -468,7 +416,7 @@ fn refresh_developer_provenance_catalog(
                 // compares chain and asset, so reporting the asset alone
                 // described a chain-only change as "usdc to usdc".
                 notes.push(format!(
-                    "re-derived fee asset for {} from {:?} to {:?}",
+                    "note: re-derived fee asset for {} from {:?} to {:?}",
                     class.operation_class.as_str(),
                     class.fee_asset,
                     derived,
@@ -477,31 +425,31 @@ fn refresh_developer_provenance_catalog(
             }
         }
     }
-    if !conflicts.is_empty() {
-        bail!(
-            "this developer catalog is signed with fee assets that disagree with what this \
-             build derives: {}. One of the two sides is stale and the refresh cannot tell \
-             which, so it refuses rather than re-sign a value the record already carries, \
-             and leaves the catalog untouched. Either this build's \
-             FEE_BEARING_OPERATION_CLASSES is wrong for that class or does not catalogue \
-             it, or the record is the stale side — a table row corrected since this root \
-             was enrolled, or a Petal that has changed since. If the record is right, make \
-             this build's table agree with what the Petal declares. If the table is right, \
-             re-enrolling that Petal re-derives its records from the table, though only for \
-             the package hash on disk, and not from inside the launcher, which stops here \
-             before it reaches enrolment — so run it yourself, from the repository root, \
-             once per Petal named above:\n\n  \
+    if !warnings.is_empty() {
+        // The subcommand that fixes this is `hide = true`, so `--help` does
+        // not list it. Printing the remedy without the command to run it is
+        // what the earlier refusal did, and it left the operator stuck at the
+        // one moment this message was their only output.
+        warnings.push(format!(
+            "warning: each record above keeps the fee asset it was signed with, and Broker \
+             will judge its claims against that value, not against this build's \
+             FEE_BEARING_OPERATION_CLASSES. Either this build's table is wrong for that \
+             class or does not catalogue it, or the record is the stale side — a table row \
+             corrected since this root was enrolled, or a Petal that has changed since. If \
+             the record is right, make this build's table agree with what the Petal \
+             declares. If the table is right, re-enrol that Petal to re-derive its records \
+             from the table, which the launcher does not do for you. From the repository \
+             root, once per Petal named above:\n\n  \
              cargo build -p bloom --no-default-features --features mount,triad-dev-harness\n  \
              target/debug/bloom init triad-enroll-developer-petal-provenance {} \
              <petal-package-dir>\n\nwhere <petal-package-dir> is that Petal's built \
              package directory, the same path the launcher takes from \
-             BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE. Recreating the developer root works too, \
-             and is the only route for a record the lineage marks inactive — those are \
-             skipped before this check and never appear above.",
-            conflicts.join("; "),
+             BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE. That re-derives only the package hash on \
+             disk; recreating the developer root clears every record at once.",
             config_dir.display(),
-        );
+        ));
     }
+    notes.append(&mut warnings);
     catalog.records.extend(developer_records);
     append_release_petal_provenance(&mut catalog, &installer_key_id, &signing_key)?;
     for record in &mut catalog.records {
@@ -521,7 +469,11 @@ fn refresh_developer_provenance_catalog(
         serde_jcs::to_vec(&record.subject).expect("provenance subject is serializable")
     });
     if current == catalog {
-        return Ok(Vec::new());
+        // Not `Vec::new()`. A disagreement writes nothing, so the catalog
+        // comes out unchanged in exactly the case the warning exists for, and
+        // returning nothing here would swallow it. A heal always changes the
+        // catalog, so anything still in hand on this path is a warning.
+        return Ok(notes);
     }
     rewrite_private_json(&catalog_path, &serde_json::to_value(catalog)?)?;
     Ok(notes)
@@ -1633,6 +1585,79 @@ mod tests {
     #[cfg(feature = "triad-dev-harness")]
     static FIXTURE_PETAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Every refresh test wants the same root: a generated developer
+    /// enrollment with the authority-fixture Petal enrolled into it, so the
+    /// catalog holds a developer-published record to plant on. Six copies of
+    /// this were the bulk of what a review called ~900 lines of refresh tests.
+    ///
+    /// The mutex guard and the tempdir have to outlive the test body — dropping
+    /// either mid-test deletes the root or lets a concurrent test rebuild the
+    /// fixture Petal underneath it — so they are held here rather than
+    /// returned alongside.
+    #[cfg(feature = "triad-dev-harness")]
+    struct RefreshRoot {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        _directory: tempfile::TempDir,
+        config: PathBuf,
+        catalog_path: PathBuf,
+        owner: u32,
+    }
+
+    #[cfg(feature = "triad-dev-harness")]
+    impl RefreshRoot {
+        fn enrolled() -> Self {
+            let guard = FIXTURE_PETAL
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let directory = tempfile::tempdir().unwrap();
+            let config = directory.path().join("config");
+            fs::create_dir(&config).unwrap();
+            fs::set_permissions(&config, fs::Permissions::from_mode(0o700)).unwrap();
+            let owner = rustix::process::geteuid().as_raw();
+            let plan = EnrollmentPlan {
+                template_dir: template_dir(),
+                output_dir: config.clone(),
+                login_uid: 1_001,
+                broker_uid: 1_002,
+                signer_uid: 1_003,
+                session_socket_gid: 1_004,
+                release_digest: "44".repeat(32),
+            };
+            generate_for_owner(&plan, owner).unwrap();
+            let petal_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(Path::parent)
+                .unwrap()
+                .join("tests/fixtures/triad-authority-petal");
+            enroll_developer_petal_provenance(&config, &petal_dir, owner).unwrap();
+            let catalog_path = config.join("provenance-catalog.json");
+            Self {
+                _guard: guard,
+                _directory: directory,
+                config,
+                catalog_path,
+                owner,
+            }
+        }
+
+        fn catalog(&self) -> ProvenanceCatalog {
+            serde_json::from_slice(&fs::read(&self.catalog_path).unwrap()).unwrap()
+        }
+
+        fn write(&self, catalog: &ProvenanceCatalog) {
+            rewrite_private_json(&self.catalog_path, &serde_json::to_value(catalog).unwrap())
+                .unwrap();
+        }
+
+        fn refresh(&self) -> Result<Vec<String>> {
+            refresh_developer_provenance_catalog(
+                &template_dir().join("provenance-catalog.unsigned.json"),
+                &self.config,
+                self.owner,
+            )
+        }
+    }
+
     fn template_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -1993,37 +2018,14 @@ mod tests {
     /// A record signed with a *different* fee asset for a class this build does
     /// catalogue is the same operational risk as clearing one: it matched its
     /// Petal before the refresh and would not after, with FEE_ASSET_MISMATCH
-    /// instead of FEE_NOT_ALLOWED as the only symptom.
+    /// instead of FEE_NOT_ALLOWED as the only symptom. So it is reported and
+    /// left alone, never re-signed on a guess.
     #[cfg(feature = "triad-dev-harness")]
     #[test]
-    fn developer_catalog_refresh_refuses_to_replace_a_differing_fee_asset() {
-        let _fixture = FIXTURE_PETAL
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let directory = tempfile::tempdir().unwrap();
-        let output = directory.path().join("config");
-        fs::create_dir(&output).unwrap();
-        fs::set_permissions(&output, fs::Permissions::from_mode(0o700)).unwrap();
-        let owner = rustix::process::geteuid().as_raw();
-        let plan = EnrollmentPlan {
-            template_dir: template_dir(),
-            output_dir: output.clone(),
-            login_uid: 1_001,
-            broker_uid: 1_002,
-            signer_uid: 1_003,
-            session_socket_gid: 1_004,
-            release_digest: "44".repeat(32),
-        };
-        generate_for_owner(&plan, owner).unwrap();
-        let petal_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .unwrap()
-            .join("tests/fixtures/triad-authority-petal");
-        enroll_developer_petal_provenance(&output, &petal_dir, owner).unwrap();
-        let catalog_path = output.join("provenance-catalog.json");
-        let mut stale: ProvenanceCatalog =
-            serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
+    fn developer_catalog_refresh_warns_instead_of_replacing_a_differing_fee_asset() {
+        let root = RefreshRoot::enrolled();
+        let catalog_path = &root.catalog_path;
+        let mut stale = root.catalog();
 
         // A catalogued class, signed with a different asset than the table
         // derives for it.
@@ -2062,16 +2064,16 @@ mod tests {
             "hyperliquid",
             "must actually differ"
         );
-        rewrite_private_json(&catalog_path, &serde_json::to_value(&stale).unwrap()).unwrap();
+        root.write(&stale);
 
-        let template = template_dir().join("provenance-catalog.unsigned.json");
-        let error = refresh_developer_provenance_catalog(&template, &output, owner)
-            .expect_err("replacing a differing fee asset must be refused");
-        let message = format!("{error:#}");
-        // The bail! names both symptom codes in one literal, so asserting
-        // either one discriminates nothing. What has to hold is the per-record
-        // diagnostic: the route and class to act on, and both values, so the
-        // operator can tell which side is stale.
+        let lines = root
+            .refresh()
+            .expect("a disagreement is reported, not refused");
+        let message = lines.join("\n");
+        // The warning text names both symptom codes in one literal, so
+        // asserting either one discriminates nothing. What has to hold is the
+        // per-record diagnostic: the route and class to act on, and both
+        // values, so the operator can tell which side is stale.
         let signed = format!(
             "{:?}",
             Some(ProvenanceFeeAsset {
@@ -2091,50 +2093,52 @@ mod tests {
             );
             assert!(
                 message.contains(&expected),
-                "the refusal must name the record, the signed value and the derived one, \
+                "the warning must name the record, the signed value and the derived one, \
                  expected {expected:?} in: {message}"
             );
         }
+        // Whole-catalog equality would say nothing here: the refresh does
+        // write, because it rebuilds the release-pins records and re-signs
+        // every record. What must hold is narrower — the class this build
+        // disagrees with keeps exactly the value it was signed with.
         let after: ProvenanceCatalog =
-            serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
-        assert_eq!(after, stale, "a refused refresh must not touch the catalog");
+            serde_json::from_slice(&fs::read(catalog_path).unwrap()).unwrap();
+        for (package_hash, route) in &planted {
+            let record = after
+                .records
+                .iter()
+                .find(|record| {
+                    matches!(&record.subject, ProvenanceSubject::Petal { package_hash: hash, route: found }
+                        if hash.as_str() == package_hash && found == route)
+                })
+                .expect("the refresh must carry the planted record across");
+            let class = record
+                .operation_classes
+                .iter()
+                .find(|class| class.operation_class == builder_class)
+                .expect("the planted class must survive");
+            assert_eq!(
+                class.fee_asset,
+                Some(ProvenanceFeeAsset {
+                    chain: Token::new("polygon").unwrap(),
+                    asset: "pusd".to_owned(),
+                }),
+                "a record this build disagrees with must be left exactly as signed"
+            );
+        }
     }
 
     /// A record with no lineage at all stays governed. The launcher's
     /// `jq`-injected authority fixture is exactly that, and its hand-written
-    /// `fee_asset` literal has to keep being re-derived — which is why the
-    /// guard is `is_some_and` and not `is_none_or`. Rewriting it the other way
-    /// silently stops governing this record, and nothing else would notice.
+    /// `fee_asset` literal has to keep being re-derived. The walk no longer
+    /// reads lineage at all, so this is a regression guard against a future
+    /// filter reintroducing one and silently dropping this record out of
+    /// scope, which nothing else here would notice.
     #[cfg(feature = "triad-dev-harness")]
     #[test]
     fn developer_catalog_refresh_governs_a_record_with_no_lineage() {
-        let _fixture = FIXTURE_PETAL
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let directory = tempfile::tempdir().unwrap();
-        let output = directory.path().join("config");
-        fs::create_dir(&output).unwrap();
-        fs::set_permissions(&output, fs::Permissions::from_mode(0o700)).unwrap();
-        let owner = rustix::process::geteuid().as_raw();
-        let plan = EnrollmentPlan {
-            template_dir: template_dir(),
-            output_dir: output.clone(),
-            login_uid: 1_001,
-            broker_uid: 1_002,
-            signer_uid: 1_003,
-            session_socket_gid: 1_004,
-            release_digest: "44".repeat(32),
-        };
-        generate_for_owner(&plan, owner).unwrap();
-        let petal_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .unwrap()
-            .join("tests/fixtures/triad-authority-petal");
-        enroll_developer_petal_provenance(&output, &petal_dir, owner).unwrap();
-        let catalog_path = output.join("provenance-catalog.json");
-        let mut stale: ProvenanceCatalog =
-            serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
+        let root = RefreshRoot::enrolled();
+        let mut stale = root.catalog();
 
         // Strip the lineage and plant a conflict the table disagrees with.
         let builder_class = Token::new(HYPERLIQUID_BUILDER_ORDER_CLASS).unwrap();
@@ -2156,14 +2160,16 @@ mod tests {
             }
         }
         assert!(planted > 0, "the fixture must enroll a developer record");
-        rewrite_private_json(&catalog_path, &serde_json::to_value(&stale).unwrap()).unwrap();
+        root.write(&stale);
 
-        let template = template_dir().join("provenance-catalog.unsigned.json");
-        let error = refresh_developer_provenance_catalog(&template, &output, owner)
-            .expect_err("a record with no lineage must still be governed");
+        let lines = root
+            .refresh()
+            .expect("a disagreement is reported, not refused");
         assert!(
-            format!("{error:#}").contains("is signed with"),
-            "the refusal must name the record: {error:#}"
+            lines
+                .iter()
+                .any(|line| line.starts_with("warning:") && line.contains("is signed with")),
+            "the warning must name the record: {lines:?}"
         );
     }
 
@@ -2185,41 +2191,18 @@ mod tests {
                 .any(|class| &class.operation_class == builder_class)
     }
 
-    /// A predecessor package stays in the catalog, re-signed inactive, and can
-    /// never authorize anything again. A disagreement on one must not refuse
-    /// the launch: the launcher runs this refresh before enrolment, and
-    /// enrolment only re-derives the package hash on disk, so there would be
-    /// no way out short of recreating the developer root.
+    /// A predecessor package stays in the catalog, re-signed inactive. The walk
+    /// does not read lineage, so this record is reached like any other — and
+    /// because it carries a value, it is reported and left exactly as signed.
+    /// Re-enrolment cannot clear it (enrolment only re-derives the package hash
+    /// on disk), so recreating the root is the only remedy, and a warning is
+    /// the right weight for something no claim can reach anyway.
     #[cfg(feature = "triad-dev-harness")]
     #[test]
-    fn developer_catalog_refresh_ignores_an_inactive_package() {
-        let _fixture = FIXTURE_PETAL
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let directory = tempfile::tempdir().unwrap();
-        let output = directory.path().join("config");
-        fs::create_dir(&output).unwrap();
-        fs::set_permissions(&output, fs::Permissions::from_mode(0o700)).unwrap();
-        let owner = rustix::process::geteuid().as_raw();
-        let plan = EnrollmentPlan {
-            template_dir: template_dir(),
-            output_dir: output.clone(),
-            login_uid: 1_001,
-            broker_uid: 1_002,
-            signer_uid: 1_003,
-            session_socket_gid: 1_004,
-            release_digest: "44".repeat(32),
-        };
-        generate_for_owner(&plan, owner).unwrap();
-        let petal_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .unwrap()
-            .join("tests/fixtures/triad-authority-petal");
-        enroll_developer_petal_provenance(&output, &petal_dir, owner).unwrap();
-        let catalog_path = output.join("provenance-catalog.json");
-        let mut stale: ProvenanceCatalog =
-            serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
+    fn developer_catalog_refresh_never_overwrites_an_inactive_package() {
+        let root = RefreshRoot::enrolled();
+        let catalog_path = &root.catalog_path;
+        let mut stale = root.catalog();
 
         // The same conflict the replace test plants, on a record enrolment has
         // since superseded.
@@ -2277,15 +2260,22 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        rewrite_private_json(&catalog_path, &serde_json::to_value(&stale).unwrap()).unwrap();
+        root.write(&stale);
 
-        let template = template_dir().join("provenance-catalog.unsigned.json");
-        refresh_developer_provenance_catalog(&template, &output, owner)
+        let lines = root
+            .refresh()
             .expect("an inactive package must not refuse the refresh");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("warning:") && line.contains("left as signed")),
+            "an inactive record this build disagrees with must still be reported, \
+             because it is the one case re-enrolment cannot fix: {lines:?}"
+        );
 
         // And it is left exactly as it was, not healed and not rewritten.
         let after: ProvenanceCatalog =
-            serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
+            serde_json::from_slice(&fs::read(catalog_path).unwrap()).unwrap();
 
         // Still present, and still marked superseded. Asserting only that the
         // record is unmodified would pass vacuously if the refresh dropped it
@@ -2357,38 +2347,15 @@ mod tests {
     }
 
     /// Clearing a fee asset for a class this build does not catalogue would
-    /// deny that Petal's claims with FEE_NOT_ALLOWED, so the refresh refuses
+    /// deny that Petal's claims with FEE_NOT_ALLOWED, so the refresh reports it
     /// and names the recovery rather than rewriting the record.
     #[cfg(feature = "triad-dev-harness")]
     #[test]
-    fn developer_catalog_refresh_refuses_to_clear_an_uncatalogued_fee_asset() {
-        let _fixture = FIXTURE_PETAL
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let directory = tempfile::tempdir().unwrap();
-        let output = directory.path().join("config");
-        fs::create_dir(&output).unwrap();
-        fs::set_permissions(&output, fs::Permissions::from_mode(0o700)).unwrap();
-        let owner = rustix::process::geteuid().as_raw();
-        let plan = EnrollmentPlan {
-            template_dir: template_dir(),
-            output_dir: output.clone(),
-            login_uid: 1_001,
-            broker_uid: 1_002,
-            signer_uid: 1_003,
-            session_socket_gid: 1_004,
-            release_digest: "44".repeat(32),
-        };
-        generate_for_owner(&plan, owner).unwrap();
-        let petal_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .unwrap()
-            .join("tests/fixtures/triad-authority-petal");
-        enroll_developer_petal_provenance(&output, &petal_dir, owner).unwrap();
-        let catalog_path = output.join("provenance-catalog.json");
-        let mut stale: ProvenanceCatalog =
-            serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
+    fn developer_catalog_refresh_warns_instead_of_clearing_an_uncatalogued_fee_asset() {
+        let root = RefreshRoot::enrolled();
+        let output = &root.config;
+        let catalog_path = &root.catalog_path;
+        let mut stale = root.catalog();
 
         // A fee asset for a class the table does not know: what an older
         // binary, or a hand edit, could leave behind.
@@ -2423,14 +2390,14 @@ mod tests {
             !planted.is_empty(),
             "the fixture must enroll a developer record"
         );
-        rewrite_private_json(&catalog_path, &serde_json::to_value(&stale).unwrap()).unwrap();
+        root.write(&stale);
 
-        let template = template_dir().join("provenance-catalog.unsigned.json");
-        let error = refresh_developer_provenance_catalog(&template, &output, owner)
-            .expect_err("clearing an uncatalogued fee asset must be refused");
-        let message = format!("{error:#}");
-        // Both symptom codes live in one bail! literal, so neither one on its
-        // own says which conflict fired. The diagnostic does: a clear derives
+        let lines = root
+            .refresh()
+            .expect("a disagreement is reported, not refused");
+        let message = lines.join("\n");
+        // Both symptom codes live in one literal, so neither one on its own
+        // says which conflict fired. The diagnostic does: a clear derives
         // None, where a replace derives Some.
         let signed = format!(
             "{:?}",
@@ -2447,28 +2414,27 @@ mod tests {
             );
             assert!(
                 message.contains(&expected),
-                "the refusal must name the record and show the value being cleared, \
+                "the warning must name the record and show the value that was kept, \
                  expected {expected:?} in: {message}"
             );
         }
         assert!(
             message.contains("FEE_BEARING_OPERATION_CLASSES"),
-            "the refusal must name the recovery that keeps the claims working: {message}"
+            "the warning must name the recovery that keeps the claims working: {message}"
         );
         assert!(
-            message.contains("re-enrolling that Petal re-derives its records from the table"),
-            "the refusal must name the targeted recovery, which does re-derive the record: \
+            message.contains("re-enrol that Petal to re-derive its records from the table"),
+            "the warning must name the targeted recovery, which does re-derive the record: \
              {message}"
         );
         assert!(
-            message.contains("leaves the catalog untouched"),
-            "the refusal must say that nothing was written, because the operator is told \
-             to go and change one of the two sides: {message}"
+            message.contains("left as signed"),
+            "the warning must say the record was kept, because the operator is told to go \
+             and change one of the two sides: {message}"
         );
-        // Naming the remedy is not giving it. The launcher runs this refresh on
-        // every launch, so a conflict stops every launch, and an operator who
-        // has to reconstruct the command from `--help` on a hidden subcommand
-        // is stuck at exactly the moment the message is their only output.
+        // Naming the remedy is not giving it. The subcommand that fixes this is
+        // `hide = true`, so `--help` does not list it, and the launcher does
+        // not run it: this message is the operator's only output.
         for fragment in [
             "cargo build -p bloom --no-default-features --features mount,triad-dev-harness",
             "target/debug/bloom init triad-enroll-developer-petal-provenance",
@@ -2476,7 +2442,7 @@ mod tests {
         ] {
             assert!(
                 message.contains(fragment),
-                "the refusal must carry a runnable recovery command, missing \
+                "the warning must carry a runnable recovery command, missing \
                  {fragment:?} in: {message}"
             );
         }
@@ -2487,9 +2453,35 @@ mod tests {
         );
 
         // And it must leave the record alone rather than half-rewriting it.
+        // Not whole-catalog equality: the refresh does write, because it
+        // rebuilds the release-pins records and re-signs every record. The
+        // narrower claim is the one that matters.
         let after: ProvenanceCatalog =
-            serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
-        assert_eq!(after, stale, "a refused refresh must not touch the catalog");
+            serde_json::from_slice(&fs::read(catalog_path).unwrap()).unwrap();
+        for (package_hash, route, class_name) in &planted {
+            let record = after
+                .records
+                .iter()
+                .find(|record| {
+                    matches!(&record.subject, ProvenanceSubject::Petal { package_hash: hash, route: found }
+                        if hash.as_str() == package_hash && found == route)
+                })
+                .expect("the refresh must carry the planted record across");
+            let class = record
+                .operation_classes
+                .iter()
+                .find(|class| &class.operation_class == class_name)
+                .expect("the planted class must survive");
+            assert_eq!(
+                class.fee_asset,
+                Some(ProvenanceFeeAsset {
+                    chain: Token::new("hyperliquid").unwrap(),
+                    asset: "usdc".to_owned(),
+                }),
+                "a class this build does not catalogue must keep the value it was signed \
+                 with, or its claims start failing FEE_NOT_ALLOWED"
+            );
+        }
     }
 
     /// A developer root enrolled before a class was catalogued carries its
@@ -2500,33 +2492,10 @@ mod tests {
     #[test]
     fn developer_catalog_refresh_rederives_a_stale_fee_asset() {
         const LEGACY_COMPONENT: &str = "bloom-legacy-component";
-        let _fixture = FIXTURE_PETAL
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let directory = tempfile::tempdir().unwrap();
-        let output = directory.path().join("config");
-        fs::create_dir(&output).unwrap();
-        fs::set_permissions(&output, fs::Permissions::from_mode(0o700)).unwrap();
-        let owner = rustix::process::geteuid().as_raw();
-        let plan = EnrollmentPlan {
-            template_dir: template_dir(),
-            output_dir: output.clone(),
-            login_uid: 1_001,
-            broker_uid: 1_002,
-            signer_uid: 1_003,
-            session_socket_gid: 1_004,
-            release_digest: "44".repeat(32),
-        };
-        generate_for_owner(&plan, owner).unwrap();
-        let petal_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .unwrap()
-            .join("tests/fixtures/triad-authority-petal");
-        enroll_developer_petal_provenance(&output, &petal_dir, owner).unwrap();
-        let catalog_path = output.join("provenance-catalog.json");
+        let root = RefreshRoot::enrolled();
+        let catalog_path = &root.catalog_path;
         let read = || -> ProvenanceCatalog {
-            serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap()
+            serde_json::from_slice(&fs::read(catalog_path).unwrap()).unwrap()
         };
 
         // What an older binary wrote: the fee-bearing class, enrolled fee-free
@@ -2563,10 +2532,9 @@ mod tests {
             }
         }
         assert_eq!(renamed, 1, "the template must ship one native-transfer row");
-        rewrite_private_json(&catalog_path, &serde_json::to_value(&stale).unwrap()).unwrap();
+        root.write(&stale);
 
-        let template = template_dir().join("provenance-catalog.unsigned.json");
-        let notes = refresh_developer_provenance_catalog(&template, &output, owner).unwrap();
+        let notes = root.refresh().unwrap();
         assert_eq!(
             notes.len(),
             rewritten,
@@ -2623,42 +2591,22 @@ mod tests {
         assert_eq!(legacy_fee.asset, "native");
     }
 
-    /// Notes announce what was saved, so a refusal must announce nothing. The
-    /// walk heals record by record and refuses only once every record has been
-    /// seen, so a catalog that heals one class and conflicts on another used to
-    /// print `re-derived fee asset` for a change the refusal then discarded —
-    /// while the refusal itself told the operator to read those notes to see
-    /// what had changed. Nothing had.
+    /// One record, both halves: a catalogued class with no value, and an
+    /// uncatalogued class carrying one. The heal must land and the
+    /// disagreement must be reported, in the same pass.
+    ///
+    /// This is the case the earlier refusing design got wrong in both
+    /// directions. It walked the whole catalog before deciding, so the heal was
+    /// always reached and always thrown away — and the refusal then told the
+    /// operator to read notes describing a change that had not been written.
+    /// Neither half happened: a root needing a legitimate heal on one class
+    /// while holding a disagreement on another got nothing, and no launch.
     #[cfg(feature = "triad-dev-harness")]
     #[test]
-    fn a_refused_refresh_announces_nothing_it_did_not_save() {
-        let _fixture = FIXTURE_PETAL
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let directory = tempfile::tempdir().unwrap();
-        let output = directory.path().join("config");
-        fs::create_dir(&output).unwrap();
-        fs::set_permissions(&output, fs::Permissions::from_mode(0o700)).unwrap();
-        let owner = rustix::process::geteuid().as_raw();
-        let plan = EnrollmentPlan {
-            template_dir: template_dir(),
-            output_dir: output.clone(),
-            login_uid: 1_001,
-            broker_uid: 1_002,
-            signer_uid: 1_003,
-            session_socket_gid: 1_004,
-            release_digest: "44".repeat(32),
-        };
-        generate_for_owner(&plan, owner).unwrap();
-        let petal_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .unwrap()
-            .join("tests/fixtures/triad-authority-petal");
-        enroll_developer_petal_provenance(&output, &petal_dir, owner).unwrap();
-        let catalog_path = output.join("provenance-catalog.json");
-        let mut stale: ProvenanceCatalog =
-            serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
+    fn a_disagreement_warns_without_blocking_the_heal_beside_it() {
+        let root = RefreshRoot::enrolled();
+        let catalog_path = &root.catalog_path;
+        let mut stale = root.catalog();
 
         // One record carrying both halves: a catalogued class with no value,
         // which the walk heals in memory, and an uncatalogued class carrying
@@ -2667,6 +2615,7 @@ mod tests {
         // thrown away.
         let builder_class = Token::new(HYPERLIQUID_BUILDER_ORDER_CLASS).unwrap();
         let mut planted = 0;
+        let mut uncatalogued = None;
         for record in &mut stale.records {
             if !matches!(record.subject, ProvenanceSubject::Petal { .. })
                 || record.publisher == Token::new("bloom-release-pins").unwrap()
@@ -2682,6 +2631,7 @@ mod tests {
                     .is_none(),
                 "the fixture class must be uncatalogued for the conflict half to bite"
             );
+            uncatalogued = Some(class.operation_class.clone());
             class.fee_asset = Some(ProvenanceFeeAsset {
                 chain: Token::new("hyperliquid").unwrap(),
                 asset: "usdc".to_owned(),
@@ -2696,24 +2646,67 @@ mod tests {
             planted += 1;
         }
         assert!(planted > 0, "the fixture must enroll a developer record");
-        rewrite_private_json(&catalog_path, &serde_json::to_value(&stale).unwrap()).unwrap();
-        let before = fs::read(&catalog_path).unwrap();
+        let uncatalogued = uncatalogued.expect("the fixture must carry an uncatalogued class");
+        root.write(&stale);
+        let before = fs::read(catalog_path).unwrap();
 
-        let template = template_dir().join("provenance-catalog.unsigned.json");
-        let error = refresh_developer_provenance_catalog(&template, &output, owner)
-            .expect_err("a conflicting record must refuse the refresh");
+        let lines = root
+            .refresh()
+            .expect("a disagreement on one class must not block the heal on another");
 
-        // The heal it walked through reached nothing: no note can escape the
-        // Err path, and there is no written change for one to have described.
-        assert_eq!(
-            fs::read(&catalog_path).unwrap(),
-            before,
-            "a refused refresh must leave the catalog byte-identical"
-        );
-        let message = format!("{error:#}");
+        // Both halves, and each announced as what it is.
         assert!(
-            message.contains("leaves the catalog untouched"),
-            "the refusal must say nothing was written rather than point at notes: {message}"
+            lines
+                .iter()
+                .any(|line| line.starts_with("note:")
+                    && line.contains(HYPERLIQUID_BUILDER_ORDER_CLASS)),
+            "the heal must be announced as a saved change: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.starts_with("warning:")
+                && line.contains(uncatalogued.as_str())
+                && line.contains("left as signed")),
+            "the disagreement must be announced as one, not as a change: {lines:?}"
+        );
+
+        // A note must describe something written, so the catalog has to have
+        // moved — the half the refusing design announced and then discarded.
+        assert_ne!(
+            fs::read(catalog_path).unwrap(),
+            before,
+            "the heal must reach disk, not just the notes"
+        );
+        let after: ProvenanceCatalog =
+            serde_json::from_slice(&fs::read(catalog_path).unwrap()).unwrap();
+        let mut healed = 0;
+        let mut kept = 0;
+        for record in &after.records {
+            for class in &record.operation_classes {
+                if class.operation_class == builder_class {
+                    assert_eq!(
+                        class.fee_asset,
+                        catalogued_fee_asset(builder_class.as_str()).unwrap(),
+                        "the catalogued class must be healed to the table's value"
+                    );
+                    healed += 1;
+                } else if class.operation_class == uncatalogued {
+                    assert_eq!(
+                        class.fee_asset,
+                        Some(ProvenanceFeeAsset {
+                            chain: Token::new("hyperliquid").unwrap(),
+                            asset: "usdc".to_owned(),
+                        }),
+                        "the class this build does not catalogue must keep what it was \
+                         signed with, or its claims start failing FEE_NOT_ALLOWED"
+                    );
+                    kept += 1;
+                }
+            }
+        }
+        assert_eq!(healed, planted, "every planted heal must have landed");
+        assert_eq!(
+            kept, planted,
+            "every planted disagreement must have been kept"
         );
     }
 
@@ -2785,8 +2778,12 @@ mod tests {
         .unwrap();
         rewrite_private_json(&catalog_path, &serde_json::to_value(&stale).unwrap()).unwrap();
 
-        let template = template_dir().join("provenance-catalog.unsigned.json");
-        refresh_developer_provenance_catalog(&template, &output, owner).unwrap();
+        refresh_developer_provenance_catalog(
+            &template_dir().join("provenance-catalog.unsigned.json"),
+            &output,
+            owner,
+        )
+        .unwrap();
         let refreshed = read();
         refreshed.validate_shape().unwrap();
         assert_eq!(developer_records(&refreshed), enrolled);
@@ -2820,7 +2817,12 @@ mod tests {
         // An up-to-date catalog is left untouched.
         let before = fs::read(&catalog_path).unwrap();
         let inode = fs::metadata(&catalog_path).unwrap().ino();
-        refresh_developer_provenance_catalog(&template, &output, owner).unwrap();
+        refresh_developer_provenance_catalog(
+            &template_dir().join("provenance-catalog.unsigned.json"),
+            &output,
+            owner,
+        )
+        .unwrap();
         assert_eq!(fs::read(&catalog_path).unwrap(), before);
         assert_eq!(fs::metadata(&catalog_path).unwrap().ino(), inode);
     }
