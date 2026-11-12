@@ -16,7 +16,7 @@ make_payload() {
   cp "$installer" "$target/installer/release/install-macos.sh"
   cp "$workspace/packaging/triad/release/compatibility-v1.toml" "$target/"
   printf 'test-unclaimed\n' >"$target/PLATFORM_CLAIM"
-  for name in bloom bloom-broker bloom-signer bloom-signer-migrate; do
+  for name in bloom bloom-broker bloom-signer bloom-signer-migrate bloom-checkout; do
     printf '#!/bin/sh\nprintf "%%s\\n" "%s"\n' "$marker" >"$target/bin/$name"
     chmod 0755 "$target/bin/$name"
   done

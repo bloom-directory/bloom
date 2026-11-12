@@ -133,6 +133,7 @@ for rollback in rollback_failed_fresh rollback_failed_restore; do
     enrollments="$root_prefix/enrollments"
     enrollment="$enrollments/501.json"
     pf_anchor="$root_prefix/etc/pf.anchors/com.bloom.triad.501"
+    checkout_plist="$root_prefix/checkout.plist"
     broker_plist="$root_prefix/broker.plist"
     signer_plist="$root_prefix/signer.plist"
     containment_plist="$root_prefix/containment.plist"
@@ -142,7 +143,7 @@ for rollback in rollback_failed_fresh rollback_failed_restore; do
     cli_link="$root_prefix/bloom"
     restore_pending=true
     mkdir -p "$config" "$runtime" "$log_root" "$enrollments" "$variable/db/bloom/501"
-    for file in "$broker_plist" "$signer_plist" "$containment_plist" \
+    for file in "$checkout_plist" "$broker_plist" "$signer_plist" "$containment_plist" \
       "$session_plist" "$machine_plist" "$newsyslog_config" "$enrollment" "$cli_link"; do
       printf 'attempt-owned\n' >"$file"
     done
@@ -153,7 +154,7 @@ for rollback in rollback_failed_fresh rollback_failed_restore; do
     cmp "$root_prefix/pf.conf.before" "$root_prefix/etc/pf.conf"
     cmp "$root_prefix/anchor.before" "$pf_anchor"
     [[ ! -s "$work/calls" ]]
-    [[ ! -e "$enrollment" && ! -e "$broker_plist" && ! -e "$signer_plist" ]]
+    [[ ! -e "$enrollment" && ! -e "$checkout_plist" && ! -e "$broker_plist" && ! -e "$signer_plist" ]]
     [[ ! -e "$runtime" && ! -e "$log_root" && ! -e "$cli_link" ]]
     if [[ "$rollback" == rollback_failed_restore ]]; then
       [[ "$restore_pending" == false && -d "$config" ]]

@@ -30,6 +30,8 @@ Infer what Bloom state settles; ask only for what it cannot:
 
 ## Authority and safety
 
+When `cards/` is present, read `docs/checkout.md` before shopping.
+
 Machine exposes this VFS, Broker runs approval ceremonies and policy, and
 Signer holds the keys. Secret input (mnemonics, recovery secrets, passkeys)
 belongs only in the Broker-hosted browser page, never in a VFS write, shell

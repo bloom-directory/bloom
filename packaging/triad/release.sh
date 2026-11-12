@@ -80,7 +80,7 @@ require_host_platform() {
 
 require_staged_architecture() {
   local platform="$1" staging="$2" binary description
-  for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
+  for binary in bloom bloom-broker bloom-signer bloom-signer-migrate bloom-checkout; do
     description="$(file -b -- "$staging/bin/$binary")"
     case "$platform" in
       linux)
@@ -270,7 +270,7 @@ build_candidate() {
       die "forbidden production Machine feature resolved: $forbidden_feature"
   done
 
-  cargo build --manifest-path "$main_root/Cargo.toml" --release -p bloom --locked
+  cargo build --manifest-path "$main_root/Cargo.toml" --release -p bloom -p bloom-checkout --locked
   cargo build --manifest-path "$broker_root/Cargo.toml" --release -p bloom-broker --locked
   cargo build --manifest-path "$signer_root/Cargo.toml" --release -p bloom-signer --locked
 
@@ -280,6 +280,7 @@ build_candidate() {
   mkdir -p "$work/staging/bin" "$work/dist-a" "$work/dist-b" "$work/verified"
   for source in \
     "$main_root:bloom" \
+    "$main_root:bloom-checkout" \
     "$broker_root:bloom-broker" \
     "$signer_root:bloom-signer" \
     "$signer_root:bloom-signer-migrate"

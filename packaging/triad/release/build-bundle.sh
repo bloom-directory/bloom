@@ -209,7 +209,7 @@ EOF
   echo "SOURCE_DATE_EPOCH must be an unsigned decimal integer" >&2
   exit 64
 }
-for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
+for binary in bloom bloom-broker bloom-signer bloom-signer-migrate bloom-checkout; do
   test -f "$staging/bin/$binary" || {
     echo "missing production binary: bin/$binary" >&2
     exit 66
@@ -225,6 +225,7 @@ broker_version="$(sed -n -E 's/^broker = "([^"]+)"$/\1/p' "$compatibility_file")
 signer_version="$(sed -n -E 's/^signer = "([^"]+)"$/\1/p' "$compatibility_file")"
 for identity in \
   "bloom:$machine_version" \
+  "bloom-checkout:$machine_version" \
   "bloom-broker:$broker_version" \
   "bloom-signer:$signer_version" \
   "bloom-signer-migrate:$signer_version"
@@ -252,7 +253,7 @@ cp -R "$staging/." "$payload/"
 platform_claim="${BLOOM_PLATFORM_CLAIM:-test-unclaimed}"
 case "$platform_claim" in
   linux)
-    for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
+    for binary in bloom bloom-broker bloom-signer bloom-signer-migrate bloom-checkout; do
       require_binary_format "$staging/bin/$binary" 'ELF ' || exit 65
     done
     ;;
@@ -262,7 +263,7 @@ case "$platform_claim" in
       echo "macOS W0 claim requires its disposable Darwin build lane" >&2
       exit 65
     }
-    for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
+    for binary in bloom bloom-broker bloom-signer bloom-signer-migrate bloom-checkout; do
       require_binary_format "$staging/bin/$binary" 'Mach-O ' || exit 65
     done
     ;;
@@ -271,7 +272,7 @@ case "$platform_claim" in
       echo "production macOS claim requires a Darwin release builder" >&2
       exit 69
     }
-    for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
+    for binary in bloom bloom-broker bloom-signer bloom-signer-migrate bloom-checkout; do
       require_binary_format "$staging/bin/$binary" 'Mach-O ' || exit 65
     done
     ;;

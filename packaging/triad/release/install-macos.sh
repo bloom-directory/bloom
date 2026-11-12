@@ -111,7 +111,7 @@ snapshot_live_payload() {
 prepare_verified_payload_for_execution() {
   $live || return 0
   xattr -dr com.apple.quarantine "$payload" || die "could not remove quarantine from the verified payload"
-  for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
+  for binary in bloom bloom-broker bloom-signer bloom-signer-migrate bloom-checkout; do
     if xattr -p com.apple.quarantine "$payload/bin/$binary" >/dev/null 2>&1; then
       die "verified payload binary remains quarantined: $binary"
     fi
@@ -149,6 +149,9 @@ join_group() { dseditgroup -o edit -a "$2" -t user "$1"; }
 load_names() {
   broker_user="bloom-broker-$login_uid"; broker_group="$broker_user"
   signer_user="bloom-signer-$login_uid"; signer_group="$signer_user"
+  checkout_user="bloom-checkout-$login_uid"; checkout_group="$checkout_user"
+  machine_checkout_group="bloom-machine-checkout-$login_uid"
+  broker_checkout_group="bloom-broker-checkout-$login_uid"
   machine_broker_group="bloom-machine-broker-$login_uid"
   broker_signer_group="bloom-broker-signer-$login_uid"; revoke_group="bloom-revoke-$login_uid"
   log_group="bloom-log-$login_uid"
@@ -178,6 +181,16 @@ persist_legacy_log_identity() {
 }
 
 load_ids() {
+  local allocated_checkout=false allocated_log=false
+  if recorded_checkout_uid="$(field "$enrollment" checkout_uid 2>/dev/null)"; then
+    BLOOM_MACOS_CHECKOUT_UID="$recorded_checkout_uid"
+    BLOOM_MACOS_CHECKOUT_GID="$(field "$enrollment" checkout_gid)"
+    BLOOM_MACOS_MACHINE_CHECKOUT_GID="$(field "$enrollment" machine_checkout_gid)"
+    BLOOM_MACOS_BROKER_CHECKOUT_GID="$(field "$enrollment" broker_checkout_gid)"
+  elif [[ "$action" != uninstall ]]; then
+    allocate_checkout_accounts
+    allocated_checkout=true
+  fi
   BLOOM_MACOS_BROKER_UID="$(field "$enrollment" broker_uid)"
   BLOOM_MACOS_SIGNER_UID="$(field "$enrollment" signer_uid)"
   BLOOM_MACOS_BROKER_GID="$(field "$enrollment" broker_gid)"
@@ -187,20 +200,25 @@ load_ids() {
   BLOOM_MACOS_REVOKE_GID="$(field "$enrollment" revoke_gid)"
   if recorded_log_gid="$(field "$enrollment" log_gid 2>/dev/null)"; then
     BLOOM_MACOS_LOG_GID="$recorded_log_gid"
-    return
-  fi
-  if [[ "$action" == uninstall ]]; then BLOOM_MACOS_LOG_GID=""; return; fi
-  if $live; then
+  elif [[ "$action" == uninstall ]]; then
+    BLOOM_MACOS_LOG_GID=""
+  elif $live; then
     if record_exists Groups "$log_group"; then adopt_existing_log_group
     else
-      BLOOM_MACOS_LOG_GID="$(next_id Groups PrimaryGroupID)"; new_group "$log_group" "$BLOOM_MACOS_LOG_GID"
+      BLOOM_MACOS_LOG_GID="$(next_id Groups PrimaryGroupID)"; new_group "$log_group" "$BLOOM_MACOS_LOG_GID"; allocated_log=true
       join_group "$log_group" "$login_user"; dsmemberutil flushcache
     fi
   else
     [[ "${BLOOM_MACOS_LOG_GID:-}" =~ ^[1-9][0-9]*$ ]] || die "BLOOM_MACOS_LOG_GID must be positive decimal"
   fi
-  persist_legacy_log_identity
-  created_groups="${created_groups/ $log_group/}"
+  if $allocated_checkout || $allocated_log || [[ -z "${recorded_log_gid:-}" && "$action" != uninstall ]]; then
+    persist_legacy_log_identity
+    created_users="${created_users/ $checkout_user/}"
+    created_groups="${created_groups/ $checkout_group/}"
+    created_groups="${created_groups/ $machine_checkout_group/}"
+    created_groups="${created_groups/ $broker_checkout_group/}"
+    created_groups="${created_groups/ $log_group/}"
+  fi
 }
 
 allocate_accounts() {
@@ -218,13 +236,32 @@ allocate_accounts() {
     join_group "${pair%%:*}" "${pair#*:}"
   done
   join_group "$log_group" "$login_user"
+  allocate_checkout_accounts
   dsmemberutil flushcache
+}
+
+allocate_checkout_accounts() {
+  if $live; then
+    BLOOM_MACOS_CHECKOUT_GID="$(next_id Groups PrimaryGroupID)"; new_group "$checkout_group" "$BLOOM_MACOS_CHECKOUT_GID"
+    BLOOM_MACOS_MACHINE_CHECKOUT_GID="$(next_id Groups PrimaryGroupID)"; new_group "$machine_checkout_group" "$BLOOM_MACOS_MACHINE_CHECKOUT_GID"
+    BLOOM_MACOS_BROKER_CHECKOUT_GID="$(next_id Groups PrimaryGroupID)"; new_group "$broker_checkout_group" "$BLOOM_MACOS_BROKER_CHECKOUT_GID"
+    BLOOM_MACOS_CHECKOUT_UID="$(next_id Users UniqueID)"; new_user "$checkout_user" "$BLOOM_MACOS_CHECKOUT_UID" "$BLOOM_MACOS_CHECKOUT_GID"
+    for pair in "$machine_checkout_group:$login_user" "$machine_checkout_group:$checkout_user" "$broker_checkout_group:$broker_user" "$broker_checkout_group:$checkout_user"; do
+      join_group "${pair%%:*}" "${pair#*:}"
+    done
+    dsmemberutil flushcache
+  else
+    BLOOM_MACOS_CHECKOUT_UID="${BLOOM_MACOS_CHECKOUT_UID:-$((500000 + login_uid))}"
+    BLOOM_MACOS_CHECKOUT_GID="${BLOOM_MACOS_CHECKOUT_GID:-$((510000 + login_uid))}"
+    BLOOM_MACOS_MACHINE_CHECKOUT_GID="${BLOOM_MACOS_MACHINE_CHECKOUT_GID:-$((520000 + login_uid))}"
+    BLOOM_MACOS_BROKER_CHECKOUT_GID="${BLOOM_MACOS_BROKER_CHECKOUT_GID:-$((530000 + login_uid))}"
+  fi
 }
 
 recover_interrupted_fresh_accounts() {
   local found=false name value
   [[ ! -e "$enrollment" && ! -e "$config/edge-manifest.json" ]] || return 0
-  for name in "$broker_user" "$signer_user"; do
+  for name in "$broker_user" "$signer_user" "$checkout_user"; do
     record_exists Users "$name" || continue
     found=true
     value="$(dscl . -read "/Users/$name" 2>/dev/null)"
@@ -232,7 +269,7 @@ recover_interrupted_fresh_accounts() {
       "$value" == *"UserShell: /usr/bin/false"* && "$value" == *"dsAttrTypeNative:IsHidden: 1"* ]] ||
       die "pre-existing user $name is not a recoverable incomplete Bloom service account"
   done
-  for name in "$broker_group" "$signer_group" "$machine_broker_group" "$broker_signer_group" "$revoke_group" "$log_group"; do
+  for name in "$broker_group" "$signer_group" "$machine_broker_group" "$broker_signer_group" "$revoke_group" "$checkout_group" "$machine_checkout_group" "$broker_checkout_group" "$log_group"; do
     record_exists Groups "$name" || continue
     found=true
     value="$(dscl . -read "/Groups/$name" 2>/dev/null)"
@@ -241,15 +278,15 @@ recover_interrupted_fresh_accounts() {
   done
   $found || return 0
   echo "recovering an interrupted fresh Bloom account allocation" >&2
-  for name in "$broker_user" "$signer_user"; do record_exists Users "$name" && dscl . -delete "/Users/$name"; done
-  for name in "$broker_group" "$signer_group" "$machine_broker_group" "$broker_signer_group" "$revoke_group" "$log_group"; do
+  for name in "$broker_user" "$signer_user" "$checkout_user"; do record_exists Users "$name" && dscl . -delete "/Users/$name"; done
+  for name in "$broker_group" "$signer_group" "$machine_broker_group" "$broker_signer_group" "$revoke_group" "$checkout_group" "$machine_checkout_group" "$broker_checkout_group" "$log_group"; do
     record_exists Groups "$name" && dscl . -delete "/Groups/$name"
   done
   dsmemberutil flushcache
 }
 
 verify_payload() {
-  for path in bin/bloom bin/bloom-broker bin/bloom-signer bin/bloom-signer-migrate PLATFORM_CLAIM; do [[ -f "$payload/$path" ]] || die "payload missing $path"; done
+  for path in bin/bloom bin/bloom-broker bin/bloom-signer bin/bloom-signer-migrate bin/bloom-checkout PLATFORM_CLAIM; do [[ -f "$payload/$path" ]] || die "payload missing $path"; done
   claim="$(<"$payload/PLATFORM_CLAIM")"
   if $live; then
     case "$claim" in
@@ -281,9 +318,20 @@ verify_payload() {
   fi
 }
 
+checkout_browser_available() {
+  ! $live || [[ -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ]]
+}
+
 render() {
   src="$1"; dst="$2"; mode="$3"; mkdir -p "$(dirname "$dst")"; tmp="$dst.new.$$"
   sed -e "s|@LOGIN_UID@|$login_uid|g" -e "s|@LOGIN_USER@|$login_user|g" \
+    -e "s|@BLOOM_CHECKOUT_USER@|$checkout_user|g" -e "s|@BLOOM_CHECKOUT_GROUP@|$checkout_group|g" \
+    -e "s|@BLOOM_CHECKOUT_UID@|$BLOOM_MACOS_CHECKOUT_UID|g" \
+    -e "s|@BLOOM_CHECKOUT_BINARY@|$release_base/current/bloom-checkout|g" \
+    -e "s|@BLOOM_CHECKOUT_STATE@|$checkout_state|g" \
+    -e "s|@BLOOM_CHECKOUT_SOCKET@|$runtime/machine-checkout/checkout.sock|g" \
+    -e "s|@BLOOM_CHECKOUT_INTAKE@|$runtime/broker-checkout/intake.sock|g" \
+    -e "s|@BLOOM_CHECKOUT_VIEW_PORT@|$checkout_view_port|g" -e "s|@BLOOM_CHECKOUT_LOG@|$checkout_log|g" \
     -e "s|@BLOOM_BROKER_USER@|$broker_user|g" -e "s|@BLOOM_BROKER_GROUP@|$broker_group|g" \
     -e "s|@BLOOM_SIGNER_USER@|$signer_user|g" -e "s|@BLOOM_SIGNER_GROUP@|$signer_group|g" \
     -e "s|@BLOOM_BROKER_UID@|$BLOOM_MACOS_BROKER_UID|g" -e "s|@BLOOM_SIGNER_UID@|$BLOOM_MACOS_SIGNER_UID|g" \
@@ -320,10 +368,14 @@ paths() {
   machine_config="$config/machine"; session_config="$config/session"; installer_config="$config/installer"
   if $live; then variable=/private/var; else variable="$root_prefix/var"; fi
   broker_state="$variable/db/bloom/$login_uid/broker"; signer_state="$variable/db/bloom/$login_uid/signer"
+  checkout_state="$variable/db/bloom/$login_uid/checkout"
   machine_state="$variable/db/bloom/$login_uid/machine"; runtime="$variable/run/bloom/$login_uid"
   log_root="$variable/log/bloom/$login_uid"; broker_log="$log_root/broker.jsonl"; signer_log="$log_root/signer.jsonl"
   broker_bootstrap_log="$log_root/broker-bootstrap.log"; signer_bootstrap_log="$log_root/signer-bootstrap.log"
+  checkout_log="$log_root/checkout.log"
   broker_plist="$root_prefix/Library/LaunchDaemons/com.bloom.broker.$login_uid.plist"
+  checkout_plist="$root_prefix/Library/LaunchDaemons/com.bloom.checkout.$login_uid.plist"
+  checkout_view_port=0
   signer_plist="$root_prefix/Library/LaunchDaemons/com.bloom.signer.$login_uid.plist"
   containment_plist="$root_prefix/Library/LaunchDaemons/com.bloom.containment.plist"
   session_plist="$root_prefix/Library/LaunchAgents/com.bloom.session.plist"
@@ -609,18 +661,18 @@ disable_legacy_network_guard() {
 # This installer creates no anchors; successful activation owns their cleanup.
 rollback_failed_restore() {
   if $live; then
-    for label in "gui/$login_uid/com.bloom.machine" "user/$login_uid/com.bloom.machine" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session" "user/$login_uid/com.bloom.session"; do
+    for label in "gui/$login_uid/com.bloom.machine" "user/$login_uid/com.bloom.machine" "system/com.bloom.checkout.$login_uid" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session" "user/$login_uid/com.bloom.session"; do
       launchctl bootout "$label" 2>/dev/null || true
     done
   fi
-  rm -f "$broker_plist" "$signer_plist" "$newsyslog_config" "$enrollments/$login_uid.json"
+  rm -f "$checkout_plist" "$broker_plist" "$signer_plist" "$newsyslog_config" "$enrollments/$login_uid.json"
   rm -rf "$runtime" "$log_root"
   has_active_enrollments || remove_cli_link
   restore_pending=false
 }
 rollback_failed_fresh() {
-  for label in "gui/$login_uid/com.bloom.machine" "user/$login_uid/com.bloom.machine" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session" "user/$login_uid/com.bloom.session"; do launchctl bootout "$label" 2>/dev/null || true; done
-  rm -f "$broker_plist" "$signer_plist" "$newsyslog_config" "$enrollment"
+  for label in "gui/$login_uid/com.bloom.machine" "user/$login_uid/com.bloom.machine" "system/com.bloom.checkout.$login_uid" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session" "user/$login_uid/com.bloom.session"; do launchctl bootout "$label" 2>/dev/null || true; done
+  rm -f "$checkout_plist" "$broker_plist" "$signer_plist" "$newsyslog_config" "$enrollment"
   rm -rf "$config" "$variable/db/bloom/$login_uid" "$runtime" "$log_root"
   has_active_enrollments || { launchctl bootout system/com.bloom.containment 2>/dev/null || true; rm -f "$containment_plist" "$session_plist" "$machine_plist"; remove_cli_link; }
 }
@@ -630,6 +682,9 @@ write_enrollment() {
     log_fields=",\"log_group\":\"$log_group\",\"log_gid\":$BLOOM_MACOS_LOG_GID"
   else
     log_fields=""
+  fi
+  if [[ -n "${BLOOM_MACOS_CHECKOUT_UID:-}" ]]; then
+    log_fields="$log_fields,\"checkout_uid\":$BLOOM_MACOS_CHECKOUT_UID,\"checkout_gid\":$BLOOM_MACOS_CHECKOUT_GID,\"machine_checkout_gid\":$BLOOM_MACOS_MACHINE_CHECKOUT_GID,\"broker_checkout_gid\":$BLOOM_MACOS_BROKER_CHECKOUT_GID"
   fi
   printf '{"schema":"bloom.macos-enrollment.1","state":"%s","login_uid":%s,"login_user":"%s","broker_user":"%s","broker_uid":%s,"broker_group":"%s","broker_gid":%s,"signer_user":"%s","signer_uid":%s,"signer_group":"%s","signer_gid":%s,"machine_broker_group":"%s","machine_broker_gid":%s,"broker_signer_group":"%s","broker_signer_gid":%s,"revoke_group":"%s","revoke_gid":%s%s,"release_digest":"%s"}\n' \
     "$state" "$login_uid" "$login_user" "$broker_user" "$BLOOM_MACOS_BROKER_UID" "$broker_group" "$BLOOM_MACOS_BROKER_GID" \
@@ -702,7 +757,7 @@ install_release() {
   release="$release_base/releases/$BLOOM_RELEASE_DIGEST"; mkdir -p "$release_base/releases"
   if [[ -e "$release" ]]; then
     [[ -d "$release" && ! -L "$release" ]] || die "invalid digest-named release"
-    for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
+    for binary in bloom bloom-broker bloom-signer bloom-signer-migrate bloom-checkout; do
       if [[ ! -f "$release/$binary" || -L "$release/$binary" ]] || ! cmp "$payload/bin/$binary" "$release/$binary" >/dev/null; then
         die "digest-named release does not match the verified payload"
       fi
@@ -711,6 +766,7 @@ install_release() {
     stage="$release_base/.release.$$.new"; mkdir "$stage"
     install -m 0755 "$payload/bin/bloom" "$stage/bloom"; install -m 0755 "$payload/bin/bloom-broker" "$stage/bloom-broker"
     install -m 0755 "$payload/bin/bloom-signer" "$stage/bloom-signer"; install -m 0755 "$payload/bin/bloom-signer-migrate" "$stage/bloom-signer-migrate"
+    install -m 0755 "$payload/bin/bloom-checkout" "$stage/bloom-checkout"
     $live && chown -R root:wheel "$stage"; mv "$stage" "$release"
   fi
   machine_binary="$release_base/current/bloom"; broker_binary="$release_base/current/bloom-broker"; signer_binary="$release_base/current/bloom-signer"
@@ -733,7 +789,20 @@ switch_release() {
   machine_binary="$release_base/current/bloom"; broker_binary="$release_base/current/bloom-broker"; signer_binary="$release_base/current/bloom-signer"
 }
 
+write_macos_checkout_endpoint() {
+  if checkout_browser_available; then
+    printf '{"socket":"%s","uid":%s}\n' "$runtime/machine-checkout/checkout.sock" "$BLOOM_MACOS_CHECKOUT_UID" > "$config/checkout.json.new.$$"
+    chmod 0644 "$config/checkout.json.new.$$"; mv -f "$config/checkout.json.new.$$" "$config/checkout.json"
+  else
+    rm -f -- "$config/checkout.json"
+  fi
+}
+
 install_config() {
+  [[ -n "${BLOOM_MACOS_CHECKOUT_UID:-}" ]] || allocate_checkout_accounts
+  mkdir -p "$checkout_state" "$runtime/machine-checkout" "$runtime/broker-checkout"
+  chmod 0700 "$checkout_state"
+  chmod 0710 "$runtime/machine-checkout" "$runtime/broker-checkout"
   mkdir -p "$enrollments" "$broker_config" "$signer_config" "$machine_config" "$session_config" "$installer_config" \
     "$broker_state/audit-checkpoints" "$signer_state/audit-checkpoints" "$machine_state/audit-checkpoints" \
     "$runtime/machine-broker" "$runtime/broker-signer" "$runtime/revoke/broker" "$runtime/revoke/signer" \
@@ -746,6 +815,7 @@ install_config() {
     [[ -d "$directory" && ! -L "$directory" ]] || die "security directory is missing or substituted: $directory"
   done
   chmod 0711 "$config" "$runtime" "$runtime/revoke"
+  write_macos_checkout_endpoint
   chmod 0700 "$runtime/signer-admin" "$installer_config/admin"
   chmod 0700 "$broker_config" "$signer_config" "$machine_config" "$session_config" "$installer_config" \
     "$broker_state" "$signer_state" "$machine_state" "$broker_state/audit-checkpoints" \
@@ -756,7 +826,7 @@ install_config() {
   # Service principals traverse to their owner-writable file; only the log
   # group can read it. No principal can replace entries in this root directory.
   chmod 0711 "$variable/log/bloom" "$log_root"
-  for service_log in "$broker_log" "$signer_log" "$broker_bootstrap_log" "$signer_bootstrap_log"; do
+  for service_log in "$broker_log" "$signer_log" "$broker_bootstrap_log" "$signer_bootstrap_log" "$checkout_log"; do
     if [[ ! -e "$service_log" ]]; then install -m 0640 /dev/null "$service_log"; fi
     [[ -f "$service_log" && ! -L "$service_log" ]] || die "service log is missing or substituted: $service_log"
     chmod 0640 "$service_log"
@@ -802,19 +872,31 @@ validate_installed_security_inputs() {
 install_assets() {
   base="$payload/installer/macos"
   render "$base/launchdaemons/com.bloom.broker.plist.in" "$broker_plist" 0644
+  if checkout_browser_available; then
+    render "$base/launchdaemons/com.bloom.checkout.plist.in" "$checkout_plist" 0644
+  else
+    rm -f "$checkout_plist"
+  fi
   render "$base/launchdaemons/com.bloom.signer.plist.in" "$signer_plist" 0644
   render "$base/launchdaemons/com.bloom.containment.plist.in" "$containment_plist" 0644
   render "$base/launchagents/com.bloom.session.plist.in" "$session_plist" 0644
   render "$base/launchagents/com.bloom.machine.plist.in" "$machine_plist" 0644
   mkdir -p "$(dirname "$newsyslog_config")"
   newsyslog_tmp="$newsyslog_config.new.$$"
-  printf '%s %s:%s 640 5 1024 * BN\n%s %s:%s 640 5 1024 * BN\n%s %s:%s 640 2 128 * BN\n%s %s:%s 640 2 128 * BN\n' \
+  printf '%s %s:%s 640 5 1024 * BN\n%s %s:%s 640 5 1024 * BN\n%s %s:%s 640 2 128 * BN\n%s %s:%s 640 2 128 * BN\n%s %s:%s 640 2 1024 * BN\n' \
     "$broker_log" "$broker_user" "$log_group" "$signer_log" "$signer_user" "$log_group" \
-    "$broker_bootstrap_log" "$broker_user" "$log_group" "$signer_bootstrap_log" "$signer_user" "$log_group" >"$newsyslog_tmp"
+    "$broker_bootstrap_log" "$broker_user" "$log_group" "$signer_bootstrap_log" "$signer_user" "$log_group" \
+    "$checkout_log" "$checkout_user" "$log_group" >"$newsyslog_tmp"
   chmod 0644 "$newsyslog_tmp"; mv -f "$newsyslog_tmp" "$newsyslog_config"
 }
 
 secure_ownership() {
+  if [[ -f "$config/checkout.json" ]]; then chown root:wheel "$config/checkout.json"; fi
+  if [[ -f "$checkout_plist" ]]; then chown root:wheel "$checkout_plist"; fi
+  chown "$checkout_user:$log_group" "$checkout_log"
+  chown -R "$checkout_user:$checkout_group" "$checkout_state"
+  chown "$checkout_user:$machine_checkout_group" "$runtime/machine-checkout"
+  chown "$broker_user:$broker_checkout_group" "$runtime/broker-checkout"
   chown -R root:wheel "$release_base"
   chown root:wheel "$product" "$enrollments" "$config" "$broker_plist" "$signer_plist" "$containment_plist" "$session_plist" "$machine_plist" "$newsyslog_config"
   chown -R "$broker_user:$broker_group" "$broker_config" "$broker_state"
@@ -882,8 +964,8 @@ capture_activation_failure() {
   local evidence="${BLOOM_MACOS_W0_EVIDENCE_DIR:-}" service source_log
   [[ -n "$evidence" && -d "$evidence" && ! -L "$evidence" ]] || return 0
   # W0-only evidence must survive rollback. Never copy identity/config files.
-  for service in broker signer; do
-    for source_log in "$log_root/$service.jsonl" "$log_root/$service-bootstrap.log"; do
+  for service in broker signer checkout; do
+    for source_log in "$log_root/$service.jsonl" "$log_root/$service-bootstrap.log" "$log_root/$service.log"; do
       [[ -f "$source_log" && ! -L "$source_log" ]] || continue
       install -m 0644 "$source_log" "$evidence/activation-$(basename "$source_log")" || true
     done
@@ -899,6 +981,7 @@ capture_activation_failure() {
   chmod 0644 "$evidence/"activation-*-launchctl.txt 2>/dev/null || true
 }
 reload_current_enrollment() {
+  if [[ -f "$checkout_plist" ]]; then plutil -lint "$checkout_plist" >/dev/null; fi
   plutil -lint "$broker_plist" "$signer_plist" "$containment_plist" "$session_plist" "$machine_plist" >/dev/null
   reload_launchd_job system com.bloom.containment "$containment_plist"
   "$machine_binary" serve triad-pf-monitor-once 2>/dev/null ||
@@ -906,6 +989,7 @@ reload_current_enrollment() {
   reload_launchagent_job "$login_uid" com.bloom.session "$session_plist"
   reload_launchd_job system "com.bloom.signer.$login_uid" "$signer_plist"
   reload_launchd_job system "com.bloom.broker.$login_uid" "$broker_plist"
+  if [[ -f "$checkout_plist" ]]; then reload_launchd_job system "com.bloom.checkout.$login_uid" "$checkout_plist"; fi
   reload_launchagent_job "$login_uid" com.bloom.machine "$machine_plist"
   require_triad_health "$login_uid" "$login_user" "$BLOOM_RELEASE_DIGEST"
 }
@@ -926,7 +1010,7 @@ stop_all_enrollments() {
   for record in "$enrollments"/*.json; do
     [[ -f "$record" && ! -L "$record" ]] || continue
     uid="${record##*/}"; uid="${uid%.json}"; [[ "$uid" =~ ^[1-9][0-9]*$ ]] || return 65
-    for label in "gui/$uid/com.bloom.machine" "user/$uid/com.bloom.machine" "gui/$uid/com.bloom.session" "user/$uid/com.bloom.session" "system/com.bloom.broker.$uid" "system/com.bloom.signer.$uid"; do stop_launchd_job "$label"; done
+    for label in "gui/$uid/com.bloom.machine" "user/$uid/com.bloom.machine" "gui/$uid/com.bloom.session" "user/$uid/com.bloom.session" "system/com.bloom.checkout.$uid" "system/com.bloom.broker.$uid" "system/com.bloom.signer.$uid"; do stop_launchd_job "$label"; done
   done
 }
 
@@ -981,6 +1065,9 @@ reload_installed_set() {
     reload_launchagent_job "$uid" com.bloom.session "$root_prefix/Library/LaunchAgents/com.bloom.session.plist" || { reload_failed; return 1; }
     reload_launchd_job system "com.bloom.signer.$uid" "$root_prefix/Library/LaunchDaemons/com.bloom.signer.$uid.plist" || { reload_failed; return 1; }
     reload_launchd_job system "com.bloom.broker.$uid" "$root_prefix/Library/LaunchDaemons/com.bloom.broker.$uid.plist" || { reload_failed; return 1; }
+    if [[ -f "$root_prefix/Library/LaunchDaemons/com.bloom.checkout.$uid.plist" ]]; then
+      reload_launchd_job system "com.bloom.checkout.$uid" "$root_prefix/Library/LaunchDaemons/com.bloom.checkout.$uid.plist" || { reload_failed; return 1; }
+    fi
     reload_launchagent_job "$uid" com.bloom.machine "$root_prefix/Library/LaunchAgents/com.bloom.machine.plist" || { reload_failed; return 1; }
     if ! require_triad_health "$uid" "$(field "$record" login_user)" "$(field "$record" release_digest)"; then
       # This login's own check set health_timed_out; keep it as reported.
@@ -1027,6 +1114,7 @@ snapshot_macos_upgrade_state() {
       "Library/LaunchDaemons/com.bloom.signer.$uid.plist"
       "$etc_relative/newsyslog.d/bloom-$uid.conf"
     )
+    [[ ! -f "$root_prefix/Library/LaunchDaemons/com.bloom.checkout.$uid.plist" ]] || paths+=("Library/LaunchDaemons/com.bloom.checkout.$uid.plist")
     [[ ! -f "$root_prefix/etc/pf.anchors/com.bloom.triad.$uid" ]] || paths+=("$etc_relative/pf.anchors/com.bloom.triad.$uid")
   done
   (cd "${root_prefix:-/}" && tar -cpf "$scratch" "${paths[@]}")
@@ -1041,6 +1129,14 @@ snapshot_macos_upgrade_state() {
 restore_macos_upgrade_state() {
   local archive="$upgrade_transaction/rollback-state.tar"
   [[ -f "$archive" && ! -L "$archive" ]] || die "macOS upgrade rollback state is missing or unsafe"
+  # The previous release may not have had a checkout job at all.
+  local record uid
+  for record in "$enrollments"/*.json; do
+    [[ -f "$record" && ! -L "$record" ]] || continue
+    uid="${record##*/}"; uid="${uid%.json}"
+    [[ "$uid" =~ ^[1-9][0-9]*$ ]] || return 65
+    rm -f -- "$root_prefix/Library/LaunchDaemons/com.bloom.checkout.$uid.plist"
+  done
   if $live; then
     # Historical snapshots use etc/... although /etc is a symlink on macOS.
     # Do not enable tar's global symlink-traversal override. Restore those exact
@@ -1344,6 +1440,9 @@ case "$action" in
   install|restore)
     [[ $# -eq 4 ]] || usage; root_and_uid "$1" "$2"; login_user="$3"; payload="$(cd "$4" && pwd -P)"
     $live && require_supported_macos "$(/usr/bin/sw_vers -productVersion)"
+    if ! checkout_browser_available; then
+      echo "warning: Google Chrome is not installed; checkout will not start. Install it and rerun the installer to enable it." >&2
+    fi
     [[ "$login_user" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "unsafe LOGIN_USER" >&2; exit 64; }
     $live && { lock_installer; [[ "$(id -u "$login_user")" == "$login_uid" ]] || die "LOGIN_USER does not match LOGIN_UID"; launchctl print "gui/$login_uid" >/dev/null 2>&1 || die "LOGIN_USER has no active GUI domain"; snapshot_live_payload; }
     requested_uid="$login_uid"; requested_user="$login_user"; load_names; paths; verify_payload; preflight_compatibility; prepare_verified_payload_for_execution
@@ -1423,10 +1522,10 @@ case "$action" in
     [[ -f "$record" && ! -L "$record" ]] || die "enrollment or retained custody record missing"
     enrollment="$record"; login_user="$(field "$record" login_user)"; BLOOM_RELEASE_DIGEST="$(field "$record" release_digest)"; load_ids
     if $live; then
-      for label in "gui/$login_uid/com.bloom.machine" "user/$login_uid/com.bloom.machine" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session" "user/$login_uid/com.bloom.session"; do stop_launchd_job "$label"; done
+      for label in "gui/$login_uid/com.bloom.machine" "user/$login_uid/com.bloom.machine" "system/com.bloom.checkout.$login_uid" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session" "user/$login_uid/com.bloom.session"; do stop_launchd_job "$label"; done
     fi
     cleanup_legacy_pf "$login_uid"
-    rm -f "$broker_plist" "$signer_plist" "$pf_anchor" "$newsyslog_config"
+    rm -f "$checkout_plist" "$broker_plist" "$signer_plist" "$pf_anchor" "$newsyslog_config"
     if $retain; then
       mkdir -p "$product/retained"; enrollment="$retained"; write_enrollment retained
       rm -f "$enrollments/$login_uid.json"; rm -rf "$runtime" "$log_root"
@@ -1435,8 +1534,13 @@ case "$action" in
       rm -f "$enrollments/$login_uid.json" "$retained"; rm -rf "$config" "$variable/db/bloom/$login_uid" "$runtime" "$log_root"
     fi
     if $live && ! $retain; then
-      for name in "$broker_user" "$signer_user"; do dscl . -delete "/Users/$name"; done
-      for name in "$broker_group" "$signer_group" "$machine_broker_group" "$broker_signer_group" "$revoke_group"; do dscl . -delete "/Groups/$name"; done
+      # Enrollments from before checkout have no checkout user or groups.
+      for name in "$broker_user" "$signer_user" "$checkout_user"; do
+        if record_exists Users "$name"; then dscl . -delete "/Users/$name"; fi
+      done
+      for name in "$broker_group" "$signer_group" "$machine_broker_group" "$broker_signer_group" "$revoke_group" "$checkout_group" "$machine_checkout_group" "$broker_checkout_group"; do
+        if record_exists Groups "$name"; then dscl . -delete "/Groups/$name"; fi
+      done
       record_exists Groups "$log_group" && dscl . -delete "/Groups/$log_group"
       dsmemberutil flushcache
     fi

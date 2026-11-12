@@ -10,6 +10,7 @@ use crate::path::VfsPath;
 pub struct DocsHandler {
     readme: String,
     examples: String,
+    checkout: String,
     wallets: String,
     petals: Arc<dyn Fn() -> Vec<u8> + Send + Sync>,
 }
@@ -19,6 +20,7 @@ impl Default for DocsHandler {
         Self {
             readme: include_str!("../docs/README.md").to_string(),
             examples: include_str!("../docs/examples.md").to_string(),
+            checkout: include_str!("../docs/checkout.md").to_string(),
             wallets: include_str!("../docs/wallets.md").to_string(),
             petals: Arc::new(|| {
                 b"# Installed Petals\n\nNo Petals are currently installed.\n".to_vec()
@@ -74,6 +76,7 @@ impl DocsHandler {
             [] => Ok(Entry::dir("")),
             [s] if s == "README.md" => Ok(Entry::file("README.md")),
             [s] if s == "examples.md" => Ok(Entry::file("examples.md")),
+            [s] if s == "checkout.md" => Ok(Entry::file("checkout.md")),
             [s] if s == "wallets.md" => Ok(Entry::file("wallets.md")),
             [s] if s == "petals.md" => Ok(Entry::file("petals.md")),
             _ => Err(HandlerError::not_found(path.to_string_path())),
@@ -84,6 +87,7 @@ impl DocsHandler {
         match path.segments() {
             [s] if s == "README.md" => Ok(self.readme.as_bytes().to_vec()),
             [s] if s == "examples.md" => Ok(self.examples.as_bytes().to_vec()),
+            [s] if s == "checkout.md" => Ok(self.checkout.as_bytes().to_vec()),
             [s] if s == "wallets.md" => Ok(self.wallets.as_bytes().to_vec()),
             [s] if s == "petals.md" => Ok((self.petals)()),
             _ => Err(HandlerError::NotAFile(path.to_string_path())),
@@ -95,6 +99,7 @@ impl DocsHandler {
             Ok(vec![
                 Entry::file("README.md"),
                 Entry::file("examples.md"),
+                Entry::file("checkout.md"),
                 Entry::file("wallets.md"),
                 Entry::file("petals.md"),
             ])
@@ -116,7 +121,13 @@ mod tests {
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(
             names,
-            ["README.md", "examples.md", "wallets.md", "petals.md"]
+            [
+                "README.md",
+                "examples.md",
+                "checkout.md",
+                "wallets.md",
+                "petals.md"
+            ]
         );
         for e in &entries {
             assert_eq!(e.kind, EntryKind::File);
@@ -146,7 +157,13 @@ mod tests {
     #[tokio::test]
     async fn lookup_known_files_are_files() {
         let h = DocsHandler::new();
-        for name in ["README.md", "examples.md", "wallets.md", "petals.md"] {
+        for name in [
+            "README.md",
+            "examples.md",
+            "checkout.md",
+            "wallets.md",
+            "petals.md",
+        ] {
             let p = VfsPath::parse(&format!("/{name}")).unwrap();
             let e = h.lookup(&p).await.unwrap();
             assert_eq!(e.kind, EntryKind::File);

@@ -4822,6 +4822,56 @@ impl Daemon {
                 ) as _,
             );
 
+        let mut checkout = config
+            .checkout
+            .clone()
+            .or(bloom_proto::config::CheckoutConfig::from_environment()?);
+        #[cfg(unix)]
+        if checkout.is_none()
+            && let Some(root) = std::env::var_os("BLOOM_CHECKOUT_CONFIG_ROOT")
+        {
+            checkout = match bloom_proto::config::CheckoutConfig::from_installed_root(
+                std::path::Path::new(&root),
+                rustix::process::geteuid().as_raw(),
+            ) {
+                Ok(endpoint) => Some(endpoint),
+                Err(bloom_proto::config::ConfigError::Io(error))
+                    if error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    None
+                }
+                Err(error) => return Err(error.into()),
+            };
+        }
+        if let Some(checkout) = &checkout {
+            let client = bloom_machine_client::checkout::CheckoutClient::new(
+                checkout.socket.clone(),
+                checkout.uid,
+            );
+            vfs_builder = vfs_builder
+                .mount(
+                    "travelers",
+                    Arc::new(bloom_vfs::handlers::CardsHandler::travelers(
+                        broker.clone(),
+                        home.cache_dir().join("traveler-operations"),
+                    )) as _,
+                )
+                .mount(
+                    "cards",
+                    Arc::new(bloom_vfs::handlers::CardsHandler::new(
+                        broker.clone(),
+                        home.cache_dir().join("card-operations"),
+                    )) as _,
+                )
+                .mount(
+                    "checkout",
+                    Arc::new(bloom_vfs::handlers::CheckoutHandler::new(
+                        client,
+                        home.cache_dir().join("checkout-operations"),
+                    )) as _,
+                );
+        }
+
         vfs_builder = vfs_builder
             .mount("wallets", wallets_handler.clone() as _)
             .mount("tools", Arc::new(ToolsHandler::new()) as _)

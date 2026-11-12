@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bloom private browser</title>
+<style>
+:root{color-scheme:light;font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif;--ink:#1c1b19;--muted:#6b665e;--line:#e4e0d9;--soft:#f5f3ef;--accent:#7a2434;--accent-dark:#5a1a26}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{margin:0;background:var(--soft);color:var(--ink);font-size:15px;line-height:1.5;-webkit-font-smoothing:antialiased}
+main{max-width:1120px;margin:0 auto;padding:20px 24px 40px}
+.brand{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:16px;font-size:13px;color:var(--muted)}
+.brand strong{color:var(--accent);font-size:17px;letter-spacing:-.02em}
+.private{display:inline-flex;align-items:center;gap:6px}
+.private svg{width:14px;height:14px}
+.card{background:white;border:1px solid var(--line);border-radius:14px;overflow:hidden;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+.summary{padding:24px 28px;display:grid;gap:12px}
+h1{margin:0;font-size:22px;line-height:1.3;letter-spacing:-.02em;font-weight:600}
+#status{margin:0;color:var(--muted);overflow-wrap:anywhere}
+.task{margin:0;padding:12px 16px;border-left:3px solid var(--accent);background:var(--soft);border-radius:0 8px 8px 0}
+.task small{display:block;color:var(--muted);font-size:12px;margin-bottom:2px}
+.task p{margin:0;overflow-wrap:anywhere}
+#purpose{margin:0;color:var(--muted);font-size:14px}
+#controls{margin:0;padding:0;border:0;min-width:0}
+.window{margin:0 28px;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:white}
+.address{display:flex;align-items:center;gap:8px;padding:8px 10px;background:var(--soft);border-bottom:1px solid var(--line);font-size:13px;color:var(--muted)}
+.address svg{width:14px;height:14px;flex:none}
+#pages{flex:1;min-width:0;border:0;background:transparent;padding:4px;font-size:13px;color:var(--ink)}
+#screen{display:block;width:100%;height:auto;background:white;cursor:pointer}
+.typing{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:14px 28px 0;font-size:13px;color:var(--muted)}
+#typing{display:flex;gap:6px;flex:1;min-width:240px}
+#text{flex:1;min-width:120px}
+.keys{display:flex;gap:6px}
+.keys button,#typing button{padding:6px 10px;font-size:13px}
+.tools{margin:20px 28px 0;padding:16px;border:1px solid var(--line);border-radius:10px;display:grid;gap:10px}
+.tools p{margin:0}
+#saved-status{color:var(--muted);font-size:14px}
+.footer{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:20px;padding:18px 28px;border-top:1px solid var(--line);background:#fcfbf9}
+.notes{flex:1 1 280px;font-size:13px;color:var(--muted)}
+.notes p{margin:0}
+input,button,select{font:inherit;border:1px solid #d8d2c8;border-radius:8px;padding:9px 14px;background:white;color:var(--ink)}
+button{cursor:pointer;font-weight:600}
+button:hover{background:var(--soft)}
+.primary{background:var(--accent);border-color:var(--accent);color:white}
+.primary:hover{background:var(--accent-dark)}
+#screen:focus-visible,input:focus-visible,button:focus-visible,select:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+@media(max-width:640px){main{padding:12px}.summary{padding:18px}.window{margin:0 12px}.typing,.footer{padding-inline:12px}.tools{margin-inline:12px}.footer button{width:100%}}
+</style>
+</head>
+<body>
+<main>
+<header class="brand"><strong>Bloom</strong><span class="private"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/></svg>Private · only you can see this</span></header>
+<section class="card" aria-labelledby="heading">
+<div class="summary">
+<h1 id="heading">Complete your checkout</h1>
+<p id="status" role="status" aria-live="polite">Connecting…</p>
+<div class="task" id="task" hidden><small>From the agent</small><p id="task-text"></p></div>
+<p id="purpose">Finish a bank check or complete checkout here. Check the shop and total before paying.</p>
+</div>
+<fieldset id="controls" aria-label="Private browser controls">
+<div class="window">
+<div class="address"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/></svg><select id="pages" aria-label="Browser page"></select></div>
+<img id="screen" tabindex="0" alt="Bloom's browser. Click to use it, then type." hidden>
+</div>
+<div class="typing">
+<span>Click the page, then type. For passwords:</span>
+<form id="typing"><input id="text" type="password" autocomplete="off" aria-label="Hidden text for the selected field" placeholder="Hidden text"><button>Send</button></form>
+<div class="keys" aria-label="Keys"><button type="button" data-key="Tab">Tab</button><button type="button" data-key="Enter">Enter</button><button type="button" data-key="Backspace">⌫</button></div>
+</div>
+<section class="tools" id="saved-tools" aria-label="Saved details" hidden>
+<p id="traveler-row" hidden><label>Traveler <select id="saved-traveler"><option value="">Choose a saved traveler</option></select></label>
+<button type="button" id="fill-traveler">Fill traveler</button></p>
+<div id="card-row" hidden>
+<p><label>Card <select id="saved-card"><option value="">Choose a saved card</option></select></label></p>
+<p><label><input type="checkbox" id="unpaid-checked"> I checked the shop's order or my bank: this order has not been paid.</label></p>
+<p><button type="button" id="pay-saved">Pay with saved card</button></p>
+</div>
+<p id="saved-status" role="status" aria-live="polite"></p>
+<a id="saved-approval" target="_blank" rel="noopener noreferrer" hidden>Review approval</a>
+</section>
+<div class="footer">
+<button type="button" id="stay-signed-in" class="primary" hidden>Done, stay signed in</button>
+<button type="button" id="finish">Close</button>
+<div class="notes">
+<p id="stay-note" hidden>Staying signed in lets the agent read pages where you're signed in, such as your name, addresses and orders. It still can't click, type or pay without you.</p>
+<p id="note">Closing before the site confirms leaves the result unknown. Check your email and bank before paying again.</p>
+</div>
+</div>
+</fieldset>
+</section>
+</main>
+<script src="/view.js"></script>
+</body>
+</html>
