@@ -10,7 +10,7 @@
 //! there is no RPC node.
 use super::*;
 use bloom_broker_api::{
-    CryptoSuite, CustodyPrepareRequest, DecimalU256, DecimalU64, DeclaredFee, Digest32,
+    CryptoSuite, CustodyPrepareRequest, DecimalU64, DecimalU256, DeclaredFee, Digest32,
     OperationId, PetalUseClaim, ProvenanceSubject, RequestNonce, Token,
 };
 use bloom_machine_client::{
