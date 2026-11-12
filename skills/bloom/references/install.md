@@ -65,9 +65,10 @@ Missing `pkexec`, a desktop, or a credential dialog is not a blocker for root.
 Root administers the install; Machine, CLI, and VFS operations use a non-root
 login account. Never pass UID `0` as `LOGIN_UID`.
 
-Briefly tell the user once: "Bloom will use separate service accounts. This
-agent's existing root access can still bypass that isolation." Then continue
-the authorized setup or upgrade without asking for confirmation.
+Once root access is known, include this brief note in your next user-facing
+setup or upgrade update: "Bloom will use separate service accounts. This
+agent's existing root access can still bypass that isolation." Give it once,
+then continue the authorized setup or upgrade without asking for confirmation.
 
 For an existing installation, select the intended account from the public
 `/etc/bloom/enrollments/*.json` records (`login_uid`, `login_user`), and confirm
