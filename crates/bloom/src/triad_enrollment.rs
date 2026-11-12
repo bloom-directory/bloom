@@ -304,6 +304,15 @@ pub fn run_developer_provenance_refresh(template: &Path, config_dir: &Path) -> R
 }
 
 #[cfg(feature = "triad-dev-harness")]
+/// Single-quote a path for a copy-paste shell command. The developer root is
+/// chosen by whoever ran the launcher, and a path with a space in it -- macOS
+/// puts application data under one by default -- silently splits into two
+/// arguments otherwise, so the command the warning prints would not run.
+#[cfg(feature = "triad-dev-harness")]
+fn shell_quoted(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
+}
+
 fn refresh_developer_provenance_catalog(
     template: &Path,
     config_dir: &Path,
@@ -446,7 +455,7 @@ fn refresh_developer_provenance_catalog(
              package directory, the same path the launcher takes from \
              BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE. That re-derives only the package hash on \
              disk; recreating the developer root clears every record at once.",
-            config_dir.display(),
+            shell_quoted(config_dir),
         ));
     }
     notes.append(&mut warnings);
@@ -2191,6 +2200,25 @@ mod tests {
                 .any(|class| &class.operation_class == builder_class)
     }
 
+    /// The refresh prints a command for the operator to paste, so the path in
+    /// it has to survive a shell. The fixture roots are tempdirs with no space
+    /// in them, so the refresh tests above would pass either way.
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
+    fn a_pasted_recovery_path_survives_spaces_and_quotes() {
+        assert_eq!(shell_quoted(Path::new("/tmp/plain")), "'/tmp/plain'");
+        assert_eq!(
+            shell_quoted(Path::new("/Users/a/Application Support/bloom")),
+            "'/Users/a/Application Support/bloom'",
+            "a space must not split the path into two arguments"
+        );
+        assert_eq!(
+            shell_quoted(Path::new("/tmp/it's")),
+            r"'/tmp/it'\''s'",
+            "an embedded quote must close, escape and reopen, not end the argument"
+        );
+    }
+
     /// A predecessor package stays in the catalog, re-signed inactive. The walk
     /// does not read lineage, so this record is reached like any other — and
     /// because it carries a value, it is reported and left exactly as signed.
@@ -2447,9 +2475,9 @@ mod tests {
             );
         }
         assert!(
-            message.contains(&output.display().to_string()),
-            "the command must name this root's own config directory rather than a \
-             placeholder the operator has to resolve: {message}"
+            message.contains(&format!("'{}'", output.display())),
+            "the command must name this root's own config directory, shell-quoted so a \
+             path with a space in it still runs: {message}"
         );
 
         // And it must leave the record alone rather than half-rewriting it.
