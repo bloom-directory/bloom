@@ -4891,7 +4891,8 @@ impl Daemon {
             let projections = next_wallet_projections.clone();
             let wallet_tree = next_wallet_tree.clone();
             async move {
-                let installed = |petal: &str| wallet_tree.installed_petal_package(petal);
+                let packages = wallet_tree.clone();
+                let installed = move |petal: &str| packages.installed_petal_package(petal);
                 render_next_actions(projections.as_ref(), wallet_tree.as_ref(), &installed).await
             }
         });
@@ -10100,7 +10101,7 @@ allowed = ["bloom:vfs.read"]
             test_petal_host(&daemon).with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let context = account_route_context("w", Some(0), None);
         let staged: bloom_proto::StagedTx = serde_json::from_value(serde_json::json!({
-            "id": "denied-outbox", "wallet": "w", "chain": "anvil", "chain_id": 31337,
+            "id": "denied-outbox", "wallet": "w", "chain": "ethereum", "chain_id": 1,
             "from": broker.child(true, 0).address, "to": broker.child(true, 1).address,
             "value_wei": "0", "data_hex": "0x", "gas_limit": 21000, "nonce": 0,
             "policy_checks": [{"rule": "destinations.allow", "outcome": "deny", "message": "not on allowlist"}],
@@ -10116,7 +10117,7 @@ allowed = ["bloom:vfs.read"]
         let error = host
             .evm_tx_confirm(
                 "w".into(),
-                "anvil".into(),
+                "ethereum".into(),
                 staged.id.clone(),
                 false,
                 Some(context),
@@ -10127,7 +10128,7 @@ allowed = ["bloom:vfs.read"]
         let entry = daemon
             .tx_engine
             .outbox
-            .read("w", "anvil", &staged.id)
+            .read("w", "ethereum", &staged.id)
             .unwrap();
         assert_eq!(entry.state, bloom_tx::outbox::OutboxState::Failed);
         let checks = std::fs::read_to_string(entry.dir.join("policy_check.json")).unwrap();
