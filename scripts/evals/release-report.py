@@ -5,11 +5,9 @@
 
 Prints a verdict per agent, then every trial in a collapsed table with the
 baseline's number in parentheses. A cell run more than once keeps its best
-attempt. Exits 1 when a smoke did not pass, an agent could not authenticate,
-an expected cell has no summary, a wallet-policy refusal fails, an agent that passed a task in the
-baseline no longer does, or a task both passed takes more than SLOWER times
-the baseline's tool calls. ALLOW_SLOWER=true reports that last case without
-failing. RUN_URL, when set, links the artifacts.
+attempt. Exits 1 on any release gate in evals/harbor/README.md ("Results");
+ALLOW_SLOWER=true waives only the slower-task gate. RUN_URL, when set, links
+the artifacts.
 """
 
 import json

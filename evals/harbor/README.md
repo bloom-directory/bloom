@@ -135,8 +135,8 @@ Broker and Signer the release matrix pins, smokes them, then runs every task
 with every agent and reports reward, tool calls, tokens and time against the
 baseline. A failed trial runs once more. It fails on a smoke failure, a
 missing result, an agent that cannot authenticate, any `evm-transfer-denied`
-failure (baseline or not), a regression against
-the baseline, or a task that passed in both but took more than 1.5 times the
+failure (baseline or not), a regression against the baseline, or a task that
+passed in both but took more than 1.5 times the
 baseline's tool calls. To accept a slower run on purpose, dispatch with
 `allow_slower` or add the `evals-allow-slower` label to the PR; that waives
 only slowness, and the report lists the slower tasks either way. It

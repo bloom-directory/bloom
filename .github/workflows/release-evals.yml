@@ -4,11 +4,9 @@ name: Release evals
 # selected agent: build the Machine from this ref with the Broker and Signer
 # the release matrix pins, prove the three services with the Solana smoke
 # (no model), then run every Harbor task with that agent and record reward,
-# tool calls, tokens and time. The report fails on a smoke failure, a missing
-# result, a failed wallet-policy refusal, or a regression against
-# evals/harbor/baselines/README.md; the rest is a
-# number for the release reviewer. A failed trial is retried once, so one
-# nondeterministic miss does not fail a release. Runs on release-proposal PRs
+# tool calls, tokens and time. The gates that fail the report are described
+# once, in evals/harbor/README.md ("Results"); the rest is a number for the
+# release reviewer. Runs on release-proposal PRs
 # and on dispatch. Model credentials are repository secrets, OAuth where the
 # agent supports it: CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`) or
 # ANTHROPIC_API_KEY for Claude Code; CODEX_AUTH_JSON (the contents of
@@ -242,6 +240,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh pr comment ${{ github.event.pull_request.number }} --body-file report.md
-      - name: Fail on smoke, policy refusal, baseline regression or slower tasks
+      - name: Fail on a release gate
         if: steps.report.outputs.failed == 'true'
         run: exit 1
