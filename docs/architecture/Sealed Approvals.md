@@ -480,13 +480,13 @@ a builder bound asks for the builder class. So listing it would make
 builder-bound session scopes unpreparable; a plain session, which requests
 `hyperliquid.agent_action` alone, is unaffected.
 
-What the session path needs instead is a widening of the delegated-action
-witness — both the `operation_class == "hyperliquid.agent_action"` predicate
-that *selects* it in `service.rs` and the class/fee gate inside the function,
-since today a builder-class claim bypasses the witness rather than being
-rejected by it — to accept the builder class with a declared fee checked
-against the committed `builder.f` and the order's own prices; and then value
-limits on the key-scope approval, in that order. Broker can bind the recipient
+The widening of the delegated-action witness this section used to call for has
+happened. `message_review.rs:34` selects the witness on
+`builder_order || operation_class == "hyperliquid.agent_action"`, where
+`0a9a8dae` selected on `agent_action` alone, so a builder-class claim no longer
+bypasses it — without a witness the claim is refused, `SelectorMismatch`,
+"Agent action requires its full use-time witness". What the session path still
+needs is value limits on the key-scope approval. Broker can bind the recipient
 and the rate unconditionally, and the amount for perps, but it labels the
 market id identity-unverified, so the fee's *asset* stays Petal-asserted
 however far the witness is widened.
