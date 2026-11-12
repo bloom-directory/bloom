@@ -16,7 +16,7 @@
 //! | `list`     | `{ "path": "/..." }`                  | `[ entry, ... ]`          |
 //! | `version`  | `null`                                | `"x.y.z"`                 |
 //! | `chains`   | `null`                                | `[ "ethereum", ... ]`     |
-//! | `confirm_batch` | `{ "wallet", "txs", "text" }` | batch result              |
+//! | `confirm_batch` | `{ "wallet", "account"?, "txs", "text" }` | batch result |
 //! | `petals.install` | remote source or package transport | package metadata          |
 //! | `petals.build` | `{ "package_dir", "out"? }`           | package metadata       |
 //! | `petals.list` | `null`                              | `[ package, ... ]`        |
@@ -33,6 +33,12 @@
 //! Unknown methods produce `-32601`. Every request, response, and notification
 //! carries a `bloom_protocol` range; peers fail closed when the ranges do not
 //! overlap.
+//!
+//! `account` on `confirm_batch` and on the `wallet_outbox_cancel` and
+//! `wallet_outbox_replace` Machine commands selects the staging account and
+//! defaults to 0. Writers omit it when it is 0, so daemons that predate the
+//! field accept those requests; such daemons reject a nonzero `account` as an
+//! unknown field rather than acting on account 0.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -435,10 +441,16 @@ impl Response {
 #[serde(deny_unknown_fields)]
 pub struct BatchConfirmIpcRequest {
     pub wallet: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_account_zero")]
     pub account: u32,
     pub txs: Vec<String>,
     pub text: String,
+}
+
+/// Account 0 is omitted on the wire so protocol-1 daemons that predate
+/// `account` (and reject unknown fields) keep accepting default requests.
+fn is_account_zero(account: &u32) -> bool {
+    *account == 0
 }
 
 pub type BatchConfirmFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>>;
@@ -738,7 +750,7 @@ pub enum MachineCommand {
     },
     WalletOutboxCancel {
         wallet: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "is_account_zero")]
         account: u32,
         chain: String,
         id: String,
@@ -746,7 +758,7 @@ pub enum MachineCommand {
     },
     WalletOutboxReplace {
         wallet: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "is_account_zero")]
         account: u32,
         chain: String,
         id: String,
@@ -1203,18 +1215,17 @@ impl IpcServer {
                     }
                 };
                 let mut params = req.params;
-                // Legacy recovery calls omit the account and mean account zero.
-                // Preserve the exact-field check for all other parameters.
+                // Account zero serializes as the legacy shape (no field); an
+                // explicit zero means the same. Other fields stay exact.
                 if matches!(
                     command,
-                    MachineCommand::WalletOutboxCancel { .. }
-                        | MachineCommand::WalletOutboxReplace { .. }
+                    MachineCommand::WalletOutboxCancel { account: 0, .. }
+                        | MachineCommand::WalletOutboxReplace { account: 0, .. }
                 ) {
                     params
                         .as_object_mut()
                         .expect("command parameters are an object")
-                        .entry("account")
-                        .or_insert(json!(0));
+                        .remove("account");
                 }
                 if serde_json::to_value(&command).expect("Machine command serializes") != params {
                     return Response::err(id, -32602, "invalid params: unknown fields");
@@ -2880,6 +2891,25 @@ mod tests {
             .await;
         assert!(valid_outbox_action.error.is_none());
 
+        for account in [0, 7] {
+            let with_account = server
+                .dispatch(Request {
+                    jsonrpc: "2.0".into(),
+                    id: json!(4),
+                    method: "machine.execute".into(),
+                    params: json!({
+                        "command": "wallet_outbox_cancel",
+                        "wallet": "minnow",
+                        "account": account,
+                        "chain": "base",
+                        "id": "tx-1",
+                        "text": "approve",
+                    }),
+                })
+                .await;
+            assert!(with_account.error.is_none(), "account {account}");
+        }
+
         let outbox_action_with_unknown_field = server
             .dispatch(Request {
                 jsonrpc: "2.0".into(),
@@ -3405,6 +3435,53 @@ summary = "Demo app used by IPC tests."
             }).await;
             let error = response.error.expect("absent wallet must fail in VFS");
             assert_eq!(error.code, -32004, "{method}: {}", error.message);
+        }
+    }
+
+    /// Protocol-1 daemons that predate `account` reject unknown fields, so
+    /// account 0 must keep the legacy shape and only a nonzero one adds it.
+    #[test]
+    fn account_zero_keeps_the_legacy_wire_shape() {
+        let batch = |account| {
+            serde_json::to_value(BatchConfirmIpcRequest {
+                wallet: "w".into(),
+                account,
+                txs: vec!["base:tx-1".into()],
+                text: "y".into(),
+            })
+            .unwrap()
+        };
+        let cancel = |account| {
+            serde_json::to_value(MachineCommand::WalletOutboxCancel {
+                wallet: "w".into(),
+                account,
+                chain: "base".into(),
+                id: "tx-1".into(),
+                text: "y".into(),
+            })
+            .unwrap()
+        };
+        let replace = |account| {
+            serde_json::to_value(MachineCommand::WalletOutboxReplace {
+                wallet: "w".into(),
+                account,
+                chain: "base".into(),
+                id: "tx-1".into(),
+                intent: "i".into(),
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            batch(0),
+            json!({ "wallet": "w", "txs": ["base:tx-1"], "text": "y" })
+        );
+        assert_eq!(
+            cancel(0),
+            json!({ "command": "wallet_outbox_cancel", "wallet": "w", "chain": "base", "id": "tx-1", "text": "y" })
+        );
+        assert!(replace(0).get("account").is_none());
+        for value in [batch(7), cancel(7), replace(7)] {
+            assert_eq!(value["account"], 7);
         }
     }
 
