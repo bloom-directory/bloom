@@ -15,7 +15,12 @@ unless the user asks for code.
 
 ## Connect
 
-Run this first. It prints the operating contract and pending actions:
+For an explicit request to install, set up, or upgrade Bloom, read
+[references/install.md](references/install.md) in full and follow it even if
+Bloom already works. On Linux, check effective UID first: a root-run agent
+continues headlessly, installing for the selected non-root Bloom account.
+
+For other requests, run this first. It prints the operating contract and pending actions:
 
 ```sh
 if command -v bloom >/dev/null; then bloom vfs cat /AGENTS.md && bloom vfs cat /next.md; else cat ~/bloom/AGENTS.md ~/bloom/next.md; fi
@@ -33,7 +38,7 @@ If the user gave a mount path, read from that path instead.
 - It works: follow the printed `AGENTS.md`. It is the contract for the
   installed version and overrides this skill. Without a mount, use
   `bloom vfs ls|cat`.
-- It fails: report the error. If the user asked to install Bloom, read
+- It fails: report the error. If the user asked to install, set up, or upgrade Bloom, read
   [references/install.md](references/install.md) (beside this file, or beside
   its URL) in full first. Otherwise do not install, restart, or launch another
   Bloom; a remote or sandboxed agent uses its existing connection.

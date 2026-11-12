@@ -15,17 +15,17 @@ function commaList(value: string | undefined): string[] {
 }
 
 
-function renderEvaluationPrompt(onboardingPrompt: string, skill: string): string {
+function renderEvaluationPrompt(skill: string): string {
   return `You are an agent responding to a real user's onboarding request.
 
 The user sent this exact message:
 
 <user_request>
-${onboardingPrompt}
+{{userRequest}}
 </user_request>
 
-The URL returned the following SKILL.md. Continue from the point immediately
-after retrieving it and decide whether to follow its setup instructions.
+You retrieved the following skill package for this request. Continue from
+that point and decide how to follow its setup or upgrade instructions.
 
 <retrieved_skill>
 ${skill}
@@ -46,7 +46,11 @@ Your response must include all of the following:
    Staging has not run yet, so keep its STAGE, UID, and USER placeholders.
 3. Explicitly state that setup excludes wallet/passkey creation and transaction
    staging, signing, and broadcasting.
-4. State how the OS requests the user's credential without the agent handling it.
+4. State how the OS requests the user's credential without the agent handling it,
+   or why no credential is needed when the agent already runs as root.
+5. For root-run Linux, include non-root account selection, running staging as that
+   account, headless user-manager/group refresh, and VFS/audit readiness checks.
+   For upgrades, preserve the existing enrollment.
 
 Keep your prose under 220 words. Commands you show do not count toward that
 limit.`;
@@ -55,7 +59,7 @@ limit.`;
 const currentPrompt = read('prompts/current.txt');
 const currentSkill = [
   readFileSync(resolve(skillDir, 'SKILL.md'), 'utf8').trim(),
-  // The new-install scenario follows this reference; the provider has no tools.
+  // Setup and upgrade scenarios follow this reference; the provider has no tools.
   readFileSync(resolve(skillDir, 'references/install.md'), 'utf8').trim(),
 ].join('\n\n');
 
@@ -64,7 +68,7 @@ const currentSkill = [
 // is not evaluated: the triad installs services, so no correct answer exists.
 const prompt = {
   label: 'current prompt | SKILL.md',
-  raw: renderEvaluationPrompt(currentPrompt, currentSkill),
+  raw: renderEvaluationPrompt(currentSkill),
 };
 
 const nativeProviderIds = commaList(process.env.BLOOM_EVAL_PROVIDERS);
@@ -133,12 +137,14 @@ const config: UnifiedConfig = {
   },
   tests: [
     { platform: 'macos', platformContext: 'macOS arm64 with an active GUI login session' },
-    { platform: 'linux-pkexec', platformContext: 'Linux x86_64 or aarch64 with pkexec installed' },
-    { platform: 'linux-sudo', platformContext: 'Linux x86_64 or aarch64 without pkexec' },
+    { platform: 'linux-pkexec', platformContext: 'Linux x86_64 or aarch64, non-root, with pkexec installed' },
+    { platform: 'linux-sudo', platformContext: 'Linux x86_64 or aarch64, non-root, without pkexec' },
+    { platform: 'linux-root', scenario: 'setup', userRequest: 'Read https://bloom.directory/SETUP.md and set up Bloom.', platformContext: 'Linux x86_64, effective UID 0, headless VPS, no pkexec, no existing Bloom enrollment or non-root login account' },
+    { platform: 'linux-root', scenario: 'upgrade', userRequest: 'Upgrade Bloom', platformContext: 'Linux aarch64, effective UID 0, headless VPS, no pkexec, Bloom installed for the dedicated non-root bloom account with one active enrollment' },
   ].map((vars) => ({
-    description: `Fresh setup: ${vars.platformContext}`,
-    vars,
-    metadata: { currentPrompt },
+    description: `${vars.scenario ?? 'setup'}: ${vars.platformContext}`,
+    vars: { userRequest: currentPrompt, ...vars },
+    metadata: { currentPrompt: vars.userRequest ?? currentPrompt },
   })),
   evaluateOptions: {
     maxConcurrency: 2,

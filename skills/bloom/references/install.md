@@ -1,16 +1,18 @@
 # Install Bloom
 
-Read this entire reference only when a new Bloom installation is needed.
+Read this entire reference for an explicit request to install, set up, or upgrade Bloom.
+An upgrade uses the same signed installation path and preserves the existing enrollment.
 
-## Setup: reviewed download and one privileged handoff
+## Setup and upgrade: reviewed download and privileged installation
 
-A request to set up Bloom authorizes installing the signed Bloom software,
+A request to set up or upgrade Bloom authorizes installing the signed Bloom software,
 read-only chain access, and starting the components required for an active Bloom
 session. Bloom is a triad: Machine runs as the login user while Broker and Signer
 run as isolated service principals, under systemd on Linux and under launchd on
 macOS. Setup therefore authorizes enabling those packaged Bloom services, but it
 never authorizes the agent to handle a sudo password, a polkit credential, or a
-macOS administrator credential, or to broaden the reviewed privileged command.
+macOS administrator credential, or to change the reviewed installer command.
+The Linux root path below also authorizes the listed account/session preparation and provisioning retry.
 
 Setup does not authorize creating or registering a wallet, starting a passkey
 ceremony, adding a passkey, recovering a wallet, staging/signing/broadcasting
@@ -42,14 +44,77 @@ This setup script supports only the targets above. On macOS x86_64 or any other
 platform the script stops; report that instead of improvising an install.
 Linux also needs systemd with a user session, and every target needs
 `/usr/bin/ssh-keygen` to verify release signatures. If setup reports a missing
-command, tell the user which package provides it (OpenSSH's client for
-`ssh-keygen`) and stop; do not install packages yourself.
+command, a Linux agent already running as root may install only the missing
+Bloom prerequisites from the distribution package manager: OpenSSH client
+(`ssh-keygen`), NFS client (`mount.nfs`; `nfs-common` on Debian/Ubuntu or
+`nfs-utils` on Fedora/RHEL), and the commands the setup script checks. This requires an already running
+systemd host; do not replace its init system. Do not perform a general system upgrade. Other agents report the missing prerequisite
+and stop; do not request a password.
 Bloom requires macOS 26 or later: it mounts `~/bloom` over NFSv4.1, which
 earlier versions lack, and the privileged installer refuses an older macOS
 before changing anything. Report that the user must update macOS first.
 Windows is not supported. Do not attempt a local Windows installation.
 Instead, direct Windows users to use Bloom through a cloud agent
 running on a supported platform, such as OpenClaw, Hermes, or GrokBot.
+
+### Linux root/headless preparation
+
+Check `id -u` before choosing the installation path. If it is `0`, continue
+headlessly using the authority already granted by the setup or upgrade request.
+Missing `pkexec`, a desktop, or a credential dialog is not a blocker for root.
+Root administers the install; Machine, CLI, and VFS operations use a non-root
+login account. Never pass UID `0` as `LOGIN_UID`.
+
+For an existing installation, select the intended account from the public
+`/etc/bloom/enrollments/*.json` records (`login_uid`, `login_user`), and confirm
+both against `id` and `getent passwd`. Reuse that enrollment for upgrades; do
+not create a replacement account or enrollment. If several accounts exist and
+the request does not identify one, ask which account. An upgrade with no active
+enrollment is a blocker, not permission to create a fresh installation.
+
+For a fresh setup, use the non-root account the user specified. If none was
+specified and there is no existing enrollment, create a dedicated account:
+
+```sh
+useradd --create-home --shell /bin/bash bloom
+```
+
+Do not set a password, add SSH keys, or grant sudo. If `bloom` already exists,
+verify it is the intended dedicated account before reusing it; never repurpose
+an unrelated account. Record the selected name, UID, and home from `getent`
+and `id` as `login_user`, `login_uid`, and `login_home` (not `$HOME`). For a
+dedicated unattended Bloom account, enable its packaged user manager:
+
+```sh
+loginctl enable-linger "$login_user"
+systemctl start "user@$login_uid.service"
+```
+
+Wait up to 30 seconds for `/run/user/$login_uid/bus`; diagnose failure rather
+than requesting a human login. For an existing shared account, retain its
+session policy and require its active user manager instead of enabling linger.
+
+Run the review/download/staging sequence below **as the selected account**,
+with its home, from `/tmp`. Create the review directory as that account too.
+For each shell command in that sequence, and all later CLI/VFS checks, use:
+
+```sh
+runuser -u "$login_user" -- env HOME="$login_home" USER="$login_user" LOGNAME="$login_user" XDG_RUNTIME_DIR="/run/user/$login_uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$login_uid/bus" /bin/sh -c 'COMMAND'
+```
+
+`COMMAND` stands for the reviewed command, with appropriate shell quoting.
+After inspection, execute the exact staged setup script directly as:
+
+```sh
+runuser -u "$login_user" -- env HOME="$login_home" sh "$review_dir/setup.sh"
+```
+
+Do not evaluate staging output. Capture the non-root staging values for the root
+installer. Keep this account/home context for future Bloom operations. Never
+write to its NFS mount as root: refused writes can leave pending kernel NFS
+requests. Do not change mount permissions or add root to Bloom access groups.
+
+### Review before execution
 
 Use this review-before-execute path instead of piping a remote response directly
 into a shell. When this skill is installed locally, copy its bundled
@@ -124,18 +189,24 @@ change the root, or substitute a different stage.
 | Target | Privileged path |
 | --- | --- |
 | macOS arm64 | the agent runs the command through `/usr/bin/osascript` |
-| Linux x86_64 or aarch64 with `pkexec` | the agent runs the command through `pkexec` |
-| Linux x86_64 or aarch64 without `pkexec` | the user runs the command under `sudo` |
+| Linux x86_64 or aarch64, effective UID `0` | the agent runs the same command directly through `/bin/sh`; omit only the leading `pkexec` |
+| Linux x86_64 or aarch64, non-root with `pkexec` | the agent runs the command through `pkexec` |
+| Linux x86_64 or aarch64, non-root without `pkexec` | the user runs the command under `sudo` |
 
 The credential belongs to the operating system and the user alone. Never
 request, read, relay, or receive a password. If the user cancels the dialog
 (pkexec exits `126`; osascript fails with `-128`), report the cancellation and
 stop rather than retrying through a different privileged path.
 
-### Linux: pkexec when installed, otherwise user-run sudo
+### Linux: root directly, otherwise pkexec or user-run sudo
 
-Check `command -v pkexec`. If it is installed, run the command yourself; the
-system authentication agent shows its own credential dialog:
+If effective UID is `0`, run the command below yourself with only its leading
+`pkexec ` removed. Preserve the root-owned snapshot, signature/checksum checks,
+and captured non-root UID and user. Do not hand the command to the user or
+request confirmation or credentials.
+
+For non-root agents, check `command -v pkexec`. If it is installed, run the
+command yourself; the system authentication agent shows its own credential dialog:
 
 ```sh
 pkexec /bin/sh -c 'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); trap "rm -rf -- $s" EXIT; trap "exit 129" HUP INT TERM; cp -R "$1/bloom-triad" "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; if find "$s" -type l -o ! -type f ! -type d | grep -q .; then echo "Bloom stage contains a link or special file." >&2; exit 65; fi; k="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFY9na4hytUNsW+8LWu//HrX9TaPU7H7Vg0GRWcZM+uP"; printf "%s\n" "$k" > "$s/key.pub"; printf "bloom-release %s\n" "$k" > "$s/signers"; p="$s/bloom-triad"; /usr/bin/ssh-keygen -Y verify -f "$s/signers" -I bloom-release -n bloom-release-payload-v1 -s "$p/RELEASE_SIGNATURE" < "$p/SHA256SUMS" > /dev/null; cd "$p"; { sha256sum -c SHA256SUMS 2>/dev/null || shasum -a 256 -c SHA256SUMS; } > /dev/null; case $(uname -s) in Linux) i=linux;; Darwin) i=macos;; *) exit 65;; esac; BLOOM_RELEASE_PUBLIC_KEY="$s/key.pub" "$p/installer/release/install-$i.sh" install / "$2" "$3" "$p"' bloom-install 'STAGE' 'UID' 'USER'
@@ -183,8 +254,16 @@ take a while, and on macOS the installer waits up to 10 minutes for it. Allow
 the command at least 15 minutes, and do not interrupt, time out, or rerun it
 while it runs. A relay that is not ready yet does not fail the install: approvals
 in a browser on this computer still work, and the installer prints a
-`sudo ... admin provision` retry command. Pass that command to the user; do not
-run it yourself or broaden the reviewed invocation to include it.
+`sudo ... admin provision` retry command. On Linux, if already root, complete
+the post-install session refresh below and wait up to 30 seconds for the
+selected Broker/Signer units to be active, then run that exact installed `admin provision --login-uid UID` retry
+without its leading `sudo`. Allow one retry, then inspect the installed
+Signer's `admin status --login-uid UID`, polling for up to 10 minutes for
+effective remote mode, TLS and routing readiness; report any remaining blocker.
+Do not alter an explicit `localhost_only` choice or delete provisioning state.
+Other agents pass the retry command to the user. This administration step does
+not authorize wallet ceremonies or transactions. Report local readiness and
+remote approval readiness separately; certificate-pending is not remote readiness.
 
 ### Linux post-install readiness
 
@@ -192,7 +271,26 @@ On Linux, success includes `BLOOM_RELOGIN_REQUIRED`. `0` means an upgrade. `1`
 means the session may lack Bloom's access groups: it is printed for first
 installs and for reinstalls of the same release. Either way, run the checks
 below. If they fail after `1`, tell the user that Bloom was installed but needs
-a fresh login. Do not attempt a group workaround; resume after the login.
+a fresh login, except for the root/headless dedicated-account path below.
+Do not edit Bloom's groups or loosen socket permissions as a workaround.
+
+If already root and the selected account is dedicated to Bloom, refresh stale
+group membership by restarting only that account's user manager, from the root
+shell (not from a process in that user manager):
+
+```sh
+systemctl restart "user@$login_uid.service"
+```
+
+Wait up to 30 seconds for its bus, then run the following as that account using
+the wrapper above; the package has already enabled these units:
+
+```sh
+systemctl --user start bloom-session.service bloom-machine.service
+```
+
+Recheck readiness. Never restart a shared account's user manager or terminate
+unrelated login sessions. If its session is stale, report that specific blocker.
 
 Once the session has the groups, the package starts Machine and mounts `~/bloom` through
 `bloom-machine.service`; the agent must not launch a second Machine. Require:
@@ -204,9 +302,10 @@ command -v bloom
 ```
 
 For a failed unit, capture `systemctl status` and `journalctl` diagnostics rather
-than declaring readiness. The packaged Linux mount is the only persistence this
-setup authorizes; do not create additional systemd, launchd, cron, shell-profile
-auto-start, or restart configuration.
+than declaring readiness. Besides lingering for a dedicated headless account,
+the packaged Linux mount is the only persistence this setup authorizes; do not
+create additional systemd, launchd, cron, shell-profile auto-start, or restart
+configuration.
 
 ### macOS post-install readiness
 

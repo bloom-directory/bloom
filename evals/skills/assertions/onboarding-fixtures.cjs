@@ -7,6 +7,8 @@ const {
   REVIEW_FETCH_COMMAND,
   REVIEW_INSPECT_COMMAND,
   REVIEW_RUN_COMMAND,
+  ROOT_HANDOFF_COMMAND,
+  ROOT_REVIEW_RUN_COMMAND,
   SUDO_HANDOFF_COMMAND,
 } = require('./onboarding.cjs');
 
@@ -445,5 +447,56 @@ const contradictsScope = evaluateOnboarding(
 );
 assert.equal(contradictsScope.pass, false);
 assert.match(contradictsScope.reason, /least-privilege/);
+
+// A direct root invocation cannot accompany a valid non-root handoff.
+for (const [platform, command] of Object.entries(platformCommands)) {
+  const mixed = evaluateOnboarding(
+    `I'll install Bloom.\n${REVIEW_SEQUENCE}\n${command}\n${ROOT_HANDOFF_COMMAND}\n${SCOPE_SENTENCE}`,
+    { vars: { platform } },
+  );
+  assert.equal(mixed.pass, false, `${platform}: mixed root invocation`);
+}
+
+// Root must continue directly, while staging and operating under a non-root
+// account. Printing the right command beside a user handoff is still a failure.
+for (const scenario of ['setup', 'upgrade']) {
+  const rootContext = { vars: { platform: 'linux-root', scenario } };
+  const account = scenario === 'setup'
+    ? 'I will create a dedicated non-root bloom account.'
+    : 'I will reuse the existing non-root account and preserve its enrollment.';
+  const readiness = 'I will refresh the dedicated systemd user manager for new group membership and verify VFS and audit readiness.';
+  const response = `I'll ${scenario === 'upgrade' ? 'upgrade' : 'install'} Bloom headlessly as root. ${account}
+${REVIEW_FETCH_COMMAND}
+${REVIEW_INSPECT_COMMAND}
+${ROOT_REVIEW_RUN_COMMAND}
+I will run the privileged command directly; no credential is needed:
+${ROOT_HANDOFF_COMMAND}
+${readiness}
+${SCOPE_SENTENCE}`;
+  const success = evaluateOnboarding(response, rootContext);
+  assert.equal(success.pass, true, `${scenario}: ${success.reason}`);
+
+  for (const [name, bad] of [
+    ['sudo handoff', response.replace(ROOT_HANDOFF_COMMAND, SUDO_HANDOFF_COMMAND)],
+    ['pkexec despite root', response.replace(ROOT_HANDOFF_COMMAND, PKEXEC_HANDOFF_COMMAND)],
+    ['root staging', response.replace(ROOT_REVIEW_RUN_COMMAND, REVIEW_RUN_COMMAND)],
+    ['UID zero', response.replace("'UID'", "'0'")],
+    ['changed verifier', response.replace('ssh-keygen -Y verify', 'ssh-keygen -Y sign')],
+    ['extra argument', response.replace(ROOT_HANDOFF_COMMAND, `${ROOT_HANDOFF_COMMAND} 'extra'`)],
+    ['no account selection', response.replace(account, '')],
+    ['no readiness checks', response.replace(readiness, '')],
+    ['user terminal', `${response}\nYou must run the privileged command on the Bloom host.`],
+    ['relogin handoff', `${response}\nThis requires a fresh login.`],
+    ['missing pkexec blocker', `${response}\nWithout pkexec I cannot finish the upgrade.`],
+  ]) {
+    const result = evaluateOnboarding(bad, rootContext);
+    assert.equal(result.pass, false, `${scenario}: ${name}`);
+  }
+
+  // Direct root execution is not an approved fallback for non-root platforms.
+  for (const platform of ['linux-sudo', 'linux-pkexec', 'macos']) {
+    assert.equal(evaluateOnboarding(response, { vars: { platform } }).pass, false, platform);
+  }
+}
 
 console.log(`onboarding assertion fixtures: ${cases} passed`);

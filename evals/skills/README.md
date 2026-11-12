@@ -3,7 +3,10 @@
 Promptfoo evaluations of the agent skill in [`skills/bloom`](../../skills/bloom/).
 They read the package files directly, so an evaluation always covers the skill
 as committed on this branch. The website serves the same files at a pinned
-commit and has no evaluation of its own.
+commit and has no evaluation of its own. After this package changes land,
+advance the website's `scripts/sync-bloom-skill.ts` pin to the landed commit.
+The website currently publishes `/SKILL.md`; its `/SETUP.md` entrypoint/alias
+must also be verified when rolling out the production prompt.
 
 ## Onboarding
 
@@ -12,7 +15,13 @@ https://bloom.directory/SKILL.md and set up Bloom.", to a tool-less agent with
 `SKILL.md` and `references/install.md` attached. The provider cannot fetch the
 reference itself, so the reference is attached explicitly. The suite grades the
 agent's first response on each supported platform: macOS, Linux with `pkexec`,
-and Linux without it.
+and Linux without it. Two root/headless cases cover the reported production
+prompts: "Read https://bloom.directory/SETUP.md and set up Bloom." on a fresh
+host, and "Upgrade Bloom" with an existing dedicated-account enrollment.
+These require direct execution of the same verified snapshot command, non-root
+staging/account selection, session refresh, and VFS/audit verification. A root
+response handing the command or a fresh-login requirement to the user fails.
+The non-root platform cases retain their existing elevation requirements.
 
 The deterministic grader reports these dimensions independently:
 
@@ -39,6 +48,10 @@ npm run check
 
 `check` runs the grader's fixtures and validates every configuration without
 model calls. CI runs it whenever `skills/**` or `evals/skills/**` changes.
+
+These tool-less evaluations check the response before execution, not service
+readiness on a host. Validate the root/headless procedure on a disposable Linux
+systemd VM for fresh installation and upgrade before claiming live acceptance.
 
 Model runs call the local `claude` and `codex` CLIs, cost money, and are run by
 hand. Each takes five fresh, uncached samples per platform:
