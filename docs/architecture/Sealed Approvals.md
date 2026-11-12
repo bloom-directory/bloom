@@ -438,12 +438,19 @@ table. A row is inert until a Petal emits that exact class, and the catalogued
 chain and asset must match the Petal's `DeclaredFee::Fee` exactly or Broker
 answers `FEE_ASSET_MISMATCH`.
 
-Cataloguing makes the claim authorizable, not reviewed. Broker reviews a class
-only if it is registered in `MESSAGE_REVIEW_OPERATION_CLASSES` or
-`POLYMARKET_REVIEW_OPERATION_CLASSES`, and the one catalogued fee-bearing
-class is in neither, so a builder order is not required to carry the decoded
-order review `hyperliquid.order` must — of the two fee-free siblings named
-above, only that one is registered. A session-signed builder order is further
+Cataloguing makes the claim authorizable. Whether it is also *reviewed* is not
+answered by the two tables, and reading them alone gets it wrong. The pinned
+Broker's exact path chains a third entry after them
+(`service.rs`, `.chain([&message_review::hyperliquid::BUILDER_ORDER_CLASS])`),
+so an **exact** builder order does require the decoded order review, exactly as
+`hyperliquid.order` does, even though the class is registered in neither table.
+Broker's own comment gives the reason: builder orders stay out of the
+exact-only list because sessions sign them under reusable grants, and only the
+exact form is reviewed. The pin is what introduced this — `0a9a8dae` chained
+only the two tables — so it is a property of bloom-broker#131, not of the
+tables. A live claim on the exact path confirms it, answering
+`SelectorMismatch`, "this message operation requires a review envelope".
+A session-signed builder order is further
 outside Broker's delegated-action witness, which matches
 `hyperliquid.agent_action` with no declared fee — and cannot be authorized at
 all today, because the reusable key-scope approval carries empty `value_limits`
@@ -451,10 +458,10 @@ and a declared fee is the first value to reach it.
 The pin moved with master, and the revision pinned here now *does* have
 `message_review.rs` with its per-venue modules, and `agent_action` in
 `service.rs`. An earlier revision of this section said it had neither; the
-merge on this branch made that false. What the pin still lacks is this class in
-either table, so it is unreviewed because it is unlisted rather than because
-nothing is reviewed — and the witness matches `hyperliquid.agent_action` with
-no declared fee, so a session-signed builder order falls outside it there too.
+merge on this branch made that false. The class is in neither table, but that
+no longer means unreviewed: the exact path chains it in separately, as above.
+The reusable path does not, and the witness matches `hyperliquid.agent_action`
+with no declared fee, so a session-signed builder order falls outside it there.
 
 **Registering a fee-bearing class in those tables is not the remedy, and for
 Polymarket it is the opposite of one.** `validate_petal_profile` rejects any
