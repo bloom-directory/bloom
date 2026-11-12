@@ -303,7 +303,6 @@ pub fn run_developer_provenance_refresh(template: &Path, config_dir: &Path) -> R
     Ok(())
 }
 
-#[cfg(feature = "triad-dev-harness")]
 /// Single-quote a path for a copy-paste shell command. The developer root is
 /// chosen by whoever ran the launcher, and a path with a space in it -- macOS
 /// puts application data under one by default -- silently splits into two
@@ -313,6 +312,7 @@ fn shell_quoted(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
 }
 
+#[cfg(feature = "triad-dev-harness")]
 fn refresh_developer_provenance_catalog(
     template: &Path,
     config_dir: &Path,
