@@ -109,9 +109,10 @@ jobs:
           signer_sha="$(sed -n -E 's/^signer_commit = "([0-9a-f]{40})"$/\1/p' <<<"$matrix")"
           skill_version="$(git show "$release_sha:skills/bloom/SKILL.md" |
             sed -n -E 's/^  version: "?([0-9]+\.[0-9]+\.[0-9]+)"?$/\1/p')"
+          plugin_version="$(git show "$release_sha:skills/bloom/.claude-plugin/plugin.json" | jq -r .version)"
           if [[ "$workspace_version" != "$version" || "$machine_version" != "$version" ||
-            "$skill_version" != "$version" ]]; then
-            echo "::error::$tag must match the workspace, triad matrix, and skill versions"
+            "$skill_version" != "$version" || "$plugin_version" != "$version" ]]; then
+            echo "::error::$tag must match the workspace, triad matrix, skill, and plugin versions"
             exit 1
           fi
           [[ -n "$broker_sha" && -n "$signer_sha" ]] || {

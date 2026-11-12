@@ -113,6 +113,8 @@ jobs:
             echo "::error::skills/bloom/SKILL.md must have exactly one metadata.version line, set to $VERSION"
             exit 1
           }
+          PLUGIN=skills/bloom/.claude-plugin/plugin.json
+          jq --arg v "$VERSION" '.version = $v' "$PLUGIN" > "$PLUGIN.new" && mv "$PLUGIN.new" "$PLUGIN"
           cargo check --workspace
 
           cargo metadata --locked --format-version 1 \
@@ -125,7 +127,7 @@ jobs:
           fi
 
           CHANGED_FILES="$(git diff --name-only)"
-          if [[ "$(printf '%s\n' "$CHANGED_FILES" | grep -Ev '^(Cargo\.toml|Cargo\.lock|packaging/triad/release/compatibility-v1\.toml|skills/bloom/SKILL\.md)$' || true)" != "" ]]; then
+          if [[ "$(printf '%s\n' "$CHANGED_FILES" | grep -Ev '^(Cargo\.toml|Cargo\.lock|packaging/triad/release/compatibility-v1\.toml|skills/bloom/SKILL\.md|skills/bloom/\.claude-plugin/plugin\.json)$' || true)" != "" ]]; then
             echo "::error::release proposal changed files outside the version-bearing release files"
             printf '%s\n' "$CHANGED_FILES"
             exit 1
@@ -134,7 +136,8 @@ jobs:
           git diff --check
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock packaging/triad/release/compatibility-v1.toml skills/bloom/SKILL.md
+          git add Cargo.toml Cargo.lock packaging/triad/release/compatibility-v1.toml skills/bloom/SKILL.md \
+            "$PLUGIN"
           git commit -m "release: v$VERSION"
           git push --set-upstream origin "HEAD:refs/heads/$BRANCH"
 

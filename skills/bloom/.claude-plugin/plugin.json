@@ -1,0 +1,25 @@
+{
+  "name": "bloom",
+  "displayName": "Bloom",
+  "version": "0.5.0",
+  "description": "Use Bloom, the programmable financial harness for AI agents: balances, payments, trades, and wallets on EVM chains and Solana, with every transaction approved by the user's passkey.",
+  "author": {
+    "name": "Bloom Directory",
+    "url": "https://bloom.directory"
+  },
+  "homepage": "https://bloom.directory",
+  "repository": "https://github.com/bloom-directory/bloom",
+  "license": "MIT",
+  "keywords": [
+    "wallet",
+    "payments",
+    "crypto",
+    "evm",
+    "solana",
+    "x402",
+    "trading"
+  ],
+  "icon": "./logo.svg",
+  "documentationUrl": "https://github.com/bloom-directory/bloom/blob/master/docs/AGENTIC_WALLET.md",
+  "supportUrl": "https://github.com/bloom-directory/bloom/issues"
+}
