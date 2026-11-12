@@ -439,6 +439,35 @@ fn macos_conformance_workflows_consume_unified_candidates() {
     };
     let broker_commit = pinned_revision("broker_commit");
     let signer_commit = pinned_revision("signer_commit");
+    // Every Broker/Signer literal (input defaults, fallbacks, checkout refs,
+    // reusable-workflow arguments) must carry the manifest pin, so a partial
+    // repin fails here instead of in release conformance.
+    let assert_every_pin = |workflow: &str, source: &str| {
+        let mut service = None;
+        let mut copies = [0, 0];
+        for line in source.lines().filter(|line| !line.contains("uses:")) {
+            let lower = line.to_ascii_lowercase();
+            if lower.contains("broker_ref") {
+                service = Some(0);
+            } else if lower.contains("signer_ref") {
+                service = Some(1);
+            }
+            for word in line.split(|c: char| !c.is_ascii_hexdigit()) {
+                if word.len() != 40 {
+                    continue;
+                }
+                let index = service
+                    .unwrap_or_else(|| panic!("{workflow}: unattributed pin {word}: {line}"));
+                let expected = [broker_commit, signer_commit][index];
+                assert_eq!(word, expected, "{workflow}: stale pin in `{}`", line.trim());
+                copies[index] += 1;
+            }
+        }
+        assert!(
+            copies.iter().all(|&count| count > 0),
+            "{workflow}: {copies:?}"
+        );
+    };
 
     for workflow in [
         "macos-unix-conformance.yml",
@@ -450,13 +479,11 @@ fn macos_conformance_workflows_consume_unified_candidates() {
         assert!(source.contains("bloom-triad-test-unclaimed.tar.gz"));
         assert!(source.contains("Reject mutable sibling refs"));
         assert!(source.contains("^[0-9a-f]{40}$"));
-        assert!(source.contains(broker_commit));
-        assert!(source.contains(signer_commit));
+        assert_every_pin(workflow, &source);
     }
 
     let ci = fs::read_to_string(workspace().join(".github/workflows/ci.yml")).unwrap();
-    assert!(ci.contains(&format!("broker_ref: {broker_commit}")));
-    assert!(ci.contains(&format!("signer_ref: {signer_commit}")));
+    assert_every_pin("ci.yml", &ci);
 
     // These assertions read both conformance workflows, so editing either
     // must trigger CI, which runs this binary on Linux. The Unix-principal
