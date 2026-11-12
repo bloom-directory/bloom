@@ -4746,15 +4746,60 @@ fn install_linux_logins(root: &Path, payload: &Path, logins: &[(&str, &str)]) {
 }
 
 #[test]
-fn linux_retained_reinstall_handles_removed_services_and_preserves_custody() {
+fn linux_same_release_reinstall_skips_only_services_a_retained_uninstall_removed() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
     fs::create_dir(&root).unwrap();
     let payload = make_installer_payload(&directory.path().join("payload"));
     install_linux_logins(&root, &payload, &[("1000", "alice")]);
-    let custody = root.join("var/lib/bloom/1000/signer/wallet-custody");
-    fs::create_dir_all(custody.parent().unwrap()).unwrap();
-    fs::write(&custody, b"retained fixture custody").unwrap();
+    // systemctl knows a unit exactly while its template is installed. The
+    // reinstall selects the retained release before this dispatch runs.
+    let release_digest = hex::encode(Sha256::digest(b"test payload\n"));
+    let harness = write_linux_live_harness(
+        directory.path(),
+        r#"
+systemctl() {
+  printf '%s\n' "$*" >> "$log"
+  local template="$root/usr/lib/systemd/system/${2%@*}@.service"
+  case "$1:${3:-}" in
+    show:--property=LoadState)
+      if [[ -f "$template" ]]; then echo loaded; else echo not-found; fi ;;
+    show:--property=ActiveState) echo inactive ;;
+    stop:*) [[ -f "$template" ]] || { echo "Unit $2 not loaded" >&2; return 5; } ;;
+    *) return 64 ;;
+  esac
+}
+switch_linux_release "$root" "$arg1"
+stop_linux_same_release_services "$root" 1000
+"#,
+    );
+    let service_stops = |name: &str| -> Vec<String> {
+        let log = directory.path().join(name);
+        let output = Command::new(&harness)
+            .arg(release_script("install-linux.sh"))
+            .arg(&root)
+            .arg(&log)
+            .arg(&release_digest)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix("stop "))
+            .filter(|unit| unit.ends_with("@1000.service"))
+            .map(str::to_owned)
+            .collect()
+    };
+    assert_eq!(
+        service_stops("installed.log"),
+        ["bloom-broker@1000.service", "bloom-signer@1000.service"]
+    );
+
     let uninstalled = Command::new(release_script("install-linux.sh"))
         .args(["uninstall", "--retain-custody"])
         .arg(&root)
@@ -4773,68 +4818,7 @@ fn linux_retained_reinstall_handles_removed_services_and_preserves_custody() {
                 .exists()
         );
     }
-    let harness = write_linux_live_harness(
-        directory.path(),
-        r#"
-systemctl() {
-  printf '%s\n' "$*" >> "$log"
-  local unit="$2" template="$root/usr/lib/systemd/system/${2%@*}@.service"
-  case "$1:${3:-}" in
-    show:--property=LoadState)
-      if [[ -f "$template" ]]; then echo loaded; else echo not-found; fi ;;
-    show:--property=ActiveState) echo inactive ;;
-    stop:*) [[ -f "$template" ]] || { echo "Unit $unit not loaded" >&2; return 5; } ;;
-    *) return 64 ;;
-  esac
-}
-stop_linux_service_if_present bloom-broker@1000.service
-stop_linux_service_if_present bloom-signer@1000.service
-"#,
-    );
-    let log = directory.path().join("stop.log");
-    let stopped = Command::new(&harness)
-        .arg(release_script("install-linux.sh"))
-        .arg(&root)
-        .arg(&log)
-        .output()
-        .unwrap();
-    assert!(
-        stopped.status.success(),
-        "{}",
-        String::from_utf8_lossy(&stopped.stderr)
-    );
-    assert!(
-        !fs::read_to_string(&log)
-            .unwrap()
-            .lines()
-            .any(|line| line.starts_with("stop "))
-    );
-    let installed = run_linux_installer(
-        &root,
-        &["install", "1000", "alice", payload.to_str().unwrap()],
-    );
-    assert!(
-        installed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&installed.stderr)
-    );
-    assert_eq!(fs::read(&custody).unwrap(), b"retained fixture custody");
-    assert!(root.join("etc/bloom/enrollments/1000.json").is_file());
-    assert!(!root.join("etc/bloom/retained/1000.json").exists());
-    for service in ["broker", "signer"] {
-        assert!(
-            root.join(format!("usr/lib/systemd/system/bloom-{service}@.service"))
-                .is_file()
-        );
-    }
-    // The live reinstall dispatch must use the tested stop behavior for both services.
-    let installer = fs::read_to_string(release_script("install-linux.sh")).unwrap();
-    assert!(
-        installer.contains("stop_linux_service_if_present \"bloom-broker@$login_uid.service\"")
-    );
-    assert!(
-        installer.contains("stop_linux_service_if_present \"bloom-signer@$login_uid.service\"")
-    );
+    assert!(service_stops("retained.log").is_empty());
 }
 
 #[test]
