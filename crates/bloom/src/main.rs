@@ -3347,8 +3347,15 @@ fn print_vfs_stat_json(path: &str, entry: &serde_json::Value) -> Result<()> {
 }
 
 enum ConfirmProjection {
-    Ceremony { url: String, expires_at_ms: u128 },
-    Broadcast { tx_hash: String },
+    Ceremony {
+        url: String,
+        expires_at_ms: u128,
+        /// A Petal-staged entry's retry step; its raw confirm never sends.
+        petal_next: Option<String>,
+    },
+    Broadcast {
+        tx_hash: String,
+    },
 }
 
 fn unix_now_ms() -> u128 {
@@ -3389,9 +3396,16 @@ async fn confirm_projection(
             && !url.trim().is_empty()
             && expires_at_ms.is_some_and(|expires| expires > unix_now_ms())
         {
+            let petal_next = value
+                .get("staged_by")
+                .is_some_and(serde_json::Value::is_string)
+                .then(|| value.get("next").and_then(serde_json::Value::as_str))
+                .flatten()
+                .map(str::to_string);
             return Some(ConfirmProjection::Ceremony {
                 url,
                 expires_at_ms: expires_at_ms.unwrap_or(0),
+                petal_next,
             });
         }
     }
@@ -3430,6 +3444,15 @@ async fn try_ipc_coded(
             };
             Err((code, map_ipc_client_error(endpoint, error)))
         }
+    }
+}
+
+fn print_approval_pending(url: &str, expires_at_ms: u128, petal_next: Option<&str>) {
+    let remaining = expires_at_ms.saturating_sub(unix_now_ms()) / 1000;
+    println!("Approval required: open {url}");
+    match petal_next {
+        Some(next) => println!("Ceremony expires in {remaining}s. {next}"),
+        None => println!("Ceremony expires in {remaining}s; re-run this confirm after approving."),
     }
 }
 
@@ -4196,15 +4219,15 @@ async fn run(cli: Cli) -> Result<()> {
             // with the entry's projection offered as context only.
             let projection = confirm_projection(&client_endpoint, &wallet, &chain, &id).await;
             match (outcome, &projection) {
-                (Err((code, _)), Some(ConfirmProjection::Ceremony { url, expires_at_ms }))
-                    if code == IPC_ERR_PERMISSION_DENIED =>
-                {
-                    let remaining = expires_at_ms.saturating_sub(unix_now_ms());
-                    println!("Approval required: open {url}");
-                    println!(
-                        "Ceremony expires in {}s; re-run this confirm after approving.",
-                        remaining / 1000
-                    );
+                (
+                    Err((code, _)),
+                    Some(ConfirmProjection::Ceremony {
+                        url,
+                        expires_at_ms,
+                        petal_next,
+                    }),
+                ) if code == IPC_ERR_PERMISSION_DENIED => {
+                    print_approval_pending(url, *expires_at_ms, petal_next.as_deref());
                     // Nothing is signed or broadcast yet, so exit 0 would tell
                     // a script the transaction went out.
                     EXIT_CODE_OVERRIDE
@@ -4231,13 +4254,15 @@ async fn run(cli: Cli) -> Result<()> {
                     "ipc wallet confirm via {}",
                     client_endpoint.display
                 ))),
-                (Ok(_), Some(ConfirmProjection::Ceremony { url, expires_at_ms })) => {
-                    let remaining = expires_at_ms.saturating_sub(unix_now_ms());
-                    println!("Approval required: open {url}");
-                    println!(
-                        "Ceremony expires in {}s; re-run this confirm after approving.",
-                        remaining / 1000
-                    );
+                (
+                    Ok(_),
+                    Some(ConfirmProjection::Ceremony {
+                        url,
+                        expires_at_ms,
+                        petal_next,
+                    }),
+                ) => {
+                    print_approval_pending(url, *expires_at_ms, petal_next.as_deref());
                     EXIT_CODE_OVERRIDE
                         .store(EXIT_APPROVAL_PENDING, std::sync::atomic::Ordering::SeqCst);
                     Ok(())

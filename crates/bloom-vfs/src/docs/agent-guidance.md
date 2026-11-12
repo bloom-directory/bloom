@@ -61,9 +61,9 @@ For outbox transactions:
 
 1. Stage once: write the body to `outbox/new.tx` (formats in
    `docs/examples.md`) or to a Petal's `new` (its README). Wherever these
-   steps say to write `confirm`, confirm a Petal's entry where its README
-   says instead. That confirm does not wait for approval: retry it once the
-   owner approves.
+   steps say to write `confirm`, including after approval, confirm a
+   Petal's entry where its README says instead. That confirm never waits
+   for approval: retry it there once the owner approves.
 2. Identify the new entry in `pending/` by its `intent.json` and `plan.md`,
    never by wildcard, sequence number, `latest` or position.
 3. Write `confirm` to that entry's `confirm` file. If the owner must
