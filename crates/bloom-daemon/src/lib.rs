@@ -15,10 +15,6 @@ mod price_oracle;
 #[path = "tests/polymarket_authorization.rs"]
 mod polymarket_authorization;
 
-#[cfg(all(test, feature = "triad-dev-harness"))]
-#[path = "tests/hyperliquid_builder_fee.rs"]
-mod hyperliquid_builder_fee;
-
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
