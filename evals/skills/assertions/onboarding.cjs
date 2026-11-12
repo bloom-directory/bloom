@@ -383,6 +383,10 @@ function evaluateOnboarding(output, context = {}) {
       component(readiness, 'Root setup must cover user-manager group refresh and VFS/audit verification', 'headless readiness'),
     );
   }
+  if (isRoot && context.vars?.requireRootNotice) {
+    const notice = /\broot\b[^.!?\n]{0,180}\b(?:can|could|may) (?:still )?(?:bypass|override|circumvent)\b[^.!?\n]{0,100}\b(?:isolation|separation|service boundaries)\b/i.test(text);
+    componentResults.push(component(notice, 'Briefly explain that existing root access can bypass Bloom service isolation', 'root access notice'));
+  }
   const score = componentResults.reduce((sum, result) => sum + result.score, 0) / componentResults.length;
 
   return {

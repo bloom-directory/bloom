@@ -516,6 +516,14 @@ assert.equal(evaluateOnboarding(presentTense, { vars: { platform: 'linux-root', 
 const preservedPronoun = referencedHelper.replace('preserving its non-root account', 'using that non-root account, and preserve it');
 assert.equal(evaluateOnboarding(preservedPronoun, { vars: { platform: 'linux-root', scenario: 'upgrade' } }).pass, true);
 
+// The root notice informs the user while setup continues without a new approval.
+const noticeContext = { vars: { platform: 'linux-root', scenario: 'upgrade', requireRootNotice: true } };
+const notice = "Bloom will use separate service accounts. This agent's existing root access can still bypass that isolation.";
+assert.equal(evaluateOnboarding(`${notice}\n${referencedHelper}`, noticeContext).pass, true);
+assert.equal(evaluateOnboarding(referencedHelper, noticeContext).pass, false);
+assert.equal(evaluateOnboarding(`${notice.replace('can still', 'cannot')}\n${referencedHelper}`, noticeContext).pass, false);
+assert.equal(evaluateOnboarding(`${notice}\n${referencedHelper}\nWant me to proceed?`, noticeContext).pass, false);
+
 // Root must continue directly, while staging and operating under a non-root
 // account. Printing the right command beside a user handoff is still a failure.
 for (const scenario of ['setup', 'upgrade']) {

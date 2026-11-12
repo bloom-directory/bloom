@@ -23,7 +23,9 @@ staging/account selection, session refresh, and VFS/audit verification. A root
 response handing the command or a fresh-login requirement to the user fails.
 Both root cases include an inherited root-private `TMPDIR`; their staging
 commands must explicitly use `TMPDIR=/tmp` in the selected account. The
-non-root platform cases retain their existing elevation requirements.
+non-root platform cases retain their existing elevation requirements. Root cases
+also require a brief notice that existing root access can bypass service
+isolation, while continuing without a confirmation step.
 
 The root grader recognizes direct staging commands, `runuser` shell blocks,
 and simple account helper functions, including the documented argument-forwarding

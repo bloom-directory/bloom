@@ -143,7 +143,7 @@ const config: UnifiedConfig = {
     { platform: 'linux-root', scenario: 'upgrade', userRequest: 'Upgrade Bloom', platformContext: 'Linux aarch64, effective UID 0, headless VPS, no pkexec, Bloom installed for the dedicated non-root bloom account with one active enrollment, inherited TMPDIR=/root/.hermes/cache/scratch is unwritable by bloom' },
   ].map((vars) => ({
     description: `${vars.scenario ?? 'setup'}: ${vars.platformContext}`,
-    vars: { userRequest: currentPrompt, ...vars },
+    vars: { userRequest: currentPrompt, ...vars, ...(vars.platform === 'linux-root' ? { requireRootNotice: true } : {}) },
     metadata: { currentPrompt: vars.userRequest ?? currentPrompt },
   })),
   evaluateOptions: {
