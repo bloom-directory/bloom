@@ -317,6 +317,9 @@ pub trait AccountPetalMount: Send + Sync {
         mount: &str,
         slot: &str,
     ) -> Result<(), HandlerError>;
+
+    /// The installed package hash of the Petal named `petal`, if any.
+    fn installed_package(&self, petal: &str) -> Option<String>;
 }
 
 #[derive(Clone)]
@@ -391,6 +394,15 @@ impl WalletsHandler {
     /// Attach the session seam that serves `wallets/<w>/<n>/sessions/`.
     pub fn set_account_petals(&self, petals: Arc<dyn AccountPetalMount>) {
         *self.account_petals.write() = Some(petals);
+    }
+
+    /// The installed package hash of the Petal named `petal`; none before the
+    /// Petal runtime is attached.
+    pub fn installed_petal_package(&self, petal: &str) -> Option<String> {
+        self.account_petals
+            .read()
+            .as_ref()?
+            .installed_package(petal)
     }
 
     /// Attach the Solana transfer engines (keyed by chain name). When set,
@@ -2229,10 +2241,8 @@ impl WalletsHandler {
                     "pending",
                     "failed",
                 )?;
-                Err(HandlerError::invalid(format!(
-                    "Broker policy ceremony is terminal: {:?}",
-                    status.state
-                )))
+                // Retired without committing; the caller proposes again.
+                Ok(())
             }
             bloom_broker_api::CeremonyState::Completed => Err(HandlerError::backend(
                 "policy_update ceremony reported the wallet-registration-only COMPLETED state",
@@ -2699,6 +2709,12 @@ fn err_be(e: impl std::fmt::Display) -> HandlerError {
     HandlerError::backend(e.to_string())
 }
 
+/// The refusal for a write waiting on owner approval, naming the entry's
+/// public challenge. It never carries the ceremony link: errors are logged.
+fn approval_pending(outbox: &str, id: &str) -> HandlerError {
+    HandlerError::ApprovalPending(format!("{outbox}/pending/{id}/{APPROVAL_CHALLENGE_FILE}"))
+}
+
 /// Render the newest pending entry as a `pending/<id>` symlink target.
 ///
 /// Ties on `created_ms` break toward the greater id: outbox ids come from a
@@ -2740,13 +2756,7 @@ fn outbox_err(e: OutboxError) -> HandlerError {
 /// (path traversal, the `latest` sentinel, or NUL). Real ids are
 /// `policy-update-<blake3-hex>`, so this is defense-in-depth.
 fn validate_policy_action_id(id: &str) -> Result<(), HandlerError> {
-    if id.is_empty()
-        || id == "latest"
-        || id.contains('/')
-        || id.contains('\\')
-        || id.contains('\0')
-        || id.contains("..")
-    {
+    if !bloom_proto::is_valid_action_id(id) {
         return Err(HandlerError::invalid(format!("invalid action id: {id}")));
     }
     Ok(())
@@ -2922,7 +2932,7 @@ fn clear_confirm_error(entry_dir: &Path) {
 /// Best effort, and never recreates an entry directory that has moved on:
 /// the temporary file is created inside the existing directory only.
 /// How to reconcile an entry that `cancel` kept because it may be signed.
-fn possibly_signed_next(error: &TxEngineError, chain: &str) -> Option<String> {
+fn possibly_signed_next(error: &TxEngineError, account: u32, chain: &str) -> Option<String> {
     let TxEngineError::Outbox(OutboxError::PossiblySigned {
         wallet,
         id,
@@ -2937,10 +2947,10 @@ fn possibly_signed_next(error: &TxEngineError, chain: &str) -> Option<String> {
         (Some(_), _) => "This entry may already be signed or broadcast, so `cancel` kept it. Do not reuse its nonce. Reconcile it by its recorded hash first; if it is still unmined, replace it with `bloom wallet cancel`, which needs its own owner approval.".to_owned(),
         (None, SigningEvidence::Entry) => "A signing request for this entry may have reached the Broker without its reply being recorded, so `cancel` kept the entry; no transaction hash is recorded yet. Do not reuse its nonce. Write the same confirm again: Bloom asks the Broker for the recorded signing operation's result and broadcasts or reconciles it. If it is still unmined afterwards, replace it with `bloom wallet cancel`, which needs its own owner approval.".to_owned(),
         (None, SigningEvidence::Cancel) => format!(
-            "A cancellation of this entry may have been signed without its reply being recorded, so `cancel` kept the entry; no transaction hash is recorded yet. Do not reuse its nonce. Writing confirm here cannot reconcile a cancellation. Run `bloom wallet cancel {wallet} {chain} {id}` again: Bloom asks the Broker for the recorded cancellation's result and broadcasts or reconciles it."
+            "A cancellation of this entry may have been signed without its reply being recorded, so `cancel` kept the entry; no transaction hash is recorded yet. Do not reuse its nonce. Writing confirm here cannot reconcile a cancellation. Run `bloom wallet cancel {wallet} {chain} {id} --account {account}` again: Bloom asks the Broker for the recorded cancellation's result and broadcasts or reconciles it."
         ),
         (None, SigningEvidence::Batch { ordered_refs }) => format!(
-            "A batch signing request covering this entry may have reached the Broker without its reply being recorded, so `cancel` kept the entry. Do not reuse its nonce. Writing confirm here cannot reconcile a batch. Run `bloom wallet confirm-batch {wallet} {}` with the refs in exactly this order: Bloom asks the Broker for that batch's result and broadcasts or reconciles each entry.",
+            "A batch signing request covering this entry may have reached the Broker without its reply being recorded, so `cancel` kept the entry. Do not reuse its nonce. Writing confirm here cannot reconcile a batch. Run `bloom wallet confirm-batch {wallet} --account {account} {}` with the refs in exactly this order: Bloom asks the Broker for that batch's result and broadcasts or reconciles each entry.",
             ordered_refs.join(" ")
         ),
         (None, SigningEvidence::UnreadableBatch) => "Bloom could not read a batch signing record, and that record could cover any entry, so `cancel` kept this one. Confirm still works. An operator must repair the record named by `outbox.batch_state_unreadable` in the Machine log, or remove it only after the Broker shows that batch never signed; then write cancel again.".to_owned(),
@@ -4384,7 +4394,7 @@ impl WalletsHandler {
                             .outbox()
                             .write_approval_challenge(&entry, &challenge)
                             .map_err(solana_outbox_err)?;
-                        Err(HandlerError::PermissionDenied)
+                        Err(approval_pending(&outbox_path, id))
                     }
                     bloom_solana_tx::signing::SolanaSignOutcome::Signed { .. } => {
                         engine
@@ -4501,6 +4511,8 @@ impl WalletsHandler {
     /// resolved from that address by the transaction engine, so a stage from
     /// account 1 can never be signed by account 0. The pending controls are
     /// fenced to the same sender, so there is no unfenced outbox write.
+    /// `account` is the mounted number a pending-approval error points back at.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn write_outbox_from(
         &self,
         wallet: &str,
@@ -4509,8 +4521,10 @@ impl WalletsHandler {
         policy: &Policy,
         rest: &[String],
         data: &[u8],
+        account: u32,
     ) -> Result<(), HandlerError> {
         let scope = from.to_string();
+        let outbox = format!("wallets/{wallet}/{account}/chains/{chain}/outbox");
         let client = self
             .chains
             .get(chain)
@@ -4569,7 +4583,7 @@ impl WalletsHandler {
                         .discard_unsigned(permit, wallet, chain, id)
                         .await
                         .map_err(|error| {
-                            let next = possibly_signed_next(&error, chain);
+                            let next = possibly_signed_next(&error, account, chain);
                             let error = err_be(error);
                             record_confirm_error(&entry_dir, wallet, id, &error, next);
                             error
@@ -4602,7 +4616,7 @@ impl WalletsHandler {
                         )
                         .await
                         .map_err(|e| match e {
-                            TxEngineError::ApprovalRequired(_) => HandlerError::PermissionDenied,
+                            TxEngineError::ApprovalRequired(_) => approval_pending(&outbox, id),
                             other => err_be(other),
                         })
                 }
@@ -4611,7 +4625,7 @@ impl WalletsHandler {
                     Ok(_staged) => Ok(()),
                     // A pending owner approval has its own projection,
                     // approval_challenge.json; anything else is recorded.
-                    Err(HandlerError::PermissionDenied) => Err(HandlerError::PermissionDenied),
+                    Err(error @ HandlerError::ApprovalPending(_)) => Err(error),
                     Err(error) => {
                         record_confirm_error(&entry_dir, wallet, id, &error, None);
                         Err(error)
@@ -4673,7 +4687,7 @@ impl WalletsHandler {
                     .await
                     .map(|_| ())
                     .map_err(|error| match error {
-                        TxEngineError::ApprovalRequired(_) => HandlerError::PermissionDenied,
+                        TxEngineError::ApprovalRequired(_) => approval_pending(&outbox, id),
                         other => err_be(other),
                     })
             }
@@ -6047,6 +6061,64 @@ mod tests {
             .map(|entry| entry.name)
             .collect();
         assert_eq!(one, ["from-account-one"]);
+    }
+
+    #[test]
+    fn possibly_signed_recovery_commands_name_the_account() {
+        for (evidence, command) in [
+            (
+                SigningEvidence::Cancel,
+                "bloom wallet cancel w base tx-1 --account 3",
+            ),
+            (
+                SigningEvidence::Batch {
+                    ordered_refs: vec!["base:tx-1".into()],
+                },
+                "bloom wallet confirm-batch w --account 3 base:tx-1",
+            ),
+        ] {
+            let error = TxEngineError::Outbox(OutboxError::PossiblySigned {
+                wallet: "w".into(),
+                id: "tx-1".into(),
+                tx_hash: None,
+                evidence,
+            });
+            let next = possibly_signed_next(&error, 3, "base").unwrap();
+            assert!(next.contains(command), "{next}");
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_account_fence_checks_sender_and_allows_sent_recovery() {
+        let f = make_handler_with_chain(true);
+        let (projection, _, evm1) = two_account_projection(&f);
+        seed_pending_from(&f, "from-account-one", &evm1, 2_000);
+        let handler = f.handler.clone().with_projection_reader(projection);
+        let w = &f.wallet_name;
+        for sent in [false, true] {
+            if sent {
+                let entry = handler
+                    .tx_engine
+                    .outbox
+                    .read(w, "anvil", "from-account-one")
+                    .unwrap();
+                handler
+                    .tx_engine
+                    .outbox
+                    .transition(&entry, OutboxState::Sent)
+                    .unwrap();
+            }
+            handler
+                .require_outbox_account(w, 1, "anvil", "from-account-one")
+                .await
+                .unwrap();
+            assert!(matches!(
+                handler
+                    .require_outbox_account(w, 0, "anvil", "from-account-one")
+                    .await,
+                Err(HandlerError::NotFound(_))
+            ));
+        }
     }
 
     /// The S4 regression: a write under account 0 to `confirm`,
@@ -9038,7 +9110,7 @@ value = "0""#,
             approved["next"]
                 .as_str()
                 .unwrap()
-                .contains("retry_path now"),
+                .contains("Now write retry_body to retry_path"),
             "{approved}"
         );
 
@@ -10515,7 +10587,7 @@ value = "0""#,
                     // Single confirm reads only the entry's own state; only
                     // the exact ordered batch reconciles a batch signature.
                     let command = format!(
-                        "bloom wallet confirm-batch {} anvil:0001-test",
+                        "bloom wallet confirm-batch {} --account 0 anvil:0001-test",
                         f.wallet_name
                     );
                     assert!(next.contains(&command), "{next}");
@@ -10525,7 +10597,10 @@ value = "0""#,
                 if matches!(marker, "cancel_raw_tx" | "cancel_dispatched") {
                     // The cancellation holds the evidence; only rerunning it
                     // reconciles it, and confirm would refuse.
-                    let command = format!("bloom wallet cancel {} anvil 0001-test", f.wallet_name);
+                    let command = format!(
+                        "bloom wallet cancel {} anvil 0001-test --account 0",
+                        f.wallet_name
+                    );
                     assert!(next.contains(&command), "{marker}: {next}");
                     assert!(!next.contains("Write the same confirm again"), "{next}");
                     continue;

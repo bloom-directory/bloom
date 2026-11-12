@@ -997,10 +997,8 @@ fn install_github_source_with_expectation(
 
 /// How an already-installed owner relates to the pinned catalog entry.
 ///
-/// Anything that is neither of these two states is a refusal: Bloom only ever
-/// replaces a Petal it can prove it installed itself from the same trusted
-/// catalog repository. An install without source provenance whose package hash
-/// is the pinned hash is reused as `Current`, but never replaced.
+/// Source provenance or an exact release-catalog hash identifies a known
+/// installation. Unknown or contradictory identities are refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PreinstalledState {
     /// The installed package is the pinned release: same commit and hash, or,
@@ -1008,6 +1006,8 @@ pub(crate) enum PreinstalledState {
     Current,
     /// Same Petal name, same trusted catalog repository, older pinned commit.
     Outdated { installed_commit: String },
+    /// A known predecessor release installed from its archive without source metadata.
+    CataloguedPredecessor { installed_hash: String },
 }
 
 pub(crate) fn ensure_preinstalled_petals(_home: &HomeDir, daemon: &Daemon) -> Result<Vec<String>> {
@@ -1071,6 +1071,13 @@ fn ensure_preinstalled_petals_with(
                         println!(
                             "preinstalled_petal: updating {} from {} to {}",
                             entry.name, installed_commit, entry.commit
+                        );
+                        true
+                    }
+                    PreinstalledState::CataloguedPredecessor { installed_hash } => {
+                        println!(
+                            "preinstalled_petal: updating {} from package {} to {}",
+                            entry.name, installed_hash, entry.commit
                         );
                         true
                     }
@@ -1553,11 +1560,11 @@ fn validate_release_authority(
 /// Returns `Current` when the installation is already the pinned commit and
 /// hash, and `Outdated` when it is the same Petal from the same trusted catalog
 /// repository at a different commit. An installation without source
-/// provenance is `Current` when its package hash is the pinned hash. Every
-/// other shape — missing provenance with any other hash (including an older
-/// release, which may be a deliberate rollback), a different repository, or an identity
-/// that contradicts itself — is refused so that manually sourced or untrusted
-/// ownership is never overwritten.
+/// provenance is `Current` when its package hash is the pinned hash, or a
+/// `CataloguedPredecessor` when its hash is explicitly listed by the pinned
+/// release. Unknown hashes, different repositories and contradictory identities
+/// are refused. Replacement still requires the normal verified release and
+/// activation checks, including the signed state-migration lineage.
 pub(crate) fn classify_existing_preinstalled(
     expected: &PreinstalledPetal,
     meta: &bloom_petals::meta::PetalMeta,
@@ -1580,11 +1587,18 @@ pub(crate) fn classify_existing_preinstalled(
         if expected.expected_hash == Some(meta.hash.as_str()) {
             return Ok(PreinstalledState::Current);
         }
-        // Matching bytes do not mean Bloom may replace them: an older release
-        // installed by hand may be a deliberate rollback.
+        if expected
+            .predecessor_package_hashes
+            .contains(&meta.hash.as_str())
+        {
+            return Ok(PreinstalledState::CataloguedPredecessor {
+                installed_hash: meta.hash.clone(),
+            });
+        }
         bail!(
-            "pre-installed Petal {} is already owned by an installation without source provenance; uninstall it before retrying",
-            expected.name
+            "pre-installed Petal {} is installed without source provenance and its hash {} is not a catalogued predecessor; Bloom will not overwrite it automatically",
+            expected.name,
+            meta.hash
         );
     };
     let expected_repo = expected
@@ -1647,6 +1661,11 @@ fn validate_existing_preinstalled(
             expected.name,
             installed_commit,
             expected.commit
+        ),
+        PreinstalledState::CataloguedPredecessor { installed_hash } => bail!(
+            "pre-installed Petal {} is still installed at predecessor package {} instead of the pinned package",
+            expected.name,
+            installed_hash
         ),
     }
 }
@@ -2482,6 +2501,14 @@ mod tests {
     // Provisioning fixtures model an installer catalog already loaded by the
     // executing daemon. Approval signatures are outside this installer test.
     fn load_successor_catalog(daemon: &mut Daemon, hash: &str) {
+        load_successor_catalog_with_predecessor(daemon, hash, None);
+    }
+
+    fn load_successor_catalog_with_predecessor(
+        daemon: &mut Daemon,
+        hash: &str,
+        predecessor: Option<&str>,
+    ) {
         use bloom_broker_api::{
             Base64UrlBytes, DecimalU64, Digest32, PetalLineageMembership, ProvenanceCatalog,
             ProvenanceOperationClass, ProvenanceRecord, ProvenanceSubject, Token,
@@ -2507,12 +2534,31 @@ mod tests {
             installer_key_id: Token::new("test-installer").unwrap(),
             installer_signature: Base64UrlBytes::from_bytes(&[2; 64]),
         };
+        let mut records = vec![record];
+        if let Some(hash) = predecessor {
+            let digest = Digest32::new(hash.to_owned()).unwrap();
+            let mut previous = records[0].clone();
+            previous.subject = ProvenanceSubject::Petal {
+                package_hash: digest.clone(),
+                route: "hello.txt".into(),
+            };
+            let lineage = previous.petal_lineage.as_mut().unwrap();
+            lineage.active = false;
+            lineage.release_sequence = DecimalU64::new(1);
+            records[0]
+                .petal_lineage
+                .as_mut()
+                .unwrap()
+                .predecessor_package_hashes
+                .push(digest);
+            records.push(previous);
+        }
         daemon.petals = daemon
             .petals
             .clone()
             .with_provenance_catalog(Some(ProvenanceCatalog {
                 schema: "bloom.provenance-catalog.1".into(),
-                records: vec![record],
+                records,
             }));
     }
 
@@ -2925,7 +2971,7 @@ mod tests {
     }
 
     #[test]
-    fn provenance_free_install_is_reused_only_at_the_pinned_hash() {
+    fn provenance_free_install_recognizes_pinned_and_predecessor_hashes() {
         let old = build_near_release("v0.1.0");
         let old_hash: &'static str = Box::leak(old.package.hash.clone().into_boxed_str());
         let home = tempfile::tempdir().unwrap();
@@ -2959,12 +3005,120 @@ mod tests {
             "near.tar.gz",
             Some("1111111111111111111111111111111111111111111111111111111111111111"),
         );
-        // A listed predecessor is still never replaced without provenance.
+        // Only the release's explicit predecessor list authorizes replacement.
+        assert!(classify_existing_preinstalled(&successor, &meta).is_err());
         successor.predecessor_package_hashes = Box::leak(Box::new([old_hash]));
-        let err = classify_existing_preinstalled(&successor, &meta)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("without source provenance"), "{err}");
+        assert_eq!(
+            classify_existing_preinstalled(&successor, &meta).unwrap(),
+            PreinstalledState::CataloguedPredecessor {
+                installed_hash: old_hash.into()
+            }
+        );
+        // A recognized predecessor is still not the requested final release.
+        assert!(validate_existing_preinstalled(&successor, &meta).is_err());
+    }
+
+    #[test]
+    fn provenance_free_predecessor_upgrades_atomically_and_preserves_private_state() {
+        use bloom_petals::private_store::PrivateStore;
+        let old = build_near_release("v0.1.0");
+        let new = build_near_release("v0.1.1");
+        let old_hash: &'static str = Box::leak(old.package.hash.clone().into_boxed_str());
+        let new_hash: &'static str = Box::leak(new.package.hash.clone().into_boxed_str());
+        let home = tempfile::tempdir().unwrap();
+        let home_dir = HomeDir::at(home.path());
+        home_dir.ensure().unwrap();
+        bloom_proto::Config::local_default()
+            .save(&home_dir.config_path())
+            .unwrap();
+        let mut daemon = Daemon::from_home(home_dir.clone()).unwrap();
+        daemon
+            .petals
+            .store()
+            .install_prepared_petal_package(old.package.clone())
+            .unwrap();
+        load_successor_catalog_with_predecessor(&mut daemon, new_hash, Some(old_hash));
+        let shared = PrivateStore::open(daemon.petals.store().private_data_root()).unwrap();
+        shared
+            .put(old_hash, "settings/value", b"shared-fixture", false)
+            .unwrap();
+        let account = PrivateStore::open_account(
+            daemon.petals.store().private_account_data_root(),
+            "alice",
+            0,
+        )
+        .unwrap();
+        account
+            .put(
+                old_hash,
+                "secrets/fixture",
+                b"disposable-test-credential",
+                true,
+            )
+            .unwrap();
+        let mut entry =
+            near_catalog_entry(NEAR_NEW_COMMIT, "v0.1.1", "near.tar.gz", Some(new_hash));
+        entry.predecessor_package_hashes = Box::leak(Box::new([old_hash]));
+        let context = bloom_daemon::ipc::IpcOperationContext::detached();
+        let failed = crate::petal_provisioning::provision_with(
+            &daemon,
+            &context,
+            &["near-intents"],
+            |_| Some(entry),
+            |_, _, _| bail!("offline fixture"),
+        );
+        assert!(matches!(
+            &failed[0].outcome,
+            crate::petal_provisioning::ProvisioningOutcome::Failed(_)
+        ));
+        assert_eq!(installed_owner(&daemon).as_deref(), Some(old_hash));
+        let results = crate::petal_provisioning::provision_with(
+            &daemon,
+            &context,
+            &["near-intents"],
+            |_| Some(entry),
+            |daemon, entry, _| {
+                assert_eq!(installed_owner(daemon).as_deref(), Some(old_hash));
+                prepare_prebuilt_petal_archive(
+                    daemon,
+                    entry,
+                    &near_release_manifest(entry, new_hash),
+                    new.archive.path(),
+                )
+            },
+        );
+        assert_eq!(
+            results[0].outcome,
+            crate::petal_provisioning::ProvisioningOutcome::Installed
+        );
+        assert_eq!(installed_owner(&daemon).as_deref(), Some(new_hash));
+        assert_eq!(
+            shared.get(new_hash, "settings/value").unwrap(),
+            b"shared-fixture"
+        );
+        assert_eq!(
+            account.get(new_hash, "secrets/fixture").unwrap(),
+            b"disposable-test-credential"
+        );
+        let meta = daemon.petals.store().load_meta(new_hash).unwrap();
+        assert_eq!(meta.replaced.as_deref(), Some(old_hash));
+        assert_eq!(
+            meta.source.as_ref().unwrap().resolved_commit,
+            NEAR_NEW_COMMIT
+        );
+        drop(daemon);
+        let daemon = Daemon::from_home(home_dir).unwrap();
+        let again = crate::petal_provisioning::provision_with(
+            &daemon,
+            &context,
+            &["near-intents"],
+            |_| Some(entry),
+            |_, _, _| panic!("already current after restart"),
+        );
+        assert_eq!(
+            again[0].outcome,
+            crate::petal_provisioning::ProvisioningOutcome::Current
+        );
     }
 
     #[test]

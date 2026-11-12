@@ -673,6 +673,30 @@ impl WalletsHandler {
         Ok(read)
     }
 
+    /// Fence batch confirmation to the selected account, as single-item controls do.
+    pub async fn require_outbox_account(
+        &self,
+        wallet: &str,
+        number: u32,
+        chain: &str,
+        id: &str,
+    ) -> Result<(), HandlerError> {
+        let view = self.account_view(wallet, number).await?;
+        let from = Self::evm_address(Self::evm_family(&view, chain)?)?;
+        // Batch retries also reconcile already-sent children.
+        let entry = self
+            .tx_engine
+            .outbox
+            .read(wallet, chain, id)
+            .map_err(super::outbox_err)?;
+        if !entry.staged.from.eq_ignore_ascii_case(&from.to_string()) {
+            return Err(HandlerError::not_found(format!(
+                "account {number}/outbox/{id}"
+            )));
+        }
+        Ok(())
+    }
+
     pub(super) async fn lookup_account(
         &self,
         wallet: &str,
@@ -913,7 +937,7 @@ impl WalletsHandler {
             .chain_id;
         let policy =
             crate::advisory_exact_evm_policy(&projection, chain, chain_id).map_err(err_be)?;
-        self.write_outbox_from(wallet, chain, from, &policy, chain_rest, data)
+        self.write_outbox_from(wallet, chain, from, &policy, chain_rest, data, number)
             .await
     }
 
@@ -1133,7 +1157,9 @@ impl WalletsHandler {
                     let signing = evm_signing_state(&entry)
                         .ok_or_else(|| HandlerError::not_found(rest.join("/")))?;
                     let outbox = format!("wallets/{wallet}/{number}/chains/{chain}/outbox");
-                    let challenge = evm_approval_challenge(&entry, &signing, &outbox)?;
+                    let challenge = evm_approval_challenge(&entry, &signing, &outbox, &|petal| {
+                        self.installed_petal_package(petal)
+                    })?;
                     return self.live_approval_challenge(wallet, challenge).await;
                 }
                 if is_private_evm_outbox_artifact(fname) {
@@ -2184,11 +2210,18 @@ fn evm_approval_challenge(
     entry: &bloom_tx::outbox::OutboxEntry,
     signing: &serde_json::Value,
     outbox: &str,
+    installed: &dyn Fn(&str) -> Option<String>,
 ) -> Result<serde_json::Value, HandlerError> {
     use sha2::Digest as _;
     let mut staged = entry.staged.clone();
     let mut retry_body = serde_json::Value::String("confirm".into());
-    let mut control = "confirm";
+    // A warning-bearing entry only ever reaches approval through
+    // `confirm.override`; plain `confirm` is refused before signing.
+    let mut control = if bloom_tx::policy_engine::has_warning(&staged.policy_checks) {
+        "confirm.override"
+    } else {
+        "confirm"
+    };
     let mut plan = "plan.md";
     let replacement_action = format!("{}:{}:replace", staged.chain_id, staged.id);
     if signing.get("action_id").and_then(|value| value.as_str()) == Some(&replacement_action)
@@ -2236,7 +2269,7 @@ fn evm_approval_challenge(
             .as_u64()
             .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
     });
-    Ok(serde_json::json!({
+    let mut challenge = serde_json::json!({
         "schema": "bloom.evm-approval-challenge/1",
         "action_id": signing.get("action_id"),
         "tx_id": staged.id,
@@ -2253,7 +2286,22 @@ fn evm_approval_challenge(
         "plan_path": format!("{outbox}/pending/{}/{plan}", staged.id),
         "retry_path": format!("{outbox}/pending/{}/{control}", staged.id),
         "retry_body": retry_body,
-    }))
+    });
+    let petal = staged
+        .execution_origin
+        .as_ref()
+        .and_then(|origin| crate::handlers::outbox::staging_petal(origin, installed));
+    if let (Some((petal, can_confirm)), "confirm" | "confirm.override") = (petal, control) {
+        challenge["staged_by"] = petal.into();
+        if !can_confirm {
+            challenge["restage"] = true.into();
+        }
+        if let Some(object) = challenge.as_object_mut() {
+            object.remove("retry_path");
+            object.remove("retry_body");
+        }
+    }
+    Ok(challenge)
 }
 
 /// Applies Broker's live approval status to a projected challenge. While the
@@ -2266,13 +2314,28 @@ fn reconcile_approval_challenge(
     challenge: &mut serde_json::Value,
     live: Option<&bloom_broker_api::ApprovalPublicStatus>,
 ) {
-    let (state, next) = match live {
-        Some(status) => approval_next_step(status.state),
+    let petal = challenge["staged_by"].as_str().map(str::to_owned);
+    let retry = match &petal {
+        Some(petal) => format!(
+            "retry {}",
+            crate::handlers::outbox::through_staging_petal(petal)
+        ),
+        None => "write retry_body to retry_path".into(),
+    };
+    let (state, mut next) = match live {
+        Some(status) => approval_next_step(status.state, &retry, petal.is_none()),
         None => (
             "unknown",
-            "Bloom could not read this approval's state. Writing retry_body to retry_path is safe and reports it.",
+            format!(
+                "Bloom could not read this approval's state. It is safe to {retry}; that reports it."
+            ),
         ),
     };
+    // Approval cannot help an entry its Petal can no longer confirm.
+    let restage = challenge["restage"] == true && !matches!(state, "exhausted" | "refused");
+    if let (true, Some(petal)) = (restage, &petal) {
+        next = crate::handlers::outbox::restage_through(petal);
+    }
     let Some(object) = challenge.as_object_mut() else {
         return;
     };
@@ -2281,7 +2344,7 @@ fn reconcile_approval_challenge(
     let Some(status) = live else {
         return;
     };
-    if state == "awaiting_ceremony" {
+    if state == "awaiting_ceremony" && !restage {
         object.insert("ceremony_url".into(), status.ceremony_url.clone().into());
         object.insert(
             "expiry_ms".into(),
@@ -2297,35 +2360,42 @@ fn reconcile_approval_challenge(
 }
 
 /// What the approval's live Broker state means for the agent holding the
-/// challenge, as `(state, next)`.
+/// challenge, as `(state, next)`. `retry` says how to retry the confirm;
+/// `direct` means it is the entry's own confirm, which waits over IPC.
 fn approval_next_step(
     state: bloom_broker_api::ApprovalLifecycleState,
-) -> (&'static str, &'static str) {
+    retry: &str,
+    direct: bool,
+) -> (&'static str, String) {
     use bloom_broker_api::ApprovalLifecycleState as S;
     match state {
         S::Prepared | S::AwaitingCeremony => (
             "awaiting_ceremony",
-            "Give ceremony_url to the owner. As soon as they approve, write retry_body to retry_path. Retrying earlier is safe: it starts no new ceremony and returns permission denied again.",
+            if direct {
+                "Give ceremony_url to the owner, then write retry_body to retry_path. Through bloom vfs write or MCP it waits for their approval and sends; on a mount it is denied until they approve, so write it again after. Neither starts a new ceremony.".into()
+            } else {
+                format!("Give ceremony_url to the owner. As soon as they approve, {retry}. Retrying earlier is safe: it starts no new ceremony and returns permission denied again.")
+            },
         ),
         S::Active => (
             "active",
-            "The owner approved. Write retry_body to retry_path now to sign and broadcast.",
+            format!("The owner approved. Now {retry} to sign and broadcast."),
         ),
         S::Exhausted => (
             "exhausted",
-            "This approval has been used. Read the transaction's outbox state before doing anything else.",
+            "This approval has been used. Read the transaction's outbox state before doing anything else.".into(),
         ),
         S::Expired => (
             "expired",
-            "This approval expired unused. Ask the owner before writing retry_body to retry_path again, which starts over or says why it cannot.",
+            format!("This approval expired unused. Ask the owner whether to retry; if so, {retry}, which starts over or says why it cannot."),
         ),
         S::Cancelled => (
             "cancelled",
-            "This approval was cancelled unused. Ask the owner before writing retry_body to retry_path again, which starts over or says why it cannot.",
+            format!("This approval was cancelled unused. Ask the owner whether to retry; if so, {retry}, which starts over or says why it cannot."),
         ),
         S::Orphaned | S::Revoked | S::Failed => (
             "refused",
-            "This approval can no longer authorize the transaction. Tell the owner; do not retry it.",
+            "This approval can no longer authorize the transaction. Tell the owner; do not retry it.".into(),
         ),
     }
 }
@@ -2408,7 +2478,7 @@ mod tests {
             "canonical_plan_facts_digest": hex::encode(sha2::Sha256::digest(serde_jcs::to_vec(&replacement).unwrap())),
         });
         let root = "wallets/main/0/chains/polygon/outbox";
-        let challenge = evm_approval_challenge(&entry, &signing, root).unwrap();
+        let challenge = evm_approval_challenge(&entry, &signing, root, &|_| None).unwrap();
         assert_eq!(
             challenge["retry_path"],
             format!("{root}/pending/fee-repair/replace")
@@ -2420,6 +2490,25 @@ mod tests {
         );
         assert_eq!(challenge["to"], original.to.as_ref().unwrap().as_str());
 
+        // An ordinary approval of a warning-bearing entry retries through
+        // confirm.override, the only control that can sign it.
+        let mut warned = original.clone();
+        warned.id = "warned".into();
+        warned.policy_checks = vec![bloom_proto::PolicyCheck {
+            rule: "caps.per_tx_usd".into(),
+            outcome: bloom_proto::PolicyOutcome::Warn,
+            class: bloom_proto::PolicyRuleClass::Soft,
+            message: "over cap".into(),
+        }];
+        outbox.write_pending(&warned, "warned plan").unwrap();
+        let warned_entry = outbox.read("main", "polygon", "warned").unwrap();
+        let ordinary = serde_json::json!({ "action_id": "137:warned:confirm" });
+        let challenge = evm_approval_challenge(&warned_entry, &ordinary, root, &|_| None).unwrap();
+        assert_eq!(
+            challenge["retry_path"],
+            format!("{root}/pending/warned/confirm.override")
+        );
+
         let mut altered = request.clone();
         altered["max_priority_fee_per_gas"] = "25000000000".into();
         outbox
@@ -2429,7 +2518,7 @@ mod tests {
                 &serde_json::to_vec(&altered).unwrap(),
             )
             .unwrap();
-        assert!(evm_approval_challenge(&entry, &signing, root).is_err());
+        assert!(evm_approval_challenge(&entry, &signing, root, &|_| None).is_err());
         outbox
             .write_artefact(
                 &entry.dir,
@@ -2449,7 +2538,98 @@ mod tests {
             "action_id": "137:fee-repair:replace",
             "canonical_plan_facts_digest": hex::encode(sha2::Sha256::digest(serde_jcs::to_vec(&replacement).unwrap())),
         });
-        assert!(evm_approval_challenge(&entry, &changed_signing, root).is_err());
+        assert!(evm_approval_challenge(&entry, &changed_signing, root, &|_| None).is_err());
+    }
+
+    #[test]
+    fn petal_staged_challenge_retries_through_its_petal() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = bloom_tx::Outbox::new(directory.path().join("outbox")).unwrap();
+        let staged = |id: &str, origin: Option<serde_json::Value>| {
+            let staged: bloom_proto::StagedTx = serde_json::from_value(serde_json::json!({
+                "id": id, "wallet": "main", "chain": "arbitrum", "chain_id": 42161,
+                "from": "0x1111111111111111111111111111111111111111",
+                "to": "0x2222222222222222222222222222222222222222",
+                "value_wei": "0", "data_hex": "0x12345678", "nonce": 1,
+                "gas_limit": 84000, "max_fee_per_gas": "50000000000",
+                "max_priority_fee_per_gas": "2500000000", "policy_checks": [],
+                "created_ms": 1, "expires_ms": 10000, "status": "pending",
+                "action_kind": "contract_call", "execution_origin": origin
+            }))
+            .unwrap();
+            outbox.write_pending(&staged, "plan").unwrap();
+            outbox.read("main", "arbitrum", id).unwrap()
+        };
+        let root = "wallets/main/0/chains/arbitrum/outbox";
+        let active = |challenge: &mut serde_json::Value| {
+            let status = bloom_broker_api::ApprovalPublicStatus {
+                approval_id: bloom_broker_api::Digest32::from_bytes([7; 32]),
+                wallet_id: bloom_broker_api::Token::new("main").unwrap(),
+                state: bloom_broker_api::ApprovalLifecycleState::Active,
+                effective_claim_assurance: None,
+                ceremony_url: None,
+                ceremony_expires_at_ms: None,
+            };
+            reconcile_approval_challenge(challenge, Some(&status));
+            challenge["next"].as_str().unwrap().to_owned()
+        };
+
+        // Confirming the raw entry would skip the Petal's confirm-time checks.
+        let petal = staged(
+            "buy",
+            Some(serde_json::json!({
+                "petal_id": "petal:pendle", "petal_digest": "ab".repeat(32),
+                "petal_version": "v1-package", "route_id": "r000003"
+            })),
+        );
+        let signing = serde_json::json!({ "action_id": "42161:buy:confirm" });
+        let installed = |petal: &str| (petal == "pendle").then(|| "ab".repeat(32));
+        let mut challenge = evm_approval_challenge(&petal, &signing, root, &installed).unwrap();
+        assert!(challenge.get("retry_path").is_none(), "{challenge}");
+        assert!(challenge.get("retry_body").is_none(), "{challenge}");
+        assert_eq!(challenge["staged_by"], "petals/pendle/");
+        let next = active(&mut challenge);
+        assert!(
+            next.contains("retry through the Petal that staged this entry (petals/pendle/"),
+            "{next}"
+        );
+        assert!(!next.contains("retry_path"), "{next}");
+
+        // After an upgrade the Petal's confirm rejects the old origin, and an
+        // origin without a route never had one: no approval can send either.
+        let legacy = staged(
+            "legacy",
+            Some(serde_json::json!({
+                "petal_id": "petal:pendle", "petal_digest": "ab".repeat(32),
+                "petal_version": "v1-package"
+            })),
+        );
+        let upgraded = |_: &str| Some("cd".repeat(32));
+        for (entry, installed) in [
+            (&petal, &upgraded as &dyn Fn(&str) -> Option<String>),
+            (&legacy, &installed),
+        ] {
+            let mut challenge = evm_approval_challenge(entry, &signing, root, installed).unwrap();
+            assert!(challenge.get("retry_path").is_none(), "{challenge}");
+            let next = active(&mut challenge);
+            assert!(
+                next.contains("petals/pendle/ can no longer confirm this entry")
+                    && !next.contains("retry through"),
+                "{next}"
+            );
+        }
+
+        // An entry staged directly through the wallet outbox keeps its control.
+        let direct = staged("send", None);
+        let signing = serde_json::json!({ "action_id": "42161:send:confirm" });
+        let mut challenge = evm_approval_challenge(&direct, &signing, root, &|_| None).unwrap();
+        assert_eq!(
+            challenge["retry_path"],
+            format!("{root}/pending/send/confirm")
+        );
+        assert!(challenge.get("staged_by").is_none());
+        let next = active(&mut challenge);
+        assert!(next.contains("write retry_body to retry_path"), "{next}");
     }
 
     #[test]

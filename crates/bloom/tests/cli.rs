@@ -572,6 +572,7 @@ impl bloom_daemon::ipc::BatchConfirmationService for FixedBatchConfirmation {
                 "signer_receipt_digest": "signer-receipt-digest",
                 "broker_receipt_digest": "broker-receipt-digest",
                 "wallet": request.wallet,
+                "account": request.account,
                 "txs": request.txs,
                 "confirmation_text": request.text,
             }))
@@ -1908,9 +1909,25 @@ fn wallet_stage_routes_via_ipc_when_home_write_lock_is_live() {
         .stdout(predicate::eq("tx-1\n"))
         .stderr(predicate::str::contains("already open for writing").not());
 
+    bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "stage",
+            "alice",
+            "anvil",
+            "--account",
+            "7",
+            "--intent",
+            intent,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::eq("tx-2\n"));
+
     stop_ipc_server(server, server_thread);
     let writes = wallets.writes();
-    assert_eq!(writes.len(), 1, "writes={writes:?}");
+    assert_eq!(writes.len(), 2, "writes={writes:?}");
+    assert_eq!(writes[1].0, "/alice/7/chains/anvil/outbox/new.tx");
     assert_eq!(writes[0].0, "/alice/0/chains/anvil/outbox/new.tx");
     assert_eq!(String::from_utf8_lossy(&writes[0].1), intent);
 }
@@ -2520,6 +2537,8 @@ fn wallet_confirm_uses_plain_ipc_write_when_socket_exists() {
             "alice",
             "base",
             "0001-deadbeef",
+            "--account",
+            "7",
             "--text",
             "y",
         ])
@@ -2535,7 +2554,7 @@ fn wallet_confirm_uses_plain_ipc_write_when_socket_exists() {
     assert_eq!(writes.len(), 1, "expected one VFS write, got {writes:?}");
     assert_eq!(
         writes[0].0,
-        "/alice/0/chains/base/outbox/pending/0001-deadbeef/confirm"
+        "/alice/7/chains/base/outbox/pending/0001-deadbeef/confirm"
     );
     assert_eq!(writes[0].1, b"y");
 }
@@ -2550,11 +2569,11 @@ fn wallet_confirm_reports_the_pending_ceremony_url() {
         + 180_000) as u64;
     let mut files = std::collections::HashMap::new();
     files.insert(
-        "/alice/0/chains/base/outbox/pending/0001-cafe/cafe.json".to_string(),
+        "/alice/7/chains/base/outbox/pending/0001-cafe/cafe.json".to_string(),
         Vec::new(),
     );
     files.insert(
-        "/alice/0/chains/base/outbox/pending/0001-cafe/approval_challenge.json".to_string(),
+        "/alice/7/chains/base/outbox/pending/0001-cafe/approval_challenge.json".to_string(),
         format!(
             "{{\"schema\":\"bloom.evm-approval-challenge/1\",\"state\":\"awaiting_ceremony\",\"ceremony_url\":\"http://localhost:18734/c/secret\",\"expiry_ms\":{expires}}}"
         )
@@ -2574,6 +2593,8 @@ fn wallet_confirm_reports_the_pending_ceremony_url() {
             "alice",
             "base",
             "0001-cafe",
+            "--account",
+            "7",
             "--text",
             "y",
         ])
@@ -2587,6 +2608,49 @@ fn wallet_confirm_reports_the_pending_ceremony_url() {
         .stdout(predicate::str::contains(
             "re-run this confirm after approving",
         ));
+
+    stop_ipc_server(server, server_thread);
+}
+
+#[test]
+fn wallet_confirm_points_a_petal_staged_entry_back_to_its_petal() {
+    let home = fresh_home();
+    let expires = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        + 180_000) as u64;
+    let mut files = std::collections::HashMap::new();
+    files.insert(
+        "/alice/0/chains/base/outbox/pending/0001-cafe/approval_challenge.json".to_string(),
+        format!(
+            "{{\"state\":\"awaiting_ceremony\",\"ceremony_url\":\"http://localhost:18734/c/secret\",\"expiry_ms\":{expires},\"staged_by\":\"petals/pendle/\",\"next\":\"After approving, retry through petals/pendle/ (see its README).\"}}"
+        )
+        .into_bytes(),
+    );
+    let handler = Arc::new(ServingHandler {
+        files,
+        ..ServingHandler::default()
+    });
+    let vfs = bloom_vfs::Vfs::builder().mount("wallets", handler).build();
+    let (server, server_thread) = spawn_ipc_server(home.path(), vfs);
+
+    // Re-running this raw confirm is refused for a Petal entry, so the CLI
+    // must give the Petal retry instead.
+    bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "confirm",
+            "alice",
+            "base",
+            "0001-cafe",
+            "--text",
+            "y",
+        ])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains("retry through petals/pendle/"))
+        .stdout(predicate::str::contains("re-run this confirm").not());
 
     stop_ipc_server(server, server_thread);
 }
@@ -2746,8 +2810,44 @@ impl Handler for ServingHandler {
         Err(match &self.write_error {
             HandlerError::NotFound(what) => HandlerError::NotFound(what.clone()),
             HandlerError::Backend(what) => HandlerError::Backend(what.clone()),
+            HandlerError::ApprovalPending(what) => HandlerError::ApprovalPending(what.clone()),
+            HandlerError::OperationNotPermitted => HandlerError::OperationNotPermitted,
             _ => HandlerError::PermissionDenied,
         })
+    }
+}
+
+/// A confirm refused while owner approval is pending names the challenge to
+/// read over IPC; a hard denial still reads differently.
+#[test]
+fn vfs_write_names_the_approval_challenge_while_owner_approval_is_pending() {
+    let home = fresh_home();
+    let outbox = "wallets/alice/0/chains/base/outbox/pending/0001-feed";
+    for (error, expected) in [
+        (
+            HandlerError::ApprovalPending(format!("{outbox}/approval_challenge.json")),
+            format!(
+                "permission denied: owner approval pending; read {outbox}/approval_challenge.json"
+            ),
+        ),
+        (
+            HandlerError::OperationNotPermitted,
+            "operation not permitted".to_owned(),
+        ),
+    ] {
+        let handler = Arc::new(ServingHandler {
+            write_error: error,
+            ..ServingHandler::default()
+        });
+        let vfs = bloom_vfs::Vfs::builder().mount("wallets", handler).build();
+        let (server, server_thread) = spawn_ipc_server(home.path(), vfs);
+        bloom_cmd(home.path())
+            .args(["vfs", "write", &format!("/{outbox}/confirm"), "--data", "y"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(expected))
+            .stderr(predicate::str::contains("ceremony_url").not());
+        stop_ipc_server(server, server_thread);
     }
 }
 
@@ -2825,6 +2925,57 @@ fn wallet_replace_uses_daemon_owned_machine_command_while_home_lock_is_live() {
 }
 
 #[test]
+fn wallet_recovery_commands_preserve_selected_account() {
+    let home = fresh_home();
+    let commands = Arc::new(RecordingMachineCommands::default());
+    let (server, server_thread) = spawn_machine_ipc_server(home.path(), commands.clone());
+    for command in ["cancel", "replace"] {
+        let mut cmd = bloom_cmd(home.path());
+        cmd.args(["wallet", command, "alice", "base", "tx-1", "--account", "7"]);
+        if command == "replace" {
+            cmd.args([
+                "--intent",
+                r#"{"max_fee_per_gas":"100","max_priority_fee_per_gas":"1"}"#,
+            ]);
+        }
+        cmd.assert().success();
+    }
+    stop_ipc_server(server, server_thread);
+    let recorded = serde_json::to_value(commands.commands()).unwrap();
+    assert_eq!(recorded.as_array().unwrap().len(), 2);
+    for command in recorded.as_array().unwrap() {
+        assert_eq!(command["account"], 7);
+        assert_eq!(command["wallet"], "alice");
+        assert_eq!(command["chain"], "base");
+        assert_eq!(command["id"], "tx-1");
+    }
+}
+
+#[test]
+fn wallet_account_range_is_checked_before_ipc() {
+    let home = fresh_home();
+    for command in ["stage", "confirm", "cancel", "replace", "confirm-batch"] {
+        for account in ["2147483648", "4294967295"] {
+            let mut cmd = bloom_cmd(home.path());
+            cmd.args(["wallet", command, "alice"]);
+            if command == "confirm-batch" {
+                cmd.arg("base:tx-1");
+            } else {
+                cmd.arg("base");
+                if command != "stage" {
+                    cmd.arg("tx-1");
+                }
+            }
+            cmd.args(["--account", account])
+                .assert()
+                .code(2)
+                .stderr(predicate::str::contains("invalid value"))
+                .stderr(predicate::str::contains("2147483647"));
+        }
+    }
+}
+
+#[test]
 fn wallet_outbox_machine_command_reports_invalid_path_params_cleanly() {
     let home = fresh_home();
     let _daemon = RunningBloom::start(home.path());
@@ -2880,6 +3031,27 @@ fn wallet_confirm_batch_uses_canonical_ipc_and_prints_authority_receipts() {
         .stdout(predicate::str::contains("broker-receipt-digest"))
         .stdout(predicate::str::contains("\"confirmation_text\": \"y\""));
 
+    stop_ipc_server(server, server_thread);
+}
+
+#[test]
+fn wallet_confirm_batch_preserves_account_including_upper_boundary() {
+    let home = fresh_home();
+    let (server, server_thread) = spawn_batch_ipc_server(home.path());
+    for account in ["7", "2147483647"] {
+        bloom_cmd(home.path())
+            .args([
+                "wallet",
+                "confirm-batch",
+                "alice",
+                "base:tx-1",
+                "--account",
+                account,
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(format!("\"account\": {account}")));
+    }
     stop_ipc_server(server, server_thread);
 }
 

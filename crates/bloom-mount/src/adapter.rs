@@ -222,7 +222,7 @@ fn map_err(e: HandlerError) -> FsError {
         HandlerError::NotFound(_) => FsError::NotFound,
         HandlerError::NotADir(_) => FsError::NotDirectory,
         HandlerError::NotAFile(_) => FsError::IsDirectory,
-        HandlerError::PermissionDenied => FsError::AccessDenied,
+        HandlerError::PermissionDenied | HandlerError::ApprovalPending(_) => FsError::AccessDenied,
         HandlerError::OperationNotPermitted => FsError::PermissionDenied,
         HandlerError::Invalid(_) => FsError::InvalidInput,
         HandlerError::Unsupported(_) => FsError::Unsupported,
