@@ -543,6 +543,51 @@ The launcher's optional controls are:
 | `BLOOM_TRIAD_DEV_CEREMONY_PORT` | Ceremony listener port when `--ceremony-port` is absent |
 | `BLOOM_TRIAD_DEV_REMOTE_UPSTREAM_PORT` | Hosted-relay loopback upstream port when `--remote-upstream-port` is absent |
 
+Every launch refreshes the developer provenance catalog before enrolling, and
+that refresh re-derives each Petal operation class's `fee_asset` from
+`FEE_BEARING_OPERATION_CLASSES` in `crates/bloom/src/triad_enrollment.rs`. A
+class enrolled before the table catalogued it is healed, with a `note:` on
+stderr. A class the record already carries any other value for is never
+overwritten, whether this build catalogues it differently or no longer
+catalogues it at all: one of the record and the table is stale, the refresh
+cannot tell which, and it will not re-sign on a guess. It prints a `warning:`
+naming the route, the package hash, the value the record carries and the value
+this build derives, and carries on — so a stale record on one class does not
+stop a launch, and does not stop a legitimate heal on another. What it does
+mean is that Broker will judge that Petal's claims against the signed value,
+not against the table, so the warning is worth acting on rather than living
+with.
+
+Correcting a row in that table is therefore a breaking change for every
+developer root enrolled against the old value. The remedy is per-Petal:
+re-enrolling the Petal re-derives its records from the table, for the package
+hash on disk. The launcher does not do this for you. Run it yourself from the
+repository root, once per Petal the warning names:
+
+```sh
+cargo build -p bloom --no-default-features --features mount,triad-dev-harness
+target/debug/bloom init triad-enroll-developer-petal-provenance \
+  "$HOME/.bloom/triad-dev/config" \
+  "$HOME/Bloom/bloom-petal-hyperliquid"
+```
+
+The first path is the `config` directory under the `--developer-root` the
+launcher was given; the second is that Petal's built package directory, the
+same path the launcher takes from `BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE`. The
+warning prints both the command and the config directory it read, so it can be
+copied from there. A fresh root works too, and is the only route for a record
+the lineage marks `active: false`: the refresh will not overwrite it and
+enrolment refuses to reactivate a superseded package hash. There is
+deliberately no override — a single flag rewriting every disagreeing record at
+once would clear unrelated ones along with the intended one, and correcting a
+row has not yet happened.
+
+Adding a row is ordinarily safe: both enrollment sites derive from the same
+table, so a record written by either carries no value for a class the table did
+not know, and takes the healing path. A record that acquired a value some other
+way — an older binary, a hand edit — does disagree when its class is added with
+a different value, and is warned about the same way.
+
 The launcher also accepts `--ceremony-port PORT`. The selected port is the
 explicit flag, otherwise `BLOOM_TRIAD_DEV_CEREMONY_PORT` when set, otherwise
 `18734`. A malformed value fails during argument validation before any build

@@ -12,8 +12,8 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 use bloom_broker_api::{
     Base64UrlBytes, DecimalU64, Digest32, PROVENANCE_RECORD_SIGNATURE_DOMAIN,
-    PetalLineageMembership, ProvenanceCatalog, ProvenanceOperationClass, ProvenanceRecord,
-    ProvenanceSubject, Token,
+    PetalLineageMembership, ProvenanceCatalog, ProvenanceFeeAsset, ProvenanceOperationClass,
+    ProvenanceRecord, ProvenanceSubject, Token,
 };
 #[cfg(feature = "triad-dev-harness")]
 use bloom_petals::package::build_petal_package_dir;
@@ -293,7 +293,23 @@ pub fn run_developer_provenance_refresh(template: &Path, config_dir: &Path) -> R
     validate_developer_caller(uid, std::env::consts::OS)?;
     let config_dir =
         fs::canonicalize(config_dir).context("canonicalize developer triad config directory")?;
-    refresh_developer_provenance_catalog(template, &config_dir, uid)
+    // Each line carries its own severity word: `note:` for a change that was
+    // saved, `warning:` for a disagreement the refresh left alone. They are
+    // returned rather than printed from inside the refresh so the tests can
+    // assert on them without capturing stderr.
+    for line in refresh_developer_provenance_catalog(template, &config_dir, uid)? {
+        eprintln!("{line}");
+    }
+    Ok(())
+}
+
+/// Single-quote a path for a copy-paste shell command. The developer root is
+/// chosen by whoever ran the launcher, and a path with a space in it -- macOS
+/// puts application data under one by default -- silently splits into two
+/// arguments otherwise, so the command the warning prints would not run.
+#[cfg(feature = "triad-dev-harness")]
+fn shell_quoted(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
 }
 
 #[cfg(feature = "triad-dev-harness")]
@@ -301,7 +317,7 @@ fn refresh_developer_provenance_catalog(
     template: &Path,
     config_dir: &Path,
     expected_owner: u32,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let catalog_path = config_dir.join("provenance-catalog.json");
     require_private_developer_file(
         &config_dir.join("installer-identity.json"),
@@ -329,6 +345,120 @@ fn refresh_developer_provenance_catalog(
         })
         .cloned()
         .collect();
+    // A developer record enrolled before a class was catalogued keeps the fee
+    // asset it was written with, and this refresh re-signs it as valid, so the
+    // stale value would outlive the upgrade: the Petal declares a fee the
+    // catalogue says its class does not take, and Broker denies every one with
+    // FEE_NOT_ALLOWED. Only `bloom-release-pins` records are rebuilt below, so
+    // without this an upgraded developer triad stays silently broken until each
+    // Petal is enrolled again by hand.
+    //
+    // Petal subjects only. The filter above already drops any record whose
+    // subject the current template still lists, so the template's own System
+    // records never reach this loop. What the guard protects is a System
+    // subject the template has since dropped or renamed: it is carried here as
+    // a developer record, and this table does not govern it, so it must keep
+    // the fee asset it was signed with.
+    //
+    // Every Petal record IS governed, including the authority fixture that
+    // `scripts/triad-dev-launch.sh` injects with `jq` — its hand-written
+    // `fee_asset` literal is re-derived here like any other, so that literal
+    // has to stay null unless its class joins the table.
+    //
+    // Healing a stale `None` is the point of the loop, and it proceeds with a
+    // note on stderr. A value the record was already signed with is never
+    // overwritten — not cleared, not replaced — because one of the record and
+    // the table is stale and the refresh cannot tell which. Re-signing on a
+    // guess denies the Petal's claims: `FEE_NOT_ALLOWED` where the value was
+    // cleared, `FEE_ASSET_MISMATCH` where it was replaced. So the record is
+    // left exactly as signed and the disagreement is reported instead.
+    //
+    // Reported, not refused. An earlier revision aborted the refresh on any
+    // disagreement, which meant one stale record stopped every launch — the
+    // launcher runs this before enrolment, so there was no way through it from
+    // inside the launcher at all. Warning keeps what refusing was for, which
+    // is that a record must never silently disagree with the table, without
+    // holding a developer hostage to a record no claim in their session will
+    // touch. The failure the warning prevents is a Broker denial at claim time
+    // with nothing pointing back here.
+    //
+    // Lineage `active` is not consulted. A superseded record's `fee_asset`
+    // still decides a claim that names its package hash, so there is no reason
+    // to treat one differently, and nothing here overwrites a signed value in
+    // either case. (No claim can name a superseded hash in practice:
+    // `bloom-petals`' store flips a single owner pointer under the install
+    // commit, and every dispatch path resolves through `resolve_petal_owner`.
+    // That is why the distinction stopped being worth its machinery.)
+    let mut developer_records = developer_records;
+    let mut notes = Vec::new();
+    let mut warnings = Vec::new();
+    for record in &mut developer_records {
+        if matches!(record.subject, ProvenanceSubject::Petal { .. }) {
+            let (package_hash, route) = match &record.subject {
+                ProvenanceSubject::Petal {
+                    package_hash,
+                    route,
+                } => (package_hash.as_str().to_owned(), route.clone()),
+                _ => (String::new(), String::new()),
+            };
+            for class in &mut record.operation_classes {
+                let derived = catalogued_fee_asset(class.operation_class.as_str())?;
+                if derived == class.fee_asset {
+                    continue;
+                }
+                // Any disagreement, not only a clearing one. A record that
+                // matched its Petal before the refresh would stop matching
+                // after, and whether the symptom is FEE_NOT_ALLOWED (cleared)
+                // or FEE_ASSET_MISMATCH (replaced with a different chain or
+                // asset) the Petal is equally broken.
+                if class.fee_asset.is_some() {
+                    warnings.push(format!(
+                        "warning: route {route} of package {package_hash} class {} is \
+                         signed with {:?} but this build derives {:?}; left as signed",
+                        class.operation_class.as_str(),
+                        class.fee_asset,
+                        derived,
+                    ));
+                    continue;
+                }
+                // The whole value, not just the asset: the guard above
+                // compares chain and asset, so reporting the asset alone
+                // described a chain-only change as "usdc to usdc".
+                notes.push(format!(
+                    "note: re-derived fee asset for {} from {:?} to {:?}",
+                    class.operation_class.as_str(),
+                    class.fee_asset,
+                    derived,
+                ));
+                class.fee_asset = derived;
+            }
+        }
+    }
+    if !warnings.is_empty() {
+        // The subcommand that fixes this is `hide = true`, so `--help` does
+        // not list it. Printing the remedy without the command to run it is
+        // what the earlier refusal did, and it left the operator stuck at the
+        // one moment this message was their only output.
+        warnings.push(format!(
+            "warning: each record above keeps the fee asset it was signed with, and Broker \
+             will judge its claims against that value, not against this build's \
+             FEE_BEARING_OPERATION_CLASSES. Either this build's table is wrong for that \
+             class or does not catalogue it, or the record is the stale side — a table row \
+             corrected since this root was enrolled, or a Petal that has changed since. If \
+             the record is right, make this build's table agree with what the Petal \
+             declares. If the table is right, re-enrol that Petal to re-derive its records \
+             from the table, which the launcher does not do for you. From the repository \
+             root, once per Petal named above:\n\n  \
+             cargo build -p bloom --no-default-features --features mount,triad-dev-harness\n  \
+             target/debug/bloom init triad-enroll-developer-petal-provenance {} \
+             <petal-package-dir>\n\nwhere <petal-package-dir> is that Petal's built \
+             package directory, the same path the launcher takes from \
+             BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE. That re-derives only the package hash on \
+             disk; recreating the developer root clears every record at once.",
+            shell_quoted(config_dir),
+        ));
+    }
+    notes.append(&mut warnings);
     catalog.records.extend(developer_records);
     append_release_petal_provenance(&mut catalog, &installer_key_id, &signing_key)?;
     for record in &mut catalog.records {
@@ -348,9 +478,14 @@ fn refresh_developer_provenance_catalog(
         serde_jcs::to_vec(&record.subject).expect("provenance subject is serializable")
     });
     if current == catalog {
-        return Ok(());
+        // Not `Vec::new()`. A disagreement writes nothing, so the catalog
+        // comes out unchanged in exactly the case the warning exists for, and
+        // returning nothing here would swallow it. A heal always changes the
+        // catalog, so anything still in hand on this path is a warning.
+        return Ok(notes);
     }
-    rewrite_private_json(&catalog_path, &serde_json::to_value(catalog)?)
+    rewrite_private_json(&catalog_path, &serde_json::to_value(catalog)?)?;
+    Ok(notes)
 }
 
 #[cfg(feature = "triad-dev-harness")]
@@ -536,11 +671,96 @@ fn developer_route_operation_classes(
         .into_iter()
         .map(|operation_class| {
             Ok(ProvenanceOperationClass {
+                fee_asset: catalogued_fee_asset(&operation_class)?,
                 operation_class: Token::new(operation_class)?,
-                fee_asset: None,
             })
         })
         .collect()
+}
+
+/// The one Hyperliquid operation class whose every claim declares a fee:
+/// builder-bearing orders sign under it and nothing else does. No released
+/// Petal emits it yet — that route split lives in bloom-petal-hyperliquid#19,
+/// and the released Petal declares no builder class at all.
+///
+/// Owner-signed only, in practice. #19's Petal routes session-signed builder
+/// orders here too, but the reusable key-scope approval is prepared with
+/// `value_limits: Vec::new()` (`bloom-daemon`), and Broker refuses a claim
+/// whose fee asset is absent from those limits with `VALUE_ASSET_NOT_ALLOWED`.
+/// A builder fee is the first declared value ever to reach that approval —
+/// plain session actions declare nothing — so the session path is denied at
+/// use time until those limits are populated.
+const HYPERLIQUID_BUILDER_ORDER_CLASS: &str = "hyperliquid.builder_order";
+
+/// One row per operation class whose *every* claim declares an exact fee.
+///
+/// A row is only legitimate where the fee is derivable from what the owner
+/// signs, and where Broker bounds the declared amount against it. Without the
+/// first, nothing can check the figure; without the second, nothing does.
+///
+/// Adding a venue takes more than a row: it also needs the Petal-side route
+/// split that makes the new class uniformly fee-bearing. A row for a class no
+/// installed Petal emits stays inert. Releasing it additionally needs the
+/// class on the Petal's `PetalAuthorityRoute` row in `github_source.rs` and a
+/// pin bump, or `validate_release_authority` rejects the release for declaring
+/// a class the pin does not list.
+///
+/// Cataloguing a fee asset makes a claim authorizable; it does not make the
+/// operation reviewed, and registering the class in Broker's review tables is
+/// not the remedy. Which venues qualify, why Polymarket's builder-code class
+/// does not, and what Broker must bound first are recorded under
+/// "Operation-class granularity and `fee_asset`" in
+/// `docs/architecture/Sealed Approvals.md`.
+const FEE_BEARING_OPERATION_CLASSES: &[CataloguedFeeAsset] = &[CataloguedFeeAsset {
+    operation_class: HYPERLIQUID_BUILDER_ORDER_CLASS,
+    chain: "hyperliquid",
+    asset: "usdc",
+}];
+
+/// A fee-bearing operation class and the asset its declared fee must name.
+struct CataloguedFeeAsset {
+    operation_class: &'static str,
+    chain: &'static str,
+    asset: &'static str,
+}
+
+/// The fee asset a catalogued operation class is enrolled with, on both the
+/// developer-harness and the release-pins path.
+///
+/// Broker treats `fee_asset: Some(_)` as "every claim in this class MUST
+/// declare `DeclaredFee::Fee`" and denies `DeclaredFee::None` with
+/// `FEE_REQUIRED`; a class without one denies any fee-declaring claim with
+/// `FEE_NOT_ALLOWED` (see `account_declared_values` in bloom-broker's
+/// `authority.rs`). A class therefore has to be uniformly fee-bearing or
+/// uniformly fee-free, and a fee asset is only correct on a class whose
+/// every claim carries an exact declared fee.
+///
+/// Venue classes that mix both are not that: Hyperliquid signs cancels,
+/// leverage updates, and plain orders under `hyperliquid.agent_action`
+/// (sessions) and `hyperliquid.order` (owner) with `{"kind":"none"}`, and
+/// Polymarket signs plain CLOB orders under `polymarket.order.poly1271` the
+/// same way, so those stay fee-free. A builder-bearing order is the one claim
+/// that declares a fee, and it signs under its own class through a dedicated
+/// route, which is what makes the fee asset safe to assert.
+///
+/// Every Petal class absent from `FEE_BEARING_OPERATION_CLASSES` stays `None`,
+/// so enrollment cannot outrun what the Petals actually declare. This governs
+/// Petal provenance only: the signed catalog also carries System records from
+/// the shipped template, and one of those (`solana.native-transfer`) names a
+/// fee asset of its own, since a native transfer always pays a network fee. See
+/// "Operation-class granularity and `fee_asset`" in
+/// `docs/architecture/Sealed Approvals.md`.
+fn catalogued_fee_asset(operation_class: &str) -> Result<Option<ProvenanceFeeAsset>> {
+    if let Some(catalogued) = FEE_BEARING_OPERATION_CLASSES
+        .iter()
+        .find(|candidate| candidate.operation_class == operation_class)
+    {
+        return Ok(Some(ProvenanceFeeAsset {
+            chain: Token::new(catalogued.chain)?,
+            asset: catalogued.asset.to_owned(),
+        }));
+    }
+    Ok(None)
 }
 
 #[cfg(feature = "triad-dev-harness")]
@@ -1058,6 +1278,10 @@ fn append_release_petal_provenance(
     )
 }
 
+/// Appends the lineage record, and one provenance record per authority
+/// route, of every pinned release Petal in `entries`, cataloguing each
+/// route's operation classes with the fee asset `catalogued_fee_asset`
+/// assigns them.
 fn append_release_petal_provenance_for_entries(
     catalog: &mut ProvenanceCatalog,
     installer_key_id: &Token,
@@ -1224,7 +1448,7 @@ fn append_release_lineage_record(
                 .map(|class| {
                     Ok(ProvenanceOperationClass {
                         operation_class: Token::new(*class)?,
-                        fee_asset: None,
+                        fee_asset: catalogued_fee_asset(class)?,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -1370,6 +1594,79 @@ mod tests {
     #[cfg(feature = "triad-dev-harness")]
     static FIXTURE_PETAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Every refresh test wants the same root: a generated developer
+    /// enrollment with the authority-fixture Petal enrolled into it, so the
+    /// catalog holds a developer-published record to plant on. Six copies of
+    /// this were the bulk of what a review called ~900 lines of refresh tests.
+    ///
+    /// The mutex guard and the tempdir have to outlive the test body — dropping
+    /// either mid-test deletes the root or lets a concurrent test rebuild the
+    /// fixture Petal underneath it — so they are held here rather than
+    /// returned alongside.
+    #[cfg(feature = "triad-dev-harness")]
+    struct RefreshRoot {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        _directory: tempfile::TempDir,
+        config: PathBuf,
+        catalog_path: PathBuf,
+        owner: u32,
+    }
+
+    #[cfg(feature = "triad-dev-harness")]
+    impl RefreshRoot {
+        fn enrolled() -> Self {
+            let guard = FIXTURE_PETAL
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let directory = tempfile::tempdir().unwrap();
+            let config = directory.path().join("config");
+            fs::create_dir(&config).unwrap();
+            fs::set_permissions(&config, fs::Permissions::from_mode(0o700)).unwrap();
+            let owner = rustix::process::geteuid().as_raw();
+            let plan = EnrollmentPlan {
+                template_dir: template_dir(),
+                output_dir: config.clone(),
+                login_uid: 1_001,
+                broker_uid: 1_002,
+                signer_uid: 1_003,
+                session_socket_gid: 1_004,
+                release_digest: "44".repeat(32),
+            };
+            generate_for_owner(&plan, owner).unwrap();
+            let petal_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(Path::parent)
+                .unwrap()
+                .join("tests/fixtures/triad-authority-petal");
+            enroll_developer_petal_provenance(&config, &petal_dir, owner).unwrap();
+            let catalog_path = config.join("provenance-catalog.json");
+            Self {
+                _guard: guard,
+                _directory: directory,
+                config,
+                catalog_path,
+                owner,
+            }
+        }
+
+        fn catalog(&self) -> ProvenanceCatalog {
+            serde_json::from_slice(&fs::read(&self.catalog_path).unwrap()).unwrap()
+        }
+
+        fn write(&self, catalog: &ProvenanceCatalog) {
+            rewrite_private_json(&self.catalog_path, &serde_json::to_value(catalog).unwrap())
+                .unwrap();
+        }
+
+        fn refresh(&self) -> Result<Vec<String>> {
+            refresh_developer_provenance_catalog(
+                &template_dir().join("provenance-catalog.unsigned.json"),
+                &self.config,
+                self.owner,
+            )
+        }
+    }
+
     fn template_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -1430,13 +1727,1015 @@ mod tests {
             key_derive_maximum_lifetime_ms: Some(60_000),
         };
 
-        let classes = developer_route_operation_classes(&route)
-            .unwrap()
-            .into_iter()
+        let records = developer_route_operation_classes(&route).unwrap();
+        let classes = records
+            .iter()
             .map(|class| class.operation_class.to_string())
             .collect::<Vec<_>>();
         assert_eq!(classes, ["fixture.delegated", "fixture.immediate"]);
         assert!(!classes.contains(&"fixture.package_wide".to_string()));
+        assert!(records.iter().all(|class| class.fee_asset.is_none()));
+    }
+
+    #[test]
+    fn only_builder_order_petal_classes_are_catalogued_with_a_fee_asset() {
+        // Every Hyperliquid class Broker registers for message review, plus
+        // the session class and Polymarket's. Listing them individually is
+        // not enough on its own — a row added for a class absent from this
+        // list would pass — so the table's own length is pinned below.
+        for class in [
+            "hyperliquid.agent_action",
+            "hyperliquid.order",
+            "hyperliquid.approve_builder_fee",
+            "hyperliquid.approve_agent",
+            "hyperliquid.cancel",
+            "hyperliquid.cancel_by_cloid",
+            "hyperliquid.schedule_cancel",
+            "hyperliquid.update_leverage",
+            "hyperliquid.usd_send",
+            "hyperliquid.usd_class_transfer",
+            // Absent on purpose: a withdrawal's claim declares
+            // `{"kind":"none"}` and the venue's flat USDC fee is deliberately
+            // left outside it, travelling in the operation record and the
+            // signing advisory instead. Cataloguing a fee asset here would
+            // make Broker answer FEE_REQUIRED for every withdrawal.
+            "hyperliquid.withdraw",
+            "polymarket.onboard",
+            "polymarket.order.poly1271",
+            "polymarket.relayer_batch",
+            "polymarket.clob_auth.v1",
+            // Absent on purpose: nothing bounds a Polymarket builder fee, so
+            // Broker must keep refusing a claim that declares one.
+            "polymarket.builder_code_order.poly1271",
+        ] {
+            assert!(
+                catalogued_fee_asset(class).unwrap().is_none(),
+                "{class} must stay fee-free"
+            );
+        }
+
+        // Hyperliquid's builder-order class is the only catalogued row, now
+        // that Polymarket's is deliberately fee-free. Pinned by count as well
+        // as by name, so that cataloguing any further class has to come here
+        // and be argued for rather than ride in on a table edit alone.
+        assert_eq!(
+            FEE_BEARING_OPERATION_CLASSES.len(),
+            1,
+            "a new fee-bearing row needs its own case in this test"
+        );
+        let class = "hyperliquid.builder_order";
+        let fee = catalogued_fee_asset(class)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{class} declares a fee on every claim"));
+        assert_eq!(fee.chain.as_str(), "hyperliquid", "{class} fee chain");
+        assert_eq!(fee.asset, "usdc", "{class} fee asset");
+    }
+
+    /// A fee-bearing class is only safe when a dedicated route makes every one
+    /// of its claims declare a fee, so each row must name a class distinct
+    /// from the fee-free class it was split out of, and must resolve.
+    #[test]
+    fn every_catalogued_fee_bearing_row_is_distinct_and_resolvable() {
+        let classes = FEE_BEARING_OPERATION_CLASSES
+            .iter()
+            .map(|entry| entry.operation_class)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            classes.len(),
+            FEE_BEARING_OPERATION_CLASSES.len(),
+            "a class may be catalogued with only one fee asset"
+        );
+        for entry in FEE_BEARING_OPERATION_CLASSES {
+            Token::new(entry.operation_class)
+                .unwrap_or_else(|_| panic!("{} is not a valid class token", entry.operation_class));
+            Token::new(entry.chain)
+                .unwrap_or_else(|_| panic!("{} is not a valid chain token", entry.chain));
+            assert!(!entry.asset.is_empty(), "{} needs an asset", entry.chain);
+        }
+    }
+
+    fn release_catalog_for(
+        entries: &[&crate::github_source::PreinstalledPetal],
+    ) -> ProvenanceCatalog {
+        let mut catalog = ProvenanceCatalog {
+            schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.to_owned(),
+            records: Vec::new(),
+        };
+        append_release_petal_provenance_for_entries(
+            &mut catalog,
+            &Token::new("installer").unwrap(),
+            &SigningKey::from_bytes(&[7; 32]),
+            entries,
+        )
+        .unwrap();
+        catalog
+    }
+
+    /// The release path catalogues a pinned builder-order route fee-bearing.
+    ///
+    /// The real Hyperliquid pin cannot carry `hyperliquid.builder_order`
+    /// until bloom-petal-hyperliquid#19 is released, so this proves the code
+    /// path with a synthetic pin: the moment the pin lists the route, its
+    /// class is enrolled with the usdc fee asset, and the shared class it is
+    /// pinned alongside stays fee-free.
+    #[test]
+    fn release_enrollment_catalogues_a_pinned_builder_order_route_fee_bearing() {
+        use crate::github_source::{PetalAuthorityRoute, PreinstalledPetal};
+        static ROUTES: &[PetalAuthorityRoute] = &[
+            PetalAuthorityRoute {
+                route_id: "r000008",
+                operation_classes: &["hyperliquid.builder_order"],
+            },
+            PetalAuthorityRoute {
+                route_id: "r000014",
+                operation_classes: &["hyperliquid.agent_action"],
+            },
+        ];
+        // A successor of the real pin: enrollment refuses a package whose
+        // hash is not the lineage baseline unless it advances the sequence
+        // and lists that baseline, and then records the baseline inactive
+        // beside it. Only the synthetic package carries the routes above.
+        const SYNTHETIC_HASH: &str =
+            "abababababababababababababababababababababababababababababababab";
+        // Master's lineage grows whenever a release ships — #224 added
+        // hyperliquid v0.1.7 — so the synthetic successor is derived from
+        // whatever the lineage holds now instead of pinning its length or its
+        // hashes. An earlier version of this test destructured a single
+        // baseline and broke the moment that release landed.
+        let lineage = crate::github_source::release_lineage_predecessors("hyperliquid");
+        let (Some(baseline), Some(newest)) = (lineage.first(), lineage.last()) else {
+            panic!("hyperliquid's lineage must hold at least its baseline");
+        };
+        let predecessors: &'static [&'static str] =
+            Vec::leak(lineage.iter().map(|past| past.hash).collect::<Vec<_>>());
+        let current = crate::github_source::preinstalled_petal("hyperliquid").unwrap();
+        let pin = PreinstalledPetal {
+            expected_hash: Some(SYNTHETIC_HASH),
+            release_sequence: newest.release_sequence + 1,
+            predecessor_package_hashes: predecessors,
+            authority_routes: ROUTES,
+            ..*current
+        };
+        assert_eq!(pin.predecessor_package_hashes.first(), Some(&baseline.hash));
+        assert_eq!(pin.predecessor_package_hashes.len(), lineage.len());
+
+        let catalog = release_catalog_for(&[&pin]);
+        let by_route = catalog
+            .records
+            .iter()
+            .filter_map(|record| {
+                let ProvenanceSubject::Petal {
+                    package_hash,
+                    route,
+                } = &record.subject
+                else {
+                    panic!("release pins only enroll Petal subjects");
+                };
+                (package_hash.as_str() == SYNTHETIC_HASH)
+                    .then_some((route.as_str(), &record.operation_classes))
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(by_route.len(), 2);
+
+        let builder = &by_route["r000008"];
+        assert_eq!(builder.len(), 1);
+        assert_eq!(
+            builder[0].operation_class.as_str(),
+            "hyperliquid.builder_order"
+        );
+        let fee = builder[0]
+            .fee_asset
+            .as_ref()
+            .expect("builder orders are catalogued fee-bearing on the release path");
+        assert_eq!(fee.chain.as_str(), "hyperliquid");
+        assert_eq!(fee.asset, "usdc");
+
+        let shared = &by_route["r000014"];
+        assert_eq!(
+            shared[0].operation_class.as_str(),
+            "hyperliquid.agent_action"
+        );
+        assert!(shared[0].fee_asset.is_none());
+    }
+
+    /// The real pins carry none of the catalogued builder-order classes yet,
+    /// so no release record is fee-bearing today. This fails the moment a pin
+    /// is updated for bloom-petal-hyperliquid#19 or the Polymarket route
+    /// split, which is the reminder to flip that venue over to asserting its
+    /// class is present with the fee asset catalogued above.
+    #[test]
+    fn current_release_pins_carry_no_fee_bearing_class_yet() {
+        let catalog = release_catalog_for(&crate::github_source::release_lineage_petals());
+        let classes = catalog
+            .records
+            .iter()
+            .flat_map(|record| record.operation_classes.iter())
+            .collect::<Vec<_>>();
+        assert!(!classes.is_empty());
+        // Named check first. A pin listing a catalogued class is the only way
+        // this tripwire fires, and it would also trip the blanket assertion
+        // below — which prints nothing useful, so it must not run first.
+        for catalogued in FEE_BEARING_OPERATION_CLASSES {
+            assert!(
+                classes
+                    .iter()
+                    .all(|class| class.operation_class.as_str() != catalogued.operation_class),
+                "the pins now list {}: assert it fee-bearing here",
+                catalogued.operation_class
+            );
+        }
+        assert!(
+            classes.iter().all(|class| class.fee_asset.is_none()),
+            "a pinned class carries a fee asset without being in \
+             FEE_BEARING_OPERATION_CLASSES, so enrollment and the table disagree"
+        );
+    }
+
+    #[cfg(feature = "triad-dev-harness")]
+    fn hyperliquid_derivation_route(classes: &[&str]) -> bloom_petals::package::RouteIndexRecord {
+        bloom_petals::package::RouteIndexRecord {
+            route_id: "r000026".into(),
+            pattern: "agent_sessions/[wallet]/new.json".into(),
+            source_path: "petal/fixture/new.json.wasm".into(),
+            artifact_path: "artifacts/routes/r000026.wasm".into(),
+            artifact_hash: "00".repeat(32),
+            abi: bloom_petals::package::RouteAbi::ComponentBloomRoute010,
+            kind: bloom_petals::package::RouteEntryKind::File,
+            ops: vec![bloom_petals::package::RouteOp::Write],
+            params: vec!["wallet".into()],
+            specificity: [1, 1, 1],
+            install_metadata: bloom_petals::package::InstallRouteMetadata {
+                mode: 0o644,
+                cache_ttl_ms: None,
+                side_effecting_read: false,
+                write_async: true,
+                executable: false,
+                required_caps: vec!["bloom:key.derive".into()],
+                sign_intent: None,
+            },
+            key_derive_operation_classes: classes.iter().map(|c| (*c).to_owned()).collect(),
+            key_derive_allowed_routes: vec!["r000026".into()],
+            key_derive_scope_declared: true,
+            key_derive_allowed_crypto_suites: vec!["secp256k1-keccak256-recoverable".into()],
+            key_derive_maximum_lifetime_ms: Some(1_800_000),
+        }
+    }
+
+    /// Broker denies a `DeclaredFee::None` claim with `FEE_REQUIRED` whenever
+    /// its class is catalogued with a fee asset. Hyperliquid signs cancels,
+    /// leverage updates, and plain orders under `hyperliquid.agent_action`
+    /// with `{"kind":"none"}`, so enrolling that shared class as fee-bearing
+    /// would deny all of them. Pin it to `None` here so the coarse class can
+    /// never be marked fee-bearing again without this failing first.
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
+    fn developer_route_provenance_leaves_the_shared_agent_action_class_fee_free() {
+        let route = hyperliquid_derivation_route(&["hyperliquid.agent_action"]);
+        let records = developer_route_operation_classes(&route).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].operation_class.as_str(),
+            "hyperliquid.agent_action"
+        );
+        assert!(records[0].fee_asset.is_none());
+    }
+
+    /// Builder-bearing orders are the one Hyperliquid claim that declares a
+    /// fee, and they sign under their own class. Broker refuses a
+    /// fee-declaring claim in a fee-free class with `FEE_NOT_ALLOWED`, so
+    /// that class must be enrolled with the usdc fee asset the Petal
+    /// declares, while the shared class it is derived alongside stays free.
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
+    fn developer_route_provenance_marks_only_the_builder_order_class_fee_bearing() {
+        let route = hyperliquid_derivation_route(&[
+            "hyperliquid.agent_action",
+            "hyperliquid.builder_order",
+        ]);
+        let records = developer_route_operation_classes(&route).unwrap();
+        let by_class = records
+            .iter()
+            .map(|class| (class.operation_class.as_str(), class.fee_asset.as_ref()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(by_class.len(), 2);
+        assert!(by_class["hyperliquid.agent_action"].is_none());
+        let fee = by_class["hyperliquid.builder_order"].expect("builder orders are fee-bearing");
+        assert_eq!(fee.chain.as_str(), "hyperliquid");
+        assert_eq!(fee.asset, "usdc");
+    }
+
+    /// A record signed with a *different* fee asset for a class this build does
+    /// catalogue is the same operational risk as clearing one: it matched its
+    /// Petal before the refresh and would not after, with FEE_ASSET_MISMATCH
+    /// instead of FEE_NOT_ALLOWED as the only symptom. So it is reported and
+    /// left alone, never re-signed on a guess.
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
+    fn developer_catalog_refresh_warns_instead_of_replacing_a_differing_fee_asset() {
+        let root = RefreshRoot::enrolled();
+        let catalog_path = &root.catalog_path;
+        let mut stale = root.catalog();
+
+        // A catalogued class, signed with a different asset than the table
+        // derives for it.
+        let builder_class = Token::new(HYPERLIQUID_BUILDER_ORDER_CLASS).unwrap();
+        let mut planted = Vec::new();
+        for record in &mut stale.records {
+            let ProvenanceSubject::Petal {
+                package_hash,
+                route,
+            } = &record.subject
+            else {
+                continue;
+            };
+            if record.publisher == Token::new("bloom-release-pins").unwrap() {
+                continue;
+            }
+            let (package_hash, route) = (package_hash.as_str().to_owned(), route.clone());
+            if let Some(class) = record.operation_classes.first_mut() {
+                class.operation_class = builder_class.clone();
+                class.fee_asset = Some(ProvenanceFeeAsset {
+                    chain: Token::new("polygon").unwrap(),
+                    asset: "pusd".to_owned(),
+                });
+                planted.push((package_hash, route));
+            }
+        }
+        assert!(
+            !planted.is_empty(),
+            "the fixture must enroll a developer record"
+        );
+        let derived = catalogued_fee_asset(builder_class.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            derived.chain.as_str(),
+            "hyperliquid",
+            "must actually differ"
+        );
+        root.write(&stale);
+
+        let lines = root
+            .refresh()
+            .expect("a disagreement is reported, not refused");
+        let message = lines.join("\n");
+        // The warning text names both symptom codes in one literal, so
+        // asserting either one discriminates nothing. What has to hold is the
+        // per-record diagnostic: the route and class to act on, and both
+        // values, so the operator can tell which side is stale.
+        let signed = format!(
+            "{:?}",
+            Some(ProvenanceFeeAsset {
+                chain: Token::new("polygon").unwrap(),
+                asset: "pusd".to_owned(),
+            })
+        );
+        let derives = format!(
+            "{:?}",
+            catalogued_fee_asset(builder_class.as_str()).unwrap()
+        );
+        for (package_hash, route) in &planted {
+            let expected = format!(
+                "route {route} of package {package_hash} class {} is signed with {signed} \
+                 but this build derives {derives}",
+                builder_class.as_str(),
+            );
+            assert!(
+                message.contains(&expected),
+                "the warning must name the record, the signed value and the derived one, \
+                 expected {expected:?} in: {message}"
+            );
+        }
+        // Whole-catalog equality would say nothing here: the refresh does
+        // write, because it rebuilds the release-pins records and re-signs
+        // every record. What must hold is narrower — the class this build
+        // disagrees with keeps exactly the value it was signed with.
+        let after: ProvenanceCatalog =
+            serde_json::from_slice(&fs::read(catalog_path).unwrap()).unwrap();
+        for (package_hash, route) in &planted {
+            let record = after
+                .records
+                .iter()
+                .find(|record| {
+                    matches!(&record.subject, ProvenanceSubject::Petal { package_hash: hash, route: found }
+                        if hash.as_str() == package_hash && found == route)
+                })
+                .expect("the refresh must carry the planted record across");
+            let class = record
+                .operation_classes
+                .iter()
+                .find(|class| class.operation_class == builder_class)
+                .expect("the planted class must survive");
+            assert_eq!(
+                class.fee_asset,
+                Some(ProvenanceFeeAsset {
+                    chain: Token::new("polygon").unwrap(),
+                    asset: "pusd".to_owned(),
+                }),
+                "a record this build disagrees with must be left exactly as signed"
+            );
+        }
+    }
+
+    /// A record with no lineage at all stays governed. The launcher's
+    /// `jq`-injected authority fixture is exactly that, and its hand-written
+    /// `fee_asset` literal has to keep being re-derived. The walk no longer
+    /// reads lineage at all, so this is a regression guard against a future
+    /// filter reintroducing one and silently dropping this record out of
+    /// scope, which nothing else here would notice.
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
+    fn developer_catalog_refresh_governs_a_record_with_no_lineage() {
+        let root = RefreshRoot::enrolled();
+        let mut stale = root.catalog();
+
+        // Strip the lineage and plant a conflict the table disagrees with.
+        let builder_class = Token::new(HYPERLIQUID_BUILDER_ORDER_CLASS).unwrap();
+        let mut planted = 0;
+        for record in &mut stale.records {
+            if !matches!(record.subject, ProvenanceSubject::Petal { .. })
+                || record.publisher == Token::new("bloom-release-pins").unwrap()
+            {
+                continue;
+            }
+            record.petal_lineage = None;
+            if let Some(class) = record.operation_classes.first_mut() {
+                class.operation_class = builder_class.clone();
+                class.fee_asset = Some(ProvenanceFeeAsset {
+                    chain: Token::new("polygon").unwrap(),
+                    asset: "pusd".to_owned(),
+                });
+                planted += 1;
+            }
+        }
+        assert!(planted > 0, "the fixture must enroll a developer record");
+        root.write(&stale);
+
+        let lines = root
+            .refresh()
+            .expect("a disagreement is reported, not refused");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("warning:") && line.contains("is signed with")),
+            "the warning must name the record: {lines:?}"
+        );
+    }
+
+    /// A developer-published Petal record the lineage marks superseded,
+    /// carrying the class the fixture plants. Both discriminators are needed
+    /// to tell one from the inactive predecessor records
+    /// `append_release_petal_provenance` contributes; see the call sites.
+    #[cfg(feature = "triad-dev-harness")]
+    fn planted_predecessor(record: &ProvenanceRecord, builder_class: &Token) -> bool {
+        matches!(record.subject, ProvenanceSubject::Petal { .. })
+            && record.publisher != Token::new("bloom-release-pins").unwrap()
+            && record
+                .petal_lineage
+                .as_ref()
+                .is_some_and(|membership| !membership.active)
+            && record
+                .operation_classes
+                .iter()
+                .any(|class| &class.operation_class == builder_class)
+    }
+
+    /// The refresh prints a command for the operator to paste, so the path in
+    /// it has to survive a shell. The fixture roots are tempdirs with no space
+    /// in them, so the refresh tests above would pass either way.
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
+    fn a_pasted_recovery_path_survives_spaces_and_quotes() {
+        assert_eq!(shell_quoted(Path::new("/tmp/plain")), "'/tmp/plain'");
+        assert_eq!(
+            shell_quoted(Path::new("/Users/a/Application Support/bloom")),
+            "'/Users/a/Application Support/bloom'",
+            "a space must not split the path into two arguments"
+        );
+        assert_eq!(
+            shell_quoted(Path::new("/tmp/it's")),
+            r"'/tmp/it'\''s'",
+            "an embedded quote must close, escape and reopen, not end the argument"
+        );
+    }
+
+    /// A predecessor package stays in the catalog, re-signed inactive. The walk
+    /// does not read lineage, so this record is reached like any other — and
+    /// because it carries a value, it is reported and left exactly as signed.
+    /// Re-enrolment cannot clear it (enrolment only re-derives the package hash
+    /// on disk), so recreating the root is the only remedy, and a warning is
+    /// the right weight for something no claim can reach anyway.
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
+    fn developer_catalog_refresh_never_overwrites_an_inactive_package() {
+        let root = RefreshRoot::enrolled();
+        let catalog_path = &root.catalog_path;
+        let mut stale = root.catalog();
+
+        // The same conflict the replace test plants, on a record enrolment has
+        // since superseded.
+        let builder_class = Token::new(HYPERLIQUID_BUILDER_ORDER_CLASS).unwrap();
+        let mut retired = 0;
+        for record in &mut stale.records {
+            if !matches!(record.subject, ProvenanceSubject::Petal { .. })
+                || record.publisher == Token::new("bloom-release-pins").unwrap()
+            {
+                continue;
+            }
+            let Some(membership) = record.petal_lineage.as_mut() else {
+                continue;
+            };
+            membership.active = false;
+            if let Some(class) = record.operation_classes.first_mut() {
+                class.operation_class = builder_class.clone();
+                class.fee_asset = Some(ProvenanceFeeAsset {
+                    chain: Token::new("polygon").unwrap(),
+                    asset: "pusd".to_owned(),
+                });
+                retired += 1;
+            }
+        }
+        assert!(
+            retired > 0,
+            "the fixture must enroll a record with a lineage"
+        );
+        assert!(
+            catalogued_fee_asset(builder_class.as_str())
+                .unwrap()
+                .is_some(),
+            "the planted class must be one the table catalogues, or this proves nothing"
+        );
+
+        // Captured before the refresh so the check below compares identities
+        // and not just a count. Every consumer of a predecessor keys on
+        // identity: `check_activation` finds one by its subject package hash,
+        // and `carry_private_store` additionally requires the publisher and
+        // `lineage_id` to match before it will carry. A refresh that
+        // re-pointed a subject hash, or rewrote a publisher, would therefore
+        // drop the predecessor for both of them while leaving any count
+        // intact — and `carry_private_store` fails quietly there, returning
+        // "different_lineage" rather than an error. Serialized rather than
+        // cloned because these types are only guaranteed `Serialize` here.
+        let planted = stale
+            .records
+            .iter()
+            .filter(|record| planted_predecessor(record, &builder_class))
+            .map(|record| {
+                (
+                    serde_jcs::to_vec(&record.subject).unwrap(),
+                    serde_jcs::to_vec(&record.publisher).unwrap(),
+                    serde_jcs::to_vec(&record.petal_lineage).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        root.write(&stale);
+
+        let lines = root
+            .refresh()
+            .expect("an inactive package must not refuse the refresh");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("warning:") && line.contains("left as signed")),
+            "an inactive record this build disagrees with must still be reported, \
+             because it is the one case re-enrolment cannot fix: {lines:?}"
+        );
+
+        // And it is left exactly as it was, not healed and not rewritten.
+        let after: ProvenanceCatalog =
+            serde_json::from_slice(&fs::read(catalog_path).unwrap()).unwrap();
+
+        // Still present, and still marked superseded. Asserting only that the
+        // record is unmodified would pass vacuously if the refresh dropped it
+        // or cleared its lineage, and a dropped predecessor fails an install:
+        // `check_activation` needs it, and the private-state carry-forward
+        // refuses to carry without it.
+        //
+        // The filter holds the count to what the fixture planted.
+        // `append_release_petal_provenance` adds inactive predecessor records
+        // of its own, many more than the fixture plants, so a bare existence
+        // probe would pass on those alone — whereas an unfiltered count fails
+        // loudly rather than quietly. Either discriminator suffices today,
+        // since no release route declares the builder class; they are kept as
+        // a pair so adding one later cannot silently widen this count.
+        let carried = after
+            .records
+            .iter()
+            .filter(|record| planted_predecessor(record, &builder_class))
+            .count();
+        assert_eq!(
+            carried, retired,
+            "every inactive record the fixture planted must survive the refresh, \
+             still carrying the lineage that marks it superseded"
+        );
+
+        for (subject, publisher, lineage) in &planted {
+            let record = after
+                .records
+                .iter()
+                .find(|record| &serde_jcs::to_vec(&record.subject).unwrap() == subject)
+                .expect(
+                    "the refresh must carry every planted predecessor across \
+                     under its own subject, or `check_activation` fails the install",
+                );
+            assert_eq!(
+                &serde_jcs::to_vec(&record.publisher).unwrap(),
+                publisher,
+                "a carried predecessor must keep its publisher, or \
+                 `carry_private_store` stops recognising it and silently \
+                 declines to carry the Petal's private state"
+            );
+            assert_eq!(
+                &serde_jcs::to_vec(&record.petal_lineage).unwrap(),
+                lineage,
+                "a carried predecessor must keep its lineage, `lineage_id` included"
+            );
+        }
+
+        for record in &after.records {
+            let Some(membership) = &record.petal_lineage else {
+                continue;
+            };
+            if membership.active {
+                continue;
+            }
+            for class in &record.operation_classes {
+                if class.operation_class == builder_class {
+                    assert_eq!(
+                        class.fee_asset,
+                        Some(ProvenanceFeeAsset {
+                            chain: Token::new("polygon").unwrap(),
+                            asset: "pusd".to_owned(),
+                        }),
+                        "an inactive record must be carried across untouched"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Clearing a fee asset for a class this build does not catalogue would
+    /// deny that Petal's claims with FEE_NOT_ALLOWED, so the refresh reports it
+    /// and names the recovery rather than rewriting the record.
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
+    fn developer_catalog_refresh_warns_instead_of_clearing_an_uncatalogued_fee_asset() {
+        let root = RefreshRoot::enrolled();
+        let output = &root.config;
+        let catalog_path = &root.catalog_path;
+        let mut stale = root.catalog();
+
+        // A fee asset for a class the table does not know: what an older
+        // binary, or a hand edit, could leave behind.
+        let mut planted = Vec::new();
+        for record in &mut stale.records {
+            let ProvenanceSubject::Petal {
+                package_hash,
+                route,
+            } = &record.subject
+            else {
+                continue;
+            };
+            if record.publisher == Token::new("bloom-release-pins").unwrap() {
+                continue;
+            }
+            let (package_hash, route) = (package_hash.as_str().to_owned(), route.clone());
+            if let Some(class) = record.operation_classes.first_mut() {
+                assert!(
+                    catalogued_fee_asset(class.operation_class.as_str())
+                        .unwrap()
+                        .is_none(),
+                    "the fixture class must be uncatalogued for this test to mean anything"
+                );
+                class.fee_asset = Some(ProvenanceFeeAsset {
+                    chain: Token::new("hyperliquid").unwrap(),
+                    asset: "usdc".to_owned(),
+                });
+                planted.push((package_hash, route, class.operation_class.clone()));
+            }
+        }
+        assert!(
+            !planted.is_empty(),
+            "the fixture must enroll a developer record"
+        );
+        root.write(&stale);
+
+        let lines = root
+            .refresh()
+            .expect("a disagreement is reported, not refused");
+        let message = lines.join("\n");
+        // Both symptom codes live in one literal, so neither one on its own
+        // says which conflict fired. The diagnostic does: a clear derives
+        // None, where a replace derives Some.
+        let signed = format!(
+            "{:?}",
+            Some(ProvenanceFeeAsset {
+                chain: Token::new("hyperliquid").unwrap(),
+                asset: "usdc".to_owned(),
+            })
+        );
+        for (package_hash, route, class) in &planted {
+            let expected = format!(
+                "route {route} of package {package_hash} class {} is signed with {signed} \
+                 but this build derives None",
+                class.as_str(),
+            );
+            assert!(
+                message.contains(&expected),
+                "the warning must name the record and show the value that was kept, \
+                 expected {expected:?} in: {message}"
+            );
+        }
+        assert!(
+            message.contains("FEE_BEARING_OPERATION_CLASSES"),
+            "the warning must name the recovery that keeps the claims working: {message}"
+        );
+        assert!(
+            message.contains("re-enrol that Petal to re-derive its records from the table"),
+            "the warning must name the targeted recovery, which does re-derive the record: \
+             {message}"
+        );
+        assert!(
+            message.contains("left as signed"),
+            "the warning must say the record was kept, because the operator is told to go \
+             and change one of the two sides: {message}"
+        );
+        // Naming the remedy is not giving it. The subcommand that fixes this is
+        // `hide = true`, so `--help` does not list it, and the launcher does
+        // not run it: this message is the operator's only output.
+        for fragment in [
+            "cargo build -p bloom --no-default-features --features mount,triad-dev-harness",
+            "target/debug/bloom init triad-enroll-developer-petal-provenance",
+            "<petal-package-dir>",
+        ] {
+            assert!(
+                message.contains(fragment),
+                "the warning must carry a runnable recovery command, missing \
+                 {fragment:?} in: {message}"
+            );
+        }
+        assert!(
+            message.contains(&format!("'{}'", output.display())),
+            "the command must name this root's own config directory, shell-quoted so a \
+             path with a space in it still runs: {message}"
+        );
+
+        // And it must leave the record alone rather than half-rewriting it.
+        // Not whole-catalog equality: the refresh does write, because it
+        // rebuilds the release-pins records and re-signs every record. The
+        // narrower claim is the one that matters.
+        let after: ProvenanceCatalog =
+            serde_json::from_slice(&fs::read(catalog_path).unwrap()).unwrap();
+        for (package_hash, route, class_name) in &planted {
+            let record = after
+                .records
+                .iter()
+                .find(|record| {
+                    matches!(&record.subject, ProvenanceSubject::Petal { package_hash: hash, route: found }
+                        if hash.as_str() == package_hash && found == route)
+                })
+                .expect("the refresh must carry the planted record across");
+            let class = record
+                .operation_classes
+                .iter()
+                .find(|class| &class.operation_class == class_name)
+                .expect("the planted class must survive");
+            assert_eq!(
+                class.fee_asset,
+                Some(ProvenanceFeeAsset {
+                    chain: Token::new("hyperliquid").unwrap(),
+                    asset: "usdc".to_owned(),
+                }),
+                "a class this build does not catalogue must keep the value it was signed \
+                 with, or its claims start failing FEE_NOT_ALLOWED"
+            );
+        }
+    }
+
+    /// A developer root enrolled before a class was catalogued carries its
+    /// records across the refresh verbatim. Without re-deriving the fee asset
+    /// the stale `None` survives, re-signed and valid, and every builder order
+    /// is denied FEE_NOT_ALLOWED on a Bloom that looks correct.
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
+    fn developer_catalog_refresh_rederives_a_stale_fee_asset() {
+        const LEGACY_COMPONENT: &str = "bloom-legacy-component";
+        let root = RefreshRoot::enrolled();
+        let catalog_path = &root.catalog_path;
+        let read = || -> ProvenanceCatalog {
+            serde_json::from_slice(&fs::read(catalog_path).unwrap()).unwrap()
+        };
+
+        // What an older binary wrote: the fee-bearing class, enrolled fee-free
+        // because no table existed to catalogue it.
+        let builder_class = Token::new(HYPERLIQUID_BUILDER_ORDER_CLASS).unwrap();
+        let mut stale = read();
+        let mut rewritten = 0;
+        for record in &mut stale.records {
+            if matches!(record.subject, ProvenanceSubject::Petal { .. })
+                && record.publisher != Token::new("bloom-release-pins").unwrap()
+                && let Some(class) = record.operation_classes.first_mut()
+            {
+                class.operation_class = builder_class.clone();
+                class.fee_asset = None;
+                rewritten += 1;
+            }
+        }
+        assert!(rewritten > 0, "the fixture must enroll a developer record");
+
+        // A System subject the current template does not list, so the refresh
+        // carries it instead of replacing it from the template.
+        let mut renamed = 0;
+        for record in &mut stale.records {
+            // The fee asset lives in `operation_classes`; the subject's own
+            // `operation_class` is a different token (`solana.transfer.confirm`).
+            if record
+                .operation_classes
+                .iter()
+                .any(|class| class.operation_class.as_str() == "solana.native-transfer")
+                && let ProvenanceSubject::System { component_id, .. } = &mut record.subject
+            {
+                *component_id = Token::new(LEGACY_COMPONENT).unwrap();
+                renamed += 1;
+            }
+        }
+        assert_eq!(renamed, 1, "the template must ship one native-transfer row");
+        root.write(&stale);
+
+        let notes = root.refresh().unwrap();
+        assert_eq!(
+            notes.len(),
+            rewritten,
+            "a heal that was written must be announced, once per record: {notes:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .all(|note| note.contains(HYPERLIQUID_BUILDER_ORDER_CLASS)),
+            "a note must name the class whose fee asset it re-derived: {notes:?}"
+        );
+        let refreshed = read();
+        refreshed.validate_shape().unwrap();
+
+        let release_publisher = Token::new("bloom-release-pins").unwrap();
+        let mut healed = 0;
+        for record in &refreshed.records {
+            // Release records are rebuilt from the pins, not carried, so they
+            // are not what this counts. Including them would make the test
+            // fail the moment a pin lists a catalogued class, which is exactly
+            // what releasing bloom-petal-hyperliquid#19 does.
+            if record.publisher == release_publisher {
+                continue;
+            }
+            for class in &record.operation_classes {
+                if class.operation_class == builder_class {
+                    let fee = class
+                        .fee_asset
+                        .as_ref()
+                        .expect("the refresh must re-derive a catalogued fee asset");
+                    assert_eq!(fee.chain.as_str(), "hyperliquid");
+                    assert_eq!(fee.asset, "usdc");
+                    healed += 1;
+                }
+            }
+        }
+        assert_eq!(healed, rewritten, "every stale record must be re-derived");
+
+        // The carve-out the Petal guard provides: a System subject this
+        // template no longer lists is carried over like a developer record,
+        // and must keep the fee asset it was signed with rather than being
+        // re-derived from a table that does not govern it. Asserting the
+        // template's own System row proves nothing — it is re-added verbatim
+        // on every refresh whatever this loop does.
+        let legacy_fee = refreshed
+            .records
+            .iter()
+            .filter(|record| matches!(&record.subject, ProvenanceSubject::System { component_id, .. } if component_id.as_str() == LEGACY_COMPONENT))
+            .flat_map(|record| &record.operation_classes)
+            .find(|class| class.operation_class.as_str() == "solana.native-transfer")
+            .and_then(|class| class.fee_asset.as_ref())
+            .expect("a carried legacy System record must survive the refresh");
+        assert_eq!(legacy_fee.chain.as_str(), "solana");
+        assert_eq!(legacy_fee.asset, "native");
+    }
+
+    /// One record, both halves: a catalogued class with no value, and an
+    /// uncatalogued class carrying one. The heal must land and the
+    /// disagreement must be reported, in the same pass.
+    ///
+    /// This is the case the earlier refusing design got wrong in both
+    /// directions. It walked the whole catalog before deciding, so the heal was
+    /// always reached and always thrown away — and the refusal then told the
+    /// operator to read notes describing a change that had not been written.
+    /// Neither half happened: a root needing a legitimate heal on one class
+    /// while holding a disagreement on another got nothing, and no launch.
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
+    fn a_disagreement_warns_without_blocking_the_heal_beside_it() {
+        let root = RefreshRoot::enrolled();
+        let catalog_path = &root.catalog_path;
+        let mut stale = root.catalog();
+
+        // One record carrying both halves: a catalogued class with no value,
+        // which the walk heals in memory, and an uncatalogued class carrying
+        // one, which makes the walk refuse. The refusal lands only after every
+        // record has been walked, so the heal is always reached, and always
+        // thrown away.
+        let builder_class = Token::new(HYPERLIQUID_BUILDER_ORDER_CLASS).unwrap();
+        let mut planted = 0;
+        let mut uncatalogued = None;
+        for record in &mut stale.records {
+            if !matches!(record.subject, ProvenanceSubject::Petal { .. })
+                || record.publisher == Token::new("bloom-release-pins").unwrap()
+            {
+                continue;
+            }
+            let Some(class) = record.operation_classes.first_mut() else {
+                continue;
+            };
+            assert!(
+                catalogued_fee_asset(class.operation_class.as_str())
+                    .unwrap()
+                    .is_none(),
+                "the fixture class must be uncatalogued for the conflict half to bite"
+            );
+            uncatalogued = Some(class.operation_class.clone());
+            class.fee_asset = Some(ProvenanceFeeAsset {
+                chain: Token::new("hyperliquid").unwrap(),
+                asset: "usdc".to_owned(),
+            });
+            record.operation_classes.insert(
+                0,
+                ProvenanceOperationClass {
+                    operation_class: builder_class.clone(),
+                    fee_asset: None,
+                },
+            );
+            planted += 1;
+        }
+        assert!(planted > 0, "the fixture must enroll a developer record");
+        let uncatalogued = uncatalogued.expect("the fixture must carry an uncatalogued class");
+        root.write(&stale);
+        let before = fs::read(catalog_path).unwrap();
+
+        let lines = root
+            .refresh()
+            .expect("a disagreement on one class must not block the heal on another");
+
+        // Both halves, and each announced as what it is.
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("note:")
+                    && line.contains(HYPERLIQUID_BUILDER_ORDER_CLASS)),
+            "the heal must be announced as a saved change: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.starts_with("warning:")
+                && line.contains(uncatalogued.as_str())
+                && line.contains("left as signed")),
+            "the disagreement must be announced as one, not as a change: {lines:?}"
+        );
+
+        // A note must describe something written, so the catalog has to have
+        // moved — the half the refusing design announced and then discarded.
+        assert_ne!(
+            fs::read(catalog_path).unwrap(),
+            before,
+            "the heal must reach disk, not just the notes"
+        );
+        let after: ProvenanceCatalog =
+            serde_json::from_slice(&fs::read(catalog_path).unwrap()).unwrap();
+        let mut healed = 0;
+        let mut kept = 0;
+        for record in &after.records {
+            for class in &record.operation_classes {
+                if class.operation_class == builder_class {
+                    assert_eq!(
+                        class.fee_asset,
+                        catalogued_fee_asset(builder_class.as_str()).unwrap(),
+                        "the catalogued class must be healed to the table's value"
+                    );
+                    healed += 1;
+                } else if class.operation_class == uncatalogued {
+                    assert_eq!(
+                        class.fee_asset,
+                        Some(ProvenanceFeeAsset {
+                            chain: Token::new("hyperliquid").unwrap(),
+                            asset: "usdc".to_owned(),
+                        }),
+                        "the class this build does not catalogue must keep what it was \
+                         signed with, or its claims start failing FEE_NOT_ALLOWED"
+                    );
+                    kept += 1;
+                }
+            }
+        }
+        assert_eq!(healed, planted, "every planted heal must have landed");
+        assert_eq!(
+            kept, planted,
+            "every planted disagreement must have been kept"
+        );
     }
 
     #[cfg(feature = "triad-dev-harness")]
@@ -1507,8 +2806,12 @@ mod tests {
         .unwrap();
         rewrite_private_json(&catalog_path, &serde_json::to_value(&stale).unwrap()).unwrap();
 
-        let template = template_dir().join("provenance-catalog.unsigned.json");
-        refresh_developer_provenance_catalog(&template, &output, owner).unwrap();
+        refresh_developer_provenance_catalog(
+            &template_dir().join("provenance-catalog.unsigned.json"),
+            &output,
+            owner,
+        )
+        .unwrap();
         let refreshed = read();
         refreshed.validate_shape().unwrap();
         assert_eq!(developer_records(&refreshed), enrolled);
@@ -1542,7 +2845,12 @@ mod tests {
         // An up-to-date catalog is left untouched.
         let before = fs::read(&catalog_path).unwrap();
         let inode = fs::metadata(&catalog_path).unwrap().ino();
-        refresh_developer_provenance_catalog(&template, &output, owner).unwrap();
+        refresh_developer_provenance_catalog(
+            &template_dir().join("provenance-catalog.unsigned.json"),
+            &output,
+            owner,
+        )
+        .unwrap();
         assert_eq!(fs::read(&catalog_path).unwrap(), before);
         assert_eq!(fs::metadata(&catalog_path).unwrap().ino(), inode);
     }
@@ -1917,6 +3225,29 @@ mod tests {
                 petal_hashes.contains(&expected),
                 "missing {name} release provenance"
             );
+        }
+        // The release-pins path must agree with the developer-harness path:
+        // the shared classes stay fee-free, because Broker denies every
+        // `DeclaredFee::None` claim in a fee-bearing class with
+        // `FEE_REQUIRED`. Assert it over the shared Hyperliquid class and
+        // Polymarket's relayer class explicitly. The fee-bearing
+        // `hyperliquid.builder_order` class is asserted here only once the
+        // Hyperliquid release pin carries its routes; until then the catalog
+        // cannot contain it and an assertion would be vacuous. System records
+        // are out of scope: a native Solana transfer always pays a network
+        // fee, so its template class names one.
+        let all_classes = catalog
+            .records
+            .iter()
+            .flat_map(|record| record.operation_classes.iter())
+            .collect::<Vec<_>>();
+        for class in ["hyperliquid.agent_action", "polymarket.relayer_batch"] {
+            let matching = all_classes
+                .iter()
+                .filter(|entry| entry.operation_class.as_str() == class)
+                .collect::<Vec<_>>();
+            assert!(!matching.is_empty(), "{class} is absent from the catalog");
+            assert!(matching.iter().all(|entry| entry.fee_asset.is_none()));
         }
         for record in catalog.records {
             let mut unsigned = record.clone();

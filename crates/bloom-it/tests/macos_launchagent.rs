@@ -440,23 +440,96 @@ fn macos_conformance_workflows_consume_unified_candidates() {
     let broker_commit = pinned_revision("broker_commit");
     let signer_commit = pinned_revision("signer_commit");
 
+    // Every sibling revision a workflow pins, with the line it is on. A
+    // `contains` check was not enough: these workflows name each sibling
+    // several times over — a `workflow_dispatch` input default per job, a
+    // `*_REF` env, and a checkout `ref` — so one copy matching says nothing
+    // about the rest, and a half-bumped workflow passed. Reporting the line
+    // matters as much: the bare `assert!(source.contains(broker_commit))` this
+    // replaces failed with no file, no revision and no remedy.
+    //
+    // Action pins (`uses: owner/repo@<sha>`) are forty hex too, and are
+    // excluded by the `@` before them. They track the action, not the triad.
+    fn pinned_sibling_revisions(source: &str) -> Vec<(usize, String)> {
+        let lowercase_hex = |byte: u8| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase();
+        let mut found = Vec::new();
+        for (index, line) in source.lines().enumerate() {
+            let bytes = line.as_bytes();
+            let mut start = 0;
+            while start < bytes.len() {
+                if !lowercase_hex(bytes[start]) {
+                    start += 1;
+                    continue;
+                }
+                let mut end = start;
+                while end < bytes.len() && lowercase_hex(bytes[end]) {
+                    end += 1;
+                }
+                if end - start == 40 && (start == 0 || bytes[start - 1] != b'@') {
+                    found.push((index + 1, line[start..end].to_owned()));
+                }
+                start = end;
+            }
+        }
+        found
+    }
+
+    let pins_agree = |workflow: &str, source: &str| {
+        let revisions = pinned_sibling_revisions(source);
+        for (line, revision) in &revisions {
+            assert!(
+                revision == broker_commit || revision == signer_commit,
+                "{workflow}:{line} pins sibling revision {revision}, which is neither \
+                 broker_commit {broker_commit} nor signer_commit {signer_commit} from \
+                 packaging/triad/release/compatibility-v1.toml. Every copy moves with \
+                 that file, and this workflow carries several."
+            );
+        }
+        for (key, expected) in [
+            ("broker_commit", broker_commit),
+            ("signer_commit", signer_commit),
+        ] {
+            assert!(
+                revisions.iter().any(|(_, revision)| revision == expected),
+                "{workflow} pins no copy of {key} {expected} from \
+                 packaging/triad/release/compatibility-v1.toml"
+            );
+        }
+        revisions.len()
+    };
+
     for workflow in [
         "macos-unix-conformance.yml",
         "macos-two-login-conformance.yml",
     ] {
         let source =
             fs::read_to_string(workspace().join(".github/workflows").join(workflow)).unwrap();
-        assert!(source.contains("packaging/triad/release.sh build macos"));
-        assert!(source.contains("bloom-triad-test-unclaimed.tar.gz"));
-        assert!(source.contains("Reject mutable sibling refs"));
-        assert!(source.contains("^[0-9a-f]{40}$"));
-        assert!(source.contains(broker_commit));
-        assert!(source.contains(signer_commit));
+        for expected in [
+            "packaging/triad/release.sh build macos",
+            "bloom-triad-test-unclaimed.tar.gz",
+            "Reject mutable sibling refs",
+            "^[0-9a-f]{40}$",
+        ] {
+            assert!(
+                source.contains(expected),
+                "{workflow} must still contain {expected:?}"
+            );
+        }
+        assert!(
+            pins_agree(workflow, &source) >= 4,
+            "{workflow} must pin both siblings in both the input default and the \
+             checkout ref; finding fewer means a pin was dropped rather than moved"
+        );
     }
 
     let ci = fs::read_to_string(workspace().join(".github/workflows/ci.yml")).unwrap();
-    assert!(ci.contains(&format!("broker_ref: {broker_commit}")));
-    assert!(ci.contains(&format!("signer_ref: {signer_commit}")));
+    pins_agree("ci.yml", &ci);
+    for (key, expected) in [("broker_ref", broker_commit), ("signer_ref", signer_commit)] {
+        assert!(
+            ci.contains(&format!("{key}: {expected}")),
+            "ci.yml must pass {key}: {expected} to the conformance workflows"
+        );
+    }
 
     // These assertions read both conformance workflows, so editing either
     // must trigger CI, which runs this binary on Linux. The Unix-principal
