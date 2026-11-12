@@ -27,8 +27,12 @@ export function resolveCli(cli, env = process.env) {
   throw new Error(`${cli} CLI not found on PATH outside node_modules/.bin; set ${BIN_OVERRIDES[cli]}`);
 }
 
-function runCommand(command, args, input, cwd, timeoutMs, signal) {
+export function runCommand(command, args, input, cwd, timeoutMs, signal) {
+  const started = Date.now();
+  let timedOut = false;
   return new Promise((resolve, reject) => {
+    let timer;
+    let forceTimer;
     const child = execFile(
       command,
       args,
@@ -37,26 +41,44 @@ function runCommand(command, args, input, cwd, timeoutMs, signal) {
         env: process.env,
         maxBuffer: 20 * 1024 * 1024,
         signal,
-        timeout: timeoutMs,
       },
       (error, stdout, stderr) => {
+        clearTimeout(timer);
+        clearTimeout(forceTimer);
+        const diagnostics = {
+          exitCode: error ? (typeof error.code === 'number' ? error.code : null) : 0,
+          code: typeof error?.code === 'string' ? error.code : null,
+          signal: error?.signal ?? null,
+          killed: error?.killed ?? false,
+          elapsedMs: Date.now() - started,
+          timeoutMs,
+          timedOut,
+        };
         if (error) {
-          error.stderr = stderr;
+          Object.assign(error, { stderr, stdout, diagnostics });
           reject(error);
           return;
         }
-        resolve({ stderr, stdout });
+        resolve({ stderr, stdout, diagnostics });
       },
     );
 
+    timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGTERM');
+      forceTimer = setTimeout(() => child.kill('SIGKILL'), 5000);
+    }, timeoutMs);
+    child.stdin.on('error', () => {}); // The child may exit before consuming input.
     child.stdin.end(input);
   });
 }
 
 function errorMessage(error) {
-  const stderr = typeof error?.stderr === 'string' ? error.stderr.trim() : '';
-  const detail = stderr ? `: ${stderr.slice(-2000)}` : '';
-  return `${error?.message ?? String(error)}${detail}`;
+  const detail = [error?.stderr, error?.stdout]
+    .filter((value) => typeof value === 'string' && value.trim())
+    .map((value) => value.trim().slice(-2000)).join('\n');
+  const status = error?.diagnostics ? JSON.stringify(error.diagnostics) : String(error?.message ?? error);
+  return `${status}${detail ? `: ${detail}` : ''}`;
 }
 
 export default class AgentCliProvider {
@@ -104,7 +126,7 @@ export default class AgentCliProvider {
           args.push('--model', model);
         }
 
-        const { stdout } = await runCommand(
+        const { stdout, diagnostics } = await runCommand(
           bin,
           args,
           prompt,
@@ -114,7 +136,7 @@ export default class AgentCliProvider {
         );
         return {
           output: stdout.trim(),
-          metadata: { cli, bin, model: model || 'default' },
+          metadata: { cli, bin, model: model || 'default', subprocess: diagnostics },
         };
       }
 
@@ -139,7 +161,7 @@ export default class AgentCliProvider {
       }
       args.push('-');
 
-      await runCommand(
+      const { diagnostics } = await runCommand(
         bin,
         args,
         prompt,
@@ -149,10 +171,13 @@ export default class AgentCliProvider {
       );
       return {
         output: (await readFile(outputPath, 'utf8')).trim(),
-        metadata: { cli, bin, model: model || 'default' },
+        metadata: { cli, bin, model: model || 'default', subprocess: diagnostics },
       };
     } catch (error) {
-      return { error: `${cli} evaluation failed${model ? ` (${model})` : ''}: ${errorMessage(error)}` };
+      return {
+        error: `${cli} evaluation failed${model ? ` (${model})` : ''}: ${errorMessage(error)}`,
+        metadata: { cli, bin, model: model || 'default', subprocess: error.diagnostics ?? null },
+      };
     } finally {
       await rm(workdir, { force: true, recursive: true });
     }

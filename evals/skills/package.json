@@ -10,7 +10,8 @@
     "eval": "PROMPTFOO_DISABLE_TELEMETRY=1 promptfoo eval --no-cache --repeat 5 --config promptfooconfig.ts --output results/latest.json",
     "eval:models": "BLOOM_EVAL_MODEL_SUITE=expanded PROMPTFOO_DISABLE_TELEMETRY=1 promptfoo eval --no-cache --repeat 5 --config promptfooconfig.ts --output results/latest-models.json",
     "eval:claude": "BLOOM_EVAL_MODEL_SUITE=claude-revisions BLOOM_EVAL_LOCAL=claude PROMPTFOO_DISABLE_TELEMETRY=1 promptfoo eval --no-cache --repeat 5 --config promptfooconfig.ts --output results/latest-claude.json",
-    "check": "node providers/agent-cli.test.mjs && node assertions/onboarding-fixtures.cjs && node assertions/tempdir-fixtures.cjs && PROMPTFOO_DISABLE_TELEMETRY=1 promptfoo validate config --config promptfooconfig.ts && BLOOM_EVAL_MODEL_SUITE=expanded PROMPTFOO_DISABLE_TELEMETRY=1 promptfoo validate config --config promptfooconfig.ts && BLOOM_EVAL_MODEL_SUITE=claude-revisions BLOOM_EVAL_LOCAL=claude PROMPTFOO_DISABLE_TELEMETRY=1 promptfoo validate config --config promptfooconfig.ts",
+    "check": "node providers/agent-cli.test.mjs && node providers/retry-errors.test.mjs && node assertions/onboarding-fixtures.cjs && node assertions/tempdir-fixtures.cjs && PROMPTFOO_DISABLE_TELEMETRY=1 promptfoo validate config --config promptfooconfig.ts && BLOOM_EVAL_MODEL_SUITE=expanded PROMPTFOO_DISABLE_TELEMETRY=1 promptfoo validate config --config promptfooconfig.ts && BLOOM_EVAL_MODEL_SUITE=claude-revisions BLOOM_EVAL_LOCAL=claude PROMPTFOO_DISABLE_TELEMETRY=1 promptfoo validate config --config promptfooconfig.ts",
+    "eval:retry-errors": "node providers/retry-errors.mjs",
     "view": "PROMPTFOO_DISABLE_TELEMETRY=1 promptfoo view --port 15500 --no"
   },
   "devDependencies": {

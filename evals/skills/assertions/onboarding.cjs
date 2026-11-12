@@ -70,6 +70,11 @@ const ROOT_REVIEW_RUN_PATTERN = /(?<![\w/.-])runuser\s+-u\s+"\$login_user"\s+--\
 // unrecognized, and every recognized wrapper must set HOME and TMPDIR itself.
 const ROOT_ENV_SOURCE = String.raw`runuser\s+-u\s+(?:"\$login_user"|bloom)\s+--\s+env\s+HOME=(?:"\$login_home"|/home/bloom)\s+TMPDIR=(?:/tmp|"/tmp"|'/tmp')(?:\s+(?:USER|LOGNAME|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS)=(?:"[^"\n]*"|'[^'\n]*'|[^\s'";]+))*\s+`;
 function rootReviewSequence(text) {
+  // The response may refer to the helper already defined by the attached skill.
+  // An explicit redefinition must validate on its own; never replace it.
+  if (/^\s*as_bloom\s+/m.test(text) && !/(?:function\s+as_bloom\b|\bas_bloom\s*\()/.test(text)) {
+    text = INSTALL_REFERENCE.match(/^as_bloom\(\) \{\n[\s\S]*?^\}/m)[0] + '\n' + text;
+  }
   const commands = [text];
   let stagedAsUser = runsAsCommand(text, ROOT_REVIEW_RUN_PATTERN);
   const direct = new RegExp(`${ROOT_ENV_SOURCE}(?:/bin/)?(?:sh|bash)\\s+(?:"\\$review_dir/setup\\.sh"|'REVIEW_DIR/setup\\.sh')`, 'gm');
@@ -91,6 +96,22 @@ function rootReviewSequence(text) {
       commands.push(command);
       stagedAsUser ||= runsAsCommand(command, REVIEW_RUN_PATTERN);
     }
+  }
+  const argvHelper = new RegExp(`^\\s*([A-Za-z_]\\w*)\\(\\)\\s*\\{\\s*${ROOT_ENV_SOURCE}"\\$@";?\\s*\\}`, 'gm');
+  for (const match of text.matchAll(argvHelper)) {
+    const call = new RegExp(`^\\s*${match[1]}\\s+([^\\n]+)`, 'gm');
+    for (const invocation of text.matchAll(call)) {
+      commands.push(invocation[1]);
+      stagedAsUser ||= runsAsCommand(invocation[1], REVIEW_RUN_PATTERN);
+    }
+  }
+  // A directory assigned inside a child shell does not become a parent-shell
+  // variable. Staging inside that same child is valid; using it outside needs
+  // an explicit parent capture (the documented argv helper does this).
+  const outsideBlocks = text.replace(block, '');
+  const hasParentCapture = /^\s*review_dir=["']?\$\([^\n]+/m.test(outsideBlocks);
+  for (const match of text.matchAll(block)) {
+    if (/\breview_dir=/.test(match[1]) && !runsAsCommand(match[1], REVIEW_RUN_PATTERN) && !hasParentCapture) return false;
   }
   const expanded = commands.join('\n');
   return stagedAsUser && runsAsCommand(expanded, REVIEW_FETCH_PATTERN)
@@ -258,7 +279,9 @@ function component(pass, reason, name) {
 function evaluateOnboarding(output, context = {}) {
   const text = (typeof output === 'string' ? output.trim() : JSON.stringify(output)).replace(/[‘’]/g, "'");
   const isRoot = context.vars?.platform === 'linux-root';
-  const proceeds = proceedsWithSetup(text);
+  const proceeds = proceedsWithSetup(text) || (isRoot
+    && /(?:\bi(?:'ll| will| am going to) (?:create|follow|run|reuse|preserve)\b|\bi (?:run|execute|download)\b)/i.test(text)
+    && /\b(?:Bloom|setup|install|upgrade)\b/i.test(text));
   // Piping the remote script into a shell is never an accepted path now, so the
   // reviewed fetch/inspect/run sequence is required unconditionally.
   const usesInstaller = (isRoot ? rootReviewSequence(text)
@@ -347,13 +370,14 @@ function evaluateOnboarding(output, context = {}) {
   ];
   if (isRoot) {
     const upgrade = context.vars?.scenario === 'upgrade';
-    const account = /non-root|\b(?:id|useradd)\b[^\n]*\bbloom\b/i.test(text) && /(?:account|enrollment)/i.test(text)
+    const account = /non-root|\b(?:id|useradd)\b[^\n]*\bbloom\b|(?:verify|confirm|check|select|pick)[^!\n]{0,200}(?:enrollment|login_uid)|enrollment[^!\n]{0,200}(?:\bid\b|getent)/i.test(text) && /(?:account|enrollment)/i.test(text)
       && !/\bbloom-install\s+'[^']*'\s+'0'\s/.test(text)
-      && (upgrade ? /(?:reuse|retain|preserve)[^.!?\n]{0,80}(?:account|enrollment)/i.test(text)
+      && (upgrade ? /(?:reus(?:e|es|ing)|retain(?:s|ed|ing)?|preserv(?:e|es|ed|ing)|keep(?:s|ing)?|using (?:the )?existing)[^.!?\n]{0,80}(?:account|enrollment|it\b)/i.test(text)
         : /(?:creat|dedicated)[^.!?\n]{0,80}(?:account|bloom)/i.test(text));
-    const readiness = /(?:systemd|user manager|user@\$login_uid)/i.test(text)
-      && /\b(?:refresh|restart)\b/i.test(text) && /\bgroups?\b/i.test(text)
-      && /(?:VFS|AGENTS\.md)/i.test(text) && /audit/i.test(text);
+    const managerRefresh = /(?:refresh|restart)[^!\n]{0,100}(?:user manager|systemd[^!\n]{0,40}manager|user@[^\s`]*\.service)/i.test(text)
+      || /(?:user manager|systemd[^!\n]{0,40}manager)[^!\n]{0,100}(?:refresh|restart)/i.test(text)
+      || /systemctl\s+restart\s+["']?user@[^\s"']+\.service/.test(text);
+    const readiness = managerRefresh && /(?:VFS|AGENTS\.md)/i.test(text) && /audit/i.test(text);
     componentResults.push(
       component(account, 'Root setup must select a non-root account and preserve existing enrollments on upgrade', 'root account selection'),
       component(readiness, 'Root setup must cover user-manager group refresh and VFS/audit verification', 'headless readiness'),

@@ -100,17 +100,15 @@ with its home, from `/tmp`. Explicitly set `TMPDIR=/tmp` inside each
 `HOME` alone does not make a root-private scratch directory writable. Both
 review-directory creation and staging use `TMPDIR`. Create the review directory
 as that account too.
-For each shell command in that sequence, and all later CLI/VFS checks, use:
+Define this argument-forwarding helper in the root shell, and use it for
+staging and all later CLI/VFS checks. Keep the selected account values available
+in each subsequent tool call. Pass commands and arguments separately; never
+store a shell command in a variable or use `eval` to invoke it.
 
 ```sh
-runuser -u "$login_user" -- env HOME="$login_home" TMPDIR=/tmp USER="$login_user" LOGNAME="$login_user" XDG_RUNTIME_DIR="/run/user/$login_uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$login_uid/bus" /bin/sh -c 'COMMAND'
-```
-
-`COMMAND` stands for the reviewed command, with appropriate shell quoting.
-After inspection, execute the exact staged setup script directly as:
-
-```sh
-runuser -u "$login_user" -- env HOME="$login_home" TMPDIR=/tmp sh "$review_dir/setup.sh"
+as_bloom() {
+  runuser -u "$login_user" -- env HOME="$login_home" TMPDIR=/tmp USER="$login_user" LOGNAME="$login_user" XDG_RUNTIME_DIR="/run/user/$login_uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$login_uid/bus" "$@"
+}
 ```
 
 Do not evaluate staging output. Capture the non-root staging values for the root
@@ -138,6 +136,21 @@ installation can restart it and invalidate the current working directory.
 ```sh
 skill_url=${BLOOM_SKILL_URL:-https://bloom.directory/SKILL.md}
 setup_url=${skill_url%/SKILL.md}/scripts/setup.sh
+```
+
+For Linux root, use the helper above. Capture `review_dir` in the parent root
+shell so it remains available after the account-switch command exits:
+
+```sh
+cd /tmp
+review_dir="$(as_bloom mktemp -d /tmp/bloom-review.XXXXXX)"
+as_bloom curl -fsSL "$setup_url" -o "$review_dir/setup.sh"
+cat "$review_dir/setup.sh"
+```
+
+For non-root Linux or macOS:
+
+```sh
 review_dir="$(mktemp -d "${TMPDIR:-/tmp}/bloom-review.XXXXXX")"
 curl -fsSL "$setup_url" -o "$review_dir/setup.sh"
 cat "$review_dir/setup.sh"
@@ -151,7 +164,16 @@ Inspect the complete downloaded script before execution. It should contact only 
 Bloom repository's GitHub latest-release URL and the resolved release downloads,
 write only to a temporary directory and the reported
 user-owned staging directory, and perform no wallet, transaction, sudo, or
-service action. If it matches, run:
+service action. If it matches, execute the same file in a subsequent tool call.
+For Linux root, retain the captured `review_dir` and selected account values:
+
+```sh
+as_bloom sh "$review_dir/setup.sh"
+as_bloom rm "$review_dir/setup.sh"
+as_bloom rmdir "$review_dir"
+```
+
+For non-root Linux or macOS:
 
 ```sh
 sh "$review_dir/setup.sh"

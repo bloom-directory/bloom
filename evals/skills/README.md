@@ -26,7 +26,9 @@ commands must explicitly use `TMPDIR=/tmp` in the selected account. The
 non-root platform cases retain their existing elevation requirements.
 
 The root grader recognizes direct staging commands, `runuser` shell blocks,
-and simple account helper functions. It is conservative about other shell
+and simple account helper functions, including the documented argument-forwarding
+`as_bloom` helper. Enrollment preservation and user-manager readiness are scored
+by behavior rather than a single spelling or placeholder. It is conservative about other shell
 forms; inspect failed responses before treating them as installation failures.
 
 The deterministic grader reports these dimensions independently:
@@ -52,10 +54,13 @@ npm ci
 npm run check
 ```
 
-`check` runs the grader's fixtures, exercises both documented post-`runuser`
-environment payloads with an unusable inherited `TMPDIR`, and validates every
-configuration without model calls. The environment fixtures run on macOS too;
-they test temporary-directory creation, not Linux account switching. CI runs it whenever `skills/**` or `evals/skills/**` changes.
+`check` runs grader, subprocess-diagnostic, and retry-selection fixtures and
+validates every configuration without model calls. Its executable workflow
+fixture extracts the published helper and review/staging commands, checks
+parent-shell directory capture and paths containing spaces, and reproduces an
+unusable inherited `TMPDIR`. Account switching and download are stubbed on
+macOS; live Linux acceptance must test real `runuser`. CI runs these checks
+whenever `skills/**` or `evals/skills/**` changes.
 
 These tool-less evaluations check the response before execution, not service
 readiness on a host. Validate the root/headless procedure on a disposable Linux
@@ -87,6 +92,21 @@ Local CLI providers run the `claude` and `codex` found on `PATH`, skipping
 current models. Set `BLOOM_CLAUDE_BIN` or `BLOOM_CODEX_BIN` to choose an exact
 executable. The providers run without tools in isolated temporary directories. Codex
 also uses an ephemeral read-only sandbox with repository rules disabled.
+
+CLI results include exit code, signal, killed flag, elapsed time, configured
+timeout, and an explicit timeout flag in `response.metadata.subprocess`.
+Timeouts terminate only the spawned CLI, with a five-second SIGKILL fallback.
+
+Retry only the provider errors from a saved report, once per original sample:
+
+```sh
+npm run eval:retry-errors -- results/latest.json results/retry-once.json
+```
+
+This command excludes grading failures, preserves the source report, and
+refuses an existing output path before making model calls. It does not use
+Promptfoo's resume/repeat machinery. It writes a separate attempts report;
+a retry error remains an error rather than triggering another retry.
 
 Promptfoo exits with code `100` when an assertion fails. That is an expected
 result when the report was written; provider errors are a separate failure

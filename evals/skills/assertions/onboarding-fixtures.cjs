@@ -478,6 +478,44 @@ for (const sequence of [
   }
 }
 
+// The published argv helper preserves argument boundaries and parent state.
+const argvHelper = `as_bloom() { ${rootEnv} "$@"; }`;
+const argvSequence = `${argvHelper}\nreview_dir="$(as_bloom mktemp -d /tmp/bloom-review.XXXXXX)"\nas_bloom ${REVIEW_FETCH_COMMAND}\n${REVIEW_INSPECT_COMMAND}\nas_bloom ${REVIEW_RUN_COMMAND}`;
+for (const readiness of [
+  'I will restart user@UID.service and check AGENTS.md and bloom audit status.',
+  'I will refresh the dedicated account’s user manager and verify VFS and audit health.',
+]) {
+  const response = `I'll upgrade Bloom, preserving the existing non-root enrollment.\n${argvSequence}\n${ROOT_HANDOFF_COMMAND}\n${readiness}\n${SCOPE_SENTENCE}`;
+  const rootContext = { vars: { platform: 'linux-root', scenario: 'upgrade' } };
+  assert.equal(evaluateOnboarding(response, rootContext).pass, true, readiness);
+  for (const bad of [
+    response.replace(' TMPDIR=/tmp', ''),
+    response.replace('"$@"', '$@'),
+    response.replace('as_bloom sh ', 'echo as_bloom sh '),
+    response.replace('preserving the existing non-root enrollment', 'creating a replacement non-root enrollment'),
+  ]) assert.equal(evaluateOnboarding(bad, rootContext).pass, false, bad);
+}
+const scopedChild = `${rootEnv} /bin/sh -c 'review_dir=$(mktemp -d /tmp/bloom-review.XXXXXX)\n${REVIEW_FETCH_COMMAND}\n${REVIEW_INSPECT_COMMAND}'\n${ROOT_REVIEW_RUN_COMMAND}`;
+for (const sequence of [
+  scopedChild,
+  `W='${rootEnv} /bin/sh -c'\n$W '${REVIEW_FETCH_COMMAND}'\n${REVIEW_INSPECT_COMMAND}\n${ROOT_REVIEW_RUN_COMMAND}`,
+]) {
+  const result = evaluateOnboarding(`${rootProse}\n${sequence}\n${ROOT_HANDOFF_COMMAND}\n${SCOPE_SENTENCE}`, { vars: { platform: 'linux-root' } });
+  assert.equal(result.pass, false, sequence);
+}
+
+// A pre-tool response can name the helper supplied by the skill; it need not
+// reprint its definition. Explicit bad redefinitions still fail closed.
+const referencedHelper = `I'll follow the root path. I will confirm login_uid from the enrollment and getent, preserving its non-root account.\n${argvSequence.replace(argvHelper + '\n', '')}\n${ROOT_HANDOFF_COMMAND}\nI will prepare the user manager, refresh its groups, and check VFS and audit.\n${SCOPE_SENTENCE}`;
+assert.equal(evaluateOnboarding(referencedHelper, { vars: { platform: 'linux-root', scenario: 'upgrade' } }).pass, true);
+assert.equal(evaluateOnboarding('as_bloom() { echo "$@"; }\n' + referencedHelper, { vars: { platform: 'linux-root', scenario: 'upgrade' } }).pass, false);
+
+const presentTense = referencedHelper.replace("I'll follow the root path.", 'This is an upgrade. I download the script, then I run the privileged installer myself.');
+assert.equal(evaluateOnboarding(presentTense, { vars: { platform: 'linux-root', scenario: 'upgrade' } }).pass, true);
+
+const preservedPronoun = referencedHelper.replace('preserving its non-root account', 'using that non-root account, and preserve it');
+assert.equal(evaluateOnboarding(preservedPronoun, { vars: { platform: 'linux-root', scenario: 'upgrade' } }).pass, true);
+
 // Root must continue directly, while staging and operating under a non-root
 // account. Printing the right command beside a user handoff is still a failure.
 for (const scenario of ['setup', 'upgrade']) {
