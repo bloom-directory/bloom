@@ -22,6 +22,40 @@ use crate::handler::{
 };
 use crate::path::VfsPath;
 
+/// The Petal that staged an outbox entry, as `petals/<name>/`, and whether it
+/// can still confirm it. A Petal rechecks its own conditions when it confirms,
+/// so its entries are confirmed through it, but it accepts only entries its
+/// installed package staged through a recorded route. After an upgrade, or for
+/// an entry staged before routes were recorded, the entry must be restaged.
+/// `installed` gives a Petal's installed package hash by name.
+pub fn staging_petal(
+    origin: &bloom_proto::plan::ExecutionOrigin,
+    installed: &dyn Fn(&str) -> Option<String>,
+) -> Option<(String, bool)> {
+    let name = origin
+        .petal_id
+        .strip_prefix(bloom_proto::petal_identity::PETAL_ID_PREFIX)?;
+    let can_confirm = origin
+        .route_id
+        .as_deref()
+        .is_some_and(|route| !route.is_empty())
+        && origin.petal_version == "v1-package"
+        && installed(name).as_deref() == Some(origin.petal_digest.as_str());
+    Some((format!("petals/{name}/"), can_confirm))
+}
+
+/// Where to confirm or retry an entry `petal` staged, for agent-facing text.
+pub fn through_staging_petal(petal: &str) -> String {
+    format!("through the Petal that staged this entry ({petal}; see its README)")
+}
+
+/// What to do with an entry `petal` staged but can no longer confirm.
+pub fn restage_through(petal: &str) -> String {
+    format!(
+        "{petal} can no longer confirm this entry: it changed since staging, or the entry predates recorded routes. Write `cancel` to the entry's `confirm`, then restage through {petal} if the owner still wants it."
+    )
+}
+
 const STATES: &[&str] = &["pending", "sent", "failed"];
 const ACTION_FILES: &[&str] = &[
     "intent.json",

@@ -1388,6 +1388,19 @@ impl IpcServer {
             let challenge: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
             let url = challenge["ceremony_url"].as_str().unwrap_or_default();
             let new_approval = challenge["approval_id"].as_str() != waiting_for.as_deref();
+            // A Petal rechecks its conditions when it confirms, so its entries
+            // are retried through it, never by rewriting this raw confirm.
+            if challenge["staged_by"].is_string() {
+                let next = challenge["next"].as_str().unwrap_or_default();
+                let link = if url.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Ceremony link: {url}.")
+                };
+                return Err(WriteError::Approval(format!(
+                    "permission denied: owner approval required.{link} {next} Details: {challenge_file}"
+                )));
+            }
             match challenge["state"].as_str().unwrap_or("unknown") {
                 "active" if retried_active => return Err(HandlerError::PermissionDenied.into()),
                 "active" => {
@@ -2703,15 +2716,20 @@ mod tests {
         challenged: AtomicBool,
         writes: AtomicUsize,
         signatures: AtomicUsize,
+        staged_by: Option<&'static str>,
     }
 
     impl ApprovalEntry {
         fn new() -> Arc<Self> {
+            Self::staged_by(None)
+        }
+        fn staged_by(staged_by: Option<&'static str>) -> Arc<Self> {
             Arc::new(Self {
                 state: std::sync::Mutex::new("awaiting_ceremony"),
                 challenged: AtomicBool::new(false),
                 writes: AtomicUsize::new(0),
                 signatures: AtomicUsize::new(0),
+                staged_by,
             })
         }
         fn set(&self, state: &'static str) {
@@ -2738,6 +2756,7 @@ mod tests {
                 "state": state,
                 "ceremony_url": "http://localhost:28735/c/abc",
                 "next": format!("next step for {state}."),
+                "staged_by": self.staged_by,
             }))
             .unwrap())
         }
@@ -2842,6 +2861,35 @@ mod tests {
         let (again, ()) = tokio::join!(confirm(&server), approve_after(&entry, 300, "active"));
         assert!(again.is_none(), "{again:?}");
         assert_eq!(entry.signatures(), 1);
+    }
+
+    /// A Petal-staged entry is retried through its Petal, which rechecks its
+    /// conditions; the IPC wait must never send it by rewriting raw confirm.
+    #[tokio::test]
+    async fn petal_staged_confirm_never_waits_or_rewrites_the_raw_sink() {
+        let entry = ApprovalEntry::staged_by(Some("petals/pendle/"));
+        let server = approval_server(&entry, 10_000);
+        confirm(&server).await.expect("approval required");
+        let (error, ()) = tokio::join!(confirm(&server), approve_after(&entry, 300, "active"));
+        let error = error.expect("must not wait and send");
+        assert_eq!(error.code, -32007);
+        assert!(
+            error.message.contains("next step for awaiting_ceremony."),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("http://localhost:28735/c/abc"),
+            "{}",
+            error.message
+        );
+        assert!(
+            !error.message.contains("write confirm to"),
+            "{}",
+            error.message
+        );
+        assert_eq!(entry.writes.load(Ordering::SeqCst), 2);
+        assert_eq!(entry.signatures(), 0);
     }
 
     #[tokio::test]

@@ -317,6 +317,9 @@ pub trait AccountPetalMount: Send + Sync {
         mount: &str,
         slot: &str,
     ) -> Result<(), HandlerError>;
+
+    /// The installed package hash of the Petal named `petal`, if any.
+    fn installed_package(&self, petal: &str) -> Option<String>;
 }
 
 #[derive(Clone)]
@@ -391,6 +394,15 @@ impl WalletsHandler {
     /// Attach the session seam that serves `wallets/<w>/<n>/sessions/`.
     pub fn set_account_petals(&self, petals: Arc<dyn AccountPetalMount>) {
         *self.account_petals.write() = Some(petals);
+    }
+
+    /// The installed package hash of the Petal named `petal`; none before the
+    /// Petal runtime is attached.
+    pub fn installed_petal_package(&self, petal: &str) -> Option<String> {
+        self.account_petals
+            .read()
+            .as_ref()?
+            .installed_package(petal)
     }
 
     /// Attach the Solana transfer engines (keyed by chain name). When set,
@@ -9098,7 +9110,7 @@ value = "0""#,
             approved["next"]
                 .as_str()
                 .unwrap()
-                .contains("retry_path now"),
+                .contains("Now write retry_body to retry_path"),
             "{approved}"
         );
 

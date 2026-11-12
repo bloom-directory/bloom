@@ -2613,6 +2613,49 @@ fn wallet_confirm_reports_the_pending_ceremony_url() {
 }
 
 #[test]
+fn wallet_confirm_points_a_petal_staged_entry_back_to_its_petal() {
+    let home = fresh_home();
+    let expires = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        + 180_000) as u64;
+    let mut files = std::collections::HashMap::new();
+    files.insert(
+        "/alice/0/chains/base/outbox/pending/0001-cafe/approval_challenge.json".to_string(),
+        format!(
+            "{{\"state\":\"awaiting_ceremony\",\"ceremony_url\":\"http://localhost:18734/c/secret\",\"expiry_ms\":{expires},\"staged_by\":\"petals/pendle/\",\"next\":\"After approving, retry through petals/pendle/ (see its README).\"}}"
+        )
+        .into_bytes(),
+    );
+    let handler = Arc::new(ServingHandler {
+        files,
+        ..ServingHandler::default()
+    });
+    let vfs = bloom_vfs::Vfs::builder().mount("wallets", handler).build();
+    let (server, server_thread) = spawn_ipc_server(home.path(), vfs);
+
+    // Re-running this raw confirm is refused for a Petal entry, so the CLI
+    // must give the Petal retry instead.
+    bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "confirm",
+            "alice",
+            "base",
+            "0001-cafe",
+            "--text",
+            "y",
+        ])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains("retry through petals/pendle/"))
+        .stdout(predicate::str::contains("re-run this confirm").not());
+
+    stop_ipc_server(server, server_thread);
+}
+
+#[test]
 fn wallet_confirm_reports_an_already_broadcast_transaction_instead_of_not_found() {
     let home = fresh_home();
     let mut files = std::collections::HashMap::new();
