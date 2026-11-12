@@ -41,7 +41,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   # The release matrix; the report fails any cell without a summary.
-  TASKS: solana-transfer evm-transfer evm-transfer-denied hyperliquid-order-proposal polymarket-limit-order-proposal near-intents-swap-proposal polymarket-clarification
+  TASKS: solana-transfer evm-transfer evm-transfer-denied hyperliquid-order-proposal polymarket-limit-order-proposal near-intents-swap-proposal polymarket-clarification casual-wallet-balances casual-eth-in-main casual-supported-chains casual-sent-history casual-anvil-status
   # A dispatch may run a subset; empty means TASKS.
   SELECTED_TASKS: ${{ inputs.tasks }}
 

@@ -2,7 +2,8 @@
 
 This is the operating contract for agents using the mounted Bloom virtual
 filesystem. Treat the directory containing this file as the VFS root and keep
-all paths mount-relative. Keep scratch files outside the mount.
+all paths mount-relative: with Bloom at `/bloom`, `wallets` is `/bloom/wallets`.
+Keep scratch files outside the mount.
 
 `ls` the mount and read `next.md` (pending outbox entries, approvals and policy updates). Read on demand:
 `cat docs/README.md` lists every route, `docs/examples.md` has command

@@ -43,6 +43,13 @@ class ProjectionReader:
             )
         return result.stdout
 
+    def read_text(self, path):
+        return (
+            self._cli("cat", "/" + path)
+            if self.endpoint
+            else (self.root / path).read_text()
+        )
+
     def read_json(self, path):
         text = (
             self._cli("cat", "/" + path)

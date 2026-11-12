@@ -93,6 +93,7 @@ class DisposableTriad:
         self.genesis = ""
         self.wallet = ""
         self.mount_lock = None
+        self.anvil_port: int | None = None
 
     def roots(self) -> Path:
         # macOS home paths leave too little room for sockets; Linux /tmp may
@@ -295,6 +296,13 @@ class DisposableTriad:
             '"https://tenderly.rpc.polygon.community"]\n'
             'display_name = "Polygon"\nnative_symbol = "POL"\nnative_decimals = 18\n'
         )
+        if self.anvil_port is not None:
+            # A configured chain whose RPC port nothing listens on: always offline.
+            config += (
+                '[chains.anvil]\nname = "anvil"\nchain_id = 31337\n'
+                f'rpc_urls = ["http://127.0.0.1:{self.anvil_port}"]\n'
+                'display_name = "Anvil"\nnative_symbol = "ETH"\nnative_decimals = 18\n'
+            )
         if solana:
             port = free_port()
             self.rpc_url = f"http://127.0.0.1:{port}"
@@ -382,6 +390,7 @@ class DisposableTriad:
             "wallet projection",
             timeout=60,
         )
+
         if ethereum_fork:
             # Bloom must read the fork, never mainnet, before the agent starts.
             selected = self.cli("vfs", "cat", "/status/chains/ethereum/rpc_url").strip()
@@ -399,6 +408,27 @@ class DisposableTriad:
                 "eth_wei": 5 * 10**16,
                 "usdc_base_units": 5_000_000,
             }
+
+    def enroll_wallet(self, name: str) -> str:
+        new_seed = self.root / f"auth-{name}.seed"
+        new_seed.write_text(secrets.token_hex(32))
+        new_seed.chmod(0o600)
+        driver = CeremonyDriver(
+            Path(self.env["BLOOM_INTEGRATION_DEBUG_DRIVER_BIN"]), new_seed, self.origin
+        )
+        launch = self.cli("wallet", "new", name)
+        url = CEREMONY.search(launch)
+        if url is None:
+            raise EvalError(f"wallet enrollment for {name} returned no ceremony")
+        result = driver.complete(url.group())
+        wallet_id = result["wallet_id"]
+        self._wait(
+            lambda: self.read(f"/wallets/{wallet_id}/accounts.json")["accounts"],
+            self.launcher,
+            f"wallet projection {name}",
+            timeout=60,
+        )
+        return wallet_id
 
     def set_policy(
         self, *, packages: list[str], destinations: list[dict[str, str]]
@@ -473,6 +503,7 @@ class DisposableTriad:
             same_device = "-x" if sys.platform == "darwin" else "--one-file-system"
             result = subprocess.run(
                 ["rm", "-r", same_device, "--", str(self.root)],
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 timeout=45,
                 check=False,
