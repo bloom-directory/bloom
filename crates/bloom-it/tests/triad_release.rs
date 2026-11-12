@@ -1998,6 +1998,13 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
         root.join("usr/libexec/bloom/bloom-linux-maintenance")
             .is_file()
     );
+    for service in ["broker", "signer"] {
+        assert!(
+            !root
+                .join(format!("usr/lib/systemd/system/bloom-{service}@.service"))
+                .exists()
+        );
+    }
 
     assert!(
         Command::new(&installer)
@@ -2014,6 +2021,12 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
     assert!(root.join("etc/bloom/enrollments/1000.json").is_file());
     assert!(!root.join("etc/bloom/retained/1000.json").exists());
     assert!(root.join("usr/bin/bloom").is_file());
+    for service in ["broker", "signer"] {
+        assert!(
+            root.join(format!("usr/lib/systemd/system/bloom-{service}@.service"))
+                .is_file()
+        );
+    }
     assert!(
         fs::read_to_string(root.join("etc/fstab"))
             .unwrap()
