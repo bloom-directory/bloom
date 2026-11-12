@@ -553,7 +553,23 @@ Correcting a row in that table is therefore a breaking change for every
 developer root enrolled against the old value. The remedy is per-Petal:
 re-enrolling the Petal re-derives its records from the table, for the package
 hash on disk, and not from inside the launcher, which aborts at the refresh
-before it reaches enrolment. A fresh root works too. There is deliberately no
+before it reaches enrolment. Run it yourself from the repository root, once per
+Petal the refusal names:
+
+```sh
+cargo build -p bloom --no-default-features --features mount,triad-dev-harness
+target/debug/bloom init triad-enroll-developer-petal-provenance \
+  "$HOME/.bloom/triad-dev/config" \
+  "$HOME/Bloom/bloom-petal-hyperliquid"
+```
+
+The first path is the `config` directory under the `--developer-root` the
+launcher was given; the second is that Petal's built package directory, the
+same path the launcher takes from `BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE`. The
+refusal prints both the command and the config directory it read, so it can be
+copied from there. A fresh root works too, and is the only route for a record
+the lineage marks `active: false`, which the refresh skips before the conflict
+check and enrolment separately refuses to reactivate. There is deliberately no
 blanket override — a single flag rewriting every disagreeing record at once
 would clear unrelated ones along with the intended one, and correcting a row
 has not yet happened.

@@ -375,8 +375,8 @@ fn refresh_developer_provenance_catalog(
         // Enrolment keeps a Petal's predecessor packages in the catalog,
         // re-signed with `active: false`. A disagreement on one is not worth
         // refusing a launch over, because re-enrolling could not clear it
-        // anyway — enrolment only re-derives the package hash on disk — so the
-        // override would be the only way out.
+        // anyway — enrolment only re-derives the package hash on disk — so
+        // recreating the developer root would be the only way out.
         //
         // What makes that safe is not the flag. A plain Petal approval never
         // consults lineage `active` at all, and an inactive record's
@@ -489,9 +489,17 @@ fn refresh_developer_provenance_catalog(
              this build's table agree with what the Petal declares. If the table is right, \
              re-enrolling that Petal re-derives its records from the table, though only for \
              the package hash on disk, and not from inside the launcher, which stops here \
-             before it reaches enrolment. Records the lineage marks inactive are skipped \
-             before this check and never appear above.",
+             before it reaches enrolment — so run it yourself, from the repository root, \
+             once per Petal named above:\n\n  \
+             cargo build -p bloom --no-default-features --features mount,triad-dev-harness\n  \
+             target/debug/bloom init triad-enroll-developer-petal-provenance {} \
+             <petal-package-dir>\n\nwhere <petal-package-dir> is that Petal's built \
+             package directory, the same path the launcher takes from \
+             BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE. Recreating the developer root works too, \
+             and is the only route for a record the lineage marks inactive — those are \
+             skipped before this check and never appear above.",
             conflicts.join("; "),
+            config_dir.display(),
         );
     }
     catalog.records.extend(developer_records);
@@ -2181,7 +2189,7 @@ mod tests {
     /// never authorize anything again. A disagreement on one must not refuse
     /// the launch: the launcher runs this refresh before enrolment, and
     /// enrolment only re-derives the package hash on disk, so there would be
-    /// no way out but the override.
+    /// no way out short of recreating the developer root.
     #[cfg(feature = "triad-dev-harness")]
     #[test]
     fn developer_catalog_refresh_ignores_an_inactive_package() {
@@ -2456,6 +2464,26 @@ mod tests {
             message.contains("leaves the catalog untouched"),
             "the refusal must say that nothing was written, because the operator is told \
              to go and change one of the two sides: {message}"
+        );
+        // Naming the remedy is not giving it. The launcher runs this refresh on
+        // every launch, so a conflict stops every launch, and an operator who
+        // has to reconstruct the command from `--help` on a hidden subcommand
+        // is stuck at exactly the moment the message is their only output.
+        for fragment in [
+            "cargo build -p bloom --no-default-features --features mount,triad-dev-harness",
+            "target/debug/bloom init triad-enroll-developer-petal-provenance",
+            "<petal-package-dir>",
+        ] {
+            assert!(
+                message.contains(fragment),
+                "the refusal must carry a runnable recovery command, missing \
+                 {fragment:?} in: {message}"
+            );
+        }
+        assert!(
+            message.contains(&output.display().to_string()),
+            "the command must name this root's own config directory rather than a \
+             placeholder the operator has to resolve: {message}"
         );
 
         // And it must leave the record alone rather than half-rewriting it.
