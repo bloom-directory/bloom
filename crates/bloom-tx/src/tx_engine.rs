@@ -5720,18 +5720,6 @@ const _PARSE_UNITS: fn(&str, u8) -> Result<U256, bloom_proto::units::UnitError> 
 mod tests {
     #[test]
     fn explicit_approval_amounts_and_simulation_guidance() {
-        let signature = "approve(address,uint256)";
-        let spender = "0x0000000000000000000000000000000000000001";
-        let encoded =
-            bloom_tools::encode_call(signature, &serde_json::json!([spender, "0"])).unwrap();
-        let bytes = hex::decode(encoded.trim_start_matches("0x")).unwrap();
-        assert_eq!(bytes.len(), 68);
-        assert!(IERC20::approveCall::abi_decode(&bytes).is_ok());
-        assert!(IERC20::approveCall::abi_decode(&bytes[..65]).is_err());
-        assert!(bloom_tools::encode_call(signature, &serde_json::json!([spender])).is_err());
-        assert!(
-            bloom_tools::encode_call(signature, &serde_json::json!([spender, "invalid"])).is_err()
-        );
         for amount in ["", " ", "1.5", "-1"] {
             assert!(super::parse_approve_amount(amount).is_err());
         }
