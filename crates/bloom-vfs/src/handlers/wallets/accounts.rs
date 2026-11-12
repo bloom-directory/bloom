@@ -1133,7 +1133,9 @@ impl WalletsHandler {
                     let signing = evm_signing_state(&entry)
                         .ok_or_else(|| HandlerError::not_found(rest.join("/")))?;
                     let outbox = format!("wallets/{wallet}/{number}/chains/{chain}/outbox");
-                    let challenge = evm_approval_challenge(&entry, &signing, &outbox)?;
+                    let challenge = evm_approval_challenge(&entry, &signing, &outbox, &|petal| {
+                        self.installed_petal_package(petal)
+                    })?;
                     return self.live_approval_challenge(wallet, challenge).await;
                 }
                 if is_private_evm_outbox_artifact(fname) {
@@ -2184,6 +2186,7 @@ fn evm_approval_challenge(
     entry: &bloom_tx::outbox::OutboxEntry,
     signing: &serde_json::Value,
     outbox: &str,
+    installed: &dyn Fn(&str) -> Option<String>,
 ) -> Result<serde_json::Value, HandlerError> {
     use sha2::Digest as _;
     let mut staged = entry.staged.clone();
@@ -2263,9 +2266,12 @@ fn evm_approval_challenge(
     let petal = staged
         .execution_origin
         .as_ref()
-        .and_then(|origin| crate::handlers::outbox::staging_petal(&origin.petal_id));
-    if let (Some(petal), "confirm" | "confirm.override") = (petal, control) {
+        .and_then(|origin| crate::handlers::outbox::staging_petal(origin, installed));
+    if let (Some((petal, can_confirm)), "confirm" | "confirm.override") = (petal, control) {
         challenge["staged_by"] = petal.into();
+        if !can_confirm {
+            challenge["restage"] = true.into();
+        }
         if let Some(object) = challenge.as_object_mut() {
             object.remove("retry_path");
             object.remove("retry_body");
@@ -2284,15 +2290,15 @@ fn reconcile_approval_challenge(
     challenge: &mut serde_json::Value,
     live: Option<&bloom_broker_api::ApprovalPublicStatus>,
 ) {
-    let petal = challenge.get("staged_by").and_then(|petal| petal.as_str());
-    let retry = match petal {
+    let petal = challenge["staged_by"].as_str().map(str::to_owned);
+    let retry = match &petal {
         Some(petal) => format!(
             "retry {}",
             crate::handlers::outbox::through_staging_petal(petal)
         ),
         None => "write retry_body to retry_path".into(),
     };
-    let (state, next) = match live {
+    let (state, mut next) = match live {
         Some(status) => approval_next_step(status.state, &retry, petal.is_none()),
         None => (
             "unknown",
@@ -2301,6 +2307,11 @@ fn reconcile_approval_challenge(
             ),
         ),
     };
+    // Approval cannot help an entry its Petal can no longer confirm.
+    let restage = challenge["restage"] == true && !matches!(state, "exhausted" | "refused");
+    if let (true, Some(petal)) = (restage, &petal) {
+        next = crate::handlers::outbox::restage_through(petal);
+    }
     let Some(object) = challenge.as_object_mut() else {
         return;
     };
@@ -2309,7 +2320,7 @@ fn reconcile_approval_challenge(
     let Some(status) = live else {
         return;
     };
-    if state == "awaiting_ceremony" {
+    if state == "awaiting_ceremony" && !restage {
         object.insert("ceremony_url".into(), status.ceremony_url.clone().into());
         object.insert(
             "expiry_ms".into(),
@@ -2443,7 +2454,7 @@ mod tests {
             "canonical_plan_facts_digest": hex::encode(sha2::Sha256::digest(serde_jcs::to_vec(&replacement).unwrap())),
         });
         let root = "wallets/main/0/chains/polygon/outbox";
-        let challenge = evm_approval_challenge(&entry, &signing, root).unwrap();
+        let challenge = evm_approval_challenge(&entry, &signing, root, &|_| None).unwrap();
         assert_eq!(
             challenge["retry_path"],
             format!("{root}/pending/fee-repair/replace")
@@ -2468,7 +2479,7 @@ mod tests {
         outbox.write_pending(&warned, "warned plan").unwrap();
         let warned_entry = outbox.read("main", "polygon", "warned").unwrap();
         let ordinary = serde_json::json!({ "action_id": "137:warned:confirm" });
-        let challenge = evm_approval_challenge(&warned_entry, &ordinary, root).unwrap();
+        let challenge = evm_approval_challenge(&warned_entry, &ordinary, root, &|_| None).unwrap();
         assert_eq!(
             challenge["retry_path"],
             format!("{root}/pending/warned/confirm.override")
@@ -2483,7 +2494,7 @@ mod tests {
                 &serde_json::to_vec(&altered).unwrap(),
             )
             .unwrap();
-        assert!(evm_approval_challenge(&entry, &signing, root).is_err());
+        assert!(evm_approval_challenge(&entry, &signing, root, &|_| None).is_err());
         outbox
             .write_artefact(
                 &entry.dir,
@@ -2503,7 +2514,7 @@ mod tests {
             "action_id": "137:fee-repair:replace",
             "canonical_plan_facts_digest": hex::encode(sha2::Sha256::digest(serde_jcs::to_vec(&replacement).unwrap())),
         });
-        assert!(evm_approval_challenge(&entry, &changed_signing, root).is_err());
+        assert!(evm_approval_challenge(&entry, &changed_signing, root, &|_| None).is_err());
     }
 
     #[test]
@@ -2548,7 +2559,8 @@ mod tests {
             })),
         );
         let signing = serde_json::json!({ "action_id": "42161:buy:confirm" });
-        let mut challenge = evm_approval_challenge(&petal, &signing, root).unwrap();
+        let installed = |petal: &str| (petal == "pendle").then(|| "ab".repeat(32));
+        let mut challenge = evm_approval_challenge(&petal, &signing, root, &installed).unwrap();
         assert!(challenge.get("retry_path").is_none(), "{challenge}");
         assert!(challenge.get("retry_body").is_none(), "{challenge}");
         assert_eq!(challenge["staged_by"], "petals/pendle/");
@@ -2559,10 +2571,34 @@ mod tests {
         );
         assert!(!next.contains("retry_path"), "{next}");
 
+        // After an upgrade the Petal's confirm rejects the old origin, and an
+        // origin without a route never had one: no approval can send either.
+        let legacy = staged(
+            "legacy",
+            Some(serde_json::json!({
+                "petal_id": "petal:pendle", "petal_digest": "ab".repeat(32),
+                "petal_version": "v1-package"
+            })),
+        );
+        let upgraded = |_: &str| Some("cd".repeat(32));
+        for (entry, installed) in [
+            (&petal, &upgraded as &dyn Fn(&str) -> Option<String>),
+            (&legacy, &installed),
+        ] {
+            let mut challenge = evm_approval_challenge(entry, &signing, root, installed).unwrap();
+            assert!(challenge.get("retry_path").is_none(), "{challenge}");
+            let next = active(&mut challenge);
+            assert!(
+                next.contains("petals/pendle/ can no longer confirm this entry")
+                    && !next.contains("retry through"),
+                "{next}"
+            );
+        }
+
         // An entry staged directly through the wallet outbox keeps its control.
         let direct = staged("send", None);
         let signing = serde_json::json!({ "action_id": "42161:send:confirm" });
-        let mut challenge = evm_approval_challenge(&direct, &signing, root).unwrap();
+        let mut challenge = evm_approval_challenge(&direct, &signing, root, &|_| None).unwrap();
         assert_eq!(
             challenge["retry_path"],
             format!("{root}/pending/send/confirm")

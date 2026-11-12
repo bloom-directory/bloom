@@ -60,15 +60,16 @@ it does not create a local wallet. Follow
 For outbox transactions:
 
 1. Stage once: write the body to `outbox/new.tx` (formats in
-   `docs/examples.md`) or to a Petal's `new`, then confirm where its README
-   says.
+   `docs/examples.md`) or to a Petal's `new` (its README). Wherever these
+   steps say to write `confirm`, confirm a Petal's entry where its README
+   says instead. That confirm does not wait for approval: retry it once the
+   owner approves.
 2. Identify the new entry in `pending/` by its `intent.json` and `plan.md`,
    never by wildcard, sequence number, `latest` or position.
-3. Write `confirm` to that entry's `confirm` file, or a Petal's entry where
-   its README says. If the owner must approve, its error gives the ceremony
-   link: give it to the human, then confirm again the same way. The entry's
-   own `confirm` waits for their approval and sends; repeat if it times out.
-   A Petal's confirm does not wait: retry it once they approve. For `expired`, `cancelled` or `refused`, tell the human.
+3. Write `confirm` to that entry's `confirm` file. If the owner must
+   approve, its error gives the ceremony link: give it to the human, then
+   write `confirm` again, which waits for their approval and sends. Repeat
+   if it times out. For `expired`, `cancelled` or `refused`, tell the human.
    On a mount, confirm does not wait: read `approval_challenge.json` and
    follow its `next`.
 4. Read `sent/<id>/` or `failed/<id>/` before reporting the result.

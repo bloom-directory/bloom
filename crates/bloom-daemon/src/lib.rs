@@ -3839,6 +3839,14 @@ impl AccountPetalMount for AccountPetals {
             .collect())
     }
 
+    fn installed_package(&self, petal: &str) -> Option<String> {
+        self.runner
+            .store()
+            .resolve_petal_owner(petal)
+            .ok()
+            .flatten()
+    }
+
     async fn stop_session(
         &self,
         account: &AccountPetalContext,
@@ -4882,7 +4890,10 @@ impl Daemon {
         vfs_builder = vfs_builder.with_root_dynamic_async("next.md", move || {
             let projections = next_wallet_projections.clone();
             let wallet_tree = next_wallet_tree.clone();
-            async move { render_next_actions(projections.as_ref(), wallet_tree.as_ref()).await }
+            async move {
+                let installed = |petal: &str| wallet_tree.installed_petal_package(petal);
+                render_next_actions(projections.as_ref(), wallet_tree.as_ref(), &installed).await
+            }
         });
 
         let vfs = vfs_builder
@@ -5368,17 +5379,28 @@ fn configured_mount(
     })
 }
 
+/// The installed package hash of a Petal by name.
+type InstalledPetals = dyn Fn(&str) -> Option<String> + Send + Sync;
+
 async fn render_next_actions(
     projections: &dyn WalletProjectionReader,
     wallet_tree: &dyn Handler,
+    installed: &InstalledPetals,
 ) -> Vec<u8> {
-    render_next_actions_with_timeout(projections, wallet_tree, WALLET_PROJECTION_LIVE_TIMEOUT).await
+    render_next_actions_with_timeout(
+        projections,
+        wallet_tree,
+        installed,
+        WALLET_PROJECTION_LIVE_TIMEOUT,
+    )
+    .await
 }
 
 /// Renders `/next.md`. `wallet_tree` is the handler mounted at `wallets/`.
 async fn render_next_actions_with_timeout(
     projections: &dyn WalletProjectionReader,
     wallet_tree: &dyn Handler,
+    installed: &InstalledPetals,
     live_timeout: Duration,
 ) -> Vec<u8> {
     let mut md = String::from("# Next Actions\n\n");
@@ -5424,7 +5446,9 @@ async fn render_next_actions_with_timeout(
             .iter()
             .map(|projection| projection.wallet.wallet_id.as_str().to_owned())
             .collect();
-        md.push_str(&render_pending_actions(wallet_tree, &wallet_ids, live_timeout).await);
+        md.push_str(
+            &render_pending_actions(wallet_tree, installed, &wallet_ids, live_timeout).await,
+        );
     }
     md.into_bytes()
 }
@@ -5451,24 +5475,36 @@ async fn wallet_dirs(tree: &dyn Handler, path: &str, unreadable: &mut Vec<String
 }
 
 /// The Petal that staged `entry`, from the `execution_origin` in its
-/// `intent.json`. Solana and directly staged entries have none.
-async fn staging_petal(tree: &dyn Handler, entry: &str) -> Option<String> {
+/// `intent.json`, and whether it can still confirm it. Solana and directly
+/// staged entries have none.
+async fn staging_petal(
+    tree: &dyn Handler,
+    installed: &InstalledPetals,
+    entry: &str,
+) -> Option<(String, bool)> {
     let path = VfsPath::parse(&format!("{entry}/intent.json")).ok()?;
     let intent: serde_json::Value = serde_json::from_slice(&tree.read(&path).await.ok()?).ok()?;
-    bloom_vfs::handlers::outbox::staging_petal(intent["execution_origin"]["petal_id"].as_str()?)
+    let origin = serde_json::from_value(intent["execution_origin"].clone()).ok()?;
+    bloom_vfs::handlers::outbox::staging_petal(&origin, installed)
 }
 
 /// One line for a pending outbox entry. `ceremony_url` is an owner
 /// capability, so it stays in the challenge file.
-async fn outbox_entry_line(tree: &dyn Handler, entry: &str) -> String {
+async fn outbox_entry_line(tree: &dyn Handler, installed: &InstalledPetals, entry: &str) -> String {
     let read = match VfsPath::parse(&format!("{entry}/approval_challenge.json")) {
         Ok(path) => tree.read(&path).await,
         Err(error) => Err(HandlerError::invalid(error.to_string())),
     };
     let challenge: serde_json::Value = match read {
         Err(HandlerError::NotFound(_)) => {
-            let confirm = match staging_petal(tree, entry).await {
-                Some(petal) => format!(
+            let confirm = match staging_petal(tree, installed, entry).await {
+                Some((petal, false)) => {
+                    return format!(
+                        "- `wallets/{entry}/`: staged, not confirmed. {}\n",
+                        bloom_vfs::handlers::outbox::restage_through(&petal)
+                    );
+                }
+                Some((petal, true)) => format!(
                     "confirm {}",
                     bloom_vfs::handlers::outbox::through_staging_petal(&petal)
                 ),
@@ -5511,6 +5547,7 @@ async fn outbox_entry_line(tree: &dyn Handler, entry: &str) -> String {
 /// cannot read, so the empty case reports what was listed, not an all-clear.
 async fn render_pending_actions(
     tree: &dyn Handler,
+    installed: &InstalledPetals,
     wallets: &[String],
     timeout: Duration,
 ) -> String {
@@ -5547,7 +5584,9 @@ async fn render_pending_actions(
                 for chain in wallet_dirs(tree, &chains, &mut unreadable).await {
                     let pending = format!("{chains}/{chain}/outbox/pending");
                     for id in wallet_dirs(tree, &pending, &mut unreadable).await {
-                        outbox.push(outbox_entry_line(tree, &format!("{pending}/{id}")).await);
+                        outbox.push(
+                            outbox_entry_line(tree, installed, &format!("{pending}/{id}")).await,
+                        );
                     }
                 }
             }
@@ -6333,7 +6372,7 @@ mod tests {
             dirs: [
                 ("alice", vec!["0", "policy-updates"]),
                 ("alice/0/chains", vec!["base", "ethereum"]),
-                ("alice/0/chains/base/outbox/pending", vec!["tx-staged", "tx-approval", "tx-petal", "tx-petal-staged"]),
+                ("alice/0/chains/base/outbox/pending", vec!["tx-staged", "tx-approval", "tx-petal", "tx-petal-staged", "tx-petal-stale"]),
                 (
                     "alice/policy-updates/pending",
                     vec!["policy-update-1", "policy-update-expired"],
@@ -6356,7 +6395,12 @@ mod tests {
                 ),
                 (
                     "alice/0/chains/base/outbox/pending/tx-petal-staged/intent.json",
-                    r#"{"id":"tx-petal-staged","execution_origin":{"petal_id":"petal:pendle"}}"#,
+                    r#"{"id":"tx-petal-staged","execution_origin":{"petal_id":"petal:pendle","petal_digest":"aa","petal_version":"v1-package","route_id":"r000003"}}"#,
+                ),
+                // Staged by a `pendle` package that has since been upgraded.
+                (
+                    "alice/0/chains/base/outbox/pending/tx-petal-stale/intent.json",
+                    r#"{"id":"tx-petal-stale","execution_origin":{"petal_id":"petal:pendle","petal_digest":"bb","petal_version":"v1-package","route_id":"r000003"}}"#,
                 ),
                 (
                 "alice/0/chains/base/outbox/pending/tx-petal/approval_challenge.json",
@@ -6370,8 +6414,14 @@ mod tests {
 
     #[tokio::test]
     async fn next_actions_lists_pending_entries_and_approvals() {
-        let md =
-            render_pending_actions(&alice_tree(), &["alice".into()], Duration::from_secs(5)).await;
+        let pendle = |petal: &str| (petal == "pendle").then(|| "aa".to_owned());
+        let md = render_pending_actions(
+            &alice_tree(),
+            &pendle,
+            &["alice".into()],
+            Duration::from_secs(5),
+        )
+        .await;
 
         assert!(
             md.contains(
@@ -6403,6 +6453,17 @@ mod tests {
             "{staged}"
         );
         assert!(!staged.contains("write `confirm`"), "{staged}");
+        // An upgraded Petal cannot confirm what its old package staged.
+        let stale = md
+            .lines()
+            .find(|line| line.contains("pending/tx-petal-stale/"))
+            .unwrap_or_else(|| panic!("{md}"));
+        assert!(
+            stale.contains("petals/pendle/ can no longer confirm this entry")
+                && stale.contains("Write `cancel`")
+                && !stale.contains("confirm through"),
+            "{stale}"
+        );
         assert!(md.contains("pending/tx-staged/`: staged, not confirmed. Review its `plan.md`; write `confirm` to its `confirm`"), "{md}");
         assert!(
             md.contains("`wallets/alice/policy-updates/pending/policy-update-1/`"),
@@ -6425,13 +6486,15 @@ mod tests {
         tree.dirs.remove("alice/0/chains/base/outbox/pending");
         tree.dirs.remove("alice/policy-updates/pending");
         assert!(
-            render_pending_actions(&tree, &["alice".into()], Duration::from_secs(5))
+            render_pending_actions(&tree, &|_| None, &["alice".into()], Duration::from_secs(5))
                 .await
                 .contains("No outbox entry or policy update is listed as pending")
         );
 
         tree.broken = Some("alice/0/chains/ethereum/outbox/pending");
-        let md = render_pending_actions(&tree, &["alice".into()], Duration::from_secs(5)).await;
+        let md =
+            render_pending_actions(&tree, &|_| None, &["alice".into()], Duration::from_secs(5))
+                .await;
         assert!(md.contains("## Not Checked"), "{md}");
         assert!(
             md.contains("`wallets/alice/0/chains/ethereum/outbox/pending/` could not be read: "),
@@ -6449,7 +6512,8 @@ mod tests {
             calls: std::sync::atomic::AtomicUsize::new(0),
         };
 
-        let rendered = render_next_actions(&projections, &WalletTreeFixture::default()).await;
+        let rendered =
+            render_next_actions(&projections, &WalletTreeFixture::default(), &|_| None).await;
 
         assert_eq!(
             projections.calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -6472,6 +6536,7 @@ mod tests {
         let rendered = render_next_actions_with_timeout(
             &projections,
             &WalletTreeFixture::default(),
+            &|_| None,
             Duration::from_millis(10),
         )
         .await;
@@ -10022,6 +10087,51 @@ allowed = ["bloom:vfs.read"]
             matches!(error, HostError::Denied(ref message) if message.contains("another account")),
             "{error}"
         );
+        assert!(broker.sign_calls.lock().is_empty());
+    }
+
+    /// A hard policy denial ends a Petal-staged entry exactly as it ends one
+    /// staged directly: the confirm through its Petal fails, the entry moves
+    /// to `failed/` with its deny, and nothing is signed or left to retry.
+    #[tokio::test]
+    async fn petal_confirm_of_a_hard_denied_entry_fails_it_without_signing() {
+        let (_dir, daemon, broker) = isolation_daemon().await;
+        let host =
+            test_petal_host(&daemon).with_broker(Some(MachineBrokerClient::new(broker.clone())));
+        let context = account_route_context("w", Some(0), None);
+        let staged: bloom_proto::StagedTx = serde_json::from_value(serde_json::json!({
+            "id": "denied-outbox", "wallet": "w", "chain": "anvil", "chain_id": 31337,
+            "from": broker.child(true, 0).address, "to": broker.child(true, 1).address,
+            "value_wei": "0", "data_hex": "0x", "gas_limit": 21000, "nonce": 0,
+            "policy_checks": [{"rule": "destinations.allow", "outcome": "deny", "message": "not on allowlist"}],
+            "created_ms": 1, "expires_ms": 99999999999999u64, "status": "pending",
+            "execution_origin": DaemonPetalHost::petal_execution_origin(&context).unwrap(),
+        }))
+        .unwrap();
+        daemon
+            .tx_engine
+            .outbox
+            .write_pending(&staged, "# denied fixture")
+            .unwrap();
+        let error = host
+            .evm_tx_confirm(
+                "w".into(),
+                "anvil".into(),
+                staged.id.clone(),
+                false,
+                Some(context),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("policy"), "{error}");
+        let entry = daemon
+            .tx_engine
+            .outbox
+            .read("w", "anvil", &staged.id)
+            .unwrap();
+        assert_eq!(entry.state, bloom_tx::outbox::OutboxState::Failed);
+        let checks = std::fs::read_to_string(entry.dir.join("policy_check.json")).unwrap();
+        assert!(checks.contains("\"deny\""), "{checks}");
         assert!(broker.sign_calls.lock().is_empty());
     }
 
