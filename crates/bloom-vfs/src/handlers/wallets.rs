@@ -2229,10 +2229,8 @@ impl WalletsHandler {
                     "pending",
                     "failed",
                 )?;
-                Err(HandlerError::invalid(format!(
-                    "Broker policy ceremony is terminal: {:?}",
-                    status.state
-                )))
+                // Retired without committing; the caller proposes again.
+                Ok(())
             }
             bloom_broker_api::CeremonyState::Completed => Err(HandlerError::backend(
                 "policy_update ceremony reported the wallet-registration-only COMPLETED state",
@@ -2697,6 +2695,12 @@ impl WalletsHandler {
 
 fn err_be(e: impl std::fmt::Display) -> HandlerError {
     HandlerError::backend(e.to_string())
+}
+
+/// The refusal for a write waiting on owner approval, naming the entry's
+/// public challenge. It never carries the ceremony link: errors are logged.
+fn approval_pending(outbox: &str, id: &str) -> HandlerError {
+    HandlerError::ApprovalPending(format!("{outbox}/pending/{id}/{APPROVAL_CHALLENGE_FILE}"))
 }
 
 /// Render the newest pending entry as a `pending/<id>` symlink target.
@@ -4378,7 +4382,7 @@ impl WalletsHandler {
                             .outbox()
                             .write_approval_challenge(&entry, &challenge)
                             .map_err(solana_outbox_err)?;
-                        Err(HandlerError::PermissionDenied)
+                        Err(approval_pending(&outbox_path, id))
                     }
                     bloom_solana_tx::signing::SolanaSignOutcome::Signed { .. } => {
                         engine
@@ -4495,6 +4499,8 @@ impl WalletsHandler {
     /// resolved from that address by the transaction engine, so a stage from
     /// account 1 can never be signed by account 0. The pending controls are
     /// fenced to the same sender, so there is no unfenced outbox write.
+    /// `account` is the mounted number a pending-approval error points back at.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn write_outbox_from(
         &self,
         wallet: &str,
@@ -4503,8 +4509,10 @@ impl WalletsHandler {
         policy: &Policy,
         rest: &[String],
         data: &[u8],
+        account: u32,
     ) -> Result<(), HandlerError> {
         let scope = from.to_string();
+        let outbox = format!("wallets/{wallet}/{account}/chains/{chain}/outbox");
         let client = self
             .chains
             .get(chain)
@@ -4596,7 +4604,7 @@ impl WalletsHandler {
                         )
                         .await
                         .map_err(|e| match e {
-                            TxEngineError::ApprovalRequired(_) => HandlerError::PermissionDenied,
+                            TxEngineError::ApprovalRequired(_) => approval_pending(&outbox, id),
                             other => err_be(other),
                         })
                 }
@@ -4605,7 +4613,7 @@ impl WalletsHandler {
                     Ok(_staged) => Ok(()),
                     // A pending owner approval has its own projection,
                     // approval_challenge.json; anything else is recorded.
-                    Err(HandlerError::PermissionDenied) => Err(HandlerError::PermissionDenied),
+                    Err(error @ HandlerError::ApprovalPending(_)) => Err(error),
                     Err(error) => {
                         record_confirm_error(&entry_dir, wallet, id, &error, None);
                         Err(error)
@@ -4667,7 +4675,7 @@ impl WalletsHandler {
                     .await
                     .map(|_| ())
                     .map_err(|error| match error {
-                        TxEngineError::ApprovalRequired(_) => HandlerError::PermissionDenied,
+                        TxEngineError::ApprovalRequired(_) => approval_pending(&outbox, id),
                         other => err_be(other),
                     })
             }
