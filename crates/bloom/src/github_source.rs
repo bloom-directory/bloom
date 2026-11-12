@@ -1091,6 +1091,19 @@ fn ensure_preinstalled_petals_with(
                 false
             }
         };
+        if let Some(hash) = owners.get(name)
+            && let Some(active_sessions) = &daemon.active_session_slots
+        {
+            let live = active_sessions(hash);
+            if !live.is_empty() {
+                println!(
+                    "preinstalled_petal: deferring update of {name} while sessions are active: {}",
+                    live.join(", ")
+                );
+                ready.push(name.to_owned());
+                continue;
+            }
+        }
 
         // No uninstall precedes this. The verified release installer downloads
         // and validates the pinned manifest, checksums, archive, package hash,
@@ -1142,6 +1155,11 @@ impl PreparedReleasePetal {
             .petals
             .check_default_activation(&self.package.hash, &self.package.name)
             .context("verify loaded bundled Petal release information")?;
+        // Automatic upgrades never force: a live session scoped to the
+        // outgoing package keeps it installed until the session ends.
+        let context = context
+            .clone()
+            .guarding_sessions(daemon.active_session_slots.clone());
         let (result, meta, index) = context
             .commit_petal_package(
                 &daemon.petals,
@@ -3119,6 +3137,84 @@ mod tests {
             again[0].outcome,
             crate::petal_provisioning::ProvisioningOutcome::Current
         );
+    }
+
+    #[test]
+    fn automatic_upgrade_defers_while_a_predecessor_session_is_live() {
+        let old = build_near_release("v0.1.0");
+        let new = build_near_release("v0.1.1");
+        let old_hash: &'static str = Box::leak(old.package.hash.clone().into_boxed_str());
+        let new_hash: &'static str = Box::leak(new.package.hash.clone().into_boxed_str());
+        let home = tempfile::tempdir().unwrap();
+        let home_dir = HomeDir::at(home.path());
+        home_dir.ensure().unwrap();
+        bloom_proto::Config::local_default()
+            .save(&home_dir.config_path())
+            .unwrap();
+        let mut daemon = Daemon::from_home(home_dir).unwrap();
+        daemon
+            .petals
+            .store()
+            .install_prepared_petal_package(old.package.clone())
+            .unwrap();
+        load_successor_catalog_with_predecessor(&mut daemon, new_hash, Some(old_hash));
+        let live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let session_live = live.clone();
+        daemon.active_session_slots = Some(std::sync::Arc::new(move |hash: &str| {
+            if hash == old_hash && session_live.load(std::sync::atomic::Ordering::SeqCst) {
+                vec!["wallets/w/1/sessions/near-intents/main".to_owned()]
+            } else {
+                Vec::new()
+            }
+        }));
+        let mut entry =
+            near_catalog_entry(NEAR_NEW_COMMIT, "v0.1.1", "near.tar.gz", Some(new_hash));
+        entry.predecessor_package_hashes = Box::leak(Box::new([old_hash]));
+        let acquire = |daemon: &Daemon, entry: &PreinstalledPetal, _: &_| {
+            prepare_prebuilt_petal_archive(
+                daemon,
+                entry,
+                &near_release_manifest(entry, new_hash),
+                new.archive.path(),
+            )
+        };
+        let provision = |daemon: &Daemon| {
+            crate::petal_provisioning::provision_with(
+                daemon,
+                &bloom_daemon::ipc::IpcOperationContext::detached(),
+                &["near-intents"],
+                |_| Some(entry),
+                acquire,
+            )
+        };
+
+        // Daemon start: the verified successor is refused at commit.
+        let deferred = provision(&daemon);
+        assert!(
+            matches!(&deferred[0].outcome,
+                crate::petal_provisioning::ProvisioningOutcome::Failed(message)
+                    if message.contains("sessions/near-intents/main")),
+            "{deferred:?}"
+        );
+        assert_eq!(installed_owner(&daemon).as_deref(), Some(old_hash));
+        // `bloom init`: deferred without acquiring or failing init.
+        let ready = ensure_preinstalled_petals_with(
+            &daemon,
+            &["near-intents"],
+            |_| Some(entry),
+            |_, _| panic!("a live session defers the replacement"),
+        )
+        .unwrap();
+        assert_eq!(ready, ["near-intents"]);
+        assert_eq!(installed_owner(&daemon).as_deref(), Some(old_hash));
+
+        // Once the session ends, the next automatic pass upgrades.
+        live.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            provision(&daemon)[0].outcome,
+            crate::petal_provisioning::ProvisioningOutcome::Installed
+        );
+        assert_eq!(installed_owner(&daemon).as_deref(), Some(new_hash));
     }
 
     #[test]

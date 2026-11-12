@@ -508,6 +508,14 @@ impl IpcOperationContext {
         }
     }
 
+    /// Refuse, without force, to replace a package that live sessions are
+    /// scoped to. Automatic installs use this so a live session defers them.
+    pub fn guarding_sessions(mut self, slots: Option<ActiveSessionSlots>) -> Self {
+        self.petal_active_sessions = slots;
+        self.petal_install_force = false;
+        self
+    }
+
     /// Common installation seam for local, source and background installs.
     /// Verification/materialization is outside the mutation lock; cancellation
     /// and the optional expected owner are checked again at the atomic commit.
