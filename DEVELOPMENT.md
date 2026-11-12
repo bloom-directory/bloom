@@ -539,7 +539,6 @@ The launcher's optional controls are:
 | `BLOOM_TRIAD_DEV_SOCKET_TIMEOUT_SECONDS` | Positive launcher socket timeout |
 | `BLOOM_TRIAD_DEV_CEREMONY_PORT` | Ceremony listener port when `--ceremony-port` is absent |
 | `BLOOM_TRIAD_DEV_REMOTE_UPSTREAM_PORT` | Hosted-relay loopback upstream port when `--remote-upstream-port` is absent |
-| `BLOOM_TRIAD_DEV_REWRITE_EXISTING_FEE_ASSETS` | Set to `1` to let a catalog refresh re-sign a fee asset a record already carries (read by the `bloom` binary the launcher invokes, not by the script) |
 
 Every launch refreshes the developer provenance catalog before enrolling, and
 that refresh re-derives each Petal operation class's `fee_asset` from
@@ -551,12 +550,13 @@ launch stops: one of the record and the table is stale, the refresh cannot tell
 which, and it will not re-sign on a guess.
 
 Correcting a row in that table is therefore a breaking change for every
-developer root enrolled against the old value. Each one needs
-`BLOOM_TRIAD_DEV_REWRITE_EXISTING_FEE_ASSETS=1` once — the override rewrites
-every conflicting record in a single pass, and the next launch finds nothing to
-change — or a fresh root. Re-enrolling the Petal re-derives its records from the
-table too, with no override, but only for the package hash on disk and not from
-inside the launcher, which aborts at the refresh before reaching enrolment.
+developer root enrolled against the old value. The remedy is per-Petal:
+re-enrolling the Petal re-derives its records from the table, for the package
+hash on disk, and not from inside the launcher, which aborts at the refresh
+before it reaches enrolment. A fresh root works too. There is deliberately no
+blanket override — a single flag rewriting every disagreeing record at once
+would clear unrelated ones along with the intended one, and correcting a row
+has not yet happened.
 
 Adding a row is ordinarily safe: both enrollment sites derive from the same
 table, so a record written by either carries no value for a class the table did

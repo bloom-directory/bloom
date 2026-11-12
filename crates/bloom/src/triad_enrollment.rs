@@ -293,7 +293,14 @@ pub fn run_developer_provenance_refresh(template: &Path, config_dir: &Path) -> R
     validate_developer_caller(uid, std::env::consts::OS)?;
     let config_dir =
         fs::canonicalize(config_dir).context("canonicalize developer triad config directory")?;
-    refresh_developer_provenance_catalog(template, &config_dir, uid)
+    // Notes are returned rather than printed from inside the refresh. Printing
+    // them there announced changes a later conflict discarded, because the
+    // refusal happens only after the whole catalog has been walked; returning
+    // them means nothing is announced that was not written.
+    for note in refresh_developer_provenance_catalog(template, &config_dir, uid)? {
+        eprintln!("note: {note}");
+    }
+    Ok(())
 }
 
 #[cfg(feature = "triad-dev-harness")]
@@ -301,7 +308,7 @@ fn refresh_developer_provenance_catalog(
     template: &Path,
     config_dir: &Path,
     expected_owner: u32,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let catalog_path = config_dir.join("provenance-catalog.json");
     require_private_developer_file(
         &config_dir.join("installer-identity.json"),
@@ -357,14 +364,13 @@ fn refresh_developer_provenance_catalog(
     // guess denies the Petal's claims — `FEE_NOT_ALLOWED` where the value was
     // cleared, `FEE_ASSET_MISMATCH` where it was replaced — leaving Broker's
     // refusal at claim time as the only symptom. Refusing makes the operator
-    // choose, which is why `REWRITE_EXISTING_FEE_ASSETS` exists: without an
-    // opt-in, correcting a row in the table would lock out every root enrolled
-    // against the old value, because the launcher runs this refresh before the
-    // enrolment that would heal the record and aborts on failure.
-    let rewrite_requested = std::env::var_os(REWRITE_EXISTING_FEE_ASSETS);
-    let rewrite_existing = rewrite_existing_requested(rewrite_requested.as_deref());
+    // choose, and the choice is targeted: re-enrolling that Petal re-derives
+    // its records from the table. There is deliberately no blanket override —
+    // one flag rewriting every disagreeing record at once would clear
+    // unrelated ones along with the intended one.
     let mut developer_records = developer_records;
     let mut conflicts = Vec::new();
+    let mut notes = Vec::new();
     for record in &mut developer_records {
         // Enrolment keeps a Petal's predecessor packages in the catalog,
         // re-signed with `active: false`. A disagreement on one is not worth
@@ -448,7 +454,7 @@ fn refresh_developer_provenance_catalog(
                 // refresh stops matching after, and whether the symptom is
                 // FEE_NOT_ALLOWED (cleared) or FEE_ASSET_MISMATCH (replaced
                 // with a different chain or asset) the Petal is equally broken.
-                if class.fee_asset.is_some() && !rewrite_existing {
+                if class.fee_asset.is_some() {
                     conflicts.push(format!(
                         "route {route} of package {package_hash} class {} is signed with \
                          {:?} but this build derives {:?}",
@@ -459,14 +465,14 @@ fn refresh_developer_provenance_catalog(
                     continue;
                 }
                 // The whole value, not just the asset: the guard above
-                // compares chain and asset, so printing the asset alone
-                // reported a chain-only change as "usdc to usdc".
-                eprintln!(
-                    "note: re-derived fee asset for {} from {:?} to {:?}",
+                // compares chain and asset, so reporting the asset alone
+                // described a chain-only change as "usdc to usdc".
+                notes.push(format!(
+                    "re-derived fee asset for {} from {:?} to {:?}",
                     class.operation_class.as_str(),
                     class.fee_asset,
                     derived,
-                );
+                ));
                 class.fee_asset = derived;
             }
         }
@@ -475,24 +481,17 @@ fn refresh_developer_provenance_catalog(
         bail!(
             "this developer catalog is signed with fee assets that disagree with what this \
              build derives: {}. One of the two sides is stale and the refresh cannot tell \
-             which, so it refuses rather than re-sign a value the record already carries. \
-             Either this build's FEE_BEARING_OPERATION_CLASSES is wrong for that class or \
-             does not catalogue it, or the record is the stale side — a table row corrected \
-             since this root was enrolled, or a Petal that has changed since. If the record \
-             is right, make this build's table agree with what the Petal declares. If the \
-             table is right, re-enrolling that Petal re-derives its records from the table \
-             and needs no override, though only for the package hash on disk, and not from \
-             inside the launcher, which stops here before it reaches enrolment. Otherwise \
-             {}=1 rewrites every record listed above in one pass, in both directions at once \
-             (records the lineage marks inactive are skipped before this check and never \
-             appear here), \
-             so read the per-record notes above to see what it changed: a claim declaring \
-             the rewritten value is then authorized where its approval's value limits cover \
-             that asset, and a Petal still declaring the old value is denied — \
-             FEE_NOT_ALLOWED where the value was cleared, FEE_ASSET_MISMATCH where it was \
-             replaced.",
+             which, so it refuses rather than re-sign a value the record already carries, \
+             and leaves the catalog untouched. Either this build's \
+             FEE_BEARING_OPERATION_CLASSES is wrong for that class or does not catalogue \
+             it, or the record is the stale side — a table row corrected since this root \
+             was enrolled, or a Petal that has changed since. If the record is right, make \
+             this build's table agree with what the Petal declares. If the table is right, \
+             re-enrolling that Petal re-derives its records from the table, though only for \
+             the package hash on disk, and not from inside the launcher, which stops here \
+             before it reaches enrolment. Records the lineage marks inactive are skipped \
+             before this check and never appear above.",
             conflicts.join("; "),
-            REWRITE_EXISTING_FEE_ASSETS,
         );
     }
     catalog.records.extend(developer_records);
@@ -514,9 +513,10 @@ fn refresh_developer_provenance_catalog(
         serde_jcs::to_vec(&record.subject).expect("provenance subject is serializable")
     });
     if current == catalog {
-        return Ok(());
+        return Ok(Vec::new());
     }
-    rewrite_private_json(&catalog_path, &serde_json::to_value(catalog)?)
+    rewrite_private_json(&catalog_path, &serde_json::to_value(catalog)?)?;
+    Ok(notes)
 }
 
 #[cfg(feature = "triad-dev-harness")]
@@ -709,22 +709,6 @@ fn developer_route_operation_classes(
         .collect()
 }
 
-/// Opt-in to let a developer catalog refresh overwrite a fee asset a record was
-/// already signed with — whether this build catalogues that class differently
-/// or not at all. Without it the refresh refuses, so the change is a choice the
-/// operator makes rather than a silent rewrite.
-#[cfg(feature = "triad-dev-harness")]
-const REWRITE_EXISTING_FEE_ASSETS: &str = "BLOOM_TRIAD_DEV_REWRITE_EXISTING_FEE_ASSETS";
-
-/// Only an exact `1` enables the overwrite. Testing for the variable's mere
-/// presence would make `=0` — the spelling an operator reaches for to turn
-/// something off — enable a destructive re-signing instead, and the refusal
-/// message tells them to set `1`.
-#[cfg(feature = "triad-dev-harness")]
-fn rewrite_existing_requested(value: Option<&std::ffi::OsStr>) -> bool {
-    value.is_some_and(|value| value == std::ffi::OsStr::new("1"))
-}
-
 /// The one Hyperliquid operation class whose every claim declares a fee:
 /// builder-bearing orders sign under it and nothing else does. No released
 /// Petal emits it yet — that route split lives in bloom-petal-hyperliquid#19,
@@ -741,61 +725,22 @@ const HYPERLIQUID_BUILDER_ORDER_CLASS: &str = "hyperliquid.builder_order";
 
 /// One row per operation class whose *every* claim declares an exact fee.
 ///
-/// Adding a venue takes more than a row. The fee must be derivable from what
-/// the owner signs, or Broker counts a figure nothing can check — that
-/// precondition is why Polymarket's class is absent below. Given it, a venue
-/// is one row here plus the Petal-side route split that makes the new class
-/// uniformly fee-bearing. A row for a class no installed Petal
-/// emits stays inert — and releasing it also needs the class on the Petal's
-/// `PetalAuthorityRoute` row in `github_source.rs` and a pin bump, or
-/// `validate_release_authority` rejects the release for declaring a class the
-/// pin does not list.
+/// A row is only legitimate where the fee is derivable from what the owner
+/// signs, and where Broker bounds the declared amount against it. Without the
+/// first, nothing can check the figure; without the second, nothing does.
 ///
-/// It is not sufficient on its own. Broker reviews a class only if it is
-/// registered there, and `hyperliquid.builder_order` appears in neither
-/// `MESSAGE_REVIEW_OPERATION_CLASSES` nor
-/// `POLYMARKET_REVIEW_OPERATION_CLASSES`, so a builder order is not required
-/// to carry the decoded order review `hyperliquid.order` must, and a
-/// session-signed one falls outside `verify_hyperliquid_agent_use`, which
-/// matches `hyperliquid.agent_action` with no declared fee. Cataloguing a fee
-/// asset makes the claim authorizable; it does not make the operation
-/// reviewed.
+/// Adding a venue takes more than a row: it also needs the Petal-side route
+/// split that makes the new class uniformly fee-bearing. A row for a class no
+/// installed Petal emits stays inert. Releasing it additionally needs the
+/// class on the Petal's `PetalAuthorityRoute` row in `github_source.rs` and a
+/// pin bump, or `validate_release_authority` rejects the release for declaring
+/// a class the pin does not list.
 ///
-/// Polymarket's builder-code order class is deliberately absent. Its fee
-/// cannot be bounded from what the owner signs: CLOB V2 removed
-/// `feeRateBps`, so the signed order carries no fee at all, and the builder's
-/// maker and taker rates live off-chain on the builder's profile with no
-/// per-user approval. Cataloguing it would let Broker count a fee that
-/// nothing can check. bloom-broker#131 is written to close that gap for
-/// Hyperliquid by deriving Broker's own bound from the signed order, per leg,
-/// and refusing a claim that declares less — but it is open and **not pinned
-/// here**, so today neither venue's declared fee is checked against the
-/// signature. Cataloguing only the venue whose fee *can* be bounded is the
-/// conservative half of that asymmetry, taken on the expectation that #131
-/// lands and is pinned. Until something bounds a Polymarket builder fee that
-/// class stays fee-free, and a claim declaring a fee under it is denied
-/// `FEE_NOT_ALLOWED`.
-///
-/// The pin moved with master. The revision in `Cargo.toml` now does have
-/// `message_review.rs` and its per-venue modules, and `agent_action` appears
-/// in `service.rs` — an earlier revision of this comment said otherwise and
-/// was made wrong by that merge. What the pin still does not have is this
-/// class in either review table, so it is unreviewed because it is unlisted,
-/// not because nothing is. The delegated-action witness matches
-/// `hyperliquid.agent_action` with no declared fee, so a session-signed
-/// builder order falls outside it there too.
-///
-/// Registering a fee-bearing class there is NOT the remedy. Polymarket's
-/// `validate_petal_profile` rejects any claim in a
-/// `POLYMARKET_REVIEW_OPERATION_CLASSES` class that declares debits,
-/// destinations or a fee, so listing the builder-code class would deny every
-/// claim it exists to permit; and `message_review_requires_exact` makes Broker
-/// refuse a reusable Petal approval whose scope contains a reviewed class, so
-/// listing the Hyperliquid one would make a builder-bound session's scope
-/// unpreparable. A plain session is unaffected: #19's manifest declares both
-/// classes, but each route grant is filtered by the classes the Petal actually
-/// requests, and it asks for the builder class only when a builder is bound.
-/// See "Operation-class granularity and `fee_asset`" in
+/// Cataloguing a fee asset makes a claim authorizable; it does not make the
+/// operation reviewed, and registering the class in Broker's review tables is
+/// not the remedy. Which venues qualify, why Polymarket's builder-code class
+/// does not, and what Broker must bound first are recorded under
+/// "Operation-class granularity and `fee_asset`" in
 /// `docs/architecture/Sealed Approvals.md`.
 const FEE_BEARING_OPERATION_CLASSES: &[CataloguedFeeAsset] = &[CataloguedFeeAsset {
     operation_class: HYPERLIQUID_BUILDER_ORDER_CLASS,
@@ -2037,27 +1982,6 @@ mod tests {
         assert_eq!(fee.asset, "usdc");
     }
 
-    /// `=0` is the spelling an operator reaches for to turn something off, so
-    /// presence alone must not enable a destructive re-signing. Tested through
-    /// the parser rather than the process environment, which would race the
-    /// other tests in this module.
-    #[cfg(feature = "triad-dev-harness")]
-    #[test]
-    fn only_an_explicit_one_permits_overwriting_an_existing_fee_asset() {
-        use std::ffi::OsStr;
-        assert!(rewrite_existing_requested(Some(OsStr::new("1"))));
-        for refused in ["0", "", "true", "yes", "01", " 1"] {
-            assert!(
-                !rewrite_existing_requested(Some(OsStr::new(refused))),
-                "{refused:?} must not enable overwriting"
-            );
-        }
-        assert!(
-            !rewrite_existing_requested(None),
-            "unset must not enable it"
-        );
-    }
-
     /// A record signed with a *different* fee asset for a class this build does
     /// catalogue is the same operational risk as clearing one: it matched its
     /// Petal before the refresh and would not after, with FEE_ASSET_MISMATCH
@@ -2068,11 +1992,6 @@ mod tests {
         let _fixture = FIXTURE_PETAL
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        assert!(
-            std::env::var_os(REWRITE_EXISTING_FEE_ASSETS).is_none(),
-            "{REWRITE_EXISTING_FEE_ASSETS} is exported in this environment, which turns \
-             the refusal this test asserts into a rewrite"
-        );
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("config");
         fs::create_dir(&output).unwrap();
@@ -2184,11 +2103,6 @@ mod tests {
         let _fixture = FIXTURE_PETAL
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        assert!(
-            std::env::var_os(REWRITE_EXISTING_FEE_ASSETS).is_none(),
-            "{REWRITE_EXISTING_FEE_ASSETS} is exported in this environment, which turns \
-             the refusal this test asserts into a rewrite"
-        );
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("config");
         fs::create_dir(&output).unwrap();
@@ -2274,11 +2188,6 @@ mod tests {
         let _fixture = FIXTURE_PETAL
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        assert!(
-            std::env::var_os(REWRITE_EXISTING_FEE_ASSETS).is_none(),
-            "{REWRITE_EXISTING_FEE_ASSETS} is exported in this environment, which turns \
-             the refusal this test asserts into a rewrite"
-        );
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("config");
         fs::create_dir(&output).unwrap();
@@ -2448,11 +2357,6 @@ mod tests {
         let _fixture = FIXTURE_PETAL
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        assert!(
-            std::env::var_os(REWRITE_EXISTING_FEE_ASSETS).is_none(),
-            "{REWRITE_EXISTING_FEE_ASSETS} is exported in this environment, which turns \
-             the refusal this test asserts into a rewrite"
-        );
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("config");
         fs::create_dir(&output).unwrap();
@@ -2549,8 +2453,9 @@ mod tests {
              {message}"
         );
         assert!(
-            message.contains(REWRITE_EXISTING_FEE_ASSETS),
-            "the refusal must name the opt-in: {message}"
+            message.contains("leaves the catalog untouched"),
+            "the refusal must say that nothing was written, because the operator is told \
+             to go and change one of the two sides: {message}"
         );
 
         // And it must leave the record alone rather than half-rewriting it.
@@ -2633,7 +2538,18 @@ mod tests {
         rewrite_private_json(&catalog_path, &serde_json::to_value(&stale).unwrap()).unwrap();
 
         let template = template_dir().join("provenance-catalog.unsigned.json");
-        refresh_developer_provenance_catalog(&template, &output, owner).unwrap();
+        let notes = refresh_developer_provenance_catalog(&template, &output, owner).unwrap();
+        assert_eq!(
+            notes.len(),
+            rewritten,
+            "a heal that was written must be announced, once per record: {notes:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .all(|note| note.contains(HYPERLIQUID_BUILDER_ORDER_CLASS)),
+            "a note must name the class whose fee asset it re-derived: {notes:?}"
+        );
         let refreshed = read();
         refreshed.validate_shape().unwrap();
 
@@ -2677,6 +2593,100 @@ mod tests {
             .expect("a carried legacy System record must survive the refresh");
         assert_eq!(legacy_fee.chain.as_str(), "solana");
         assert_eq!(legacy_fee.asset, "native");
+    }
+
+    /// Notes announce what was saved, so a refusal must announce nothing. The
+    /// walk heals record by record and refuses only once every record has been
+    /// seen, so a catalog that heals one class and conflicts on another used to
+    /// print `re-derived fee asset` for a change the refusal then discarded —
+    /// while the refusal itself told the operator to read those notes to see
+    /// what had changed. Nothing had.
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
+    fn a_refused_refresh_announces_nothing_it_did_not_save() {
+        let _fixture = FIXTURE_PETAL
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("config");
+        fs::create_dir(&output).unwrap();
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o700)).unwrap();
+        let owner = rustix::process::geteuid().as_raw();
+        let plan = EnrollmentPlan {
+            template_dir: template_dir(),
+            output_dir: output.clone(),
+            login_uid: 1_001,
+            broker_uid: 1_002,
+            signer_uid: 1_003,
+            session_socket_gid: 1_004,
+            release_digest: "44".repeat(32),
+        };
+        generate_for_owner(&plan, owner).unwrap();
+        let petal_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join("tests/fixtures/triad-authority-petal");
+        enroll_developer_petal_provenance(&output, &petal_dir, owner).unwrap();
+        let catalog_path = output.join("provenance-catalog.json");
+        let mut stale: ProvenanceCatalog =
+            serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
+
+        // One record carrying both halves: a catalogued class with no value,
+        // which the walk heals in memory, and an uncatalogued class carrying
+        // one, which makes the walk refuse. The refusal lands only after every
+        // record has been walked, so the heal is always reached, and always
+        // thrown away.
+        let builder_class = Token::new(HYPERLIQUID_BUILDER_ORDER_CLASS).unwrap();
+        let mut planted = 0;
+        for record in &mut stale.records {
+            if !matches!(record.subject, ProvenanceSubject::Petal { .. })
+                || record.publisher == Token::new("bloom-release-pins").unwrap()
+            {
+                continue;
+            }
+            let Some(class) = record.operation_classes.first_mut() else {
+                continue;
+            };
+            assert!(
+                catalogued_fee_asset(class.operation_class.as_str())
+                    .unwrap()
+                    .is_none(),
+                "the fixture class must be uncatalogued for the conflict half to bite"
+            );
+            class.fee_asset = Some(ProvenanceFeeAsset {
+                chain: Token::new("hyperliquid").unwrap(),
+                asset: "usdc".to_owned(),
+            });
+            record.operation_classes.insert(
+                0,
+                ProvenanceOperationClass {
+                    operation_class: builder_class.clone(),
+                    fee_asset: None,
+                },
+            );
+            planted += 1;
+        }
+        assert!(planted > 0, "the fixture must enroll a developer record");
+        rewrite_private_json(&catalog_path, &serde_json::to_value(&stale).unwrap()).unwrap();
+        let before = fs::read(&catalog_path).unwrap();
+
+        let template = template_dir().join("provenance-catalog.unsigned.json");
+        let error = refresh_developer_provenance_catalog(&template, &output, owner)
+            .expect_err("a conflicting record must refuse the refresh");
+
+        // The heal it walked through reached nothing: no note can escape the
+        // Err path, and there is no written change for one to have described.
+        assert_eq!(
+            fs::read(&catalog_path).unwrap(),
+            before,
+            "a refused refresh must leave the catalog byte-identical"
+        );
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("leaves the catalog untouched"),
+            "the refusal must say nothing was written rather than point at notes: {message}"
+        );
     }
 
     #[cfg(feature = "triad-dev-harness")]

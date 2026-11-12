@@ -380,12 +380,16 @@ off-chain on the builder's profile with no per-user approval. Cataloguing it
 would have Broker count a fee nothing can check. Hyperliquid's is catalogued
 because its fee *is* derivable from the signed order: bloom-broker#131 computes
 Broker's own bound from each leg's limit price and size and refuses a claim
-declaring less. That PR is open and **not pinned here**, so today neither
-venue's declared fee is checked against the signature — cataloguing only the
-venue whose fee can be bounded is the conservative half of the asymmetry, taken
-on the expectation that #131 lands and is pinned. Until something bounds a
-Polymarket builder fee, that class stays fee-free and a claim declaring a fee
-under it is denied `FEE_NOT_ALLOWED`.
+declaring less.
+
+Derivable is the precondition; bounded is the requirement. A declared fee that
+Broker does not check against the signature is a figure the owner's limits
+count and nothing verifies, so a row here is only safe once the pinned Broker
+bounds that venue's fee — which is why the row and the pin that bounds it
+belong in the same change, and why a Petal emitting the class must not be
+released ahead of either. Until something bounds a Polymarket builder fee, that
+class stays fee-free and a claim declaring a fee under it is denied
+`FEE_NOT_ALLOWED`.
 
 Splitting a fee-bearing operation into its own operation class is what makes
 a `fee_asset` safe to assert. Adding one to a shared class is a breaking
