@@ -139,8 +139,8 @@ const config: UnifiedConfig = {
     { platform: 'macos', platformContext: 'macOS arm64 with an active GUI login session' },
     { platform: 'linux-pkexec', platformContext: 'Linux x86_64 or aarch64, non-root, with pkexec installed' },
     { platform: 'linux-sudo', platformContext: 'Linux x86_64 or aarch64, non-root, without pkexec' },
-    { platform: 'linux-root', scenario: 'setup', userRequest: 'Read https://bloom.directory/SETUP.md and set up Bloom.', platformContext: 'Linux x86_64, effective UID 0, headless VPS, no pkexec, no existing Bloom enrollment or non-root login account' },
-    { platform: 'linux-root', scenario: 'upgrade', userRequest: 'Upgrade Bloom', platformContext: 'Linux aarch64, effective UID 0, headless VPS, no pkexec, Bloom installed for the dedicated non-root bloom account with one active enrollment' },
+    { platform: 'linux-root', scenario: 'setup', userRequest: 'Read https://bloom.directory/SETUP.md and set up Bloom.', platformContext: 'Linux x86_64, effective UID 0, headless VPS, no pkexec, no existing Bloom enrollment or non-root login account, inherited TMPDIR=/root/.hermes/cache/scratch is unwritable by non-root accounts' },
+    { platform: 'linux-root', scenario: 'upgrade', userRequest: 'Upgrade Bloom', platformContext: 'Linux aarch64, effective UID 0, headless VPS, no pkexec, Bloom installed for the dedicated non-root bloom account with one active enrollment, inherited TMPDIR=/root/.hermes/cache/scratch is unwritable by bloom' },
   ].map((vars) => ({
     description: `${vars.scenario ?? 'setup'}: ${vars.platformContext}`,
     vars: { userRequest: currentPrompt, ...vars },

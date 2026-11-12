@@ -95,18 +95,22 @@ than requesting a human login. For an existing shared account, retain its
 session policy and require its active user manager instead of enabling linger.
 
 Run the review/download/staging sequence below **as the selected account**,
-with its home, from `/tmp`. Create the review directory as that account too.
+with its home, from `/tmp`. Explicitly set `TMPDIR=/tmp` inside each
+`runuser` invocation: `runuser -u` can preserve root's `TMPDIR`, and changing
+`HOME` alone does not make a root-private scratch directory writable. Both
+review-directory creation and staging use `TMPDIR`. Create the review directory
+as that account too.
 For each shell command in that sequence, and all later CLI/VFS checks, use:
 
 ```sh
-runuser -u "$login_user" -- env HOME="$login_home" USER="$login_user" LOGNAME="$login_user" XDG_RUNTIME_DIR="/run/user/$login_uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$login_uid/bus" /bin/sh -c 'COMMAND'
+runuser -u "$login_user" -- env HOME="$login_home" TMPDIR=/tmp USER="$login_user" LOGNAME="$login_user" XDG_RUNTIME_DIR="/run/user/$login_uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$login_uid/bus" /bin/sh -c 'COMMAND'
 ```
 
 `COMMAND` stands for the reviewed command, with appropriate shell quoting.
 After inspection, execute the exact staged setup script directly as:
 
 ```sh
-runuser -u "$login_user" -- env HOME="$login_home" sh "$review_dir/setup.sh"
+runuser -u "$login_user" -- env HOME="$login_home" TMPDIR=/tmp sh "$review_dir/setup.sh"
 ```
 
 Do not evaluate staging output. Capture the non-root staging values for the root

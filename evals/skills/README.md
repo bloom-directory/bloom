@@ -21,7 +21,9 @@ host, and "Upgrade Bloom" with an existing dedicated-account enrollment.
 These require direct execution of the same verified snapshot command, non-root
 staging/account selection, session refresh, and VFS/audit verification. A root
 response handing the command or a fresh-login requirement to the user fails.
-The non-root platform cases retain their existing elevation requirements.
+Both root cases include an inherited root-private `TMPDIR`; their staging
+commands must explicitly use `TMPDIR=/tmp` in the selected account. The
+non-root platform cases retain their existing elevation requirements.
 
 The deterministic grader reports these dimensions independently:
 
@@ -46,8 +48,10 @@ npm ci
 npm run check
 ```
 
-`check` runs the grader's fixtures and validates every configuration without
-model calls. CI runs it whenever `skills/**` or `evals/skills/**` changes.
+`check` runs the grader's fixtures, exercises both documented post-`runuser`
+environment payloads with an unusable inherited `TMPDIR`, and validates every
+configuration without model calls. The environment fixtures run on macOS too;
+they test temporary-directory creation, not Linux account switching. CI runs it whenever `skills/**` or `evals/skills/**` changes.
 
 These tool-less evaluations check the response before execution, not service
 readiness on a host. Validate the root/headless procedure on a disposable Linux

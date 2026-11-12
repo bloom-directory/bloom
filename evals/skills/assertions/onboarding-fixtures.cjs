@@ -479,6 +479,7 @@ ${SCOPE_SENTENCE}`;
   for (const [name, bad] of [
     ['sudo handoff', response.replace(ROOT_HANDOFF_COMMAND, SUDO_HANDOFF_COMMAND)],
     ['pkexec despite root', response.replace(ROOT_HANDOFF_COMMAND, PKEXEC_HANDOFF_COMMAND)],
+    ['inherited root TMPDIR', response.replace(' TMPDIR=/tmp', '')],
     ['root staging', response.replace(ROOT_REVIEW_RUN_COMMAND, REVIEW_RUN_COMMAND)],
     ['UID zero', response.replace("'UID'", "'0'")],
     ['changed verifier', response.replace('ssh-keygen -Y verify', 'ssh-keygen -Y sign')],

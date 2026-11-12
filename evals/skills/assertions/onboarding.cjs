@@ -23,7 +23,7 @@ const MACOS_HANDOFF_COMMAND = INSTALL_REFERENCE.match(/^\/usr\/bin\/osascript \\
 // single-quoted values (`'\''` escapes a quote inside a value). Whitespace runs
 // may differ; nothing else may.
 const ROOT_HANDOFF_COMMAND = PKEXEC_HANDOFF_COMMAND.replace(/^pkexec /, '');
-const ROOT_REVIEW_RUN_COMMAND = 'runuser -u "$login_user" -- env HOME="$login_home" sh "$review_dir/setup.sh"';
+const ROOT_REVIEW_RUN_COMMAND = 'runuser -u "$login_user" -- env HOME="$login_home" TMPDIR=/tmp sh "$review_dir/setup.sh"';
 const ROOT_SCRIPT = SUDO_HANDOFF_COMMAND.match(/^sudo \/bin\/sh -c '([^']+)' bloom-install /)[1];
 const ROOT_SCRIPT_SOURCE = ROOT_SCRIPT.trim()
   .split(/\s+/)
@@ -64,7 +64,7 @@ const DIRECT_PIPE_PATTERN = /curl[^\n|]*\/setup\.sh"?\s*\|\s*(?:sudo\s+)?(?:sh|b
 // Root runs only the fixed snapshot script with three captured values.
 const SUDO_HANDOFF_PATTERN = rootHandoffPattern('sudo');
 const ROOT_HANDOFF_PATTERN = rootHandoffPattern('');
-const ROOT_REVIEW_RUN_PATTERN = /(?<![\w/.-])runuser\s+-u\s+"\$login_user"\s+--\s+env\s+HOME="\$login_home"\s+(?:sh|bash)\s+"\$review_dir\/setup\.sh"/;
+const ROOT_REVIEW_RUN_PATTERN = /(?<![\w/.-])runuser\s+-u\s+"\$login_user"\s+--\s+env\s+HOME="\$login_home"\s+TMPDIR=\/tmp\s+(?:sh|bash)\s+"\$review_dir\/setup\.sh"/;
 // Adding environment or changing the root turns the reviewed handoff into a
 // different privileged command.
 const WIDENED_SUDO_PATTERN = /sudo\s+(?:-[A-Za-z]+\s+)*[A-Z][A-Z0-9_]*=/;
