@@ -55,8 +55,8 @@ limit.`;
 const currentPrompt = read('prompts/current.txt');
 const currentSkill = [
   readFileSync(resolve(skillDir, 'SKILL.md'), 'utf8').trim(),
-  // The new-install scenario follows this reference; the provider has no tools.
-  readFileSync(resolve(skillDir, 'references/install.md'), 'utf8').trim(),
+  // The new-install scenario follows the guide SKILL.md links; the provider has no tools.
+  readFileSync(resolve(evalDir, '../../install/install.md'), 'utf8').trim(),
 ].join('\n\n');
 
 // Evaluate the skill package as published: its filesystem entrypoint
