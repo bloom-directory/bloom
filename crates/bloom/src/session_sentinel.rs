@@ -500,31 +500,10 @@ mod tests {
                 "logout retained an authenticated channel"
             );
         }
-        // Nothing may still be served over the socket once the sentinel is
-        // gone. A refused connect() is not a synchronous observation of that.
-        // The listener's descriptor is closed before the sentinel task
-        // completes, yet with the rest of this suite running alongside, a
-        // connect() issued the moment the task ends still succeeds now and
-        // again: 8 of 12,000 in-suite runs on Darwin 27.2, where the window
-        // measured 43-570us, and 4 of 12,000 on Linux 6.12 aarch64. That
-        // window is what made this test flaky, on both platforms. It needs
-        // the suite's pressure -- a bare close() of a listening socket
-        // refuses at once, and so does this shutdown reduced to a standalone
-        // binary -- so the mechanism is not pinned down. Assert what holds
-        // either way: where the connection is refused there is nothing left
-        // to check, and a connection the kernel still hands out has no
-        // sentinel behind it, so it carries no data. How it says so differs
-        // by platform, end of file on Darwin and ECONNRESET on Linux, and
-        // neither is a served channel. Only a retained listener holds one
-        // open, and the timeout catches that.
-        if let Ok(mut late) = tokio::net::UnixStream::connect(&socket).await {
-            let served =
-                tokio::time::timeout(std::time::Duration::from_secs(1), late.read(&mut [0; 1]))
-                    .await
-                    .expect("logout retained the listener");
-            // Only a readable byte means the socket is still served.
-            assert!(!matches!(served, Ok(1..)), "logout retained the listener");
-        }
+        assert!(
+            tokio::net::UnixStream::connect(&socket).await.is_err(),
+            "logout retained the listener"
+        );
     }
 
     #[test]
