@@ -162,23 +162,7 @@ jobs:
       # the runner's unrestricted sudo satisfies that rule.
       - name: Install the launcher's Linux prerequisites
         run: |
-          # The same transient Ubuntu mirror DNS failure that reddened `local
-          # integration tests` in ci.yml: `apt-get update` logs
-          # `Temporary failure resolving 'azure.archive.ubuntu.com'`, exits 0
-          # on its warnings, and the install then exits 100 having fetched
-          # nothing. Retry rather than lose a release run to a resolver blip.
-          for attempt in $(seq 1 4); do
-            if sudo apt-get update && sudo apt-get install -y nfs-common; then
-              break
-            fi
-            if [ "$attempt" -eq 4 ]; then
-              echo "::error::could not install nfs-common after 4 attempts" >&2
-              exit 1
-            fi
-            delay=$((attempt * 15))
-            echo "::warning::apt attempt ${attempt} failed; retrying in ${delay}s" >&2
-            sleep "${delay}"
-          done
+          sudo apt-get update && sudo apt-get install -y nfs-common
           sudo loginctl enable-linger "$(id -un)"
           for _ in $(seq 1 30); do
             [ -S "/run/user/$(id -u)/bus" ] && break
