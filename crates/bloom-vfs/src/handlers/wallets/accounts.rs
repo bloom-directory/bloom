@@ -2335,7 +2335,7 @@ fn approval_next_step(
     match state {
         S::Prepared | S::AwaitingCeremony => (
             "awaiting_ceremony",
-            "Give ceremony_url to the owner. As soon as they approve, write retry_body to retry_path. Retrying earlier is safe: it starts no new ceremony and returns permission denied again.",
+            "Give ceremony_url to the owner, then write retry_body to retry_path. Through bloom vfs write or MCP it waits for their approval and sends; on a mount it is denied until they approve, so write it again after. Neither starts a new ceremony.",
         ),
         S::Active => (
             "active",

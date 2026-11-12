@@ -813,6 +813,42 @@ pub struct IpcServer {
     activation_health_only: bool,
     ready: Option<Arc<dyn Fn() + Send + Sync>>,
     shutdown: Arc<Notify>,
+    approval_wait: std::time::Duration,
+}
+
+/// How long an IPC confirm waits for the owner's approval before it returns.
+/// It stays under the 60 s request timeout common MCP clients default to.
+const APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(50);
+const APPROVAL_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+enum WriteError {
+    Handler(HandlerError),
+    /// The owner's approval did not arrive; the message says what to do.
+    Approval(String),
+}
+
+impl From<HandlerError> for WriteError {
+    fn from(error: HandlerError) -> Self {
+        WriteError::Handler(error)
+    }
+}
+
+/// The approval challenge beside a pending outbox `confirm` sink.
+fn confirm_challenge_path(path: &VfsPath) -> Option<VfsPath> {
+    match path.segments() {
+        [root, _, _, chains, _, outbox, pending, _, control]
+            if root == "wallets"
+                && chains == "chains"
+                && outbox == "outbox"
+                && pending == "pending"
+                && matches!(control.as_str(), "confirm" | "confirm.override") =>
+        {
+            let mut segments = path.segments().to_vec();
+            segments.pop();
+            VfsPath::parse(&format!("/{}/approval_challenge.json", segments.join("/"))).ok()
+        }
+        _ => None,
+    }
 }
 
 impl IpcServer {
@@ -831,6 +867,7 @@ impl IpcServer {
             activation_health_only: false,
             ready: None,
             shutdown: Arc::new(Notify::new()),
+            approval_wait: APPROVAL_WAIT,
         }
     }
 
@@ -1140,9 +1177,10 @@ impl IpcServer {
                 Ok(v) => Response::ok(id, v),
                 Err(e) => map_handler_err(id, e),
             },
-            "write" => match self.do_write(&req.params).await {
+            "write" => match self.do_write(&req.params, &context).await {
                 Ok(()) => Response::ok(id, Value::Null),
-                Err(e) => map_handler_err(id, e),
+                Err(WriteError::Handler(e)) => map_handler_err(id, e),
+                Err(WriteError::Approval(message)) => Response::err(id, -32007, message),
             },
             "write_with_lookup" => match self.do_write_with_lookup(&req.params).await {
                 Ok(value) => Response::ok(id, value),
@@ -1289,13 +1327,98 @@ impl IpcServer {
         Ok(json!({ "bytes_b64": B64.encode(&bytes), "len": bytes.len() }))
     }
 
-    async fn do_write(&self, params: &Value) -> Result<(), HandlerError> {
+    async fn do_write(
+        &self,
+        params: &Value,
+        context: &IpcOperationContext,
+    ) -> Result<(), WriteError> {
         let path = parse_path(params)?;
         if write_path_uses_wallet_signer(&path) && !is_fee_repair_write(&path, params) {
-            return Err(HandlerError::PermissionDenied);
+            return Err(HandlerError::PermissionDenied.into());
         }
         let bytes = parse_write_bytes(params)?;
-        self.vfs.write(&path, &bytes).await
+        let Some(challenge) = confirm_challenge_path(&path) else {
+            return Ok(self.vfs.write(&path, &bytes).await?);
+        };
+        let waiting_for = self.approval_id(&challenge).await;
+        match self.vfs.write(&path, &bytes).await {
+            Err(HandlerError::PermissionDenied) => {
+                self.await_approval(&path, &bytes, &challenge, waiting_for, context)
+                    .await
+            }
+            result => Ok(result?),
+        }
+    }
+
+    async fn approval_id(&self, challenge_path: &VfsPath) -> Option<String> {
+        let raw = self.vfs.read(challenge_path).await.ok()?;
+        let challenge: Value = serde_json::from_slice(&raw).ok()?;
+        challenge["approval_id"].as_str().map(str::to_owned)
+    }
+
+    /// A confirm denied for owner approval returns the ceremony link at once
+    /// when the approval is new to the caller. A confirm made after the
+    /// caller already saw that approval waits, outside every VFS lock, for
+    /// Broker to report it active, then repeats the same write. That retry is
+    /// the ordinary confirm path: it re-verifies the approval with Broker and
+    /// signs at most once under the entry's dispatch marker. Waiting never
+    /// starts a ceremony or restages anything.
+    async fn await_approval(
+        &self,
+        path: &VfsPath,
+        bytes: &[u8],
+        challenge_path: &VfsPath,
+        waiting_for: Option<String>,
+        context: &IpcOperationContext,
+    ) -> Result<(), WriteError> {
+        let deadline = tokio::time::Instant::now() + self.approval_wait;
+        let challenge_file = challenge_path.to_string_path();
+        let mut retried_active = false;
+        let mut first = true;
+        loop {
+            let Ok(raw) = self.vfs.read(challenge_path).await else {
+                // A denial with no challenge is not an approval wait. A
+                // challenge that disappears mid-wait means the entry left
+                // `pending/` (sent, cancelled, expired): report where it went.
+                if first {
+                    return Err(HandlerError::PermissionDenied.into());
+                }
+                return Ok(self.vfs.write(path, bytes).await?);
+            };
+            let challenge: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
+            let url = challenge["ceremony_url"].as_str().unwrap_or_default();
+            let new_approval = challenge["approval_id"].as_str() != waiting_for.as_deref();
+            match challenge["state"].as_str().unwrap_or("unknown") {
+                "active" if retried_active => return Err(HandlerError::PermissionDenied.into()),
+                "active" => {
+                    retried_active = true;
+                    match self.vfs.write(path, bytes).await {
+                        Err(HandlerError::PermissionDenied) => continue,
+                        result => return Ok(result?),
+                    }
+                }
+                "awaiting_ceremony" | "unknown" => retried_active = false,
+                state => {
+                    let next = challenge["next"].as_str().unwrap_or_default();
+                    return Err(WriteError::Approval(format!(
+                        "permission denied: owner approval {state}. {next} Details: {challenge_file}"
+                    )));
+                }
+            }
+            if new_approval || context.is_cancelled() || tokio::time::Instant::now() >= deadline {
+                let link = if url.is_empty() {
+                    format!("in {challenge_file}")
+                } else {
+                    format!("{url} (also in {challenge_file})")
+                };
+                return Err(WriteError::Approval(format!(
+                    "permission denied: owner approval required. Give the human the ceremony link {link}, then write confirm to {} again; it waits for the approval and sends.",
+                    path.to_string_path()
+                )));
+            }
+            first = false;
+            tokio::time::sleep(APPROVAL_POLL).await;
+        }
     }
 
     /// Serialize a VFS mutation with lookup of the identity projection it
@@ -2568,6 +2691,174 @@ mod tests {
 
         fn is_read_side_effecting(&self, path: &VfsPath) -> bool {
             path.segments().last().map(String::as_str) == Some("confirm")
+        }
+    }
+
+    /// One pending outbox entry as the wallets handler presents it: the
+    /// first denied confirm creates the challenge, a confirm signs only while
+    /// Broker reports the approval active, a signed entry leaves `pending/`,
+    /// and the challenge reports Broker's live state.
+    struct ApprovalEntry {
+        state: std::sync::Mutex<&'static str>,
+        challenged: AtomicBool,
+        writes: AtomicUsize,
+        signatures: AtomicUsize,
+    }
+
+    impl ApprovalEntry {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                state: std::sync::Mutex::new("awaiting_ceremony"),
+                challenged: AtomicBool::new(false),
+                writes: AtomicUsize::new(0),
+                signatures: AtomicUsize::new(0),
+            })
+        }
+        fn set(&self, state: &'static str) {
+            *self.state.lock().unwrap() = state;
+        }
+        fn signatures(&self) -> usize {
+            self.signatures.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Handler for ApprovalEntry {
+        async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+            Ok(Entry::file(path.segments().last().unwrap()))
+        }
+
+        async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            if self.signatures() > 0 || !self.challenged.load(Ordering::SeqCst) {
+                return Err(HandlerError::NotFound(path.to_string_path()));
+            }
+            let state = *self.state.lock().unwrap();
+            Ok(serde_json::to_vec(&json!({
+                "approval_id": "a1",
+                "state": state,
+                "ceremony_url": "http://localhost:28735/c/abc",
+                "next": format!("next step for {state}."),
+            }))
+            .unwrap())
+        }
+
+        async fn write(&self, path: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            if self.signatures() > 0 {
+                return Err(HandlerError::NotFound(path.to_string_path()));
+            }
+            self.challenged.store(true, Ordering::SeqCst);
+            if *self.state.lock().unwrap() != "active" {
+                return Err(HandlerError::PermissionDenied);
+            }
+            self.signatures.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    const CONFIRM: &str = "/wallets/w/0/chains/base/outbox/pending/tx-1/confirm";
+
+    fn approval_server(entry: &Arc<ApprovalEntry>, wait_ms: u64) -> IpcServer {
+        let mut server = IpcServer::new(
+            Vfs::builder().mount("wallets", entry.clone()).build(),
+            "0",
+            vec![],
+        );
+        server.approval_wait = std::time::Duration::from_millis(wait_ms);
+        server
+    }
+
+    async fn confirm(server: &IpcServer) -> Option<RpcError> {
+        server
+            .dispatch(Request {
+                jsonrpc: "2.0".into(),
+                id: json!(1),
+                method: "write".into(),
+                params: json!({"path": CONFIRM, "bytes_b64": B64.encode(b"confirm")}),
+            })
+            .await
+            .error
+    }
+
+    async fn approve_after(entry: &Arc<ApprovalEntry>, ms: u64, state: &'static str) {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        entry.set(state);
+    }
+
+    /// The first confirm returns the link at once; the second waits.
+    #[tokio::test]
+    async fn first_confirm_returns_the_link_and_the_next_waits_then_signs_once() {
+        let entry = ApprovalEntry::new();
+        let server = approval_server(&entry, 10_000);
+        let started = std::time::Instant::now();
+        let error = confirm(&server).await.expect("approval required");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(error.code, -32007);
+        for needle in [
+            "give the human the ceremony link http://localhost:28735/c/abc",
+            "/wallets/w/0/chains/base/outbox/pending/tx-1/approval_challenge.json",
+            "write confirm to /wallets/w/0/chains/base/outbox/pending/tx-1/confirm again",
+        ] {
+            assert!(
+                error
+                    .message
+                    .to_lowercase()
+                    .contains(&needle.to_lowercase()),
+                "{}",
+                error.message
+            );
+        }
+        // Two agents confirm again concurrently while the owner approves.
+        let (first, second, ()) = tokio::join!(
+            confirm(&server),
+            confirm(&server),
+            approve_after(&entry, 700, "active")
+        );
+        assert_eq!(entry.signatures(), 1);
+        let outcomes = [first.map(|e| e.code), second.map(|e| e.code)];
+        assert!(outcomes.contains(&None), "{outcomes:?}");
+        assert!(
+            outcomes.iter().all(|o| matches!(o, None | Some(-32004))),
+            "{outcomes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_wait_names_the_link_and_a_reconfirm_resumes() {
+        let entry = ApprovalEntry::new();
+        let server = approval_server(&entry, 600);
+        confirm(&server).await.expect("approval required");
+        let started = std::time::Instant::now();
+        let error = confirm(&server).await.expect("no approval yet");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(600));
+        assert_eq!(error.code, -32007);
+        assert!(
+            error.message.contains("http://localhost:28735/c/abc"),
+            "{}",
+            error.message
+        );
+        assert_eq!(entry.signatures(), 0);
+
+        let (again, ()) = tokio::join!(confirm(&server), approve_after(&entry, 300, "active"));
+        assert!(again.is_none(), "{again:?}");
+        assert_eq!(entry.signatures(), 1);
+    }
+
+    #[tokio::test]
+    async fn refused_or_expired_approval_ends_the_wait_without_signing() {
+        for state in ["refused", "expired", "cancelled"] {
+            let entry = ApprovalEntry::new();
+            let server = approval_server(&entry, 10_000);
+            confirm(&server).await.expect("approval required");
+            let started = std::time::Instant::now();
+            let (error, ()) = tokio::join!(confirm(&server), approve_after(&entry, 300, state));
+            let error = error.expect("must not succeed");
+            assert_eq!(error.code, -32007);
+            assert!(error.message.contains(state), "{}", error.message);
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+            // Only the two confirms the agent wrote: the wait never repeats one.
+            assert_eq!(entry.writes.load(Ordering::SeqCst), 2, "{state}");
+            assert_eq!(entry.signatures(), 0, "{state}");
         }
     }
 
