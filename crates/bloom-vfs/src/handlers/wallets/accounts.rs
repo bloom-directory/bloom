@@ -673,6 +673,30 @@ impl WalletsHandler {
         Ok(read)
     }
 
+    /// Fence batch confirmation to the selected account, as single-item controls do.
+    pub async fn require_outbox_account(
+        &self,
+        wallet: &str,
+        number: u32,
+        chain: &str,
+        id: &str,
+    ) -> Result<(), HandlerError> {
+        let view = self.account_view(wallet, number).await?;
+        let from = Self::evm_address(Self::evm_family(&view, chain)?)?;
+        // Batch retries also reconcile already-sent children.
+        let entry = self
+            .tx_engine
+            .outbox
+            .read(wallet, chain, id)
+            .map_err(super::outbox_err)?;
+        if !entry.staged.from.eq_ignore_ascii_case(&from.to_string()) {
+            return Err(HandlerError::not_found(format!(
+                "account {number}/outbox/{id}"
+            )));
+        }
+        Ok(())
+    }
+
     pub(super) async fn lookup_account(
         &self,
         wallet: &str,

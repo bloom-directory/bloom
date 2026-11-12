@@ -277,7 +277,7 @@ pub enum OutboxError {
         (Some(hash), _) => format!("it may have been broadcast as {hash}"),
         (None, SigningEvidence::Entry) => "a signing request may have been sent, but no transaction hash is recorded".to_owned(),
         (None, SigningEvidence::Cancel) => "a cancellation of it may have been signed, but no transaction hash is recorded; reconcile it by running `bloom wallet cancel` for it again".to_owned(),
-        (None, SigningEvidence::Batch { ordered_refs }) => format!("a batch signing request covering it may have been sent; reconcile that batch with `bloom wallet confirm-batch {wallet} {}`, listing its refs in exactly this order", ordered_refs.join(" ")),
+        (None, SigningEvidence::Batch { ordered_refs }) => format!("a batch signing request covering it may have been sent; reconcile that batch with `bloom wallet confirm-batch` for wallet '{wallet}' and its staging account, listing its refs in exactly this order: {}", ordered_refs.join(" ")),
         (None, SigningEvidence::UnreadableBatch) => format!("a batch signing record under outbox/{BATCH_SIGNING_STATE_DIR} could not be read, so Bloom cannot prove this entry was never signed"),
     })]
     PossiblySigned {
@@ -2325,7 +2325,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("`bloom wallet confirm-batch alice anvil:second anvil:first`"),
+                .contains("wallet 'alice' and its staging account, listing its refs in exactly this order: anvil:second anvil:first"),
             "{error}"
         );
     }
