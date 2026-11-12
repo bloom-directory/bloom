@@ -913,7 +913,7 @@ impl WalletsHandler {
             .chain_id;
         let policy =
             crate::advisory_exact_evm_policy(&projection, chain, chain_id).map_err(err_be)?;
-        self.write_outbox_from(wallet, chain, from, &policy, chain_rest, data)
+        self.write_outbox_from(wallet, chain, from, &policy, chain_rest, data, number)
             .await
     }
 
@@ -2188,7 +2188,13 @@ fn evm_approval_challenge(
     use sha2::Digest as _;
     let mut staged = entry.staged.clone();
     let mut retry_body = serde_json::Value::String("confirm".into());
-    let mut control = "confirm";
+    // A warning-bearing entry only ever reaches approval through
+    // `confirm.override`; plain `confirm` is refused before signing.
+    let mut control = if bloom_tx::policy_engine::has_warning(&staged.policy_checks) {
+        "confirm.override"
+    } else {
+        "confirm"
+    };
     let mut plan = "plan.md";
     let replacement_action = format!("{}:{}:replace", staged.chain_id, staged.id);
     if signing.get("action_id").and_then(|value| value.as_str()) == Some(&replacement_action)
@@ -2305,7 +2311,7 @@ fn approval_next_step(
     match state {
         S::Prepared | S::AwaitingCeremony => (
             "awaiting_ceremony",
-            "Give ceremony_url to the owner. As soon as they approve, write retry_body to retry_path. Retrying earlier is safe: it starts no new ceremony and returns permission denied again.",
+            "Give ceremony_url to the owner, then write retry_body to retry_path. Through bloom vfs write or MCP it waits for their approval and sends; on a mount it is denied until they approve, so write it again after. Neither starts a new ceremony.",
         ),
         S::Active => (
             "active",
@@ -2419,6 +2425,25 @@ mod tests {
             format!("{root}/pending/fee-repair/replacement_plan.md")
         );
         assert_eq!(challenge["to"], original.to.as_ref().unwrap().as_str());
+
+        // An ordinary approval of a warning-bearing entry retries through
+        // confirm.override, the only control that can sign it.
+        let mut warned = original.clone();
+        warned.id = "warned".into();
+        warned.policy_checks = vec![bloom_proto::PolicyCheck {
+            rule: "caps.per_tx_usd".into(),
+            outcome: bloom_proto::PolicyOutcome::Warn,
+            class: bloom_proto::PolicyRuleClass::Soft,
+            message: "over cap".into(),
+        }];
+        outbox.write_pending(&warned, "warned plan").unwrap();
+        let warned_entry = outbox.read("main", "polygon", "warned").unwrap();
+        let ordinary = serde_json::json!({ "action_id": "137:warned:confirm" });
+        let challenge = evm_approval_challenge(&warned_entry, &ordinary, root).unwrap();
+        assert_eq!(
+            challenge["retry_path"],
+            format!("{root}/pending/warned/confirm.override")
+        );
 
         let mut altered = request.clone();
         altered["max_priority_fee_per_gas"] = "25000000000".into();

@@ -4,7 +4,7 @@ This is the operating contract for agents using the mounted Bloom virtual
 filesystem. Treat the directory containing this file as the VFS root and keep
 all paths mount-relative. Keep scratch files outside the mount.
 
-`ls` the mount and read `next.md` (actions needing attention). Read on demand:
+`ls` the mount and read `next.md` (pending outbox entries, approvals and policy updates). Read on demand:
 `cat docs/README.md` lists every route, `docs/examples.md` has command
 walkthroughs (including contract deploys and local Anvil), `docs/wallets.md` covers accounts, wallet creation, recovery,
 passkeys and sessions, and `docs/petals.md` lists installed Petals. Read a
@@ -65,14 +65,13 @@ For native transfers and Petal actions that project into the outbox:
    `docs/examples.md`) or to a Petal's `new` (its README).
 2. Identify the new entry in `pending/` by its `intent.json` and `plan.md`,
    never by wildcard, sequence number, `latest` or position.
-3. Write `confirm` to that entry's `confirm` file.
-4. A denied confirm usually means owner approval: read the entry's
-   `approval_challenge.json`, check its wallet, action, intent and expiry, and
-   give its `ceremony_url` to the human. Poll the challenge; when `state` is
-   `active`, write its exact `retry_body` (`confirm` when omitted) to its
-   `retry_path`. The approval does not broadcast on its own. For `expired`,
-   `cancelled` or `refused`, tell the human.
-5. Read `sent/<id>/` or `failed/<id>/` before reporting the result.
+3. Write `confirm` to that entry's `confirm` file. If the owner must
+   approve, its error gives the ceremony link: give it to the human, then
+   write `confirm` again, which waits for their approval and sends. Repeat
+   if it times out. For `expired`, `cancelled` or `refused`, tell the human.
+   On a mount, confirm does not wait: read `approval_challenge.json` and
+   follow its `next`.
+4. Read `sent/<id>/` or `failed/<id>/` before reporting the result.
 
 Do not restage while an approval is pending, or because a pending path
 disappeared: list `sent/` and `failed/` first. `confirm.override` is only for
@@ -96,8 +95,8 @@ An error alone does not show whether an earlier operation completed.
 
 - **No such file or directory**: the path is absent now. An entry that left
   `pending/` moved to `sent/` or `failed/`.
-- **Permission denied**: on a confirm, read `approval_challenge.json`.
-  Read-only targets also deny.
+- **Permission denied**: on a confirm, follow its message, or on a mount read
+  `approval_challenge.json`. Read-only targets also deny.
 - **Operation not permitted**: policy or a safety check refused it. Read
   `policy_check.json`; repeating does not help.
 - **"signing outcome unknown; it may already be signed"**: retry the identical
