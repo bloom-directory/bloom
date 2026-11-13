@@ -29,11 +29,14 @@ isolation, while continuing without a confirmation step.
 
 The root grader requires account-owned review-directory creation and ordered
 production download, full inspection, and execution. It recognizes explicit
-`runuser`/`env` commands and argv helpers such as the documented `as_bloom`.
+`runuser`/`env -i` commands and argv helpers such as the documented `as_bloom`.
+The clean PATH and captured account/runtime/bus assignments must match the
+documented helper; command substitutions in that environment are rejected.
 Shell blocks and command-string helpers are rejected because their variable
-scope is not established. Enrollment preservation and user-manager readiness are scored
-by behavior rather than a single spelling or placeholder. It is conservative about other shell
-forms; inspect failed responses before treating them as installation failures.
+scope is not established. Post-staging shell probes are allowed. The literal
+`REVIEW_DIR` placeholder denotes copying the printed path into the next tool call;
+arbitrary directory reassignment is rejected. Enrollment preservation and
+user-manager readiness are scored by behavior. It is conservative about other shell forms; inspect failed responses before treating them as installation failures.
 
 The deterministic grader reports these dimensions independently:
 
@@ -60,9 +63,12 @@ npm run check
 
 `check` runs grader, subprocess-diagnostic, and retry-selection fixtures and
 validates every configuration without model calls. Its executable workflow
-fixture extracts the published helper and review/staging commands, checks
-parent-shell directory capture and paths containing spaces, and reproduces an
-unusable inherited `TMPDIR`. Account switching and download are stubbed in these portable fixtures; live Linux acceptance must test real `runuser`. CI runs these checks
+fixture runs the published review, staging and readiness blocks in separate
+shells, restoring literal values and the printed review path. It covers paths
+with spaces/quotes, synthetic caller-environment isolation, unusable inherited
+`TMPDIR`, failure status/file retention, and conditional user-manager restart.
+Account switching, download and services are stubbed; `env -i` is real. Live
+Linux acceptance must test real `runuser`. CI runs these checks
 whenever `skills/**` or `evals/skills/**` changes.
 
 These tool-less evaluations check the response before execution, not service

@@ -19,6 +19,8 @@ For an explicit request to install, set up, or upgrade Bloom, read
 [references/install.md](references/install.md) in full and follow it even if
 Bloom already works. On Linux, check effective UID first: a root-run agent
 continues headlessly, installing for the selected non-root Bloom account.
+Website-loaded skills use the production setup script and latest stable release,
+even from a preview/pinned skill URL; local packages use their bundled script.
 
 For other requests, run this first. It prints the operating contract and pending actions:
 

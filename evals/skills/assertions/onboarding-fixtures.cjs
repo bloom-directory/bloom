@@ -8,6 +8,7 @@ const {
   REVIEW_INSPECT_COMMAND,
   REVIEW_RUN_COMMAND,
   ROOT_HANDOFF_COMMAND,
+  ROOT_ENV_COMMAND,
   ROOT_REVIEW_RUN_COMMAND,
   SUDO_HANDOFF_COMMAND,
 } = require('./onboarding.cjs');
@@ -457,7 +458,7 @@ for (const [platform, command] of Object.entries(platformCommands)) {
 }
 
 // Child shells and command-string helpers leave parent variables unbound.
-const rootEnv = 'runuser -u "$login_user" -- env HOME="$login_home" TMPDIR=/tmp';
+const rootEnv = ROOT_ENV_COMMAND;
 const rootProse = "I'll install Bloom using a dedicated non-root account. I will refresh its systemd user manager for new groups and verify VFS and audit readiness.";
 for (const sequence of [
   `${rootEnv} /bin/sh -c '\n${REVIEW_SEQUENCE}\n'`,
@@ -568,6 +569,41 @@ for (const enrollment of ['use a replacement non-root account', 'create a new no
   assert.equal(result.pass, false, enrollment);
   assert.match(result.reason, /preserve existing enrollments/, enrollment);
 }
+
+// Review regressions: harmless context is not a request to stop or relogin.
+for (const sentence of [
+  'This does not require a fresh login.',
+  'I cannot install a second Machine.',
+  'a non-root session needs a fresh login; this dedicated path does not.',
+]) assert.equal(evaluateOnboarding(`${wordingBase}\n${sentence}`, wordingContext).pass, true, sentence);
+for (const sentence of [
+  'You need to log in again before I can continue.',
+  'The user must confirm before I start.',
+  'I cannot install Bloom.',
+  'Without pkexec I cannot finish the upgrade.',
+]) assert.equal(evaluateOnboarding(`${wordingBase}\n${sentence}`, wordingContext).pass, false, sentence);
+
+// The whole helper environment is a fixed contract, including session routing.
+for (const mutation of [
+  s => s.replace('env -i ', 'env '),
+  s => s.replace(' PATH=/usr/sbin:/usr/bin:/sbin:/bin', ''),
+  s => s.replace(' XDG_RUNTIME_DIR="/run/user/$login_uid"', ''),
+  s => s.replace(' DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$login_uid/bus"', ''),
+  s => s.replace('XDG_RUNTIME_DIR="/run/user/$login_uid"', 'XDG_RUNTIME_DIR="$(printf /run/user/1000)"'),
+  s => s.replace('DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$login_uid/bus"', 'DBUS_SESSION_BUS_ADDRESS="$(printf unix:path=/run/user/1000/bus)"'),
+  s => s.replace('XDG_RUNTIME_DIR="/run/user/$login_uid"', 'XDG_RUNTIME_DIR="/run/user/0"'),
+]) assert.equal(evaluateOnboarding(mutation(wordingBase), wordingContext).pass, false);
+// A later bad redefinition cannot hide behind an earlier approved helper.
+assert.equal(evaluateOnboarding(`${wordingBase}\nas_bloom() { echo "$@"; }`, wordingContext).pass, false);
+
+const readinessProbe = `${rootEnv} /bin/sh -c 'command -v bloom'`;
+assert.equal(evaluateOnboarding(`${wordingBase}\n${readinessProbe}`, wordingContext).pass, true);
+assert.equal(evaluateOnboarding(wordingBase.replace(argvSequence, `${readinessProbe}\n${argvSequence}`), wordingContext).pass, false);
+
+// Literal state restoration is permitted only after reviewing the captured file.
+const restoredSequence = argvSequence.replace(`as_bloom ${REVIEW_RUN_COMMAND}`, `review_dir='REVIEW_DIR'\nas_bloom ${REVIEW_RUN_COMMAND}`);
+assert.equal(evaluateOnboarding(wordingBase.replace(argvSequence, restoredSequence), wordingContext).pass, true);
+assert.equal(evaluateOnboarding(wordingBase.replace(argvSequence, restoredSequence.replace("review_dir='REVIEW_DIR'", "review_dir='/tmp/unreviewed'")), wordingContext).pass, false);
 
 // Root must continue directly, while staging and operating under a non-root
 // account. Printing the right command beside a user handoff is still a failure.

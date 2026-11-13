@@ -47,9 +47,13 @@ Linux also needs systemd with a user session, and every target needs
 command, a Linux agent already running as root may install only the missing
 Bloom prerequisites from the distribution package manager: OpenSSH client
 (`ssh-keygen`), NFS client (`mount.nfs`; `nfs-common` on Debian/Ubuntu or
-`nfs-utils` on Fedora/RHEL), and the commands the setup script checks. This requires an already running
-systemd host; do not replace its init system. Do not perform a general system upgrade. Other agents report the missing prerequisite
-and stop; do not request a password.
+`nfs-utils` on Fedora/RHEL), and only these other prerequisites:
+`awk`, `cat`, `chmod`, `cmp`, `cp`,
+`curl`, `dirname`, `grep`, `id`, `mkdir`, `mktemp`, `mv`, `rm`, `tar`, `uname`,
+`getent`, `runuser`, `systemctl`, `systemd-sysusers`, and `systemd-tmpfiles`.
+This requires an already running systemd host; do not replace its init system
+or perform a general system upgrade. Other agents report the missing
+prerequisite and stop; do not request a password.
 Bloom requires macOS 26 or later: it mounts `~/bloom` over NFSv4.1, which
 earlier versions lack, and the privileged installer refuses an older macOS
 before changing anything. Report that the user must update macOS first.
@@ -88,9 +92,14 @@ Do not set a password, add SSH keys, or grant sudo. If `bloom` already exists,
 verify it is the intended dedicated account before reusing it; never repurpose
 an unrelated account. Record the selected name, UID, and home from `getent`
 and `id` as `login_user`, `login_uid`, and `login_home` (not `$HOME`). For a
-dedicated unattended Bloom account, enable its packaged user manager:
+dedicated unattended Bloom account, enable its packaged user manager. Substitute
+the selected values as shell-quoted literals in each command block; placeholders
+are not executable account values:
 
 ```sh
+set -eu
+login_user='SELECTED_USER'
+login_uid='SELECTED_UID'
 loginctl enable-linger "$login_user"
 systemctl start "user@$login_uid.service"
 ```
@@ -105,16 +114,13 @@ with its home, from `/tmp`. Explicitly set `TMPDIR=/tmp` inside each
 `HOME` alone does not make a root-private scratch directory writable. Staging
 uses `TMPDIR`; the review-directory command also explicitly selects `/tmp`.
 Create the review directory as that account too.
-Define this argument-forwarding helper in the root shell, and use it for
-staging and all later CLI/VFS checks. Keep the selected account values available
-in each subsequent tool call. Pass commands and arguments separately; never
-store a shell command in a variable or use `eval` to invoke it.
-
-```sh
-as_bloom() {
-  runuser -u "$login_user" -- env HOME="$login_home" TMPDIR=/tmp USER="$login_user" LOGNAME="$login_user" XDG_RUNTIME_DIR="/run/user/$login_uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$login_uid/bus" "$@"
-}
-```
+Treat each root command block below as a fresh shell: substitute the selected
+name, UID and home as shell-quoted literals for `SELECTED_USER`, `SELECTED_UID`
+and `SELECTED_HOME` every time. Do not assume functions or variables survive
+separate tool calls. The argument-forwarding helper uses a clean environment; do not
+forward root's credentials or tool configuration. Keep the fixed system PATH,
+including the sbin directories required by the setup checks. Pass commands and
+arguments separately; never store a shell command in a variable or use `eval`.
 
 Do not evaluate staging output. Capture the non-root staging values for the root
 installer. Keep this account/home context for future Bloom operations. Never
@@ -135,22 +141,32 @@ For every setup or privileged handoff invocation, set the working directory to
 `/private/tmp` on macOS or `/tmp` on Linux. Never run from inside the Bloom mount:
 installation can restart it and invalidate the current working directory.
 
-For Linux root, use the helper above. Capture `review_dir` in the parent root
-shell so it remains available after the account-switch command exits:
+For Linux root, define the helper and capture `review_dir` in this root call.
+The final line prints its path for the next call:
 
 ```sh
+set -eu
+login_user='SELECTED_USER'
+login_uid='SELECTED_UID'
+login_home='SELECTED_HOME'
+as_bloom() {
+  runuser -u "$login_user" -- env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME="$login_home" TMPDIR=/tmp USER="$login_user" LOGNAME="$login_user" XDG_RUNTIME_DIR="/run/user/$login_uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$login_uid/bus" "$@"
+}
 cd /tmp
 review_dir="$(as_bloom mktemp -d /tmp/bloom-review.XXXXXX)"
 as_bloom curl -fsSL https://bloom.directory/scripts/setup.sh -o "$review_dir/setup.sh"
 cat "$review_dir/setup.sh"
+printf 'BLOOM_REVIEW_DIR=%s\n' "$review_dir"
 ```
 
 For non-root Linux or macOS:
 
 ```sh
+set -eu
 review_dir="$(mktemp -d "${TMPDIR:-/tmp}/bloom-review.XXXXXX")"
 curl -fsSL https://bloom.directory/scripts/setup.sh -o "$review_dir/setup.sh"
 cat "$review_dir/setup.sh"
+printf 'BLOOM_REVIEW_DIR=%s\n' "$review_dir"
 ```
 
 Inspect the complete downloaded script before execution. It should contact only the
@@ -158,20 +174,35 @@ Bloom repository's GitHub latest-release URL and the resolved release downloads,
 write only to a temporary directory and the reported
 user-owned staging directory, and perform no wallet, transaction, sudo, or
 service action. If it matches, execute the same file in a subsequent tool call.
-For Linux root, retain the captured `review_dir` and selected account values:
+For the next call, replace `REVIEW_DIR` with the exact `BLOOM_REVIEW_DIR` path
+printed above, as a shell-quoted literal. Never create a new review directory or
+use an empty value. Restore the account context too. Cleanup runs only after
+successful staging; a failure leaves the reviewed file available for diagnosis.
+For Linux root:
 
 ```sh
-as_bloom sh "$review_dir/setup.sh"
-as_bloom rm "$review_dir/setup.sh"
-as_bloom rmdir "$review_dir"
+set -eu
+login_user='SELECTED_USER'
+login_uid='SELECTED_UID'
+login_home='SELECTED_HOME'
+as_bloom() {
+  runuser -u "$login_user" -- env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME="$login_home" TMPDIR=/tmp USER="$login_user" LOGNAME="$login_user" XDG_RUNTIME_DIR="/run/user/$login_uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$login_uid/bus" "$@"
+}
+cd /tmp
+review_dir='REVIEW_DIR'
+as_bloom sh "$review_dir/setup.sh" &&
+  as_bloom rm "$review_dir/setup.sh" &&
+  as_bloom rmdir "$review_dir"
 ```
 
 For non-root Linux or macOS:
 
 ```sh
-sh "$review_dir/setup.sh"
-rm "$review_dir/setup.sh"
-rmdir "$review_dir"
+set -eu
+review_dir='REVIEW_DIR'
+sh "$review_dir/setup.sh" &&
+  rm "$review_dir/setup.sh" &&
+  rmdir "$review_dir"
 ```
 
 Stop and report if the fetch or verification fails or the script conflicts with
@@ -293,29 +324,42 @@ below. If they fail after `1`, tell the user that Bloom was installed but needs
 a fresh login, except for the root/headless dedicated-account path below.
 Do not edit Bloom's groups or loosen socket permissions as a workaround.
 
-If already root and the selected account is dedicated to Bloom, refresh stale
-group membership by restarting only that account's user manager, from the root
-shell (not from a process in that user manager):
+If already root and the selected account is dedicated to Bloom, restart its
+user manager only when `BLOOM_RELOGIN_REQUIRED=1`. Substitute that captured
+installer value for `RELOGIN_REQUIRED` below. A healthy upgrade reporting `0`
+needs no extra user-manager restart. Run this from the root shell, not from a
+process in that user manager:
 
 ```sh
-systemctl restart "user@$login_uid.service"
+set -eu
+login_uid='SELECTED_UID'
+relogin_required='RELOGIN_REQUIRED'
+case "$relogin_required" in
+  1) systemctl restart "user@$login_uid.service" ;;
+  0) : ;;
+  *) printf '%s\n' 'Expected BLOOM_RELOGIN_REQUIRED=0 or 1.' >&2; exit 1 ;;
+esac
 ```
 
-Wait up to 30 seconds for its bus, then run the following as that account using
-the helper above; the package has already enabled these units:
-
-```sh
-as_bloom systemctl --user start bloom-session.service bloom-machine.service
-```
-
-Recheck readiness. Never restart a shared account's user manager or terminate
-unrelated login sessions. If its session is stale, report that specific blocker.
+Wait up to 30 seconds for its bus, then start/check the packaged services below.
+If `0` still fails because the dedicated user manager lacks required groups,
+confirm that mismatch before allowing one user-manager restart and recheck.
+Otherwise diagnose the failed checks. Never restart a shared account's user
+manager or terminate unrelated login sessions. If its session is stale, report that specific blocker.
 
 Once the session has the groups, the package starts Machine and mounts
 `~/bloom` through `bloom-machine.service`; the agent must not launch a second
 Machine. For Linux root, use the captured account values:
 
 ```sh
+set -eu
+login_user='SELECTED_USER'
+login_uid='SELECTED_UID'
+login_home='SELECTED_HOME'
+as_bloom() {
+  runuser -u "$login_user" -- env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME="$login_home" TMPDIR=/tmp USER="$login_user" LOGNAME="$login_user" XDG_RUNTIME_DIR="/run/user/$login_uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$login_uid/bus" "$@"
+}
+as_bloom systemctl --user start bloom-session.service bloom-machine.service
 as_bloom systemctl --user is-active bloom-session.service bloom-machine.service
 systemctl is-active "bloom-signer@$login_uid.service" "bloom-broker@$login_uid.service"
 as_bloom /bin/sh -c 'command -v bloom'
@@ -364,6 +408,13 @@ captured home; `$HOME` and `$(id -u)` in the root shell refer to root even when
 passed as arguments to `as_bloom`:
 
 ```sh
+set -eu
+login_user='SELECTED_USER'
+login_uid='SELECTED_UID'
+login_home='SELECTED_HOME'
+as_bloom() {
+  runuser -u "$login_user" -- env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME="$login_home" TMPDIR=/tmp USER="$login_user" LOGNAME="$login_user" XDG_RUNTIME_DIR="/run/user/$login_uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$login_uid/bus" "$@"
+}
 as_bloom cat "$login_home/bloom/AGENTS.md"
 as_bloom cat "$login_home/bloom/status/daemon.json"
 as_bloom bloom audit status
