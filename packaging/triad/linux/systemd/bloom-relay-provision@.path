@@ -1,0 +1,9 @@
+[Unit]
+Description=Provision the Bloom hosted ceremony relay when login UID %i is authenticated
+
+[Path]
+PathChanged=/run/bloom/%i/session/session.sock
+Unit=bloom-relay-provision@%i.service
+
+[Install]
+WantedBy=multi-user.target

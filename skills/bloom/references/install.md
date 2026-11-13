@@ -182,9 +182,13 @@ approve from another device such as a phone; DNS and certificate issuance can
 take a while, and on macOS the installer waits up to 10 minutes for it. Allow
 the command at least 15 minutes, and do not interrupt, time out, or rerun it
 while it runs. A relay that is not ready yet does not fail the install: approvals
-in a browser on this computer still work, and the installer prints a
-`sudo ... admin provision` retry command. Pass that command to the user; do not
-run it yourself or broaden the reviewed invocation to include it.
+in a browser on this computer still work. On Linux the packaged relay
+provisioning completes the relay by itself when the login's Bloom session
+starts, so do not run a provisioning command yourself and do not hand one to
+the user. On macOS the installer prints a `sudo ... admin provision` retry
+command when the relay is still pending at the deadline. Pass that command to
+the user; do not run it yourself or broaden the reviewed invocation to include
+it.
 
 ### Linux post-install readiness
 

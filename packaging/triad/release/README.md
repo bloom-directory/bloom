@@ -405,14 +405,22 @@ Provisioning publishes the validated control CA to Broker's private
 `relay-control-ca.pem` beside its scoped credentials. Broker publishes each
 validated certificate/key pair atomically in `relay-tls-bundle.json`; a failed
 renewal preserves the previous bundle while it remains valid.
-Both installers invoke `bloom-signer admin provision --login-uid UID` directly
-inside their existing root step, with no second elevation prompt. There is no
-separate ceremony administration wrapper or automatic elevation in Signer.
+Both installers arrange `bloom-signer admin provision --login-uid UID` without
+a second elevation prompt. On macOS the installer invokes it directly; on
+Linux a privileged systemd service runs the provisioning helper. Signer does
+not elevate itself.
 On macOS, the installer reports TLS and routing readiness while it waits up to
 10 minutes for the hosted relay. DNS propagation and ACME issuance commonly
 take a few minutes. If readiness is still pending at the deadline, installation
 finishes with localhost available and prints the exact retry command; rerunning
 `admin provision` is safe and resumes the same installation assignment.
+On Linux, provisioning is part of a standard setup and is never left to the
+user. The installer queues the packaged `bloom-relay-provision` systemd service, which
+waits for the Signer administration socket, provisions the relay, and polls
+until the remote ceremony surface is effective. The same helper backs
+`bloom-relay-provision@.service`, which `bloom-relay-provision@.path` starts
+when the login's session authenticates. Failed attempts are retried automatically
+while the session remains available; localhost remains available in the meantime.
 For manual administration, explicitly elevate the installed binary:
 
 ```sh

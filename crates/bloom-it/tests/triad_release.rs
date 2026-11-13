@@ -2560,16 +2560,34 @@ exit "$ADMIN_TEST_EXIT"
         )
         .unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        // The Linux installer provisions through the packaged helper, so the
+        // test stubs the helper rather than Signer administration itself.
+        let helper = release.join("bloom-relay-provision");
+        fs::write(
+            &helper,
+            r#"#!/bin/sh
+printf '%s\n' "$@" >> "$ADMIN_TEST_LOG"
+exit "$ADMIN_TEST_EXIT"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
         let source = fs::read_to_string(release_script(installer)).unwrap();
         let start = source.find(&format!("{function}() {{")).unwrap();
         let end = start + source[start..].find("\n}").unwrap() + 2;
-        let function_source = source[start..end].replace(
-            "if ! /usr/libexec/bloom/current/bloom-signer admin",
-            "if ! \"$release_base/current/bloom-signer\" admin",
-        );
+        let function_source = source[start..end]
+            .replace(
+                "if ! /usr/libexec/bloom/current/bloom-signer admin",
+                "if ! \"$release_base/current/bloom-signer\" admin",
+            )
+            .replace(
+                "[[ -S \"/run/bloom/$login_uid/session/session.sock\" ]]",
+                "true",
+            );
         let script = format!(
             r#"set -eu
 release_base="$1"; runtime="$2"; login_uid=1000; live=true
+systemctl() {{ printf '%s\n' "$@" >> "$ADMIN_TEST_LOG"; return "$ADMIN_TEST_EXIT"; }}
 field() {{
   case "$2" in
     desired_mode) printf '%s' "$ADMIN_DESIRED" ;;
@@ -2626,23 +2644,83 @@ field() {{
                     assert!(stderr.contains("Hosted ceremony relay is ready"));
                 }
             } else {
-                assert_eq!(invocation, "admin\nprovision\n--login-uid\n1000\n");
+                // The Linux installer delegates to the packaged helper, which
+                // owns the retry and the readiness poll, so the installer
+                // itself never invokes Signer administration directly.
+                assert_eq!(
+                    invocation,
+                    "start\n--no-block\nbloom-relay-provision@1000.service\n"
+                );
                 if exit_code == "0" {
                     assert!(stderr.is_empty());
                 } else {
-                    assert!(stderr.contains("localhost remains available. Retry: sudo "));
-                    assert!(stderr.contains("bloom-signer"));
-                    assert!(stderr.contains("admin provision --login-uid 1000"));
+                    assert!(stderr.contains("localhost remains available"));
+                    assert!(
+                        !stderr.contains("Retry: sudo"),
+                        "the installer must not leave provisioning to the user"
+                    );
                 }
             }
         }
     }
     assert!(!release_script("bloom-ceremonies").exists());
-    assert!(
-        !fs::read_to_string(release_script("build-bundle.sh"))
-            .unwrap()
-            .contains("bloom-ceremonies")
-    );
+    assert!(!fs::read_to_string(release_script("build-bundle.sh"))
+        .unwrap()
+        .contains("bloom-ceremonies"));
+}
+
+#[test]
+fn linux_relay_provisioning_runs_as_part_of_a_standard_setup() {
+    let installer = fs::read_to_string(release_script("install-linux.sh")).unwrap();
+    let helper =
+        fs::read_to_string(workspace().join("packaging/triad/linux/bin/bloom-relay-provision"))
+            .unwrap();
+    let service = fs::read_to_string(
+        workspace().join("packaging/triad/linux/systemd/bloom-relay-provision@.service"),
+    )
+    .unwrap();
+    let path = fs::read_to_string(
+        workspace().join("packaging/triad/linux/systemd/bloom-relay-provision@.path"),
+    )
+    .unwrap();
+
+    // A standard setup provisions the relay itself. The installer calls the
+    // packaged helper rather than asking the user to run a retry command.
+    assert!(installer
+        .contains("systemctl start --no-block \"bloom-relay-provision@$login_uid.service\""));
+    assert!(!installer.contains("localhost remains available. Retry: sudo"));
+    assert!(!installer.contains("admin provision --login-uid $login_uid\" >&2"));
+    // The helper is installed as a packaged binary and enabled as a path
+    // unit, so a session that starts later provisions without the user
+    // running anything.
+    assert!(installer.contains("systemctl enable --now \"bloom-relay-provision@$login_uid.path\""));
+    assert!(installer.contains("installer/linux/bin/bloom-relay-provision"));
+    assert!(installer.contains("installer/linux/systemd/bloom-relay-provision@.path"));
+    assert!(installer.contains("installer/linux/systemd/bloom-relay-provision@.service"));
+
+    // The helper waits for the Signer administration socket before it
+    // provisions, which is the ordering the Linux installer could not
+    // satisfy on its own.
+    assert!(helper.contains("/run/bloom/$login_uid/signer/admin/admin.sock"));
+    assert!(helper.contains("admin status --login-uid"));
+    assert!(helper.contains("admin provision --login-uid"));
+    assert!(helper.contains("remote_tls_ready"));
+    assert!(helper.contains("remote_routing_ready"));
+
+    // The unit runs as root, needs the Signer, and grants only the
+    // capabilities provisioning actually requires.
+    assert!(service.contains("ExecStart=/usr/libexec/bloom/bloom-relay-provision %i"));
+    assert!(service.contains("After=bloom-broker@%i.service bloom-signer@%i.service"));
+    assert!(service.contains("Restart=on-failure"));
+    assert!(service.contains("CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER"));
+    assert!(service.contains("AmbientCapabilities="));
+    assert!(!service.contains("AmbientCapabilities=CAP_"));
+    // Repeated logins must not exhaust a start-rate burst and leave the
+    // relay unprovisioned.
+    assert!(service.contains("StartLimitIntervalSec=0"));
+    // The path unit starts provisioning when the login session authenticates.
+    assert!(path.contains("PathChanged=/run/bloom/%i/session/session.sock"));
+    assert!(path.contains("Unit=bloom-relay-provision@%i.service"));
 }
 
 #[test]
