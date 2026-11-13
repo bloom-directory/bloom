@@ -493,14 +493,23 @@ fn spawn_ipc_server(
     home: &Path,
     vfs: bloom_vfs::Vfs,
 ) -> (bloom_daemon::ipc::IpcServer, std::thread::JoinHandle<()>) {
-    use bloom_daemon::ipc::{IpcServer, default_socket_path};
+    serve_ipc(
+        home,
+        bloom_daemon::ipc::IpcServer::new(vfs, "ipc-test-version", vec!["ipc-chain".into()]),
+    )
+}
 
-    let socket = default_socket_path(home);
+/// Serve `server` on `home`'s default socket from a dedicated thread and wait
+/// until the socket accepts connections.
+fn serve_ipc(
+    home: &Path,
+    server: bloom_daemon::ipc::IpcServer,
+) -> (bloom_daemon::ipc::IpcServer, std::thread::JoinHandle<()>) {
+    let socket = bloom_daemon::ipc::default_socket_path(home);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("build tokio runtime");
-    let server = IpcServer::new(vfs, "ipc-test-version", vec!["ipc-chain".into()]);
     let server_for_thread = server.clone();
     let socket_for_thread = socket.clone();
     let server_thread = std::thread::spawn(move || {
@@ -514,12 +523,13 @@ fn spawn_ipc_server(
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while !ipc_endpoint_accepting(&socket) {
-        if std::time::Instant::now() >= deadline {
-            panic!("ipc server never created socket at {}", socket.display());
-        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ipc server never created socket at {}",
+            socket.display()
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
-
     (server, server_thread)
 }
 
@@ -583,115 +593,41 @@ impl bloom_daemon::ipc::BatchConfirmationService for FixedBatchConfirmation {
 fn spawn_batch_ipc_server(
     home: &Path,
 ) -> (bloom_daemon::ipc::IpcServer, std::thread::JoinHandle<()>) {
-    use bloom_daemon::ipc::{IpcServer, default_socket_path};
-
-    let socket = default_socket_path(home);
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build tokio runtime");
-    let server = IpcServer::new(
+    let server = bloom_daemon::ipc::IpcServer::new(
         bloom_vfs::Vfs::builder().build(),
         "ipc-test-version",
         vec![],
     )
     .with_batch_confirmation(Arc::new(FixedBatchConfirmation));
-    let server_for_thread = server.clone();
-    let socket_for_thread = socket.clone();
-    let server_thread = std::thread::spawn(move || {
-        rt.block_on(async move {
-            server_for_thread
-                .serve(&socket_for_thread)
-                .await
-                .expect("ipc serve");
-        });
-    });
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !ipc_endpoint_accepting(&socket) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "batch IPC server never created socket at {}",
-            socket.display()
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    (server, server_thread)
+    serve_ipc(home, server)
 }
 
 fn spawn_machine_ipc_server(
     home: &Path,
     service: Arc<RecordingMachineCommands>,
 ) -> (bloom_daemon::ipc::IpcServer, std::thread::JoinHandle<()>) {
-    use bloom_daemon::ipc::{IpcServer, default_socket_path};
-
-    let socket = default_socket_path(home);
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build tokio runtime");
-    let server = IpcServer::new(bloom_vfs::Vfs::new(), "ipc-test-version", vec![])
-        .with_machine_commands(service);
-    let server_for_thread = server.clone();
-    let socket_for_thread = socket.clone();
-    let server_thread = std::thread::spawn(move || {
-        rt.block_on(async move {
-            server_for_thread
-                .serve(&socket_for_thread)
-                .await
-                .expect("ipc serve");
-        });
-    });
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !ipc_endpoint_accepting(&socket) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "Machine IPC server never created socket at {}",
-            socket.display()
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    (server, server_thread)
+    let server =
+        bloom_daemon::ipc::IpcServer::new(bloom_vfs::Vfs::new(), "ipc-test-version", vec![])
+            .with_machine_commands(service);
+    serve_ipc(home, server)
 }
 
 fn spawn_petals_ipc_server(
     home: &Path,
 ) -> (bloom_daemon::ipc::IpcServer, std::thread::JoinHandle<()>) {
-    use bloom_daemon::ipc::{IpcServer, default_socket_path};
-
-    let socket = default_socket_path(home);
     let store = bloom_petals::PetalStore::open(home.join("petals/store")).unwrap();
     let registry =
         Arc::new(bloom_petals::NameRegistry::open(home.join("petals/registry")).unwrap());
     let runner =
         bloom_petals::PetalRunner::new(store, registry, bloom_petals::PetalVm::new().unwrap());
-    let server = IpcServer::new(
+    let server = bloom_daemon::ipc::IpcServer::new(
         bloom_vfs::Vfs::builder().build(),
         "ipc-test-version",
         vec![],
     )
     .with_petals(runner)
     .with_petal_source_installer(Arc::new(TestPetalSourceInstaller));
-    let server_for_thread = server.clone();
-    let socket_for_thread = socket.clone();
-    let server_thread = std::thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async move {
-                server_for_thread.serve(&socket_for_thread).await.unwrap();
-            });
-    });
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !ipc_endpoint_accepting(&socket) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "Petal IPC server never created socket at {}",
-            socket.display()
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    (server, server_thread)
+    serve_ipc(home, server)
 }
 
 struct TestPetalSourceInstaller;
@@ -2220,7 +2156,6 @@ fn wallet_address_qr_out_does_not_use_legacy_keystore() {
 /// configured IPC authority plane.
 #[test]
 fn vfs_routes_via_ipc_when_socket_exists() {
-    use bloom_daemon::ipc::{IpcServer, default_socket_path};
     use bloom_vfs::{Entry, Handler, HandlerError, Vfs, VfsPath};
 
     struct SingleFileHandler {
@@ -2282,39 +2217,10 @@ fn vfs_routes_via_ipc_when_socket_exists() {
     let probe = SingleFileHandler::new("marker", b"ipc-only-marker\n".to_vec());
 
     let home = fresh_home();
-    let socket = default_socket_path(home.path());
     let vfs = Vfs::builder()
         .mount("probe", std::sync::Arc::new(probe))
         .build();
-
-    // Build a Tokio runtime for the server in a dedicated thread; the
-    // CLI subprocess provides its own runtime separately.
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build tokio runtime");
-    let server = IpcServer::new(vfs, "ipc-test-version", vec!["ipc-chain".into()]);
-    let server_for_thread = server.clone();
-    let socket_for_thread = socket.clone();
-    let server_thread = std::thread::spawn(move || {
-        rt.block_on(async move {
-            server_for_thread
-                .serve(&socket_for_thread)
-                .await
-                .expect("ipc serve");
-        });
-    });
-
-    // Wait for the socket file to materialise (server binds before
-    // accepting connections; this is the same pattern used by the daemon's
-    // own ipc tests).
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !ipc_endpoint_accepting(&socket) {
-        if std::time::Instant::now() >= deadline {
-            panic!("ipc server never created socket at {}", socket.display());
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let (server, server_thread) = spawn_ipc_server(home.path(), vfs);
 
     // `vfs ls /probe` should hit the test server (which advertises the
     // bespoke marker entry); the production daemon doesn't mount `probe`,
