@@ -5,29 +5,55 @@
 //! Only holders of the random cookie can connect, and the server listens on
 //! neither TCP nor the abstract socket namespace, so other local accounts
 //! cannot read the screen while a card is entered.
+//!
+//! Xvfb runs in its own user and mount namespace whose `/tmp` is a private
+//! directory, so its socket and lock file never touch the host's
+//! `/tmp/.X11-unix` or `/tmp/.X<n>-lock`. A desktop's display cannot be
+//! taken over, even when a sandbox hides the desktop's lock file.
+//! Chromium connects by the socket's full path.
 
 use crate::cdp::{child_fd, pipe};
 use anyhow::{Context, Result, bail};
 use std::{
+    ffi::{CStr, CString},
     fs::File,
     io::{Read, Write},
     os::fd::AsRawFd,
-    os::unix::{fs::OpenOptionsExt, process::CommandExt},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{DirBuilderExt, OpenOptionsExt},
+        process::CommandExt,
+    },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
 };
 
 pub struct Display {
     child: Child,
-    number: u32,
+    socket: PathBuf,
     authority: PathBuf,
 }
 
 impl Display {
-    /// Starts Xvfb with an authority file in `dir`, which must be private.
+    /// Starts Xvfb with an authority file and its own `/tmp` in `dir`, which
+    /// must be private.
     pub fn start(xvfb: &Path, dir: &Path) -> Result<Self> {
         let authority = dir.join("Xauthority");
         write_authority(&authority)?;
+        let tmp = dir.join("display-tmp");
+        // Xvfb clears a stopped earlier display's stale lock and socket itself.
+        if !tmp.is_dir() {
+            std::fs::DirBuilder::new().mode(0o700).create(&tmp)?;
+        }
+        let sockets = tmp.join(".X11-unix");
+        // Leave room for "/X<number>" inside sockaddr_un's 108 bytes.
+        if sockets.as_os_str().len() > 96 {
+            bail!("The display directory path is too long: {}", tmp.display());
+        }
+        let tmp_c = CString::new(tmp.as_os_str().as_bytes())?;
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let uid_map = format!("{uid} {uid} 1");
+        let gid_map = format!("{gid} {gid} 1");
         let (read, write) = pipe()?;
         let child_write = child_fd(&write)?;
         let output = child_write.as_raw_fd();
@@ -49,7 +75,7 @@ impl Display {
                 {
                     return Err(std::io::Error::last_os_error());
                 }
-                Ok(())
+                isolate(&tmp_c, &uid_map, &gid_map)
             });
         }
         let mut child = command
@@ -65,24 +91,70 @@ impl Display {
         while reader.read(&mut byte)? == 1 && byte[0] != b'\n' && number.len() < 8 {
             number.push(byte[0] as char);
         }
-        let Ok(number) = number.parse() else {
+        let Ok(number) = number.parse::<u32>() else {
             let _ = child.kill();
             let _ = child.wait();
             bail!("The virtual display did not start");
         };
         Ok(Self {
             child,
-            number,
+            socket: sockets.join(format!("X{number}")),
             authority,
         })
     }
 
     pub fn environment(&self) -> [(&'static str, std::ffi::OsString); 2] {
+        let mut display = std::ffi::OsString::from("unix:");
+        display.push(&self.socket);
         [
-            ("DISPLAY", format!(":{}", self.number).into()),
+            ("DISPLAY", display),
             ("XAUTHORITY", self.authority.clone().into_os_string()),
         ]
     }
+}
+
+/// Runs in the forked Xvfb child before exec, so it uses only raw system
+/// calls: enter a new user and mount namespace and bind `tmp` over `/tmp`.
+fn isolate(tmp: &CStr, uid_map: &str, gid_map: &str) -> std::io::Result<()> {
+    let fail = || Err(std::io::Error::last_os_error());
+    unsafe {
+        if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) != 0 {
+            return fail();
+        }
+        for (path, text) in [
+            (c"/proc/self/setgroups", "deny"),
+            (c"/proc/self/uid_map", uid_map),
+            (c"/proc/self/gid_map", gid_map),
+        ] {
+            let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+            if fd < 0 {
+                return fail();
+            }
+            let written = libc::write(fd, text.as_ptr().cast(), text.len());
+            libc::close(fd);
+            if written != text.len() as isize {
+                return fail();
+            }
+        }
+        if libc::mount(
+            std::ptr::null(),
+            c"/".as_ptr(),
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE,
+            std::ptr::null(),
+        ) != 0
+            || libc::mount(
+                tmp.as_ptr(),
+                c"/tmp".as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            ) != 0
+        {
+            return fail();
+        }
+    }
+    Ok(())
 }
 
 impl Drop for Display {
@@ -130,9 +202,8 @@ mod tests {
     }
 
     /// The X11 connection setup reply: 0 refused, 1 accepted.
-    fn handshake(number: &str, cookie: Option<&[u8]>) -> u8 {
-        let mut stream =
-            std::os::unix::net::UnixStream::connect(format!("/tmp/.X11-unix/X{number}")).unwrap();
+    fn handshake(socket: &str, cookie: Option<&[u8]>) -> u8 {
+        let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
         let name: &[u8] = if cookie.is_some() {
             b"MIT-MAGIC-COOKIE-1"
         } else {
@@ -157,14 +228,21 @@ mod tests {
     async fn headed_browser_runs_on_a_display_only_its_cookie_opens() {
         let Some(xvfb) = xvfb() else { return };
         let dir = tempfile::tempdir().unwrap();
+        let host_x11 = || std::fs::read_dir("/tmp/.X11-unix").map(|e| e.count()).ok();
+        let host_before = host_x11();
         let display = Display::start(&xvfb, dir.path()).unwrap();
         let environment = display.environment();
-        let number = environment[0]
+        let socket = environment[0]
             .1
             .to_str()
             .unwrap()
-            .trim_start_matches(':')
+            .strip_prefix("unix:")
+            .unwrap()
             .to_owned();
+        // The socket lives in Checkout's directory, never in the host's.
+        assert!(socket.starts_with(dir.path().to_str().unwrap()), "{socket}");
+        assert_eq!(host_x11(), host_before, "the host's X11 sockets changed");
+        let number = socket.rsplit_once("/X").unwrap().1.to_owned();
         let authority = std::fs::read(&environment[1].1).unwrap();
         assert_eq!(
             std::fs::metadata(&environment[1].1)
@@ -175,12 +253,12 @@ mod tests {
             0o600
         );
         assert_eq!(
-            handshake(&number, None),
+            handshake(&socket, None),
             0,
             "a client without the cookie connected"
         );
         assert_eq!(
-            handshake(&number, Some(&authority[authority.len() - 16..])),
+            handshake(&socket, Some(&authority[authority.len() - 16..])),
             1
         );
         // No listener in the abstract namespace, which ignores file permissions.

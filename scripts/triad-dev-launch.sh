@@ -24,6 +24,8 @@ checkout_chromium=""
 checkout_view_port=""
 checkout_fixture_tls=0
 checkout_xvfb=""
+no_checkout=0
+checkout_build=0
 services_only=0
 retain_temporary_files=0
 hosted_relay=0
@@ -47,6 +49,7 @@ while [ "$#" -gt 0 ]; do
     --checkout-view-port) need_value "$@"; checkout_view_port="$2"; shift 2 ;;
     --checkout-fixture-tls) checkout_fixture_tls=1; shift ;;
     --checkout-xvfb) need_value "$@"; checkout_xvfb="$2"; shift 2 ;;
+    --no-checkout) no_checkout=1; shift ;;
     --ceremony-port) need_value "$@"; ceremony_port_arg="$2"; ceremony_port_arg_set=1; shift 2 ;;
     --remote-upstream-port) need_value "$@"; remote_upstream_port_arg="$2"; remote_upstream_port_arg_set=1; shift 2 ;;
     --services-only) services_only=1; shift ;;
@@ -55,11 +58,11 @@ while [ "$#" -gt 0 ]; do
     *) die "unknown argument: $1" ;;
   esac
 done
-required_paths=("$developer_root" "$machine_socket" "$log_dir" "$ready_file")
-for value in "${required_paths[@]}"; do
-  [ -n "$value" ] ||
-    die "developer root, Machine socket, log dir, and ready file are required"
-done
+[ -n "$developer_root" ] || die "--developer-root is required"
+# Everything else defaults inside the developer root, so one root isolates a candidate.
+machine_socket="${machine_socket:-${developer_root}/machine.sock}"
+log_dir="${log_dir:-${developer_root}/logs}"
+ready_file="${ready_file:-${developer_root}/ready}"
 if [ "$services_only" -eq 1 ] && [ -n "$mount_dir" ]; then
   die "--services-only cannot be combined with --mount"
 fi
@@ -99,9 +102,27 @@ elif [ -n "${BLOOM_TRIAD_DEV_CEREMONY_PORT:-}" ]; then
   ceremony_port_raw="$BLOOM_TRIAD_DEV_CEREMONY_PORT"
 fi
 ceremony_port="$(parse_port '--ceremony-port (or BLOOM_TRIAD_DEV_CEREMONY_PORT)' "$ceremony_port_raw")"
+# Checkout starts by default whenever a Chromium is installed. It builds from
+# this checkout, picks a free view port, and on Linux uses Xvfb when present;
+# its display stays in Checkout's own namespace. --no-checkout opts out.
+if [ -z "$checkout_bin" ] && [ "$no_checkout" -eq 0 ] && [ -z "$checkout_chromium$checkout_view_port$checkout_xvfb" ]; then
+  checkout_chromium="$(command -v chromium chromium-browser google-chrome-stable google-chrome | head -n 1 || true)"
+  if [ -n "$checkout_chromium" ]; then
+    checkout_bin="${BLOOM_INTEGRATION_CHECKOUT_BIN:-${repo_root}/target/debug/bloom-checkout}"
+    [ -n "${BLOOM_INTEGRATION_CHECKOUT_BIN:-}" ] || checkout_build=1
+    [ "$(uname -s)" != Linux ] || checkout_xvfb="$(command -v Xvfb || true)"
+  else
+    printf 'No Chromium found; starting without Checkout.\n' >&2
+  fi
+fi
 if [ -n "$checkout_bin" ]; then
-  [ -x "$checkout_bin" ] && [ -x "$checkout_chromium" ] || die "checkout and Chromium must be executable"
-  checkout_view_port="$(parse_port '--checkout-view-port' "$checkout_view_port")"
+  { [ "$checkout_build" -eq 1 ] || [ -x "$checkout_bin" ]; } && [ -x "$checkout_chromium" ] ||
+    die "checkout and Chromium must be executable"
+  if [ -z "$checkout_view_port" ]; then
+    checkout_view_port=0
+  else
+    checkout_view_port="$(parse_port '--checkout-view-port' "$checkout_view_port")"
+  fi
   [ "$checkout_view_port" -ne "$ceremony_port" ] || die "checkout and ceremony ports must differ"
   [ -z "$checkout_xvfb" ] || [ -x "$checkout_xvfb" ] || die "--checkout-xvfb must be executable"
 elif [ -n "$checkout_chromium" ] || [ -n "$checkout_view_port" ] || [ -n "$checkout_xvfb" ]; then
@@ -292,6 +313,9 @@ if [ "$host_os" = Linux ]; then
 fi
 if [ -z "${BLOOM_INTEGRATION_MACHINE_BIN:-}" ]; then
   (cd "$repo_root" && cargo build -p bloom --no-default-features --features mount,triad-dev-harness)
+fi
+if [ "$checkout_build" -eq 1 ]; then
+  (cd "$repo_root" && cargo build -p bloom-checkout)
 fi
 
 if [ -z "${BLOOM_INTEGRATION_BROKER_BIN:-}" ]; then
