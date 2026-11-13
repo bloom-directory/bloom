@@ -1342,7 +1342,7 @@ impl IpcServer {
         };
         let waiting_for = self.approval_id(&challenge).await;
         match self.vfs.write(&path, &bytes).await {
-            Err(HandlerError::PermissionDenied) => {
+            Err(HandlerError::PermissionDenied | HandlerError::ApprovalPending(_)) => {
                 self.await_approval(&path, &bytes, &challenge, waiting_for, context)
                     .await
             }
@@ -1406,7 +1406,9 @@ impl IpcServer {
                 "active" => {
                     retried_active = true;
                     match self.vfs.write(path, bytes).await {
-                        Err(HandlerError::PermissionDenied) => continue,
+                        Err(HandlerError::PermissionDenied | HandlerError::ApprovalPending(_)) => {
+                            continue;
+                        }
                         result => return Ok(result?),
                     }
                 }
@@ -2768,7 +2770,8 @@ mod tests {
             }
             self.challenged.store(true, Ordering::SeqCst);
             if *self.state.lock().unwrap() != "active" {
-                return Err(HandlerError::PermissionDenied);
+                // The variant the real wallet handler returns.
+                return Err(HandlerError::ApprovalPending(path.to_string_path()));
             }
             self.signatures.fetch_add(1, Ordering::SeqCst);
             Ok(())
