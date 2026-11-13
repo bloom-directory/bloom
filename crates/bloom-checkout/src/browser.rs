@@ -65,20 +65,22 @@ impl Browser {
         self.unusable.load(Ordering::SeqCst) || self.cdp.exited()
     }
 
+    /// Launch headless, as every caller but the service entry point wants.
     pub async fn launch(
         executable: &Path,
         profile: &Path,
         test_flags: &[String],
     ) -> Result<Arc<Self>> {
-        Self::launch_on(executable, profile, test_flags, &[]).await
+        Self::launch_on(executable, profile, test_flags, None).await
     }
 
-    /// `display` holds the X display variables for a headed browser.
+    /// `display` makes the browser headed: `Some(&[])` uses the display this
+    /// process inherited, and non-empty variables select a private X display.
     pub async fn launch_on(
         executable: &Path,
         profile: &Path,
         test_flags: &[String],
-        display: &[(&str, std::ffi::OsString)],
+        display: Option<&[(&str, std::ffi::OsString)]>,
     ) -> Result<Arc<Self>> {
         // Fixture merchants listen on loopback in tests and developer Triads.
         Self::launch_with_egress(
@@ -96,7 +98,7 @@ impl Browser {
         profile: &Path,
         test_flags: &[String],
         egress: crate::egress::Policy,
-        display: &[(&str, std::ffi::OsString)],
+        display: Option<&[(&str, std::ffi::OsString)]>,
     ) -> Result<Arc<Self>> {
         if profile.exists() {
             let metadata = std::fs::symlink_metadata(profile)?;
@@ -805,7 +807,7 @@ mod tests {
             &root.path().join("profile"),
             &["--no-sandbox".into()],
             Arc::new(move |address| address == shop_address),
-            &[],
+            None,
         )
         .await
         .unwrap();

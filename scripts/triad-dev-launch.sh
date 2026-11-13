@@ -23,6 +23,7 @@ checkout_bin=""
 checkout_chromium=""
 checkout_view_port=""
 checkout_fixture_tls=0
+checkout_browser_window=0
 checkout_xvfb=""
 services_only=0
 retain_temporary_files=0
@@ -46,6 +47,7 @@ while [ "$#" -gt 0 ]; do
     --checkout-chromium) need_value "$@"; checkout_chromium="$2"; shift 2 ;;
     --checkout-view-port) need_value "$@"; checkout_view_port="$2"; shift 2 ;;
     --checkout-fixture-tls) checkout_fixture_tls=1; shift ;;
+    --checkout-browser-window) checkout_browser_window=1; shift ;;
     --checkout-xvfb) need_value "$@"; checkout_xvfb="$2"; shift 2 ;;
     --ceremony-port) need_value "$@"; ceremony_port_arg="$2"; ceremony_port_arg_set=1; shift 2 ;;
     --remote-upstream-port) need_value "$@"; remote_upstream_port_arg="$2"; remote_upstream_port_arg_set=1; shift 2 ;;
@@ -819,6 +821,7 @@ if [ -n "$checkout_bin" ]; then
   mv "$checkout_config_new" "$machine_config"
   checkout_extra=()
   if [ "$checkout_fixture_tls" -eq 1 ]; then checkout_extra+=(--fixture-allow-insecure-tls); fi
+  if [ "$checkout_browser_window" -eq 1 ]; then checkout_extra+=(--browser-window); fi
   # A headed browser on Checkout's own private display, for shops that refuse headless ones.
   if [ -n "$checkout_xvfb" ]; then checkout_extra+=(--xvfb "$checkout_xvfb"); fi
   "$checkout_bin" --chromium "$checkout_chromium" \

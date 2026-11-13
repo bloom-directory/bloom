@@ -34,6 +34,11 @@ struct Args {
     /// Exit cleanly when the session-bound Broker disappears (launchd lifecycle).
     #[arg(long)]
     follow_broker_lifecycle: bool,
+    /// Shop in an ordinary browser window on the display this process is given,
+    /// rather than a headless one that shops recognise and turn away. The
+    /// display may be virtual, so this does not require a screen.
+    #[arg(long, conflicts_with = "xvfb")]
+    browser_window: bool,
     #[cfg(feature = "triad-dev-harness")]
     #[arg(long)]
     fixture_allow_insecure_tls: bool,
@@ -83,8 +88,14 @@ async fn main() -> Result<()> {
         Some(_) => anyhow::bail!("--xvfb is supported only on Linux"),
         None => Vec::new(),
     };
-    let browser =
-        Browser::launch_on(&args.chromium, &args.profile, &flags, &display_environment).await?;
+    let headed = args.xvfb.is_some() || args.browser_window;
+    let browser = Browser::launch_on(
+        &args.chromium,
+        &args.profile,
+        &flags,
+        headed.then_some(display_environment.as_slice()),
+    )
+    .await?;
     let view_listener =
         tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, args.view_port)).await?;
     let view_port = view_listener.local_addr()?.port();
