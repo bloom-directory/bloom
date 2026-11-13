@@ -657,16 +657,10 @@ impl DaemonPetalHost {
         let Some(wallets) = self.wallets.as_ref() else {
             return Ok(None);
         };
-        match wallets
-            .ensure_petal_eligibility(wallet, package_hash)
-            .await
-            .map_err(|error| HostError::Denied(error.to_string()))?
-        {
-            bloom_machine_client::PetalEligibility::Allowed(_) => Ok(None),
-            bloom_machine_client::PetalEligibility::AwaitingPolicyApproval(pending) => {
-                Ok(Some(pending))
-            }
-        }
+        petal_eligibility_outcome(
+            wallet,
+            wallets.ensure_petal_eligibility(wallet, package_hash).await,
+        )
     }
 
     fn with_provenance_catalog(
@@ -3947,6 +3941,116 @@ impl AccountPetalMount for AccountPetals {
     }
 }
 
+/// What a Petal's use of `wallet` does with its eligibility: go on when the
+/// policy allows it, wait on a policy change, or fail with
+/// [`eligibility_host_error`].
+fn petal_eligibility_outcome(
+    wallet: &str,
+    eligibility: Result<bloom_machine_client::PetalEligibility, bloom_vfs::HandlerError>,
+) -> Result<Option<bloom_machine_client::PendingPolicyUpdate>, HostError> {
+    match eligibility.map_err(|error| eligibility_host_error(wallet, error))? {
+        bloom_machine_client::PetalEligibility::Allowed(_) => Ok(None),
+        bloom_machine_client::PetalEligibility::AwaitingPolicyApproval(pending) => {
+            Ok(Some(pending))
+        }
+        // Not produced here: this request is proposed at any version.
+        bloom_machine_client::PetalEligibility::ChangedSinceCreation(_) => Err(HostError::Denied(
+            "wallet policy does not allow this Petal package".into(),
+        )),
+    }
+}
+
+/// The error a Petal gets when its wallet's policy could not be made to allow
+/// it. What clears up on a retry goes back as a backend error whose message
+/// the Petal shows the agent whole: a wait for the Petals chosen during
+/// setup, or another command holding the wallet's policy for a moment. A
+/// denial would reach the agent only as a refusal, and some Petals answer it
+/// by asking the owner instead. Anything else is a denial.
+fn eligibility_host_error(wallet: &str, error: bloom_vfs::HandlerError) -> HostError {
+    if let Some(message) = bloom_vfs::handlers::wallets::default_policy_waiting_message(&error) {
+        warn!(wallet = %wallet, reason = %message, "petal.default_policy_waiting");
+        return HostError::Backend(message.to_owned());
+    }
+    if bloom_vfs::handlers::wallets::is_policy_coordination_busy(&error) {
+        warn!(wallet = %wallet, reason = %error, "petal.policy_coordination_busy");
+        return HostError::Backend(format!(
+            "{}: another command is changing this wallet's policy; retry this operation in a few seconds",
+            bloom_vfs::handlers::wallets::POLICY_COORDINATION_BUSY
+        ));
+    }
+    HostError::Denied(error.to_string())
+}
+
+/// What a wallet's first Petal proposal also allows, from its setup: each
+/// chosen Petal that is installed, and its destinations. A chosen Petal that
+/// is not installed is listed in `not_installed`, so the proposal waits for
+/// it rather than leave it out of the policy for good. Only the Petals setup
+/// offers ([`bloom_proto::config::SETUP_PETALS`]) count. One whose owner
+/// record cannot be read, or holds an invalid package hash, fails the whole
+/// setup, so the proposal stops.
+fn default_policy_setup(
+    store: &PetalStore,
+    chosen: &bloom_proto::config::WalletSetup,
+) -> Result<bloom_vfs::handlers::DefaultPolicySetup, bloom_vfs::HandlerError> {
+    let mut setup = bloom_vfs::handlers::DefaultPolicySetup::default();
+    for name in chosen.petals.keys() {
+        // Setup never offers these, so a config naming one, as only a hand
+        // edit or a Petal since dropped from the catalog can, allows nothing
+        // more; no release installs it, so waiting for it would never end.
+        if !bloom_proto::config::SETUP_PETALS.contains(&name.as_str()) {
+            warn!(petal = %name, "default_policy.petal_not_in_setup_ignored");
+            continue;
+        }
+        let installed = store.resolve_petal_owner(name).map_err(|error| {
+            warn!(petal = %name, %error, "petal.default_policy_owner_unreadable");
+            bloom_vfs::HandlerError::backend(format!("read the installed {name} Petal: {error}"))
+        })?;
+        let Some(hash) = installed else {
+            setup.not_installed.push(name.clone());
+            continue;
+        };
+        let package = bloom_broker_api::Digest32::new(hash).map_err(|error| {
+            bloom_vfs::HandlerError::backend(format!(
+                "the installed {name} Petal has an invalid package hash: {error}"
+            ))
+        })?;
+        setup.packages.push(package);
+        setup.destinations.extend(default_policy_destinations(name));
+    }
+    Ok(setup)
+}
+
+/// [`default_policy_setup`] for `wallet`, from the config on disk now, not a
+/// copy taken when Machine started, so a setup saved since is the one
+/// proposed. A config that cannot be read stops the proposal.
+fn saved_default_policy_setup(
+    store: &PetalStore,
+    config_path: &std::path::Path,
+    wallet: &str,
+) -> Result<bloom_vfs::handlers::DefaultPolicySetup, bloom_vfs::HandlerError> {
+    let config = Config::load(config_path).map_err(|error| {
+        bloom_vfs::HandlerError::backend(format!(
+            "read {wallet}'s setup before proposing its policy: {error}"
+        ))
+    })?;
+    default_policy_setup(store, config.setup.wallet(wallet))
+}
+
+/// The fixed contracts a chosen Petal transacts with, as Broker policy
+/// destinations. The table lives in Bloom's source, never in config, and a
+/// test checks every entry is a valid destination, so none is dropped here.
+pub fn default_policy_destinations(name: &str) -> Vec<bloom_broker_api::PolicyDestination> {
+    bloom_proto::petal_destinations::for_petal(name)
+        .iter()
+        .filter_map(|destination| {
+            Some(bloom_broker_api::PolicyDestination {
+                chain: bloom_broker_api::Token::new(destination.chain.to_owned()).ok()?,
+                destination: destination.destination.to_owned(),
+            })
+        })
+        .collect()
+}
+
 /// All wired-up state the daemon owns. Cheap to clone (everything is
 /// behind Arc/clone-safe inner types).
 #[derive(Clone)]
@@ -4735,6 +4839,25 @@ impl Daemon {
             })),
         );
 
+        // Build the petals runtime: content-addressed store under
+        // `~/.bloom/petals/store`, name registry under
+        // `~/.bloom/petals/registry`, and a wasmtime engine. Petal
+        // packages are exposed under `petals/`.
+        let petals_root = home.root().join("petals");
+        let petal_store = PetalStore::open(petals_root.join("store"))
+            .map_err(|e| DaemonError::Audit(format!("petals store: {e}")))?;
+
+        // A wallet's first Petal proposal also allows every installed Petal
+        // its setup chose.
+        let default_policy_packages: bloom_vfs::handlers::DefaultPolicyPackages = {
+            // Read from disk on each call, not from the copy Machine loaded at
+            // startup, and installed hashes resolved on each call too, so a
+            // Petal update is picked up without a restart. A config that
+            // cannot be read stops the proposal.
+            let config_path = home.config_path();
+            let store = petal_store.clone();
+            Arc::new(move |wallet: &str| saved_default_policy_setup(&store, &config_path, wallet))
+        };
         let wallets_handler = Arc::new(
             WalletsHandler::new(
                 chains.clone(),
@@ -4748,16 +4871,9 @@ impl Daemon {
             .with_home_write_permit_opt(home_write_permit.clone())
             .with_mempool_indexes(mempool_indexes.clone())
             .with_solana(solana_engines)
-            .with_solana_reads(solana_chain_registry.clone()),
+            .with_solana_reads(solana_chain_registry.clone())
+            .with_default_policy_packages(default_policy_packages),
         );
-
-        // Build the petals runtime: content-addressed store under
-        // `~/.bloom/petals/store`, name registry under
-        // `~/.bloom/petals/registry`, and a wasmtime engine. Petal
-        // packages are exposed under `petals/`.
-        let petals_root = home.root().join("petals");
-        let petal_store = PetalStore::open(petals_root.join("store"))
-            .map_err(|e| DaemonError::Audit(format!("petals store: {e}")))?;
         let petal_registry = Arc::new(
             NameRegistry::open(petals_root.join("registry"))
                 .map_err(|e| DaemonError::Audit(format!("petals registry: {e}")))?,
@@ -5145,6 +5261,37 @@ impl Daemon {
     /// callers must not construct a second edge over the same Machine journal.
     pub fn broker_client(&self) -> Option<MachineBrokerClient> {
         self.machine_broker.clone()
+    }
+
+    /// Propose every package in `packages` and every destination in
+    /// `destinations` together through the wallet's existing policy
+    /// operation. `Allowed` means the policy allows all of them. Only the
+    /// policy wallet creation installed is added to: once it has changed,
+    /// nothing is proposed.
+    pub async fn ensure_default_policy(
+        &self,
+        wallet: &str,
+        packages: &[bloom_broker_api::Digest32],
+        destinations: &[bloom_broker_api::PolicyDestination],
+    ) -> Result<bloom_machine_client::PetalEligibility, bloom_vfs::HandlerError> {
+        self.wallets
+            .ensure_petal_packages_allowed(wallet, packages, destinations)
+            .await
+    }
+
+    /// `wallet`'s policy once its retained proposals are reconciled, so a
+    /// change the owner approved meanwhile commits: the change still waiting
+    /// for the owner, or the current policy. The waiting change is this
+    /// request's own only when it adds nothing else. Proposes nothing.
+    pub async fn reconciled_wallet_policy(
+        &self,
+        wallet: &str,
+        packages: &[bloom_broker_api::Digest32],
+        destinations: &[bloom_broker_api::PolicyDestination],
+    ) -> Result<bloom_vfs::handlers::ReconciledPolicy, bloom_vfs::HandlerError> {
+        self.wallets
+            .reconciled_policy(wallet, packages, destinations)
+            .await
     }
 
     /// Idempotent: ensure background workers are running. Already
@@ -6210,6 +6357,156 @@ mod tests {
 
         config.nfs_listen_addr = "not-a-socket".to_owned();
         assert!(configured_mount(&config, std::path::Path::new("/tmp/bloom-mount")).is_err());
+    }
+
+    /// A wait for the Petals chosen during setup reaches the Petal whole, as a
+    /// backend error free of the words a Petal reads as a refusal or a bad
+    /// request, so the agent sees what to wait for; anything else is denied.
+    #[test]
+    fn a_wait_for_chosen_petals_reaches_the_agent_whole() {
+        let waiting =
+            bloom_vfs::handlers::wallets::default_policy_waiting(&["hyperliquid".to_owned()]);
+        let Err(HostError::Backend(message)) = petal_eligibility_outcome("main", Err(waiting))
+        else {
+            panic!("the wait must not be a denial");
+        };
+        assert!(message.starts_with("DEFAULT_POLICY_WAITING: "), "{message}");
+        assert!(message.contains("hyperliquid"), "{message}");
+        assert!(message.contains("`docs/petals.md`"), "{message}");
+        assert!(
+            message.contains("[setup.wallets.<wallet>.petals]"),
+            "{message}"
+        );
+        let lower = message.to_ascii_lowercase();
+        for word in ["denied", "permission", "invalid", "not found"] {
+            assert!(!lower.contains(word), "{word}: {message}");
+        }
+        assert!(matches!(
+            eligibility_host_error("main", bloom_vfs::HandlerError::backend("broker refused")),
+            HostError::Denied(_)
+        ));
+        // Another command holding the wallet's policy is a retry, not a refusal.
+        let busy = bloom_vfs::HandlerError::backend(format!(
+            "{}; retry: Resource temporarily unavailable (os error 35)",
+            bloom_vfs::handlers::wallets::POLICY_COORDINATION_BUSY
+        ));
+        let Err(HostError::Backend(message)) =
+            petal_eligibility_outcome("denied-wallet", Err(busy))
+        else {
+            panic!("a busy policy must not be a denial");
+        };
+        assert!(message.contains("retry this operation"), "{message}");
+        let lower = message.to_ascii_lowercase();
+        for word in ["denied", "permission", "invalid", "not found"] {
+            assert!(!lower.contains(word), "{word}: {message}");
+        }
+    }
+
+    /// One chosen Petal whose owner record cannot be read fails the whole
+    /// default-policy setup, rather than leaving that Petal out of the first
+    /// proposal. A chosen Petal that is not installed is named, so the
+    /// proposal waits for it; a name setup never offers is ignored, since
+    /// nothing would ever install it.
+    #[test]
+    fn default_policy_setup_fails_when_an_owner_record_is_unreadable() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = PetalStore::open(temp.path()).unwrap();
+        let mut chosen = bloom_proto::config::WalletSetup::default();
+        for name in ["hyperliquid", "polymarket", "safe", "tolly", "Hyperliquid"] {
+            chosen.petals.insert(name.to_owned(), Default::default());
+        }
+
+        let setup = default_policy_setup(&store, &chosen).unwrap();
+        assert!(setup.packages.is_empty(), "nothing is installed yet");
+        // Missing chosen Petals are named, so a Petal's use waits for them;
+        // Safe, which setup never offers, a Petal no release installs, and a
+        // misspelt name are ignored though a config names them.
+        assert_eq!(setup.not_installed, ["hyperliquid", "polymarket"]);
+
+        // Installed: each package is proposed, with the destinations its
+        // transactions need: none for Hyperliquid, `petal:polymarket` on
+        // Polygon for Polymarket.
+        std::fs::create_dir_all(temp.path().join("owners")).unwrap();
+        let install = |name: &str, hash: &str| {
+            std::fs::create_dir_all(store.package_path(hash).unwrap()).unwrap();
+            std::fs::write(
+                temp.path().join("owners").join(format!("{name}.json")),
+                serde_json::json!({"name": name, "hash": hash}).to_string(),
+            )
+            .unwrap();
+        };
+        install("hyperliquid", &"ab".repeat(32));
+        let setup = default_policy_setup(&store, &chosen).unwrap();
+        assert_eq!(setup.not_installed, ["polymarket"]);
+        assert_eq!(
+            setup.packages,
+            [bloom_broker_api::Digest32::new("ab".repeat(32)).unwrap()]
+        );
+        assert!(setup.destinations.is_empty());
+        install("polymarket", &"cd".repeat(32));
+        let setup = default_policy_setup(&store, &chosen).unwrap();
+        assert!(setup.not_installed.is_empty());
+        assert_eq!(setup.packages.len(), 2);
+        assert_eq!(
+            setup.destinations,
+            default_policy_destinations("polymarket")
+        );
+        assert!(
+            setup
+                .destinations
+                .contains(&bloom_broker_api::PolicyDestination {
+                    chain: bloom_broker_api::Token::new("polygon").unwrap(),
+                    destination: "petal:polymarket".into(),
+                })
+        );
+        // Every catalog destination is a valid one, so none is dropped.
+        for name in bloom_proto::config::SETUP_PETALS {
+            assert_eq!(
+                default_policy_destinations(name).len(),
+                bloom_proto::petal_destinations::for_petal(name).len(),
+                "{name}"
+            );
+        }
+
+        std::fs::write(temp.path().join("owners/polymarket.json"), b"not json").unwrap();
+        let error = default_policy_setup(&store, &chosen).unwrap_err();
+        assert!(error.to_string().contains("polymarket"), "{error}");
+        // A wallet without a setup proposes nothing beyond its request.
+        assert_eq!(
+            default_policy_setup(&store, &Default::default()).unwrap(),
+            bloom_vfs::handlers::DefaultPolicySetup::default()
+        );
+    }
+
+    /// A wallet's first proposal reads its setup from the config on disk each
+    /// time, so a setup saved after Machine started is the one proposed, and
+    /// an unreadable config stops the proposal.
+    #[test]
+    fn the_first_proposal_reads_the_saved_setup_each_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = PetalStore::open(temp.path().join("store")).unwrap();
+        let path = temp.path().join("config.toml");
+        let mut config = Config::local_default();
+        config.save(&path).unwrap();
+        assert_eq!(
+            saved_default_policy_setup(&store, &path, "trading").unwrap(),
+            bloom_vfs::handlers::DefaultPolicySetup::default()
+        );
+        config
+            .setup
+            .wallet_mut("trading")
+            .petals
+            .insert("hyperliquid".into(), Default::default());
+        config.save(&path).unwrap();
+        let setup = saved_default_policy_setup(&store, &path, "trading").unwrap();
+        assert_eq!(setup.not_installed, ["hyperliquid"]);
+        assert_eq!(
+            saved_default_policy_setup(&store, &path, "main").unwrap(),
+            bloom_vfs::handlers::DefaultPolicySetup::default(),
+            "another wallet's setup is not main's"
+        );
+        std::fs::write(&path, "not toml").unwrap();
+        assert!(saved_default_policy_setup(&store, &path, "trading").is_err());
     }
 
     #[test]

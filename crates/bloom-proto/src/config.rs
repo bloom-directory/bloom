@@ -61,6 +61,9 @@ pub struct Config {
     /// upper bound.
     #[serde(default)]
     pub petals: PetalsConfig,
+    /// What `bloom init` setup chose.
+    #[serde(default, skip_serializing_if = "SetupConfig::is_empty")]
+    pub setup: SetupConfig,
     #[serde(default)]
     pub mempool: BTreeMap<String, MempoolChainConfig>,
     #[serde(default)]
@@ -101,6 +104,117 @@ pub struct PetalsConfig {
     #[serde(default)]
     pub runtime: BTreeMap<String, PetalRuntimeConfig>,
 }
+
+/// Replace the file at `path`, or the file a symbolic link there points to,
+/// with `bytes` in one step: a sibling is written, synced and renamed over
+/// it, with the replaced file's permissions.
+fn replace_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let target = std::fs::canonicalize(path)?;
+    let directory = target.parent().unwrap_or_else(|| Path::new("."));
+    let mut sibling = tempfile::NamedTempFile::new_in(directory)?;
+    sibling
+        .as_file()
+        .set_permissions(std::fs::metadata(&target)?.permissions())?;
+    sibling.write_all(bytes)?;
+    sibling.as_file().sync_all()?;
+    sibling.persist(&target).map_err(|error| error.error)?;
+    Ok(())
+}
+
+/// What setup chose, as the top-level `[setup]` table. It is not part of
+/// `[petals]`: a Bloom release refuses unknown keys there, but ignores an
+/// unknown top-level table, so a home this setup ran on still starts with an
+/// older Bloom. Unknown keys are ignored here for the same reason, so a later
+/// Bloom's additions never stop this one from starting.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SetupConfig {
+    /// Written when `bloom init` finished. This, not an empty `main`, is what
+    /// tells a later run that setup already happened: declining every Petal
+    /// is a valid choice, and `bloom serve` or an interrupted menu can leave a
+    /// config with no choices in it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub complete: bool,
+    /// Each wallet's setup, by wallet name: `bloom init` writes `main`'s.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub wallets: BTreeMap<String, WalletSetup>,
+}
+
+/// One wallet's setup: the Petals its default policy allows. Bloom
+/// provisions its catalog Petals regardless; the wallet's default policy
+/// proposes exactly these. Nothing here grants authority.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalletSetup {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub petals: BTreeMap<String, PetalSetupConfig>,
+}
+
+/// One chosen Petal, as `[setup.wallets.<wallet>.petals.<name>]`. It holds
+/// nothing yet; a table, rather than a list of names, leaves room for
+/// per-Petal choices without changing the layout.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PetalSetupConfig {}
+
+/// The setup of a wallet that has none.
+static NO_WALLET_SETUP: WalletSetup = WalletSetup {
+    petals: BTreeMap::new(),
+};
+
+impl SetupConfig {
+    fn is_empty(&self) -> bool {
+        !self.complete && self.wallets.is_empty()
+    }
+
+    /// `wallet`'s setup, empty when it has none.
+    pub fn wallet(&self, wallet: &str) -> &WalletSetup {
+        self.wallets.get(wallet).unwrap_or(&NO_WALLET_SETUP)
+    }
+
+    /// `wallet`'s setup, to change.
+    pub fn wallet_mut(&mut self, wallet: &str) -> &mut WalletSetup {
+        self.wallets.entry(wallet.to_owned()).or_default()
+    }
+
+    /// The default wallet's setup, which `bloom init` chooses.
+    pub fn main(&self) -> &WalletSetup {
+        self.wallet(DEFAULT_POLICY_WALLET)
+    }
+
+    /// The default wallet's setup, to change.
+    pub fn main_mut(&mut self) -> &mut WalletSetup {
+        self.wallet_mut(DEFAULT_POLICY_WALLET)
+    }
+}
+
+/// Wallet whose default policy allows the Petals chosen during setup.
+pub const DEFAULT_POLICY_WALLET: &str = "main";
+
+/// Catalog Petals setup does not offer, so no default policy allows them,
+/// even when a config names one; the owner allows one with their own policy
+/// change.
+///
+/// Safe signs a Safe transaction's confirmation and stages its execution.
+/// Broker refuses that signature unless the policy allows exact destinations
+/// on its chain, and Machine refuses the execution unless the policy lists the
+/// Safe's address. Neither is a fixed contract setup could propose:
+/// exact destinations would let any staged transaction deploy a contract, and
+/// the Safe is the owner's own. Allowing only its package would let setup
+/// say Safe is allowed while every use of it is refused.
+pub const PETALS_NOT_IN_SETUP: &[&str] = &["safe"];
+
+/// Petals setup offers, in the order `bloom init` installs them: Bloom's
+/// catalog Petals except [`PETALS_NOT_IN_SETUP`]. Only these are proposed or
+/// waited for. A config naming any other Petal, as only a hand edit or a
+/// Petal since dropped from the catalog can, allows nothing more, since no
+/// release installs it and waiting for it would never end.
+pub const SETUP_PETALS: &[&str] = &[
+    "polymarket",
+    "hyperliquid",
+    "enso",
+    "near-intents",
+    "feedback",
+];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PetalRuntimeConfig {
@@ -462,6 +576,7 @@ impl Config {
             )]),
             etherscan: None,
             petals: PetalsConfig::default(),
+            setup: SetupConfig::default(),
             mempool: BTreeMap::new(),
             private_rpc: BTreeMap::new(),
             backends: BackendsConfig::default(),
@@ -483,6 +598,48 @@ impl Config {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(path, s)?;
+        Ok(())
+    }
+
+    /// Save only `[setup]` into the config at `path`, leaving everything else
+    /// in the file as its owner wrote it, comments and layout included. The
+    /// file is replaced in one step, keeping its permissions, so a crash
+    /// leaves the old config whole; a symbolic link at `path` is kept and the
+    /// file it points to is replaced. Without a file there, the whole config
+    /// is saved.
+    pub fn save_setup(&self, path: &Path) -> Result<(), ConfigError> {
+        let existing = match std::fs::read_to_string(path) {
+            Ok(existing) => existing,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return self.save(path),
+            Err(error) => return Err(error.into()),
+        };
+        let mut document: toml_edit::DocumentMut = existing
+            .parse()
+            .map_err(|error| ConfigError::Invalid(format!("{error}")))?;
+        #[derive(Serialize)]
+        struct Setup<'a> {
+            #[serde(skip_serializing_if = "SetupConfig::is_empty")]
+            setup: &'a SetupConfig,
+        }
+        // Appended after everything else rather than merged in, so no table
+        // of the owner's moves.
+        document.remove("setup");
+        let mut text = document.to_string().trim_end().to_owned();
+        text.push('\n');
+        let setup = toml::to_string_pretty(&Setup { setup: &self.setup })?;
+        if !setup.trim().is_empty() {
+            text.push('\n');
+            text.push_str(&setup);
+        }
+        // What is written must load back as this setup.
+        let saved: Config = toml::from_str(&text)?;
+        if saved.setup.wallets != self.setup.wallets || saved.setup.complete != self.setup.complete
+        {
+            return Err(ConfigError::Invalid(
+                "the saved [setup] does not read back as written".into(),
+            ));
+        }
+        replace_file(path, text.as_bytes())?;
         Ok(())
     }
 
@@ -1680,5 +1837,152 @@ rpc_urls = ["https://mainnet.optimism.io"]
             !cfg.chains["ethereum"].op_stack,
             "ethereum should not be op_stack"
         );
+    }
+    #[test]
+    fn setup_completion_is_written_only_once_recorded() {
+        let mut cfg = Config::local_default();
+        assert!(!cfg.setup.complete);
+        let encoded = toml::to_string_pretty(&cfg).unwrap();
+        assert!(!encoded.contains("[setup"), "{encoded}");
+
+        // Petal tables alone do not mean setup finished.
+        cfg.setup
+            .main_mut()
+            .petals
+            .insert("hyperliquid".into(), PetalSetupConfig::default());
+        let decoded: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        assert!(decoded.setup.main().petals.contains_key("hyperliquid"));
+        assert!(!decoded.setup.complete);
+
+        cfg.setup.complete = true;
+        let decoded: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        assert!(decoded.setup.complete);
+    }
+
+    /// Each wallet keeps its own setup; a wallet without one reads as empty.
+    #[test]
+    fn each_wallet_keeps_its_own_setup() {
+        let mut cfg = Config::local_default();
+        cfg.setup.complete = true;
+        cfg.setup
+            .main_mut()
+            .petals
+            .insert("hyperliquid".into(), PetalSetupConfig::default());
+        cfg.setup
+            .wallet_mut("trading")
+            .petals
+            .insert("polymarket".into(), PetalSetupConfig::default());
+        let td = tempdir().unwrap();
+        let path = td.path().join("config.toml");
+        cfg.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.setup.wallets, cfg.setup.wallets);
+        assert!(loaded.setup.main().petals.contains_key("hyperliquid"));
+        assert!(
+            !loaded
+                .setup
+                .wallet("trading")
+                .petals
+                .contains_key("hyperliquid")
+        );
+        assert_eq!(loaded.setup.wallet("savings"), &WalletSetup::default());
+    }
+
+    /// Setup's choices sit outside `[petals]`, whose unknown keys a Bloom
+    /// release refuses, so going back to a release still loads the config.
+    /// Keys a later Bloom adds under a chosen Petal are ignored.
+    #[test]
+    fn setup_choices_stay_out_of_the_table_releases_refuse_unknown_keys_in() {
+        let mut cfg = Config::local_default();
+        cfg.setup.complete = true;
+        cfg.setup
+            .main_mut()
+            .petals
+            .insert("polymarket".into(), PetalSetupConfig::default());
+        let encoded = toml::to_string_pretty(&cfg).unwrap();
+        let document: toml::Value = toml::from_str(&encoded).unwrap();
+        assert_eq!(
+            document["petals"]
+                .as_table()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            ["runtime"],
+            "{encoded}"
+        );
+        // A release's `[petals]` table: only these keys, unknown ones refused.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct ReleasePetals {
+            #[serde(default)]
+            preinstalled: Vec<String>,
+            #[serde(default)]
+            runtime: BTreeMap<String, PetalRuntimeConfig>,
+        }
+        document["petals"]
+            .clone()
+            .try_into::<ReleasePetals>()
+            .unwrap();
+        let later: Config = toml::from_str(&format!(
+            "{encoded}\n[setup.wallets.main.petals.polymarket.values]\nmax_daily_usd = \"100\"\n"
+        ))
+        .unwrap();
+        assert!(later.setup.main().petals.contains_key("polymarket"));
+    }
+    /// Saving setup into an existing config changes only `[setup]`: the
+    /// owner's comments and every other setting stay as they wrote them,
+    /// a link to the config stays a link, and its permissions are kept.
+    #[cfg(unix)]
+    #[test]
+    fn saving_setup_keeps_the_rest_of_the_config_as_written() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let td = tempdir().unwrap();
+        let real = td.path().join("dotfiles").join("bloom.toml");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        let written = format!(
+            "# my RPC notes: keep this\n{}",
+            toml::to_string_pretty(&Config::local_default()).unwrap()
+        );
+        std::fs::write(&real, &written).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let path = td.path().join("config.toml");
+        std::os::unix::fs::symlink(&real, &path).unwrap();
+
+        let mut cfg = Config::load(&path).unwrap();
+        cfg.setup.complete = true;
+        cfg.setup
+            .main_mut()
+            .petals
+            .insert("polymarket".into(), PetalSetupConfig::default());
+        cfg.save_setup(&path).unwrap();
+        let saved = std::fs::read_to_string(&real).unwrap();
+        assert!(saved.starts_with(&written), "{saved}");
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let loaded = Config::load(&path).unwrap();
+        assert!(loaded.setup.complete);
+        assert!(loaded.setup.main().petals.contains_key("polymarket"));
+        let names: Vec<String> = std::fs::read_dir(real.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, ["bloom.toml"], "no sibling is left behind");
+
+        // Saving again replaces `[setup]` rather than adding another.
+        cfg.setup.main_mut().petals.clear();
+        cfg.save_setup(&path).unwrap();
+        let saved = std::fs::read_to_string(&real).unwrap();
+        assert_eq!(saved.matches("[setup]").count(), 1, "{saved}");
+        assert!(Config::load(&path).unwrap().setup.main().petals.is_empty());
     }
 }

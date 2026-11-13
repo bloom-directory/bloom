@@ -1802,7 +1802,15 @@ impl TxEngine {
         // the destination has bytecode we still flag it as a contract
         // call; the heuristic mirrors the spec's "code length > 0 OR data
         // is non-empty" rule.
-        let mut policy_ctx = policy_engine::AddressContext::default();
+        let mut policy_ctx = policy_engine::AddressContext {
+            // A Petal's own destinations are only trusted when the policy names
+            // it; the engine merely reports which Petal staged this.
+            staged_by_petal: execution_origin
+                .as_ref()
+                .map(|origin| origin.petal_id.clone())
+                .filter(|petal| !petal.is_empty()),
+            ..Default::default()
+        };
         // Synthetic policy checks contributed by NFT-aware code paths
         // (e.g. operator-wide approvals) — appended after the rules engine
         // has produced its own checks so they all show up in plan.md.
@@ -7416,6 +7424,87 @@ mod tests {
         assert_eq!(subject.total_value_usd_micro, Some(1_250_000));
         assert_eq!(calls.lock().len(), 1);
         assert_eq!(calls.lock()[0].1, "1250000");
+    }
+
+    /// A wallet policy's `petal:<name>` entry lets the transaction that
+    /// Petal stages go to a destination it chose. The engine reports which
+    /// Petal staged it; a hand-staged transaction, or one another Petal
+    /// staged, is still matched against the listed addresses.
+    #[tokio::test]
+    async fn a_petal_entry_covers_only_what_that_petal_staged() {
+        let mut policy = Policy::default();
+        policy
+            .allowlists
+            .recipients
+            .insert("petal:polymarket".into());
+        let stage = |origin: Option<ExecutionOrigin>| {
+            let policy = policy.clone();
+            async move {
+                let url = spawn_stage_rpc(false).await;
+                let oracle = RecordingOracle {
+                    calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                    usd_micro: 1_250_000,
+                    age_ms: 0,
+                    max_age_ms: 60_000,
+                };
+                let (engine, _dir, permit, chain) = stage_fixture(&url, oracle);
+                let intent = RawIntent {
+                    body: RawIntentBody::Send {
+                        to: "0x2222222222222222222222222222222222222222".into(),
+                        value: "0.001 eth".into(),
+                        token: None,
+                        amount: String::new(),
+                        data: None,
+                    },
+                    chain: Some("anvil".into()),
+                    gas: bloom_proto::intent::GasStrategy::Auto,
+                    nonce: None,
+                    gas_limit_hint: None,
+                    usd_value_hint: None,
+                };
+                engine
+                    .stage_with_execution_origin(
+                        &permit,
+                        "alice",
+                        "0x3333333333333333333333333333333333333333"
+                            .parse()
+                            .unwrap(),
+                        intent,
+                        &chain,
+                        &policy,
+                        None,
+                        origin,
+                    )
+                    .await
+            }
+        };
+        let petal = |id: &str| ExecutionOrigin {
+            petal_id: id.into(),
+            ..ExecutionOrigin::default()
+        };
+        let staged = stage(Some(petal("petal:polymarket"))).await.unwrap();
+        assert!(
+            !crate::policy_engine::has_hard_violation(&staged.policy_checks),
+            "{:?}",
+            staged.policy_checks
+        );
+        assert!(
+            staged.policy_checks.iter().any(|check| check
+                .message
+                .contains("destination chosen by petal:polymarket")),
+            "{:?}",
+            staged.policy_checks
+        );
+        for origin in [None, Some(petal("petal:near-intents"))] {
+            let staged = stage(origin.clone()).await;
+            assert!(
+                match &staged {
+                    Ok(staged) => crate::policy_engine::has_hard_violation(&staged.policy_checks),
+                    Err(_) => true,
+                },
+                "{origin:?}: {staged:?}"
+            );
+        }
     }
 
     #[tokio::test]
