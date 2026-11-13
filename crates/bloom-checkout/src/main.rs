@@ -69,7 +69,10 @@ async fn main() -> Result<()> {
         Some(xvfb) => {
             use anyhow::Context;
             let dir = args.state.parent().context("State path has no directory")?;
-            Some(bloom_checkout::display::Display::start(xvfb, dir)?)
+            // Without a private display, run headless; never fall back to a host display.
+            bloom_checkout::display::Display::start(xvfb, dir)
+                .inspect_err(|error| eprintln!("Running headless: {error:#}"))
+                .ok()
         }
         None => None,
     };
