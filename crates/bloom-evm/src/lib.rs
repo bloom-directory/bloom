@@ -265,10 +265,6 @@ impl ChainClient {
     pub fn id(&self) -> ChainId {
         ChainId(self.spec.chain_id)
     }
-    /// True when this chain uses the OP Stack (Base, Optimism, …).
-    pub fn is_op_stack(&self) -> bool {
-        self.spec.op_stack
-    }
     pub fn provider(&self) -> Arc<RootProvider<Ethereum>> {
         self.primary.clone()
     }
@@ -1104,16 +1100,6 @@ impl ChainRegistry {
 
     pub fn list_names(&self) -> Vec<String> {
         self.inner.read().keys().cloned().collect()
-    }
-
-    /// Resolve a registered chain's path segment name from its numeric id, e.g.
-    /// `42161` → `"arbitrum"`. Used to render chain-qualified paths.
-    pub fn name_for_chain_id(&self, chain_id: u64) -> Option<String> {
-        self.inner
-            .read()
-            .values()
-            .find(|c| c.spec().chain_id == chain_id)
-            .map(|c| c.spec().name.clone())
     }
 
     pub fn from_chains<I: IntoIterator<Item = ChainSpec>>(specs: I) -> Result<Self, ChainError> {

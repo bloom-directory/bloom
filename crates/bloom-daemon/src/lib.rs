@@ -4191,30 +4191,14 @@ impl Daemon {
     /// Explicit key-free developer composition used by the debug CLI when an
     /// installed triad is absent. Release builds do not compile this entry
     /// point. It has no Broker client, signing path, custody path, legacy
-    /// keystore, or legacy approval store.
-    #[cfg(debug_assertions)]
-    pub fn from_home_without_broker_for_debug(home: HomeDir) -> Result<Self, DaemonError> {
-        Self::from_home_inner(home, None, None, None)
-    }
-
-    /// Write-permitted counterpart to [`Self::from_home_without_broker_for_debug`]
-    /// for Machine-owned state such as Petal installation and unsigned staging.
+    /// keystore, or legacy approval store. It is write-permitted for
+    /// Machine-owned state such as Petal installation and unsigned staging.
     #[cfg(debug_assertions)]
     pub fn from_home_with_permit_without_broker_for_debug(
         home: HomeDir,
         permit: Arc<HomeWritePermit>,
     ) -> Result<Self, DaemonError> {
         Self::from_home_inner(home, Some(permit), None, None)
-    }
-
-    /// Build a Machine daemon whose signing and custody authority is provided
-    /// exclusively by the Broker service boundary.
-    pub fn from_home_with_broker(
-        home: HomeDir,
-        broker: MachineBrokerClient,
-        provenance_catalog: bloom_broker_api::ProvenanceCatalog,
-    ) -> Result<Self, DaemonError> {
-        Self::from_home_inner(home, None, Some(broker), Some(provenance_catalog))
     }
 
     pub fn from_home_with_permit_and_broker(
@@ -5178,13 +5162,6 @@ impl Daemon {
         self.watch_executor.stop().await;
     }
 
-    /// Convenience for the default home dir (`~/.bloom`).
-    #[cfg(any(test, debug_assertions, feature = "unsigned-audit-test-seam"))]
-    pub fn from_default_home() -> Result<Self, DaemonError> {
-        let home = HomeDir::resolve("~/.bloom")?;
-        Self::from_home(home)
-    }
-
     /// Spawn long-lived background tasks: the update checker and the
     /// outbox expiry sweeper that runs every 60s and moves any pending
     /// entry past its `expires_ms` into `failed/` (fix #3). Caller keeps
@@ -5641,6 +5618,20 @@ fn run_expiry_sweep_once(
         "cutoff_ms": now_ms.to_string(),
         "scope": "all_pending_machine_outbox_entries",
     });
+    audited_sweep(audit, intent, "expiry sweep", || {
+        outbox.sweep_expired(now_ms)
+    })
+}
+
+/// Journals `intent`, runs `sweep`, and journals its outcome. A sweep never
+/// runs unless its intent was recorded first.
+fn audited_sweep<E: std::fmt::Display>(
+    audit: &AuditLog,
+    intent: serde_json::Value,
+    label: &str,
+    sweep: impl FnOnce() -> Result<usize, E>,
+) -> Result<usize, String> {
+    let operation = intent["operation"].clone();
     let operation_id =
         bloom_tools::sha256_hex(&serde_jcs::to_vec(&intent).map_err(|error| error.to_string())?);
     let correlation_id = format!("{operation_id}:{}", audit.sequence() + 1);
@@ -5658,8 +5649,8 @@ fn run_expiry_sweep_once(
             prev: String::new(),
             digest: String::new(),
         })
-        .map_err(|error| format!("Machine audit unavailable before expiry sweep: {error}"))?;
-    let swept = outbox.sweep_expired(now_ms);
+        .map_err(|error| format!("Machine audit unavailable before {label}: {error}"))?;
+    let swept = sweep();
     let result = match &swept {
         Ok(count) => serde_json::json!({"outcome": "completed", "swept": count}),
         Err(error) => serde_json::json!({"outcome": "error", "error": error.to_string()}),
@@ -5671,14 +5662,14 @@ fn run_expiry_sweep_once(
             wallet: None,
             chain: None,
             data: serde_json::json!({
-                "operation": "tx.outbox.sweep_expired",
+                "operation": operation,
                 "correlation_id": correlation_id,
                 "result": result,
             }),
             prev: String::new(),
             digest: String::new(),
         })
-        .map_err(|error| format!("Machine audit unavailable after expiry sweep: {error}"))?;
+        .map_err(|error| format!("Machine audit unavailable after {label}: {error}"))?;
     swept.map_err(|error| error.to_string())
 }
 
@@ -5731,47 +5722,9 @@ fn run_solana_expiry_sweep_once(
         "live_block_heights": live_block_heights.len(),
         "scope": "all_pending_machine_solana_outbox_entries",
     });
-    let operation_id =
-        bloom_tools::sha256_hex(&serde_jcs::to_vec(&intent).map_err(|error| error.to_string())?);
-    let correlation_id = format!("{operation_id}:{}", audit.sequence() + 1);
-    audit
-        .append(AuditRecord {
-            ts_ms: 0,
-            kind: "machine.effect.intent".into(),
-            wallet: None,
-            chain: None,
-            data: serde_json::json!({
-                "operation_id": operation_id,
-                "correlation_id": correlation_id,
-                "details": intent,
-            }),
-            prev: String::new(),
-            digest: String::new(),
-        })
-        .map_err(|error| {
-            format!("Machine audit unavailable before Solana expiry sweep: {error}")
-        })?;
-    let swept = outbox.sweep_expired_with_statuses(now_ms, live_block_heights, observed);
-    let result = match &swept {
-        Ok(count) => serde_json::json!({"outcome": "completed", "swept": count}),
-        Err(error) => serde_json::json!({"outcome": "error", "error": error.to_string()}),
-    };
-    audit
-        .append(AuditRecord {
-            ts_ms: 0,
-            kind: "machine.effect.result".into(),
-            wallet: None,
-            chain: None,
-            data: serde_json::json!({
-                "operation": "solana_tx.outbox.sweep_expired",
-                "correlation_id": correlation_id,
-                "result": result,
-            }),
-            prev: String::new(),
-            digest: String::new(),
-        })
-        .map_err(|error| format!("Machine audit unavailable after Solana expiry sweep: {error}"))?;
-    swept.map_err(|error| error.to_string())
+    audited_sweep(audit, intent, "Solana expiry sweep", || {
+        outbox.sweep_expired_with_statuses(now_ms, live_block_heights, observed)
+    })
 }
 
 fn spawn_wallet_projection_refresh(
@@ -8426,47 +8379,33 @@ mod tests {
     /// (`solana.transfer.confirm`), so `from_home_with_permit_and_broker`
     /// actually reaches the Solana engine/reconciler construction path.
     fn solana_and_evm_catalog() -> bloom_broker_api::ProvenanceCatalog {
+        use bloom_broker_api::Token;
+        let record = |action: &str, op: &str, chain: &str| bloom_broker_api::ProvenanceRecord {
+            subject: bloom_broker_api::ProvenanceSubject::System {
+                component_id: Token::new("bloom-machine").unwrap(),
+                operation_class: Token::new(action).unwrap(),
+            },
+            publisher: Token::new("bloom-installer").unwrap(),
+            petal_lineage: None,
+            operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                operation_class: Token::new(op).unwrap(),
+                fee_asset: Some(bloom_broker_api::ProvenanceFeeAsset {
+                    chain: Token::new(chain).unwrap(),
+                    asset: "native".into(),
+                }),
+            }],
+            installer_key_id: Token::new("installer-key").unwrap(),
+            installer_signature: bloom_broker_api::Base64UrlBytes::from_bytes(&[11; 64]),
+        };
         bloom_broker_api::ProvenanceCatalog {
             schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
             records: vec![
-                bloom_broker_api::ProvenanceRecord {
-                    subject: bloom_broker_api::ProvenanceSubject::System {
-                        component_id: bloom_broker_api::Token::new("bloom-machine").unwrap(),
-                        operation_class: bloom_broker_api::Token::new("transaction.confirm")
-                            .unwrap(),
-                    },
-                    publisher: bloom_broker_api::Token::new("bloom-installer").unwrap(),
-                    petal_lineage: None,
-                    operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
-                        operation_class: bloom_broker_api::Token::new("transaction.confirm")
-                            .unwrap(),
-                        fee_asset: Some(bloom_broker_api::ProvenanceFeeAsset {
-                            chain: bloom_broker_api::Token::new("ethereum").unwrap(),
-                            asset: "native".into(),
-                        }),
-                    }],
-                    installer_key_id: bloom_broker_api::Token::new("installer-key").unwrap(),
-                    installer_signature: bloom_broker_api::Base64UrlBytes::from_bytes(&[11; 64]),
-                },
-                bloom_broker_api::ProvenanceRecord {
-                    subject: bloom_broker_api::ProvenanceSubject::System {
-                        component_id: bloom_broker_api::Token::new("bloom-machine").unwrap(),
-                        operation_class: bloom_broker_api::Token::new("solana.transfer.confirm")
-                            .unwrap(),
-                    },
-                    publisher: bloom_broker_api::Token::new("bloom-installer").unwrap(),
-                    petal_lineage: None,
-                    operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
-                        operation_class: bloom_broker_api::Token::new("solana.native-transfer")
-                            .unwrap(),
-                        fee_asset: Some(bloom_broker_api::ProvenanceFeeAsset {
-                            chain: bloom_broker_api::Token::new("solana").unwrap(),
-                            asset: "native".into(),
-                        }),
-                    }],
-                    installer_key_id: bloom_broker_api::Token::new("installer-key").unwrap(),
-                    installer_signature: bloom_broker_api::Base64UrlBytes::from_bytes(&[11; 64]),
-                },
+                record("transaction.confirm", "transaction.confirm", "ethereum"),
+                record(
+                    "solana.transfer.confirm",
+                    "solana.native-transfer",
+                    "solana",
+                ),
             ],
         }
     }
