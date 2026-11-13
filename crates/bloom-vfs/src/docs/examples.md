@@ -78,6 +78,33 @@ verify `wallets/alice/<n>/account.json` and use
 `wallets/alice/<n>/chains/anvil/outbox/` throughout the same procedure.
 Numbered outboxes expose only actions staged by that account.
 
+## Intent shapes
+
+`outbox/new.tx` and `simulate/new` take one JSON object with its fields at the
+top level, plus an optional `chain`:
+
+```text
+send 0.25 ETH to 0x...                                  native send, one line
+{"kind":"send","to":"0x...","value":"0.25 eth"}           native send
+{"kind":"send","to":"0x...","token":"USDC","amount":"10"} token send, human units
+{"kind":"approve","token":"0x...","spender":"0x...","amount":"1000000"}
+                                    raw token units; "0" revokes, "max" is unlimited
+{"kind":"raw","to":"0x...","data":"0x...","value":"0"}    any contract call with calldata
+{"kind":"call","contract":"0x...","method":"transfer(address,uint256)","args":["0x...","1"]}
+{"kind":"deploy","data":"0x<initcode>","value":"0"}
+```
+
+A swap or other DeFi action is an approve, then a raw call. Encode calldata
+with your normal tools, for example `cast calldata`. Stage the second only
+after the first is in `sent/`:
+
+```sh
+O="$BLOOM/wallets/alice/0/chains/base/outbox"
+printf '{"kind":"approve","token":"<usdc>","spender":"<router>","amount":"10000000"}' > "$O/new.tx"
+# Confirm it and read sent/<id>/ (transaction loop above), then:
+printf '{"kind":"raw","to":"<router>","data":"<calldata>","value":"0"}' > "$O/new.tx"
+```
+
 ## Repairing rejected EIP-1559 fees
 
 A node can reject a signed transaction when its priority fee is below the

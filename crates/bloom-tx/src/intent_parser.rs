@@ -20,9 +20,12 @@ pub enum ParseError {
     Shell(String),
     #[error("invalid intent: {0}")]
     Invalid(String),
-    #[error("ambiguous intent")]
+    #[error("ambiguous intent: expected {SHAPES}")]
     Ambiguous,
 }
+
+/// Every intent shape, named in errors so an agent can correct its write.
+const SHAPES: &str = "kind send (to, value | to, token, amount), approve (token, spender, amount), raw (to, data[, value]) for any contract call with calldata, call (contract, method, args), deploy (data), nft_transfer, nft_approve or nft_approve_all; fields go at the top level";
 
 #[derive(serde::Deserialize, Debug, Clone)]
 struct LooseIntent {
@@ -73,6 +76,11 @@ struct LooseIntent {
 
 impl LooseIntent {
     fn into_raw(self) -> Result<RawIntent, ParseError> {
+        if self.extra.contains_key("intent") {
+            return Err(ParseError::Invalid(format!(
+                "put the intent's fields at the top level, not under \"intent\"; expected {SHAPES}"
+            )));
+        }
         let kind = self
             .kind
             .clone()
@@ -221,7 +229,11 @@ impl LooseIntent {
                 operator: self.operator.ok_or(ParseError::Ambiguous)?,
                 approved: self.approved.ok_or(ParseError::Ambiguous)?,
             },
-            _ => return Err(ParseError::Ambiguous),
+            other => {
+                return Err(ParseError::Invalid(format!(
+                    "unknown kind \"{other}\"; expected {SHAPES}"
+                )));
+            }
         };
         let gas = match self.gas.or(self.priority).as_deref() {
             Some("auto") | None => bloom_proto::GasStrategy::Auto,
@@ -434,6 +446,44 @@ fn parse_nft_shell(line: &str) -> Result<RawIntent, ParseError> {
 mod tests {
     use super::*;
     use bloom_proto::RawIntentBody;
+
+    #[test]
+    fn errors_name_the_accepted_shapes() {
+        // Writes an agent made in a 2026-11-04 bench trial (bloom#447).
+        let to = "0xE592427A0AEce92De3Edee1F18E0157C05861564";
+        for (input, start) in [
+            (
+                format!(r#"{{"intent":{{"chain":"ethereum","to":"{to}","data":"0x01"}}}}"#),
+                "invalid intent: put the intent's fields at the top level",
+            ),
+            (
+                format!(r#"{{"kind":"contract_call","to":"{to}","data":"0x01"}}"#),
+                "invalid intent: unknown kind \"contract_call\"",
+            ),
+            (
+                r#"{"chain":"ethereum"}"#.into(),
+                "ambiguous intent: expected",
+            ),
+        ] {
+            let err = super::parse(&input).unwrap_err().to_string();
+            assert!(err.starts_with(start), "{err}");
+            assert!(err.contains("raw (to, data[, value])"), "{err}");
+        }
+        // The shapes docs/examples.md lists.
+        for input in [
+            format!("send 0.25 ETH to {to}"),
+            format!(r#"{{"kind":"send","to":"{to}","value":"0.25 eth"}}"#),
+            format!(r#"{{"kind":"send","to":"{to}","token":"USDC","amount":"10"}}"#),
+            format!(r#"{{"kind":"approve","token":"{to}","spender":"{to}","amount":"1000000"}}"#),
+            format!(r#"{{"kind":"raw","to":"{to}","data":"0x01","value":"0"}}"#),
+            format!(
+                r#"{{"kind":"call","contract":"{to}","method":"transfer(address,uint256)","args":["{to}","1"]}}"#
+            ),
+            r#"{"kind":"deploy","data":"0x60006000f3","value":"0"}"#.into(),
+        ] {
+            super::parse(&input).unwrap();
+        }
+    }
 
     #[test]
     fn parse_explicit_deployment_and_reject_ambiguous_fields() {

@@ -59,8 +59,9 @@ it does not create a local wallet. Follow
 
 For outbox transactions:
 
-1. Stage once: write the body to `outbox/new.tx` (formats in
-   `docs/examples.md`) or to a Petal's `new` (its README). Wherever these
+1. Stage once: write the body to `outbox/new.tx` (every shape, including
+   approve and contract calls, in `docs/examples.md`) or to a Petal's `new`
+   (its README). Wherever these
    steps say to write `confirm`, including after approval, confirm a
    Petal's entry where its README says instead. That confirm never waits
    for approval: retry it there once the owner approves.
