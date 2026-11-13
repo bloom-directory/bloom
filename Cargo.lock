@@ -2988,6 +2988,7 @@ dependencies = [
  "bloom-update",
  "bloom-watch",
  "bs58",
+ "flate2",
  "fs2",
  "futures",
  "hex",
