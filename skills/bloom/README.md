@@ -10,7 +10,9 @@ waits for the user's passkey in a browser ceremony, or for a Sealed Approval
 the user signed in advance.
 
 This package is one skill, `SKILL.md`. It contains guidance only; it does not
-install Bloom or create a wallet. In Claude Code:
+install Bloom or create a wallet. Install it with
+`clawhub install @bloom-directory/bloom` or `npx skills add bloom-directory/bloom`,
+or in Claude Code with:
 
 ```text
 /plugin install bloom --marketplace bloom-directory/bloom
