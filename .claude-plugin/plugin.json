@@ -1,0 +1,12 @@
+{
+  "name": "bloom",
+  "displayName": "Bloom",
+  "version": "0.4.2",
+  "description": "Balances, payments, trades, and wallets for AI agents on EVM chains and Solana. Every transaction needs the user's passkey.",
+  "author": { "name": "Bloom Directory", "url": "https://bloom.directory" },
+  "homepage": "https://bloom.directory",
+  "repository": "https://github.com/bloom-directory/bloom",
+  "license": "MIT",
+  "keywords": ["wallet", "payments", "trading", "x402", "evm", "solana"],
+  "icon": "./docs/assets/bloom-icon.svg"
+}

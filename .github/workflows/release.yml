@@ -114,6 +114,13 @@ jobs:
             echo "::error::$tag must match the workspace, triad matrix, and skill versions"
             exit 1
           fi
+          for manifest in .claude-plugin/plugin.json .codex-plugin/plugin.json gemini-extension.json; do
+            if git cat-file -e "$release_sha:$manifest" 2>/dev/null &&
+              [[ "$(git show "$release_sha:$manifest" | jq -r .version)" != "$version" ]]; then
+              echo "::error::$tag must match the version in $manifest"
+              exit 1
+            fi
+          done
           [[ -n "$broker_sha" && -n "$signer_sha" ]] || {
             echo "::error::triad matrix must pin full Broker and Signer commit IDs"
             exit 1

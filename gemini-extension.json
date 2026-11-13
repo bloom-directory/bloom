@@ -1,0 +1,5 @@
+{
+  "name": "bloom",
+  "version": "0.4.2",
+  "description": "Balances, payments, trades, and wallets for AI agents on EVM chains and Solana. Every transaction needs the user's passkey."
+}

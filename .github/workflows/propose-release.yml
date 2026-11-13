@@ -37,6 +37,7 @@ jobs:
       GH_TOKEN: ${{ secrets.RELEASE_PR_TOKEN }}
       VERSION: ${{ inputs.version }}
       BASE: ${{ github.event.repository.default_branch }}
+      PLUGIN_MANIFESTS: .claude-plugin/plugin.json .codex-plugin/plugin.json gemini-extension.json
     steps:
       - name: Require release PR token
         run: |
@@ -112,6 +113,13 @@ jobs:
             echo "::error::skills/bloom/SKILL.md must have exactly one metadata.version line, set to $VERSION"
             exit 1
           }
+          for manifest in $PLUGIN_MANIFESTS; do
+            sed -i -E 's/^  "version": "[0-9]+\.[0-9]+\.[0-9]+"/  "version": "'"$VERSION"'"/' "$manifest"
+            [[ "$(jq -r .version "$manifest")" == "$VERSION" ]] || {
+              echo "::error::$manifest must have a top-level version set to $VERSION"
+              exit 1
+            }
+          done
           cargo check --workspace
 
           cargo metadata --locked --format-version 1 \
@@ -124,7 +132,7 @@ jobs:
           fi
 
           CHANGED_FILES="$(git diff --name-only)"
-          if [[ "$(printf '%s\n' "$CHANGED_FILES" | grep -Ev '^(Cargo\.toml|Cargo\.lock|packaging/triad/release/compatibility-v1\.toml|skills/bloom/SKILL\.md)$' || true)" != "" ]]; then
+          if [[ "$(printf '%s\n' "$CHANGED_FILES" | grep -Ev '^(Cargo\.toml|Cargo\.lock|packaging/triad/release/compatibility-v1\.toml|skills/bloom/SKILL\.md|\.claude-plugin/plugin\.json|\.codex-plugin/plugin\.json|gemini-extension\.json)$' || true)" != "" ]]; then
             echo "::error::release proposal changed files outside the version-bearing release files"
             printf '%s\n' "$CHANGED_FILES"
             exit 1
@@ -133,7 +141,7 @@ jobs:
           git diff --check
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock packaging/triad/release/compatibility-v1.toml skills/bloom/SKILL.md
+          git add Cargo.toml Cargo.lock packaging/triad/release/compatibility-v1.toml skills/bloom/SKILL.md $PLUGIN_MANIFESTS
           git commit -m "release: v$VERSION"
           git push --set-upstream origin "HEAD:refs/heads/$BRANCH"
 
