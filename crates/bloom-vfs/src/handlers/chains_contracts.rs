@@ -141,29 +141,7 @@ impl LiveTailState {
     }
 }
 
-/// Fetch the parsed ABI for `(chain_id, addr)`, going through the
-/// short-TTL cache. Errors map onto sensible `HandlerError` variants.
-///
-/// **Not proxy-aware.** Most callers should reach for
-/// [`fetch_abi_proxy_aware`] so EIP-1967 proxies (USDC etc.) surface the
-/// implementation ABI rather than the proxy/admin one.
-pub async fn fetch_abi(
-    cache: &AbiCache,
-    src: &Arc<dyn ContractMetadataSource>,
-    chain_id: u64,
-    addr: Address,
-) -> Result<Arc<JsonAbi>, HandlerError> {
-    if let Some(a) = cache.get(&(chain_id, addr)) {
-        return Ok(a);
-    }
-    let abi = fetch_abi_uncached(src, chain_id, addr).await?;
-    let arc = Arc::new(abi);
-    cache.put((chain_id, addr), arc.clone());
-    Ok(arc)
-}
-
-/// One ABI fetch + parse, no caching. Shared between the direct fetch
-/// and the proxy-aware variant so error handling stays in one place.
+/// One ABI fetch + parse, no caching.
 async fn fetch_abi_uncached(
     src: &Arc<dyn ContractMetadataSource>,
     chain_id: u64,
@@ -868,32 +846,6 @@ pub fn proxy_slot(leaf: &str) -> Option<(B256, Option<B256>)> {
 }
 
 // ---- Routing -----------------------------------------------------------
-
-/// Trait so `chains.rs` can call into us without circular imports.
-#[async_trait::async_trait]
-pub trait ContractsRouter: Send + Sync {
-    async fn lookup_contract(&self, addr: Address, rest: &[String]) -> Result<Entry, HandlerError>;
-    async fn read_contract(
-        &self,
-        client: &ChainClient,
-        chain_id: u64,
-        addr: Address,
-        rest: &[String],
-    ) -> Result<Vec<u8>, HandlerError>;
-    async fn write_contract(
-        &self,
-        client: &ChainClient,
-        chain_id: u64,
-        addr: Address,
-        rest: &[String],
-        data: &[u8],
-    ) -> Result<(), HandlerError>;
-    async fn list_contract(
-        &self,
-        addr: Address,
-        rest: &[String],
-    ) -> Result<Vec<Entry>, HandlerError>;
-}
 
 /// Concrete dispatcher used by `ChainsHandler`. Holds the contract
 /// metadata source (already resolved by the gating layer) and shared

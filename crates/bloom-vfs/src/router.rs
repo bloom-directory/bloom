@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use bloom_proto::audit::{AuditLog, AuditRecord};
 
 use crate::cache::PathCache;
-use crate::handler::{Entry, EntryKind, Handler, HandlerError};
+use crate::handler::{Entry, Handler, HandlerError};
 use crate::path::VfsPath;
 
 // This source document is exposed only through the two mount-root aliases below.
@@ -131,20 +131,6 @@ impl Vfs {
 
     pub fn handler(&self, name: &str) -> Option<&Arc<dyn Handler>> {
         self.handlers.get(name)
-    }
-
-    pub fn top_segments(&self) -> Vec<String> {
-        self.handlers.keys().cloned().collect()
-    }
-
-    /// Whether an audit log is wired into this router.
-    pub fn has_audit(&self) -> bool {
-        self.audit.is_some()
-    }
-
-    /// Whether a router-level path cache is wired.
-    pub fn has_cache(&self) -> bool {
-        self.cache.is_some()
     }
 
     /// Whether reading `path` would have externally-visible side
@@ -677,20 +663,10 @@ fn path_to_cache_key(path: &VfsPath) -> String {
     path.segments().join("/")
 }
 
-/// Convenience: render a value as an `ls -l`-style metadata line.
-pub fn entry_size(e: &Entry) -> u64 {
-    e.size
-}
-
-/// Convenience: classify entry as dir.
-pub fn is_dir(e: &Entry) -> bool {
-    e.kind == EntryKind::Dir
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handler::Entry;
+    use crate::handler::EntryKind;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::{Mutex, Notify};

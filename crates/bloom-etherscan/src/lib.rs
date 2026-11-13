@@ -16,9 +16,6 @@
 //!
 //! - Etherscan returns ABIs as JSON-encoded strings inside a JSON envelope;
 //!   we decode the inner string into `serde_json::Value` for callers.
-//! - "Multi-file" verified sources are returned with the `SourceCode`
-//!   field wrapped in an extra `{...}` (i.e. `{{...}}`); we strip the
-//!   outer wrap and parse the inner standard-json object.
 //! - Errors come back wrapped in `{status: "0", message: "...", result: ...}`
 //!   bodies *with HTTP 200*; we promote them to typed errors.
 
@@ -41,20 +38,6 @@ pub mod cache;
 pub mod traits;
 pub use cache::EtherscanCache;
 pub use traits::{AddressHistorySource, ContractMetadataSource, DataSourceError};
-
-/// EIP-1967 implementation slot (`keccak256("eip1967.proxy.implementation") - 1`).
-pub const EIP1967_IMPL_SLOT: B256 = B256::new([
-    0x36, 0x08, 0x94, 0xa1, 0x3b, 0xa1, 0xa3, 0x21, 0x06, 0x67, 0xc8, 0x28, 0x49, 0x2d, 0xb9, 0x8d,
-    0xca, 0x3e, 0x20, 0x76, 0xcc, 0x37, 0x35, 0xa9, 0x20, 0xa3, 0xca, 0x50, 0x5d, 0x38, 0x2b, 0xbc,
-]);
-
-/// Storage-read abstraction. Lets [`EtherscanClient::json_abi_for`] follow
-/// EIP-1967 proxies without depending on `bloom-evm` directly.
-#[async_trait::async_trait]
-pub trait StorageReader: Send + Sync {
-    /// Read 32 bytes from `addr` at `slot` (latest block).
-    async fn read_slot(&self, addr: Address, slot: B256) -> Result<B256, EtherscanError>;
-}
 
 /// Default base URL for Etherscan multichain API.
 pub const DEFAULT_BASE_URL: &str = "https://api.etherscan.io/v2/api";
@@ -93,22 +76,6 @@ impl Sort {
         match self {
             Sort::Asc => "asc",
             Sort::Desc => "desc",
-        }
-    }
-}
-
-/// Closeness option for `getblocknobytime`.
-#[derive(Debug, Clone, Copy)]
-pub enum Closest {
-    Before,
-    After,
-}
-
-impl Closest {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Closest::Before => "before",
-            Closest::After => "after",
         }
     }
 }
@@ -167,28 +134,6 @@ impl ContractSource {
             ));
         }
         Ok(serde_json::from_str(&self.abi)?)
-    }
-
-    /// Parsed source code blob. For multi-file projects the upstream wraps
-    /// a standard-json object in extra `{...}`; we strip them.
-    ///
-    /// Returns `Ok(None)` for a plain (single-file) source string.
-    pub fn parsed_multi_file_sources(&self) -> Result<Option<serde_json::Value>, EtherscanError> {
-        let s = self.source_code.trim();
-        if s.starts_with("{{") && s.ends_with("}}") {
-            // strip exactly one outer brace pair
-            let inner = &s[1..s.len() - 1];
-            return Ok(Some(serde_json::from_str(inner)?));
-        }
-        if s.starts_with('{') && s.ends_with('}') {
-            // some chains return the standard-json without the double wrap
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(s)
-                && v.get("sources").is_some()
-            {
-                return Ok(Some(v));
-            }
-        }
-        Ok(None)
     }
 }
 
@@ -355,9 +300,6 @@ pub struct EtherscanClient {
     /// Optional cache, used by `json_abi_for` (and any future cached
     /// helpers). Always-on read-through; misses fall back to the network.
     cache: Option<Arc<EtherscanCache>>,
-    /// Storage reader for proxy resolution (EIP-1967). When absent we
-    /// fall back to Etherscan's own `Implementation` field.
-    storage: Option<Arc<dyn StorageReader>>,
 }
 
 impl std::fmt::Debug for EtherscanClient {
@@ -366,7 +308,6 @@ impl std::fmt::Debug for EtherscanClient {
             .field("cfg", &self.cfg)
             .field("limiter", &self.limiter)
             .field("cache", &self.cache.is_some())
-            .field("storage", &self.storage.is_some())
             .finish()
     }
 }
@@ -437,7 +378,6 @@ impl EtherscanClient {
             http,
             limiter,
             cache: None,
-            storage: None,
         }
     }
 
@@ -445,14 +385,6 @@ impl EtherscanClient {
     /// [`Self::json_abi_for`]; other endpoints stay uncached for now.
     pub fn with_cache(mut self, cache: Arc<EtherscanCache>) -> Self {
         self.cache = Some(cache);
-        self
-    }
-
-    /// Builder: attach a [`StorageReader`] used for EIP-1967 proxy
-    /// detection in [`Self::json_abi_for`]. Without one, proxy resolution
-    /// relies solely on Etherscan's own `Implementation` field.
-    pub fn with_storage_reader(mut self, reader: Arc<dyn StorageReader>) -> Self {
-        self.storage = Some(reader);
         self
     }
 
@@ -597,11 +529,8 @@ impl EtherscanClient {
     /// Resolve a [`JsonAbi`] for `addr` on `chain_id`, transparently
     /// following EIP-1967 proxy delegation up to two hops deep.
     ///
-    /// Resolution order for the implementation address:
-    /// 1. If a [`StorageReader`] is wired, read the EIP-1967 implementation
-    ///    slot. A non-zero value (lower 20 bytes) overrides `addr`.
-    /// 2. Otherwise, if Etherscan's `getsourcecode` reports `Proxy=1`
-    ///    with a non-empty `Implementation`, use that.
+    /// The implementation address comes from Etherscan's `getsourcecode`
+    /// (`Proxy=1` with a non-empty `Implementation`).
     ///
     /// Returns `Ok(None)` when the resolved address has no verified ABI.
     /// Cached under kind `abi`, key `0x<addr>` per chain.
@@ -621,24 +550,7 @@ impl EtherscanClient {
         let mut current = addr;
         let mut hops = 0;
         let abi = loop {
-            // Storage read is the EIP-1967 standard path; fall back to
-            // Etherscan's own proxy field if no reader is wired.
             let mut next = None;
-            if let Some(reader) = &self.storage {
-                match reader.read_slot(current, EIP1967_IMPL_SLOT).await {
-                    Ok(slot) if !slot.is_zero() => {
-                        let impl_addr = addr_from_slot(slot);
-                        debug!(%current, %impl_addr, "json_abi_for.proxy.eip1967");
-                        next = Some(impl_addr);
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        debug!(error = %e, %current, "json_abi_for.slot_read_failed");
-                    }
-                }
-            }
-            // Always fetch source for the current address — we need the
-            // ABI either way.
             let src = match self.get_source_code(chain_id, current).await {
                 Ok(s) => s,
                 Err(e @ EtherscanError::Api { .. })
@@ -648,9 +560,7 @@ impl EtherscanClient {
                 }
                 Err(e) => return Err(e),
             };
-            // If the chain reader didn't already give us a target, look
-            // at Etherscan's reported proxy fields.
-            if next.is_none() && src.is_proxy() && !src.implementation.is_empty() {
+            if src.is_proxy() && !src.implementation.is_empty() {
                 match src.implementation.parse::<Address>() {
                     Ok(impl_addr) if impl_addr != Address::ZERO => {
                         debug!(%current, %impl_addr, "json_abi_for.proxy.etherscan_field");
@@ -722,26 +632,6 @@ impl EtherscanClient {
         let s: String = Self::decode(result)?;
         s.parse::<U256>()
             .map_err(|e| EtherscanError::InvalidResponse(format!("balance parse: {e}")))
-    }
-
-    /// `module=account&action=tokenbalance`.
-    pub async fn get_token_balance(
-        &self,
-        chain_id: u64,
-        addr: Address,
-        contract_addr: Address,
-    ) -> Result<U256, EtherscanError> {
-        let extra = [
-            ("contractaddress", contract_addr.to_string()),
-            ("address", addr.to_string()),
-            ("tag", "latest".to_string()),
-        ];
-        let result = self
-            .raw_call(chain_id, "account", "tokenbalance", &extra)
-            .await?;
-        let s: String = Self::decode(result)?;
-        s.parse::<U256>()
-            .map_err(|e| EtherscanError::InvalidResponse(format!("tokenbalance parse: {e}")))
     }
 
     /// `module=account&action=txlist`.
@@ -884,27 +774,6 @@ impl EtherscanClient {
         Self::decode(result)
     }
 
-    // --- Block -------------------------------------------------------------
-
-    /// `module=block&action=getblocknobytime`.
-    pub async fn get_block_no_by_time(
-        &self,
-        chain_id: u64,
-        ts: u64,
-        closest: Closest,
-    ) -> Result<u64, EtherscanError> {
-        let extra = [
-            ("timestamp", ts.to_string()),
-            ("closest", closest.as_str().to_string()),
-        ];
-        let result = self
-            .raw_call(chain_id, "block", "getblocknobytime", &extra)
-            .await?;
-        let s: String = Self::decode(result)?;
-        s.parse::<u64>()
-            .map_err(|e| EtherscanError::InvalidResponse(format!("block number parse: {e}")))
-    }
-
     // --- Logs --------------------------------------------------------------
 
     /// `module=logs&action=getLogs`.
@@ -944,14 +813,6 @@ impl EtherscanClient {
         let result = self.raw_call(chain_id, "logs", "getLogs", &extra).await?;
         Self::decode(result)
     }
-}
-
-/// EIP-1967 storage slot encodes the implementation address right-aligned
-/// in a 32-byte word (lower 20 bytes).
-fn addr_from_slot(slot: B256) -> Address {
-    let mut bytes = [0u8; 20];
-    bytes.copy_from_slice(&slot.as_slice()[12..]);
-    Address::from(bytes)
 }
 
 /// Standard Etherscan envelope: `{status, message, result}`.
@@ -1072,51 +933,6 @@ mod tests {
             .unwrap();
         assert_eq!(s.contract_name, "X");
         assert!(!s.is_proxy());
-        assert!(s.parsed_multi_file_sources().unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn multi_file_source_unwraps_double_braces() {
-        let inner = r#"{"language":"Solidity","sources":{"X.sol":{"content":"contract X{}"}}}"#;
-        let wrapped = format!("{{{}}}", inner); // outer {{...}}
-        // SourceCode value embedded as a JSON string with quotes/braces escaped.
-        let escaped = serde_json::to_string(&wrapped).unwrap();
-        let body = format!(
-            r#"{{"status":"1","message":"OK","result":[{{
-                "SourceCode":{escaped},
-                "ABI":"[]",
-                "ContractName":"X",
-                "CompilerVersion":"v0.8.20",
-                "OptimizationUsed":"1",
-                "Runs":"200",
-                "ConstructorArguments":"",
-                "EVMVersion":"london",
-                "Library":"",
-                "LicenseType":"MIT",
-                "Proxy":"0",
-                "Implementation":"",
-                "SwarmSource":""
-            }}]}}"#
-        );
-        // We need to leak this static-ish; spawn_canned_server takes &'static.
-        let leaked: &'static str = Box::leak(body.into_boxed_str());
-        let addr = spawn_canned_server(leaked).await;
-        let c = client_for(addr);
-        let s = c
-            .get_source_code(
-                1,
-                "0x0000000000000000000000000000000000000001"
-                    .parse()
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let multi = s
-            .parsed_multi_file_sources()
-            .unwrap()
-            .expect("multi-file expected");
-        assert_eq!(multi["language"], "Solidity");
-        assert!(multi["sources"]["X.sol"]["content"].is_string());
     }
 
     #[tokio::test]
@@ -1179,18 +995,6 @@ mod tests {
             .await
             .unwrap();
         assert!(txs.is_empty());
-    }
-
-    #[tokio::test]
-    async fn block_no_by_time_parses() {
-        let body = r#"{"status":"1","message":"OK","result":"19000000"}"#;
-        let addr = spawn_canned_server(body).await;
-        let c = client_for(addr);
-        let n = c
-            .get_block_no_by_time(1, 1_700_000_000, Closest::Before)
-            .await
-            .unwrap();
-        assert_eq!(n, 19_000_000);
     }
 
     #[tokio::test]
@@ -1267,26 +1071,6 @@ mod tests {
         assert_eq!(txs[0].token_id, "42");
         assert_eq!(txs[0].token_value, "7");
         assert_eq!(txs[0].token_symbol, "M1155");
-    }
-
-    #[tokio::test]
-    async fn token_balance_parses() {
-        let body = r#"{"status":"1","message":"OK","result":"1000000"}"#;
-        let addr = spawn_canned_server(body).await;
-        let c = client_for(addr);
-        let b = c
-            .get_token_balance(
-                1,
-                "0x0000000000000000000000000000000000000001"
-                    .parse()
-                    .unwrap(),
-                "0x0000000000000000000000000000000000000002"
-                    .parse()
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(b.to_string(), "1000000");
     }
 
     #[test]
