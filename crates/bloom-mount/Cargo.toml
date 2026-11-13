@@ -13,9 +13,6 @@ default = []
 # to the platform `mount` command so the running daemon's VFS shows up
 # as a real filesystem mount.
 mount = ["dep:embednfs", "dep:bloom-vfs", "dep:bytes", "dep:lru", "dep:futures"]
-# Back-compat alias for the original feature name. New callers should
-# prefer `mount`; both pull the same code in.
-nfs = ["mount"]
 
 [dependencies]
 # bloom-vfs is only needed when the `mount` feature is on — that is
