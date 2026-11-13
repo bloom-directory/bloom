@@ -2750,7 +2750,12 @@ fn render_address_qr_png(address: &str) -> Result<Vec<u8>, HandlerError> {
     ihdr.push(0); // no interlace
     push_png_chunk(&mut png, b"IHDR", &ihdr);
 
-    let compressed = zlib_store(&raw);
+    use std::io::Write as _;
+    let mut zlib = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::none());
+    let compressed = zlib
+        .write_all(&raw)
+        .and_then(|()| zlib.finish())
+        .map_err(|e| HandlerError::backend(format!("qr png encode: {e}")))?;
     push_png_chunk(&mut png, b"IDAT", &compressed);
     push_png_chunk(&mut png, b"IEND", &[]);
     Ok(png)
@@ -2760,48 +2765,10 @@ fn push_png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
     out.extend_from_slice(&(data.len() as u32).to_be_bytes());
     out.extend_from_slice(kind);
     out.extend_from_slice(data);
-    let mut crc_input = Vec::with_capacity(kind.len() + data.len());
-    crc_input.extend_from_slice(kind);
-    crc_input.extend_from_slice(data);
-    out.extend_from_slice(&crc32(&crc_input).to_be_bytes());
-}
-
-fn zlib_store(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len() + data.len() / 65_535 * 5 + 8);
-    out.extend_from_slice(&[0x78, 0x01]);
-    for (i, chunk) in data.chunks(65_535).enumerate() {
-        let final_block = i == data.len().saturating_sub(1) / 65_535;
-        out.push(if final_block { 0x01 } else { 0x00 });
-        let len = chunk.len() as u16;
-        out.extend_from_slice(&len.to_le_bytes());
-        out.extend_from_slice(&(!len).to_le_bytes());
-        out.extend_from_slice(chunk);
-    }
-    out.extend_from_slice(&adler32(data).to_be_bytes());
-    out
-}
-
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffffu32;
-    for &byte in data {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            let mask = 0u32.wrapping_sub(crc & 1);
-            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-        }
-    }
-    !crc
-}
-
-fn adler32(data: &[u8]) -> u32 {
-    const MOD: u32 = 65_521;
-    let mut a = 1u32;
-    let mut b = 0u32;
-    for &byte in data {
-        a = (a + u32::from(byte)) % MOD;
-        b = (b + a) % MOD;
-    }
-    (b << 16) | a
+    let mut crc = flate2::Crc::new();
+    crc.update(kind);
+    crc.update(data);
+    out.extend_from_slice(&crc.sum().to_be_bytes());
 }
 
 fn now_ms() -> u128 {
