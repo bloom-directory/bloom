@@ -638,7 +638,6 @@ async fn launch_custody_ceremony(
     ceremony_kind: bloom_broker_api::CeremonyKind,
     wallet_id: Option<bloom_broker_api::Token>,
     input: CustodyInputShape,
-    legacy_migration: Option<LegacyMigrationLaunch>,
     local: bool,
 ) -> Result<String> {
     use rand::RngCore as _;
@@ -665,53 +664,25 @@ async fn launch_custody_ceremony(
                 format!("requested wallet name must be a protocol token: {error}"),
             )
         })?;
-    let workflow = if legacy_migration.is_some() {
-        "credential_migration"
-    } else {
-        match ceremony_kind {
-            bloom_broker_api::CeremonyKind::WalletImport => "wallet_import",
-            bloom_broker_api::CeremonyKind::CredentialReplace => "credential_rebind",
-            bloom_broker_api::CeremonyKind::WalletDelete => "wallet_delete",
-            _ => "wallet_custody",
-        }
+    let workflow = match ceremony_kind {
+        bloom_broker_api::CeremonyKind::WalletImport => "wallet_import",
+        bloom_broker_api::CeremonyKind::CredentialReplace => "credential_rebind",
+        bloom_broker_api::CeremonyKind::WalletDelete => "wallet_delete",
+        _ => "wallet_custody",
     };
-    let (operation_id, exact_terms_digest, legacy_passkey_migration) =
-        if let Some(migration) = &legacy_migration {
-            (
-                migration.operation_id.clone(),
-                migration.exact_terms_digest.clone(),
-                Some(migration.public_terms.clone()),
-            )
-        } else {
-            let mut operation_bytes = [0_u8; 32];
-            rand::thread_rng().fill_bytes(&mut operation_bytes);
-            let operation_id = bloom_broker_api::OperationId::from_bytes(operation_bytes);
-            let effective_wallet_id = wallet_id
-                .clone()
-                .unwrap_or_else(|| requested_wallet_id.clone());
-            let reviewed_terms = serde_jcs::to_vec(&serde_json::json!({
-                "ceremony_kind": ceremony_kind,
-                "wallet_id": effective_wallet_id,
-            }))
-            .context("canonicalize custody launch terms")?;
-            (
-                operation_id,
-                bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(reviewed_terms).into()),
-                None,
-            )
-        };
-    if let Some(migration) = &legacy_migration {
-        daemon
-            .wallet_projections
-            .begin_legacy_migration(
-                &migration.operation_id,
-                &migration.public_terms.wallet_name,
-                &migration.exact_terms_digest,
-            )
-            .await
-            .map_err(anyhow::Error::new)
-            .context("record pending legacy migration")?;
-    }
+    let mut operation_bytes = [0_u8; 32];
+    rand::thread_rng().fill_bytes(&mut operation_bytes);
+    let operation_id = bloom_broker_api::OperationId::from_bytes(operation_bytes);
+    let effective_wallet_id = wallet_id
+        .clone()
+        .unwrap_or_else(|| requested_wallet_id.clone());
+    let reviewed_terms = serde_jcs::to_vec(&serde_json::json!({
+        "ceremony_kind": ceremony_kind,
+        "wallet_id": effective_wallet_id,
+    }))
+    .context("canonicalize custody launch terms")?;
+    let exact_terms_digest =
+        bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(reviewed_terms).into());
     let response = client
         .prepare_custody(
             method,
@@ -723,17 +694,14 @@ async fn launch_custody_ceremony(
                 },
                 ceremony_kind,
                 custody_operation_id: operation_id,
-                wallet_id: legacy_passkey_migration
-                    .is_none()
-                    .then_some(requested_wallet_id)
-                    .or(wallet_id),
+                wallet_id: Some(requested_wallet_id),
                 key_ref: None,
                 exact_terms_digest,
                 expected_input_class: bloom_broker_api::Token::new(input.expected_input_class())
                     .context("custody input class")?,
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
-                legacy_passkey_migration,
+                legacy_passkey_migration: None,
                 wallet_seed_profile: input.wallet_seed_profile(),
                 derivation_requests: Vec::new(),
                 account_terms: None,
@@ -1056,13 +1024,6 @@ async fn launch_wallet_registration_via_vfs(
 }
 
 #[derive(Clone)]
-struct LegacyMigrationLaunch {
-    operation_id: bloom_broker_api::OperationId,
-    exact_terms_digest: bloom_broker_api::Digest32,
-    public_terms: bloom_broker_api::LegacyPasskeyMigrationPublic,
-}
-
-#[derive(Clone)]
 struct DaemonMachineCommands {
     home: HomeDir,
     daemon: Daemon,
@@ -1270,11 +1231,6 @@ fn machine_command_event_fields(
         ),
         MachineCommand::WalletAddPasskey { .. } => (
             "credential_add",
-            None,
-            MachineCommandEventClass::RemotePrepared,
-        ),
-        MachineCommand::WalletMigrate { .. } => (
-            "credential_migration",
             None,
             MachineCommandEventClass::RemotePrepared,
         ),
@@ -1745,7 +1701,6 @@ async fn execute_machine_command(
                     ceremony_kind,
                     wallet_id,
                     input,
-                    None,
                     local,
                 )
                 .await?
@@ -1756,22 +1711,6 @@ async fn execute_machine_command(
             local,
             remote,
         } => launch_passkey_enrollment_via_vfs(&daemon.vfs, &name, local, remote).await?,
-        MachineCommand::WalletMigrate { receipt } => {
-            let receipt: LegacyMigrationReceiptFile =
-                serde_json::from_value(serde_json::to_value(receipt)?)?;
-            let (name, migration) = receipt.into_launch()?;
-            launch_custody_ceremony(
-                daemon,
-                &name,
-                bloom_machine_client::CustodyPrepareMethod::WalletImport,
-                bloom_broker_api::CeremonyKind::WalletImport,
-                None,
-                CustodyInputShape::Named("legacy_passkey_v1_prf"),
-                Some(migration),
-                true,
-            )
-            .await?
-        }
         MachineCommand::WalletPolicyPrepare {
             name,
             policy,
@@ -1914,53 +1853,6 @@ async fn execute_wallet_outbox_action(
     ))?;
     bloom_vfs::Handler::write(vfs, &path, body).await?;
     Ok(())
-}
-
-#[derive(serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyMigrationReceiptFile {
-    schema: String,
-    operation_id: bloom_broker_api::OperationId,
-    wallet_name: bloom_broker_api::Token,
-    address: String,
-    public_key_fingerprint: bloom_broker_api::Digest32,
-    credential_id_fingerprint: bloom_broker_api::Digest32,
-    legacy_format_version: u8,
-    bundle_digest: bloom_broker_api::Digest32,
-    policy_mode: String,
-    exact_terms_digest: bloom_broker_api::Digest32,
-}
-
-impl LegacyMigrationReceiptFile {
-    fn into_launch(self) -> Result<(String, LegacyMigrationLaunch)> {
-        let public_terms = bloom_broker_api::LegacyPasskeyMigrationPublic {
-            schema: bloom_broker_api::Token::new(self.schema)
-                .context("legacy migration receipt schema")?,
-            wallet_name: self.wallet_name.clone(),
-            address: self.address,
-            public_key_fingerprint: self.public_key_fingerprint,
-            credential_id_fingerprint: self.credential_id_fingerprint,
-            legacy_format_version: self.legacy_format_version,
-            bundle_digest: self.bundle_digest,
-            policy_mode: bloom_broker_api::Token::new(self.policy_mode)
-                .context("legacy migration receipt policy mode")?,
-        };
-        let computed = public_terms
-            .terms_digest(&self.operation_id)
-            .map_err(anyhow::Error::new)
-            .context("validate legacy migration receipt terms")?;
-        if computed != self.exact_terms_digest {
-            anyhow::bail!("legacy migration receipt terms digest does not match its contents");
-        }
-        Ok((
-            self.wallet_name.as_str().to_owned(),
-            LegacyMigrationLaunch {
-                operation_id: self.operation_id,
-                exact_terms_digest: self.exact_terms_digest,
-                public_terms,
-            },
-        ))
-    }
 }
 
 const MAX_POLICY_DOCUMENT_BYTES: u64 = 1024 * 1024;
@@ -2912,10 +2804,6 @@ enum WalletCmd {
         #[arg(long)]
         local: bool,
     },
-    /// Convert a staged v1 passkey wallet into Signer-owned Triad custody.
-    /// The receipt contains public binding data only; Machine never opens the
-    /// legacy wallet directory.
-    MigratePasskey { receipt: PathBuf },
     /// List configured wallets.
     List,
     /// Print the authenticated, key-free Broker projection for a wallet.
@@ -4028,42 +3916,6 @@ async fn run(cli: Cli) -> Result<()> {
                     name,
                     kind: wallet_import_kind(raw_private_key),
                     local,
-                },
-            )
-            .await
-        }
-        Cmd::Wallet(WalletCmd::MigratePasskey { receipt }) => {
-            use std::io::Read as _;
-
-            let descriptor = rustix::fs::open(
-                &receipt,
-                rustix::fs::OFlags::RDONLY
-                    | rustix::fs::OFlags::CLOEXEC
-                    | rustix::fs::OFlags::NOFOLLOW,
-                rustix::fs::Mode::empty(),
-            )
-            .with_context(|| format!("open migration receipt {}", receipt.display()))?;
-            let mut file = std::fs::File::from(descriptor);
-            let metadata = file
-                .metadata()
-                .with_context(|| format!("inspect migration receipt {}", receipt.display()))?;
-            if !metadata.file_type().is_file() || metadata.len() > 64 * 1024 {
-                anyhow::bail!("migration receipt must be a regular file no larger than 64 KiB");
-            }
-            let mut encoded = Vec::with_capacity(metadata.len() as usize);
-            (&mut file)
-                .take(64 * 1024 + 1)
-                .read_to_end(&mut encoded)
-                .with_context(|| format!("read migration receipt {}", receipt.display()))?;
-            if encoded.len() > 64 * 1024 {
-                anyhow::bail!("migration receipt exceeds 64 KiB");
-            }
-            let receipt: LegacyMigrationReceiptFile =
-                serde_json::from_slice(&encoded).context("parse legacy migration receipt")?;
-            call_machine_command(
-                &client_endpoint,
-                MachineCommand::WalletMigrate {
-                    receipt: serde_json::from_value(serde_json::to_value(receipt)?)?,
                 },
             )
             .await
@@ -5243,20 +5095,20 @@ mod tests {
     use tracing_subscriber::prelude::*;
 
     use super::{
-        CeremonyCmd, Cli, Cmd, CustodyInputShape, LegacyMigrationReceiptFile,
-        MachineCommandEventClass, WalletCmd, ceremony_cancel_remote_result,
-        ceremony_projection_path, commit_policy_update, emit_machine_mutation,
-        emit_machine_mutation_rejection_if_needed, emit_machine_preparation_rejection_if_needed,
-        emit_machine_ready, emit_remote_preparation, endpoint_connection_error,
-        enrollment_state_is_usable, execute_audit_command, execute_wallet_outbox_action,
-        finish_ceremony_cancel_projection, finish_operation_cancel_local_result,
-        finish_policy_commit_local_result, finish_remote_preparation,
-        format_petal_consent_net_rule, handle_ceremony, is_completed_policy_update_receipt,
-        launch_passkey_enrollment_via_vfs, launch_wallet_registration_via_vfs,
-        load_ceremony_projection, long_running_role, machine_command_event_fields,
-        machine_error_from_anyhow, machine_wallet_lookup_error, open_machine_audit_with_history,
-        operation_cancel_remote_result, persist_ceremony_projection, policy_commit_remote_result,
-        request_body_with_wallet, wallet_import_kind,
+        CeremonyCmd, Cli, Cmd, CustodyInputShape, MachineCommandEventClass, WalletCmd,
+        ceremony_cancel_remote_result, ceremony_projection_path, commit_policy_update,
+        emit_machine_mutation, emit_machine_mutation_rejection_if_needed,
+        emit_machine_preparation_rejection_if_needed, emit_machine_ready, emit_remote_preparation,
+        endpoint_connection_error, enrollment_state_is_usable, execute_audit_command,
+        execute_wallet_outbox_action, finish_ceremony_cancel_projection,
+        finish_operation_cancel_local_result, finish_policy_commit_local_result,
+        finish_remote_preparation, format_petal_consent_net_rule, handle_ceremony,
+        is_completed_policy_update_receipt, launch_passkey_enrollment_via_vfs,
+        launch_wallet_registration_via_vfs, load_ceremony_projection, long_running_role,
+        machine_command_event_fields, machine_error_from_anyhow, machine_wallet_lookup_error,
+        open_machine_audit_with_history, operation_cancel_remote_result,
+        persist_ceremony_projection, policy_commit_remote_result, request_body_with_wallet,
+        wallet_import_kind,
     };
     use bloom_daemon::ipc::{
         MachineCeremonyAction, MachineCommand, MachineCustodyKind, MachineOperationAction,
@@ -5636,60 +5488,6 @@ mod tests {
         ));
         assert_eq!(invalid_path.kind, Kind::InvalidParams);
         assert_eq!(invalid_path.code, "INVALID_ARGUMENT");
-    }
-
-    #[test]
-    fn legacy_migration_receipt_is_digest_bound_and_cli_is_explicit() {
-        let operation_id = bloom_broker_api::OperationId::from_bytes([81; 32]);
-        let public = bloom_broker_api::LegacyPasskeyMigrationPublic {
-            schema: bloom_broker_api::Token::new("bloom.legacy_passkey_migration_receipt.v1")
-                .unwrap(),
-            wallet_name: bloom_broker_api::Token::new("wallet").unwrap(),
-            address: "0x1111111111111111111111111111111111111111".into(),
-            public_key_fingerprint: bloom_broker_api::Digest32::from_bytes([82; 32]),
-            credential_id_fingerprint: bloom_broker_api::Digest32::from_bytes([83; 32]),
-            legacy_format_version: 1,
-            bundle_digest: bloom_broker_api::Digest32::from_bytes([84; 32]),
-            policy_mode: bloom_broker_api::Token::new("restrictive_current_policy").unwrap(),
-        };
-        let exact_terms_digest = public.terms_digest(&operation_id).unwrap();
-        let receipt = LegacyMigrationReceiptFile {
-            schema: public.schema.as_str().into(),
-            operation_id: operation_id.clone(),
-            wallet_name: public.wallet_name.clone(),
-            address: public.address.clone(),
-            public_key_fingerprint: public.public_key_fingerprint.clone(),
-            credential_id_fingerprint: public.credential_id_fingerprint.clone(),
-            legacy_format_version: public.legacy_format_version,
-            bundle_digest: public.bundle_digest.clone(),
-            policy_mode: public.policy_mode.as_str().into(),
-            exact_terms_digest,
-        };
-        let (wallet_name, launch) = receipt.into_launch().unwrap();
-        assert_eq!(wallet_name, "wallet");
-        assert_eq!(launch.operation_id, operation_id);
-
-        let tampered = LegacyMigrationReceiptFile {
-            schema: public.schema.as_str().into(),
-            operation_id: launch.operation_id,
-            wallet_name: public.wallet_name,
-            address: public.address,
-            public_key_fingerprint: public.public_key_fingerprint,
-            credential_id_fingerprint: public.credential_id_fingerprint,
-            legacy_format_version: 2,
-            bundle_digest: public.bundle_digest,
-            policy_mode: public.policy_mode.as_str().into(),
-            exact_terms_digest: launch.exact_terms_digest,
-        };
-        assert!(tampered.into_launch().is_err());
-
-        let cli =
-            Cli::try_parse_from(["bloom", "wallet", "migrate-passkey", "receipt.json"]).unwrap();
-        assert!(matches!(
-            cli.cmd,
-            Some(Cmd::Wallet(WalletCmd::MigratePasskey { receipt }))
-                if receipt.as_os_str() == "receipt.json"
-        ));
     }
 
     #[test]

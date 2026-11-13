@@ -1100,27 +1100,6 @@ fn paid_http_mpp_facts(
     }
 }
 
-#[cfg(test)]
-pub fn persist_request_confirm_approved(
-    root: &Path,
-    id: &str,
-    wallet: &str,
-    confirm_value: &str,
-) -> Result<(), HandlerError> {
-    let id = safe_fs_component(id, "request id")?;
-    let dir = root.join("requests").join("pending").join(&id);
-    fs::write(
-        dir.join(".confirm_approved.json"),
-        serde_json::to_vec_pretty(&json!({
-            "schema": "bloom.requests.confirm_approved.v1",
-            "wallet": wallet,
-            "confirm_value": confirm_value,
-        }))
-        .map_err(|e| HandlerError::backend(e.to_string()))?,
-    )?;
-    Ok(())
-}
-
 #[async_trait]
 impl Handler for RequestsHandler {
     async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {

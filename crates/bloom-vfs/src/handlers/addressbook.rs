@@ -37,14 +37,6 @@ impl AddressBookHandler {
         })
     }
 
-    /// Convenience for tests / in-process use without persistence.
-    pub fn from_book(book: AddressBook, path: impl Into<PathBuf>) -> Self {
-        Self {
-            book: Arc::new(RwLock::new(book)),
-            path: path.into(),
-        }
-    }
-
     fn save(&self) -> Result<(), HandlerError> {
         let snapshot = self.book.read().clone();
         snapshot

@@ -1038,69 +1038,69 @@ async fn component_http_fetch(
     }
 }
 
+/// Runs one `bloom:store` host call behind the store capability gate and
+/// reports `call`'s host error as the component `err` result.
+fn component_store_call(
+    store: StoreContextMut<'_, StoreData>,
+    results: &mut [ComponentVal],
+    op: &str,
+    call: impl FnOnce(&StoreData) -> Result<Option<ComponentVal>, HostError>,
+) -> anyhow::Result<()> {
+    let data = store.data();
+    let result = if data.caps.contains(&Capability::Store) {
+        call(data)
+    } else {
+        log_denied(data, op);
+        Err(HostError::Denied("store".into()))
+    };
+    set_component_result(
+        results,
+        match result {
+            Ok(value) => component_ok(value),
+            Err(e) => component_host_err(e),
+        },
+    )
+}
+
+fn component_private_store(data: &StoreData) -> Result<&PrivateStore, HostError> {
+    data.private_store
+        .as_ref()
+        .ok_or_else(|| HostError::Denied("store unavailable".into()))
+}
+
 async fn component_store_get(
     store: StoreContextMut<'_, StoreData>,
     params: &[ComponentVal],
     results: &mut [ComponentVal],
 ) -> anyhow::Result<()> {
-    if !store.data().caps.contains(&Capability::Store) {
-        log_denied(store.data(), "component_store_get");
-        return set_component_result(
-            results,
-            component_host_err(HostError::Denied("store".into())),
-        );
-    }
-    let (namespace, key) = match component_namespace_key(params) {
-        Ok(v) => v,
-        Err(e) => return set_component_result(results, component_host_err(e)),
-    };
-    if let Err(e) = store_namespace_allowed(store.data(), &namespace) {
-        return set_component_result(results, component_host_err(e));
-    }
-    let logical_key = key;
-    let key = match namespaced_store_key(&namespace, &logical_key) {
-        Ok(key) => key,
-        Err(e) => return set_component_result(results, component_host_err(e)),
-    };
-    let Some(private_store) = store.data().private_store.clone() else {
-        return set_component_result(
-            results,
-            component_host_err(HostError::Denied("store unavailable".into())),
-        );
-    };
-    let petal_hash = store.data().petal_hash.clone();
-    let value = match private_store.get(&petal_hash, &key) {
-        Err(HostError::NotFound(_))
-            if namespace == "state"
-                && (logical_key == "creds" || logical_key.starts_with("creds/")) =>
-        {
-            // SDK releases through 0.1.0 routed secret writes to `secrets`
-            // but routed every read to `state`, despite documenting `creds/`
-            // as key-routed. Preserve compatibility with already-built Petals
-            // while the corrected SDK propagates through pinned packages.
-            if let Err(e) = store_namespace_allowed(store.data(), "secrets") {
-                return set_component_result(results, component_host_err(e));
+    component_store_call(store, results, "component_store_get", |data| {
+        let (namespace, logical_key) = component_namespace_key(params)?;
+        store_namespace_allowed(data, &namespace)?;
+        let key = namespaced_store_key(&namespace, &logical_key)?;
+        let private_store = component_private_store(data)?;
+        let value = match private_store.get(&data.petal_hash, &key) {
+            Err(HostError::NotFound(_))
+                if namespace == "state"
+                    && (logical_key == "creds" || logical_key.starts_with("creds/")) =>
+            {
+                // SDK releases through 0.1.0 routed secret writes to `secrets`
+                // but routed every read to `state`, despite documenting `creds/`
+                // as key-routed. Preserve compatibility with already-built Petals
+                // while the corrected SDK propagates through pinned packages.
+                store_namespace_allowed(data, "secrets")?;
+                let secret_key = namespaced_store_key("secrets", &logical_key)?;
+                private_store.get(&data.petal_hash, &secret_key)
             }
-            let secret_key = match namespaced_store_key("secrets", &logical_key) {
-                Ok(key) => key,
-                Err(e) => return set_component_result(results, component_host_err(e)),
-            };
-            private_store.get(&petal_hash, &secret_key)
-        }
-        result => result,
-    };
-    match value {
-        Ok(bytes) => set_component_result(
-            results,
-            component_ok(Some(ComponentVal::Option(Some(Box::new(component_bytes(
+            result => result,
+        };
+        match value {
+            Ok(bytes) => Ok(Some(ComponentVal::Option(Some(Box::new(component_bytes(
                 bytes,
             )))))),
-        ),
-        Err(HostError::NotFound(_)) => {
-            set_component_result(results, component_ok(Some(ComponentVal::Option(None))))
+            Err(HostError::NotFound(_)) => Ok(Some(ComponentVal::Option(None))),
+            Err(e) => Err(e),
         }
-        Err(e) => set_component_result(results, component_host_err(e)),
-    }
+    })
 }
 
 async fn component_store_put(
@@ -1108,53 +1108,7 @@ async fn component_store_put(
     params: &[ComponentVal],
     results: &mut [ComponentVal],
 ) -> anyhow::Result<()> {
-    if !store.data().caps.contains(&Capability::Store) {
-        log_denied(store.data(), "component_store_put");
-        return set_component_result(
-            results,
-            component_host_err(HostError::Denied("store".into())),
-        );
-    }
-    let [namespace, key, value, secret] = params else {
-        return set_component_result(
-            results,
-            component_host_err(HostError::Invalid("invalid bloom:store.put params".into())),
-        );
-    };
-    let namespace = match component_string(namespace, "namespace") {
-        Ok(namespace) => namespace,
-        Err(e) => return set_component_result(results, component_host_err(e)),
-    };
-    let key = match component_string(key, "key") {
-        Ok(key) => key,
-        Err(e) => return set_component_result(results, component_host_err(e)),
-    };
-    let value = match component_byte_list(value, "value") {
-        Ok(value) => value,
-        Err(e) => return set_component_result(results, component_host_err(e)),
-    };
-    let secret = match component_bool(secret, "secret") {
-        Ok(secret) => secret,
-        Err(e) => return set_component_result(results, component_host_err(e)),
-    };
-    if let Err(e) = store_namespace_put_allowed(store.data(), &namespace, secret) {
-        return set_component_result(results, component_host_err(e));
-    }
-    let key = match namespaced_store_key(&namespace, &key) {
-        Ok(key) => key,
-        Err(e) => return set_component_result(results, component_host_err(e)),
-    };
-    let Some(private_store) = store.data().private_store.clone() else {
-        return set_component_result(
-            results,
-            component_host_err(HostError::Denied("store unavailable".into())),
-        );
-    };
-    let petal_hash = store.data().petal_hash.clone();
-    match private_store.put(&petal_hash, &key, &value, secret) {
-        Ok(()) => set_component_result(results, component_ok(None)),
-        Err(e) => set_component_result(results, component_host_err(e)),
-    }
+    component_store_write(store, params, results, false)
 }
 
 async fn component_store_put_new(
@@ -1162,55 +1116,41 @@ async fn component_store_put_new(
     params: &[ComponentVal],
     results: &mut [ComponentVal],
 ) -> anyhow::Result<()> {
-    if !store.data().caps.contains(&Capability::Store) {
-        log_denied(store.data(), "component_store_put_new");
-        return set_component_result(
-            results,
-            component_host_err(HostError::Denied("store".into())),
-        );
-    }
-    let [namespace, key, value, secret] = params else {
-        return set_component_result(
-            results,
-            component_host_err(HostError::Invalid(
-                "invalid bloom:store.put-new params".into(),
-            )),
-        );
+    component_store_write(store, params, results, true)
+}
+
+fn component_store_write(
+    store: StoreContextMut<'_, StoreData>,
+    params: &[ComponentVal],
+    results: &mut [ComponentVal],
+    put_new: bool,
+) -> anyhow::Result<()> {
+    let (op, invalid) = if put_new {
+        (
+            "component_store_put_new",
+            "invalid bloom:store.put-new params",
+        )
+    } else {
+        ("component_store_put", "invalid bloom:store.put params")
     };
-    let namespace = match component_string(namespace, "namespace") {
-        Ok(namespace) => namespace,
-        Err(e) => return set_component_result(results, component_host_err(e)),
-    };
-    let key = match component_string(key, "key") {
-        Ok(key) => key,
-        Err(e) => return set_component_result(results, component_host_err(e)),
-    };
-    let value = match component_byte_list(value, "value") {
-        Ok(value) => value,
-        Err(e) => return set_component_result(results, component_host_err(e)),
-    };
-    let secret = match component_bool(secret, "secret") {
-        Ok(secret) => secret,
-        Err(e) => return set_component_result(results, component_host_err(e)),
-    };
-    if let Err(e) = store_namespace_put_allowed(store.data(), &namespace, secret) {
-        return set_component_result(results, component_host_err(e));
-    }
-    let key = match namespaced_store_key(&namespace, &key) {
-        Ok(key) => key,
-        Err(e) => return set_component_result(results, component_host_err(e)),
-    };
-    let Some(private_store) = store.data().private_store.clone() else {
-        return set_component_result(
-            results,
-            component_host_err(HostError::Denied("store unavailable".into())),
-        );
-    };
-    let petal_hash = store.data().petal_hash.clone();
-    match private_store.put_new(&petal_hash, &key, &value, secret) {
-        Ok(()) => set_component_result(results, component_ok(None)),
-        Err(e) => set_component_result(results, component_host_err(e)),
-    }
+    component_store_call(store, results, op, |data| {
+        let [namespace, key, value, secret] = params else {
+            return Err(HostError::Invalid(invalid.into()));
+        };
+        let namespace = component_string(namespace, "namespace")?;
+        let key = component_string(key, "key")?;
+        let value = component_byte_list(value, "value")?;
+        let secret = component_bool(secret, "secret")?;
+        store_namespace_put_allowed(data, &namespace, secret)?;
+        let key = namespaced_store_key(&namespace, &key)?;
+        let private_store = component_private_store(data)?;
+        if put_new {
+            private_store.put_new(&data.petal_hash, &key, &value, secret)?;
+        } else {
+            private_store.put(&data.petal_hash, &key, &value, secret)?;
+        }
+        Ok(None)
+    })
 }
 
 async fn component_store_list(
@@ -1218,43 +1158,19 @@ async fn component_store_list(
     params: &[ComponentVal],
     results: &mut [ComponentVal],
 ) -> anyhow::Result<()> {
-    if !store.data().caps.contains(&Capability::Store) {
-        log_denied(store.data(), "component_store_list");
-        return set_component_result(
-            results,
-            component_host_err(HostError::Denied("store".into())),
-        );
-    }
-    let (namespace, prefix) = match component_namespace_key(params) {
-        Ok(v) => v,
-        Err(e) => return set_component_result(results, component_host_err(e)),
-    };
-    if let Err(e) = store_namespace_allowed(store.data(), &namespace) {
-        return set_component_result(results, component_host_err(e));
-    }
-    let store_prefix = match namespaced_store_prefix(&namespace, &prefix) {
-        Ok(prefix) => prefix,
-        Err(e) => return set_component_result(results, component_host_err(e)),
-    };
-    let Some(private_store) = store.data().private_store.clone() else {
-        return set_component_result(
-            results,
-            component_host_err(HostError::Denied("store unavailable".into())),
-        );
-    };
-    let petal_hash = store.data().petal_hash.clone();
-    match private_store.list(&petal_hash, &store_prefix) {
-        Ok(keys) => {
-            let namespace_prefix = format!("{namespace}/");
-            let keys = keys
-                .into_iter()
-                .filter_map(|key| key.strip_prefix(&namespace_prefix).map(str::to_string))
-                .map(ComponentVal::String)
-                .collect();
-            set_component_result(results, component_ok(Some(ComponentVal::List(keys))))
-        }
-        Err(e) => set_component_result(results, component_host_err(e)),
-    }
+    component_store_call(store, results, "component_store_list", |data| {
+        let (namespace, prefix) = component_namespace_key(params)?;
+        store_namespace_allowed(data, &namespace)?;
+        let store_prefix = namespaced_store_prefix(&namespace, &prefix)?;
+        let keys = component_private_store(data)?.list(&data.petal_hash, &store_prefix)?;
+        let namespace_prefix = format!("{namespace}/");
+        let keys = keys
+            .into_iter()
+            .filter_map(|key| key.strip_prefix(&namespace_prefix).map(str::to_string))
+            .map(ComponentVal::String)
+            .collect();
+        Ok(Some(ComponentVal::List(keys)))
+    })
 }
 
 async fn component_store_delete(
@@ -1262,35 +1178,13 @@ async fn component_store_delete(
     params: &[ComponentVal],
     results: &mut [ComponentVal],
 ) -> anyhow::Result<()> {
-    if !store.data().caps.contains(&Capability::Store) {
-        log_denied(store.data(), "component_store_delete");
-        return set_component_result(
-            results,
-            component_host_err(HostError::Denied("store".into())),
-        );
-    }
-    let (namespace, key) = match component_namespace_key(params) {
-        Ok(v) => v,
-        Err(e) => return set_component_result(results, component_host_err(e)),
-    };
-    if let Err(e) = store_namespace_allowed(store.data(), &namespace) {
-        return set_component_result(results, component_host_err(e));
-    }
-    let key = match namespaced_store_key(&namespace, &key) {
-        Ok(key) => key,
-        Err(e) => return set_component_result(results, component_host_err(e)),
-    };
-    let Some(private_store) = store.data().private_store.clone() else {
-        return set_component_result(
-            results,
-            component_host_err(HostError::Denied("store unavailable".into())),
-        );
-    };
-    let petal_hash = store.data().petal_hash.clone();
-    match private_store.del(&petal_hash, &key) {
-        Ok(()) => set_component_result(results, component_ok(None)),
-        Err(e) => set_component_result(results, component_host_err(e)),
-    }
+    component_store_call(store, results, "component_store_delete", |data| {
+        let (namespace, key) = component_namespace_key(params)?;
+        store_namespace_allowed(data, &namespace)?;
+        let key = namespaced_store_key(&namespace, &key)?;
+        component_private_store(data)?.del(&data.petal_hash, &key)?;
+        Ok(None)
+    })
 }
 
 async fn component_store_delete_if_value(
@@ -1298,51 +1192,20 @@ async fn component_store_delete_if_value(
     params: &[ComponentVal],
     results: &mut [ComponentVal],
 ) -> anyhow::Result<()> {
-    if !store.data().caps.contains(&Capability::Store) {
-        log_denied(store.data(), "component_store_delete_if_value");
-        return set_component_result(
-            results,
-            component_host_err(HostError::Denied("store".into())),
-        );
-    }
-    let [namespace, key, expected] = params else {
-        return set_component_result(
-            results,
-            component_host_err(HostError::Invalid(
+    component_store_call(store, results, "component_store_delete_if_value", |data| {
+        let [namespace, key, expected] = params else {
+            return Err(HostError::Invalid(
                 "invalid bloom:store.delete-if-value params".into(),
-            )),
-        );
-    };
-    let namespace = match component_string(namespace, "namespace") {
-        Ok(namespace) => namespace,
-        Err(e) => return set_component_result(results, component_host_err(e)),
-    };
-    let key = match component_string(key, "key") {
-        Ok(key) => key,
-        Err(e) => return set_component_result(results, component_host_err(e)),
-    };
-    let expected = match component_byte_list(expected, "expected") {
-        Ok(expected) => expected,
-        Err(e) => return set_component_result(results, component_host_err(e)),
-    };
-    if let Err(e) = store_namespace_allowed(store.data(), &namespace) {
-        return set_component_result(results, component_host_err(e));
-    }
-    let key = match namespaced_store_key(&namespace, &key) {
-        Ok(key) => key,
-        Err(e) => return set_component_result(results, component_host_err(e)),
-    };
-    let Some(private_store) = store.data().private_store.clone() else {
-        return set_component_result(
-            results,
-            component_host_err(HostError::Denied("store unavailable".into())),
-        );
-    };
-    let petal_hash = store.data().petal_hash.clone();
-    match private_store.del_if_value(&petal_hash, &key, &expected) {
-        Ok(()) => set_component_result(results, component_ok(None)),
-        Err(e) => set_component_result(results, component_host_err(e)),
-    }
+            ));
+        };
+        let namespace = component_string(namespace, "namespace")?;
+        let key = component_string(key, "key")?;
+        let expected = component_byte_list(expected, "expected")?;
+        store_namespace_allowed(data, &namespace)?;
+        let key = namespaced_store_key(&namespace, &key)?;
+        component_private_store(data)?.del_if_value(&data.petal_hash, &key, &expected)?;
+        Ok(None)
+    })
 }
 
 async fn component_sign_hash(

@@ -191,12 +191,6 @@ impl ChainsHandler {
         self
     }
 
-    /// Builder: install a custom address-history source.
-    pub fn with_address_history(mut self, src: Option<Arc<dyn AddressHistorySource>>) -> Self {
-        self.address_history = src;
-        self
-    }
-
     /// Builder: attach an ENS client so `addresses/<addr>/ens` returns
     /// the reverse-resolved name (cross-checked against forward
     /// resolution by `EnsClient::reverse`).

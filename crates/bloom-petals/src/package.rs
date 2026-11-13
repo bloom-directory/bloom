@@ -2963,7 +2963,7 @@ fn host_type_export_matches(
         HostTypeExport::VfsEntryKind => is_entry_kind(&ty, types, 0),
         HostTypeExport::VfsEntry => is_route_entry(&ty, types, 0),
         HostTypeExport::EvmTransaction => is_evm_transaction(&ty, types, 0),
-        HostTypeExport::OutboxApprovalRequired => is_outbox_approval_required(&ty, types, 0),
+        HostTypeExport::OutboxApprovalRequired => is_approval_pending(&ty, types, 0),
         HostTypeExport::StagedTransaction => is_staged_transaction(&ty, types, 0),
         HostTypeExport::OutboxInspection => is_outbox_inspection(&ty, types, 0),
         HostTypeExport::SignApprovalRequired => is_approval_required(&ty, types, 0),
@@ -3242,27 +3242,50 @@ fn result_matches(
     })
 }
 
-fn is_sign_result_petal(
+type TypeCheck = fn(&ComponentValType, &[ComponentTypeEntry<'_>], usize) -> bool;
+
+/// A two-case variant whose cases are named and typed exactly as given.
+fn is_two_case_variant(
     ty: &ComponentValType,
     types: &[ComponentTypeEntry<'_>],
     depth: usize,
+    first: (&str, TypeCheck),
+    second: (&str, TypeCheck),
 ) -> bool {
     with_defined_type(ty, types, depth, |defined, types, depth| {
         let ComponentDefinedType::Variant(cases) = defined else {
             return false;
         };
         cases.as_ref().len() == 2
-            && cases[0].name == "signature"
-            && cases[0]
-                .ty
-                .as_ref()
-                .is_some_and(|ty| is_byte_list(ty, types, depth))
-            && cases[1].name == "approval-required"
-            && cases[1]
-                .ty
-                .as_ref()
-                .is_some_and(|ty| is_approval_required(ty, types, depth))
+            && [first, second]
+                .iter()
+                .zip(cases.iter())
+                .all(|((name, check), case)| {
+                    case.name == *name && case.ty.as_ref().is_some_and(|ty| check(ty, types, depth))
+                })
     })
+}
+
+fn is_byte_list_list(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    depth: usize,
+) -> bool {
+    is_list_of(ty, types, is_byte_list, depth)
+}
+
+fn is_sign_result_petal(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    depth: usize,
+) -> bool {
+    is_two_case_variant(
+        ty,
+        types,
+        depth,
+        ("signature", is_byte_list),
+        ("approval-required", is_approval_required),
+    )
 }
 
 fn is_safe_sign_result_petal(
@@ -3270,22 +3293,13 @@ fn is_safe_sign_result_petal(
     types: &[ComponentTypeEntry<'_>],
     depth: usize,
 ) -> bool {
-    with_defined_type(ty, types, depth, |defined, types, depth| {
-        let ComponentDefinedType::Variant(cases) = defined else {
-            return false;
-        };
-        cases.as_ref().len() == 2
-            && cases[0].name == "signature"
-            && cases[0]
-                .ty
-                .as_ref()
-                .is_some_and(|ty| is_byte_list(ty, types, depth))
-            && cases[1].name == "approval-pending"
-            && cases[1]
-                .ty
-                .as_ref()
-                .is_some_and(|ty| is_approval_pending(ty, types, depth))
-    })
+    is_two_case_variant(
+        ty,
+        types,
+        depth,
+        ("signature", is_byte_list),
+        ("approval-pending", is_approval_pending),
+    )
 }
 
 fn is_sign_request_petal(
@@ -3418,22 +3432,13 @@ fn is_sign_batch_result_petal(
     types: &[ComponentTypeEntry<'_>],
     depth: usize,
 ) -> bool {
-    with_defined_type(ty, types, depth, |defined, types, depth| {
-        let ComponentDefinedType::Variant(cases) = defined else {
-            return false;
-        };
-        cases.as_ref().len() == 2
-            && cases[0].name == "signatures"
-            && cases[0]
-                .ty
-                .as_ref()
-                .is_some_and(|ty| is_list_of(ty, types, is_byte_list, depth))
-            && cases[1].name == "approval-required"
-            && cases[1]
-                .ty
-                .as_ref()
-                .is_some_and(|ty| is_approval_required(ty, types, depth))
-    })
+    is_two_case_variant(
+        ty,
+        types,
+        depth,
+        ("signatures", is_byte_list_list),
+        ("approval-required", is_approval_required),
+    )
 }
 
 fn is_payload_batch_sign_result_petal(
@@ -3441,22 +3446,13 @@ fn is_payload_batch_sign_result_petal(
     types: &[ComponentTypeEntry<'_>],
     depth: usize,
 ) -> bool {
-    with_defined_type(ty, types, depth, |defined, types, depth| {
-        let ComponentDefinedType::Variant(cases) = defined else {
-            return false;
-        };
-        cases.as_ref().len() == 2
-            && cases[0].name == "signatures"
-            && cases[0]
-                .ty
-                .as_ref()
-                .is_some_and(|ty| is_list_of(ty, types, is_byte_list, depth))
-            && cases[1].name == "approval-pending"
-            && cases[1]
-                .ty
-                .as_ref()
-                .is_some_and(|ty| is_approval_pending(ty, types, depth))
-    })
+    is_two_case_variant(
+        ty,
+        types,
+        depth,
+        ("signatures", is_byte_list_list),
+        ("approval-pending", is_approval_pending),
+    )
 }
 
 fn is_approval_required(
@@ -3524,23 +3520,6 @@ fn is_evm_transaction(
     })
 }
 
-fn is_outbox_approval_required(
-    ty: &ComponentValType,
-    types: &[ComponentTypeEntry<'_>],
-    depth: usize,
-) -> bool {
-    with_defined_type(ty, types, depth, |defined, types, depth| {
-        let ComponentDefinedType::Record(fields) = defined else {
-            return false;
-        };
-        fields.as_ref().len() == 2
-            && fields[0].0 == "action-id"
-            && is_string(&fields[0].1)
-            && fields[1].0 == "expires-ms"
-            && is_u64(&fields[1].1, types, depth)
-    })
-}
-
 fn is_staged_transaction(
     ty: &ComponentValType,
     types: &[ComponentTypeEntry<'_>],
@@ -3556,7 +3535,7 @@ fn is_staged_transaction(
             && fields[1].0 == "plan-md"
             && is_string(&fields[1].1)
             && fields[2].0 == "approval"
-            && is_option_of(&fields[2].1, types, is_outbox_approval_required, depth)
+            && is_option_of(&fields[2].1, types, is_approval_pending, depth)
     })
 }
 
@@ -3856,7 +3835,7 @@ fn is_u64(ty: &ComponentValType, _types: &[ComponentTypeEntry<'_>], _depth: usiz
     )
 }
 
-fn validate_route_id_arg(route_id: &str) -> Result<(), PetalError> {
+pub(crate) fn validate_route_id_arg(route_id: &str) -> Result<(), PetalError> {
     let valid = route_id.len() == 7
         && route_id.starts_with('r')
         && route_id[1..].bytes().all(|b| b.is_ascii_digit())

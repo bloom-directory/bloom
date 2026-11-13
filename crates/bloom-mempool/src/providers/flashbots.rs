@@ -6,6 +6,7 @@
 use alloy::primitives::{B256, Bytes};
 use async_trait::async_trait;
 
+use super::json_rpc;
 use crate::private::{
     HealthStatus, MAINNET_CHAIN_ID, PrivateRpcError, PrivateRpcProvider, SEPOLIA_CHAIN_ID,
 };
@@ -20,13 +21,9 @@ pub struct FlashbotsProvider {
 
 impl FlashbotsProvider {
     pub fn new(url: impl Into<String>) -> Result<Self, PrivateRpcError> {
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .map_err(|e| PrivateRpcError::Transport(e.to_string()))?;
         Ok(Self {
             url: url.into(),
-            http,
+            http: json_rpc::http_client()?,
         })
     }
 
@@ -46,63 +43,11 @@ impl PrivateRpcProvider for FlashbotsProvider {
     }
 
     async fn submit(&self, signed_raw_tx: &Bytes) -> Result<B256, PrivateRpcError> {
-        let raw_hex = format!("0x{}", hex::encode(signed_raw_tx.as_ref()));
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "eth_sendRawTransaction",
-            "params": [raw_hex],
-        });
-        let resp: serde_json::Value = self
-            .http
-            .post(&self.url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| PrivateRpcError::Transport(e.to_string()))?
-            .error_for_status()
-            .map_err(|e| PrivateRpcError::Transport(e.to_string()))?
-            .json()
-            .await
-            .map_err(|e| PrivateRpcError::Transport(e.to_string()))?;
-        if let Some(err) = resp.get("error") {
-            return Err(PrivateRpcError::ProviderError(err.to_string()));
-        }
-        let hash_str = resp
-            .get("result")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| PrivateRpcError::ProviderError("missing result".into()))?;
-        hash_str
-            .parse()
-            .map_err(|e| PrivateRpcError::ProviderError(format!("{e}")))
+        json_rpc::send_raw_transaction(&self.http, &self.url, signed_raw_tx).await
     }
 
     async fn health(&self) -> Result<HealthStatus, PrivateRpcError> {
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "eth_blockNumber",
-            "params": [],
-        });
-        let resp: serde_json::Value = self
-            .http
-            .post(&self.url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| PrivateRpcError::Transport(e.to_string()))?
-            .error_for_status()
-            .map_err(|e| PrivateRpcError::Transport(e.to_string()))?
-            .json()
-            .await
-            .map_err(|e| PrivateRpcError::Transport(e.to_string()))?;
-        if resp.get("error").is_some() {
-            Ok(HealthStatus::Unhealthy)
-        } else if resp.get("result").is_some() {
-            Ok(HealthStatus::Healthy)
-        } else {
-            Ok(HealthStatus::Degraded)
-        }
+        json_rpc::health(&self.http, &self.url).await
     }
 }
 

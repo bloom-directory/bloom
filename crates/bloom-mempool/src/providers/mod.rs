@@ -11,3 +11,6 @@ pub mod mev_blocker;
 
 #[cfg(feature = "flashbots")]
 pub mod flashbots;
+
+#[cfg(any(feature = "mev_blocker", feature = "flashbots"))]
+mod json_rpc;

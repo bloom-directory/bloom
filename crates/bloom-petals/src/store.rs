@@ -24,7 +24,7 @@ use crate::error::PetalError;
 use crate::meta::{Capability, PetalMeta, PetalMode, PetalPackageMeta, PetalSourceProvenance};
 use crate::package::{
     PreparedPetalPackage, ROUTE_INDEX_SCHEMA, RouteIndex, route_artifact_bytes,
-    verify_prepared_package,
+    validate_route_id_arg, verify_prepared_package,
 };
 
 const OBJECTS: &str = "objects";
@@ -141,11 +141,6 @@ impl PetalStore {
         self.package_path_unchecked(hash).join(ROUTE_INDEX)
     }
 
-    pub fn route_index_path(&self, hash: &str) -> Result<PathBuf, PetalError> {
-        validate_hash_arg(hash)?;
-        Ok(self.route_index_path_unchecked(hash))
-    }
-
     /// Install raw wasm bytes. The store assigns the content hash.
     /// If a petal with the same hash is already present, its metadata
     /// is updated only when the requested mode and caps match the
@@ -214,13 +209,6 @@ impl PetalStore {
         root: impl AsRef<Path>,
     ) -> Result<(InstallResult, PetalMeta, RouteIndex), PetalError> {
         self.install_prepared_petal_package(PreparedPetalPackage::from_dir(root)?)
-    }
-
-    pub fn install_petal_package_tar(
-        &self,
-        archive: impl AsRef<Path>,
-    ) -> Result<(InstallResult, PetalMeta, RouteIndex), PetalError> {
-        self.install_prepared_petal_package(PreparedPetalPackage::from_petal_tar(archive)?)
     }
 
     pub fn install_prepared_petal_package(
@@ -820,20 +808,6 @@ fn validate_hash_arg(hash: &str) -> Result<(), PetalError> {
         Ok(())
     } else {
         Err(PetalError::InvalidHash(hash.to_string()))
-    }
-}
-
-fn validate_route_id_arg(route_id: &str) -> Result<(), PetalError> {
-    let valid = route_id.len() == 7
-        && route_id.starts_with('r')
-        && route_id[1..].bytes().all(|b| b.is_ascii_digit())
-        && route_id != "r000000";
-    if valid {
-        Ok(())
-    } else {
-        Err(PetalError::InvalidWasm(format!(
-            "invalid route id {route_id:?}"
-        )))
     }
 }
 

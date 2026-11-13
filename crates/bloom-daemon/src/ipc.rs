@@ -663,21 +663,6 @@ pub enum MachineOperationAction {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct MachineLegacyMigrationReceipt {
-    pub schema: String,
-    pub operation_id: bloom_broker_api::OperationId,
-    pub wallet_name: bloom_broker_api::Token,
-    pub address: String,
-    pub public_key_fingerprint: bloom_broker_api::Digest32,
-    pub credential_id_fingerprint: bloom_broker_api::Digest32,
-    pub legacy_format_version: u8,
-    pub bundle_digest: bloom_broker_api::Digest32,
-    pub policy_mode: String,
-    pub exact_terms_digest: bloom_broker_api::Digest32,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MachineCommand {
     TriadHealth {
@@ -736,9 +721,6 @@ pub enum MachineCommand {
         /// hosted surface when effective, otherwise this host's browser.
         #[serde(default)]
         remote: bool,
-    },
-    WalletMigrate {
-        receipt: MachineLegacyMigrationReceipt,
     },
     WalletPolicyPrepare {
         name: String,

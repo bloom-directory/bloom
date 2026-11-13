@@ -177,23 +177,6 @@ pub async fn read_contract_source(
     json_bytes(&s)
 }
 
-/// Read the raw ABI without proxy resolution.
-///
-/// Currently unused at the router level — the contracts surface uses
-/// [`super::chains_contracts::fetch_abi_proxy_aware`] so EIP-1967
-/// proxies surface the implementation ABI rather than the proxy/admin
-/// one. Kept around (and tested) because future callers wanting the
-/// raw proxy-side ABI for inspection can reach for it directly.
-#[allow(dead_code)]
-pub async fn read_contract_abi(
-    src: &Arc<dyn ContractMetadataSource>,
-    chain_id: u64,
-    addr: Address,
-) -> Result<Vec<u8>, HandlerError> {
-    let abi = src.get_abi(chain_id, addr).await.map_err(map_err)?;
-    json_bytes(&abi)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,34 +479,6 @@ mod tests {
             HandlerError::NotFound(s) => {
                 assert!(s.to_ascii_lowercase().contains("not verified"))
             }
-            other => panic!("expected NotFound, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn read_contract_abi_emits_array_payload() {
-        let body = r#"{"status":"1","message":"OK","result":"[{\"type\":\"function\",\"name\":\"foo\"}]"}"#;
-        let addr = spawn_canned(body).await;
-        let client = metadata_for(addr);
-        let bytes = read_contract_abi(&client, 1, fixed_addr()).await.unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(parsed.is_array());
-        assert_eq!(parsed[0]["name"], "foo");
-        assert_eq!(bytes.last().copied(), Some(b'\n'));
-    }
-
-    #[tokio::test]
-    async fn read_contract_abi_unverified_maps_to_not_found() {
-        // get_abi raises Api{status:"0", message:"Contract source code not verified"}
-        // when the result is the literal sentinel. map_err should surface NotFound.
-        let body = r#"{"status":"1","message":"OK","result":"Contract source code not verified"}"#;
-        let addr = spawn_canned(body).await;
-        let client = metadata_for(addr);
-        let err = read_contract_abi(&client, 1, fixed_addr())
-            .await
-            .unwrap_err();
-        match err {
-            HandlerError::NotFound(_) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
     }
