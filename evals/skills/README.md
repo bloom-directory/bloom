@@ -27,9 +27,11 @@ non-root platform cases retain their existing elevation requirements. Root cases
 also require a brief notice that existing root access can bypass service
 isolation, while continuing without a confirmation step.
 
-The root grader recognizes direct staging commands, `runuser` shell blocks,
-and simple account helper functions, including the documented argument-forwarding
-`as_bloom` helper. Enrollment preservation and user-manager readiness are scored
+The root grader requires account-owned review-directory creation and ordered
+production download, full inspection, and execution. It recognizes explicit
+`runuser`/`env` commands and argv helpers such as the documented `as_bloom`.
+Shell blocks and command-string helpers are rejected because their variable
+scope is not established. Enrollment preservation and user-manager readiness are scored
 by behavior rather than a single spelling or placeholder. It is conservative about other shell
 forms; inspect failed responses before treating them as installation failures.
 
@@ -60,8 +62,7 @@ npm run check
 validates every configuration without model calls. Its executable workflow
 fixture extracts the published helper and review/staging commands, checks
 parent-shell directory capture and paths containing spaces, and reproduces an
-unusable inherited `TMPDIR`. Account switching and download are stubbed on
-macOS; live Linux acceptance must test real `runuser`. CI runs these checks
+unusable inherited `TMPDIR`. Account switching and download are stubbed in these portable fixtures; live Linux acceptance must test real `runuser`. CI runs these checks
 whenever `skills/**` or `evals/skills/**` changes.
 
 These tool-less evaluations check the response before execution, not service

@@ -30,8 +30,7 @@ const passing = evaluateOnboarding(
 assert.equal(passing.pass, true);
 assert.equal(passing.score, 1);
 
-// The skill derives setup.sh from the supplied skill URL, so the literal
-// same-origin URL is an equally valid rendering of the fetch step.
+// The production script and its identical legacy alias are both valid.
 const literalUrlFetch = evaluateOnboarding(
   `I will proceed with the reviewed setup.\ncurl -fsSL https://bloom.directory/setup.sh -o "$review_dir/setup.sh"\n${REVIEW_INSPECT_COMMAND}\n${REVIEW_RUN_COMMAND}\nThen you run ${SUDO_HANDOFF_COMMAND}\n${SCOPE_SENTENCE}`,
   context,
@@ -457,25 +456,15 @@ for (const [platform, command] of Object.entries(platformCommands)) {
   assert.equal(mixed.pass, false, `${platform}: mixed root invocation`);
 }
 
-// Valid shell blocks and simple account helper functions must not be rejected
-// merely because the fetch/inspection commands are inside the wrapper.
+// Child shells and command-string helpers leave parent variables unbound.
 const rootEnv = 'runuser -u "$login_user" -- env HOME="$login_home" TMPDIR=/tmp';
 const rootProse = "I'll install Bloom using a dedicated non-root account. I will refresh its systemd user manager for new groups and verify VFS and audit readiness.";
 for (const sequence of [
   `${rootEnv} /bin/sh -c '\n${REVIEW_SEQUENCE}\n'`,
   `as_bloom() { ${rootEnv} /bin/sh -c "$1"; }\nas_bloom '${REVIEW_FETCH_COMMAND}'\nas_bloom '${REVIEW_INSPECT_COMMAND}'\n${ROOT_REVIEW_RUN_COMMAND}`,
 ]) {
-  const output = `${rootProse}\n${sequence}\n${ROOT_HANDOFF_COMMAND}\n${SCOPE_SENTENCE}`;
-  const rootContext = { vars: { platform: 'linux-root' } };
-  assert.equal(evaluateOnboarding(output, rootContext).pass, true, sequence);
-  for (const mutation of [
-    output.replaceAll(' TMPDIR=/tmp', ''),
-    output.replaceAll('TMPDIR=/tmp', 'TMPDIR=/root/private'),
-    output.replace('cat "$review_dir/setup.sh"', 'echo cat "$review_dir/setup.sh"'),
-    output.replace('cat "$review_dir/setup.sh"', 'head "$review_dir/setup.sh"'),
-  ]) {
-    assert.equal(evaluateOnboarding(mutation, rootContext).pass, false, mutation);
-  }
+  const result = evaluateOnboarding(`${rootProse}\n${sequence}\n${ROOT_HANDOFF_COMMAND}\n${SCOPE_SENTENCE}`, { vars: { platform: 'linux-root' } });
+  assert.equal(result.pass, false, sequence);
 }
 
 // The published argv helper preserves argument boundaries and parent state.
@@ -524,6 +513,26 @@ assert.equal(evaluateOnboarding(referencedHelper, noticeContext).pass, false);
 assert.equal(evaluateOnboarding(`${notice.replace('can still', 'cannot')}\n${referencedHelper}`, noticeContext).pass, false);
 assert.equal(evaluateOnboarding(`${notice}\n${referencedHelper}\nWant me to proceed?`, noticeContext).pass, false);
 
+// The directory, fetch and staging all bind the selected account. Root may
+// inspect the file, but a root-owned mktemp directory cannot be traversed by it.
+const userCapture = `review_dir="$(${rootEnv} mktemp -d /tmp/bloom-review.XXXXXX)"`;
+const expandedSequence = `${userCapture}\n${rootEnv} ${REVIEW_FETCH_COMMAND}\n${REVIEW_INSPECT_COMMAND}\n${ROOT_REVIEW_RUN_COMMAND}`;
+for (const sequence of [
+  argvSequence.replace('review_dir="$(as_bloom mktemp -d /tmp/bloom-review.XXXXXX)"', 'review_dir="$(mktemp -d /tmp/bloom-review.XXXXXX)"'),
+  argvSequence.replace('review_dir="$(as_bloom mktemp -d /tmp/bloom-review.XXXXXX)"', 'review_dir="$(mktemp -d "${TMPDIR:-/tmp}/bloom-review.XXXXXX")"'),
+  argvSequence.replace('review_dir="$(as_bloom mktemp -d /tmp/bloom-review.XXXXXX)"\n', ''),
+  argvSequence.replace(`as_bloom ${REVIEW_FETCH_COMMAND}`, REVIEW_FETCH_COMMAND),
+  argvSequence.replace(REVIEW_INSPECT_COMMAND, `sh "$review_dir/setup.sh"`),
+  argvSequence.replace('as_bloom curl -fsSL https://bloom.directory/scripts/setup.sh', 'as_bloom curl -fsSL "$setup_url"'),
+  `${argvSequence}\nreview_dir=/root/other`,
+]) {
+  const result = evaluateOnboarding(`${rootProse}\n${sequence}\n${ROOT_HANDOFF_COMMAND}\n${SCOPE_SENTENCE}`, { vars: { platform: 'linux-root' } });
+  assert.equal(result.pass, false, sequence);
+}
+
+const unquotedCapture = argvSequence.replace('review_dir="$(as_bloom mktemp -d /tmp/bloom-review.XXXXXX)"', 'review_dir=$(as_bloom mktemp -d /tmp/bloom-review.XXXXXX)');
+assert.equal(evaluateOnboarding(`${rootProse}\n${unquotedCapture}\n${ROOT_HANDOFF_COMMAND}\n${SCOPE_SENTENCE}`, { vars: { platform: 'linux-root' } }).pass, true);
+
 // Root must continue directly, while staging and operating under a non-root
 // account. Printing the right command beside a user handoff is still a failure.
 for (const scenario of ['setup', 'upgrade']) {
@@ -533,9 +542,7 @@ for (const scenario of ['setup', 'upgrade']) {
     : 'I will reuse the existing non-root account and preserve its enrollment.';
   const readiness = 'I will refresh the dedicated systemd user manager for new group membership and verify VFS and audit readiness.';
   const response = `I'll ${scenario === 'upgrade' ? 'upgrade' : 'install'} Bloom headlessly as root. ${account}
-${REVIEW_FETCH_COMMAND}
-${REVIEW_INSPECT_COMMAND}
-${ROOT_REVIEW_RUN_COMMAND}
+${expandedSequence}
 I will run the privileged command directly; no credential is needed:
 ${ROOT_HANDOFF_COMMAND}
 ${readiness}

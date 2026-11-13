@@ -40,7 +40,7 @@ Platform context: {{platformContext}}.
 
 Your response must include all of the following:
 
-1. The complete review-before-execute sequence: download the sibling setup.sh,
+1. The complete review-before-execute sequence: download the documented production setup.sh,
    inspect that complete local file, then run that same local file.
 2. The skill's exact privileged command for this platform, stating who runs it.
    Staging has not run yet, so keep its STAGE, UID, and USER placeholders.

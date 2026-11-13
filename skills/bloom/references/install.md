@@ -102,9 +102,9 @@ session policy and require its active user manager instead of enabling linger.
 Run the review/download/staging sequence below **as the selected account**,
 with its home, from `/tmp`. Explicitly set `TMPDIR=/tmp` inside each
 `runuser` invocation: `runuser -u` can preserve root's `TMPDIR`, and changing
-`HOME` alone does not make a root-private scratch directory writable. Both
-review-directory creation and staging use `TMPDIR`. Create the review directory
-as that account too.
+`HOME` alone does not make a root-private scratch directory writable. Staging
+uses `TMPDIR`; the review-directory command also explicitly selects `/tmp`.
+Create the review directory as that account too.
 Define this argument-forwarding helper in the root shell, and use it for
 staging and all later CLI/VFS checks. Keep the selected account values available
 in each subsequent tool call. Pass commands and arguments separately; never
@@ -129,19 +129,11 @@ into a shell. When this skill is installed locally, copy its bundled
 and execute that exact copy. Resolve the bundled path relative to the skill
 directory, not the current working directory.
 
-When the user supplies a specific `SKILL.md` URL, use the `scripts/setup.sh`
-beside that document; never silently replace a preview or custom origin with
-production.
-For a website-loaded skill, fetch the script as follows:
+For a website-loaded skill, fetch the production setup script as follows.
 
 For every setup or privileged handoff invocation, set the working directory to
 `/private/tmp` on macOS or `/tmp` on Linux. Never run from inside the Bloom mount:
 installation can restart it and invalidate the current working directory.
-
-```sh
-skill_url=${BLOOM_SKILL_URL:-https://bloom.directory/SKILL.md}
-setup_url=${skill_url%/SKILL.md}/scripts/setup.sh
-```
 
 For Linux root, use the helper above. Capture `review_dir` in the parent root
 shell so it remains available after the account-switch command exits:
@@ -149,7 +141,7 @@ shell so it remains available after the account-switch command exits:
 ```sh
 cd /tmp
 review_dir="$(as_bloom mktemp -d /tmp/bloom-review.XXXXXX)"
-as_bloom curl -fsSL "$setup_url" -o "$review_dir/setup.sh"
+as_bloom curl -fsSL https://bloom.directory/scripts/setup.sh -o "$review_dir/setup.sh"
 cat "$review_dir/setup.sh"
 ```
 
@@ -157,13 +149,9 @@ For non-root Linux or macOS:
 
 ```sh
 review_dir="$(mktemp -d "${TMPDIR:-/tmp}/bloom-review.XXXXXX")"
-curl -fsSL "$setup_url" -o "$review_dir/setup.sh"
+curl -fsSL https://bloom.directory/scripts/setup.sh -o "$review_dir/setup.sh"
 cat "$review_dir/setup.sh"
 ```
-
-Set `BLOOM_SKILL_URL` to the exact URL the user supplied when it is not the
-production URL. The setup script must come from the same origin and path
-prefix as that skill.
 
 Inspect the complete downloaded script before execution. It should contact only the
 Bloom repository's GitHub latest-release URL and the resolved release downloads,
@@ -314,17 +302,26 @@ systemctl restart "user@$login_uid.service"
 ```
 
 Wait up to 30 seconds for its bus, then run the following as that account using
-the wrapper above; the package has already enabled these units:
+the helper above; the package has already enabled these units:
 
 ```sh
-systemctl --user start bloom-session.service bloom-machine.service
+as_bloom systemctl --user start bloom-session.service bloom-machine.service
 ```
 
 Recheck readiness. Never restart a shared account's user manager or terminate
 unrelated login sessions. If its session is stale, report that specific blocker.
 
-Once the session has the groups, the package starts Machine and mounts `~/bloom` through
-`bloom-machine.service`; the agent must not launch a second Machine. Require:
+Once the session has the groups, the package starts Machine and mounts
+`~/bloom` through `bloom-machine.service`; the agent must not launch a second
+Machine. For Linux root, use the captured account values:
+
+```sh
+as_bloom systemctl --user is-active bloom-session.service bloom-machine.service
+systemctl is-active "bloom-signer@$login_uid.service" "bloom-broker@$login_uid.service"
+as_bloom /bin/sh -c 'command -v bloom'
+```
+
+For non-root Linux, run these checks as the login user:
 
 ```sh
 systemctl --user is-active bloom-session.service bloom-machine.service
@@ -362,10 +359,22 @@ configuration beyond it.
 ## Mounted VFS and audit readiness
 
 On either supported target, require the service checks above, both VFS reads,
-and audit health before reporting Bloom fully ready. Use the mounted reads below
-when available. If native mounting is unavailable, run `bloom vfs cat /AGENTS.md`
-and `bloom vfs cat /status/daemon.json` instead; a working CLI VFS connection
-does not require the human to repair the mount first:
+and audit health before reporting Bloom fully ready. For Linux root, use the
+captured home; `$HOME` and `$(id -u)` in the root shell refer to root even when
+passed as arguments to `as_bloom`:
+
+```sh
+as_bloom cat "$login_home/bloom/AGENTS.md"
+as_bloom cat "$login_home/bloom/status/daemon.json"
+as_bloom bloom audit status
+```
+
+If the native mount is unavailable, Linux root uses `as_bloom bloom vfs cat
+/AGENTS.md` and `as_bloom bloom vfs cat /status/daemon.json` instead. A working
+CLI VFS connection does not require the human to repair the mount first.
+
+For non-root Linux or macOS, use these mounted reads when available, or the
+same `bloom vfs cat` fallbacks without `as_bloom`:
 
 ```sh
 BLOOM_MOUNT=${BLOOM_MOUNT:-"$HOME/bloom"}
