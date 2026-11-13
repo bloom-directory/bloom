@@ -1,7 +1,6 @@
 [workspace]
 members = [
   "crates/bloom",
-  "crates/bloom-machine",
   "crates/bloom-daemon",
   "crates/bloom-vfs",
   "crates/bloom-mcp",

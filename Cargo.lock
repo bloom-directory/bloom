@@ -2489,23 +2489,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bloom-machine"
-version = "0.5.0"
-dependencies = [
- "anyhow",
- "bloom-broker-api",
- "bloom-machine-client",
- "clap",
- "hex",
- "rand 0.8.6",
- "serde_jcs",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "tokio",
-]
-
-[[package]]
 name = "bloom-machine-client"
 version = "0.5.0"
 dependencies = [
