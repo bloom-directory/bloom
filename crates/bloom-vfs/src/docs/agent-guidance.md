@@ -23,8 +23,9 @@ Infer what Bloom state settles; ask only for what it cannot:
 - With one wallet or account, use it.
 - A read that names no chain covers every chain: read `holdings.json`.
 - For a write, use the only chain where `holdings.json` shows the asset, or
-  the network the Petal's documentation names as its default. If two or more
-  funded chains remain, ask one question that names them.
+  the network the Petal's documentation names as its default. Use mainnet
+  unless the user names a testnet. If two or more funded chains remain, ask
+  one question that names them.
 - If `holdings.json` has an `errors` entry for a chain that could hold the
   asset, say so rather than treating that chain as empty.
 
@@ -82,7 +83,9 @@ For outbox transactions:
      write `confirm` to `confirm.override` only if they accept it. Otherwise
      read its `last_error.json`: `kind: policy_approval_required` means the
      owner must first allow that Petal through the ceremony link in `error`.
-5. Read `sent/<id>/` or `failed/<id>/` before reporting the result.
+5. Read `sent/<id>/` or `failed/<id>/` before reporting the result. Report
+   a failed or partly completed request as a failure, and say which steps
+   did not complete.
 
 Do not restage while an approval is pending, or because a pending path
 disappeared: list `sent/` and `failed/` first.
