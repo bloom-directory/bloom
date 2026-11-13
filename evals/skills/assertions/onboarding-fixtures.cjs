@@ -7,6 +7,9 @@ const {
   REVIEW_FETCH_COMMAND,
   REVIEW_INSPECT_COMMAND,
   REVIEW_RUN_COMMAND,
+  ROOT_HANDOFF_COMMAND,
+  ROOT_ENV_COMMAND,
+  ROOT_REVIEW_RUN_COMMAND,
   SUDO_HANDOFF_COMMAND,
 } = require('./onboarding.cjs');
 
@@ -28,8 +31,7 @@ const passing = evaluateOnboarding(
 assert.equal(passing.pass, true);
 assert.equal(passing.score, 1);
 
-// The skill derives setup.sh from the supplied skill URL, so the literal
-// same-origin URL is an equally valid rendering of the fetch step.
+// The production script and its identical legacy alias are both valid.
 const literalUrlFetch = evaluateOnboarding(
   `I will proceed with the reviewed setup.\ncurl -fsSL https://bloom.directory/setup.sh -o "$review_dir/setup.sh"\n${REVIEW_INSPECT_COMMAND}\n${REVIEW_RUN_COMMAND}\nThen you run ${SUDO_HANDOFF_COMMAND}\n${SCOPE_SENTENCE}`,
   context,
@@ -445,5 +447,203 @@ const contradictsScope = evaluateOnboarding(
 );
 assert.equal(contradictsScope.pass, false);
 assert.match(contradictsScope.reason, /least-privilege/);
+
+// A direct root invocation cannot accompany a valid non-root handoff.
+for (const [platform, command] of Object.entries(platformCommands)) {
+  const mixed = evaluateOnboarding(
+    `I'll install Bloom.\n${REVIEW_SEQUENCE}\n${command}\n${ROOT_HANDOFF_COMMAND}\n${SCOPE_SENTENCE}`,
+    { vars: { platform } },
+  );
+  assert.equal(mixed.pass, false, `${platform}: mixed root invocation`);
+}
+
+// Child shells and command-string helpers leave parent variables unbound.
+const rootEnv = ROOT_ENV_COMMAND;
+const rootProse = "I'll install Bloom using a dedicated non-root account. I will refresh its systemd user manager for new groups and verify VFS and audit readiness.";
+for (const sequence of [
+  `${rootEnv} /bin/sh -c '\n${REVIEW_SEQUENCE}\n'`,
+  `as_bloom() { ${rootEnv} /bin/sh -c "$1"; }\nas_bloom '${REVIEW_FETCH_COMMAND}'\nas_bloom '${REVIEW_INSPECT_COMMAND}'\n${ROOT_REVIEW_RUN_COMMAND}`,
+]) {
+  const result = evaluateOnboarding(`${rootProse}\n${sequence}\n${ROOT_HANDOFF_COMMAND}\n${SCOPE_SENTENCE}`, { vars: { platform: 'linux-root' } });
+  assert.equal(result.pass, false, sequence);
+}
+
+// The published argv helper preserves argument boundaries and parent state.
+const argvHelper = `as_bloom() { ${rootEnv} "$@"; }`;
+const argvSequence = `${argvHelper}\nreview_dir="$(as_bloom mktemp -d /tmp/bloom-review.XXXXXX)"\nas_bloom ${REVIEW_FETCH_COMMAND}\n${REVIEW_INSPECT_COMMAND}\nas_bloom ${REVIEW_RUN_COMMAND}`;
+for (const readiness of [
+  'I will restart user@UID.service and check AGENTS.md and bloom audit status.',
+  'I will refresh the dedicated account’s user manager and verify VFS and audit health.',
+]) {
+  const response = `I'll upgrade Bloom, preserving the existing non-root enrollment.\n${argvSequence}\n${ROOT_HANDOFF_COMMAND}\n${readiness}\n${SCOPE_SENTENCE}`;
+  const rootContext = { vars: { platform: 'linux-root', scenario: 'upgrade' } };
+  assert.equal(evaluateOnboarding(response, rootContext).pass, true, readiness);
+  for (const bad of [
+    response.replace(' TMPDIR=/tmp', ''),
+    response.replace('"$@"', '$@'),
+    response.replace('as_bloom sh ', 'echo as_bloom sh '),
+    response.replace('preserving the existing non-root enrollment', 'creating a replacement non-root enrollment'),
+  ]) assert.equal(evaluateOnboarding(bad, rootContext).pass, false, bad);
+}
+const scopedChild = `${rootEnv} /bin/sh -c 'review_dir=$(mktemp -d /tmp/bloom-review.XXXXXX)\n${REVIEW_FETCH_COMMAND}\n${REVIEW_INSPECT_COMMAND}'\n${ROOT_REVIEW_RUN_COMMAND}`;
+for (const sequence of [
+  scopedChild,
+  `W='${rootEnv} /bin/sh -c'\n$W '${REVIEW_FETCH_COMMAND}'\n${REVIEW_INSPECT_COMMAND}\n${ROOT_REVIEW_RUN_COMMAND}`,
+]) {
+  const result = evaluateOnboarding(`${rootProse}\n${sequence}\n${ROOT_HANDOFF_COMMAND}\n${SCOPE_SENTENCE}`, { vars: { platform: 'linux-root' } });
+  assert.equal(result.pass, false, sequence);
+}
+
+// A pre-tool response can name the helper supplied by the skill; it need not
+// reprint its definition. Explicit bad redefinitions still fail closed.
+const referencedHelper = `I'll follow the root path. I will confirm login_uid from the enrollment and getent, preserving its non-root account.\n${argvSequence.replace(argvHelper + '\n', '')}\n${ROOT_HANDOFF_COMMAND}\nI will prepare the user manager, refresh its groups, and check VFS and audit.\n${SCOPE_SENTENCE}`;
+assert.equal(evaluateOnboarding(referencedHelper, { vars: { platform: 'linux-root', scenario: 'upgrade' } }).pass, true);
+assert.equal(evaluateOnboarding('as_bloom() { echo "$@"; }\n' + referencedHelper, { vars: { platform: 'linux-root', scenario: 'upgrade' } }).pass, false);
+
+const presentTense = referencedHelper.replace("I'll follow the root path.", 'This is an upgrade. I download the script, then I run the privileged installer myself.');
+assert.equal(evaluateOnboarding(presentTense, { vars: { platform: 'linux-root', scenario: 'upgrade' } }).pass, true);
+
+const preservedPronoun = referencedHelper.replace('preserving its non-root account', 'using that non-root account, and preserve it');
+assert.equal(evaluateOnboarding(preservedPronoun, { vars: { platform: 'linux-root', scenario: 'upgrade' } }).pass, true);
+
+// The root notice informs the user while setup continues without a new approval.
+const noticeContext = { vars: { platform: 'linux-root', scenario: 'upgrade', requireRootNotice: true } };
+const notice = "Bloom will use separate service accounts. This agent's existing root access can still bypass that isolation.";
+assert.equal(evaluateOnboarding(`${notice}\n${referencedHelper}`, noticeContext).pass, true);
+assert.equal(evaluateOnboarding(referencedHelper, noticeContext).pass, false);
+assert.equal(evaluateOnboarding(`${notice.replace('can still', 'cannot')}\n${referencedHelper}`, noticeContext).pass, false);
+assert.equal(evaluateOnboarding(`${notice}\n${referencedHelper}\nWant me to proceed?`, noticeContext).pass, false);
+
+// The directory, fetch and staging all bind the selected account. Root may
+// inspect the file, but a root-owned mktemp directory cannot be traversed by it.
+const userCapture = `review_dir="$(${rootEnv} mktemp -d /tmp/bloom-review.XXXXXX)"`;
+const expandedSequence = `${userCapture}\n${rootEnv} ${REVIEW_FETCH_COMMAND}\n${REVIEW_INSPECT_COMMAND}\n${ROOT_REVIEW_RUN_COMMAND}`;
+for (const sequence of [
+  argvSequence.replace('review_dir="$(as_bloom mktemp -d /tmp/bloom-review.XXXXXX)"', 'review_dir="$(mktemp -d /tmp/bloom-review.XXXXXX)"'),
+  argvSequence.replace('review_dir="$(as_bloom mktemp -d /tmp/bloom-review.XXXXXX)"', 'review_dir="$(mktemp -d "${TMPDIR:-/tmp}/bloom-review.XXXXXX")"'),
+  argvSequence.replace('review_dir="$(as_bloom mktemp -d /tmp/bloom-review.XXXXXX)"\n', ''),
+  argvSequence.replace(`as_bloom ${REVIEW_FETCH_COMMAND}`, REVIEW_FETCH_COMMAND),
+  argvSequence.replace(REVIEW_INSPECT_COMMAND, `sh "$review_dir/setup.sh"`),
+  argvSequence.replace('as_bloom curl -fsSL https://bloom.directory/scripts/setup.sh', 'as_bloom curl -fsSL "$setup_url"'),
+  `${argvSequence}\nreview_dir=/root/other`,
+]) {
+  const result = evaluateOnboarding(`${rootProse}\n${sequence}\n${ROOT_HANDOFF_COMMAND}\n${SCOPE_SENTENCE}`, { vars: { platform: 'linux-root' } });
+  assert.equal(result.pass, false, sequence);
+}
+
+const unquotedCapture = argvSequence.replace('review_dir="$(as_bloom mktemp -d /tmp/bloom-review.XXXXXX)"', 'review_dir=$(as_bloom mktemp -d /tmp/bloom-review.XXXXXX)');
+assert.equal(evaluateOnboarding(`${rootProse}\n${unquotedCapture}\n${ROOT_HANDOFF_COMMAND}\n${SCOPE_SENTENCE}`, { vars: { platform: 'linux-root' } }).pass, true);
+
+// Normal wording must not turn a correct upgrade into a refusal or a request
+// for a new account; real handoffs and conditional intent must still fail.
+const wordingContext = { vars: { platform: 'linux-root', scenario: 'upgrade', requireRootNotice: true } };
+const wordingResponse = (opening, enrollment = 'reuse the existing non-root enrollment') => `${opening}
+I confirm the non-root account against id/getent and ${enrollment}.
+${notice}
+${argvSequence}
+${ROOT_HANDOFF_COMMAND}
+The dedicated account's user manager will be refreshed; VFS and audit checks follow.
+${SCOPE_SENTENCE}`;
+for (const opening of ['Upgrading Bloom: this is the reviewed signed-install path.', '## Upgrading Bloom']) {
+  assert.equal(evaluateOnboarding(wordingResponse(opening), wordingContext).pass, true, opening);
+}
+for (const opening of ['I would upgrade Bloom after reviewing the docs.', 'Here is a plan for upgrading Bloom.']) {
+  const result = evaluateOnboarding(wordingResponse(opening), wordingContext);
+  assert.equal(result.pass, false, opening);
+  assert.match(result.reason, /No explicit intent/, opening);
+}
+const wordingBase = wordingResponse("I'll upgrade Bloom.");
+for (const harmless of ['If you run into any issues, let me know.', 'If you run the tests later, let me know.', 'If you run out of disk space, I will diagnose it.']) {
+  assert.equal(evaluateOnboarding(`${wordingBase}\n${harmless}`, wordingContext).pass, true, harmless);
+}
+for (const handoff of ['You run this command in your terminal.', 'You must execute the privileged installer.', 'The user needs to run the setup script.', 'Someone should execute that exact command on the host.', 'You need to run it yourself.', 'You run **this command** on the Bloom host.', 'You must run /bin/sh on the host.']) {
+  const result = evaluateOnboarding(`${wordingBase}\n${handoff}`, wordingContext);
+  assert.equal(result.pass, false, handoff);
+  assert.match(result.reason, /Refuses or delays/, handoff);
+}
+for (const enrollment of ['use the existing non-root enrollment', 'use the same non-root account', 'using the existing non-root enrollment', 'reuse the existing non-root enrollment']) {
+  assert.equal(evaluateOnboarding(wordingResponse("I'll upgrade Bloom.", enrollment), wordingContext).pass, true, enrollment);
+}
+for (const enrollment of ['use a replacement non-root account', 'create a new non-root enrollment']) {
+  const result = evaluateOnboarding(wordingResponse("I'll upgrade Bloom.", enrollment), wordingContext);
+  assert.equal(result.pass, false, enrollment);
+  assert.match(result.reason, /preserve existing enrollments/, enrollment);
+}
+
+// Review regressions: harmless context is not a request to stop or relogin.
+for (const sentence of [
+  'This does not require a fresh login.',
+  'I cannot install a second Machine.',
+  'a non-root session needs a fresh login; this dedicated path does not.',
+]) assert.equal(evaluateOnboarding(`${wordingBase}\n${sentence}`, wordingContext).pass, true, sentence);
+for (const sentence of [
+  'You need to log in again before I can continue.',
+  'The user must confirm before I start.',
+  'I cannot install Bloom.',
+  'Without pkexec I cannot finish the upgrade.',
+]) assert.equal(evaluateOnboarding(`${wordingBase}\n${sentence}`, wordingContext).pass, false, sentence);
+
+// The whole helper environment is a fixed contract, including session routing.
+for (const mutation of [
+  s => s.replace('env -i ', 'env '),
+  s => s.replace(' PATH=/usr/sbin:/usr/bin:/sbin:/bin', ''),
+  s => s.replace(' XDG_RUNTIME_DIR="/run/user/$login_uid"', ''),
+  s => s.replace(' DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$login_uid/bus"', ''),
+  s => s.replace('XDG_RUNTIME_DIR="/run/user/$login_uid"', 'XDG_RUNTIME_DIR="$(printf /run/user/1000)"'),
+  s => s.replace('DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$login_uid/bus"', 'DBUS_SESSION_BUS_ADDRESS="$(printf unix:path=/run/user/1000/bus)"'),
+  s => s.replace('XDG_RUNTIME_DIR="/run/user/$login_uid"', 'XDG_RUNTIME_DIR="/run/user/0"'),
+]) assert.equal(evaluateOnboarding(mutation(wordingBase), wordingContext).pass, false);
+// A later bad redefinition cannot hide behind an earlier approved helper.
+assert.equal(evaluateOnboarding(`${wordingBase}\nas_bloom() { echo "$@"; }`, wordingContext).pass, false);
+
+const readinessProbe = `${rootEnv} /bin/sh -c 'command -v bloom'`;
+assert.equal(evaluateOnboarding(`${wordingBase}\n${readinessProbe}`, wordingContext).pass, true);
+assert.equal(evaluateOnboarding(wordingBase.replace(argvSequence, `${readinessProbe}\n${argvSequence}`), wordingContext).pass, false);
+
+// Literal state restoration is permitted only after reviewing the captured file.
+const restoredSequence = argvSequence.replace(`as_bloom ${REVIEW_RUN_COMMAND}`, `review_dir='REVIEW_DIR'\nas_bloom ${REVIEW_RUN_COMMAND}`);
+assert.equal(evaluateOnboarding(wordingBase.replace(argvSequence, restoredSequence), wordingContext).pass, true);
+assert.equal(evaluateOnboarding(wordingBase.replace(argvSequence, restoredSequence.replace("review_dir='REVIEW_DIR'", "review_dir='/tmp/unreviewed'")), wordingContext).pass, false);
+
+// Root must continue directly, while staging and operating under a non-root
+// account. Printing the right command beside a user handoff is still a failure.
+for (const scenario of ['setup', 'upgrade']) {
+  const rootContext = { vars: { platform: 'linux-root', scenario } };
+  const account = scenario === 'setup'
+    ? 'I will create a dedicated non-root bloom account.'
+    : 'I will reuse the existing non-root account and preserve its enrollment.';
+  const readiness = 'I will refresh the dedicated systemd user manager for new group membership and verify VFS and audit readiness.';
+  const response = `I'll ${scenario === 'upgrade' ? 'upgrade' : 'install'} Bloom headlessly as root. ${account}
+${expandedSequence}
+I will run the privileged command directly; no credential is needed:
+${ROOT_HANDOFF_COMMAND}
+${readiness}
+${SCOPE_SENTENCE}`;
+  const success = evaluateOnboarding(response, rootContext);
+  assert.equal(success.pass, true, `${scenario}: ${success.reason}`);
+
+  for (const [name, bad] of [
+    ['sudo handoff', response.replace(ROOT_HANDOFF_COMMAND, SUDO_HANDOFF_COMMAND)],
+    ['pkexec despite root', response.replace(ROOT_HANDOFF_COMMAND, PKEXEC_HANDOFF_COMMAND)],
+    ['inherited root TMPDIR', response.replace(' TMPDIR=/tmp', '')],
+    ['root staging', response.replace(ROOT_REVIEW_RUN_COMMAND, REVIEW_RUN_COMMAND)],
+    ['UID zero', response.replace("'UID'", "'0'")],
+    ['changed verifier', response.replace('ssh-keygen -Y verify', 'ssh-keygen -Y sign')],
+    ['extra argument', response.replace(ROOT_HANDOFF_COMMAND, `${ROOT_HANDOFF_COMMAND} 'extra'`)],
+    ['no account selection', response.replace(account, '')],
+    ['no readiness checks', response.replace(readiness, '')],
+    ['user terminal', `${response}\nYou must run the privileged command on the Bloom host.`],
+    ['relogin handoff', `${response}\nThis requires a fresh login.`],
+    ['missing pkexec blocker', `${response}\nWithout pkexec I cannot finish the upgrade.`],
+  ]) {
+    const result = evaluateOnboarding(bad, rootContext);
+    assert.equal(result.pass, false, `${scenario}: ${name}`);
+  }
+
+  // Direct root execution is not an approved fallback for non-root platforms.
+  for (const platform of ['linux-sudo', 'linux-pkexec', 'macos']) {
+    assert.equal(evaluateOnboarding(response, { vars: { platform } }).pass, false, platform);
+  }
+}
 
 console.log(`onboarding assertion fixtures: ${cases} passed`);

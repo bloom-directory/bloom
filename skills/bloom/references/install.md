@@ -1,103 +1,153 @@
 # Install Bloom
 
-Read this entire reference only when a new Bloom installation is needed.
+For an explicit install, setup or upgrade request, read this reference in full.
+Upgrade through the same signed path, preserving the existing enrollment.
 
-## Setup: reviewed download and one privileged handoff
+## Setup and upgrade: reviewed download and privileged installation
 
-A request to set up Bloom authorizes installing the signed Bloom software,
-read-only chain access, and starting the components required for an active Bloom
-session. Bloom is a triad: Machine runs as the login user while Broker and Signer
-run as isolated service principals, under systemd on Linux and under launchd on
-macOS. Setup therefore authorizes enabling those packaged Bloom services, but it
-never authorizes the agent to handle a sudo password, a polkit credential, or a
-macOS administrator credential, or to broaden the reviewed privileged command.
+The request authorizes signed Bloom software, read-only chain access and its
+packaged services: Machine as the login user, Broker/Signer as isolated service
+principals (systemd on Linux, launchd on macOS). Root may also perform the
+account/session preparation and bounded provisioning retry below.
 
-Setup does not authorize creating or registering a wallet, starting a passkey
-ceremony, adding a passkey, recovering a wallet, staging/signing/broadcasting
-a transaction, or installing unrelated software. Those actions require a
-separate, explicit user request.
+Setup excludes wallet/passkey creation or registration, ceremonies, recovery,
+and transaction staging, signing and broadcasting. Unrelated software requires
+another explicit request. Never handle an OS credential or change the fixed
+privileged command.
 
-The reviewed setup script resolves GitHub's latest published stable Bloom release
-on every run, then uses that exact tag for all downloads and staging paths. Latest
-means GitHub's designated latest release, excluding drafts and prereleases; it
-does not mean the newest bare Git tag. All supported targets use signed triad
-artifacts:
+The reviewed script resolves GitHub's designated latest stable release once
+(no drafts/prereleases), then downloads only that tag. It verifies archive and
+payload signatures, SHA-256 manifests and platform claims before staging under
+`~/.cache/bloom/install`; it never elevates or executes the staged release.
+Never use `releases/latest/download`, substitute platforms, or fall back to an
+older/cached release. Discovery/download/verification failure means stop.
 
-| Target | Signed release artifact | Platform claim |
-| --- | --- | --- |
-| Linux x86_64 | `bloom-triad-linux-x86_64.tar.gz` | `linux` |
-| Linux aarch64 | `bloom-triad-linux-aarch64.tar.gz` | `linux` |
-| macOS arm64 | `bloom-triad-macos-aarch64.tar.gz` | `macos-unix-principals` |
+Artifacts/claims: Linux x86_64 uses `bloom-triad-linux-x86_64.tar.gz`, aarch64 uses
+`bloom-triad-linux-aarch64.tar.gz` (both `linux`); macOS arm64 uses
+`bloom-triad-macos-aarch64.tar.gz` (`macos-unix-principals`). Linux needs an active
+systemd user session; macOS needs an active GUI login and macOS 26+ for NFSv4.1.
+Stop on macOS x86_64 or any unsupported target. Windows users need a supported
+cloud agent (OpenClaw, Hermes or GrokBot), not a local install.
 
-The script verifies both the archive and internal payload signatures against
-Bloom's reviewed release key, verifies their SHA-256 manifests, checks the
-platform claim, and stages the payload below `~/.cache/bloom/install`. It does
-not execute the staged release or invoke sudo. Resolve `releases/latest` only once
-and keep every artifact download on the resolved tag; do not use moving
-`releases/latest/download` URLs or substitute one platform's artifact for the
-other. If discovery, download, or verification fails, stop and report the failure;
-never fall back to an older release or cached payload.
+Every target needs `/usr/bin/ssh-keygen`. Only Linux root may install missing
+prerequisites through its distro package manager: OpenSSH client, NFS client
+(`mount.nfs`: `nfs-common` on Debian/Ubuntu, `nfs-utils` on Fedora/RHEL), and
+`awk`, `cat`, `chmod`, `cmp`, `cp`, `curl`, `dirname`, `grep`, `id`, `mkdir`,
+`mktemp`, `mv`, `rm`, `tar`, `uname`, `getent`, `runuser`, `systemctl`,
+`systemd-sysusers`, `systemd-tmpfiles`. Require an existing systemd host; no init
+replacement or general upgrade. Other agents report missing prerequisites and
+stop without requesting a password.
 
-This setup script supports only the targets above. On macOS x86_64 or any other
-platform the script stops; report that instead of improvising an install.
-Linux also needs systemd with a user session, and every target needs
-`/usr/bin/ssh-keygen` to verify release signatures. If setup reports a missing
-command, tell the user which package provides it (OpenSSH's client for
-`ssh-keygen`) and stop; do not install packages yourself.
-Bloom requires macOS 26 or later: it mounts `~/bloom` over NFSv4.1, which
-earlier versions lack, and the privileged installer refuses an older macOS
-before changing anything. Report that the user must update macOS first.
-Windows is not supported. Do not attempt a local Windows installation.
-Instead, direct Windows users to use Bloom through a cloud agent
-running on a supported platform, such as OpenClaw, Hermes, or GrokBot.
+### Linux root/headless preparation
 
-Use this review-before-execute path instead of piping a remote response directly
-into a shell. When this skill is installed locally, copy its bundled
-`scripts/setup.sh` to `$review_dir/setup.sh` instead of downloading it, then inspect
-and execute that exact copy. Resolve the bundled path relative to the skill
-directory, not the current working directory.
+Check `id -u`. At UID 0, continue headlessly: missing pkexec/desktop/dialog is
+not a blocker. Root administers installation; staging, Machine, CLI and VFS use
+a non-root account. Never use `LOGIN_UID=0`.
 
-When the user supplies a specific `SKILL.md` URL, use the `scripts/setup.sh`
-beside that document; never silently replace a preview or custom origin with
-production.
-For a website-loaded skill, fetch the script as follows:
+Once root is known, give this note once in the next user-facing update, then
+continue without confirmation: "Bloom will use separate service accounts. This
+agent's existing root access can still bypass that isolation."
 
-For every setup or privileged handoff invocation, set the working directory to
-`/private/tmp` on macOS or `/tmp` on Linux. Never run from inside the Bloom mount:
-installation can restart it and invalidate the current working directory.
+For upgrades, select the account from public `/etc/bloom/enrollments/*.json`
+(`login_uid`, `login_user`), checking `id` and `getent passwd`. Reuse it; never
+replace the account/enrollment. Ask which account if ambiguous; no active
+enrollment blocks an upgrade. For fresh setup, use the user-specified account;
+if none and no enrollment exists, create a dedicated one:
 
 ```sh
-skill_url=${BLOOM_SKILL_URL:-https://bloom.directory/SKILL.md}
-setup_url=${skill_url%/SKILL.md}/scripts/setup.sh
-review_dir="$(mktemp -d "${TMPDIR:-/tmp}/bloom-review.XXXXXX")"
-curl -fsSL "$setup_url" -o "$review_dir/setup.sh"
+useradd --create-home --shell /bin/bash bloom
+```
+
+No password, SSH keys or sudo. Verify any existing `bloom` account is intended;
+never repurpose an unrelated account. Record its name, UID and home from
+`id`/`getent`. In **each root tool call**, prepend this initialization, replacing
+selected values with shell-quoted literals; append the step body in that same
+call. Repeat it for the next call: functions/variables are not shared.
+
+```sh
+set -eu
+login_user='SELECTED_USER'
+login_uid='SELECTED_UID'
+login_home='SELECTED_HOME'
+as_bloom() {
+  runuser -u "$login_user" -- env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME="$login_home" TMPDIR=/tmp USER="$login_user" LOGNAME="$login_user" XDG_RUNTIME_DIR="/run/user/$login_uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$login_uid/bus" "$@"
+}
+```
+
+Use `as_bloom` for review/staging/CLI/VFS. It clears root's environment, selects
+the user's bus and writable TMPDIR, and keeps sbin on PATH. Forward arguments
+separately; no `eval`. Never write the NFS mount as root, change mount/socket
+groups or permissions, or evaluate staging output as shell code.
+
+For a dedicated unattended account:
+
+```sh
+loginctl enable-linger "$login_user"
+systemctl start "user@$login_uid.service"
+```
+
+Wait up to 30 seconds for `/run/user/$login_uid/bus`; diagnose failure without
+asking for a human login. Shared accounts retain their session policy: require
+an active manager, do not enable linger or restart it.
+
+### Review before execution
+
+Work from `/tmp` on Linux or `/private/tmp` on macOS, never inside Bloom's mount.
+For local skills, copy bundled `scripts/setup.sh` (relative to the skill, not
+CWD) into the review directory instead of downloading. Website-loaded skills
+fetch production. Inspect that exact local copy before execution.
+
+Linux root: prepend initialization, then create/download as the account:
+
+```sh
+cd /tmp
+review_dir="$(as_bloom mktemp -d /tmp/bloom-review.XXXXXX)"
+as_bloom curl -fsSL https://bloom.directory/scripts/setup.sh -o "$review_dir/setup.sh"
 cat "$review_dir/setup.sh"
+printf 'BLOOM_REVIEW_DIR=%s\n' "$review_dir"
 ```
 
-Set `BLOOM_SKILL_URL` to the exact URL the user supplied when it is not the
-production URL. The setup script must come from the same origin and path
-prefix as that skill.
-
-Inspect the complete downloaded script before execution. It should contact only the
-Bloom repository's GitHub latest-release URL and the resolved release downloads,
-write only to a temporary directory and the reported
-user-owned staging directory, and perform no wallet, transaction, sudo, or
-service action. If it matches, run:
+Non-root Linux/macOS:
 
 ```sh
-sh "$review_dir/setup.sh"
-rm "$review_dir/setup.sh"
-rmdir "$review_dir"
+set -eu
+review_dir="$(mktemp -d "${TMPDIR:-/tmp}/bloom-review.XXXXXX")"
+curl -fsSL https://bloom.directory/scripts/setup.sh -o "$review_dir/setup.sh"
+cat "$review_dir/setup.sh"
+printf 'BLOOM_REVIEW_DIR=%s\n' "$review_dir"
 ```
 
-Stop and report if the fetch or verification fails or the script conflicts with
-those boundaries. Require a successful exit and capture the reported values
-without evaluating its output as shell code.
+Inspect the whole script. Require:
 
-Successful staging reports the target-specific mode plus the captured handoff
-values. On Linux x86_64 or aarch64,
-`BLOOM_INSTALL_MODE=triad-linux-systemd`; on macOS arm64,
-`BLOOM_INSTALL_MODE=triad-macos-launchd`:
+- Only Bloom's GitHub latest-release URL and resolved-tag downloads.
+- Writes only to temporary and reported user-owned staging directories.
+- No wallet, transaction, sudo or service action.
+
+Stop if it conflicts or fetching/verification fails. In a **separate call**, run
+the same reviewed file. Restore `REVIEW_DIR` from printed `BLOOM_REVIEW_DIR` as a
+shell-quoted literal; never create a replacement directory. Linux root repeats
+initialization before this body; cleanup runs only on successful staging:
+
+```sh
+cd /tmp
+review_dir='REVIEW_DIR'
+as_bloom sh "$review_dir/setup.sh" &&
+  as_bloom rm "$review_dir/setup.sh" &&
+  as_bloom rmdir "$review_dir"
+```
+
+Non-root Linux/macOS:
+
+```sh
+set -eu
+review_dir='REVIEW_DIR'
+sh "$review_dir/setup.sh" &&
+  rm "$review_dir/setup.sh" &&
+  rmdir "$review_dir"
+```
+
+Require success and capture output as data, never `eval`. Linux mode is
+`BLOOM_INSTALL_MODE=triad-linux-systemd`; macOS is `triad-macos-launchd`:
 
 ```text
 BLOOM_RELEASE_TAG=<resolved-tag>
@@ -106,62 +156,42 @@ BLOOM_LOGIN_UID=<decimal UID>
 BLOOM_LOGIN_USER=<login name>
 ```
 
-One privileged step remains. Root never runs files from the user-owned stage:
-the privileged command below copies the payload into a new root-owned
-directory, verifies the copy's signature with the release key written into the
-command, and only then runs the signed release installer from the copy. Every
-supported path runs this identical command; only who runs it and who asks for
-the credential differs.
+The fixed privileged step copies the user-owned stage to a new root-owned
+snapshot, verifies its signature/checksums with the command's release key, then
+executes the signed installer there. Root never executes from the user-owned
+stage. Keep the signed stage for reinstall/diagnosis.
 
-The command is fixed. Replace only the three placeholders `STAGE`, `UID`, and
-`USER` with the captured `BLOOM_STAGE`, `BLOOM_LOGIN_UID`, and
-`BLOOM_LOGIN_USER` values as shell-quoted literals:
-single-quote each value, replacing any embedded `'` with `'\''`. Shell
-variables are not available, because staging runs in a child process and its
-output must not be evaluated. Do not add arguments, add environment variables,
-change the root, or substitute a different stage.
+Replace **only** `STAGE`, `UID`, `USER` with captured `BLOOM_STAGE`,
+`BLOOM_LOGIN_UID`, `BLOOM_LOGIN_USER` as single-quoted literals (embedded `'`
+becomes `'\''`). No output evaluation, extra arguments/environment, changed
+root or alternate stage.
 
-| Target | Privileged path |
-| --- | --- |
-| macOS arm64 | the agent runs the command through `/usr/bin/osascript` |
-| Linux x86_64 or aarch64 with `pkexec` | the agent runs the command through `pkexec` |
-| Linux x86_64 or aarch64 without `pkexec` | the user runs the command under `sudo` |
+### Linux: root directly, otherwise pkexec or user-run sudo
 
-The credential belongs to the operating system and the user alone. Never
-request, read, relay, or receive a password. If the user cancels the dialog
-(pkexec exits `126`; osascript fails with `-128`), report the cancellation and
-stop rather than retrying through a different privileged path.
-
-### Linux: pkexec when installed, otherwise user-run sudo
-
-Check `command -v pkexec`. If it is installed, run the command yourself; the
-system authentication agent shows its own credential dialog:
+- **Already root:** run the command yourself, removing only leading `pkexec `.
+  Preserve the signed snapshot and non-root UID/user. No handoff or confirmation.
+- **Non-root with pkexec:** the agent runs it; the OS dialog takes the credential.
+  Nothing between `pkexec` and `/bin/sh` (no sudo/env/assignments/options).
 
 ```sh
 pkexec /bin/sh -c 'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); trap "rm -rf -- $s" EXIT; trap "exit 129" HUP INT TERM; cp -R "$1/bloom-triad" "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; if find "$s" -type l -o ! -type f ! -type d | grep -q .; then echo "Bloom stage contains a link or special file." >&2; exit 65; fi; k="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFY9na4hytUNsW+8LWu//HrX9TaPU7H7Vg0GRWcZM+uP"; printf "%s\n" "$k" > "$s/key.pub"; printf "bloom-release %s\n" "$k" > "$s/signers"; p="$s/bloom-triad"; /usr/bin/ssh-keygen -Y verify -f "$s/signers" -I bloom-release -n bloom-release-payload-v1 -s "$p/RELEASE_SIGNATURE" < "$p/SHA256SUMS" > /dev/null; cd "$p"; { sha256sum -c SHA256SUMS 2>/dev/null || shasum -a 256 -c SHA256SUMS; } > /dev/null; case $(uname -s) in Linux) i=linux;; Darwin) i=macos;; *) exit 65;; esac; BLOOM_RELEASE_PUBLIC_KEY="$s/key.pub" "$p/installer/release/install-$i.sh" install / "$2" "$3" "$p"' bloom-install 'STAGE' 'UID' 'USER'
 ```
 
-Nothing may sit between `pkexec` and `/bin/sh`: no `sudo`, `env`, variable
-assignments, or `pkexec` options. Do not fall back to sudo when the user
-cancels the dialog.
-
-If `pkexec` is not installed, or it exits `127` with no dialog shown (for
-example "No authentication agent found" over SSH), give the user the same command with `sudo` in
-place of `pkexec` to run in their terminal, values already substituted. For
-example, if staging reported these values:
+Without pkexec, or exit `127` with no dialog (e.g. no authentication agent), the
+user runs the same command with `sudo` instead. Substitute the actual staging
+values, not this example:
 
 ```sh
 sudo /bin/sh -c 'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); trap "rm -rf -- $s" EXIT; trap "exit 129" HUP INT TERM; cp -R "$1/bloom-triad" "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; if find "$s" -type l -o ! -type f ! -type d | grep -q .; then echo "Bloom stage contains a link or special file." >&2; exit 65; fi; k="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFY9na4hytUNsW+8LWu//HrX9TaPU7H7Vg0GRWcZM+uP"; printf "%s\n" "$k" > "$s/key.pub"; printf "bloom-release %s\n" "$k" > "$s/signers"; p="$s/bloom-triad"; /usr/bin/ssh-keygen -Y verify -f "$s/signers" -I bloom-release -n bloom-release-payload-v1 -s "$p/RELEASE_SIGNATURE" < "$p/SHA256SUMS" > /dev/null; cd "$p"; { sha256sum -c SHA256SUMS 2>/dev/null || shasum -a 256 -c SHA256SUMS; } > /dev/null; case $(uname -s) in Linux) i=linux;; Darwin) i=macos;; *) exit 65;; esac; BLOOM_RELEASE_PUBLIC_KEY="$s/key.pub" "$p/installer/release/install-$i.sh" install / "$2" "$3" "$p"' bloom-install '/home/lee/.cache/bloom/install/v1.2.3-linux-x86_64' '1000' 'lee'
 ```
 
-Use the actual captured values, not the example values. The user types their
-sudo password into their own terminal.
+The user enters the password in their terminal. Never request/read/relay it.
+If pkexec is cancelled (`126`), stop; no sudo fallback on cancellation.
 
 ### macOS: the agent runs osascript
 
-Run the command yourself through `/usr/bin/osascript`; macOS shows its own
-administrator dialog. Pass the fixed script and the three values as arguments so
-they stay out of the AppleScript source:
+The agent runs this; macOS presents its credential dialog. Pass the fixed script
+and three captured values as arguments, not AppleScript source:
 
 ```sh
 /usr/bin/osascript \
@@ -171,31 +201,55 @@ they stay out of the AppleScript source:
   'set -eu; s=$(mktemp -d /var/tmp/bloom-install.XXXXXX); trap "rm -rf -- $s" EXIT; trap "exit 129" HUP INT TERM; cp -R "$1/bloom-triad" "$s/"; chown -R 0:0 "$s"; chmod -R go-w "$s"; if find "$s" -type l -o ! -type f ! -type d | grep -q .; then echo "Bloom stage contains a link or special file." >&2; exit 65; fi; k="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFY9na4hytUNsW+8LWu//HrX9TaPU7H7Vg0GRWcZM+uP"; printf "%s\n" "$k" > "$s/key.pub"; printf "bloom-release %s\n" "$k" > "$s/signers"; p="$s/bloom-triad"; /usr/bin/ssh-keygen -Y verify -f "$s/signers" -I bloom-release -n bloom-release-payload-v1 -s "$p/RELEASE_SIGNATURE" < "$p/SHA256SUMS" > /dev/null; cd "$p"; { sha256sum -c SHA256SUMS 2>/dev/null || shasum -a 256 -c SHA256SUMS; } > /dev/null; case $(uname -s) in Linux) i=linux;; Darwin) i=macos;; *) exit 65;; esac; BLOOM_RELEASE_PUBLIC_KEY="$s/key.pub" "$p/installer/release/install-$i.sh" install / "$2" "$3" "$p"' 'STAGE' 'UID' 'USER'
 ```
 
-Never add a `user name` or `password` parameter to `do shell script`.
+Never add `user name` or `password`. Cancellation (`-128`) means stop, not an
+alternate privileged path. On either platform, require successful installation.
+Allow **at least
+15 minutes**; do not interrupt, time out or rerun while it runs.
 
-Require a successful privileged installer exit on either target. Keep the signed
-staging directory available for reinstall or diagnosis.
-
-The privileged step can run for several minutes. Besides installing the
-services, it prepares Bloom's hosted ceremony relay, which lets the human
-approve from another device such as a phone; DNS and certificate issuance can
-take a while, and on macOS the installer waits up to 10 minutes for it. Allow
-the command at least 15 minutes, and do not interrupt, time out, or rerun it
-while it runs. A relay that is not ready yet does not fail the install: approvals
-in a browser on this computer still work, and the installer prints a
-`sudo ... admin provision` retry command. Pass that command to the user; do not
-run it yourself or broaden the reviewed invocation to include it.
+Relay DNS/certificates may remain pending without failing local installation.
+On Linux root, refresh the session below and wait up to 30 seconds for selected
+Broker/Signer units to be active, then run the installer's exact installed
+`admin provision --login-uid UID` retry command without leading sudo, **once**.
+Inspect installed Signer `admin status --login-uid UID`, polling up to 10 minutes
+for effective remote mode, TLS and routing. Other agents hand the retry to the
+user. Leave explicit `localhost_only` and provisioning state intact. Report local
+and remote readiness separately; certificate-pending is not remote-ready.
 
 ### Linux post-install readiness
 
-On Linux, success includes `BLOOM_RELOGIN_REQUIRED`. `0` means an upgrade. `1`
-means the session may lack Bloom's access groups: it is printed for first
-installs and for reinstalls of the same release. Either way, run the checks
-below. If they fail after `1`, tell the user that Bloom was installed but needs
-a fresh login. Do not attempt a group workaround; resume after the login.
+`BLOOM_RELOGIN_REQUIRED=0` means upgrade; `1` means groups may be stale (first
+install or same-release reinstall). Run readiness either way; do not edit groups
+or socket permissions. Non-root failures after `1` may require the user's fresh
+login; root uses the dedicated-account procedure below instead.
 
-Once the session has the groups, the package starts Machine and mounts `~/bloom` through
-`bloom-machine.service`; the agent must not launch a second Machine. Require:
+For dedicated accounts only, root restarts the manager when the installer flag
+is `1`. Substitute its value for `RELOGIN_REQUIRED`, prepend initialization, and
+run outside that manager:
+
+```sh
+relogin_required='RELOGIN_REQUIRED'
+case "$relogin_required" in
+  1) systemctl restart "user@$login_uid.service" ;;
+  0) : ;;
+  *) printf '%s\n' 'Expected BLOOM_RELOGIN_REQUIRED=0 or 1.' >&2; exit 1 ;;
+esac
+```
+
+Wait up to 30 seconds for its bus. At flag `0`, restart only if readiness fails
+and stale groups are confirmed. Never restart a shared manager or unrelated
+sessions; report the blocker. Packaged Machine owns the mount; no second Machine
+or extra persistence beyond dedicated-account linger and packaged units.
+
+Linux root, with initialization prepended:
+
+```sh
+as_bloom systemctl --user start bloom-session.service bloom-machine.service
+as_bloom systemctl --user is-active bloom-session.service bloom-machine.service
+systemctl is-active "bloom-signer@$login_uid.service" "bloom-broker@$login_uid.service"
+as_bloom /bin/sh -c 'command -v bloom'
+```
+
+Non-root Linux:
 
 ```sh
 systemctl --user is-active bloom-session.service bloom-machine.service
@@ -203,19 +257,13 @@ systemctl is-active "bloom-signer@$(id -u).service" "bloom-broker@$(id -u).servi
 command -v bloom
 ```
 
-For a failed unit, capture `systemctl status` and `journalctl` diagnostics rather
-than declaring readiness. The packaged Linux mount is the only persistence this
-setup authorizes; do not create additional systemd, launchd, cron, shell-profile
-auto-start, or restart configuration.
+For failed units, collect systemctl status/journalctl diagnostics, not a readiness
+claim. Do not add systemd/cron/shell-profile auto-start or restart configuration.
 
 ### macOS post-install readiness
 
-On macOS, an active GUI login session is required and validated by the privileged
-installer. The installer bootstraps the packaged launchd Machine and session
-services in the user domain, and Broker and Signer in the system domain. Do not
-launch a second Machine or create extra LaunchAgents/LaunchDaemons. Require the
-installed CLI and the following user-domain and system-domain labels for the
-captured login UID to be loaded before declaring readiness:
+The installer validates the active GUI session and bootstraps Machine/session
+in the user domain, Broker/Signer in the system domain. Require CLI and labels:
 
 ```sh
 command -v bloom
@@ -225,17 +273,23 @@ launchctl print "system/com.bloom.broker.$(id -u)"
 launchctl print "system/com.bloom.signer.$(id -u)"
 ```
 
-If any check fails, capture `launchctl print` diagnostics for that label. The
-packaged launchd triad owns its own lifecycle; do not add auto-start or restart
-configuration beyond it.
+On failure, collect `launchctl print` diagnostics. No second Machine or additional
+LaunchAgents/LaunchDaemons; packaged services own their lifecycle.
 
 ## Mounted VFS and audit readiness
 
-On either supported target, require the service checks above, both VFS reads,
-and audit health before reporting Bloom fully ready. Use the mounted reads below
-when available. If native mounting is unavailable, run `bloom vfs cat /AGENTS.md`
-and `bloom vfs cat /status/daemon.json` instead; a working CLI VFS connection
-does not require the human to repair the mount first:
+Require service checks, both VFS reads and audit health. Root prepends
+initialization and uses the selected home (caller `$HOME`/`$(id -u)` are root):
+
+```sh
+as_bloom cat "$login_home/bloom/AGENTS.md"
+as_bloom cat "$login_home/bloom/status/daemon.json"
+as_bloom bloom audit status
+```
+
+If the mount is unavailable, root uses `as_bloom bloom vfs cat /AGENTS.md` and
+`as_bloom bloom vfs cat /status/daemon.json`; a working CLI needs no human mount
+repair. Non-root Linux/macOS use mounted reads or the same CLI fallbacks:
 
 ```sh
 BLOOM_MOUNT=${BLOOM_MOUNT:-"$HOME/bloom"}
@@ -245,8 +299,7 @@ cat "$BLOOM_MOUNT/status/daemon.json"
 bloom audit status
 ```
 
-Require `mutation_degradation: null` for readiness. Poll startup effects for up to 30 seconds.
-Once idle, allow one restart of the existing packaged Machine as a workaround, not a root-cause fix.
-Recheck audit health/startup completion; continue only if healthy, otherwise report the blocker and stop.
-An empty mount directory is not a successful mount. Wallet onboarding and
-transaction actions remain outside this setup scope even while Bloom is running.
+Require `mutation_degradation: null`. Poll startup effects up to 30 seconds.
+Once idle, allow one restart of the packaged Machine, then recheck; otherwise
+report the blocker and stop. An empty mount is not success. Wallet/passkey and
+transaction actions remain outside setup.

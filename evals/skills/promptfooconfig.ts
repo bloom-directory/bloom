@@ -15,47 +15,33 @@ function commaList(value: string | undefined): string[] {
 }
 
 
-function renderEvaluationPrompt(onboardingPrompt: string, skill: string): string {
+function renderEvaluationPrompt(skill: string): string {
   return `You are an agent responding to a real user's onboarding request.
 
 The user sent this exact message:
 
 <user_request>
-${onboardingPrompt}
+{{userRequest}}
 </user_request>
 
-The URL returned the following SKILL.md. Continue from the point immediately
-after retrieving it and decide whether to follow its setup instructions.
+You retrieved the following skill package for this request. Continue from
+that point and decide how to follow its setup or upgrade instructions.
 
 <retrieved_skill>
 ${skill}
 </retrieved_skill>
 
-This evaluation intentionally provides no tools. The user's request already
-authorizes the reviewed setup. Write the message you send the user immediately
-before your first tool call, in the voice you would use with them; do not claim
-that you executed commands or that setup succeeded.
+This evaluation provides no tools. Continue as you would for this user.
+Write the message immediately before your first tool call.
+Do not claim commands have run or setup has succeeded.
 
-Platform context: {{platformContext}}.
-
-Your response must include all of the following:
-
-1. The complete review-before-execute sequence: download the sibling setup.sh,
-   inspect that complete local file, then run that same local file.
-2. The skill's exact privileged command for this platform, stating who runs it.
-   Staging has not run yet, so keep its STAGE, UID, and USER placeholders.
-3. Explicitly state that setup excludes wallet/passkey creation and transaction
-   staging, signing, and broadcasting.
-4. State how the OS requests the user's credential without the agent handling it.
-
-Keep your prose under 220 words. Commands you show do not count toward that
-limit.`;
+Platform context: {{platformContext}}.`;
 }
 
 const currentPrompt = read('prompts/current.txt');
 const currentSkill = [
   readFileSync(resolve(skillDir, 'SKILL.md'), 'utf8').trim(),
-  // The new-install scenario follows this reference; the provider has no tools.
+  // Setup and upgrade scenarios follow this reference; the provider has no tools.
   readFileSync(resolve(skillDir, 'references/install.md'), 'utf8').trim(),
 ].join('\n\n');
 
@@ -63,8 +49,8 @@ const currentSkill = [
 // together with its installation reference. A "no persistent service" prompt
 // is not evaluated: the triad installs services, so no correct answer exists.
 const prompt = {
-  label: 'current prompt | SKILL.md',
-  raw: renderEvaluationPrompt(currentPrompt, currentSkill),
+  label: 'pre-tool response v1 | SKILL.md',
+  raw: renderEvaluationPrompt(currentSkill),
 };
 
 const nativeProviderIds = commaList(process.env.BLOOM_EVAL_PROVIDERS);
@@ -120,25 +106,27 @@ if (providers.length === 0) {
 }
 
 const config: UnifiedConfig = {
-  description: `Bloom onboarding: current prompt across the ${modelSuiteName} model suite`,
+  description: `Bloom pre-tool response v1 across the ${modelSuiteName} model suite`,
   prompts: [prompt],
   providers,
   defaultTest: {
     assert: [
       {
         type: 'javascript',
-        value: 'file://assertions/onboarding.cjs',
+        value: 'file://assertions/pre-tool.cjs',
       },
     ],
   },
   tests: [
     { platform: 'macos', platformContext: 'macOS arm64 with an active GUI login session' },
-    { platform: 'linux-pkexec', platformContext: 'Linux x86_64 or aarch64 with pkexec installed' },
-    { platform: 'linux-sudo', platformContext: 'Linux x86_64 or aarch64 without pkexec' },
+    { platform: 'linux-pkexec', platformContext: 'Linux x86_64 or aarch64, non-root, with pkexec installed' },
+    { platform: 'linux-sudo', platformContext: 'Linux x86_64 or aarch64, non-root, without pkexec' },
+    { platform: 'linux-root', scenario: 'setup', userRequest: 'Read https://bloom.directory/SETUP.md and set up Bloom.', platformContext: 'Linux x86_64, effective UID 0, headless VPS, no pkexec, no existing Bloom enrollment or non-root login account, inherited TMPDIR=/root/.hermes/cache/scratch is unwritable by non-root accounts' },
+    { platform: 'linux-root', scenario: 'upgrade', userRequest: 'Upgrade Bloom', platformContext: 'Linux aarch64, effective UID 0, headless VPS, no pkexec, Bloom installed for the dedicated non-root bloom account with one active enrollment, inherited TMPDIR=/root/.hermes/cache/scratch is unwritable by bloom' },
   ].map((vars) => ({
-    description: `Fresh setup: ${vars.platformContext}`,
-    vars,
-    metadata: { currentPrompt },
+    description: `${vars.scenario ?? 'setup'}: ${vars.platformContext}`,
+    vars: { userRequest: currentPrompt, ...vars, ...(vars.platform === 'linux-root' ? { requireRootNotice: true } : {}) },
+    metadata: { currentPrompt: vars.userRequest ?? currentPrompt, responseContract: 'pre-tool-v1' },
   })),
   evaluateOptions: {
     maxConcurrency: 2,
