@@ -47,16 +47,43 @@ Hermes users can also install the package directly:
 hermes skills install bloom-directory/bloom/skills/bloom
 ```
 
+## Claude Code
+
+`skills/bloom/` is also a Claude Code plugin: `.claude-plugin/plugin.json`
+makes the folder a plugin whose root `SKILL.md` loads as the `bloom:bloom`
+skill, and its `README.md` is the directory listing. The repository's
+`.claude-plugin/marketplace.json` lists it, so users can install it before the
+directory lists it:
+
+```sh
+/plugin install bloom --marketplace bloom-directory/bloom
+```
+
+Check both after changing the folder:
+
+```sh
+claude plugin validate ./skills/bloom
+claude plugin validate .
+```
+
+Anthropic's plugin directory follows the default branch from the developer
+portal (<https://claude.ai/directory/manage>, plugin path `skills/bloom`). A
+merged change that passes its scan is published; a held or failed version
+keeps the previous one live. The Propose Release workflow sets the plugin's
+`version` with the skill's.
+
 ## ClawHub
 
-Publish this same folder, not the website output or the repository root. A human
-signs in to ClawHub with the GitHub identity that should own the listing:
+Publish this folder from the release tag, without `.claude-plugin/`: ClawHub
+refuses a folder with a plugin manifest as a skill. A human signs in to ClawHub
+with the GitHub identity that should own the listing:
 
 ```sh
 npx clawhub login
 npx clawhub whoami
-git checkout vX.Y.Z
-npx clawhub skill publish ./skills/bloom --slug bloom --name "Bloom" --owner bloom-directory --version X.Y.Z --changelog "Bloom vX.Y.Z" --dry-run
+stage="$(mktemp -d)"
+git archive vX.Y.Z skills/bloom ':(exclude)skills/bloom/.claude-plugin' | tar -x -C "$stage"
+npx clawhub skill publish "$stage/skills/bloom" --slug bloom --name "Bloom" --owner bloom-directory --version X.Y.Z --changelog "Bloom vX.Y.Z" --dry-run
 ```
 
 The listing is <https://clawhub.ai/bloom-directory/skills/bloom>, owned by the

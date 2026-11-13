@@ -12,7 +12,8 @@ and the workflow and release driver checked into the commit being released.
    does not enforce monotonicity. Update the workspace version in
    `Cargo.toml`, workspace package records in `Cargo.lock`, the Machine
    version in `packaging/triad/release/compatibility-v1.toml`, and the skill's
-   `metadata.version` in `skills/bloom/SKILL.md`. The optional
+   `metadata.version` in `skills/bloom/SKILL.md`, and `version` in
+   `skills/bloom/.claude-plugin/plugin.json`. The optional
    **Propose Release** workflow creates this PR; it never tags or publishes.
    Keep reviewed source and Petal pins unless a separate change validates them.
 2. Require normal PR CI and acceptance evidence appropriate to the changes.
