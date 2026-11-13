@@ -17,7 +17,7 @@ use url::Url;
 const TRUSTED_GITHUB_OWNER: &str = "bloom-directory";
 // Retain a bounded diagnostic tail for reconciliation after streamed output.
 const SOURCE_BUILD_STREAM_LIMIT: usize = 256 * 1024;
-const NEAR_INTENTS_RELEASE_COMMIT: &str = "b847d31373cbc847f6ccddb1175a44c5aa0d263d";
+const NEAR_INTENTS_RELEASE_COMMIT: &str = "5807812e6e71dbf12f24690bbdae23da0e76dfc4";
 const ENSO_RELEASE_COMMIT: &str = "7b4039f7943011d6af7adfc5c8ac151ddcf88392";
 
 /// Canonical defaults for every Bloom home, independent of persisted config.
@@ -446,6 +446,15 @@ pub(crate) fn release_lineage_predecessors(name: &str) -> &'static [ReleaseLinea
             ],
             authority_routes: &[],
         },
+        ReleaseLineagePredecessor {
+            hash: "80f26b1b6c4eda85f2870e2baac9f6366f1f35e861ebb855bf234550e591ad21",
+            release_sequence: 3,
+            predecessor_package_hashes: &[
+                "ac2ccab59f36ee863843f92aaf0c975c00dbf32b246df5ccbb79757093785921",
+                "a498727c1e9ba6f4385ca7514c2ef59236b6234b234b6e1920cb21358ea3b057",
+            ],
+            authority_routes: &[],
+        },
     ];
     const FEEDBACK: &[ReleaseLineagePredecessor] = &[baseline(
         "5f26e7bbf7f507cfcf4c13645cf9f4f0c903d769c201e3e9d1f5c914b14fa2a3",
@@ -518,18 +527,19 @@ const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
     name: "near-intents",
     repository: "https://github.com/bloom-directory/bloom-petal-near",
     commit: NEAR_INTENTS_RELEASE_COMMIT,
-    release_tag: "v0.1.5",
-    archive: "near-intents-v0.1.5.petal.tar.gz",
-    expected_hash: Some("80f26b1b6c4eda85f2870e2baac9f6366f1f35e861ebb855bf234550e591ad21"),
-    archive_sha256: "a6327a2738f4c9967c33bbebd25337fa924736e41f22299c812de540c59b3d4a",
+    release_tag: "v0.1.6",
+    archive: "near-intents-v0.1.6.petal.tar.gz",
+    expected_hash: Some("2d3bb36060784dc6452fccfde3ada2ed0d413814cc8380422f4142114e48a065"),
+    archive_sha256: "809daa030ccc7770c9a9918f91100595659623dbb2b60aebb352257727c30f58",
     tooling_commit: "2beed2ff344ce2b0c112e07096027e1ae0404007",
     petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
     default_eligible: true,
     lineage_id: None,
-    release_sequence: 3,
+    release_sequence: 4,
     predecessor_package_hashes: &[
         "ac2ccab59f36ee863843f92aaf0c975c00dbf32b246df5ccbb79757093785921",
         "a498727c1e9ba6f4385ca7514c2ef59236b6234b234b6e1920cb21358ea3b057",
+        "80f26b1b6c4eda85f2870e2baac9f6366f1f35e861ebb855bf234550e591ad21",
     ],
     authority_routes: &[],
 };
@@ -2252,9 +2262,9 @@ mod tests {
     #[test]
     fn built_in_entries_are_immutable_and_incompatible_petals_are_absent() {
         let near = preinstalled_petal("near-intents").unwrap();
-        assert_eq!(near.release_tag, "v0.1.5");
+        assert_eq!(near.release_tag, "v0.1.6");
         assert_eq!(near.commit.len(), 40);
-        assert_eq!(near.archive, "near-intents-v0.1.5.petal.tar.gz");
+        assert_eq!(near.archive, "near-intents-v0.1.6.petal.tar.gz");
         assert!(near.repository.ends_with("/bloom-petal-near"));
         let enso = preinstalled_petal("enso").unwrap();
         assert_eq!(enso.release_tag, "v0.1.7");
