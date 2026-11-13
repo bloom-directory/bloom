@@ -1,7 +1,7 @@
 schema = "bloom.triad-compatibility/1"
 
 [revisions]
-broker_commit = "d8bdcddf01f8d3a088299b6b30393ddbee934c2f"
+broker_commit = "94c422210e0ec374d461d500ff849e16d40cf30b"
 signer_commit = "7b8e848e0657075e94ef0cffb86b5844bc07a1c7"
 service_runtime_commit = "48b83c54c1787b4aff2456bd3adbe18856902e45"
 petal_contract_commit = "7dd2722db5de305dd63ca4ed03591f3ab82fa40b"
