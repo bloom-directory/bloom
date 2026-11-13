@@ -4582,8 +4582,8 @@ impl Daemon {
         // handler that needs to attribute revert returndata. Builtin
         // decoders (Solidity Error/Panic) are always installed; the
         // Etherscan-driven ABI decoder is layered on top when an
-        // Etherscan client is configured. Stages 4 and 5 (Openchain,
-        // Heimdall) plug in by appending more decoders here.
+        // Etherscan client is configured; the Openchain selector lookup
+        // runs last.
         let mut decoder_chain = DecoderChain::new().with(boxed(BuiltinDecoder));
         debug!("revert.decoder.builtin_pushed");
         if let Some(es) = etherscan_arc.clone() {
@@ -4595,20 +4595,6 @@ impl Daemon {
         }
         decoder_chain = decoder_chain.with(boxed(OpenchainDecoder::default()));
         debug!("revert.decoder.openchain_pushed");
-        #[cfg(feature = "bytecode-decompile")]
-        {
-            let bytecode_source: Arc<dyn bloom_revert::BytecodeSource> = Arc::new(
-                bloom_revert::ChainRegistryBytecodeSource::new(chains.clone()),
-            );
-            let cache_dir = home.cache_dir().join("heimdall");
-            decoder_chain = decoder_chain.with(boxed(
-                bloom_revert::HeimdallDecompileDecoder::new(bytecode_source)
-                    .with_cache_dir(cache_dir),
-            ));
-            debug!(cache_dir = %home.cache_dir().join("heimdall").display(), "revert.decoder.heimdall_pushed");
-        }
-        #[cfg(not(feature = "bytecode-decompile"))]
-        debug!("revert.decoder.heimdall_skipped: feature 'bytecode-decompile' off");
         let decoder_chain = Arc::new(decoder_chain);
 
         // Seed initial mempool backend statuses from the handlers we just
@@ -5067,7 +5053,6 @@ impl Daemon {
             chains = ?config.chains.keys().collect::<Vec<_>>(),
             etherscan = etherscan_arc.is_some(),
             ens_resolver = ens_client.is_some(),
-            heimdall = cfg!(feature = "bytecode-decompile"),
             "daemon.built"
         );
 

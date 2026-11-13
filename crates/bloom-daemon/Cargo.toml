@@ -14,10 +14,6 @@ default = ["mount"]
 # in the embednfs server. Portable builds can opt out with
 # `--no-default-features`.
 mount = ["bloom-mount/mount"]
-# Forward to bloom-revert/bytecode-decompile: appends the heimdall-rs
-# decompile fallback to the revert-decoder chain. Heavy build (heimdall
-# pulls a lot of git deps) so opt-in only.
-bytecode-decompile = ["bloom-revert/bytecode-decompile"]
 # Explicitly nonproduction constructor seam for external developer harnesses.
 # Release packaging must not enable this feature.
 unsigned-audit-test-seam = []

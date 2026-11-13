@@ -14,9 +14,6 @@ default = ["mount"]
 # Enable the embedded NFS mount adapter through the daemon crate. This remains
 # a named feature so portable builds can opt out with `--no-default-features`.
 mount = ["bloom-daemon/mount", "dep:bloom-mount"]
-# Pass-through for the heimdall-rs decompile decoder. Build with
-# `cargo build --features bytecode-decompile` to enable.
-bytecode-decompile = ["bloom-daemon/bytecode-decompile"]
 # Out-of-process same-UID integration bootstrap. It adds no custody or signing
 # implementation to Machine and is excluded from release bundles.
 triad-dev-harness = [
