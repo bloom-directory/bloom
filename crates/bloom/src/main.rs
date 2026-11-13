@@ -9,6 +9,7 @@
 mod commands {
     pub mod qr;
 }
+mod default_policy;
 mod deploy;
 mod github_source;
 mod macos_runtime;
@@ -1286,6 +1287,12 @@ fn machine_command_event_fields(
             Some(operation_id.clone()),
             MachineCommandEventClass::DurableMutation,
         ),
+        MachineCommand::WalletDefaultPolicy { .. } => {
+            ("default_policy", None, MachineCommandEventClass::Prepared)
+        }
+        MachineCommand::WalletPersona { .. } => {
+            ("wallet_persona", None, MachineCommandEventClass::Prepared)
+        }
         MachineCommand::WalletOutboxCancel { id, .. } => (
             "wallet_outbox_cancel",
             Some(id.clone()),
@@ -1781,6 +1788,48 @@ async fn execute_machine_command(
         }
         MachineCommand::WalletPolicyCommit { operation_id } => {
             commit_policy_update(home, machine_broker()?, operation_id).await?
+        }
+        MachineCommand::WalletDefaultPolicy {
+            name,
+            owner_just_chose,
+            observe_only,
+        } => {
+            validate_wallet_name(&name).map_err(|error| {
+                machine_error(
+                    MachineErrorKind::InvalidParams,
+                    format!("wallet name must be a safe single path segment: {error:#}"),
+                )
+            })?;
+            let status = default_policy::advance_default_policy(
+                daemon,
+                &name,
+                default_policy::DefaultPolicyMode::of_command(owner_just_chose, observe_only),
+            )
+            .await?;
+            format!("{}\n", serde_json::to_string(&status)?)
+        }
+        MachineCommand::WalletPersona {
+            name,
+            persona,
+            petals,
+        } => {
+            validate_wallet_name(&name).map_err(|error| {
+                machine_error(
+                    MachineErrorKind::InvalidParams,
+                    format!("wallet name must be a safe single path segment: {error:#}"),
+                )
+            })?;
+            let (notes, status) =
+                default_policy::switch_persona(daemon, &name, persona, petals).await?;
+            // Notes first, one per line; the status is the last line.
+            let mut text = String::new();
+            for note in notes {
+                text.push_str(&note);
+                text.push('\n');
+            }
+            text.push_str(&serde_json::to_string(&status)?);
+            text.push('\n');
+            text
         }
         MachineCommand::WalletOutboxCancel {
             wallet,
@@ -2693,12 +2742,24 @@ enum Cmd {
     Update(UpdateCmd),
     /// Initialise ~/.bloom with default config + dirs.
     Init {
+        /// Persona for the main wallet's default policy; saving it grants nothing.
+        #[arg(long, value_parser = persona_cli_values())]
+        persona: Option<String>,
         #[command(subcommand)]
         internal: Option<InitInternal>,
     },
 
     /// Print a shell completion script.
     Completions { shell: Shell },
+}
+
+fn persona_cli_values() -> clap::builder::PossibleValuesParser {
+    use clap::builder::PossibleValue;
+    clap::builder::PossibleValuesParser::new([
+        PossibleValue::new("institutional").alias("custodian"),
+        PossibleValue::new("trader"),
+        PossibleValue::new("degen"),
+    ])
 }
 
 #[derive(Subcommand, Debug)]
@@ -2911,6 +2972,17 @@ enum WalletCmd {
         /// Use the canonical localhost ceremony surface.
         #[arg(long)]
         local: bool,
+    },
+    /// Approve the default policy for a wallet: one policy ceremony that allows
+    /// the Petals chosen during setup. `new` and `import` run it for `main`.
+    DefaultPolicy { name: String },
+    /// Choose or switch a wallet's persona: a fresh start for that wallet.
+    /// Choose its Petals again, reset their limits to the persona's, and
+    /// approve one ceremony that replaces the wallet's policy.
+    Persona {
+        name: String,
+        #[arg(value_parser = persona_cli_values())]
+        persona: String,
     },
     /// Convert a staged v1 passkey wallet into Signer-owned Triad custody.
     /// The receipt contains public binding data only; Machine never opens the
@@ -3574,6 +3646,10 @@ async fn machine_command(
 
 async fn call_machine_command(endpoint: &ResolvedEndpoint, command: MachineCommand) -> Result<()> {
     let output = machine_command(endpoint, command).await?;
+    print_machine_command_output(&output)
+}
+
+fn print_machine_command_output(output: &MachineCommandOutput) -> Result<()> {
     std::io::Write::write_all(&mut std::io::stdout(), output.stdout.as_bytes())?;
     std::io::Write::write_all(&mut std::io::stderr(), output.stderr.as_bytes())?;
     if output.exit_code != 0 {
@@ -3713,7 +3789,7 @@ async fn run(cli: Cli) -> Result<()> {
     }
 
     match cli.cmd.context("a command is required")? {
-        Cmd::Init { internal } => {
+        Cmd::Init { persona, internal } => {
             if let Some(internal) = internal {
                 return match internal {
                     #[cfg(feature = "triad-dev-harness")]
@@ -3814,13 +3890,96 @@ async fn run(cli: Cli) -> Result<()> {
             if !structured_service_output() {
                 eprintln!("{ALPHA_DISCLOSURE}");
             }
-            let (_home_permit, d) = build_write_daemon(home.clone()).context("init daemon")?;
+            let (_home_permit, mut d) = build_write_daemon(home.clone()).context("init daemon")?;
+            // Building the daemon writes a default config when none exists, and
+            // `bloom serve` does the same, so the file's presence says nothing
+            // about setup. The marker is saved only together with the choices.
+            let first_setup = !d.config.setup.complete;
+            let requested_persona = persona
+                .as_deref()
+                .map(str::parse::<bloom_proto::persona::PersonaPreset>)
+                .transpose()
+                .map_err(anyhow::Error::msg)?;
+            let any_recipient_chains = default_policy::any_recipient_chain_names(&d.config.chains);
+            // At first setup `--persona` chooses main's persona without asking.
+            // Afterwards a switch is a fresh start for the wallet, which
+            // Machine makes while it runs, so this changes nothing and says how.
+            if first_setup {
+                let main = d.config.setup.main_mut();
+                default_policy::select_persona(&mut main.persona, requested_persona)?;
+                if requested_persona.is_none() && main.persona.is_none() {
+                    if !structured_service_output() && default_policy::interactive_setup_available()
+                    {
+                        default_policy::run_persona_menu(
+                            &mut main.persona,
+                            &any_recipient_chains,
+                            &mut std::io::stdin().lock(),
+                            &mut std::io::stdout(),
+                        )?;
+                    } else {
+                        main.persona = Some(bloom_proto::persona::PersonaConfig::default());
+                    }
+                }
+            } else if let Some(preset) = requested_persona {
+                println!(
+                    "{}",
+                    default_policy::persona_switch_note(
+                        bloom_proto::config::DEFAULT_POLICY_WALLET,
+                        preset
+                    )
+                );
+            }
+            let owners_before = default_policy::petal_owners(&d)?;
+            if first_setup {
+                let persona = d.config.setup.main().persona.clone();
+                if !structured_service_output() && default_policy::interactive_setup_available() {
+                    default_policy::run_setup_menu(
+                        d.config.setup.main_mut(),
+                        persona.as_ref(),
+                        &mut std::io::stdin().lock(),
+                        &mut std::io::stdout(),
+                    )?;
+                } else {
+                    default_policy::accept_setup_suggestions(
+                        d.config.setup.main_mut(),
+                        persona.as_ref(),
+                    );
+                }
+                // Queue the settings this run will write before anything is
+                // installed, so a run that stops part-way still writes them later.
+                default_policy::record_pending_setup_settings(&d, &owners_before)
+                    .await
+                    .context("queue the chosen Petal settings")?;
+                d.config.setup.complete = true;
+                d.config
+                    .save(&d.home.config_path())
+                    .context("save setup choices")?;
+            } else if d.config.holds_legacy_setup_keys() {
+                // An earlier build kept setup's choices under `[petals]`,
+                // where a Bloom release refuses them; move them to `[setup]`.
+                d.config
+                    .save(&d.home.config_path())
+                    .context("move setup choices to [setup]")?;
+            }
             let preinstalled = github_source::ensure_preinstalled_petals(&home, &d)
                 .context("provision canonical pre-installed Petals")?;
+            for message in default_policy::apply_setup_settings(&d, &owners_before, first_setup)
+                .await
+                .context("write Petal settings chosen during setup")?
+            {
+                println!("{message}");
+            }
             println!("home: {}", d.home.root().display());
             println!("config: {}", d.home.config_path().display());
             println!("chains: {:?}", d.chains.list_names());
             println!("preinstalled_petals: {preinstalled:?}");
+            println!(
+                "{}",
+                default_policy::persona_message(
+                    d.config.setup.main().persona.as_ref(),
+                    &any_recipient_chains
+                )
+            );
             println!("next: bloom wallet new main");
             println!("then: bloom wallet address main --qr");
             println!("packaged Linux mount: systemctl --user status bloom-machine.service");
@@ -4007,13 +4166,11 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Wallet(WalletCmd::New { name, local }) => {
-            call_machine_command(
+            default_policy::create_wallet_then_default_policy(
                 &client_endpoint,
-                MachineCommand::WalletCustody {
-                    name,
-                    kind: MachineCustodyKind::New,
-                    local,
-                },
+                name,
+                MachineCustodyKind::New,
+                local,
             )
             .await
         }
@@ -4022,13 +4179,32 @@ async fn run(cli: Cli) -> Result<()> {
             raw_private_key,
             local,
         }) => {
-            call_machine_command(
+            default_policy::create_wallet_then_default_policy(
                 &client_endpoint,
-                MachineCommand::WalletCustody {
-                    name,
-                    kind: wallet_import_kind(raw_private_key),
-                    local,
-                },
+                name,
+                wallet_import_kind(raw_private_key),
+                local,
+            )
+            .await
+        }
+        Cmd::Wallet(WalletCmd::Persona { name, persona }) => {
+            validate_wallet_name(&name)?;
+            let preset = persona
+                .parse::<bloom_proto::persona::PersonaPreset>()
+                .map_err(anyhow::Error::msg)?;
+            // Only to name the chains Degen opens; Machine reads its own copy.
+            let chains = bloom_proto::Config::load(&home.config_path())
+                .map(|config| config.chains)
+                .unwrap_or_default();
+            default_policy::run_persona_switch(&client_endpoint, &chains, &name, preset).await
+        }
+        Cmd::Wallet(WalletCmd::DefaultPolicy { name }) => {
+            // Wait out a policy lock another command holds; a ceremony this
+            // command opens extends the deadline to its own expiry.
+            default_policy::wait_for_default_policy(
+                &client_endpoint,
+                &name,
+                current_unix_ms().saturating_add(default_policy::POLICY_LOCK_GRACE_MS),
             )
             .await
         }
@@ -4571,15 +4747,34 @@ async fn run(cli: Cli) -> Result<()> {
             let provisioning_context = server.petal_operation_context();
             let provisioning = Arc::new(std::sync::Mutex::new(None));
             let ready_provisioning = provisioning.clone();
+            let settings_retry = Arc::new(std::sync::Mutex::new(None));
+            let ready_settings_retry = settings_retry.clone();
             let ready_context = provisioning_context.clone();
             let ready_daemon = d.clone();
             let server = server.with_ready_callback(Arc::new(move || {
                 emit_machine_ready();
                 let daemon = ready_daemon.clone();
                 let context = ready_context.clone();
+                // Queued setup writes and approved persona switches, stopped
+                // together at shutdown.
+                let switches = daemon.clone();
+                let settings = daemon.clone();
+                *ready_settings_retry.lock().expect("settings retry handle") =
+                    Some(tokio::spawn(async move {
+                        tokio::join!(
+                            default_policy::retry_queued_settings(settings),
+                            default_policy::apply_approved_switches(switches),
+                        );
+                    }));
                 *ready_provisioning.lock().expect("provisioning handle") =
                     Some(tokio::task::spawn_blocking(move || {
-                        petal_provisioning::provision(&daemon, &context)
+                        // Machine is already serving, so a Petal's code can be
+                        // running when its update would activate, and a
+                        // download can fail. Those installs are tried again
+                        // rather than left out.
+                        petal_provisioning::provision_and_retry(&daemon, &context, |results| {
+                            default_policy::apply_provisioned_settings(&daemon, results);
+                        })
                     }));
             }));
             // Start audited and durable background effects only after every
@@ -4618,6 +4813,9 @@ async fn run(cli: Cli) -> Result<()> {
                 .await
                 .context("ipc serve");
             shutdown.abort();
+            if let Some(retry) = settings_retry.lock().expect("settings retry handle").take() {
+                retry.abort();
+            }
             provisioning_context.cancel();
             let provisioning_task = provisioning.lock().expect("provisioning handle").take();
             if let Some(task) = provisioning_task
@@ -6023,6 +6221,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `bloom wallet persona` names a wallet and one of the three personas,
+    /// Institutional also by its stored name.
+    #[test]
+    fn wallet_persona_takes_a_wallet_and_a_persona() {
+        for (given, stored) in [
+            ("institutional", "institutional"),
+            ("custodian", "custodian"),
+            ("trader", "trader"),
+            ("degen", "degen"),
+        ] {
+            let parsed = Cli::try_parse_from(["bloom", "wallet", "persona", "trading", given])
+                .unwrap_or_else(|error| panic!("{given}: {error}"));
+            assert!(
+                matches!(
+                    &parsed.cmd,
+                    Some(Cmd::Wallet(WalletCmd::Persona { name, persona }))
+                        if name == "trading" && persona == stored
+                ),
+                "{given}"
+            );
+        }
+        assert!(Cli::try_parse_from(["bloom", "wallet", "persona", "trading", "whale"]).is_err());
+        assert!(Cli::try_parse_from(["bloom", "wallet", "persona", "trading"]).is_err());
     }
 
     #[test]

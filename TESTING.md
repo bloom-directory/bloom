@@ -130,6 +130,18 @@ The custody entrypoint runs these scripts in order:
 | `scripts/test-raw-key-import-transfer.sh` | Imported scalar spends on local Anvil with the expected sender |
 | `scripts/test-bip39-import-transfer.sh` | Real Broker/Signer allocation of EVM and Solana account 1, followed by account-1 EVM spending on Anvil and Solana spending on a local Agave validator (requires `solana-test-validator`, `solana`, and `solana-keygen`) |
 
+Default-policy and persona setup have their own end-to-end scripts, run on a
+developer triad with the catalog Petals and the same `BLOOM_INTEGRATION_*_BIN`
+binaries plus `BLOOM_INTEGRATION_DEBUG_DRIVER_BIN`:
+
+| Script | Evidence |
+|---|---|
+| `scripts/test-default-policy-e2e.sh` | Setup's chosen Petals and persona proposed as one default policy for a new wallet, approved through a real ceremony, with setup's Petal settings written |
+| `scripts/test-persona-switch-e2e.sh` | Persona switches: nothing changes before approval, an approved switch replaces the policy and resets Petal limits, a later switch supersedes a waiting one, and an approved switch applies with no command waiting |
+
+Run both after changing `crates/bloom/src/default_policy.rs`, persona or
+default-policy handling in `bloom-daemon` or `bloom-vfs`, or the Broker pin.
+
 Use disposable test inputs. Import/transfer suites require `anvil`, `cast`,
 and the selected `BLOOM_INTEGRATION_*_BIN` binaries. Successful fixture
 signing does not replace these service-boundary checks.

@@ -71,6 +71,23 @@ fn deny_apps_subtree(path: &VfsPath) -> Result<(), HostError> {
     Ok(())
 }
 
+/// A Petal stages a transaction with its own staging call, which records the
+/// Petal as the transaction's origin. Writing a wallet's `outbox/new.tx` would
+/// stage it as the wallet's own send instead, and Machine gives wallet-origin
+/// transfers a rule it never gives a Petal's: the Degen persona's
+/// `erc20:any-recipient` entry.
+fn deny_wallet_outbox_staging(path: &VfsPath) -> Result<(), HostError> {
+    if matches!(path.segments(), [root, _, _, chains, _, outbox, leaf]
+        if root == "wallets" && chains == "chains" && outbox == "outbox" && leaf == "new.tx")
+    {
+        return Err(HostError::Denied(
+            "Petals stage transactions with their own staging call, not a wallet's outbox/new.tx"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl PetalHost for VfsHost {
     async fn vfs_lookup(&self, path: &str) -> Result<HostVfsEntry, HostError> {
@@ -102,6 +119,7 @@ impl PetalHost for VfsHost {
     async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
         let path = VfsPath::parse(path).map_err(|e| HostError::Invalid(format!("path: {e}")))?;
         deny_apps_subtree(&path)?;
+        deny_wallet_outbox_staging(&path)?;
         self.vfs
             .write(&path, bytes)
             .await
@@ -340,6 +358,34 @@ impl PetalRunner {
                 self.carry_private_store(meta, None).map(|_| ())
             },
         )
+    }
+
+    /// [`Self::install_staged_petal_package`] with the permit to change the
+    /// package's Petal already held, as from
+    /// [`crate::store::PetalStore::activation_permit_waiting`].
+    pub fn install_staged_petal_package_permitted<F>(
+        &self,
+        permit: crate::store::ActivationPermit,
+        staged: crate::store::StagedPetalPackage,
+        source: Option<crate::meta::PetalSourceProvenance>,
+        commit_guard: F,
+    ) -> Result<
+        (
+            crate::store::InstallResult,
+            crate::meta::PetalMeta,
+            RouteIndex,
+        ),
+        PetalError,
+    >
+    where
+        F: Fn() -> Result<(), PetalError>,
+    {
+        self.store
+            .install_staged_with_permit(permit, staged, source, commit_guard, |meta| {
+                let name = meta.name.as_deref().expect("staged package name");
+                self.check_activation(&meta.hash, name)?;
+                self.carry_private_store(meta, None).map(|_| ())
+            })
     }
 
     fn prepare_private_store(
@@ -740,7 +786,7 @@ impl PetalRunner {
         trusted_params: &[(String, String)],
         account: Option<&AccountPetalContext>,
     ) -> Result<DispatchOutput, PetalError> {
-        let execution = self.store.execution_guard().await;
+        let execution = self.store.execution_guard(mount).await;
         self.dispatch_petal_route_with_execution_permit(
             mount,
             request,
@@ -765,7 +811,7 @@ impl PetalRunner {
         opts: RunOptions,
         trusted_params: &[(String, String)],
         account: Option<&AccountPetalContext>,
-        _execution: &tokio::sync::RwLockReadGuard<'_, ()>,
+        _execution: &crate::store::ExecutionGuard,
     ) -> Result<DispatchOutput, PetalError> {
         if let Some((name, _)) = request
             .ctx
@@ -931,6 +977,39 @@ impl PetalRunner {
     fn petal_sign_intents(&self, hash: &str) -> Result<BTreeSet<String>, PetalError> {
         let manifest = std::fs::read(self.store.package_path(hash)?.join("source/petal.toml"))?;
         sign_intents_from_manifest_toml(&manifest)
+    }
+
+    /// Whether the Petal at `mount` stores a value under `key` for the write
+    /// route at `path`, in the partition a run of that route uses for
+    /// `account`. Data a replaced release carries forward is moved first, as
+    /// before a run, so carried values count as stored.
+    pub fn petal_store_has(
+        &self,
+        mount: &str,
+        path: &str,
+        account: Option<&AccountPetalContext>,
+        key: &str,
+    ) -> Result<bool, PetalError> {
+        let matched = self.petal_route(mount, DispatchOp::Write, path)?;
+        self.prepare_private_store(&matched.hash, account)?;
+        let root = match account {
+            Some(_) => self.store.private_account_data_root(),
+            None => self.store.private_data_root(),
+        };
+        let account = account.map(|account| (account.wallet.clone(), account.number));
+        let policy = self.petal_store_policy(&matched.hash)?;
+        let store = crate::vm::open_selected_private_store(
+            root,
+            account.as_ref(),
+            Some(&policy),
+            Some(&self.store.private_data_root()),
+        )
+        .map_err(|e| PetalError::vm(format!("private store open: {e}")))?;
+        match store.get(&matched.hash, key) {
+            Ok(_) => Ok(true),
+            Err(crate::host::HostError::NotFound(_)) => Ok(false),
+            Err(e) => Err(PetalError::vm(format!("private store read: {e}"))),
+        }
     }
 
     fn petal_store_policy(
@@ -1580,10 +1659,15 @@ namespaces = ["settings"]
         let data =
             crate::private_store::PrivateStore::open(runner.store().private_data_root()).unwrap();
         // This is the same shared permit dispatch holds for the guest lifetime.
-        let active = runner.store().execution_guard().await;
-        let concurrent = runner.store().execution_guard().await;
+        let active = runner.store().execution_guard("echo").await;
+        let concurrent = runner.store().execution_guard("echo").await;
         data.put(&predecessor, "settings/value", b"before", false)
             .unwrap();
+        // Typed, so Machine can try a refused install again.
+        assert!(matches!(
+            runner.store().uninstall(&predecessor),
+            Err(crate::PetalError::Busy)
+        ));
         assert!(
             runner
                 .store()
@@ -1995,6 +2079,41 @@ namespaces = ["settings"]
             host.vfs_list("../wallets").await,
             Err(HostError::Invalid(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn vfs_host_refuses_staging_through_a_wallet_outbox() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let vfs = Vfs::builder()
+            .mount("wallets", Arc::new(StaticHandler(calls.clone())) as _)
+            .build();
+        let host = VfsHost::new(Arc::new(vfs));
+        for staging in [
+            "wallets/main/0/chains/ethereum/outbox/new.tx",
+            "/wallets/main/0/chains/solana/outbox/new.tx",
+            "wallets/main/0/chains/./ethereum/outbox/x/../new.tx",
+        ] {
+            assert!(
+                matches!(
+                    host.vfs_write(staging, b"{}").await,
+                    Err(HostError::Denied(_))
+                ),
+                "{staging}"
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // Only staging is refused: reading the outbox and other wallet
+        // writes still reach the VFS.
+        host.vfs_read("wallets/main/0/chains/ethereum/outbox/new.tx")
+            .await
+            .unwrap();
+        host.vfs_write("wallets/main/0/chains/ethereum/outbox/abc/note", b"x")
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

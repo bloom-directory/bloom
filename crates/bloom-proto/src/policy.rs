@@ -7,6 +7,28 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::AssuranceLevel;
 use serde::{Deserialize, Serialize};
 
+/// Wallet policy opt-in, listed as `{"chain": "evm-<chain id>", "destination":
+/// ERC20_ANY_RECIPIENT}`, that lets Machine stage the native wallet's canonical
+/// transfer of any ERC-20 token to any recipient on that chain. The Degen
+/// persona proposes it. The owner still approves each transfer, on a page
+/// that names its recipient. It is the same string as
+/// `bloom_broker_api::ERC20_ANY_RECIPIENT` in bloom-broker#112, whose reviewed
+/// sessions also honour it, for the tokens the owner approves in the session.
+/// A Broker without that change keeps it as a literal string, which matches no
+/// address. Machine never treats it as an address or a general wildcard.
+pub const ERC20_ANY_RECIPIENT: &str = "erc20:any-recipient";
+
+/// The maximum approval lifetime a Trader or Degen wallet policy asks for, so
+/// bloom#377's reusable permissions can last until revoked. The same value as
+/// `bloom_broker_api::STANDING_APPROVAL_POLICY_LIFETIME_MS` in
+/// bloom-broker#112; the two must stay equal. A Broker without that change
+/// reads it as an ordinary lifetime, so it bounds no approval in practice.
+pub const STANDING_APPROVAL_POLICY_LIFETIME_MS: u64 = 9_007_199_254_740_991;
+
+/// The maximum approval lifetime wallet creation installs, 30 days, which an
+/// Institutional wallet's policy keeps.
+pub const CREATION_APPROVAL_LIFETIME_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Policy {
     /// Authenticated numeric-chain deployment opt-in. This advisory flag is

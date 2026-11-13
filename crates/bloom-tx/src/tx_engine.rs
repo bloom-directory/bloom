@@ -1802,7 +1802,15 @@ impl TxEngine {
         // the destination has bytecode we still flag it as a contract
         // call; the heuristic mirrors the spec's "code length > 0 OR data
         // is non-empty" rule.
-        let mut policy_ctx = policy_engine::AddressContext::default();
+        let mut policy_ctx = policy_engine::AddressContext {
+            // A Petal's own destinations are only trusted when the policy names
+            // it; the engine merely reports which Petal staged this.
+            staged_by_petal: execution_origin
+                .as_ref()
+                .map(|origin| origin.petal_id.clone())
+                .filter(|petal| !petal.is_empty()),
+            ..Default::default()
+        };
         // Synthetic policy checks contributed by NFT-aware code paths
         // (e.g. operator-wide approvals) — appended after the rules engine
         // has produced its own checks so they all show up in plan.md.
@@ -1834,6 +1842,16 @@ impl TxEngine {
         match &intent.body {
             RawIntentBody::Send { .. } => {
                 if let Some(t) = &token_for_plan {
+                    // The wallet's own canonical `transfer(recipient, amount)`
+                    // of any token, with no value attached. The owner still
+                    // approves each one, on a page that names the recipient.
+                    policy_ctx.standard_erc20_transfer = data_bytes.len() == 68
+                        && data_bytes[..4] == [0xa9, 0x05, 0x9c, 0xbb]
+                        && data_bytes[4..16].iter().all(|b| *b == 0)
+                        && value_wei == U256::ZERO
+                        && execution_origin.as_ref().is_none_or(|o| {
+                            o.petal_id == bloom_proto::petal_identity::PETAL_ID_EVM_WALLET
+                        });
                     policy_ctx.token = to;
                     policy_ctx.contract = to;
                     policy_ctx.destination_is_contract = true;
@@ -7418,6 +7436,131 @@ mod tests {
         assert_eq!(calls.lock()[0].1, "1250000");
     }
 
+    /// Stage a send of 1.25 `token` (or 0.001 of the native asset) to an
+    /// unlisted recipient under `policy`, as `origin` would.
+    async fn stage_send_to_unlisted_recipient(
+        token: Option<Address>,
+        policy: &Policy,
+        origin: Option<ExecutionOrigin>,
+    ) -> Result<StagedTx, TxEngineError> {
+        let url = spawn_stage_rpc(false).await;
+        let oracle = RecordingOracle {
+            calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            usd_micro: 1_250_000,
+            age_ms: 0,
+            max_age_ms: 60_000,
+        };
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle);
+        if let Some(token) = token {
+            engine.token_cache.write().insert(
+                (31337, token),
+                TokenMeta {
+                    address: token,
+                    symbol: "USDC".into(),
+                    decimals: 6,
+                },
+            );
+        }
+        let intent = RawIntent {
+            body: RawIntentBody::Send {
+                to: "0x2222222222222222222222222222222222222222".into(),
+                value: if token.is_some() {
+                    String::new()
+                } else {
+                    "0.001 eth".into()
+                },
+                token: token.map(|token| token.to_string()),
+                amount: if token.is_some() {
+                    "1.25 usdc".into()
+                } else {
+                    String::new()
+                },
+                data: None,
+            },
+            chain: Some("anvil".into()),
+            gas: bloom_proto::intent::GasStrategy::Auto,
+            nonce: None,
+            gas_limit_hint: None,
+            usd_value_hint: None,
+        };
+        engine
+            .stage_with_execution_origin(
+                &permit,
+                "alice",
+                "0x3333333333333333333333333333333333333333"
+                    .parse()
+                    .unwrap(),
+                intent,
+                &chain,
+                policy,
+                None,
+                origin,
+            )
+            .await
+    }
+
+    /// The `erc20:any-recipient` opt-in covers the wallet's own canonical
+    /// transfer of any ERC-20 token. A Petal's transfer, a native send, or a
+    /// policy without the opt-in keep matching listed recipients.
+    #[tokio::test]
+    async fn only_a_native_wallet_erc20_send_uses_the_any_recipient_opt_in() {
+        let denied = |staged: &Result<StagedTx, TxEngineError>| match staged {
+            Ok(staged) => crate::policy_engine::has_hard_violation(&staged.policy_checks),
+            Err(_) => true,
+        };
+        let usdc: Address = lookup_known_token(1, "USDC").unwrap().parse().unwrap();
+        // A token Bloom knows nothing about.
+        let unknown: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let mut opted_in = Policy::default();
+        opted_in
+            .allowlists
+            .recipients
+            .insert(bloom_proto::policy::ERC20_ANY_RECIPIENT.into());
+        let mut listed_only = Policy::default();
+        listed_only
+            .allowlists
+            .recipients
+            .insert("0x4444444444444444444444444444444444444444".into());
+        let petal = ExecutionOrigin {
+            petal_id: "petal:polymarket".into(),
+            ..ExecutionOrigin::default()
+        };
+
+        for (token, origin) in [
+            (usdc, None),
+            (usdc, Some(ExecutionOrigin::default())),
+            (unknown, None),
+        ] {
+            let staged = stage_send_to_unlisted_recipient(Some(token), &opted_in, origin).await;
+            let staged = staged.unwrap();
+            assert!(
+                !crate::policy_engine::has_hard_violation(&staged.policy_checks),
+                "{:?}",
+                staged.policy_checks
+            );
+            assert!(
+                staged
+                    .policy_checks
+                    .iter()
+                    .any(|check| check.message.contains("ERC20 transfers to any recipient")),
+                "{:?}",
+                staged.policy_checks
+            );
+        }
+        for (token, policy, origin) in [
+            (Some(usdc), &opted_in, Some(petal.clone())),
+            (Some(unknown), &opted_in, Some(petal)),
+            (None, &opted_in, None),
+            (Some(usdc), &listed_only, None),
+            (Some(unknown), &listed_only, None),
+        ] {
+            let staged = stage_send_to_unlisted_recipient(token, policy, origin.clone()).await;
+            assert!(denied(&staged), "{token:?} {origin:?}: {staged:?}");
+        }
+    }
+
     #[tokio::test]
     async fn stage_erc20_transfer_accepts_bare_fractional_amount() {
         // `send 0.5 USDC to ...` and `{"token":"USDC","amount":"0.5"}` both
@@ -11211,8 +11354,9 @@ mod tests {
 
     #[test]
     fn resolve_token_symbol_resolves_on_arbitrum() {
-        // Regression: USDC by symbol must resolve on non-mainnet chains via the
-        // shared bloom_proto::tokens table (previously only chains 1/31337).
+        // Regression: USDC by symbol must resolve on non-mainnet chains via
+        // Broker's shared list (`bloom_broker_api::known_tokens`), which
+        // replaced Bloom's own table (previously only chains 1/31337).
         let (a, sym) = TxEngine::resolve_token_address("USDC", 42161).unwrap();
         assert_eq!(
             format!("{a:#x}"),
