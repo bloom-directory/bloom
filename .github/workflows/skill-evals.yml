@@ -4,6 +4,7 @@ on:
   pull_request:
     paths: &skill_paths
       - ".github/workflows/skill-evals.yml"
+      - ".claude-plugin/**"
       - "skills/**"
       - "install/**"
       - "evals/skills/**"
@@ -39,3 +40,8 @@ jobs:
       # Grader fixtures and config validation only; no model calls.
       - name: Check onboarding grader and configs
         run: npm run check
+      - name: Check plugin manifests
+        working-directory: .
+        run: |
+          jq -er '.plugins[].source' .claude-plugin/marketplace.json | xargs -I{} test -f {}/.claude-plugin/plugin.json
+          jq -e '.name and .version' skills/bloom/.claude-plugin/plugin.json
