@@ -46,7 +46,7 @@ minor_min = 0
 minor_max = 1
 
 [[bundles]]
-machine = "0.5.0"
+machine = "0.5.1"
 broker = "0.1.0"
 signer = "0.1.0"
 backends = ["local"]
