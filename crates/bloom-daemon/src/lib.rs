@@ -4191,30 +4191,14 @@ impl Daemon {
     /// Explicit key-free developer composition used by the debug CLI when an
     /// installed triad is absent. Release builds do not compile this entry
     /// point. It has no Broker client, signing path, custody path, legacy
-    /// keystore, or legacy approval store.
-    #[cfg(debug_assertions)]
-    pub fn from_home_without_broker_for_debug(home: HomeDir) -> Result<Self, DaemonError> {
-        Self::from_home_inner(home, None, None, None)
-    }
-
-    /// Write-permitted counterpart to [`Self::from_home_without_broker_for_debug`]
-    /// for Machine-owned state such as Petal installation and unsigned staging.
+    /// keystore, or legacy approval store. It is write-permitted for
+    /// Machine-owned state such as Petal installation and unsigned staging.
     #[cfg(debug_assertions)]
     pub fn from_home_with_permit_without_broker_for_debug(
         home: HomeDir,
         permit: Arc<HomeWritePermit>,
     ) -> Result<Self, DaemonError> {
         Self::from_home_inner(home, Some(permit), None, None)
-    }
-
-    /// Build a Machine daemon whose signing and custody authority is provided
-    /// exclusively by the Broker service boundary.
-    pub fn from_home_with_broker(
-        home: HomeDir,
-        broker: MachineBrokerClient,
-        provenance_catalog: bloom_broker_api::ProvenanceCatalog,
-    ) -> Result<Self, DaemonError> {
-        Self::from_home_inner(home, None, Some(broker), Some(provenance_catalog))
     }
 
     pub fn from_home_with_permit_and_broker(
@@ -5176,13 +5160,6 @@ impl Daemon {
             let _ = s.send(());
         }
         self.watch_executor.stop().await;
-    }
-
-    /// Convenience for the default home dir (`~/.bloom`).
-    #[cfg(any(test, debug_assertions, feature = "unsigned-audit-test-seam"))]
-    pub fn from_default_home() -> Result<Self, DaemonError> {
-        let home = HomeDir::resolve("~/.bloom")?;
-        Self::from_home(home)
     }
 
     /// Spawn long-lived background tasks: the update checker and the
