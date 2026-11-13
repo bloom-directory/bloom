@@ -111,12 +111,6 @@ pub trait MempoolProvider: Send + Sync {
     /// Open a long-lived subscription. The returned stream lives until
     /// the caller drops it; the provider is responsible for cleanup.
     async fn subscribe(&self) -> Result<BoxStream<'static, PendingTx>, MempoolError>;
-
-    /// True = stream already includes full tx fields; False = the
-    /// stream yields hash-only `PendingTx`s with `input.is_empty()`
-    /// and the daemon must follow up via `eth_getTransactionByHash`
-    /// before storing in the index.
-    fn delivers_bodies(&self) -> bool;
 }
 
 /// Conformance test suite. Any `MempoolProvider` implementation
@@ -182,10 +176,6 @@ impl MempoolProvider for MockMempoolProvider {
     async fn subscribe(&self) -> Result<BoxStream<'static, PendingTx>, MempoolError> {
         let items = self.fixtures.clone();
         Ok(Box::pin(stream::iter(items)))
-    }
-
-    fn delivers_bodies(&self) -> bool {
-        true
     }
 }
 

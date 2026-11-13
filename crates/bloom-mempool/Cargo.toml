@@ -6,14 +6,10 @@ license.workspace = true
 description = "Mempool observability + private orderflow + MEV heuristic for bloom-eth"
 
 [features]
-default = ["alchemy", "generic_eth_subscribe", "mev_blocker", "flashbots"]
+default = ["alchemy", "mev_blocker", "flashbots"]
 alchemy = ["dep:reqwest", "dep:tokio-tungstenite"]
-generic_eth_subscribe = ["dep:tokio-tungstenite"]
 mev_blocker = ["dep:reqwest"]
 flashbots = ["dep:reqwest"]
-# Opt-in: enables tests that hit real Alchemy / MEV-Blocker / Flashbots
-# endpoints. Never enabled in CI.
-live-providers = []
 
 [dependencies]
 alloy.workspace = true
@@ -31,7 +27,4 @@ reqwest = { workspace = true, optional = true }
 tokio-tungstenite = { workspace = true, optional = true }
 
 [dev-dependencies]
-alloy-signer-local = "2.0.5"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
-tracing-subscriber.workspace = true
-tempfile.workspace = true

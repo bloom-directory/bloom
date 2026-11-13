@@ -235,15 +235,13 @@ status/
 ```rust
 #[async_trait]
 pub trait MempoolProvider: Send + Sync {
-    fn id(&self) -> &'static str;             // "alchemy" | "generic_eth_subscribe"
+    fn id(&self) -> &'static str;             // "alchemy"
 
     /// Open a long-lived subscription. Returns a stream the daemon
     /// owns; provider drops it on close.
+    /// Providers must deliver full tx bodies; hash-only streams are
+    /// not supported.
     async fn subscribe(&self) -> Result<BoxStream<'static, PendingTx>, MempoolError>;
-
-    /// True = stream already includes full tx fields; False = caller
-    /// must follow up with eth_getTransactionByHash via the RpcPool.
-    fn delivers_bodies(&self) -> bool;
 }
 
 pub struct PendingTx {
@@ -492,7 +490,7 @@ basefee_overrun_pct = 20
 
 ```toml
 [mempool.<chain>]
-provider = "alchemy"         # "alchemy" | "generic_eth_subscribe"
+provider = "alchemy"         # only "alchemy" is supported
 ws_url = "wss://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
 max_index_size = 50_000
 
@@ -516,9 +514,7 @@ clear "not configured" error other absent-backend trees do.
 |---|---|---|
 | `default = ["alchemy", "mev_blocker", "flashbots"]` | all v1 providers | yes |
 | `alchemy` | alloy-pubsub + WS transport | yes |
-| `generic_eth_subscribe` | WS transport only | always on |
 | `mev_blocker` / `flashbots` | reqwest client + URL constants | yes |
-| `live-providers` | unlocks network-touching tests | **no** |
 
 ### 10.2 Layers
 
@@ -551,14 +547,6 @@ clear "not configured" error other absent-backend trees do.
      bump scanner pipeline end-to-end, on the real NFS mount.
    - Verifies tailing `mempool/live` produces no WARN spam — the
      `Attrs.change` lever already in `MEMORY.md` applies here too.
-
-4. **Live-network smoke** (`--features live-providers`, **opt-in,
-   not in CI**):
-   - `tests/it/mempool_alchemy_smoke.rs` — gated on
-     `ALCHEMY_API_KEY`; 30 s subscription, asserts ≥ N observations.
-   - `tests/it/private_rpc_health.rs` — gated on
-     `RUN_PRIVATE_RPC_HEALTH=1`; pings MEV-Blocker and Flashbots
-     health endpoints. Read-only.
 
 ### 10.3 CI matrix (extends existing `ci.yml`)
 
