@@ -126,6 +126,7 @@ jobs:
           bash bloom/tests/packaging/macos-installer-staged.sh
           bash bloom/tests/packaging/macos-pf-retirement.sh
           bash bloom/tests/packaging/macos-upgrade-rollback.sh
+          bash bloom/tests/packaging/macos-quarantine-xattr-path.sh
 
       # The canonical-listener test must run before any installed Broker owns
       # port 18734. Installed acceptance repeats the other tests below.

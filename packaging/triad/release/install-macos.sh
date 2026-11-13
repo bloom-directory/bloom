@@ -110,9 +110,12 @@ snapshot_live_payload() {
 
 prepare_verified_payload_for_execution() {
   $live || return 0
-  xattr -dr com.apple.quarantine "$payload" || die "could not remove quarantine from the verified payload"
+  # Name the system tool: an earlier PATH entry (for example a Python `xattr`
+  # package script) has an incompatible CLI, and a failing `-p` probe would
+  # otherwise be read as "not quarantined".
+  /usr/bin/xattr -dr com.apple.quarantine "$payload" || die "could not remove quarantine from the verified payload"
   for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
-    if xattr -p com.apple.quarantine "$payload/bin/$binary" >/dev/null 2>&1; then
+    if /usr/bin/xattr -p com.apple.quarantine "$payload/bin/$binary" >/dev/null 2>&1; then
       die "verified payload binary remains quarantined: $binary"
     fi
   done

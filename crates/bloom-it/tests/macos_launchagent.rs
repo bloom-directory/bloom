@@ -471,6 +471,7 @@ fn macos_conformance_workflows_consume_unified_candidates() {
         "macos-installer-staged.sh",
         "macos-pf-retirement.sh",
         "macos-upgrade-rollback.sh",
+        "macos-quarantine-xattr-path.sh",
     ] {
         assert!(unix.contains(&format!("bash bloom/tests/packaging/{script}")));
     }
@@ -609,6 +610,18 @@ fn macos_pf_retirement_preserves_foreign_rules_and_migrates_legacy_guards() {
         .arg(workspace().join("tests/packaging/macos-pf-retirement.sh"))
         .status()
         .expect("run isolated macOS PF retirement regression");
+    assert!(status.success());
+}
+
+#[test]
+fn macos_quarantine_removal_uses_system_xattr_despite_path_shadowing() {
+    // Runs natively on macOS against /usr/bin/xattr; elsewhere the script
+    // retargets only that absolute path to a stub while a shadowing `xattr`
+    // stays first on PATH.
+    let status = Command::new("bash")
+        .arg(workspace().join("tests/packaging/macos-quarantine-xattr-path.sh"))
+        .status()
+        .expect("run macOS quarantine xattr PATH regression");
     assert!(status.success());
 }
 
