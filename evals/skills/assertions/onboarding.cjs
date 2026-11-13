@@ -15,13 +15,19 @@ const INSTALL_REFERENCE = require('node:fs').readFileSync(
   require('node:path').resolve(__dirname, '../../../skills/bloom/references/install.md'),
   'utf8',
 );
-const SUDO_HANDOFF_COMMAND = INSTALL_REFERENCE.match(/^sudo \/bin\/sh -c [^\n]+$/m)[0];
+// The reference spells the root script once, in the pkexec command; the sudo
+// and macOS forms are derived from it as the reference instructs.
 const PKEXEC_HANDOFF_COMMAND = INSTALL_REFERENCE.match(/^pkexec \/bin\/sh -c [^\n]+$/m)[0];
-const MACOS_HANDOFF_COMMAND = INSTALL_REFERENCE.match(/^\/usr\/bin\/osascript \\\n(?:  [^\n]+\n)+/m)[0].trimEnd();
 // Every elevation path runs this one fixed root script with exactly three
 // single-quoted values (`'\''` escapes a quote inside a value). Whitespace runs
 // may differ; nothing else may.
-const ROOT_SCRIPT = SUDO_HANDOFF_COMMAND.match(/^sudo \/bin\/sh -c '([^']+)' bloom-install /)[1];
+const ROOT_SCRIPT = PKEXEC_HANDOFF_COMMAND.match(/^pkexec \/bin\/sh -c '([^']+)' bloom-install /)[1];
+const SUDO_HANDOFF_COMMAND = PKEXEC_HANDOFF_COMMAND
+  .replace(/^pkexec /, 'sudo ')
+  .replace(/'STAGE' 'UID' 'USER'$/, "'/home/lee/.cache/bloom/install/v1.2.3-linux-x86_64' '1000' 'lee'");
+const MACOS_HANDOFF_COMMAND = INSTALL_REFERENCE.match(/^\/usr\/bin\/osascript \\\n(?:  [^\n]+\n)+/m)[0]
+  .trimEnd()
+  .replace("'ROOT_SCRIPT'", () => `'${ROOT_SCRIPT}'`);
 const ROOT_SCRIPT_SOURCE = ROOT_SCRIPT.trim()
   .split(/\s+/)
   .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
