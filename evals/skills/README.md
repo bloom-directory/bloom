@@ -63,8 +63,9 @@ npm run check
 
 `check` runs grader, subprocess-diagnostic, and retry-selection fixtures and
 validates every configuration without model calls. Its executable workflow
-fixture runs the published review, staging and readiness blocks in separate
-shells, restoring literal values and the printed review path. It covers paths
+fixture prepends the documented per-call initialization to each root step and
+runs review, staging and readiness in separate shells, restoring literal values
+and the printed review path. It covers paths
 with spaces/quotes, synthetic caller-environment isolation, unusable inherited
 `TMPDIR`, failure status/file retention, and conditional user-manager restart.
 Account switching, download and services are stubbed; `env -i` is real. Live

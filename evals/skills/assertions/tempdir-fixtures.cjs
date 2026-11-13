@@ -17,10 +17,11 @@ const refresh = blocks.find(s => s.includes('case "$relogin_required"'));
 const services = blocks.find(s => s.includes('as_bloom systemctl --user is-active'));
 const mount = blocks.find(s => s.includes('as_bloom cat "$login_home/bloom/AGENTS.md"'));
 const helpers = [...install.matchAll(/^as_bloom\(\) \{\n[\s\S]*?^\}/gm)].map(m => m[0]);
-assert.equal(helpers.length, 4);
-assert.ok(helpers.every(h => h === helpers[0]), 'Each fresh root call restores the same helper');
+assert.equal(helpers.length, 1);
+const prelude = blocks.find(s => s.includes('as_bloom() {'));
+assert.match(install, /each root tool call[\s\S]*?prepend this initialization/);
 assert.doesNotMatch(install, /BLOOM_SKILL_URL|skill_url=/);
-assert.equal(grade(`${"I'll install Bloom for a dedicated non-root account and refresh its user manager, checking VFS and audit health."}\n${review}\n${stage}\n${grade.ROOT_HANDOFF_COMMAND}\n${services}\n${mount}\nSetup excludes wallet/passkey creation and transaction staging, signing and broadcasting.`, { vars: { platform: 'linux-root' } }).pass, true);
+assert.equal(grade(`${"I'll install Bloom for a dedicated non-root account and refresh its user manager, checking VFS and audit health."}\n${prelude}\n${review}\n${stage}\n${grade.ROOT_HANDOFF_COMMAND}\n${services}\n${mount}\nSetup excludes wallet/passkey creation and transaction staging, signing and broadcasting.`, { vars: { platform: 'linux-root' } }).pass, true);
 const root = mkdtempSync('/tmp/bloom argv fixture.');
 const quote = s => `'${s.replaceAll("'", "'\\''")}'`;
 const home = join(root, "home with 'quotes' and spaces");
@@ -52,7 +53,7 @@ const literalize = (script, values = {}) => {
   for (const [key, value] of Object.entries(substitutions)) script = script.replaceAll(quote(key), quote(value));
   return script;
 };
-const call = (script, values) => spawnSync('/bin/sh', ['-c', literalize(script, values)], { env, encoding: 'utf8' });
+const call = (script, values, rootCall = true) => spawnSync('/bin/sh', ['-c', literalize(`${rootCall ? prelude + '\n' : ''}${script}`, values)], { env, encoding: 'utf8' });
 const reviewed = [];
 function reviewCall() {
   const result = call(review);
@@ -91,11 +92,11 @@ try {
     ['no TMPDIR', s => s.replaceAll(' TMPDIR=/tmp', '')],
     ['no clean environment', s => s.replaceAll('env -i ', 'env ')],
     ['no user bus', s => s.replaceAll(' DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$login_uid/bus"', '')],
-  ]) scenario(`reject ${name}`, () => assert.notEqual(call(mutate(name === 'caller HOME' ? mount : services)).status, 0));
+  ]) scenario(`reject ${name}`, () => assert.notEqual(call(mutate(`${prelude}\n${name === 'caller HOME' ? mount : services}`), undefined, false).status, 0));
   writeFileSync(fixture, 'exit 42\n');
   const failedDirectory = reviewCall();
   for (const [name, block] of [['root', stage], ['non-root', nonrootStage]]) scenario(`${name} stage failure retains reviewed script`, () => {
-    assert.equal(call(block, { REVIEW_DIR: failedDirectory }).status, 42);
+    assert.equal(call(block, { REVIEW_DIR: failedDirectory }, name === 'root').status, 42);
     assert.equal(existsSync(join(failedDirectory, 'setup.sh')), true);
   });
   for (const value of ['0', '1', 'invalid']) scenario(`refresh flag ${value}`, () => {
