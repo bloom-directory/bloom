@@ -40,6 +40,9 @@ owner capabilities: keep them out of logs and Petal-visible data.
 Every write is an operation: it may stage work, start a ceremony, spend
 reusable authority or broadcast. Read the result before retrying.
 
+For a person, `views/` provides read-only browser pages: `wallets.html`,
+`receive.html`, and `activity.html`. See `views/AGENTS.md` for their scope.
+
 ## Accounts
 
 `wallets/<wallet>/accounts.json` lists the wallet's accounts; each entry's

@@ -20,6 +20,7 @@ Route reference. Rules are in the mount's `AGENTS.md`; procedures are in
 | `ens/`, `prices/` | ENS resolution and price-provider reads |
 | `addressbook/` | Named public addresses |
 | `tools/` | Pure encoding, hashing, address, ABI, and unit helpers |
+| `views/` | Read-only HTML pages for a person to open in a browser; read `views/AGENTS.md` before pointing someone at one |
 | `docs/` | Route reference, examples, installed-Petal index |
 | `petal-key-requests/`, `petal-signing-requests/` | Broker-backed Petal request projections |
 
