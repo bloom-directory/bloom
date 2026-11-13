@@ -36,7 +36,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Check out Machine
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           path: bloom
       - name: Reject mutable sibling refs
@@ -48,13 +48,13 @@ jobs:
           [[ "$BROKER_REF" =~ ^[0-9a-f]{40}$ ]]
           [[ "$SIGNER_REF" =~ ^[0-9a-f]{40}$ ]]
       - name: Check out Broker
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           repository: bloom-directory/bloom-broker
           ref: ${{ inputs.broker_ref || '0a9a8dae12e86237cb9d6ba63a2456d7c0871cf9' }}
           path: bloom-broker
       - name: Check out Signer
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           repository: bloom-directory/bloom-signer
           ref: ${{ inputs.signer_ref || '68d8ecaec34a7cae99f754972b5a781a8e17e542' }}
@@ -150,7 +150,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Check out Machine
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           path: bloom
       - name: Reject mutable sibling refs
@@ -162,13 +162,13 @@ jobs:
           [[ "$BROKER_REF" =~ ^[0-9a-f]{40}$ ]]
           [[ "$SIGNER_REF" =~ ^[0-9a-f]{40}$ ]]
       - name: Check out Broker
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           repository: bloom-directory/bloom-broker
           ref: ${{ inputs.broker_ref || '0a9a8dae12e86237cb9d6ba63a2456d7c0871cf9' }}
           path: bloom-broker
       - name: Check out Signer
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           repository: bloom-directory/bloom-signer
           ref: ${{ inputs.signer_ref || '68d8ecaec34a7cae99f754972b5a781a8e17e542' }}
