@@ -57,8 +57,8 @@ guide from a local checkout, copy the `setup.sh` beside it to
 `$review_dir/setup.sh` instead of downloading it, then inspect and execute that
 exact copy.
 
-When the user supplies a specific guide URL, use the `scripts/setup.sh` on that
-site; never silently replace a preview or custom origin with production.
+When the user supplies a specific guide URL, use the setup script from that
+same site or commit; never silently replace a preview or custom origin with production.
 Otherwise fetch the script as follows:
 
 For every setup or privileged handoff invocation, set the working directory to
@@ -67,7 +67,10 @@ installation can restart it and invalidate the current working directory.
 
 ```sh
 guide_url=${BLOOM_INSTALL_URL:-https://bloom.directory/references/install.md}
-setup_url=${guide_url%/references/install.md}/scripts/setup.sh
+case $guide_url in
+  */references/install.md) setup_url=${guide_url%/references/install.md}/scripts/setup.sh ;;
+  *) setup_url=${guide_url%/*}/setup.sh ;;
+esac
 review_dir="$(mktemp -d "${TMPDIR:-/tmp}/bloom-review.XXXXXX")"
 curl -fsSL "$setup_url" -o "$review_dir/setup.sh"
 cat "$review_dir/setup.sh"
