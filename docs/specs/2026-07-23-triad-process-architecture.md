@@ -14,7 +14,7 @@ target is three independently released and independently sandboxable
 executables:
 
 ```text
-bloom (Machine)  <->  bloom-broker  <->  bloom-signer
+bloom-machine  <->  bloom-broker  <->  bloom-signer
 ```
 
 The roles may initially run on one host over authenticated local IPC. Future
@@ -105,7 +105,7 @@ non-extractable, as with AWS KMS.
 
 | Term | Meaning |
 |---|---|
-| Machine | The `bloom` executable running `bloom serve` (service ID `bloom-machine`): VFS, Petal runtime, package handling, chain access, simulation, action orchestration, broadcast, and user projections. |
+| Machine | The `bloom-machine` executable: VFS, Petal runtime, package handling, chain access, simulation, action orchestration, broadcast, and user projections. |
 | Broker | The `bloom-broker` executable: Sealed Approval, ceremony HTTP application, canonical review, policy evaluation, declared-usage budgets, reservations, and authorization audit. |
 | Signer | The `bloom-signer` executable: backend registry, backend credentials, key operations, structural approval checks, replay protection, revocation, and custody audit. |
 | Sealed Approval | The sole Bloom **signing**-authorization concept. It binds a subject, key, selector, limits, validity, policy, and lifecycle. It never authorizes a custody workflow. |
