@@ -5,9 +5,8 @@
 //! Petal route artifact.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bloom_proto::config::PetalRuntimeConfig;
@@ -22,6 +21,57 @@ use crate::host::PetalHost;
 use crate::runner::{PETAL_DOCUMENT_NAMES, PetalRunner};
 use crate::vm::{COMPONENT_NOT_A_DIR_CODE, COMPONENT_UNSUPPORTED_CODE, RunOptions};
 
+/// How long host-owned ancestor checks may reuse a live account observation,
+/// matching the Machine's default wallet-projection reuse window. One mounted
+/// path traversal checks the same ancestors several times; each live
+/// observation costs a Broker wallet refresh. Every guest dispatch, lookups
+/// included, observes the account afresh, so a cached observation never
+/// authorizes Petal code.
+const ACCOUNT_CONTEXT_REUSE: Duration = Duration::from_secs(1);
+
+/// Why the last write to a Petal failed. A mount reports a failed write only
+/// as an errno, so the Petal's message is kept at `petals/<name>/last_error.json`
+/// until that same path's write succeeds. The record names the path it
+/// describes and when it was written: the mount can fail a write before the
+/// router ever runs, and a reader must be able to tell such a record from its
+/// own attempt. Shape matches `outbox/pending/<id>/last_error.json`.
+pub(crate) const LAST_ERROR: &str = "last_error.json";
+
+/// Ceiling on the guest message kept in a `last_error.json` record. A refusal
+/// is agent-facing prose; past this it is a payload, not a reason, and it is
+/// held in memory until the write that failed succeeds.
+const MAX_WRITE_ERROR_BYTES: usize = 4096;
+
+/// Recent account observations, ordered by when each began. A refusal is
+/// kept (as `None`) rather than removed, so an older observation that
+/// finishes later cannot reinstate the account it refused.
+#[derive(Default)]
+struct AccountContextCache {
+    next_generation: u64,
+    entries: BTreeMap<(String, u32), CachedAccountContext>,
+}
+
+struct CachedAccountContext {
+    generation: u64,
+    observed: Instant,
+    context: Option<AccountPetalContext>,
+}
+
+/// The most recent failed write to one Petal: the served record plus the path
+/// it describes, so a success on another route cannot clear it.
+struct LastWriteError {
+    path: String,
+    record: Vec<u8>,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 #[derive(Clone)]
 pub struct PetalRouter {
     runner: PetalRunner,
@@ -29,6 +79,9 @@ pub struct PetalRouter {
     runtime_petals: BTreeMap<String, PetalRuntimeConfig>,
     audit: Option<Arc<AuditLog>>,
     audit_effect_lock: Arc<tokio::sync::Mutex<()>>,
+    account_contexts: Arc<Mutex<AccountContextCache>>,
+    account_context_reuse: Duration,
+    last_errors: Arc<Mutex<BTreeMap<String, LastWriteError>>>,
 }
 
 impl PetalRouter {
@@ -39,17 +92,14 @@ impl PetalRouter {
             runtime_petals: BTreeMap::new(),
             audit: None,
             audit_effect_lock: Arc::new(tokio::sync::Mutex::new(())),
+            account_contexts: Arc::new(Mutex::new(AccountContextCache::default())),
+            account_context_reuse: ACCOUNT_CONTEXT_REUSE,
+            last_errors: Arc::default(),
         }
     }
 
     pub fn with_audit(mut self, audit: Arc<AuditLog>) -> Self {
         self.audit = Some(audit);
-        self
-    }
-
-    /// Retained temporarily for daemon API compatibility. Petal writes are
-    /// synchronous in this iteration so VFS callers receive execution errors.
-    pub fn with_async_write_switch(self, _enabled: Arc<AtomicBool>) -> Self {
         self
     }
 
@@ -106,19 +156,141 @@ impl PetalRouter {
         PETAL_DOCUMENT_NAMES.contains(&path)
     }
 
+    /// Files the host serves itself at a Petal's mount root. A guest route of
+    /// the same name is never reached, so every operation treats them alike.
+    fn is_host_file(rest: &str) -> bool {
+        rest == LAST_ERROR || Self::is_petal_document(rest)
+    }
+
+    fn last_error(&self, mount: &str) -> Option<Vec<u8>> {
+        Some(self.last_errors.lock().ok()?.get(mount)?.record.clone())
+    }
+
+    /// Keep `message` as the reason for `rest`'s failed write, replacing any
+    /// earlier record for this Petal. Only installed Petals get an entry, so
+    /// the map cannot be grown by writing to invented mount names.
+    fn record_write_error(&self, mount: &str, rest: &str, message: &str) {
+        if !self.is_petal(mount) {
+            return;
+        }
+        let mut message = message.to_owned();
+        if message.len() > MAX_WRITE_ERROR_BYTES {
+            let mut cut = MAX_WRITE_ERROR_BYTES;
+            while !message.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            message.truncate(cut);
+        }
+        let record = serde_json::json!({
+            "schema": "bloom.petal-write-error/1",
+            "path": rest,
+            "at_ms": now_ms(),
+            "error": message,
+            "next": "Check path and at_ms against the write you just made: an older record, or one for another path, is a different attempt. No record at all does not mean the write succeeded.",
+        });
+        let Ok(record) = serde_json::to_vec_pretty(&record) else {
+            return;
+        };
+        if let Ok(mut last_errors) = self.last_errors.lock() {
+            last_errors.insert(
+                mount.to_owned(),
+                LastWriteError {
+                    path: rest.to_owned(),
+                    record,
+                },
+            );
+        }
+    }
+
+    /// Drop the record only when this write is the one it blamed. A success on
+    /// another route says nothing about the failure a reader has yet to read.
+    fn clear_write_error(&self, mount: &str, rest: &str) {
+        if let Ok(mut last_errors) = self.last_errors.lock()
+            && last_errors
+                .get(mount)
+                .is_some_and(|entry| entry.path == rest)
+        {
+            last_errors.remove(mount);
+        }
+    }
+
     fn add_petal_documents(mut entries: Vec<Entry>) -> Vec<Entry> {
         entries.retain(|entry| !Self::is_petal_document(&entry.name));
         entries.extend(PETAL_DOCUMENT_NAMES.map(Entry::read_only_file));
         entries
     }
 
+    /// Resolve the account a wallet-scoped route runs as. `account.json` is
+    /// served on the live authority path, so every read is a Broker wallet
+    /// refresh. Guest dispatches (`live`) always observe it afresh, because a
+    /// guest runs with its route's capabilities whatever the operation. Host-
+    /// owned ancestor checks, which run no guest, reuse an observation made in
+    /// the last `account_context_reuse`.
     async fn account_context(
         &self,
         wallet: &str,
         number: &str,
+        live: bool,
     ) -> Result<AccountPetalContext, HandlerError> {
         let number = canonical_account(number)
             .ok_or_else(|| HandlerError::not_found("invalid account number"))?;
+        let key = (wallet.to_owned(), number);
+        let (generation, observed) = {
+            let mut cache = self.account_context_cache()?;
+            if !live
+                && let Some(CachedAccountContext {
+                    observed,
+                    context: Some(context),
+                    ..
+                }) = cache.entries.get(&key)
+                && observed.elapsed() <= self.account_context_reuse
+            {
+                return Ok(context.clone());
+            }
+            let generation = cache.next_generation;
+            cache.next_generation += 1;
+            (generation, Instant::now())
+        };
+        let result = self.observe_account_context(wallet, number).await;
+        let mut cache = self.account_context_cache()?;
+        let reuse = self.account_context_reuse;
+        cache
+            .entries
+            .retain(|_, entry| entry.observed.elapsed() <= reuse);
+        // Only the newest observation of an account is kept, so a slow
+        // success never overwrites a later refusal. One already older than the
+        // reuse window could not be reused, and every entry it could replace
+        // has been pruned.
+        let superseded = cache
+            .entries
+            .get(&key)
+            .is_some_and(|entry| entry.generation > generation);
+        if !superseded && observed.elapsed() <= reuse {
+            cache.entries.insert(
+                key,
+                CachedAccountContext {
+                    generation,
+                    observed,
+                    context: result.as_ref().ok().cloned(),
+                },
+            );
+        }
+        result
+    }
+
+    fn account_context_cache(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, AccountContextCache>, HandlerError> {
+        self.account_contexts
+            .lock()
+            .map_err(|_| HandlerError::backend("account context cache poisoned"))
+    }
+
+    async fn observe_account_context(
+        &self,
+        wallet: &str,
+        number: u32,
+    ) -> Result<AccountPetalContext, HandlerError> {
         let bytes = self
             .host
             .vfs_read(&format!("wallets/{wallet}/{number}/account.json"))
@@ -166,7 +338,7 @@ impl PetalRouter {
 
     fn metadata_route_path(&self, path: &VfsPath, _op: DispatchOp) -> Option<(String, String)> {
         let (mount, rest) = Self::mount_path(path).ok()?;
-        (self.is_petal(mount) && !Self::is_petal_document(&rest)).then(|| (mount.to_owned(), rest))
+        (self.is_petal(mount) && !Self::is_host_file(&rest)).then(|| (mount.to_owned(), rest))
     }
 
     async fn validate_ancestor(&self, mount: &str, path: &str) -> Result<(), HandlerError> {
@@ -192,19 +364,20 @@ impl PetalRouter {
                 .map(|(_, value)| **value);
             if let (Some(wallet), Some(number)) = (wallet, number) {
                 if checked_accounts.insert((wallet, number)) {
-                    self.account_context(wallet, number).await?;
+                    self.account_context(wallet, number, false).await?;
                 }
             } else if let Some(wallet) = wallet
                 && checked_wallets.insert(wallet)
-                && !self
-                    .host
-                    .vfs_list("wallets")
-                    .await
-                    .map_err(map_host_err)?
-                    .iter()
-                    .any(|entry| {
-                        entry.name == wallet && entry.kind == crate::host::HostVfsEntryKind::Dir
-                    })
+                && (is_reserved_wallet_entry(wallet)
+                    || !self
+                        .host
+                        .vfs_list("wallets")
+                        .await
+                        .map_err(map_host_err)?
+                        .iter()
+                        .any(|entry| {
+                            entry.name == wallet && entry.kind == crate::host::HostVfsEntryKind::Dir
+                        }))
             {
                 return Err(HandlerError::not_found(format!("wallets/{wallet}")));
             }
@@ -245,7 +418,7 @@ impl PetalRouter {
             }
             for entry in self.host.vfs_list(&core).await.map_err(map_host_err)? {
                 if entry.kind == crate::host::HostVfsEntryKind::Dir
-                    && (core == "wallets" && entry.name != "registrations"
+                    && (core == "wallets" && !is_reserved_wallet_entry(&entry.name)
                         || core != "wallets" && canonical_account(&entry.name).is_some())
                 {
                     entries.insert(entry.name.clone(), Entry::dir(&entry.name));
@@ -286,7 +459,9 @@ impl PetalRouter {
                 {
                     return Err(HandlerError::PermissionDenied);
                 }
-                let account = self.account_context(wallet, index).await?;
+                // The guest runs with its route's capabilities for every
+                // operation, lookups included, so it runs as the live account.
+                let account = self.account_context(wallet, index, true).await?;
                 self.dispatch_for_account(mount, op, path, body, &account, &execution)
                     .await
             }
@@ -317,6 +492,11 @@ impl PetalRouter {
     }
 }
 
+/// Core lists control entries such as `recoveries` beside the wallets.
+fn is_reserved_wallet_entry(name: &str) -> bool {
+    bloom_vfs::handlers::wallets::is_wallet_control_entry(name)
+}
+
 fn canonical_account(segment: &str) -> Option<u32> {
     if segment.is_empty()
         || (segment.len() > 1 && segment.starts_with('0'))
@@ -337,6 +517,20 @@ fn map_host_err(error: crate::host::HostError) -> HandlerError {
 }
 
 impl PetalRouter {
+    /// Whether this operation is a security effect: a write, or a read whose
+    /// route declares it side-effecting. Unknown read metadata counts as one.
+    fn is_effect(&self, mount: &str, op: DispatchOp, path: &str) -> bool {
+        match op {
+            DispatchOp::Write => true,
+            DispatchOp::Read => self
+                .runner
+                .petal_route_effective_metadata(mount, op, path)
+                .map(|(_, metadata)| metadata.side_effecting_read)
+                .unwrap_or(true),
+            DispatchOp::Lookup | DispatchOp::List => false,
+        }
+    }
+
     /// Dispatch using the account identity resolved by the host from live core state.
     #[allow(clippy::too_many_arguments)]
     async fn dispatch_for_account(
@@ -382,15 +576,7 @@ impl PetalRouter {
         // makes a single mounted path traversal append (and authenticate) many
         // journal records before NFS reaches the command WRITE. A read is an
         // effect only when its route explicitly declares that property.
-        let audit_effect = match op {
-            DispatchOp::Write => true,
-            DispatchOp::Read => self
-                .runner
-                .petal_route_effective_metadata(mount, op, &path)
-                .map(|(_, metadata)| metadata.side_effecting_read)
-                .unwrap_or(true),
-            DispatchOp::Lookup | DispatchOp::List => false,
-        };
+        let audit_effect = self.is_effect(mount, op, &path);
         let _audit_guard = if audit_effect {
             Some(self.audit_effect_lock.lock().await)
         } else {
@@ -513,6 +699,14 @@ impl Handler for PetalRouter {
         if rest.is_empty() {
             return Ok(Entry::dir(mount));
         }
+        if rest == LAST_ERROR {
+            let bytes = self
+                .last_error(mount)
+                .ok_or_else(|| HandlerError::not_found(path.to_string_path()))?;
+            let mut entry = Entry::read_only_file(LAST_ERROR);
+            entry.size = bytes.len() as u64;
+            return Ok(entry);
+        }
         if Self::is_petal_document(&rest) {
             let bytes = self
                 .runner
@@ -546,6 +740,14 @@ impl Handler for PetalRouter {
 
     async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
         let (mount, rest) = Self::mount_path(path)?;
+        if !self.is_petal(mount) {
+            return Err(HandlerError::not_found(path.to_string_path()));
+        }
+        if rest == LAST_ERROR {
+            return self
+                .last_error(mount)
+                .ok_or_else(|| HandlerError::not_found(path.to_string_path()));
+        }
         if Self::is_petal_document(&rest) {
             return self
                 .runner
@@ -566,19 +768,31 @@ impl Handler for PetalRouter {
 
     async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
         let (mount, rest) = Self::mount_path(path)?;
-        if rest.is_empty() || Self::is_petal_document(&rest) {
+        if rest.is_empty() || Self::is_host_file(&rest) {
             return Err(HandlerError::PermissionDenied);
         }
-        match self
-            .dispatch(mount, DispatchOp::Write, rest, data.to_vec())
-            .await?
+        // dispatch_error drops a -2 message, so keep the Petal's own reason.
+        let mut reason = None;
+        let result = match self
+            .dispatch(mount, DispatchOp::Write, rest.clone(), data.to_vec())
+            .await
         {
-            DispatchResponse::Write => Ok(()),
-            DispatchResponse::Error { code, message } => {
+            Ok(DispatchResponse::Write) => Ok(()),
+            Ok(DispatchResponse::Error { code, message }) => {
+                reason = Some(message.clone());
                 Err(dispatch_error(code, message, path.to_string_path()))
             }
-            other => Err(unexpected_response("write", other)),
+            Ok(other) => Err(unexpected_response("write", other)),
+            Err(error) => Err(error),
+        };
+        match &result {
+            Ok(()) => self.clear_write_error(mount, &rest),
+            Err(error) => {
+                let message = reason.unwrap_or_else(|| error.to_string());
+                self.record_write_error(mount, &rest, &message);
+            }
         }
+        result
     }
 
     async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
@@ -624,7 +838,17 @@ impl Handler for PetalRouter {
             }
         }
         Ok(if rest.is_empty() {
-            Self::add_petal_documents(entries)
+            let mut entries = Self::add_petal_documents(entries);
+            // The host owns this name whether or not a record exists, so a
+            // guest entry of the same name is never advertised: lookup and
+            // read would refuse it.
+            entries.retain(|entry| entry.name != LAST_ERROR);
+            if let Some(record) = self.last_error(mount) {
+                let mut entry = Entry::read_only_file(LAST_ERROR);
+                entry.size = record.len() as u64;
+                entries.push(entry);
+            }
+            entries
         } else {
             entries
         })
@@ -653,20 +877,6 @@ impl Handler for PetalRouter {
                 .petal_route_effective_metadata(&mount, DispatchOp::Read, &rest)
                 .ok()
                 .map(|(_, metadata)| metadata.side_effecting_read)
-                .unwrap_or(false);
-        }
-        false
-    }
-
-    fn is_async_write_command(&self, path: &VfsPath) -> bool {
-        if let Some((mount, rest)) = self.metadata_route_path(path, DispatchOp::Write) {
-            return self
-                .runner
-                .petal_route_effective_metadata(&mount, DispatchOp::Write, &rest)
-                .ok()
-                .map(|(route, metadata)| {
-                    route.route.install_metadata.write_async || metadata.write_async
-                })
                 .unwrap_or(false);
         }
         false
@@ -790,12 +1000,14 @@ fn map_petal_err(e: PetalError) -> HandlerError {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     use bloom_vfs::{Handler, Vfs, VfsPath};
     use tempfile::TempDir;
 
     use super::*;
     use crate::host::{DenyHost, HostError, HostVfsEntry, HostVfsEntryKind, PetalHost};
+    use crate::package::route_fixtures::FixtureWrite;
     use crate::registry::NameRegistry;
     use crate::store::PetalStore;
     use crate::vm::PetalVm;
@@ -818,7 +1030,14 @@ mod tests {
         }
         async fn vfs_list(&self, path: &str) -> Result<Vec<HostVfsEntry>, HostError> {
             let names = match path {
-                "wallets" => vec!["alice"],
+                // Core lists its control entries beside the wallets.
+                "wallets" => std::iter::once("alice")
+                    .chain(
+                        bloom_vfs::handlers::wallets::WALLET_CONTROL_ENTRIES
+                            .iter()
+                            .map(|(name, _)| *name),
+                    )
+                    .collect(),
                 "wallets/alice" => vec!["0", "1"],
                 _ => return Err(HostError::NotFound(path.into())),
             };
@@ -872,7 +1091,7 @@ mod tests {
         ] {
             let (_dir, runner) = runner();
             let router = PetalRouter::new(runner, Arc::new(LifecycleHost { evm, solana }));
-            let result = router.account_context("alice", "0").await;
+            let result = router.account_context("alice", "0", true).await;
             if evm != "active" && solana != "active" {
                 assert!(matches!(result, Err(HandlerError::NotFound(_))));
             } else {
@@ -881,6 +1100,134 @@ mod tests {
                 assert_eq!(context.solana_fingerprint.is_some(), solana == "active");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn account_context_reuses_recent_observations_only_for_non_effects() {
+        struct CountingHost {
+            reads: std::sync::atomic::AtomicUsize,
+            refuse: AtomicBool,
+        }
+        #[async_trait]
+        impl PetalHost for CountingHost {
+            async fn vfs_lookup(&self, path: &str) -> Result<HostVfsEntry, HostError> {
+                AccountHost.vfs_lookup(path).await
+            }
+            async fn vfs_list(&self, path: &str) -> Result<Vec<HostVfsEntry>, HostError> {
+                AccountHost.vfs_list(path).await
+            }
+            async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
+                AccountHost.vfs_write(path, bytes).await
+            }
+            async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
+                self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(HostError::Denied(path.into()));
+                }
+                AccountHost.vfs_read(path).await
+            }
+        }
+        let host = Arc::new(CountingHost {
+            reads: Default::default(),
+            refuse: AtomicBool::new(false),
+        });
+        let reads = || host.reads.load(std::sync::atomic::Ordering::SeqCst);
+        let (_dir, runner) = runner();
+        let mut router = PetalRouter::new(runner, host.clone());
+
+        // A traversal's lookups and its read share one live observation.
+        for _ in 0..3 {
+            router.account_context("alice", "0", false).await.unwrap();
+        }
+        assert_eq!(reads(), 1);
+        // Accounts are cached independently.
+        router.account_context("alice", "1", false).await.unwrap();
+        assert_eq!(reads(), 2);
+        // Effects never reuse a cached observation.
+        router.account_context("alice", "0", true).await.unwrap();
+        router.account_context("alice", "0", true).await.unwrap();
+        assert_eq!(reads(), 4);
+
+        // A refused live observation evicts the cached account.
+        host.refuse.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(router.account_context("alice", "0", true).await.is_err());
+        assert!(router.account_context("alice", "0", false).await.is_err());
+        assert_eq!(reads(), 6);
+
+        // An expired observation is refreshed.
+        host.refuse
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        router.account_context_reuse = Duration::ZERO;
+        router.account_context("alice", "1", false).await.unwrap();
+        router.account_context("alice", "1", false).await.unwrap();
+        assert_eq!(reads(), 8);
+    }
+
+    #[tokio::test]
+    async fn a_slow_success_never_overwrites_a_later_refusal() {
+        struct GatedHost {
+            reads: std::sync::atomic::AtomicUsize,
+            refuse: AtomicBool,
+            gate: tokio::sync::Notify,
+        }
+        #[async_trait]
+        impl PetalHost for GatedHost {
+            async fn vfs_lookup(&self, path: &str) -> Result<HostVfsEntry, HostError> {
+                AccountHost.vfs_lookup(path).await
+            }
+            async fn vfs_list(&self, path: &str) -> Result<Vec<HostVfsEntry>, HostError> {
+                AccountHost.vfs_list(path).await
+            }
+            async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
+                AccountHost.vfs_write(path, bytes).await
+            }
+            async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
+                self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(HostError::Denied(path.into()));
+                }
+                // Observed before the refusal, but finishes after it.
+                self.gate.notified().await;
+                AccountHost.vfs_read(path).await
+            }
+        }
+        let host = Arc::new(GatedHost {
+            reads: Default::default(),
+            refuse: AtomicBool::new(false),
+            gate: tokio::sync::Notify::new(),
+        });
+        let (_dir, runner) = runner();
+        let router = PetalRouter::new(runner, host.clone());
+
+        let (slow, refused) = tokio::join!(router.account_context("alice", "0", true), async {
+            host.refuse.store(true, std::sync::atomic::Ordering::SeqCst);
+            let refused = router.account_context("alice", "0", true).await;
+            host.gate.notify_one();
+            refused
+        });
+        assert!(slow.is_ok());
+        assert!(refused.is_err());
+        // The cached refusal is newer than the slow success, so a non-effect
+        // observes again rather than reusing the account.
+        assert!(router.account_context("alice", "0", false).await.is_err());
+        assert_eq!(host.reads.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn expired_account_observations_are_pruned() {
+        let (_dir, runner) = runner();
+        let mut router = PetalRouter::new(runner, Arc::new(AccountHost));
+        router.account_context_reuse = Duration::from_millis(50);
+        router.account_context("alice", "0", false).await.unwrap();
+        router.account_context("alice", "1", false).await.unwrap();
+        assert_eq!(router.account_contexts.lock().unwrap().entries.len(), 2);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        router.account_context("alice", "1", false).await.unwrap();
+        let cache = router.account_contexts.lock().unwrap();
+        assert_eq!(
+            cache.entries.keys().collect::<Vec<_>>(),
+            [&("alice".to_owned(), 1)]
+        );
     }
 
     fn runner() -> (TempDir, PetalRunner) {
@@ -952,7 +1299,9 @@ namespaces = ["wallets"]
         );
     }
 
-    fn write_async_failing_package(root: &std::path::Path) {
+    /// A package whose single `submit` route declares `write-async` — Bloom
+    /// must wait for it anyway — and writes as `write` says.
+    fn write_route_package(root: &std::path::Path, write: FixtureWrite) {
         write_package_file(
             root,
             "petal.toml",
@@ -965,7 +1314,7 @@ name = "example"
         write_package_file(
             root,
             "petal/example/operations/[wallet]/[index]/submit.wasm",
-            &crate::package::route_fixtures::async_failing_write_route_component(),
+            &crate::package::route_fixtures::write_route_component(write),
         );
     }
 
@@ -1043,7 +1392,6 @@ name = "example"
             assert_eq!(entry.size, contents.len() as u64);
             assert_eq!(entry.mode, 0o444);
             assert_eq!(vfs.read(&path).await.unwrap(), contents);
-            assert!(!vfs.is_async_write_command(&path));
             assert!(matches!(
                 vfs.write(&path, b"replace").await,
                 Err(HandlerError::PermissionDenied)
@@ -1059,37 +1407,6 @@ name = "example"
                 router.cache_ttl(&VfsPath::parse(&format!("/example/{name}")).unwrap()),
                 None
             );
-        }
-    }
-
-    #[tokio::test]
-    async fn package_documents_are_not_async_guest_commands() {
-        let (dir, runner) = runner();
-        let package = dir.path().join("example-app");
-        write_async_failing_package(&package);
-        std::fs::rename(
-            package.join("petal/example/operations/[wallet]/[index]/submit.wasm"),
-            package.join("petal/example/operations/[wallet]/[index]/submit-old.wasm"),
-        )
-        .unwrap();
-        // Even explicit guest documentation routes cannot override the host's
-        // repository documents or attach their command/cache metadata.
-        for name in PETAL_DOCUMENT_NAMES {
-            write_package_file(
-                &package,
-                &format!("petal/example/{name}.wasm"),
-                &crate::package::route_fixtures::async_failing_write_route_component(),
-            );
-        }
-        runner.store().install_petal_package_dir(&package).unwrap();
-        let router = PetalRouter::new(runner, Arc::new(DenyHost));
-        assert!(router.is_async_write_command(
-            &VfsPath::parse("/example/operations/alice/0/submit-old").unwrap()
-        ));
-        for name in PETAL_DOCUMENT_NAMES {
-            let path = VfsPath::parse(&format!("/example/{name}")).unwrap();
-            assert!(!router.is_async_write_command(&path));
-            assert_eq!(router.cache_ttl(&path), None);
         }
     }
 
@@ -1463,7 +1780,10 @@ name = "example"
         }
         runner.store().install_petal_package_dir(&package).unwrap();
         let host = Arc::new(CountingAccountHost::default());
-        let router = PetalRouter::new(runner, host.clone());
+        let mut router = PetalRouter::new(runner, host.clone());
+        // Without reuse, each invocation observes live account state once
+        // however many ancestor routes share the account.
+        router.account_context_reuse = Duration::ZERO;
         router
             .list(&VfsPath::parse("demo/intents").unwrap())
             .await
@@ -1485,6 +1805,63 @@ name = "example"
             2,
             "each invocation rechecks live account state exactly once"
         );
+        // Within the reuse window, a traversal's repeated lookups share one
+        // live observation.
+        router.account_context_reuse = ACCOUNT_CONTEXT_REUSE;
+        router.account_contexts.lock().unwrap().entries.clear();
+        for _ in 0..3 {
+            router
+                .lookup(&VfsPath::parse("demo/intents/alice/0").unwrap())
+                .await
+                .unwrap();
+        }
+        assert_eq!(host.reads.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn guest_lookups_never_run_on_a_cached_account() {
+        struct RetiringHost {
+            reads: std::sync::atomic::AtomicUsize,
+            retired: AtomicBool,
+        }
+        #[async_trait]
+        impl PetalHost for RetiringHost {
+            async fn vfs_lookup(&self, path: &str) -> Result<HostVfsEntry, HostError> {
+                AccountHost.vfs_lookup(path).await
+            }
+            async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
+                self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self.retired.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Ok(br#"{"schema":"bloom.account.v1","wallet":"alice","number":0,"freshness":"fresh","evm":{"state":"retired","public_key_fingerprint":"aa"},"solana":{"state":"missing"}}"#.to_vec());
+                }
+                AccountHost.vfs_read(path).await
+            }
+            async fn vfs_list(&self, path: &str) -> Result<Vec<HostVfsEntry>, HostError> {
+                AccountHost.vfs_list(path).await
+            }
+            async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
+                AccountHost.vfs_write(path, bytes).await
+            }
+        }
+        let (dir, runner) = runner();
+        let package = dir.path().join("example-app");
+        write_dynamic_dir_package(&package, false);
+        runner.store().install_petal_package_dir(&package).unwrap();
+        let host = Arc::new(RetiringHost {
+            reads: Default::default(),
+            retired: AtomicBool::new(false),
+        });
+        let router = PetalRouter::new(runner, host.clone());
+        let path = VfsPath::parse("example/intents/alice/0").unwrap();
+        router.lookup(&path).await.unwrap();
+        assert_eq!(host.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // A guest lookup can use its route's capabilities, so even inside the
+        // reuse window it observes the account again and refuses a retirement
+        // before the guest runs.
+        host.retired
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(router.lookup(&path).await.is_err());
+        assert_eq!(host.reads.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -1518,27 +1895,127 @@ name = "example"
     }
 
     #[tokio::test]
-    async fn write_async_route_errors_are_returned_to_the_vfs_caller() {
+    async fn write_errors_are_returned_and_kept_in_last_error() {
         let (dir, runner) = runner();
         let package = dir.path().join("example-app");
-        write_async_failing_package(&package);
+        write_route_package(&package, FixtureWrite::Denied);
+        write_package_file(
+            &package,
+            "petal/example/operations/[wallet]/[index]/accept.wasm",
+            &crate::package::route_fixtures::write_route_component(FixtureWrite::Accepting),
+        );
         runner.store().install_petal_package_dir(&package).unwrap();
-
-        // A true switch used to detach this write and return Ok immediately.
-        // The compatibility method is now deliberately a no-op.
-        let router = PetalRouter::new(runner, Arc::new(AccountHost))
-            .with_async_write_switch(Arc::new(AtomicBool::new(true)));
+        let router = PetalRouter::new(runner, Arc::new(AccountHost));
         let vfs = Vfs::builder().mount("petals", Arc::new(router)).build();
-        let path = VfsPath::parse("/petals/example/operations/alice/0/submit").unwrap();
-        assert!(
-            vfs.is_async_write_command(&path),
-            "mounted component writes must not return handler failures through macOS NFS"
-        );
+        let failing = VfsPath::parse("/petals/example/operations/alice/0/submit").unwrap();
+        let accepting = VfsPath::parse("/petals/example/operations/alice/0/accept").unwrap();
+        let last_error = VfsPath::parse("/petals/example/last_error.json").unwrap();
+        let listed = |entries: Vec<Entry>| entries.iter().any(|e| e.name == LAST_ERROR);
 
-        let error = vfs.write(&path, b"payload").await.unwrap_err();
-        assert!(
-            error.to_string().contains("component route write"),
-            "unexpected write error: {error}"
+        assert!(!vfs.is_async_write_command(&failing));
+        assert!(vfs.lookup(&last_error).await.is_err());
+        assert!(!listed(
+            vfs.list(&VfsPath::parse("/petals/example").unwrap())
+                .await
+                .unwrap()
+        ));
+
+        // A -2 refusal reaches the mount as a bare EACCES; its reason must survive.
+        let error = vfs.write(&failing, b"payload").await.unwrap_err();
+        assert!(matches!(error, HandlerError::PermissionDenied), "{error}");
+        let record: serde_json::Value =
+            serde_json::from_slice(&vfs.read(&last_error).await.unwrap()).unwrap();
+        assert_eq!(record["path"], "operations/alice/0/submit");
+        assert_eq!(record["error"], crate::package::route_fixtures::DENY_REASON);
+        assert_eq!(record["schema"], "bloom.petal-write-error/1");
+        // A reader compares at_ms with its own write, so it has to be real.
+        assert!(record["at_ms"].as_u64().unwrap() > 1_700_000_000_000);
+        assert_eq!(vfs.lookup(&last_error).await.unwrap().mode, 0o444);
+        assert!(listed(
+            vfs.list(&VfsPath::parse("/petals/example").unwrap())
+                .await
+                .unwrap()
+        ));
+        assert!(matches!(
+            vfs.write(&last_error, b"{}").await,
+            Err(HandlerError::PermissionDenied)
+        ));
+
+        // A success on another route says nothing about the refusal a reader
+        // has yet to read, so it must not clear it.
+        vfs.write(&accepting, b"payload").await.unwrap();
+        let record: serde_json::Value =
+            serde_json::from_slice(&vfs.read(&last_error).await.unwrap()).unwrap();
+        assert_eq!(record["path"], "operations/alice/0/submit");
+    }
+
+    #[tokio::test]
+    async fn a_trapping_route_records_the_host_error_it_has_no_reason_for() {
+        let (dir, runner) = runner();
+        let package = dir.path().join("example-app");
+        write_route_package(&package, FixtureWrite::Trapping);
+        runner.store().install_petal_package_dir(&package).unwrap();
+        let router = PetalRouter::new(runner, Arc::new(AccountHost));
+        let vfs = Vfs::builder().mount("petals", Arc::new(router)).build();
+        let failing = VfsPath::parse("/petals/example/operations/alice/0/submit").unwrap();
+        let last_error = VfsPath::parse("/petals/example/last_error.json").unwrap();
+
+        // A trap is not a route refusal, so there is no message to keep; the
+        // record falls back to the host error and must still name the path.
+        let error = vfs.write(&failing, b"payload").await.unwrap_err();
+        let record: serde_json::Value =
+            serde_json::from_slice(&vfs.read(&last_error).await.unwrap()).unwrap();
+        assert_eq!(record["path"], "operations/alice/0/submit");
+        assert_eq!(record["error"], error.to_string());
+        assert!(!record["error"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_the_failing_path_clears_its_own_record() {
+        let (dir, runner) = runner();
+        let package = dir.path().join("example-app");
+        write_route_package(&package, FixtureWrite::Denied);
+        runner.store().install_petal_package_dir(&package).unwrap();
+        let router = PetalRouter::new(runner, Arc::new(AccountHost));
+
+        router.record_write_error("example", "operations/a", "first");
+        router.clear_write_error("example", "operations/b");
+        assert!(router.last_error("example").is_some(), "unrelated success");
+        router.clear_write_error("example", "operations/a");
+        assert!(router.last_error("example").is_none());
+
+        // An uninstalled mount name never gets an entry: a write to an
+        // invented name would otherwise pin one for the process's life.
+        router.record_write_error("absent", "x", "nope");
+        assert!(router.last_error("absent").is_none());
+
+        // A route's refusal is prose; a payload-sized one is truncated.
+        let long = "x".repeat(MAX_WRITE_ERROR_BYTES * 2);
+        router.record_write_error("example", "operations/a", &long);
+        let record: serde_json::Value =
+            serde_json::from_slice(&router.last_error("example").unwrap()).unwrap();
+        assert_eq!(
+            record["error"].as_str().unwrap().len(),
+            MAX_WRITE_ERROR_BYTES
         );
+    }
+
+    #[tokio::test]
+    async fn an_uninstalled_mount_serves_no_record() {
+        let (dir, runner) = runner();
+        let package = dir.path().join("example-app");
+        write_route_package(&package, FixtureWrite::Denied);
+        runner.store().install_petal_package_dir(&package).unwrap();
+        let router = PetalRouter::new(runner, Arc::new(AccountHost));
+        router.record_write_error("example", "operations/a", "first");
+        let vfs = Vfs::builder().mount("petals", Arc::new(router)).build();
+
+        // read must agree with lookup: no Petal, no record, even if one was
+        // retained under that name before the Petal was removed.
+        let absent = VfsPath::parse("/petals/absent/last_error.json").unwrap();
+        assert!(matches!(
+            vfs.read(&absent).await,
+            Err(HandlerError::NotFound(_))
+        ));
     }
 }

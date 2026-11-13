@@ -20,7 +20,7 @@ The happy path for a new user is:
 Tell your agent: "Read https://bloom.directory/SKILL.md and set up Bloom."
 ```
 
-That skill instructs the agent to install or build `bloom`, run `bloom init`, inspect `/docs`, and prefer `bloom vfs` or the mounted `/bloom` filesystem over custom Web3 code.
+That [skill](../skills/bloom/SKILL.md) connects to an existing Bloom first. Only when asked to install does it stage the signed release and hand the one privileged step to the user's operating system. It then follows the mounted `AGENTS.md` and prefers the filesystem over custom Web3 code.
 
 ## What the wallet enables
 
@@ -37,36 +37,9 @@ An agent using Bloom can:
   challenges staged for review before any x402 or Tempo MPP credential is
   signed;
 - enforce wallet policy: spend caps, allow/deny lists, contract-call gates, private orderflow preferences, and audit logging;
-- use thirteen read-ready public EVM networks immediately after `bloom init`: Ethereum, Base, Tempo, Robinhood Chain, Arbitrum, Optimism, Polygon, BNB Smart Chain, Avalanche, Gnosis, Linea, HyperEVM, and Arc, plus local Anvil.
+- use thirteen read-ready public EVM networks immediately after setup: Ethereum, Base, Tempo, Robinhood Chain, Arbitrum, Optimism, Polygon, BNB Smart Chain, Avalanche, Gnosis, Linea, HyperEVM, and Arc, plus local Anvil.
 
-Mainnet and L2 broadcast routing is enabled by default. Live sends still require the applicable signing, policy, confirmation, and Sealed Approval gates.
-
-## First five minutes
-
-```sh
-# 1. Install/build Bloom, then initialize the default home.
-bloom init
-
-# 2. See what the agent can read.
-bloom vfs ls /
-bloom vfs cat /docs/README.md
-bloom vfs cat /chains/ethereum/head/number
-bloom vfs cat /prices/spot/eth.usd
-
-# 3. Create a demo wallet. Passkey is the default — Broker launches a WebAuthn
-# ceremony in the browser and Signer retains all private key material.
-bloom wallet new alice
-bloom wallet list
-
-# 4. Stage a devnet transaction when Anvil is running.
-bloom vfs write \
-  /wallets/alice/0/chains/anvil/outbox/new.tx \
-  --data 'send 0.01 eth to 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 on anvil'
-
-# 5. Review the generated plan before confirming.
-bloom vfs ls /wallets/alice/0/chains/anvil/outbox/pending
-bloom vfs cat /wallets/alice/0/chains/anvil/outbox/pending/<id>/plan.md
-```
+Mainnet and L2 broadcast routing is enabled by default. Live sends still require the applicable signing, policy, confirmation, and Sealed Approval gates. After setup, the mounted `AGENTS.md` and `docs/` describe discovery, wallet creation, and the transaction loop for the installed version.
 
 ## Paid HTTP requests
 

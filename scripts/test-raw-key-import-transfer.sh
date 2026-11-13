@@ -15,10 +15,9 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-broker_repo="$(cd "${repo_root}/../bloom-broker" && pwd -P)"
 launcher="${BLOOM_TRIAD_DEV_LAUNCHER:-${repo_root}/scripts/triad-dev-launch.sh}"
 bloom_bin="${BLOOM_INTEGRATION_MACHINE_BIN:-${repo_root}/target/debug/bloom}"
-driver_bin="${BLOOM_INTEGRATION_DEBUG_DRIVER_BIN:-${broker_repo}/target/debug/bloom-broker-debug-driver}"
+driver_bin="${BLOOM_INTEGRATION_DEBUG_DRIVER_BIN:-$(cd "${repo_root}/../bloom-broker" && pwd -P)/target/debug/bloom-broker-debug-driver}"
 startup_timeout_secs="${BLOOM_INTEGRATION_STARTUP_TIMEOUT_SECS:-300}"
 
 die() { printf 'raw-import transfer e2e: %s\n' "$*" >&2; exit 1; }
@@ -181,7 +180,7 @@ printf 'raw-import transfer e2e: importing scalar %s through the ceremony...\n' 
 import_launch="$(cli wallet import "$WALLET_NAME" --raw-private-key)"
 import_ceremony_url="$(printf '%s\n' "$import_launch" | sed -n 's/^ceremony_url: //p')"
 [ -n "$import_ceremony_url" ] || die "wallet import launch omitted ceremony_url: $import_launch"
-printf '%s\n' "$import_launch" | sed -n 's/^ceremony_url: //p' | grep -q '^http://localhost:18734/ceremony/' ||
+printf '%s\n' "$import_launch" | sed -n 's/^ceremony_url: //p' | grep -qF "${BLOOM_TRIAD_DEV_CEREMONY_ORIGIN}/ceremony/" ||
   die "import ceremony URL is not the canonical Broker origin: $import_ceremony_url"
 import_result="$("$driver_bin" complete "$import_ceremony_url" "$AUTH_SEED" \
   --sign-count 1 --raw-private-key "$TEST_RAW_KEY_B64")"
@@ -191,7 +190,8 @@ printf 'raw-import transfer e2e: imported wallet %s\n' "$wallet_id"
 # 5. Projection: authenticated Broker projection carries the imported key's
 #    exact EVM address, and wallet.accounts is the imported-scalar profile
 #    with no derived accounts.
-projection="$(cli wallet projection "$wallet_id")"
+# Broker publishes the imported wallet shortly after the ceremony completes.
+for _ in $(seq 50); do projection="$(cli wallet projection "$wallet_id" 2>/dev/null)" && break; sleep 0.2; done
 printf '%s' "$projection" | jq -e --arg wallet "$wallet_id" --arg addr "$expected_addr" '
   .wallet.wallet_id == $wallet and
   .source_protocol == "bloom.machine-broker.v1" and
@@ -232,7 +232,14 @@ printf '%s' "$policy_operation" | grep -Eq '^[0-9a-f]{64}$' ||
   die "policy update launch omitted a valid operation_id: $policy_launch"
 cli wallet commit-policy "$policy_operation" >/dev/null ||
   die "policy commit failed"
-updated_policy="$(vcat "/wallets/${wallet_id}/policy.json")"
+# The policy projection refreshes shortly after the commit.
+for _ in $(seq 50); do
+  updated_policy="$(vcat "/wallets/${wallet_id}/policy.json")"
+  printf '%s' "$updated_policy" | jq -e --arg dest "$RECIPIENT" '
+    any(.allowed_destinations[]; .destination == $dest)
+  ' >/dev/null && break
+  sleep 0.2
+done
 printf '%s' "$updated_policy" | jq -e --arg dest "$RECIPIENT" '
   any(.allowed_destinations[]; .destination == $dest)
 ' >/dev/null || die "committed policy omitted the allowlisted recipient: $updated_policy"
@@ -267,28 +274,45 @@ policy_check="$(vcat "${pending_dir}/${pending_id}/policy_check.json")"
 printf '%s' "$policy_check" | jq -e . >/dev/null || die "policy_check.json is not valid JSON"
 printf 'raw-import transfer e2e: staged pending entry %s\n' "$pending_id"
 
-# 9. First confirm must fail closed and persist the Sealed Approval ceremony.
+# 9. The first confirm fails closed at once and names the ceremony link.
 confirm_path="${pending_dir}/${pending_id}/confirm"
-if vwrite "$confirm_path" "y" >/dev/null 2>&1; then
+if vwrite "$confirm_path" "y" >/dev/null 2>"${run_root}/confirm1.err"; then
   die "confirm succeeded before the approval ceremony completed"
 fi
-ceremony="$(wait_for_file "pending ceremony projection" "${pending_dir}/${pending_id}/ceremony.json")"
-approval_ceremony_url="$(printf '%s' "$ceremony" | jq -er '.ceremony_url')"
-printf '%s' "$ceremony" | jq -e '.approval_operation_id | test("^[0-9a-f]{64}$")' >/dev/null ||
-  die "pending ceremony.json omitted a durable approval operation id: $ceremony"
+challenge="$(wait_for_file "pending approval challenge" "${pending_dir}/${pending_id}/approval_challenge.json")"
+approval_ceremony_url="$(printf '%s' "$challenge" | jq -er '.ceremony_url')"
+printf '%s' "$challenge" | jq -e '(.approval_id | test("^[0-9a-f]{64}$")) and .state == "awaiting_ceremony"' >/dev/null ||
+  die "pending approval challenge omitted its approval id or live state: $challenge"
+grep -qF "$approval_ceremony_url" "${run_root}/confirm1.err" ||
+  die "the first confirm's error did not name its ceremony link: $(cat "${run_root}/confirm1.err")"
 
-# 10. Complete the approval ceremony and confirm on the exact retry.
+# 10. Confirming again waits for the owner without signing. A concurrent
+#     confirm must not sign twice. Completing the ceremony lets the waiting
+#     confirm sign and send.
+vwrite "$confirm_path" "y" >/dev/null 2>"${run_root}/confirm2.err" &
+confirm_pid=$!
+vwrite "$confirm_path" "y" >/dev/null 2>"${run_root}/confirm3.err" &
+confirm3_pid=$!
+sleep 1
+kill -0 "$confirm_pid" 2>/dev/null || die "the second confirm returned before approval: $(cat "${run_root}/confirm2.err")"
+[ "$(cast nonce --rpc-url "$rpc_url" "$expected_addr")" = "0" ] || die "a transaction was sent before approval"
 "$driver_bin" complete "$approval_ceremony_url" "$AUTH_SEED" --sign-count 3 >/dev/null ||
   die "completing the Sealed Approval ceremony failed"
-vwrite "$confirm_path" "y" || die "post-ceremony confirm retry failed"
+confirm_ok=0
+wait "$confirm_pid" && confirm_ok=$((confirm_ok + 1))
+wait "$confirm3_pid" && confirm_ok=$((confirm_ok + 1))
+[ "$confirm_ok" -ge 1 ] ||
+  die "no waiting confirm succeeded: $(cat "${run_root}/confirm2.err" "${run_root}/confirm3.err")"
 
 # 11. The entry must reconcile into sent/ with a transaction hash.
 sent_dir="/wallets/${wallet_id}/0/chains/anvil/outbox/sent"
 tx_hash="$(wait_for_file "broadcast transaction hash" "${sent_dir}/${pending_id}/tx_hash" | tr -d '[:space:]')"
 printf '%s' "$tx_hash" | grep -Eq '^0x[0-9a-f]{64}$' || die "malformed tx_hash: $tx_hash"
-terminal_ceremony="$(vcat "${sent_dir}/${pending_id}/ceremony.json")"
-printf '%s' "$terminal_ceremony" | jq -e '.sign_dispatched == true and .ceremony_url == null' >/dev/null ||
-  die "terminal signing projection is not terminal: $terminal_ceremony"
+for name in approval_challenge.json ceremony.json; do
+  if vcat "${sent_dir}/${pending_id}/${name}" >/dev/null 2>&1; then
+    die "sent entry must not project ${name}"
+  fi
+done
 sent_intent="$(vcat "${sent_dir}/${pending_id}/intent.json")"
 printf '%s' "$sent_intent" | jq -e --arg hash "$tx_hash" '
   .status == "sent" and .tx_hash == $hash

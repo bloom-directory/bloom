@@ -194,7 +194,7 @@ fn legacy_monitor_preserves_session_lifecycle_without_claiming_network_containme
     assert!(monitor.contains("status.json"));
     assert!(monitor.contains("restart_services_for_live_session"));
     assert!(monitor.contains("if enrollment_state == \"active\""));
-    assert!(monitor.contains("gui/{login_uid}/com.bloom.session"));
+    assert!(monitor.contains("user/{login_uid}/com.bloom.session"));
     assert!(monitor.contains("session.sock"));
     assert!(monitor.contains("metadata.file_type().is_socket()"));
     assert!(monitor.contains("system/com.bloom.{service}.{login_uid}"));
@@ -204,10 +204,13 @@ fn legacy_monitor_preserves_session_lifecycle_without_claiming_network_containme
     assert_ordered(
         &monitor,
         &[
-            "gui/{login_uid}/com.bloom.session",
-            "state = running",
+            "fn restart_services_for_live_session",
+            "prepare_login_sentinel(",
             "session.sock",
             "[\"signer\", \"broker\"]",
+            "fn prepare_login_sentinel",
+            "user/{login_uid}/com.bloom.session",
+            "state = running",
         ],
     );
 
@@ -307,16 +310,6 @@ fn macos_installer_manages_the_path_entry_and_migrates_legacy_cli_post_activatio
         ],
     );
     assert!(!source.contains("rm -rf -- \"$login_home/.local"));
-}
-
-#[test]
-#[cfg(target_os = "macos")]
-fn staged_macos_installer_cli_lifecycle_passes() {
-    let status = Command::new("bash")
-        .arg(workspace().join("tests/packaging/macos-installer-staged.sh"))
-        .status()
-        .expect("run staged macOS installer CLI lifecycle");
-    assert!(status.success());
 }
 
 #[test]
@@ -464,6 +457,23 @@ fn macos_conformance_workflows_consume_unified_candidates() {
     let ci = fs::read_to_string(workspace().join(".github/workflows/ci.yml")).unwrap();
     assert!(ci.contains(&format!("broker_ref: {broker_commit}")));
     assert!(ci.contains(&format!("signer_ref: {signer_commit}")));
+
+    // These assertions read both conformance workflows, so editing either
+    // must trigger CI, which runs this binary on Linux. The Unix-principal
+    // workflow runs the packaging scripts directly.
+    let code_paths = ci.split("- \"Cargo.toml\"").next().unwrap();
+    assert!(code_paths.contains("- \".github/workflows/macos-unix-conformance.yml\""));
+    assert!(code_paths.contains("- \".github/workflows/macos-two-login-conformance.yml\""));
+    assert!(ci.contains("-E 'package(bloom-it) and binary(macos_launchagent)'"));
+    let unix = fs::read_to_string(workspace().join(".github/workflows/macos-unix-conformance.yml"))
+        .unwrap();
+    for script in [
+        "macos-installer-staged.sh",
+        "macos-pf-retirement.sh",
+        "macos-upgrade-rollback.sh",
+    ] {
+        assert!(unix.contains(&format!("bash bloom/tests/packaging/{script}")));
+    }
 }
 
 #[test]
@@ -504,7 +514,15 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     assert!(source.contains("task-access-probe"));
     assert!(source.contains("Machine login sampled"));
     assert!(source.contains("session sentinel did not reject an unauthorized login-UID peer"));
-    assert!(source.contains("services did not drain after the login-session sentinel disappeared"));
+    assert!(source.contains("source \"$conformance_dir/logout-drain.sh\""));
+    assert!(source.contains(
+        "wait_for_logout_services \"$broker_uid\" \"$signer_uid\" \"$broker_label\" \"$signer_label\""
+    ));
+    let logout_drain = fs::read_to_string(
+        workspace().join("tests/conformance/macos-unix-principals/logout-drain.sh"),
+    )
+    .unwrap();
+    assert!(logout_drain.contains("services did not exit successfully after login-session logout"));
     assert!(
         source.contains(
             "Broker retained the ceremony listener on $ceremony_host after session logout"
@@ -601,4 +619,106 @@ fn macos_upgrade_rollback_handles_the_system_etc_symlink() {
         .status()
         .expect("run macOS rollback archive regression");
     assert!(status.success());
+}
+
+#[test]
+fn interactive_services_are_not_throttled_as_background_jobs() {
+    // Machine, Broker and Signer answer the user's mount, CLI and ceremony
+    // requests. launchd's Background type throttled Machine's startup
+    // journal verification about 60-fold; only the monitors stay Background.
+    for (template, process_type) in [
+        ("launchagents/com.bloom.machine.plist.in", "Standard"),
+        ("launchdaemons/com.bloom.broker.plist.in", "Standard"),
+        ("launchdaemons/com.bloom.signer.plist.in", "Standard"),
+        ("launchagents/com.bloom.session.plist.in", "Background"),
+        ("launchdaemons/com.bloom.containment.plist.in", "Background"),
+    ] {
+        let source =
+            fs::read_to_string(workspace().join("packaging/triad/macos").join(template)).unwrap();
+        assert!(
+            source.contains(&format!(
+                "<key>ProcessType</key>\n  <string>{process_type}</string>"
+            )),
+            "{template} must run as {process_type}"
+        );
+    }
+}
+
+#[test]
+fn macos_installer_hides_legacy_wallets_whose_migration_completed() {
+    let source =
+        fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
+    let start = source
+        .find("# A legacy wallet has finished migrating")
+        .unwrap();
+    let report = source[start..]
+        .find("report_legacy_wallet_migrations() {")
+        .unwrap()
+        + start;
+    let end = report + source[report..].find("\n}\n").unwrap() + 3;
+    let functions = &source[start..end];
+
+    let home = tempfile::tempdir().unwrap();
+    let keystore = home.path().join(".bloom/keystore");
+    for name in ["done", "differs", "pending"] {
+        fs::create_dir_all(keystore.join(name)).unwrap();
+        fs::write(keystore.join(name).join("kind"), "passkey").unwrap();
+    }
+    let receipt = |name: &str, address: &str| {
+        fs::write(
+            home.path()
+                .join(format!(".bloom/{name}.triad-migration-receipt.json")),
+            format!(r#"{{"address":"{address}"}}"#),
+        )
+        .unwrap();
+    };
+    receipt("done", "0x62D236408548f0F4694Acc9CcD2B1CB6a9551154");
+    receipt("differs", "0x10ad25D496aFeD7e172bF7b79F1CD786CFE30722");
+
+    let harness = format!(
+        r#"set -Eeuo pipefail
+live=true; legacy_cli_removed=false; login_uid=501; login_user=alice
+release_base=/unused; signer_config=/unused; cli_link=/usr/local/bin/bloom
+BLOOM_MACOS_SIGNER_UID=503; BLOOM_MACOS_SIGNER_GID=703
+resolve_login_home() {{ login_home='{home}'; }}
+# The receipt is read as the login user; the Machine reports live addresses.
+/usr/bin/sudo() {{ shift 3; "$@"; }}
+/usr/bin/plutil() {{ sed -n 's/.*"address":"\([^"]*\)".*/\1/p' "${{@: -1}}"; }}
+launchctl() {{
+  case "${{@: -1}}" in
+    done) echo 0x62d236408548f0f4694acc9ccd2b1cb6a9551154 ;;
+    differs) echo 0x943431A21c2DFF4aB97e9AB41E5dfF9E306c4bD5 ;;
+    *) return 1 ;;
+  esac
+}}
+{functions}
+report_legacy_wallet_migrations
+"#,
+        home = home.path().display(),
+    );
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(harness)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("Already migrated, no action needed: done\n"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("Migrate legacy passkey wallet done"),
+        "{stdout}"
+    );
+    // A receipt whose address the Machine does not report, or no receipt at
+    // all, still gets its instructions.
+    assert!(
+        stdout.contains("Migrate legacy passkey wallet differs"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Migrate legacy passkey wallet pending"),
+        "{stdout}"
+    );
 }

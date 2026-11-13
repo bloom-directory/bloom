@@ -512,6 +512,8 @@ fn print_public_custody_result(result: &CustodyResult) -> Result<()> {
             "wallet_id": result.wallet_id,
             "public_key_refs": result.public_key_refs,
             "credential_summaries": result.credential_summaries,
+                "surface": result.surface,
+                "credential_authority_generation": result.credential_authority_generation,
             "receipt_digest": result.receipt_digest,
             "has_encrypted_browser_result": result.encrypted_browser_result.is_some(),
         }))
@@ -772,6 +774,11 @@ mod tests {
 
     fn completed_receipt(operation_id: OperationId) -> CustodyResult {
         CustodyResult {
+            surface: Some(bloom_broker_api::CeremonySurfaceRef {
+                surface_id: bloom_broker_api::Token::new("local").unwrap(),
+                identity_digest: bloom_broker_api::Digest32::from_bytes([0; 32]),
+            }),
+            credential_authority_generation: Some(bloom_broker_api::DecimalU64::new(0)),
             ceremony_kind: CeremonyKind::PolicyUpdate,
             custody_operation_id: operation_id,
             public_status: CeremonyState::Succeeded,
@@ -883,10 +890,14 @@ mod tests {
         );
         server.await.unwrap();
 
+        // Keep the port reserved without listening: a freed ephemeral port can
+        // be reused by another concurrent client (including a TCP self-connect).
+        let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+        reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
         assert_eq!(
-            probe_ceremony_listener_owner_at(&test_address).await,
+            probe_ceremony_listener_owner_at(&reserved.local_addr().unwrap().to_string()).await,
             CeremonyListenerOwner::Unbound,
-            "a freed listener is not misreported as a foreign owner"
+            "a port without a listener is not misreported as a foreign owner"
         );
     }
 

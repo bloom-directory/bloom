@@ -26,6 +26,8 @@ pub enum ParseError {
 
 #[derive(serde::Deserialize, Debug, Clone)]
 struct LooseIntent {
+    #[serde(flatten)]
+    extra: std::collections::BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     kind: Option<String>,
     #[serde(default)]
@@ -47,8 +49,6 @@ struct LooseIntent {
     #[serde(default)]
     amount: Option<String>,
     #[serde(default)]
-    intent: Option<String>,
-    #[serde(default)]
     chain: Option<String>,
     #[serde(default)]
     gas: Option<String>,
@@ -69,8 +69,6 @@ struct LooseIntent {
     approved: Option<bool>,
     #[serde(default)]
     usd_value_hint: Option<String>,
-    #[serde(default)]
-    review_mode: Option<String>,
 }
 
 impl LooseIntent {
@@ -83,8 +81,6 @@ impl LooseIntent {
                     Some("approve".into())
                 } else if self.contract.is_some() && self.method.is_some() {
                     Some("call".into())
-                } else if self.intent.is_some() {
-                    Some("enso".into())
                 } else if self.to.is_some() {
                     if self
                         .data
@@ -159,7 +155,6 @@ impl LooseIntent {
                     || self.args.is_some()
                     || self.amount.is_some()
                     || self.spender.is_some()
-                    || self.intent.is_some()
                     || self.operator.is_some()
                     || self.token_id.is_some()
                     || self.standard.is_some()
@@ -183,14 +178,30 @@ impl LooseIntent {
                     value: self.value.unwrap_or_default(),
                 }
             }
-            "enso" => RawIntentBody::Enso {
-                intent: self.intent.ok_or(ParseError::Ambiguous)?,
-            },
-            "approve" => RawIntentBody::Approve {
-                token: self.token.ok_or(ParseError::Ambiguous)?,
-                spender: self.spender.ok_or(ParseError::Ambiguous)?,
-                amount: self.amount.unwrap_or_else(|| "max".into()),
-            },
+            "approve" => {
+                if !self.extra.is_empty()
+                    || self.to.is_some()
+                    || self.value.is_some()
+                    || self.data.is_some()
+                    || self.contract.is_some()
+                    || self.method.is_some()
+                    || self.args.is_some()
+                    || self.operator.is_some()
+                    || self.token_id.is_some()
+                    || self.standard.is_some()
+                    || self.safe.is_some()
+                    || self.approved.is_some()
+                {
+                    return Err(ParseError::Invalid("approve accepts token, spender and amount plus transaction options; remove unknown or incompatible fields".into()));
+                }
+                let amount = self.amount.filter(|v| !v.trim().is_empty()).ok_or_else(||
+                    ParseError::Invalid("approve requires amount in raw token units; use 0 to revoke or explicit max for unlimited".into()))?;
+                RawIntentBody::Approve {
+                    token: self.token.ok_or(ParseError::Ambiguous)?,
+                    spender: self.spender.ok_or(ParseError::Ambiguous)?,
+                    amount,
+                }
+            }
             "nft_transfer" => RawIntentBody::NftTransfer {
                 contract: self.contract.ok_or(ParseError::Ambiguous)?,
                 to: self.to.ok_or(ParseError::Ambiguous)?,
@@ -231,7 +242,6 @@ impl LooseIntent {
             nonce: self.nonce,
             gas_limit_hint: None,
             usd_value_hint: self.usd_value_hint,
-            review_mode: self.review_mode,
         })
     }
 }
@@ -295,7 +305,6 @@ pub fn parse(input: &str) -> Result<RawIntent, ParseError> {
             nonce: None,
             gas_limit_hint: None,
             usd_value_hint: None,
-            review_mode: None,
         });
     }
     if s.starts_with("nft ") {
@@ -418,7 +427,6 @@ fn parse_nft_shell(line: &str) -> Result<RawIntent, ParseError> {
         nonce: None,
         gas_limit_hint: None,
         usd_value_hint: None,
-        review_mode: None,
     })
 }
 
@@ -563,12 +571,6 @@ value = "0"
     }
 
     #[test]
-    fn json_enso() {
-        let r = parse(r#"{"kind":"enso","intent":"swap 1 ETH to USDC"}"#).unwrap();
-        assert!(matches!(r.body, RawIntentBody::Enso { .. }));
-    }
-
-    #[test]
     fn empty_input_errors() {
         assert!(matches!(parse(""), Err(ParseError::Empty)));
     }
@@ -592,9 +594,34 @@ value = "0"
     }
 
     #[test]
+    fn approval_requires_explicit_unambiguous_amount() {
+        for amount in ["0", "123", "max"] {
+            let input = serde_json::json!({"kind":"approve", "token":"USDC", "spender":"router", "amount":amount});
+            assert!(parse(&input.to_string()).is_ok());
+        }
+        for extra in [
+            serde_json::json!({}),
+            serde_json::json!({"amount":""}),
+            serde_json::json!({"amount":" "}),
+            serde_json::json!({"ammount":"max"}),
+            serde_json::json!({"amount":"0", "value":"0"}),
+            serde_json::json!({"amount":"0", "unknown":true}),
+        ] {
+            let mut input =
+                serde_json::json!({"kind":"approve", "token":"USDC", "spender":"router"});
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(parse(&input.to_string()).is_err(), "{input}");
+        }
+        assert!(parse("kind = 'approve'\ntoken = 'USDC'\nspender = 'router'").is_err());
+    }
+
+    #[test]
     fn json_approve_inferred_from_fields() {
         // No kind; presence of token+spender disambiguates.
-        let r = parse(r#"{"token":"0xUSDC","spender":"0xRouter"}"#).unwrap();
+        let r = parse(r#"{"token":"0xUSDC","spender":"0xRouter","amount":"max"}"#).unwrap();
         match r.body {
             RawIntentBody::Approve { amount, .. } => assert_eq!(amount, "max"),
             _ => panic!("wrong variant"),

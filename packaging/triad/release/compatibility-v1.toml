@@ -1,32 +1,39 @@
 schema = "bloom.triad-compatibility/1"
 
 [revisions]
-broker_commit = "df25a54676aa2c52d6b018db486b46ec6a51718a"
-signer_commit = "97b9ac7e47ee682e59804d04f6288419f3598a58"
-service_runtime_commit = "5db670e1b7507deabfdcf451be8b5d315c1c9d91"
-petal_contract_commit = "73c5b06a77599368fbc79fb7947a629b5b4c630e"
+broker_commit = "0a9a8dae12e86237cb9d6ba63a2456d7c0871cf9"
+signer_commit = "68d8ecaec34a7cae99f754972b5a781a8e17e542"
+service_runtime_commit = "48b83c54c1787b4aff2456bd3adbe18856902e45"
+petal_contract_commit = "7dd2722db5de305dd63ca4ed03591f3ab82fa40b"
 
+# Persisted credential surfaces and registration selections are unreadable by
+# the released Machine reader; see docs/reviews/2026-09-23-schema-migration.md.
+# Machine state 3 adds `review_payload_digest` to pending exact-signing state,
+# which Machine 0.4.x rejects as an unknown field.
 [state.machine]
-current = 1
-downgrade_floor = 1
+current = 3
+downgrade_floor = 3
+migration_floor = 1
 
 [state.broker]
-current = 2
-downgrade_floor = 2
+current = 3
+downgrade_floor = 3
+migration_floor = 1
 
 [state.signer]
-current = 1
-downgrade_floor = 1
+current = 2
+downgrade_floor = 2
+migration_floor = 1
 
 [protocols.machine_broker]
 major = 1
-minor_min = 6
-minor_max = 6
+minor_min = 8
+minor_max = 8
 
 [protocols.broker_signer]
 major = 1
-minor_min = 5
-minor_max = 5
+minor_min = 6
+minor_max = 6
 
 [protocols.signer_control]
 major = 1
@@ -39,7 +46,7 @@ minor_min = 0
 minor_max = 1
 
 [[bundles]]
-machine = "0.3.2"
+machine = "0.5.0"
 broker = "0.1.0"
 signer = "0.1.0"
 backends = ["local"]

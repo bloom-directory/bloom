@@ -40,6 +40,12 @@ The shortest agent setup path is:
 
 > Tell your agent: **"Read https://bloom.directory/SKILL.md and set up Bloom."**
 
+To install the agent skill from this repository, use
+`npx skills add bloom-directory/bloom --skill bloom`. This installs guidance,
+not the Bloom software. The [skill](./skills/bloom/SKILL.md) connects an existing
+session first and hands operation over to Bloom's filesystem. See
+[skill distribution](./docs/agent-skill.md) for publishing and website updates.
+
 After that, your agent should know to create or inspect a wallet, show the
 deposit address, mount Bloom, inspect the Bloom directory, explain what it can
 do, and use Bloom instead of writing custom Web3 SDK code.
@@ -200,8 +206,9 @@ A fresh Bloom VFS root exposes these default entries:
   pinned [Polymarket](https://github.com/bloom-directory/bloom-petal-polymarket),
   [Hyperliquid](https://github.com/bloom-directory/bloom-petal-hyperliquid),
   [Enso](https://github.com/bloom-directory/bloom-petal-enso),
-  [Near Intents](https://github.com/bloom-directory/bloom-petal-near), and
-  [Feedback](https://github.com/bloom-directory/bloom-petal-feedback) releases.
+  [Near Intents](https://github.com/bloom-directory/bloom-petal-near),
+  [Feedback](https://github.com/bloom-directory/bloom-petal-feedback), and
+  [Safe](https://github.com/bloom-directory/bloom-petal-safe) releases.
   Tolly is excluded until its explicit-account release is available.
   Read `docs/petals.md` in the VFS for the exact installed set, mount
   directories, summaries, and declared capabilities.

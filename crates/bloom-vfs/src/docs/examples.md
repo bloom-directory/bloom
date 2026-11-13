@@ -15,6 +15,21 @@ Anvil instance.
 
 ## Local Anvil transaction
 
+Anvil is not configured by default, and an unreachable configured chain makes
+every read under its paths wait for the endpoint to fail. Ask the operator to
+add this to `~/.bloom/config.toml`, restart Bloom, and check `ls chains/`;
+remove it when the node stops:
+
+```toml
+[chains.anvil]
+name = "anvil"
+chain_id = 31337
+rpc_urls = ["http://127.0.0.1:8545"]
+display_name = "Anvil (local)"
+native_symbol = "ETH"
+native_decimals = 18
+```
+
 ```sh
 # 1. Discover and inspect the exact inputs.
 ls "$BLOOM/chains/"
@@ -25,6 +40,7 @@ cat "$BLOOM/wallets/alice/projection.json"
 # 2. Stage once through an explicit account path. Account 0 is the initial
 #    account; any other numbered path (wallets/alice/1/chains/...) spends
 #    from that account's key and sees only its own outbox entries.
+#    Name the chain's native asset: ETH here, POL on polygon, BNB on bsc.
 printf 'send 0.01 ETH to 0x0000000000000000000000000000000000000001\n' \
   > "$BLOOM/wallets/alice/0/chains/anvil/outbox/new.tx"
 
@@ -46,8 +62,10 @@ ls "$BLOOM/wallets/alice/0/chains/anvil/outbox/failed/"
 
 If confirmation requires fresh approval, read this exact pending action's
 `approval_challenge.json`. Check its wallet, action, intent, and expiry before
-forwarding the ceremony URL to the human. After approval, retry only the
-challenge's `retry_path`. Do not restage while approval is pending.
+forwarding the ceremony URL to the human. Re-read it while they approve: its
+`state` turns from `awaiting_ceremony` to `active` as soon as they finish. Then
+write the challenge's exact `retry_body` to its `retry_path` (an omitted
+`retry_body` means `confirm`). Do not restage while approval is pending.
 
 
 Follow `$ID` into its resulting state and read its intent and receipt before
@@ -59,6 +77,41 @@ The explicit account-0 outbox above spends from account 0. For another account,
 verify `wallets/alice/<n>/account.json` and use
 `wallets/alice/<n>/chains/anvil/outbox/` throughout the same procedure.
 Numbered outboxes expose only actions staged by that account.
+
+## Repairing rejected EIP-1559 fees
+
+A node can reject a signed transaction when its priority fee is below the
+chain minimum. Keep the exact pending entry and inspect its `last_error.json`,
+`intent.json`, `broadcast_attempted.json`, and the chain's
+`chains/<chain>/gas/current.json`. Do not restage it at another nonce.
+
+`gas/current.json` exposes current decimal-wei fee suggestions in `eip1559`.
+For a pending EIP-1559 entry, write a JSON fee pair to `replace`. Both caps
+must be at least 10% above the original caps and satisfy the node's quoted
+minimum. This preserves the account, nonce, destination, value, calldata, and
+Petal origin. Like `confirm`, it is refused until a `depends_on` predecessor
+has mined successfully, or while the call fails simulation. It requires a new
+exact owner approval. Any other body written to `replace` returns permission
+denied and records nothing: through the mount, `replace` accepts only this fee
+pair. For example, when the
+node requires a 25 gwei tip and the original max fee is 50 gwei:
+
+```sh
+# Keep this proposal in scratch outside the mount. Quantities are wei.
+printf '%s\n' '{"max_fee_per_gas":"60000000000","max_priority_fee_per_gas":"30000000000"}' > fees.json
+cat fees.json > "$BLOOM/wallets/<wallet>/0/chains/<chain>/outbox/pending/<id>/replace"
+cat "$BLOOM/wallets/<wallet>/0/chains/<chain>/outbox/pending/<id>/replacement_plan.md"
+cat "$BLOOM/wallets/<wallet>/0/chains/<chain>/outbox/pending/<id>/approval_challenge.json"
+```
+
+Open that challenge's ceremony URL once. Poll its state; when active, write
+its exact `retry_body` to `retry_path`. For fee repair this is the same fee
+JSON, not a new transaction intent. Read the resulting sent entry's receipt
+before continuing the Petal operation. Original attempt metadata remains for
+reconciliation, and the receipt records whichever attempt mined. A transport
+error does not prove a transaction was absent. Write the same `retry_body`
+again: once a replacement was signed, the retry settles that recorded
+replacement and never signs another.
 
 ## Deploying an EVM contract
 
@@ -84,7 +137,7 @@ Creation remains subject to exact Broker approval; recipient allowlists do
 not grant deployment permission. Follow-up initialization calls are separate
 transactions and approvals. First add the numeric-chain policy opt-in through
 its normal ceremony: `{"chain":"evm-31337","destination":"exact"}` for Anvil.
-Machine and Broker must both support protocol 1.6.
+Machine and Broker must both support protocol 1.7.
 
 For an existing Foundry project, start the adapter in a separate terminal:
 
@@ -136,6 +189,22 @@ printf 'cancel\n' > "$BLOOM/wallets/registrations/main/cancel"
 
 Do not put a mnemonic, private key, passkey response, or PRF output in the
 mount. Those inputs stay inside the Broker-hosted browser ceremony.
+
+## Recovering a wallet
+
+```sh
+printf 'main\n' > "$BLOOM/wallets/recover"
+cat "$BLOOM/wallets/recoveries/main/status.json"
+# Open the complete ceremony_url in a browser and enter recovery material there.
+# Poll until ceremony_state is SUCCEEDED, then inspect:
+cat "$BLOOM/wallets/recoveries/main/result.json"
+```
+
+The write needs only the wallet name, even when Machine has no cached wallet
+inventory. A consumed one-use URL is removed from status. To cancel a pending
+ceremony, write `cancel` to `wallets/recoveries/main/cancel`; after cancellation
+or expiry, write the name to `wallets/recover` again for a new operation.
+Never write the recovery ID or secret into the mount or pass them as arguments.
 
 ## Solana account-aware reads and transfer
 
@@ -211,6 +280,9 @@ a single-token approval and should be clearly visible in the policy projection.
 
 ## Updating wallet policy
 
+Use this workflow only for an explicitly requested policy change. A denied
+payment is a refusal to report, not permission to expand an allowlist.
+
 ```sh
 # The proposal is a scratch file in the working directory, outside the mount.
 cat "$BLOOM/wallets/alice/policy.json" > proposed-policy.json
@@ -220,16 +292,19 @@ cat "$BLOOM/wallets/alice/policy-updates/latest/status.json"
 cat "$BLOOM/wallets/alice/policy-updates/latest/approval_challenge.json"
 ```
 
-Verify that the update challenge matches the proposal before forwarding its
-ceremony URL. After the human approves, retry the exact same proposal bytes:
+Note the `action_id` in `status.json`. Verify that the update challenge
+matches the proposal before forwarding its ceremony URL. After the human
+approves, retry the exact same proposal bytes:
 
 ```sh
 cp proposed-policy.json "$BLOOM/wallets/alice/policy.json"
 cat "$BLOOM/wallets/alice/policy.json"
-cat "$BLOOM/wallets/alice/policy-updates/latest/status.json"
+cat "$BLOOM/wallets/alice/policy-updates/confirmed/<action_id>/status.json"
 ```
 
-Verify the committed policy and terminal status. Broker performs
+`latest` names only a pending update, so it is gone once the update commits.
+A refused or failed update is under `failed/<action_id>/` instead. Verify the
+committed policy and terminal status. Broker performs
 `policy.validate_update` before approval and `policy.commit_update` on the
 authorized retry. Editing or reformatting the proposal requires fresh review.
 

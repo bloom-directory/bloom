@@ -7,8 +7,12 @@ one exact minor, while Signer control and login-session liveness accept a range.
 Service packages may advance independently when every edge remains inside its
 declared range; incompatible edges fail closed.
 It also records the reviewed Broker, Signer, service-runtime, and
-Petal-contract commits plus the current state schema and downgrade floor for
-Machine, Broker, and Signer. This committed file is the source of truth for
+Petal-contract commits plus the current state schema, migration floor, and
+downgrade floor for Machine, Broker, and Signer. The migration floor names the
+oldest state the candidate can upgrade; it does not authorize an old release
+to reopen migrated state. See the
+[schema migration review](../../../docs/reviews/2026-09-23-schema-migration.md).
+This committed file is the source of truth for
 the Broker and Signer revisions: candidate builds require the supplied
 checkouts to match its exact pins and never rewrite them.
 
@@ -73,19 +77,30 @@ source-quality gates. All targets emit the archive plus `.sha256`, `.sig`,
 and `.pub` sidecars.
 
 The release workflow builds Linux aarch64 natively on `ubuntu-24.04-arm` and
-macOS aarch64 on `macos-15` alongside Linux x86_64. A manual `dry_run=true`
+macOS aarch64 on `macos-15` alongside Linux x86_64 on `ubuntu-24.04`. Both
+Linux builds run in a pinned `ubuntu:22.04` container so the binaries need
+only glibc 2.35: a build on 24.04 requires glibc 2.38+ and fails to start on
+22.04. Both jobs share the same image digest, Ubuntu archive snapshot
+(`20261027T000000Z`) and checksum-verified rustup 1.29.2 installer. The snapshot
+pins transitive build packages as well as gcc/libc-dev; update it deliberately
+for security fixes. The hosted runner's read-only public CA bundle bootstraps
+HTTPS until the container installs its own certificates. Archive signatures
+remain required; historical snapshot metadata is exempt from expiry checks.
+These pins remove live package/bootstrap drift, not a guarantee of bit-identical
+binaries across different hosts. A manual `dry_run=true`
 dispatch uploads all three `test-unclaimed` candidates as Actions artifacts
 and cannot reach production
 signing or GitHub publication. Live candidate installation requires both a
 root-owned, non-writable pin of that artifact's ephemeral public key and the
 explicit `BLOOM_ALLOW_TEST_UNCLAIMED=true` installer opt-in.
 
-The installed macOS launchagent mounts Bloom through native NFSv4.1 and
-requires macOS 26 or later, as specified in the Bloom design. Native Unix
-conformance runs on `macos-26`; live installation and restore reject older
-systems before changing service accounts or runtime state. The macOS 15
-minimum in the rootless security design concerns container protection, not
-native NFS mounting. Unmounted CLI use is separate from this mount requirement.
+**Bloom requires macOS 26 or later.** The installed Machine launch agent always
+mounts `~/bloom` through native NFSv4.1 (`serve --mount-home`), which earlier
+macOS versions do not support, and an installed Bloom has no configuration
+without that mount. Native Unix conformance runs on `macos-26`; live
+installation and restore reject older systems before changing service accounts
+or runtime state. The macOS 15 minimum in the rootless security design concerns
+container protection, not this mount.
 
 `release.sh sign linux|linux-aarch64|macos` is the isolated production signing
 pass. It never executes a candidate-owned binary or script. It verifies the
@@ -104,6 +119,19 @@ Before merging release-workflow changes, dispatch the branch with
 uploads the `test-unclaimed` candidate for inspection, and skips both the
 protected production-signing job and the publish job. Normal tag pushes and
 tag retries cannot select dry-run mode.
+
+Release notes list every Bloom commit since the previous release, with links
+to the Broker and Signer changes between the two releases' compatibility
+records. `release-notes.sh changes` picks that baseline: the highest published,
+non-draft, non-prerelease `vX.Y.Z` release that is an ancestor of the release
+commit and older than its tag. A retry therefore reproduces the same list. The
+`prepare` job generates this section once, shows it in the job summary (so a dry
+run previews it), and the publish job uses it to create or retry the release.
+The section sits between `<!-- bloom-release-changes:start -->` and `end`
+markers. On a retry, `release-notes.sh splice` replaces only that section and
+keeps anything a maintainer wrote around it, such as upgrade notes or known
+issues. A body from before the markers keeps its text and gains the section at
+the end. `scripts/test-release-notes.sh` covers these cases.
 
 Before compiling, `release.sh` rejects the remaining forbidden production
 Machine features from the resolved normal/build Cargo graph. Bundle assembly
@@ -163,11 +191,22 @@ an immutable release directory and a coordinated host-wide transaction: stop
 all active enrollments, atomically switch `current`, update the release digest
 in active and retained configuration, and validate active services before
 committing. Active enrollments require available user session buses. Failed
-activation and interrupted transactions restore the previous release. Custody,
-identity material, and allocated NFS ports are preserved.
+activation and interrupted transactions restore the previous release unless
+the upgrade is forward-only (below). Custody, identity material, and allocated
+NFS ports are preserved.
+
+Each release directory keeps its `compatibility-v1.toml`. Before anything is
+stopped, Linux applies the same state checks as macOS: it refuses a candidate
+whose record is malformed, whose `current` state is older than the installed
+release's, or whose `migration_floor` is above it. The upgrade is
+forward-only when the installed release's `current` state is below the
+candidate's `downgrade_floor`, or when the installed release has no record.
+A failed forward-only upgrade stops the release set, keeps the candidate
+selected, keeps the transaction, and exits with "state migration is
+forward-only". The previous binaries could not read the migrated state.
 
 Before any unit is mutated, the transaction (`schema
-bloom.linux-upgrade-transaction.2`) snapshots the installed Bloom-owned unit
+bloom.linux-upgrade-transaction.3`) snapshots the installed Bloom-owned unit
 templates — both ceremony sockets, the Broker and Signer service templates, the
 session path, the two user service units, and the retired RPC/control socket
 templates — recording explicit absence alongside bytes and modes. A rollback
@@ -181,7 +220,14 @@ payload of the last installation, so a KMS host that rolls back after an
 upgrade with a payload lacking the KMS overlay is repaired by rerunning the
 installer with that overlay.
 
-Recovery after an interruption restores the coherent previous installation and
+Recovery of a forward-only transaction selects its candidate and keeps the
+transaction. The installer run that triggered recovery then runs the full
+upgrade steps even when it requests that same candidate: every login is
+rewritten and started under the authenticated health gate, and only then is
+the transaction retired. Requesting a different release instead retires the
+kept transaction and upgrades from the candidate.
+
+Recovery of any other transaction restores the coherent previous installation and
 then lets the verified installer retry the requested release; it never
 completes the interrupted candidate in place. Recovery clears the transaction
 as soon as the previous installation is restored and only then restarts it,
@@ -194,7 +240,8 @@ transaction recorded by an earlier installer (`schema
 bloom.linux-upgrade-transaction.1`) carries no unit snapshot; it is recovered
 by rolling the binary selection and release metadata back on their own, as the
 installer that opened it would have, and the retried installation then rewrites
-every Bloom-owned unit coherently before starting anything.
+every Bloom-owned unit coherently before starting anything. Schemas 1 and 2
+carry no forward-only marker and always roll back, as their installers would.
 
 Linux installs provide `bloom-uninstall`. Its default `--retain-custody` mode
 stops and disables the selected enrollment, removes runtime integration, and
@@ -203,6 +250,9 @@ purge requires `--purge` and the exact `delete-bloom-login-LOGIN_UID`
 confirmation. Shared runtime files are removed only after the last active
 enrollment, while the uninstaller remains available until all retained custody
 has also been purged.
+Reinstalling the retained release recreates removed service units before activation.
+The same-release stop step skips only services systemd reports as missing and
+inactive; inspection errors and failures to stop existing services still abort.
 
 ```sh
 sudo bloom-uninstall
@@ -222,13 +272,21 @@ identity-shaped JSON for a production macOS claim.
 The macOS installer stages an immutable release before stopping any installed
 triad. A live install first copies the candidate into a private root-owned
 snapshot and authenticates and installs exclusively from that snapshot. It then
-journals the old and new digests, stops every enrollment before
+journals the old and new digests plus source and target schema watermarks, stops every enrollment before
 the shared atomic `current` switch, updates build-digest state, and validates
-each installed triad before publishing all enrollments active. Failed activation
-and a transaction found after interruption restore the old release, integration
-files, and health. Custody and identity directories are never regenerated or
-replaced during this sequence. The candidate state schemas must be at least the
-installed schemas.
+each installed triad in health-only mode before publishing any enrollment
+active. Machine verifies its whole audit journal before it listens, so both
+installers wait up to `BLOOM_HEALTH_TIMEOUT_SECONDS` (default 600) for that
+health, printing progress every 30 seconds. If a rollback's restored release
+has not answered by then, the macOS installer says it is reinstated and may
+still be starting, rather than reporting a failed restore. Same-schema failures before publication may restore the old release.
+Schema migrations become forward-only before candidate authority services
+start; every upgrade commits forward before a full Machine can write its cache
+or accept user work. Interrupted upgrades resume the recorded target or a
+schema-compatible corrected candidate. Custody databases, Machine caches, and
+identity directories are never copied or replaced during this sequence. The
+candidate state schemas must be at least both the installed schemas and any
+journaled target watermark.
 
 The macOS release remains rooted at `/usr/local/libexec/bloom`, with the
 user-facing `/usr/local/bin/bloom` symlink following its atomic `current`
@@ -266,3 +324,107 @@ boundaries; a digest-bound conformance report is supplementary evidence, not a
 required release asset. Machine and session jobs run in the `user/UID` launchd
 domain, while Broker and Signer jobs run in the system domain. The rootless
 code-identity architecture remains a separate future profile.
+
+
+## Remote ceremony packaging contract
+
+The Signer administrative socket is separate from authority RPC and revocation
+control. Linux provisions `/run/bloom/LOGIN_UID/signer/admin/admin.sock`;
+macOS provisions `signer-admin/admin.sock` beneath the per-login runtime root.
+The directory is Signer-owned mode `0700`; production administration accepts
+kernel-authenticated root peers, and the administrative client verifies the
+Signer peer. Neither the Machine-to-Broker group nor the revoke group receives
+administrative socket access. `BLOOM_SIGNER_ADMIN_SOCKET` selects the path only.
+
+Remote setup must retain the existing isolated service principals. Installation
+admin key material belongs in protected local administration state. Broker alone
+owns ACME account keys, certificate keys and the TLS listener; the relay owns
+neither. Signer remains without network access. Only the privileged setup client
+may enroll the installation and deliver an authenticated assignment through
+Signer administration. A hostname from ordinary configuration is insufficient.
+
+Desired remote-enabled is the setup default, but it is not evidence of effective
+remote access. Provisioning must report explicit retryable stages until verified
+assignment, valid TLS and externally observed routing are ready. The installer
+must not report remote setup as complete based on process health alone. Local
+ceremonies stay independently available. Disablement fences remote commits
+immediately and waits for Broker's closure acknowledgement at the same revision.
+
+Release acceptance must exercise the admin peer rejection, multi-wallet local
+credential guard, restart reconciliation, certificate expiry, relay outage and
+retained-hostname re-enable behavior. Public DNS/CA staging drills, ingress
+addresses, relay verification pins and infrastructure accounts are deployment
+prerequisites; fixture tests do not substitute for those observations. No public
+DNS changes or deployment occur as part of ordinary tests.
+
+The Linux Broker service permits IPv4/IPv6 networking for its outbound relay,
+ACME and DNS clients. It retains its isolated UID, protected files and Unix-only
+authority RPC; Signer retains `PrivateNetwork=yes`, `IPAddressDeny=any` and
+`RestrictAddressFamilies=AF_UNIX`. Broker's ceremony TLS listener is loopback-only.
+Deployments requiring network enforcement of exact outbound destinations need a
+reviewed egress proxy or firewall policy covering relay, ACME and DNS lifecycle;
+static ingress addresses alone do not cover CA renewal endpoints.
+
+The shipped v0.4.0 bundle used Machine–Broker API 1.7 and Machine and Broker
+state/floor 2. This clear-signing candidate adopts the landed Broker's API 1.8
+and moves both Machine and Broker to state/floor 3: Machine state 3 adds
+`review_payload_digest` to pending exact-signing state, which Machine 0.4.x
+rejects. Broker–Signer remains 1.6 and Signer state/floor remains 2. This is the
+coordinated release bump, not an additional bump for each PR. Both upgrades are
+forward-only. Take a compatible backup of Machine and Broker state before
+migration: neither the old v0.4.0 Machine nor the old v0.4.0 Broker can reopen
+state migrated to 3. Rollback requires restoring compatible Machine and Broker
+state, not lowering either floor or installing an old binary over migrated data.
+Legacy localhost credential wraps, RP IDs and user handles are preserved;
+legacy signed receipts retain their original canonical signed bytes. Old pending
+ceremonies fail on restart. After activating this state version, supported
+rollback must not select the old reusable-recovery or single-origin code.
+The receipt delivery window remains bound to its original Browser key even
+across service restart; a lost recipient key does not authorize re-encryption.
+
+Production provisioning requires root-owned mode `0600` relay configuration and
+CA PEM, and the reviewed relay receipt public key in Signer's configuration.
+On Linux, `/var/lib/bloom/<login-uid>/installer/admin` retains the installation
+admin key and provisioning retry/binding records in root-only storage.
+Broker's generated relay material lives in
+`/var/lib/bloom/<login-uid>/broker/relay`, owned by Broker. The packaged systemd
+unit selects that directory through `BLOOM_BROKER_RELAY_STATE_DIR`; explicit
+`remote_tls` configuration still takes precedence. This is the initial released
+relay layout, with no migration from earlier unmerged candidates.
+macOS retains its existing `config/<login-uid>/installer/admin` and private
+Broker configuration directory under Application Support. Developer paths are
+unchanged. Linux relay configuration and administrator-supplied trust pins stay
+under `/etc/bloom/<login-uid>`.
+Scoped tunnel and DNS credentials are separate `0600` Broker-owned files;
+they convey no surface administration or wallet authority. The signed payload includes the reviewed public pins in `installer/relay`.
+Before service activation, both installers fill an absent/null Signer pin and
+materialize root-only relay configuration from those inputs. Existing matching
+trust is preserved; differing pins fail closed and require explicit rotation.
+See [hosted relay trust](../relay/README.md) for provenance and retry behavior.
+Provisioning publishes the validated control CA to Broker's private
+`relay-control-ca.pem` beside its scoped credentials. Broker publishes each
+validated certificate/key pair atomically in `relay-tls-bundle.json`; a failed
+renewal preserves the previous bundle while it remains valid.
+Both installers invoke `bloom-signer admin provision --login-uid UID` directly
+inside their existing root step, with no second elevation prompt. There is no
+separate ceremony administration wrapper or automatic elevation in Signer.
+On macOS, the installer reports TLS and routing readiness while it waits up to
+10 minutes for the hosted relay. DNS propagation and ACME issuance commonly
+take a few minutes. If readiness is still pending at the deadline, installation
+finishes with localhost available and prints the exact retry command; rerunning
+`admin provision` is safe and resumes the same installation assignment.
+For manual administration, explicitly elevate the installed binary:
+
+```sh
+# Linux
+sudo /usr/libexec/bloom/current/bloom-signer admin status --login-uid "$(id -u)"
+# macOS
+sudo /usr/local/libexec/bloom/current/bloom-signer admin status --login-uid "$(id -u)"
+```
+
+Replace `status` with `provision`, `remote-enabled` or `localhost-only` as needed.
+`--login-uid` selects the installed enrollment and fixed platform paths; it is
+not the Signer service UID. `bloom-signer --help` and `bloom-signer admin --help`
+work without root. The service itself runs as its dedicated unprivileged user;
+root is required for installed administrative operations, not for executing
+the binary or displaying help. See `DEVELOPMENT.md` for harness administration.

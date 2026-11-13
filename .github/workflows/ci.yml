@@ -1,11 +1,18 @@
 name: CI
 
+permissions:
+  contents: read
+
 on:
   pull_request:
     paths: &code_paths
       - ".github/workflows/ci.yml"
+      # The macOS source assertions read both conformance workflows.
+      - ".github/workflows/macos-unix-conformance.yml"
+      - ".github/workflows/macos-two-login-conformance.yml"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "deny.toml"
       - "rust-toolchain.toml"
       - "crates/**"
       - "examples/**"
@@ -40,6 +47,16 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  advisories:
+    name: cargo deny advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # RustSec vulnerabilities and yanked crates, configured in deny.toml.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories
+
   harbor_eval_static:
     name: Harbor eval static checks
     runs-on: ubuntu-latest
@@ -48,10 +65,16 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - name: Validate bounded Harbor harness
         run: scripts/test-harbor-evals.sh
+      - name: Validate hosted relay launcher readiness
+        run: scripts/test-triad-dev-hosted-relay.sh
+      - name: Validate macOS logout drain timing
+        run: bash tests/conformance/macos-unix-principals/test-logout-drain.sh
       # Failure-mode cases for the ceremony-port A/B concurrency script
       # (stub launchers; binds no ports and needs no Triad).
       - name: Run concurrency script failure-mode cases
         run: scripts/test-ceremony-port-concurrency-cases.sh
+      - name: Run release-notes generator cases
+        run: scripts/test-release-notes.sh
 
   clippy:
     name: clippy
@@ -209,6 +232,16 @@ jobs:
           cargo nextest run --archive-file target/nextest-archive.tar.zst \
             -E 'package(bloom-it) and (binary(anvil_e2e) or binary(erc20_e2e))' \
             --no-fail-fast
+          # Machine-to-Broker exact signing (x402, MPP, policy update). Only the
+          # dispatch-only macOS W0 job ran it before, so Linux PRs missed breaks.
+          cargo nextest run --archive-file target/nextest-archive.tar.zst \
+            -E 'package(bloom-vfs) and binary(triad_policy_update)' \
+            --no-tests=fail \
+            --no-fail-fast
+          cargo nextest run --archive-file target/nextest-archive.tar.zst \
+            -E 'package(bloom-daemon) and binary(m2_no_legacy_authority_store)' \
+            --no-tests=fail \
+            --no-fail-fast
       # The triad release binary asserts the content of the packaged
       # installers, launcher, and release gates. It was previously not run at
       # all, so a launcher change could silently invalidate its assertions.
@@ -231,6 +264,15 @@ jobs:
         run: >
           cargo nextest run --archive-file target/nextest-archive.tar.zst
           -E 'package(bloom-it) and binary(triad_release) and not test(/^macos_/)'
+          --no-fail-fast
+      # The macOS LaunchAgent assertions read packaging and Machine sources,
+      # so they run on Linux for every change. The macOS Unix-principal
+      # conformance workflow runs the packaging scripts directly.
+      - name: Run macOS LaunchAgent source assertions from archive
+        run: >
+          cargo nextest run --archive-file target/nextest-archive.tar.zst
+          -E 'package(bloom-it) and binary(macos_launchagent)'
+          --no-tests=fail
           --no-fail-fast
       # Every `solana_*` binary drives a local Agave validator, which this job
       # does not start; they run in the dedicated solana-validator workflow.
@@ -281,8 +323,8 @@ jobs:
       github.ref_name == 'triad-architecture'
     uses: ./.github/workflows/macos-unix-conformance.yml
     with:
-      broker_ref: df25a54676aa2c52d6b018db486b46ec6a51718a
-      signer_ref: 97b9ac7e47ee682e59804d04f6288419f3598a58
+      broker_ref: 0a9a8dae12e86237cb9d6ba63a2456d7c0871cf9
+      signer_ref: 68d8ecaec34a7cae99f754972b5a781a8e17e542
 
   linux_w0_isolation:
     name: Linux W0 principal and socket isolation

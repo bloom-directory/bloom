@@ -11,6 +11,10 @@ pub mod ipc;
 mod ens_resolver;
 mod price_oracle;
 
+#[cfg(all(test, feature = "triad-dev-harness"))]
+#[path = "tests/polymarket_authorization.rs"]
+mod polymarket_authorization;
+
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -55,6 +59,7 @@ use bloom_tx::outbox::{CentralActionIdentity, CentralOutboxProjection, Outbox, O
 use bloom_tx::tx_engine::{
     ConfirmBatchResult, ConfirmBatchTarget, Eip1559FeeOverrides, TxEngine, TxEngineError,
 };
+use bloom_vfs::handler::{EntryKind, Handler, HandlerError};
 use bloom_vfs::handlers::outbox::StagedPetalIdentity;
 use bloom_vfs::handlers::status::{MempoolBackendStatus, PrivateRpcBackendStatus};
 use bloom_vfs::handlers::wallets::{AccountPetalContext, AccountPetalMount, AccountSessionEntry};
@@ -342,6 +347,41 @@ struct PetalTxOutbox {
     write_permit: Option<Arc<HomeWritePermit>>,
 }
 
+fn petal_review_payload<'a>(
+    operation_class: &str,
+    claimed_class: &str,
+    action: Option<&'a [u8]>,
+    crypto_suite: bloom_broker_api::CryptoSuite,
+    preimage: &[u8],
+) -> Result<Option<&'a [u8]>, HostError> {
+    if operation_class != claimed_class {
+        return Err(HostError::Invalid(
+            "Petal operation class does not match its claim".into(),
+        ));
+    }
+    if operation_class == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS {
+        action.map(Some).ok_or_else(|| {
+            HostError::Invalid("Safe confirmation requires a review envelope".into())
+        })
+    } else {
+        let message = action.filter(|bytes| {
+            serde_json::from_slice::<serde_json::Value>(bytes)
+                .ok()
+                .is_some_and(|value| value["schema"] == "bloom.message.review.v1")
+        });
+        let signed_message = bloom_machine_client::is_signed_message(crypto_suite, preimage);
+        if (bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES.contains(&operation_class)
+            || signed_message)
+            && message.is_none()
+        {
+            return Err(HostError::Invalid(
+                "This signing operation requires a message review envelope".into(),
+            ));
+        }
+        Ok(message)
+    }
+}
+
 impl DaemonPetalHost {
     /// Resolve the path-selected owner against fresh Broker membership before
     /// preparing any approval, custody ceremony, or signature. The path
@@ -540,6 +580,8 @@ impl DaemonPetalHost {
             == Some("wallets")
             && ((segments.len() == 2 && segments[1] == "new")
                 || (segments.len() >= 2 && segments[1] == "registrations")
+                || (segments.len() == 2 && segments[1] == "recover")
+                || (segments.len() >= 2 && segments[1] == "recoveries")
                 || (segments.len() == 4
                     && segments[2] == "sealed-approvals"
                     && segments[3] == "new.json")
@@ -965,7 +1007,11 @@ impl DaemonPetalHost {
             .map_err(|error| HostError::Invalid(error.to_string()))?;
         let prepared = broker
             .prepare_approval(bloom_broker_api::ApprovalPrepareRequest {
+                evm_reported_token: None,
+                surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
                 evm_review_payloads: Vec::new(),
+                safe_review_payloads: Vec::new(),
+                message_review_payloads: Vec::new(),
                 operation_id,
                 terms,
                 canonical_plan_facts_digest: plan_digest,
@@ -974,7 +1020,6 @@ impl DaemonPetalHost {
                 // belongs to the native Solana transfer path.
                 petal_use_claim: None,
                 system_use_claim: None,
-                requested_review_mode: None,
             })
             .await
             .map_err(|error| {
@@ -1079,6 +1124,7 @@ impl DaemonPetalHost {
         operation_class: &str,
         signature_count: usize,
         account_key: Option<&bloom_broker_api::KeyRef>,
+        review_binding: Option<&bloom_broker_api::Digest32>,
     ) -> Result<(String, PathBuf, PathBuf), HostError> {
         let root = self
             .petal_signing_state_root
@@ -1099,6 +1145,10 @@ impl DaemonPetalHost {
         ] {
             identity.update(&(part.len() as u64).to_be_bytes());
             identity.update(part);
+        }
+        if let Some(binding) = review_binding {
+            identity.update(b"solana-message-review/v1\0");
+            identity.update(binding.as_str().as_bytes());
         }
         let request_id = identity.finalize().to_hex().to_string();
         Ok((
@@ -1690,6 +1740,7 @@ impl PetalHost for DaemonPetalHost {
             .prepare_custody(
                 bloom_machine_client::CustodyPrepareMethod::KeyDerive,
                 bloom_broker_api::CustodyPrepareRequest {
+                    surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
                     ceremony_kind: bloom_broker_api::CeremonyKind::KeyDerive,
                     custody_operation_id: custody_operation_id.clone(),
                     wallet_id: Some(wallet_id),
@@ -1779,7 +1830,7 @@ impl PetalHost for DaemonPetalHost {
                 builder = builder.header(name.as_str(), value.as_str());
             }
             let resp = builder.body(body.clone()).send().await.map_err(|e| {
-                let err = HostError::Backend(format!("http_fetch send: {e}"));
+                let err = petal_http_transport_error("send", &method, &url, e);
                 self.audited_http_error(&correlation_id, &method, &url, "error", None, None, err)
             })?;
             let status = resp.status().as_u16();
@@ -1895,7 +1946,7 @@ impl PetalHost for DaemonPetalHost {
             let mut stream = resp.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|e| {
-                    let err = HostError::Backend(format!("http_fetch body: {e}"));
+                    let err = petal_http_transport_error("body", &method, &url, e);
                     self.audited_http_error(
                         &correlation_id,
                         &method,
@@ -1984,6 +2035,13 @@ impl PetalHost for DaemonPetalHost {
                 "PetalUseClaim must use exact RFC 8785 canonical JSON".into(),
             ));
         }
+        let review_payload = petal_review_payload(
+            &req.operation_class,
+            claim.operation_class.as_str(),
+            req.action.as_deref(),
+            crypto_suite,
+            &req.preimage,
+        )?;
         let trusted_package_hash = bloom_broker_api::Digest32::new(context.package_hash.clone())
             .map_err(|error| HostError::Invalid(error.to_string()))?;
         if let Some(pending) = self
@@ -2083,6 +2141,7 @@ impl PetalHost for DaemonPetalHost {
                     &trusted_subject,
                     &claim,
                     req.claim_assurance_evidence.as_deref(),
+                    review_payload,
                 )
                 .await
                 .map_err(|reason| {
@@ -2101,7 +2160,7 @@ impl PetalHost for DaemonPetalHost {
                         reason = %reason,
                         "petal.sign_payload_denied"
                     );
-                    HostError::Denied(reason)
+                    exact_signing_host_error(reason)
                 })?;
             return match outcome {
                 bloom_vfs::ExactPayloadOutcome::ApprovalRequired {
@@ -2196,7 +2255,7 @@ impl PetalHost for DaemonPetalHost {
                 protocol_error_code = error.code.as_str(),
                 "petal.sign_payload_denied"
             );
-            HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
+            exact_signing_host_error(bloom_vfs::ExactSigningError::from_broker(error, true))
         })?;
         let [signature] = result.signatures.as_slice() else {
             return Err(HostError::Backend(
@@ -2218,13 +2277,39 @@ impl PetalHost for DaemonPetalHost {
 
     async fn sign_payload_batch_outcome(
         &self,
-        req: PayloadBatchSignRequest,
+        mut req: PayloadBatchSignRequest,
     ) -> Result<PayloadBatchSignOutcome, HostError> {
         if req.key_ref.is_some() {
             return Err(HostError::Denied(
                 "Petal payload batches require Machine-owned approval and root selection".into(),
             ));
         }
+        // A Petal's reusable preference is not session authority. Until Broker
+        // supports verified order sessions, step up to exact approval before
+        // choosing durable paths or interpreting approval hints. Keep CLOB auth
+        // on its distinct one-use scope; never downgrade an existing attempt.
+        let review_payload = if bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES
+            .contains(&req.operation_class.as_str())
+        {
+            req.selector = bloom_broker_api::PetalSignSelector::Exact;
+            let bytes = req.action.as_deref().ok_or_else(|| {
+                HostError::Invalid(
+                    "Polymarket exact signing requires its complete prepared record".into(),
+                )
+            })?;
+            if bytes.len() > bloom_broker_api::SINGLE_PAYLOAD_MAX_BYTES
+                || req.payloads.len() != 1
+                || req.signature_algorithm != "secp256k1-keccak256-recoverable"
+                || !serde_json::from_slice::<serde_json::Value>(bytes)
+                    .ok()
+                    .is_some_and(|value| value.as_array().is_some_and(|items| items.len() == 1))
+            {
+                return Err(HostError::Invalid("Polymarket exact signing requires one bounded prepared record and one recoverable Keccak payload".into()));
+            }
+            Some(bytes)
+        } else {
+            None
+        };
         let broker = self.broker.as_ref().ok_or_else(|| {
             HostError::Backend("SERVICE_UNAVAILABLE: Broker client is not configured".into())
         })?;
@@ -2248,6 +2333,16 @@ impl PetalHost for DaemonPetalHost {
                 )));
             }
         };
+        if review_payload.is_none()
+            && req.operation_class != bloom_broker_api::POLYMARKET_CLOB_AUTH_CLASS
+            && req
+                .payloads
+                .iter()
+                .any(|item| bloom_machine_client::is_signed_message(crypto_suite, &item.preimage))
+        {
+            return Err(HostError::Invalid(
+                "Signed-message batches require the single-payload exact path with a review envelope".into()));
+        }
         let account_key = self
             .account_owner(context, &req.wallet, crypto_suite, None)
             .await?;
@@ -2329,6 +2424,22 @@ impl PetalHost for DaemonPetalHost {
             package_hash: trusted_package_hash,
             route: context.route_id.clone(),
         };
+        let solana_review_binding =
+            if bloom_broker_api::pumpfun_review_required(&req.operation_class) {
+                if crypto_suite != bloom_broker_api::CryptoSuite::Ed25519Message
+                    || preimages.len() != 1
+                {
+                    return Err(HostError::Denied(
+                        "Pump transaction review requires one Ed25519 message".into(),
+                    ));
+                }
+                Some(
+                    bloom_broker_api::solana_message_binding(&preimages[0])
+                        .map_err(|error| HostError::Denied(error.to_string()))?,
+                )
+            } else {
+                None
+            };
         let (request_id, exact_state_path, owner_projection_path) = match req.selector {
             bloom_broker_api::PetalSignSelector::Exact => self.petal_signing_paths(
                 context,
@@ -2344,6 +2455,7 @@ impl PetalHost for DaemonPetalHost {
                 &req.operation_class,
                 preimages.len(),
                 account_key.as_ref(),
+                solana_review_binding.as_ref(),
             )?,
         };
         if req
@@ -2361,7 +2473,7 @@ impl PetalHost for DaemonPetalHost {
                 bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(payload).into())
             })
             .collect::<Vec<_>>();
-        let canonical_facts = match req.selector {
+        let mut canonical_facts = match req.selector {
             bloom_broker_api::PetalSignSelector::Exact => serde_json::json!({
                 "schema": "bloom.machine.petal-exact-batch-facts.v1",
                 "request_id": request_id,
@@ -2394,6 +2506,9 @@ impl PetalHost for DaemonPetalHost {
                 "required_claim_assurance": claim.claim_assurance.level(),
             }),
         };
+        if let Some(binding) = solana_review_binding {
+            canonical_facts["solana_message_binding"] = serde_json::json!(binding);
+        }
         let catalog = self.provenance_catalog.clone().ok_or_else(|| {
             HostError::Backend("installer provenance catalog is not configured".into())
         })?;
@@ -2430,10 +2545,11 @@ impl PetalHost for DaemonPetalHost {
                     &trusted_subject,
                     &claim,
                     req.claim_assurance_evidence.as_deref(),
+                    review_payload,
                 )
                 .await
         }
-        .map_err(HostError::Denied)?;
+        .map_err(exact_signing_host_error)?;
         match outcome {
             bloom_vfs::ExactPayloadBatchOutcome::ApprovalRequired {
                 approval_id,
@@ -2642,7 +2758,6 @@ impl PetalHost for DaemonPetalHost {
                     nonce: req.nonce,
                     gas_limit_hint: None,
                     usd_value_hint: None,
-                    review_mode: None,
                 },
                 &chain,
                 &wallet_policy,
@@ -2798,18 +2913,47 @@ impl PetalHost for DaemonPetalHost {
             .outbox
             .read_receipt(&wallet, &chain_name, &outbox_id)
             .map_err(|e| HostError::Backend(format!("read EVM outbox receipt: {e}")))?;
-        let state = receipt
-            .as_ref()
-            .map(|receipt| receipt.outcome.clone())
-            .unwrap_or_else(|| entry.staged.status.to_string());
+        // A same-nonce cancellation that may be signed or broadcast is not
+        // visible in the status; report it, or the Petal sees an untouched
+        // pending or sent entry.
+        let state = match &receipt {
+            Some(receipt) => receipt.outcome.clone(),
+            None if entry.state != bloom_tx::outbox::OutboxState::Failed
+                && bloom_tx::outbox::cancel_attempted(&entry) =>
+            {
+                "cancelling".to_owned()
+            }
+            // An older Bloom released this entry although it may be signed;
+            // "failed" would invite a second payment.
+            None if entry.state == bloom_tx::outbox::OutboxState::Failed
+                && entry
+                    .dir
+                    .join(bloom_tx::outbox::SIGNING_UNKNOWN_FILE)
+                    .exists() =>
+            {
+                "signing_unknown".to_owned()
+            }
+            None => entry.staged.status.to_string(),
+        };
         let receipt_json = receipt
             .map(|receipt| serde_json::to_string(&receipt))
             .transpose()
             .map_err(|e| HostError::Backend(format!("encode EVM outbox receipt: {e}")))?;
+        // A broadcast whose RPC reply was lost records its hash only in the
+        // attempt marker; report it so the caller can still track the tx.
+        let tx_hash = match entry.staged.tx_hash.clone() {
+            Some(hash) => Some(hash),
+            None => service
+                .tx_engine
+                .outbox
+                .read_broadcast_attempt(&entry, bloom_tx::outbox::BroadcastAttemptKind::Confirm)
+                .map_err(|e| HostError::Backend(format!("read EVM broadcast attempt: {e}")))?
+                .map(|attempt| attempt.tx_hash),
+        };
         Ok(EvmOutboxInspection {
             outbox_id,
             state,
-            tx_hash: entry.staged.tx_hash,
+            tx_hash,
             receipt_json,
         })
     }
@@ -2864,10 +3008,11 @@ async fn daemon_petal_chain_read(
         "eth_getBalance" if matches!(params.len(), 1 | 2) => {
             require_latest_block_param(&params, 1)?;
             let address = parse_petal_address(&params[0], "eth_getBalance address")?;
-            let balance = chain
-                .balance(address)
-                .await
-                .map_err(|e| HostError::Backend(format!("native balance: {e}")))?;
+            let balance = chain.balance(address).await.map_err(|e| match e {
+                // Deterministic, not an outage: do not invite a retry.
+                bloom_evm::ChainError::NoNativeAsset(_) => HostError::Invalid(e.to_string()),
+                e => HostError::Backend(format!("native balance: {e}")),
+            })?;
             format!("{balance:#x}")
         }
         "eth_getCode" if matches!(params.len(), 1 | 2) => {
@@ -3074,6 +3219,31 @@ fn petal_outbox_outcome(
     })
 }
 
+fn petal_http_transport_error(
+    phase: &str,
+    method: &str,
+    url: &str,
+    error: reqwest::Error,
+) -> HostError {
+    // URL userinfo, paths and queries can hold credentials, so the message
+    // names only method and host. reqwest prints the URL from its own field,
+    // which without_url() clears; the source chain (DNS, connect, TLS,
+    // timeout) is appended as is and, in the pinned reqwest, carries no URL.
+    let host = url::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "<invalid url>".into());
+    let error = error.without_url();
+    let mut message = format!("http_fetch {phase}: {method} {host}: {error}");
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    HostError::Backend(message)
+}
+
 fn resolve_redirect_target(current_url: &str, location: &str) -> Result<String, HostError> {
     let base = url::Url::parse(current_url).map_err(|e| HostError::Invalid(format!("url: {e}")))?;
     base.join(location)
@@ -3127,7 +3297,6 @@ fn audit_http_target(raw: &str) -> serde_json::Value {
             "scheme": url.scheme(),
             "host": url.host_str(),
             "port": url.port(),
-            "path": url.path(),
         }),
         Err(_) => serde_json::json!({ "invalid": true }),
     }
@@ -3315,6 +3484,9 @@ impl ipc::BatchConfirmationService for CanonicalBatchConfirmation {
             if !(1..=32).contains(&request.txs.len()) {
                 return Err("transaction batch must contain 1 to 32 children".into());
             }
+            if request.account >= (1_u32 << 31) {
+                return Err("account must be between 0 and 2147483647".into());
+            }
             let wallet_id = bloom_broker_api::Token::new(request.wallet.clone())
                 .map_err(|error| format!("invalid wallet ID: {error}"))?;
             let projection = self
@@ -3340,6 +3512,10 @@ impl ipc::BatchConfirmationService for CanonicalBatchConfirmation {
                         "transaction batch contains duplicate ref '{reference}'"
                     ));
                 }
+                self.wallets
+                    .require_outbox_account(&request.wallet, request.account, chain_name, id)
+                    .await
+                    .map_err(|error| error.to_string())?;
                 self.wallets
                     .require_outbox_petal_eligibility(&request.wallet, chain_name, id)
                     .await
@@ -3670,6 +3846,14 @@ impl AccountPetalMount for AccountPetals {
             .collect())
     }
 
+    fn installed_package(&self, petal: &str) -> Option<String> {
+        self.runner
+            .store()
+            .resolve_petal_owner(petal)
+            .ok()
+            .flatten()
+    }
+
     async fn stop_session(
         &self,
         account: &AccountPetalContext,
@@ -3852,6 +4036,19 @@ fn ceremony_projection_records(root: &Path) -> Result<Vec<PathBuf>, DaemonError>
     }
     records.sort();
     Ok(records)
+}
+
+/// Only a refusal proves no signature exists; a Petal may rebuild after
+/// `Denied` but must keep its payload after `Backend`. The unknown outcome
+/// carries no Broker text: Petal SDKs classify host errors by words such as
+/// "denied" or "invalid", and it must never read as a refusal.
+fn exact_signing_host_error(error: bloom_vfs::ExactSigningError) -> HostError {
+    match error {
+        bloom_vfs::ExactSigningError::Refused(reason) => HostError::Denied(reason),
+        bloom_vfs::ExactSigningError::OutcomeUnknown(_) => {
+            HostError::Backend("signing outcome unknown; it may already be signed".into())
+        }
+    }
 }
 
 /// Stop every durable Petal ceremony projection from advertising an owner
@@ -4079,7 +4276,8 @@ impl Daemon {
             )
             .map_err(|error| {
                 DaemonError::Audit(format!("Machine wallet projection cache: {error}"))
-            })?,
+            })?
+            .with_max_age(config.wallet_projection_max_age),
         );
         // Build per-chain mempool indexes + handlers from [mempool.<chain>]
         // config. Each entry creates an LRU index, a VFS handler, and
@@ -4498,6 +4696,7 @@ impl Daemon {
                 env!("CARGO_PKG_VERSION"),
                 wallet_projections.clone(),
             )
+            .with_ceremony_broker(broker.clone())
             .with_solana_chains(solana_chain_registry.clone())
             .with_mempool_statuses(initial_mempool_statuses)
             .with_update_snapshot_fn(Arc::new(move || {
@@ -4544,6 +4743,7 @@ impl Daemon {
                 wallet_projections.clone(),
                 home.root().join("machine-policy-projections"),
             )
+            .with_passkey_names_path(home.root().join("passkey-names.json"))
             .with_broker(broker.clone())
             .with_home_write_permit_opt(home_write_permit.clone())
             .with_mempool_indexes(mempool_indexes.clone())
@@ -4693,9 +4893,15 @@ impl Daemon {
         // Answers: what wallets need attention, what confirms are pending,
         // what risk data is stale.
         let next_wallet_projections = wallet_projections.clone();
+        let next_wallet_tree = wallets_handler.clone();
         vfs_builder = vfs_builder.with_root_dynamic_async("next.md", move || {
             let projections = next_wallet_projections.clone();
-            async move { render_next_actions(projections.as_ref()).await }
+            let wallet_tree = next_wallet_tree.clone();
+            async move {
+                let packages = wallet_tree.clone();
+                let installed = move |petal: &str| packages.installed_petal_package(petal);
+                render_next_actions(projections.as_ref(), wallet_tree.as_ref(), &installed).await
+            }
         });
 
         let vfs = vfs_builder
@@ -5040,6 +5246,19 @@ impl Daemon {
         let interval = Duration::from_secs(60);
         let background_span = tracing::Span::current();
         let handle = tokio::spawn(async move {
+            // Once per start: an older Bloom may have moved possibly signed
+            // entries to failed/; mark them so nobody retries them blindly.
+            let marking = outbox.clone();
+            match tokio::task::spawn_blocking(move || marking.mark_possibly_signed_failed()).await {
+                Ok(Ok(marked)) => {
+                    for entry in marked {
+                        let staged = entry.staged;
+                        warn!(id = %staged.id, wallet = %staged.wallet, chain = %staged.chain, nonce = staged.nonce, "outbox.failed_entry_signing_unknown");
+                    }
+                }
+                Ok(Err(error)) => warn!(%error, "outbox.signing_unknown_scan_failed"),
+                Err(error) => warn!(%error, "outbox.signing_unknown_scan_failed"),
+            }
             // Tick at `interval`, but exit promptly when the cancel
             // channel flips. We use `tokio::select!` so a long sleep
             // doesn't delay shutdown.
@@ -5052,7 +5271,15 @@ impl Daemon {
                             .duration_since(UNIX_EPOCH)
                             .map(|d| d.as_millis())
                             .unwrap_or(0);
-                        match run_expiry_sweep_once(&outbox, &audit, now_ms) {
+                        // The sweep waits for the outbox lifecycle file lock;
+                        // keep that wait off the async worker.
+                        let (sweep_outbox, sweep_audit) = (outbox.clone(), audit.clone());
+                        let swept = tokio::task::spawn_blocking(move || {
+                            run_expiry_sweep_once(&sweep_outbox, &sweep_audit, now_ms)
+                        })
+                        .await
+                        .unwrap_or_else(|error| Err(error.to_string()));
+                        match swept {
                             Ok(0) => tracing::trace!("outbox.sweep_expired.empty"),
                             Ok(n) => info!(swept = n, "outbox.sweep_expired"),
                             Err(error) => {
@@ -5061,26 +5288,26 @@ impl Daemon {
                             },
                         }
                         if let Some(solana_outbox) = &solana_outbox {
-                            // Live heights first: a Solana entry may only be
-                            // terminally expired when the cluster itself has
-                            // moved past the blockhash window. Chains whose
-                            // height cannot be observed are retained this
-                            // tick rather than judged by the wall estimate.
-                            let mut live_heights = std::collections::HashMap::new();
-                            for name in solana_chains.list_names() {
-                                let Some(client) = solana_chains.get(&name) else {
-                                    continue;
-                                };
-                                match client.get_block_height().await {
-                                    Ok(height) => {
-                                        live_heights.insert(name, height);
+                            let live_heights = solana_sweep_heights(&solana_chains).await;
+                            let mut observed = std::collections::HashSet::new();
+                            match solana_outbox.expired_pending(now_ms, &live_heights) {
+                                Ok(entries) => for entry in entries {
+                                    let Ok(Some(signature)) = solana_outbox.recorded_signature(&entry) else {
+                                        continue;
+                                    };
+                                    let Some(client) = solana_chains.get(&entry.staged.chain) else {
+                                        continue;
+                                    };
+                                    // Each probe searches transaction history. Only an
+                                    // observation counts; absence never retires a signature.
+                                    let probes = client.probe_signature_status_all_endpoints(&signature).await;
+                                    if probes.iter().any(|probe| matches!(&probe.status, Ok(Some(_)))) {
+                                        observed.insert((entry.staged.chain, signature));
                                     }
-                                    Err(error) => {
-                                        warn!(chain = %name, error = %error, "solana_outbox.sweep_height_unavailable")
-                                    }
-                                }
+                                },
+                                Err(error) => warn!(error = %error, "solana_outbox.sweep_signature_scan_failed"),
                             }
-                            match run_solana_expiry_sweep_once(solana_outbox, &audit, now_ms, &live_heights) {
+                            match run_solana_expiry_sweep_once(solana_outbox, &audit, now_ms, &live_heights, &observed) {
                                 Ok(0) => tracing::trace!("solana_outbox.sweep_expired.empty"),
                                 Ok(n) => info!(swept = n, "solana_outbox.sweep_expired"),
                                 Err(e) => warn!(error = %e, "solana_outbox.sweep_expired_failed"),
@@ -5160,12 +5387,28 @@ fn configured_mount(
     })
 }
 
-async fn render_next_actions(projections: &dyn WalletProjectionReader) -> Vec<u8> {
-    render_next_actions_with_timeout(projections, WALLET_PROJECTION_LIVE_TIMEOUT).await
+/// The installed package hash of a Petal by name.
+type InstalledPetals = dyn Fn(&str) -> Option<String> + Send + Sync;
+
+async fn render_next_actions(
+    projections: &dyn WalletProjectionReader,
+    wallet_tree: &dyn Handler,
+    installed: &InstalledPetals,
+) -> Vec<u8> {
+    render_next_actions_with_timeout(
+        projections,
+        wallet_tree,
+        installed,
+        WALLET_PROJECTION_LIVE_TIMEOUT,
+    )
+    .await
 }
 
+/// Renders `/next.md`. `wallet_tree` is the handler mounted at `wallets/`.
 async fn render_next_actions_with_timeout(
     projections: &dyn WalletProjectionReader,
+    wallet_tree: &dyn Handler,
+    installed: &InstalledPetals,
     live_timeout: Duration,
 ) -> Vec<u8> {
     let mut md = String::from("# Next Actions\n\n");
@@ -5204,11 +5447,179 @@ async fn render_next_actions_with_timeout(
         md.push('\n');
     }
 
-    if !wallet_projection_unavailable && stale_wallets.is_empty() {
-        md.push_str("No wallets with pending actions.\n\n");
-        md.push_str("All policies are signed and no outbox confirms await review.\n");
+    if wallet_projection_unavailable {
+        md.push_str("Outboxes and policy updates were not checked.\n");
+    } else {
+        let wallet_ids: Vec<String> = wallets
+            .iter()
+            .map(|projection| projection.wallet.wallet_id.as_str().to_owned())
+            .collect();
+        md.push_str(
+            &render_pending_actions(wallet_tree, installed, &wallet_ids, live_timeout).await,
+        );
     }
     md.into_bytes()
+}
+
+/// Child directories of `wallets/<path>`. A missing path has none; any other
+/// failure goes to `unreadable`, so next.md never reports it as empty.
+async fn wallet_dirs(tree: &dyn Handler, path: &str, unreadable: &mut Vec<String>) -> Vec<String> {
+    let listed = match VfsPath::parse(path) {
+        Ok(parsed) => tree.list(&parsed).await,
+        Err(error) => Err(HandlerError::invalid(error.to_string())),
+    };
+    match listed {
+        Ok(entries) => entries
+            .into_iter()
+            .filter(|entry| entry.kind == EntryKind::Dir)
+            .map(|entry| entry.name)
+            .collect(),
+        Err(HandlerError::NotFound(_)) => Vec::new(),
+        Err(error) => {
+            unreadable.push(format!("- `wallets/{path}/` could not be read: {error}\n"));
+            Vec::new()
+        }
+    }
+}
+
+/// The Petal that staged `entry`, from the `execution_origin` in its
+/// `intent.json`, and whether it can still confirm it. Solana and directly
+/// staged entries have none.
+async fn staging_petal(
+    tree: &dyn Handler,
+    installed: &InstalledPetals,
+    entry: &str,
+) -> Option<(String, bool)> {
+    let path = VfsPath::parse(&format!("{entry}/intent.json")).ok()?;
+    let intent: serde_json::Value = serde_json::from_slice(&tree.read(&path).await.ok()?).ok()?;
+    let origin = serde_json::from_value(intent["execution_origin"].clone()).ok()?;
+    bloom_vfs::handlers::outbox::staging_petal(&origin, installed)
+}
+
+/// One line for a pending outbox entry. `ceremony_url` is an owner
+/// capability, so it stays in the challenge file.
+async fn outbox_entry_line(tree: &dyn Handler, installed: &InstalledPetals, entry: &str) -> String {
+    let read = match VfsPath::parse(&format!("{entry}/approval_challenge.json")) {
+        Ok(path) => tree.read(&path).await,
+        Err(error) => Err(HandlerError::invalid(error.to_string())),
+    };
+    let challenge: serde_json::Value = match read {
+        Err(HandlerError::NotFound(_)) => {
+            let confirm = match staging_petal(tree, installed, entry).await {
+                Some((petal, false)) => {
+                    return format!(
+                        "- `wallets/{entry}/`: staged, not confirmed. {}\n",
+                        bloom_vfs::handlers::outbox::restage_through(&petal)
+                    );
+                }
+                Some((petal, true)) => format!(
+                    "confirm {}",
+                    bloom_vfs::handlers::outbox::through_staging_petal(&petal)
+                ),
+                None => "write `confirm` to its `confirm`".into(),
+            };
+            return format!(
+                "- `wallets/{entry}/`: staged, not confirmed. Review its `plan.md`; {confirm} only if the owner still wants it, or write `cancel` to its `confirm` to discard it.\n"
+            );
+        }
+        Err(error) => {
+            return format!(
+                "- `wallets/{entry}/`: its `approval_challenge.json` could not be read: {error}\n"
+            );
+        }
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+    };
+    let field = |name: &str| challenge.get(name).and_then(|value| value.as_str());
+    let retry_body = match challenge.get("retry_body") {
+        Some(serde_json::Value::String(body)) => body.clone(),
+        None | Some(serde_json::Value::Null) => "confirm".into(),
+        Some(body) => body.to_string(),
+    };
+    // A Petal-staged entry retries through its Petal, which `next` names.
+    let retry = match field("staged_by") {
+        Some(_) => String::new(),
+        None => format!(
+            " `retry_path`: `{}`; `retry_body`: `{retry_body}`.",
+            field("retry_path").unwrap_or("its `confirm`")
+        ),
+    };
+    format!(
+        "- `wallets/{entry}/`: owner approval `{}`. {}{retry} `ceremony_url` is in its `approval_challenge.json`.\n",
+        field("state").unwrap_or("unknown"),
+        field("next").unwrap_or(""),
+    )
+}
+
+/// Lists each wallet's pending outbox entries and policy updates by walking
+/// the `wallets/` routes an agent would list. A listing can omit an entry it
+/// cannot read, so the empty case reports what was listed, not an all-clear.
+async fn render_pending_actions(
+    tree: &dyn Handler,
+    installed: &InstalledPetals,
+    wallets: &[String],
+    timeout: Duration,
+) -> String {
+    let (mut outbox, mut policy, mut unreadable) = (Vec::new(), Vec::new(), Vec::new());
+    let scan = async {
+        for wallet in wallets {
+            let updates = format!("{wallet}/policy-updates/pending");
+            for id in wallet_dirs(tree, &updates, &mut unreadable).await {
+                // Reading `status.json` reconciles a cancelled, expired or
+                // failed ceremony out of `pending/`.
+                let read = match VfsPath::parse(&format!("{updates}/{id}/status.json")) {
+                    Ok(path) => tree.read(&path).await,
+                    Err(error) => Err(HandlerError::invalid(error.to_string())),
+                };
+                match read.map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes)) {
+                    Ok(Ok(status)) if status["state"] != "pending" => {}
+                    Ok(Ok(_)) => policy.push(format!(
+                        "- `wallets/{updates}/{id}/`: awaits the owner's approval. Read its `status.json`.\n"
+                    )),
+                    Ok(Err(error)) => unreadable.push(format!(
+                        "- `wallets/{updates}/{id}/status.json` could not be parsed: {error}\n"
+                    )),
+                    Err(HandlerError::NotFound(_)) => {}
+                    Err(error) => unreadable.push(format!(
+                        "- `wallets/{updates}/{id}/status.json` could not be read: {error}\n"
+                    )),
+                }
+            }
+            for account in wallet_dirs(tree, wallet, &mut unreadable).await {
+                if account.parse::<u32>().is_err() {
+                    continue;
+                }
+                let chains = format!("{wallet}/{account}/chains");
+                for chain in wallet_dirs(tree, &chains, &mut unreadable).await {
+                    let pending = format!("{chains}/{chain}/outbox/pending");
+                    for id in wallet_dirs(tree, &pending, &mut unreadable).await {
+                        outbox.push(
+                            outbox_entry_line(tree, installed, &format!("{pending}/{id}")).await,
+                        );
+                    }
+                }
+            }
+        }
+    };
+    if tokio::time::timeout(timeout, scan).await.is_err() {
+        unreadable.push(format!(
+            "- The check stopped after {}s; list `outbox/pending/` and `policy-updates/pending/` directly.\n",
+            timeout.as_secs_f32()
+        ));
+    }
+    let mut md = String::new();
+    for (title, lines) in [
+        ("Pending Outbox Entries", outbox),
+        ("Pending Policy Updates", policy),
+        ("Not Checked", unreadable),
+    ] {
+        if !lines.is_empty() {
+            md.push_str(&format!("## {title}\n\n{}\n", lines.concat()));
+        }
+    }
+    if md.is_empty() {
+        md.push_str("No outbox entry or policy update is listed as pending.\n");
+    }
+    md
 }
 
 fn run_expiry_sweep_once(
@@ -5216,6 +5627,15 @@ fn run_expiry_sweep_once(
     audit: &AuditLog,
     now_ms: u128,
 ) -> Result<usize, String> {
+    // A sweep with nothing to expire changes nothing, so an idle tick is not
+    // journaled; otherwise every tick would grow the audit journal forever.
+    if outbox
+        .expired_pending(now_ms)
+        .map_err(|error| error.to_string())?
+        .is_empty()
+    {
+        return Ok(0);
+    }
     let intent = serde_json::json!({
         "operation": "tx.outbox.sweep_expired",
         "cutoff_ms": now_ms.to_string(),
@@ -5262,6 +5682,31 @@ fn run_expiry_sweep_once(
     swept.map_err(|error| error.to_string())
 }
 
+/// Live heights for the expiry sweep: a Solana entry may only be terminally
+/// expired when every configured endpoint has finalized past the blockhash
+/// window. Chains where any endpoint lags or cannot answer report their
+/// lowest height or none, so their entries are retained this tick rather
+/// than judged by the wall estimate.
+async fn solana_sweep_heights(
+    chains: &bloom_solana::SolanaChainRegistry,
+) -> std::collections::HashMap<String, u64> {
+    let mut live_heights = std::collections::HashMap::new();
+    for name in chains.list_names() {
+        let Some(client) = chains.get(&name) else {
+            continue;
+        };
+        match client.finalized_block_height_all_endpoints().await {
+            Ok(height) => {
+                live_heights.insert(name, height);
+            }
+            Err(error) => {
+                warn!(chain = %name, error = %error, "solana_outbox.sweep_height_unavailable")
+            }
+        }
+    }
+    live_heights
+}
+
 /// Solana sibling of [`run_expiry_sweep_once`]: same audit-wrapped shape,
 /// over `bloom_solana_tx::outbox::SolanaOutbox` instead of EVM's
 /// `bloom_tx::outbox::Outbox` (Fix D, PLAN-SOLANA-PR-FIXES.md).
@@ -5270,7 +5715,16 @@ fn run_solana_expiry_sweep_once(
     audit: &AuditLog,
     now_ms: u128,
     live_block_heights: &std::collections::HashMap<String, u64>,
+    observed: &std::collections::HashSet<(String, String)>,
 ) -> Result<usize, String> {
+    // As for EVM: an idle tick changes nothing and is not journaled.
+    if outbox
+        .sweep_targets(now_ms, live_block_heights, observed)
+        .map_err(|error| error.to_string())?
+        .is_empty()
+    {
+        return Ok(0);
+    }
     let intent = serde_json::json!({
         "operation": "solana_tx.outbox.sweep_expired",
         "cutoff_ms": now_ms.to_string(),
@@ -5297,7 +5751,7 @@ fn run_solana_expiry_sweep_once(
         .map_err(|error| {
             format!("Machine audit unavailable before Solana expiry sweep: {error}")
         })?;
-    let swept = outbox.sweep_expired(now_ms, live_block_heights);
+    let swept = outbox.sweep_expired_with_statuses(now_ms, live_block_heights, observed);
     let result = match &swept {
         Ok(count) => serde_json::json!({"outcome": "completed", "swept": count}),
         Err(error) => serde_json::json!({"outcome": "error", "error": error.to_string()}),
@@ -5620,11 +6074,131 @@ fn render_petal_discovery_markdown(installed: &[bloom_petals::package::PetalDisc
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn http_audit_target_omits_credentials_and_path() {
+        let target = super::audit_http_target(
+            "https://user:password@example.com/path-secret?key=query-secret",
+        );
+        assert_eq!(
+            target,
+            serde_json::json!({"scheme":"https", "host":"example.com", "port":null})
+        );
+        assert_eq!(
+            super::audit_http_target("invalid-secret"),
+            serde_json::json!({"invalid":true})
+        );
+    }
+
     use super::*;
     use bloom_broker_api::{MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService};
     use bloom_vfs::VfsPath;
     use bloom_vfs::handler::Entry;
     use bloom_vfs::handler::Handler;
+
+    #[test]
+    fn safe_petal_review_mapping_rejects_class_substitution() {
+        let petal_review_payload = |operation, claim, action| {
+            super::petal_review_payload(
+                operation,
+                claim,
+                action,
+                bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable,
+                b"transaction",
+            )
+        };
+        let safe = bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS;
+        let envelope = b"safe review".as_slice();
+        assert_eq!(
+            petal_review_payload(safe, safe, Some(envelope)).unwrap(),
+            Some(envelope)
+        );
+        assert!(matches!(
+            petal_review_payload(safe, safe, None),
+            Err(HostError::Invalid(message)) if message.contains("requires a review envelope")
+        ));
+        assert_eq!(
+            petal_review_payload("transaction.confirm", "transaction.confirm", Some(envelope))
+                .unwrap(),
+            None
+        );
+        for (operation, claim) in [(safe, "transaction.confirm"), ("transaction.confirm", safe)] {
+            assert!(matches!(
+                petal_review_payload(operation, claim, Some(envelope)),
+                Err(HostError::Invalid(message)) if message.contains("does not match")
+            ));
+        }
+    }
+
+    #[test]
+    fn message_review_mapping_keeps_full_envelopes_and_refuses_downgrades() {
+        let petal_review_payload = |operation, claim, action| {
+            super::petal_review_payload(
+                operation,
+                claim,
+                action,
+                bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable,
+                b"message",
+            )
+        };
+        let envelope =
+            br#"{"schema":"bloom.message.review.v1","kind":"personal","message":"exact text"}"#
+                .as_slice();
+        for class in bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES {
+            assert_eq!(
+                petal_review_payload(class, class, Some(envelope)).unwrap(),
+                Some(envelope)
+            );
+            assert!(petal_review_payload(class, class, None).is_err());
+            assert!(petal_review_payload(class, class, Some(b"raw action")).is_err());
+            assert!(petal_review_payload(class, "another.class", Some(envelope)).is_err());
+        }
+        assert_eq!(
+            petal_review_payload("custom.message", "custom.message", Some(envelope)).unwrap(),
+            Some(envelope)
+        );
+        assert_eq!(
+            petal_review_payload("custom.message", "custom.message", Some(b"legacy action"))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn unlisted_signed_messages_require_review_envelopes() {
+        use bloom_broker_api::CryptoSuite::*;
+        let envelope = br#"{"schema":"bloom.message.review.v1"}"#.as_slice();
+        for preimage in [
+            b"\x19\x01typed data".as_slice(),
+            b"\x19Ethereum Signed Message",
+            b"\x19",
+        ] {
+            for action in [None, Some(b"legacy action".as_slice())] {
+                assert!(matches!(
+                    petal_review_payload("custom.message", "custom.message", action,
+                        Secp256k1Keccak256Recoverable, preimage),
+                    Err(HostError::Invalid(message)) if message.contains("requires a message review envelope")
+                ));
+            }
+            assert_eq!(
+                petal_review_payload(
+                    "custom.message",
+                    "custom.message",
+                    Some(envelope),
+                    Secp256k1Keccak256Recoverable,
+                    preimage
+                )
+                .unwrap(),
+                Some(envelope)
+            );
+            for suite in [Ed25519Message, Secp256k1Sha256Recoverable] {
+                assert_eq!(
+                    petal_review_payload("custom.message", "custom.message", None, suite, preimage)
+                        .unwrap(),
+                    None
+                );
+            }
+        }
+    }
 
     #[cfg(feature = "mount")]
     #[test]
@@ -5765,13 +6339,189 @@ mod tests {
         }
     }
 
+    /// A `wallets/` tree: directory listings, file bodies, and one path
+    /// whose listing fails.
+    #[derive(Default)]
+    struct WalletTreeFixture {
+        dirs: std::collections::HashMap<&'static str, Vec<&'static str>>,
+        files: std::collections::HashMap<&'static str, &'static str>,
+        broken: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl Handler for WalletTreeFixture {
+        async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+            Err(HandlerError::not_found(path.to_string_path()))
+        }
+
+        async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            let key = path.segments().join("/");
+            if self.broken == Some(key.as_str()) {
+                return Err(HandlerError::backend("disk unreadable"));
+            }
+            let names = self
+                .dirs
+                .get(key.as_str())
+                .ok_or_else(|| HandlerError::not_found(key.clone()))?;
+            Ok(names.iter().map(|name| Entry::dir(name)).collect())
+        }
+
+        async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            let key = path.segments().join("/");
+            self.files
+                .get(key.as_str())
+                .map(|body| body.as_bytes().to_vec())
+                .ok_or_else(|| HandlerError::not_found(key))
+        }
+    }
+
+    fn alice_tree() -> WalletTreeFixture {
+        WalletTreeFixture {
+            dirs: [
+                ("alice", vec!["0", "policy-updates"]),
+                ("alice/0/chains", vec!["base", "ethereum"]),
+                ("alice/0/chains/base/outbox/pending", vec!["tx-staged", "tx-approval", "tx-petal", "tx-petal-staged", "tx-petal-stale"]),
+                (
+                    "alice/policy-updates/pending",
+                    vec!["policy-update-1", "policy-update-expired"],
+                ),
+            ]
+            .into(),
+            files: [
+                (
+                    "alice/policy-updates/pending/policy-update-1/status.json",
+                    r#"{"state":"pending"}"#,
+                ),
+                // Its status read reconciled the expired ceremony out of pending.
+                (
+                    "alice/policy-updates/pending/policy-update-expired/status.json",
+                    r#"{"state":"failed"}"#,
+                ),
+                (
+                "alice/0/chains/base/outbox/pending/tx-approval/approval_challenge.json",
+                r#"{"state":"awaiting_ceremony","next":"Give ceremony_url to the owner.","ceremony_url":"http://127.0.0.1:18734/c#secret","retry_path":"wallets/alice/0/chains/base/outbox/pending/tx-approval/confirm"}"#,
+                ),
+                (
+                    "alice/0/chains/base/outbox/pending/tx-petal-staged/intent.json",
+                    r#"{"id":"tx-petal-staged","execution_origin":{"petal_id":"petal:pendle","petal_digest":"aa","petal_version":"v1-package","route_id":"r000003"}}"#,
+                ),
+                // Staged by a `pendle` package that has since been upgraded.
+                (
+                    "alice/0/chains/base/outbox/pending/tx-petal-stale/intent.json",
+                    r#"{"id":"tx-petal-stale","execution_origin":{"petal_id":"petal:pendle","petal_digest":"bb","petal_version":"v1-package","route_id":"r000003"}}"#,
+                ),
+                (
+                "alice/0/chains/base/outbox/pending/tx-petal/approval_challenge.json",
+                r#"{"state":"active","next":"The owner approved. Now retry through the Petal that staged this entry (petals/pendle/; see its README) to sign and broadcast.","staged_by":"petals/pendle/"}"#,
+                ),
+            ]
+            .into(),
+            broken: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn next_actions_lists_pending_entries_and_approvals() {
+        let pendle = |petal: &str| (petal == "pendle").then(|| "aa".to_owned());
+        let md = render_pending_actions(
+            &alice_tree(),
+            &pendle,
+            &["alice".into()],
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert!(
+            md.contains(
+                "`wallets/alice/0/chains/base/outbox/pending/tx-staged/`: staged, not confirmed"
+            ),
+            "{md}"
+        );
+        assert!(md.contains("`wallets/alice/0/chains/base/outbox/pending/tx-approval/`: owner approval `awaiting_ceremony`"), "{md}");
+        assert!(md.contains("`retry_path`: `wallets/alice/0/chains/base/outbox/pending/tx-approval/confirm`; `retry_body`: `confirm`"), "{md}");
+        let petal = md
+            .lines()
+            .find(|line| line.contains("pending/tx-petal/"))
+            .unwrap_or_else(|| panic!("{md}"));
+        assert!(
+            petal.contains("(petals/pendle/; see its README)"),
+            "{petal}"
+        );
+        assert!(
+            !petal.contains("retry_path") && !petal.contains("`confirm`"),
+            "{petal}"
+        );
+        // Before any approval, the first confirm also goes through the Petal.
+        let staged = md
+            .lines()
+            .find(|line| line.contains("pending/tx-petal-staged/"))
+            .unwrap_or_else(|| panic!("{md}"));
+        assert!(
+            staged.contains("confirm through the Petal that staged this entry (petals/pendle/"),
+            "{staged}"
+        );
+        assert!(!staged.contains("write `confirm`"), "{staged}");
+        // An upgraded Petal cannot confirm what its old package staged.
+        let stale = md
+            .lines()
+            .find(|line| line.contains("pending/tx-petal-stale/"))
+            .unwrap_or_else(|| panic!("{md}"));
+        assert!(
+            stale.contains("petals/pendle/ can no longer confirm this entry")
+                && stale.contains("Write `cancel`")
+                && !stale.contains("confirm through"),
+            "{stale}"
+        );
+        assert!(md.contains("pending/tx-staged/`: staged, not confirmed. Review its `plan.md`; write `confirm` to its `confirm`"), "{md}");
+        assert!(
+            md.contains("`wallets/alice/policy-updates/pending/policy-update-1/`"),
+            "{md}"
+        );
+        assert!(!md.contains("policy-update-expired"), "{md}");
+        assert!(
+            !md.contains("secret"),
+            "the ceremony URL stays in the challenge file: {md}"
+        );
+        assert!(
+            !md.contains("No outbox entry or policy update is listed as pending"),
+            "{md}"
+        );
+    }
+
+    #[tokio::test]
+    async fn next_actions_reports_unreadable_outbox_instead_of_nothing_pending() {
+        let mut tree = alice_tree();
+        tree.dirs.remove("alice/0/chains/base/outbox/pending");
+        tree.dirs.remove("alice/policy-updates/pending");
+        assert!(
+            render_pending_actions(&tree, &|_| None, &["alice".into()], Duration::from_secs(5))
+                .await
+                .contains("No outbox entry or policy update is listed as pending")
+        );
+
+        tree.broken = Some("alice/0/chains/ethereum/outbox/pending");
+        let md =
+            render_pending_actions(&tree, &|_| None, &["alice".into()], Duration::from_secs(5))
+                .await;
+        assert!(md.contains("## Not Checked"), "{md}");
+        assert!(
+            md.contains("`wallets/alice/0/chains/ethereum/outbox/pending/` could not be read: "),
+            "{md}"
+        );
+        assert!(
+            !md.contains("No outbox entry or policy update is listed as pending"),
+            "{md}"
+        );
+    }
+
     #[tokio::test]
     async fn next_actions_refreshes_wallet_projections_before_rendering() {
         let projections = ProjectionRefreshFixture {
             calls: std::sync::atomic::AtomicUsize::new(0),
         };
 
-        let rendered = render_next_actions(&projections).await;
+        let rendered =
+            render_next_actions(&projections, &WalletTreeFixture::default(), &|_| None).await;
 
         assert_eq!(
             projections.calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -5791,8 +6541,13 @@ mod tests {
             cached_calls: std::sync::atomic::AtomicUsize::new(0),
         };
 
-        let rendered =
-            render_next_actions_with_timeout(&projections, Duration::from_millis(10)).await;
+        let rendered = render_next_actions_with_timeout(
+            &projections,
+            &WalletTreeFixture::default(),
+            &|_| None,
+            Duration::from_millis(10),
+        )
+        .await;
 
         assert_eq!(
             projections
@@ -5803,7 +6558,7 @@ mod tests {
         assert!(
             String::from_utf8(rendered)
                 .unwrap()
-                .contains("No wallets with pending actions.")
+                .contains("No outbox entry or policy update is listed as pending")
         );
     }
 
@@ -5904,6 +6659,7 @@ mod tests {
                                 ],
                                 supported_crypto_suites: vec![
                                     bloom_broker_api::CryptoSuite::Secp256k1Sha256Recoverable,
+                                    bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable,
                                 ],
                             },
                         ))
@@ -6079,6 +6835,15 @@ mod tests {
                         }
                         Ok(MachineBrokerResponse::CustodyResult(
                             bloom_broker_api::CustodyResult {
+                                surface: Some(bloom_broker_api::CeremonySurfaceRef {
+                                    surface_id: bloom_broker_api::Token::new("local").unwrap(),
+                                    identity_digest: bloom_broker_api::Digest32::from_bytes(
+                                        [0; 32],
+                                    ),
+                                }),
+                                credential_authority_generation: Some(
+                                    bloom_broker_api::DecimalU64::new(0),
+                                ),
                                 ceremony_kind: bloom_broker_api::CeremonyKind::KeyDerive,
                                 custody_operation_id: request.operation_id,
                                 public_status: bloom_broker_api::CeremonyState::Succeeded,
@@ -6712,6 +7477,25 @@ mod tests {
 
     #[tokio::test]
     async fn exact_petal_batch_is_atomic_and_rejects_an_old_hint_after_reorder() {
+        petal_batch_approval(false).await;
+    }
+
+    #[tokio::test]
+    async fn reusable_polymarket_order_steps_up_to_exact_and_binds_review_on_retry() {
+        petal_batch_approval(true).await;
+    }
+
+    async fn petal_batch_approval(reviewed: bool) {
+        let class = if reviewed {
+            "polymarket.order.poly1271"
+        } else {
+            "order.batch"
+        };
+        let suite = if reviewed {
+            bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable
+        } else {
+            bloom_broker_api::CryptoSuite::Secp256k1Sha256Recoverable
+        };
         let directory = tempfile::tempdir().unwrap();
         let state_root = directory.path().join("petal-signing-requests");
         let broker = Arc::new(PetalExactBrokerFixture::new());
@@ -6731,7 +7515,7 @@ mod tests {
                 },
                 publisher: bloom_broker_api::Token::new("fixture-publisher").unwrap(),
                 operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
-                    operation_class: bloom_broker_api::Token::new("order.batch").unwrap(),
+                    operation_class: bloom_broker_api::Token::new(class).unwrap(),
                     fee_asset: None,
                 }],
                 installer_key_id: bloom_broker_api::Token::new("fixture-installer").unwrap(),
@@ -6751,11 +7535,19 @@ mod tests {
             ],
             actor: None,
         };
-        let preimages = [b"first exact payload".to_vec(), b"second".to_vec()];
+        let preimages = if reviewed {
+            vec![b"\x19\x01order".to_vec()]
+        } else {
+            vec![b"first exact payload".to_vec(), b"second".to_vec()]
+        };
         let hashes = preimages
             .iter()
             .map(|payload| {
-                bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(payload).into())
+                bloom_broker_api::Digest32::from_bytes(if reviewed {
+                    alloy::primitives::keccak256(payload).into()
+                } else {
+                    sha2::Sha256::digest(payload).into()
+                })
             })
             .collect::<Vec<_>>();
         let batch_digest = |payloads: &[Vec<u8>]| {
@@ -6771,8 +7563,8 @@ mod tests {
         let claim = bloom_broker_api::PetalUseClaim {
             package_hash: bloom_broker_api::Digest32::from_bytes([0xbb; 32]),
             route: context.route_id.clone(),
-            operation_class: bloom_broker_api::Token::new("order.batch").unwrap(),
-            crypto_suite: bloom_broker_api::CryptoSuite::Secp256k1Sha256Recoverable,
+            operation_class: bloom_broker_api::Token::new(class).unwrap(),
+            crypto_suite: suite,
             payload_digest: batch_digest(&preimages),
             ordered_hashes: hashes.clone(),
             declared_debits: Vec::new(),
@@ -6791,14 +7583,27 @@ mod tests {
                     claimed_hash: hash.to_bytes(),
                 })
                 .collect(),
-            signature_algorithm: "secp256k1-sha256-recoverable".into(),
-            operation_class: "order.batch".into(),
+            signature_algorithm: if reviewed {
+                "secp256k1-keccak256-recoverable"
+            } else {
+                "secp256k1-sha256-recoverable"
+            }
+            .into(),
+            operation_class: class.into(),
             petal_use_claim_jcs: serde_jcs::to_vec(&claim).unwrap(),
             claim_assurance_evidence: None,
             approval_hint: None,
-            action: Some(b"two exact orders".to_vec()),
+            action: Some(if reviewed {
+                br#"[{"order":"original"}]"#.to_vec()
+            } else {
+                b"two exact orders".to_vec()
+            }),
             advisory: None,
-            selector: bloom_broker_api::PetalSignSelector::Exact,
+            selector: if reviewed {
+                bloom_broker_api::PetalSignSelector::Reusable
+            } else {
+                bloom_broker_api::PetalSignSelector::Exact
+            },
             key_ref: None,
             context: Some(context),
         };
@@ -6812,26 +7617,86 @@ mod tests {
         };
         assert!(!pending.action_id.contains("ceremony"));
         request.approval_hint = Some(pending.action_id.clone());
-        let mut reordered = request.clone();
-        reordered.payloads.swap(0, 1);
-        let reordered_preimages = reordered
-            .payloads
-            .iter()
-            .map(|item| item.preimage.clone())
-            .collect::<Vec<_>>();
-        let mut reordered_claim = claim;
-        reordered_claim.payload_digest = batch_digest(&reordered_preimages);
-        reordered_claim.ordered_hashes.reverse();
-        reordered.petal_use_claim_jcs = serde_jcs::to_vec(&reordered_claim).unwrap();
-        let error = host
-            .sign_payload_batch_outcome(reordered)
-            .await
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("approval artifact does not match")
-        );
+        if reviewed {
+            let mut old_scope = request.clone();
+            old_scope.approval_hint = Some("old-reusable-approval".into());
+            assert!(
+                host.sign_payload_batch_outcome(old_scope)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("approval artifact does not match")
+            );
+            let mut missing = request.clone();
+            missing.action = None;
+            assert!(
+                host.sign_payload_batch_outcome(missing)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("complete prepared record")
+            );
+            let mut changed = request.clone();
+            changed.action = Some(br#"[{"order":"changed"}]"#.to_vec());
+            assert!(
+                host.sign_payload_batch_outcome(changed)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("persisted operation identity")
+            );
+            let mut wrong_hash = request.clone();
+            wrong_hash.payloads[0].preimage.push(0);
+            assert!(
+                host.sign_payload_batch_outcome(wrong_hash)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("claimed hashes")
+            );
+            let requests = broker.requests.lock().unwrap();
+            let prepared = requests
+                .iter()
+                .find_map(|request| match request {
+                    MachineBrokerRequest::SealedApprovalPrepare(request) => Some(request),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(matches!(
+                prepared.terms.selector,
+                bloom_broker_api::ApprovalSelector::Exact { .. }
+            ));
+            assert_eq!(
+                prepared.message_review_payloads[0].decode(),
+                request.action.clone().unwrap()
+            );
+            assert!(
+                !requests
+                    .iter()
+                    .any(|request| matches!(request, MachineBrokerRequest::SigningSignBatch(_)))
+            );
+        } else {
+            let mut reordered = request.clone();
+            reordered.payloads.swap(0, 1);
+            let reordered_preimages = reordered
+                .payloads
+                .iter()
+                .map(|item| item.preimage.clone())
+                .collect::<Vec<_>>();
+            let mut reordered_claim = claim;
+            reordered_claim.payload_digest = batch_digest(&reordered_preimages);
+            reordered_claim.ordered_hashes.reverse();
+            reordered.petal_use_claim_jcs = serde_jcs::to_vec(&reordered_claim).unwrap();
+            let error = host
+                .sign_payload_batch_outcome(reordered)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("approval artifact does not match")
+            );
+        }
 
         broker
             .active
@@ -6841,7 +7706,14 @@ mod tests {
         else {
             panic!("approved retry must return the complete signature batch");
         };
-        assert_eq!(signatures, vec![vec![0x40; 65], vec![0x41; 65]]);
+        assert_eq!(
+            signatures,
+            if reviewed {
+                vec![vec![0x40; 65]]
+            } else {
+                vec![vec![0x40; 65], vec![0x41; 65]]
+            }
+        );
         let requests = broker.requests.lock().unwrap();
         let signed = requests.iter().find_map(|request| match request {
             MachineBrokerRequest::SigningSignBatch(request) => Some(request),
@@ -6936,6 +7808,11 @@ mod tests {
         let protected = vec![
             "wallets/new".to_string(),
             "wallets/registrations".to_string(),
+            "wallets/recover".to_string(),
+            "wallets/recoveries".to_string(),
+            "wallets/recoveries/alice/status.json".to_string(),
+            "wallets/recoveries/alice/result.json".to_string(),
+            "wallets/recoveries/alice/cancel".to_string(),
             format!("wallets/registrations/{}/status.json", "22".repeat(32)),
             format!("wallets/registrations/{}/result.json", "22".repeat(32)),
             format!("wallets/registrations/{}/cancel", "22".repeat(32)),
@@ -7137,7 +8014,6 @@ mod tests {
             expires_ms: u128::MAX,
             status: bloom_proto::TxStatus::Pending,
             action_kind: bloom_proto::TxActionKind::Unknown,
-            review_mode: None,
             tx_hash: Some(tx_hash.clone()),
             token: None,
             nft: None,
@@ -7255,6 +8131,110 @@ mod tests {
         .await
         .unwrap();
 
+        // A broadcast whose RPC reply was lost has no hash in intent.json;
+        // inspection reports the hash recorded in its attempt marker.
+        let mut unacknowledged = staged.clone();
+        unacknowledged.id = "petal-inspect-lost-reply".into();
+        unacknowledged.tx_hash = None;
+        daemon
+            .tx_engine
+            .outbox
+            .write_pending(&unacknowledged, "# plan")
+            .unwrap();
+        let entry = daemon
+            .tx_engine
+            .outbox
+            .read("w", "anvil", &unacknowledged.id)
+            .unwrap();
+        daemon
+            .tx_engine
+            .outbox
+            .write_broadcast_attempt(
+                &entry,
+                bloom_tx::outbox::BroadcastAttemptKind::Confirm,
+                &bloom_tx::outbox::BroadcastAttempt {
+                    schema: "bloom.broadcast_attempted.v1".into(),
+                    tx_hash: tx_hash.clone(),
+                    raw_tx_blake3: String::new(),
+                    raw_tx_path: "raw_tx".into(),
+                    from: unacknowledged.from.clone(),
+                    to: unacknowledged.to.clone(),
+                    nonce: unacknowledged.nonce,
+                    chain_id: unacknowledged.chain_id,
+                    created_ms: 1,
+                    transport: bloom_tx::outbox::BroadcastTransport::PublicRpc,
+                    private_provider: None,
+                },
+            )
+            .unwrap();
+        let inspection = host
+            .evm_tx_inspect(
+                "w".into(),
+                "anvil".into(),
+                unacknowledged.id.clone(),
+                Some(context.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inspection.state, "pending");
+        assert_eq!(inspection.tx_hash.as_deref(), Some(tx_hash.as_str()));
+
+        // A dispatched cancellation is reported, not hidden behind the
+        // unchanged status; the hash stays the original transaction's.
+        daemon
+            .tx_engine
+            .outbox
+            .write_artefact(
+                &entry.dir,
+                bloom_tx::outbox::SIGNING_STATE_FILE,
+                br#"{"sign_dispatched":true,"action_id":"31337:petal-inspect-lost-reply:cancel"}"#,
+            )
+            .unwrap();
+        let inspection = host
+            .evm_tx_inspect(
+                "w".into(),
+                "anvil".into(),
+                unacknowledged.id.clone(),
+                Some(context.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inspection.state, "cancelling");
+        assert_eq!(inspection.tx_hash.as_deref(), Some(tx_hash.as_str()));
+
+        // An entry an older Bloom moved to failed/ although it may be signed
+        // is not reported as a retryable failure.
+        let entry = daemon
+            .tx_engine
+            .outbox
+            .read("w", "anvil", &unacknowledged.id)
+            .unwrap();
+        daemon
+            .tx_engine
+            .outbox
+            .transition(&entry, bloom_tx::outbox::OutboxState::Failed)
+            .unwrap();
+        assert_eq!(
+            daemon
+                .tx_engine
+                .outbox
+                .mark_possibly_signed_failed()
+                .unwrap()
+                .len(),
+            1
+        );
+        let inspection = host
+            .evm_tx_inspect(
+                "w".into(),
+                "anvil".into(),
+                unacknowledged.id.clone(),
+                Some(context.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inspection.state, "signing_unknown");
+        assert_eq!(inspection.tx_hash.as_deref(), Some(tx_hash.as_str()));
+
         let mut other_app = context.clone();
         other_app.petal_root = "other".into();
         let denied = host
@@ -7267,6 +8247,53 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(denied, HostError::Denied(_)));
+
+        // A legacy hard-policy refusal moved to failed/ without persisting its
+        // status. Outbox reads report it failed, so a Petal can retry, and
+        // inspection does not rewrite it.
+        let mut legacy = staged.clone();
+        legacy.id = "legacy-refusal".into();
+        legacy.policy_checks = vec![bloom_proto::policy::PolicyCheck::hard(
+            "recipient",
+            bloom_proto::policy::PolicyOutcome::Deny,
+            "Safe is not an allowed destination",
+        )];
+        daemon
+            .tx_engine
+            .outbox
+            .write_pending(&legacy, "plan")
+            .unwrap();
+        let entry = daemon
+            .tx_engine
+            .outbox
+            .read("w", "anvil", &legacy.id)
+            .unwrap();
+        daemon
+            .tx_engine
+            .outbox
+            .transition(&entry, bloom_tx::outbox::OutboxState::Failed)
+            .unwrap();
+        let entry = daemon
+            .tx_engine
+            .outbox
+            .read("w", "anvil", &legacy.id)
+            .unwrap();
+        let intent = std::fs::read(entry.dir.join("intent.json")).unwrap();
+        let inspection = host
+            .evm_tx_inspect(
+                "w".into(),
+                "anvil".into(),
+                legacy.id.clone(),
+                Some(context.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inspection.state, "failed");
+        assert_eq!(
+            std::fs::read(entry.dir.join("intent.json")).unwrap(),
+            intent,
+            "inspection must be read-only"
+        );
 
         let mut other_context = context;
         other_context.package_hash = "c".repeat(64);
@@ -7730,7 +8757,6 @@ ws_url = "wss://example.invalid"
             expires_ms: 0,
             status: bloom_proto::TxStatus::Pending,
             action_kind: bloom_proto::TxActionKind::ContractCreation,
-            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,
@@ -7782,7 +8808,6 @@ ws_url = "wss://example.invalid"
             expires_ms: 0,
             status: bloom_proto::TxStatus::Pending,
             action_kind: bloom_proto::TxActionKind::ContractCreation,
-            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,
@@ -8033,7 +9058,6 @@ ws_url = "wss://example.invalid"
             expires_ms: 1,
             status: bloom_proto::TxStatus::Pending,
             action_kind: bloom_proto::TxActionKind::Unknown,
-            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,
@@ -8061,6 +9085,39 @@ ws_url = "wss://example.invalid"
             .expect("background task did not honour shutdown signal");
     }
 
+    #[tokio::test]
+    async fn idle_expiry_sweeps_leave_the_audit_journal_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = HomeDir::at(dir.path());
+        let d = Daemon::from_home(home.clone()).unwrap();
+        let solana_outbox =
+            bloom_solana_tx::outbox::SolanaOutbox::new(home.solana_outbox_dir()).unwrap();
+        let before = d.audit.count().unwrap();
+        for now_ms in [1_u128, 2, 3] {
+            assert_eq!(
+                run_expiry_sweep_once(&d.tx_engine.outbox, &d.audit, now_ms).unwrap(),
+                0
+            );
+            assert_eq!(
+                run_solana_expiry_sweep_once(
+                    &solana_outbox,
+                    &d.audit,
+                    now_ms,
+                    &std::collections::HashMap::new(),
+                    &std::collections::HashSet::new(),
+                )
+                .unwrap(),
+                0
+            );
+        }
+        assert_eq!(
+            d.audit.count().unwrap(),
+            before,
+            "idle sweeps must not append records"
+        );
+        assert!(d.audit.pending_effect_correlations().unwrap().is_empty());
+    }
+
     // Fix D (PLAN-SOLANA-PR-FIXES.md): the periodic sweep task only ever
     // knew about the EVM outbox — `solana_engines`' outbox root was never
     // passed to it at all, so even a correctly-set Solana expiry wouldn't
@@ -8068,6 +9125,59 @@ ws_url = "wss://example.invalid"
     // above: call the sweep function directly rather than waiting on the
     // real 60s tick, but exercise the exact outbox root
     // `spawn_background_tasks` itself constructs (`home.outbox_dir()`).
+    /// A loopback Solana RPC answering `getBlockHeight` with `height`, or
+    /// failing every request when `height` is `None`.
+    async fn spawn_solana_height_stub(height: Option<u64>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let _ = socket.read(&mut [0u8; 8192]).await;
+                let body = match height {
+                    Some(h) => format!(r#"{{"jsonrpc":"2.0","id":1,"result":{h}}}"#),
+                    None => r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"down"}}"#
+                        .to_string(),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    /// Every configured endpoint must be past the window before the sweep
+    /// may retire even an unsigned entry.
+    #[tokio::test]
+    async fn solana_sweep_height_requires_every_endpoint() {
+        let fast = spawn_solana_height_stub(Some(200)).await;
+        for slow in [Some(50), None] {
+            let slow = spawn_solana_height_stub(slow).await;
+            let registry = bloom_solana::SolanaChainRegistry::new();
+            registry.add(
+                bloom_solana::SolanaClient::build(&bloom_solana::SolanaSpec {
+                    name: "solana-devnet".into(),
+                    endpoints: [&fast, &slow]
+                        .map(|url| bloom_solana::EndpointSpec {
+                            url: url.to_string(),
+                            weight: 100,
+                            cu_per_sec: None,
+                            max_rps: None,
+                            http_only: false,
+                        })
+                        .to_vec(),
+                    expected_genesis_base58: None,
+                })
+                .unwrap(),
+            );
+            let heights = solana_sweep_heights(&registry).await;
+            assert!(heights.get("solana-devnet").is_none_or(|h| *h <= 50));
+        }
+    }
+
     #[tokio::test]
     async fn solana_sweep_reaps_an_expired_staged_transfer() {
         let dir = tempfile::tempdir().unwrap();
@@ -8103,6 +9213,7 @@ ws_url = "wss://example.invalid"
             &d.audit,
             2,
             &std::collections::HashMap::from([("solana-devnet".to_string(), 101_u64)]),
+            &std::collections::HashSet::new(),
         )
         .unwrap();
         assert_eq!(n, 1, "an abandoned, expired Solana stage must be reaped");
@@ -8148,7 +9259,6 @@ ws_url = "wss://example.invalid"
             expires_ms: 1,
             status: bloom_proto::TxStatus::Pending,
             action_kind: bloom_proto::TxActionKind::Unknown,
-            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,
@@ -8442,12 +9552,12 @@ ws_url = "wss://example.invalid"
 
         fn policy(&self) -> bloom_broker_api::SignedPolicySnapshot {
             let canonical = serde_json::to_vec(&bloom_broker_api::CanonicalWalletPolicy {
+                clear_signing: None,
                 wallet_id: bloom_broker_api::Token::new("w").unwrap(),
                 maximum_approval_lifetime_ms: 3_600_000,
                 allowed_petal_packages: Vec::new(),
                 allowed_destinations: Vec::new(),
                 required_verifiers: Vec::new(),
-                clear_signing: None,
             })
             .unwrap();
             bloom_broker_api::SignedPolicySnapshot {
@@ -8861,7 +9971,7 @@ allowed = ["bloom:vfs.read"]
                 )
                 .unwrap();
             let reusable = host
-                .petal_reusable_signing_paths(&context, "w", "test.intent", 1, Some(key))
+                .petal_reusable_signing_paths(&context, "w", "test.intent", 1, Some(key), None)
                 .unwrap();
             identities.push((exact, reusable));
         }
@@ -8876,7 +9986,57 @@ allowed = ["bloom:vfs.read"]
                 "w",
                 "test.intent",
                 1,
-                Some(&changed_locator)
+                Some(&changed_locator),
+                None
+            )
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn solana_review_identity_excludes_blockhash_and_replaces_unreviewed_grants() {
+        let (_dir, daemon, _) = isolation_daemon().await;
+        let host = test_petal_host(&daemon)
+            .with_petal_signing_state_root(daemon.home.cache_dir().join("signing"));
+        let context = account_route_context("w", Some(0), None);
+        let payload = hex::decode(bloom_broker_api::solana_vectors::MESSAGE_HEX).unwrap();
+        let binding = bloom_broker_api::solana_message_binding(&payload).unwrap();
+        let original = host
+            .petal_reusable_signing_paths(&context, "w", "pumpfun.buy", 1, None, Some(&binding))
+            .unwrap();
+        let old = host
+            .petal_reusable_signing_paths(&context, "w", "pumpfun.buy", 1, None, None)
+            .unwrap();
+        assert_ne!(original, old, "old opaque grants must not be reused");
+        // The frozen fixture has three static accounts and one-byte count.
+        let mut fresh = payload.clone();
+        fresh[100..132].fill(0x55);
+        let fresh_binding = bloom_broker_api::solana_message_binding(&fresh).unwrap();
+        assert_eq!(binding, fresh_binding);
+        assert_eq!(
+            original,
+            host.petal_reusable_signing_paths(
+                &context,
+                "w",
+                "pumpfun.buy",
+                1,
+                None,
+                Some(&fresh_binding)
+            )
+            .unwrap()
+        );
+        let mut altered = payload;
+        *altered.last_mut().unwrap() ^= 1;
+        let altered_binding = bloom_broker_api::solana_message_binding(&altered).unwrap();
+        assert_ne!(
+            original,
+            host.petal_reusable_signing_paths(
+                &context,
+                "w",
+                "pumpfun.buy",
+                1,
+                None,
+                Some(&altered_binding)
             )
             .unwrap()
         );
@@ -8938,8 +10098,55 @@ allowed = ["bloom:vfs.read"]
         assert!(broker.sign_calls.lock().is_empty());
     }
 
+    /// A hard policy denial ends a Petal-staged entry exactly as it ends one
+    /// staged directly: the confirm through its Petal fails, the entry moves
+    /// to `failed/` with its deny, and nothing is signed or left to retry.
+    #[tokio::test]
+    async fn petal_confirm_of_a_hard_denied_entry_fails_it_without_signing() {
+        let (_dir, daemon, broker) = isolation_daemon().await;
+        let host =
+            test_petal_host(&daemon).with_broker(Some(MachineBrokerClient::new(broker.clone())));
+        let context = account_route_context("w", Some(0), None);
+        let staged: bloom_proto::StagedTx = serde_json::from_value(serde_json::json!({
+            "id": "denied-outbox", "wallet": "w", "chain": "ethereum", "chain_id": 1,
+            "from": broker.child(true, 0).address, "to": broker.child(true, 1).address,
+            "value_wei": "0", "data_hex": "0x", "gas_limit": 21000, "nonce": 0,
+            "policy_checks": [{"rule": "destinations.allow", "outcome": "deny", "message": "not on allowlist"}],
+            "created_ms": 1, "expires_ms": 99999999999999u64, "status": "pending",
+            "execution_origin": DaemonPetalHost::petal_execution_origin(&context).unwrap(),
+        }))
+        .unwrap();
+        daemon
+            .tx_engine
+            .outbox
+            .write_pending(&staged, "# denied fixture")
+            .unwrap();
+        let error = host
+            .evm_tx_confirm(
+                "w".into(),
+                "ethereum".into(),
+                staged.id.clone(),
+                false,
+                Some(context),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("policy"), "{error}");
+        let entry = daemon
+            .tx_engine
+            .outbox
+            .read("w", "ethereum", &staged.id)
+            .unwrap();
+        assert_eq!(entry.state, bloom_tx::outbox::OutboxState::Failed);
+        let checks = std::fs::read_to_string(entry.dir.join("policy_check.json")).unwrap();
+        assert!(checks.contains("\"deny\""), "{checks}");
+        assert!(broker.sign_calls.lock().is_empty());
+    }
+
     #[tokio::test]
     async fn identical_petal_evm_stage_requests_reuse_only_the_selected_account_pending_entry() {
+        // A default chain: a local Anvil node is opt-in. Reusing the staged
+        // entry never reaches the chain's RPC endpoint.
         let (_dir, daemon, broker) = isolation_daemon().await;
         let host =
             test_petal_host(&daemon).with_broker(Some(MachineBrokerClient::new(broker.clone())));
@@ -8949,7 +10156,7 @@ allowed = ["bloom:vfs.read"]
             let context = account_route_context("w", Some(number), None);
             let staged: bloom_proto::StagedTx = serde_json::from_value(serde_json::json!({
                 "id": format!("account-{number}-pending"),
-                "wallet": "w", "chain": "anvil", "chain_id": 31337,
+                "wallet": "w", "chain": "ethereum", "chain_id": 1,
                 "from": broker.child(true, number).address, "to": to,
                 "value_wei": "0", "data_hex": "0x", "gas_limit": 21000,
                 "nonce": 0, "policy_checks": [], "created_ms": 1,
@@ -8968,7 +10175,7 @@ allowed = ["bloom:vfs.read"]
             let outcome = host
                 .evm_tx_stage(EvmTransactionRequest {
                     wallet: "w".into(),
-                    chain: "anvil".into(),
+                    chain: "ethereum".into(),
                     to: to.clone(),
                     value_wei: "0".into(),
                     data_hex: "0x".into(),
@@ -8985,7 +10192,7 @@ allowed = ["bloom:vfs.read"]
             daemon
                 .tx_engine
                 .outbox
-                .list("w", "anvil", OutboxState::Pending)
+                .list("w", "ethereum", OutboxState::Pending)
                 .unwrap()
                 .len(),
             2
@@ -9842,6 +11049,39 @@ allowed = ["bloom:vfs.read"]
         assert!(
             names.contains(&"unknown-eeeeeeeeeeee"),
             "an unmounted session renders under unknown-<hash prefix>: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn petal_http_transport_errors_name_method_host_and_cause_but_no_url_data() {
+        // A closed port: Linux and macOS both refuse the connect at once.
+        // (A bound socket that never listens times out on macOS instead.)
+        let port = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let url = format!(
+            "http://fixture-user:fixture-password@127.0.0.1:{port}/fixture-path-token?key=fixture-query-token"
+        );
+        let original = reqwest::Client::new().get(&url).send().await.unwrap_err();
+        let message = petal_http_transport_error("send", "GET", &url, original).to_string();
+        for value in [
+            "fixture-user",
+            "fixture-password",
+            "fixture-path-token",
+            "fixture-query-token",
+        ] {
+            assert!(!message.contains(value), "URL data leaked: {message}");
+        }
+        assert!(
+            message.contains("http_fetch send: GET 127.0.0.1: "),
+            "method and host were dropped: {message}"
+        );
+        assert!(
+            message.contains("tcp connect error"),
+            "transport cause was dropped: {message}"
         );
     }
 }

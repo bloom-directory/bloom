@@ -21,7 +21,6 @@ pub mod plan;
 pub mod policy;
 pub mod polymarket_policy;
 pub mod serde_micro;
-pub mod tokens;
 pub mod units;
 pub mod valuation;
 
@@ -41,10 +40,12 @@ pub use config::{
 pub use defi_policy::{DefiPolicy, DefiRouteCtx, ReceiverClass, evaluate_defi_route};
 pub use home::{HomeDir, HomeError, HomeWritePermit};
 pub use intent::{
-    EnsoIntent, GasStrategy, INTENT_HASH_DOMAIN, RawIntent, RawIntentBody, ShellIntent, TxIntent,
-    ValueOrToken, intent_hash_of,
+    GasStrategy, INTENT_HASH_DOMAIN, RawIntent, RawIntentBody, ShellIntent, TxIntent, ValueOrToken,
+    intent_hash_of,
 };
-pub use plan::{NftAction, NftRef, PlanRender, StagedTx, TokenRef, TxActionKind, TxStatus};
+pub use plan::{
+    NftAction, NftRef, PlanRender, StagedTx, TokenRef, TxActionKind, TxStatus, is_valid_action_id,
+};
 pub use policy::{
     AgentAutonomyMode, ApprovalPolicy, ApprovalStepUpPolicy, AuthorizationSubject,
     AuthorizationSurface, AutonomyDecision, BudgetSnapshot, LimitsPolicy, Policy, PolicyCheck,

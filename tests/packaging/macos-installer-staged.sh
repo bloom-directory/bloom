@@ -66,20 +66,23 @@ make_payload "$payload_a" release-a
 make_payload "$payload_b" release-b
 
 # Foreign CLI entries fail before release, enrollment, or custody paths exist.
-for conflict in file symlink directory; do
-  root="$work/conflict-$conflict"
-  mkdir -p "$root/usr/local/bin"
-  case "$conflict" in
-    file) printf 'foreign\n' >"$root/usr/local/bin/bloom" ;;
-    symlink) ln -s /opt/foreign/bloom "$root/usr/local/bin/bloom" ;;
-    directory) mkdir "$root/usr/local/bin/bloom" ;;
-  esac
-  if run_installer "$digest_a" install "$root" 501 releaseuser "$payload_a"; then
-    echo "installer overwrote a foreign CLI $conflict" >&2
-    exit 1
-  fi
-  [[ ! -e "$root/usr/local/libexec/bloom" ]]
-  [[ ! -e "$root/Library/Application Support/BloomTriad" ]]
+for command_name in bloom; do
+  for conflict in file symlink directory; do
+    root="$work/conflict-$command_name-$conflict"
+    mkdir -p "$root/usr/local/bin"
+    entry="$root/usr/local/bin/$command_name"
+    case "$conflict" in
+      file) printf 'foreign\n' >"$entry" ;;
+      symlink) ln -s "/opt/foreign/$command_name" "$entry" ;;
+      directory) mkdir "$entry" ;;
+    esac
+    if run_installer "$digest_a" install "$root" 501 releaseuser "$payload_a"; then
+      echo "installer overwrote a foreign $command_name $conflict" >&2
+      exit 1
+    fi
+    [[ ! -e "$root/usr/local/libexec/bloom" ]]
+    [[ ! -e "$root/Library/Application Support/BloomTriad" ]]
+  done
 done
 
 root="$work/lifecycle-root"
@@ -98,6 +101,7 @@ resolved_root="$(cd "$root" && pwd -P)"
 # remain untouched, and the notice renders exact principal-bound commands.
 install_output="$(run_installer "$digest_a" install "$root" 501 releaseuser "$payload_a" 2>&1)"
 [[ -L "$root/usr/local/bin/bloom" ]]
+[[ ! -e "$root/usr/local/bin/bloom-ceremonies" && ! -L "$root/usr/local/bin/bloom-ceremonies" ]]
 [[ "$(readlink "$root/usr/local/bin/bloom")" == ../libexec/bloom/current/bloom ]]
 [[ ! -e "$legacy" && ! -L "$legacy" ]]
 [[ -d "$legacy_wallet" && -f "$legacy_wallet/kind" ]]
@@ -134,6 +138,7 @@ assert_legacy_pf_removed
 # it without requiring release-tree deletion.
 "$installer" uninstall --retain-custody "$root" 501
 [[ ! -e "$root/usr/local/bin/bloom" && ! -L "$root/usr/local/bin/bloom" ]]
+[[ ! -e "$root/usr/local/bin/bloom-ceremonies" && ! -L "$root/usr/local/bin/bloom-ceremonies" ]]
 [[ -d "$root/usr/local/libexec/bloom" ]]
 seed_legacy_pf
 run_installer "$digest_b" restore "$root" 501 releaseuser "$payload_b"
@@ -147,6 +152,7 @@ run_installer "$digest_b" install "$root" 502 seconduser "$payload_b"
 [[ -L "$root/usr/local/bin/bloom" ]]
 "$installer" uninstall "$root" 502 delete-bloom-login-502
 [[ ! -e "$root/usr/local/bin/bloom" && ! -L "$root/usr/local/bin/bloom" ]]
+[[ ! -e "$root/usr/local/bin/bloom-ceremonies" && ! -L "$root/usr/local/bin/bloom-ceremonies" ]]
 
 # A legacy symlink is unlinked without following its target, and staged mode
 # cannot touch a same-named entry outside the staged root.
