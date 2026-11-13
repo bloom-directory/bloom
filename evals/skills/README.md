@@ -1,16 +1,16 @@
 # Skill evaluations
 
-Promptfoo evaluations of the agent skill in [`skills/bloom`](../../skills/bloom/).
-They read the package files directly, so an evaluation always covers the skill
-as committed on this branch. The website serves the same files at a pinned
-commit and has no evaluation of its own.
+Promptfoo evaluations of the agent skill in [`skills/bloom`](../../skills/bloom/)
+and the [install guide](../../install/install.md) it links. They read the files
+directly, so an evaluation always covers them as committed on this branch. The
+website serves the same files at a pinned commit and has no evaluation of its own.
 
 ## Onboarding
 
 The onboarding suite sends the production prompt, "Read
 https://bloom.directory/SKILL.md and set up Bloom.", to a tool-less agent with
-`SKILL.md` and `references/install.md` attached. The provider cannot fetch the
-reference itself, so the reference is attached explicitly. The suite grades the
+`SKILL.md` and `install/install.md` attached. The provider cannot fetch the
+guide itself, so the guide is attached explicitly. The suite grades the
 agent's first response on each supported platform: macOS, Linux with `pkexec`,
 and Linux without it.
 
@@ -24,8 +24,8 @@ The deterministic grader reports these dimensions independently:
 - no refusal or confirmation loop;
 - honest execution status, including no fabricated tool calls.
 
-It reads the sudo, pkexec, and osascript commands from `references/install.md`,
-so the grader cannot drift from the skill.
+It reads the sudo, pkexec, and osascript commands from `install/install.md`,
+so the grader cannot drift from the guide.
 
 ## Running
 
