@@ -66,11 +66,15 @@ RUN set -eux; \
 
 # ----------------------------------------------------------------------------
 FROM debian:${DEBIAN_RELEASE}-slim AS runtime
+# nfs-common supplies /sbin/mount.nfs4, which bloom-mount execs to mount the
+# embedded NFSv4.1 export at the --mount path. Without it `bloom serve --mount`
+# fails at the mount step.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         ca-certificates \
         libssl3 \
         netcat-openbsd \
+        nfs-common \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /out/bin/bloom      /usr/local/bin/bloom
