@@ -634,61 +634,13 @@ impl EtherscanClient {
             .map_err(|e| EtherscanError::InvalidResponse(format!("balance parse: {e}")))
     }
 
-    /// `module=account&action=txlist`.
+    /// `module=account&action=<action>` paginated history feeds (`txlist`,
+    /// `txlistinternal`, `tokentx`, `tokennfttx`, `token1155tx`).
     #[allow(clippy::too_many_arguments)]
-    pub async fn get_tx_list(
+    pub(crate) async fn account_history<T: DeserializeOwned>(
         &self,
         chain_id: u64,
-        addr: Address,
-        start_block: u64,
-        end_block: u64,
-        page: u32,
-        offset: u32,
-        sort: Sort,
-    ) -> Result<Vec<TxRecord>, EtherscanError> {
-        let extra = [
-            ("address", addr.to_string()),
-            ("startblock", start_block.to_string()),
-            ("endblock", end_block.to_string()),
-            ("page", page.to_string()),
-            ("offset", offset.to_string()),
-            ("sort", sort.as_str().to_string()),
-        ];
-        let result = self.raw_call(chain_id, "account", "txlist", &extra).await?;
-        Self::decode(result)
-    }
-
-    /// `module=account&action=txlistinternal`.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn get_internal_tx_list(
-        &self,
-        chain_id: u64,
-        addr: Address,
-        start_block: u64,
-        end_block: u64,
-        page: u32,
-        offset: u32,
-        sort: Sort,
-    ) -> Result<Vec<TxRecord>, EtherscanError> {
-        let extra = [
-            ("address", addr.to_string()),
-            ("startblock", start_block.to_string()),
-            ("endblock", end_block.to_string()),
-            ("page", page.to_string()),
-            ("offset", offset.to_string()),
-            ("sort", sort.as_str().to_string()),
-        ];
-        let result = self
-            .raw_call(chain_id, "account", "txlistinternal", &extra)
-            .await?;
-        Self::decode(result)
-    }
-
-    /// `module=account&action=tokentx`.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn get_token_tx(
-        &self,
-        chain_id: u64,
+        action: &str,
         addr: Address,
         contract_addr_filter: Option<Address>,
         start_block: u64,
@@ -696,7 +648,7 @@ impl EtherscanClient {
         page: u32,
         offset: u32,
         sort: Sort,
-    ) -> Result<Vec<TokenTransfer>, EtherscanError> {
+    ) -> Result<Vec<T>, EtherscanError> {
         let mut extra: Vec<(&str, String)> = vec![
             ("address", addr.to_string()),
             ("startblock", start_block.to_string()),
@@ -708,69 +660,7 @@ impl EtherscanClient {
         if let Some(ca) = contract_addr_filter {
             extra.push(("contractaddress", ca.to_string()));
         }
-        let result = self
-            .raw_call(chain_id, "account", "tokentx", &extra)
-            .await?;
-        Self::decode(result)
-    }
-
-    /// `module=account&action=tokennfttx` (ERC-721 transfers).
-    #[allow(clippy::too_many_arguments)]
-    pub async fn get_nft_tx(
-        &self,
-        chain_id: u64,
-        addr: Address,
-        contract_addr_filter: Option<Address>,
-        start_block: u64,
-        end_block: u64,
-        page: u32,
-        offset: u32,
-        sort: Sort,
-    ) -> Result<Vec<TokenTransfer>, EtherscanError> {
-        let mut extra: Vec<(&str, String)> = vec![
-            ("address", addr.to_string()),
-            ("startblock", start_block.to_string()),
-            ("endblock", end_block.to_string()),
-            ("page", page.to_string()),
-            ("offset", offset.to_string()),
-            ("sort", sort.as_str().to_string()),
-        ];
-        if let Some(ca) = contract_addr_filter {
-            extra.push(("contractaddress", ca.to_string()));
-        }
-        let result = self
-            .raw_call(chain_id, "account", "tokennfttx", &extra)
-            .await?;
-        Self::decode(result)
-    }
-
-    /// `module=account&action=token1155tx` (ERC-1155 transfers).
-    #[allow(clippy::too_many_arguments)]
-    pub async fn get_nft1155_tx(
-        &self,
-        chain_id: u64,
-        addr: Address,
-        contract_addr_filter: Option<Address>,
-        start_block: u64,
-        end_block: u64,
-        page: u32,
-        offset: u32,
-        sort: Sort,
-    ) -> Result<Vec<TokenTransfer>, EtherscanError> {
-        let mut extra: Vec<(&str, String)> = vec![
-            ("address", addr.to_string()),
-            ("startblock", start_block.to_string()),
-            ("endblock", end_block.to_string()),
-            ("page", page.to_string()),
-            ("offset", offset.to_string()),
-            ("sort", sort.as_str().to_string()),
-        ];
-        if let Some(ca) = contract_addr_filter {
-            extra.push(("contractaddress", ca.to_string()));
-        }
-        let result = self
-            .raw_call(chain_id, "account", "token1155tx", &extra)
-            .await?;
+        let result = self.raw_call(chain_id, "account", action, &extra).await?;
         Self::decode(result)
     }
 

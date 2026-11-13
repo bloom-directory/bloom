@@ -5175,29 +5175,15 @@ fn expected_evm_batch_sign_operation_digest(
 fn read_triad_batch_signing_state(
     path: &std::path::Path,
 ) -> Result<Option<TriadEvmBatchSigningState>, TxEngineError> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(TxEngineError::Outbox(error.into())),
-    };
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        return Err(TxEngineError::ApprovalState(
-            "durable Broker batch projection is not a regular file".into(),
-        ));
-    }
-    let bytes = std::fs::read(path).map_err(OutboxError::from)?;
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|error| TxEngineError::ApprovalState(format!("decode batch ceremony: {error}")))
+    read_triad_projection(path, "batch", "batch ceremony")
 }
 
 fn write_triad_batch_signing_state(
     path: &std::path::Path,
     state: &TriadEvmBatchSigningState,
 ) -> Result<(), TxEngineError> {
-    use std::io::Write as _;
     #[cfg(unix)]
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    use std::os::unix::fs::PermissionsExt as _;
 
     let parent = path.parent().ok_or_else(|| {
         TxEngineError::ApprovalState("batch ceremony projection has no parent directory".into())
@@ -5208,75 +5194,71 @@ fn write_triad_batch_signing_state(
         .map_err(OutboxError::from)?;
     let bytes = serde_json::to_vec_pretty(state)
         .map_err(|error| TxEngineError::ApprovalState(error.to_string()))?;
-    let mut random = [0_u8; 8];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut random);
-    let temporary = parent.join(format!(
-        ".{TRIAD_BATCH_STATE_FILE}.{}.tmp",
-        hex::encode(random)
-    ));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let result = (|| -> Result<(), std::io::Error> {
-        let mut file = options.open(&temporary)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, path)?;
-        std::fs::File::open(parent)?.sync_all()?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result.map_err(|error| TxEngineError::Outbox(error.into()))
+    write_triad_projection(path, parent, TRIAD_BATCH_STATE_FILE, &bytes)
 }
 
 fn read_triad_signing_state(
     path: &std::path::Path,
 ) -> Result<Option<TriadEvmSigningState>, TxEngineError> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(TxEngineError::Outbox(error.into())),
-    };
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        return Err(TxEngineError::ApprovalState(
-            "durable Broker signing projection is not a regular file".into(),
-        ));
-    }
-    let bytes = std::fs::read(path).map_err(OutboxError::from)?;
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|error| TxEngineError::ApprovalState(format!("decode ceremony.json: {error}")))
+    read_triad_projection(path, "signing", "ceremony.json")
 }
 
 fn write_triad_signing_state(
     path: &std::path::Path,
     state: &TriadEvmSigningState,
 ) -> Result<(), TxEngineError> {
-    use std::io::Write as _;
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt as _;
-
     let bytes = serde_json::to_vec_pretty(state)
         .map_err(|error| TxEngineError::ApprovalState(error.to_string()))?;
     let parent = path.parent().ok_or_else(|| {
         TxEngineError::ApprovalState("ceremony projection has no parent directory".into())
     })?;
+    write_triad_projection(path, parent, TRIAD_SIGNING_STATE_FILE, &bytes)
+}
+
+/// Read a durable Broker projection, refusing anything but a regular file.
+fn read_triad_projection<T: serde::de::DeserializeOwned>(
+    path: &std::path::Path,
+    kind: &str,
+    decode_label: &str,
+) -> Result<Option<T>, TxEngineError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(TxEngineError::Outbox(error.into())),
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(TxEngineError::ApprovalState(format!(
+            "durable Broker {kind} projection is not a regular file"
+        )));
+    }
+    let bytes = std::fs::read(path).map_err(OutboxError::from)?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| TxEngineError::ApprovalState(format!("decode {decode_label}: {error}")))
+}
+
+/// Atomically replace `path` with `bytes` through a fresh 0600 temporary
+/// file in `parent`, syncing the file and directory.
+fn write_triad_projection(
+    path: &std::path::Path,
+    parent: &std::path::Path,
+    file_name: &str,
+    bytes: &[u8],
+) -> Result<(), TxEngineError> {
+    use std::io::Write as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt as _;
+
     let mut random = [0_u8; 8];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut random);
-    let temporary = parent.join(format!(
-        ".{TRIAD_SIGNING_STATE_FILE}.{}.tmp",
-        hex::encode(random)
-    ));
+    let temporary = parent.join(format!(".{file_name}.{}.tmp", hex::encode(random)));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
     let result = (|| -> Result<(), std::io::Error> {
         let mut file = options.open(&temporary)?;
-        file.write_all(&bytes)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         std::fs::rename(&temporary, path)?;
         std::fs::File::open(parent)?.sync_all()?;

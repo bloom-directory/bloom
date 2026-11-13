@@ -261,6 +261,30 @@ struct ReusablePetalBatchSigningAttemptIdentity<'a> {
     claim_assurance_evidence_digest: Option<Digest32>,
 }
 
+/// Create the state directory and take the exclusive per-state file lock.
+async fn lock_signing_state(state_path: &Path, label: &'static str) -> Result<fs::File, String> {
+    let parent = state_path
+        .parent()
+        .ok_or_else(|| format!("{label} state path has no parent"))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("create {label} state directory: {error}"))?;
+    let lock_path = state_path.with_extension("lock");
+    tokio::task::spawn_blocking(move || {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .map_err(|error| format!("open {label} lock: {error}"))?;
+        file.lock_exclusive()
+            .map_err(|error| format!("lock {label} state: {error}"))?;
+        Ok(file)
+    })
+    .await
+    .map_err(|error| format!("join {label} lock task: {error}"))?
+}
+
 impl BrokerExactPayloadSigner {
     pub fn new(broker: MachineBrokerClient, provenance_catalog: ProvenanceCatalog) -> Self {
         Self {
@@ -287,27 +311,7 @@ impl BrokerExactPayloadSigner {
         canonical_plan_facts: &serde_json::Value,
         review_payload: Option<&[u8]>,
     ) -> Result<ExactPayloadOutcome, String> {
-        let parent = state_path
-            .parent()
-            .ok_or_else(|| "exact signing state path has no parent".to_owned())?;
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("create exact signing state directory: {error}"))?;
-        let lock_path = state_path.with_extension("lock");
-        let lock = tokio::task::spawn_blocking(move || {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(lock_path)
-                .map_err(|error| format!("open exact signing lock: {error}"))?;
-            file.lock_exclusive()
-                .map_err(|error| format!("lock exact signing state: {error}"))?;
-            Ok::<_, String>(file)
-        })
-        .await
-        .map_err(|error| format!("join exact signing lock task: {error}"))??;
-
+        let lock = lock_signing_state(state_path, "exact signing").await?;
         let result = self
             .sign_or_prepare_locked(
                 state_path,
@@ -347,26 +351,7 @@ impl BrokerExactPayloadSigner {
         claim_assurance_evidence: Option<&[u8]>,
         petal_review_payload: Option<&[u8]>,
     ) -> Result<ExactPayloadOutcome, ExactSigningError> {
-        let parent = state_path
-            .parent()
-            .ok_or_else(|| "exact signing state path has no parent".to_owned())?;
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("create exact signing state directory: {error}"))?;
-        let lock_path = state_path.with_extension("lock");
-        let lock = tokio::task::spawn_blocking(move || {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(lock_path)
-                .map_err(|error| format!("open exact signing lock: {error}"))?;
-            file.lock_exclusive()
-                .map_err(|error| format!("lock exact signing state: {error}"))?;
-            Ok::<_, String>(file)
-        })
-        .await
-        .map_err(|error| format!("join exact signing lock task: {error}"))??;
+        let lock = lock_signing_state(state_path, "exact signing").await?;
         let result = self
             .sign_or_prepare_locked(
                 state_path,
@@ -625,26 +610,7 @@ impl BrokerExactPayloadSigner {
         claim_assurance_evidence: Option<&[u8]>,
         message_review_payload: Option<&[u8]>,
     ) -> Result<ExactPayloadBatchOutcome, ExactSigningError> {
-        let parent = state_path
-            .parent()
-            .ok_or_else(|| "exact batch signing state path has no parent".to_owned())?;
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("create exact batch signing state directory: {error}"))?;
-        let lock_path = state_path.with_extension("lock");
-        let lock = tokio::task::spawn_blocking(move || {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(lock_path)
-                .map_err(|error| format!("open exact batch signing lock: {error}"))?;
-            file.lock_exclusive()
-                .map_err(|error| format!("lock exact batch signing state: {error}"))?;
-            Ok::<_, String>(file)
-        })
-        .await
-        .map_err(|error| format!("join exact batch signing lock task: {error}"))??;
+        let lock = lock_signing_state(state_path, "exact batch signing").await?;
         let result = self
             .sign_or_prepare_petal_batch_locked(
                 state_path,
@@ -684,26 +650,7 @@ impl BrokerExactPayloadSigner {
         claim: &PetalUseClaim,
         claim_assurance_evidence: Option<&[u8]>,
     ) -> Result<ExactPayloadBatchOutcome, ExactSigningError> {
-        let parent = state_path
-            .parent()
-            .ok_or_else(|| "reusable batch signing state path has no parent".to_owned())?;
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("create reusable batch signing state directory: {error}"))?;
-        let lock_path = state_path.with_extension("lock");
-        let lock = tokio::task::spawn_blocking(move || {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(lock_path)
-                .map_err(|error| format!("open reusable batch signing lock: {error}"))?;
-            file.lock_exclusive()
-                .map_err(|error| format!("lock reusable batch signing state: {error}"))?;
-            Ok::<_, String>(file)
-        })
-        .await
-        .map_err(|error| format!("join reusable batch signing lock task: {error}"))??;
+        let lock = lock_signing_state(state_path, "reusable batch signing").await?;
         let result = self
             .sign_or_prepare_reusable_petal_batch_locked(
                 state_path,
