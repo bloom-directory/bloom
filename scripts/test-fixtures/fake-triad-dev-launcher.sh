@@ -397,7 +397,7 @@ def fixture_loop():
                 "petal-key-requests/" + "33" * 32 + ".json",
                 {
                     "schema": "bloom.machine.petal-key-request.v1",
-                    "request_id": request_id,
+                    "key_slot": request_id,
                     "scope": {
                         "wallet_id": wallet,
                         "package_hash": fixture_package_hash,
@@ -405,7 +405,7 @@ def fixture_loop():
                         "agent_id": None,
                         "purpose": "fixture.payload",
                         "allowed_crypto_suites": ["secp256k1-sha256-recoverable"],
-                        "maximum_lifetime_ms": "900000",
+                        "maximum_lifetime_ms": "300000",
                         "custody_operation_id": operation_id,
                     },
                     "scope_digest": scope_digest,
@@ -431,14 +431,25 @@ def fixture_loop():
             key_record = json.loads(
                 (mount / ("petal-key-requests/" + "33" * 32 + ".json")).read_text()
             )
-            key_record["status"] = "succeeded"
-            key_record["ceremony_url"] = None
+            key_record["status"] = "awaiting_user"
+            key_record["ceremony_url"] = "http://127.0.0.1:18734/fixture-reusable"
             key_record["public_key"] = {
                 "key_ref": fixture_key_ref,
                 "canonical_public_key": "Ag",
                 "addresses": [address],
                 "supported_crypto_suites": ["secp256k1-sha256-recoverable"],
             }
+            write_json("petal-key-requests/" + "33" * 32 + ".json", key_record)
+            write_json(f"petals/triad-authority-fixture/wallets/{wallet}/0/session.json", {
+                "schema": "bloom.triad-authority-fixture.result.v1",
+                "stage": "key", "outcome": {"state": "pending"},
+            })
+        elif stage == 2:
+            key_record = json.loads(
+                (mount / ("petal-key-requests/" + "33" * 32 + ".json")).read_text()
+            )
+            key_record["status"] = "succeeded"
+            key_record["ceremony_url"] = None
             write_json("petal-key-requests/" + "33" * 32 + ".json", key_record)
             write_json(
                 f"petals/triad-authority-fixture/wallets/{wallet}/0/session.json",
