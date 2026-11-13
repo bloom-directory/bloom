@@ -6,28 +6,22 @@ use bloom_broker_api::{
     ApprovalPrepareRequest, ApprovalPrepareState, Base64UrlBytes, CryptoSuite, DecimalU64,
     Digest32, KeyPublic, KeyRef, KeyRequest, KeyRole, KeySpec, MachineBrokerRequest,
     MachineBrokerResponse, MachineBrokerService, MachineSignRequest, NormalizedSignature,
-    ProtocolError, ProtocolErrorCode, ProvenanceCatalog, ProvenanceOperationClass,
-    ProvenanceRecord, ProvenanceSubject, SealedApprovalPrepareResponse, ServiceFuture,
-    SigningPayloads, SigningResult, Token, WalletAccountsPublic, WalletPublic, WalletRequest,
+    ProtocolError, ProtocolErrorCode, SealedApprovalPrepareResponse, ServiceFuture,
+    SigningPayloads, SigningResult, WalletAccountsPublic, WalletPublic, WalletRequest,
 };
 use bloom_machine_client::MachineBrokerClient;
 use bloom_solana_tx::message::{build_transfer_message, verify_signature};
 use bloom_solana_tx::signing::{SignTransferRequest, SolanaSignOutcome, SolanaTransferSigner};
 use sha2::{Digest as _, Sha256};
 
+mod common;
+use common::{catalog, digest, token};
+
 /// A Broker fixture that signs with a real Ed25519 derived child.
 struct SolanaBrokerFixture {
     child_signing_key: ed25519_dalek::SigningKey,
     child_key_ref: KeyRef,
     prepared_claim: std::sync::Mutex<Option<bloom_broker_api::SystemUseClaim>>,
-}
-
-fn token(s: &str) -> Token {
-    Token::new(s).unwrap()
-}
-
-fn digest(byte: u8) -> Digest32 {
-    Digest32::from_bytes([byte; 32])
 }
 
 impl SolanaBrokerFixture {
@@ -205,29 +199,6 @@ impl MachineBrokerService for SolanaBrokerFixture {
                 )),
             }
         })
-    }
-}
-
-fn catalog() -> ProvenanceCatalog {
-    ProvenanceCatalog {
-        schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
-        records: vec![ProvenanceRecord {
-            subject: ProvenanceSubject::System {
-                component_id: token("bloom-machine"),
-                operation_class: token("solana.transfer.confirm"),
-            },
-            publisher: token("bloom-installer"),
-            petal_lineage: None,
-            operation_classes: vec![ProvenanceOperationClass {
-                operation_class: token("solana.native-transfer"),
-                fee_asset: Some(bloom_broker_api::ProvenanceFeeAsset {
-                    chain: token("solana"),
-                    asset: "native".into(),
-                }),
-            }],
-            installer_key_id: token("installer-key"),
-            installer_signature: Base64UrlBytes::from_bytes(&[11; 64]),
-        }],
     }
 }
 
