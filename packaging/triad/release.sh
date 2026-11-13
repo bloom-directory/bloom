@@ -80,7 +80,7 @@ require_host_platform() {
 
 require_staged_architecture() {
   local platform="$1" staging="$2" binary description
-  for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
+  for binary in bloom bloom-broker bloom-signer; do
     description="$(file -b -- "$staging/bin/$binary")"
     case "$platform" in
       linux)
@@ -281,8 +281,7 @@ build_candidate() {
   for source in \
     "$main_root:bloom" \
     "$broker_root:bloom-broker" \
-    "$signer_root:bloom-signer" \
-    "$signer_root:bloom-signer-migrate"
+    "$signer_root:bloom-signer"
   do
     local source_root="${source%%:*}"
     binary="${source#*:}"

@@ -16,7 +16,7 @@ make_payload() {
   cp "$installer" "$target/installer/release/install-macos.sh"
   cp "$workspace/packaging/triad/release/compatibility-v1.toml" "$target/"
   printf 'test-unclaimed\n' >"$target/PLATFORM_CLAIM"
-  for name in bloom bloom-broker bloom-signer bloom-signer-migrate; do
+  for name in bloom bloom-broker bloom-signer; do
     printf '#!/bin/sh\nprintf "%%s\\n" "%s"\n' "$marker" >"$target/bin/$name"
     chmod 0755 "$target/bin/$name"
   done
@@ -88,17 +88,15 @@ done
 root="$work/lifecycle-root"
 legacy="$root/Users/releaseuser/.local/bin/bloom"
 legacy_wallet="$root/Users/releaseuser/.bloom/keystore/alice"
-unsupported_wallet="$root/Users/releaseuser/.bloom/keystore/watch-only"
 mkdir -p "$(dirname "$legacy")"
 printf 'old Bloom\n' >"$legacy"
-mkdir -p "$legacy_wallet" "$unsupported_wallet"
+mkdir -p "$legacy_wallet"
 printf 'passkey\n' >"$legacy_wallet/kind"
-printf 'watch\n' >"$unsupported_wallet/kind"
 resolved_root="$(cd "$root" && pwd -P)"
 
 # Fresh install exposes the exact relative link and removes only the staged
 # login's supported legacy entry after enrollment convergence. Wallet sources
-# remain untouched, and the notice renders exact principal-bound commands.
+# remain untouched, and the notice says v1 wallets are unsupported.
 install_output="$(run_installer "$digest_a" install "$root" 501 releaseuser "$payload_a" 2>&1)"
 [[ -L "$root/usr/local/bin/bloom" ]]
 [[ ! -e "$root/usr/local/bin/bloom-ceremonies" && ! -L "$root/usr/local/bin/bloom-ceremonies" ]]
@@ -106,20 +104,7 @@ install_output="$(run_installer "$digest_a" install "$root" 501 releaseuser "$pa
 [[ ! -e "$legacy" && ! -L "$legacy" ]]
 [[ -d "$legacy_wallet" && -f "$legacy_wallet/kind" ]]
 [[ "$(readlink "$root/usr/local/libexec/bloom/current")" == "releases/$digest_a" ]]
-grep -F "Legacy Bloom wallets were not modified and remain at: $resolved_root/Users/releaseuser/.bloom/keystore" <<<"$install_output" >/dev/null
-printf -v stage_command '  sudo %q stage --source %q --config %q --source-uid %q --signer-uid %q --signer-gid %q --receipt %q' \
-  "$resolved_root/usr/local/libexec/bloom/current/bloom-signer-migrate" \
-  "$resolved_root/Users/releaseuser/.bloom/keystore/alice" \
-  "$resolved_root/Library/Application Support/BloomTriad/config/501/signer/config.json" \
-  501 250502 260500 \
-  "$resolved_root/Users/releaseuser/.bloom/alice.triad-migration-receipt.json"
-printf -v finish_command '  %q wallet migrate-passkey %q' \
-  "$resolved_root/usr/local/bin/bloom" \
-  "$resolved_root/Users/releaseuser/.bloom/alice.triad-migration-receipt.json"
-grep -F "$stage_command" <<<"$install_output" >/dev/null
-grep -F "$finish_command" <<<"$install_output" >/dev/null
-grep -F "Only the staging command requires sudo" <<<"$install_output" >/dev/null
-grep -F "Legacy wallet watch-only uses unsupported kind 'watch'" <<<"$install_output" >/dev/null
+grep -F "Legacy v1 Bloom wallets are not supported and were not modified: $resolved_root/Users/releaseuser/.bloom/keystore" <<<"$install_output" >/dev/null
 
 # The exact managed link is accepted; repair also retires legacy PF orphans.
 seed_legacy_pf
