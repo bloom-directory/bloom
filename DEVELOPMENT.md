@@ -68,6 +68,10 @@ cargo build -p bloom --no-default-features --features mount
 # Developer triad bootstrap. This feature is forbidden in release bundles.
 cargo build -p bloom --no-default-features \
   --features mount,triad-dev-harness
+
+# Optional heavy revert-decoder fallback.
+cargo build -p bloom --no-default-features \
+  --features mount,bytecode-decompile
 ```
 
 Build Broker and Signer from their own repositories. Release artifacts must be

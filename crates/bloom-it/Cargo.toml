@@ -6,6 +6,12 @@ license.workspace = true
 description = "End-to-end integration tests for bloom"
 publish = false
 
+[features]
+default = []
+# Forwards to bloom-revert/bytecode-decompile so the heimdall-fallback
+# integration test (`tests/revert_decoding_fallbacks.rs`) compiles.
+bytecode-decompile = ["bloom-revert/bytecode-decompile"]
+
 [dependencies]
 bloom-proto.workspace = true
 bloom-evm.workspace = true

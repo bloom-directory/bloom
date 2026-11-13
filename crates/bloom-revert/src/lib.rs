@@ -3,9 +3,12 @@
 //! Surfaces a [`DecoderChain`] that walks a list of [`RevertDecoder`]s in
 //! order, returning the first one that matches the selector. Builtin
 //! decoding (Solidity `Error(string)` / `Panic(uint256)`) is always tried
-//! first; richer decoders (ABI-driven, public selector lookup) plug in by
-//! being pushed onto the chain. `DecodeSource::HeimdallDecompile` remains
-//! a reserved serialized variant with no decoder.
+//! first; richer decoders (ABI-driven, public selector lookup, bytecode
+//! decompile) plug in by being pushed onto the chain.
+//!
+//! Stages 4 and 5 (Openchain selector lookup, Heimdall decompile) are
+//! reserved as [`DecodeSource`] variants but not implemented here — the
+//! second-pass agent appends decoder impls without altering core types.
 
 #![forbid(unsafe_code)]
 
@@ -21,11 +24,17 @@ mod chain;
 mod etherscan;
 mod openchain;
 
+#[cfg(feature = "bytecode-decompile")]
+mod heimdall;
+
 pub use abi::{AbiSource, EtherscanAbiSource};
 pub use builtin::BuiltinDecoder;
 pub use chain::DecoderChain;
 pub use etherscan::EtherscanAbiDecoder;
 pub use openchain::OpenchainDecoder;
+
+#[cfg(feature = "bytecode-decompile")]
+pub use heimdall::{BytecodeSource, ChainRegistryBytecodeSource, HeimdallDecompileDecoder};
 
 /// Source attribution for a decoded revert. Variants for stages 4 and 5
 /// are reserved here so decoders added later can populate them without
