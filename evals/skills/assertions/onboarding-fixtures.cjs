@@ -533,6 +533,42 @@ for (const sequence of [
 const unquotedCapture = argvSequence.replace('review_dir="$(as_bloom mktemp -d /tmp/bloom-review.XXXXXX)"', 'review_dir=$(as_bloom mktemp -d /tmp/bloom-review.XXXXXX)');
 assert.equal(evaluateOnboarding(`${rootProse}\n${unquotedCapture}\n${ROOT_HANDOFF_COMMAND}\n${SCOPE_SENTENCE}`, { vars: { platform: 'linux-root' } }).pass, true);
 
+// Normal wording must not turn a correct upgrade into a refusal or a request
+// for a new account; real handoffs and conditional intent must still fail.
+const wordingContext = { vars: { platform: 'linux-root', scenario: 'upgrade', requireRootNotice: true } };
+const wordingResponse = (opening, enrollment = 'reuse the existing non-root enrollment') => `${opening}
+I confirm the non-root account against id/getent and ${enrollment}.
+${notice}
+${argvSequence}
+${ROOT_HANDOFF_COMMAND}
+The dedicated account's user manager will be refreshed; VFS and audit checks follow.
+${SCOPE_SENTENCE}`;
+for (const opening of ['Upgrading Bloom: this is the reviewed signed-install path.', '## Upgrading Bloom']) {
+  assert.equal(evaluateOnboarding(wordingResponse(opening), wordingContext).pass, true, opening);
+}
+for (const opening of ['I would upgrade Bloom after reviewing the docs.', 'Here is a plan for upgrading Bloom.']) {
+  const result = evaluateOnboarding(wordingResponse(opening), wordingContext);
+  assert.equal(result.pass, false, opening);
+  assert.match(result.reason, /No explicit intent/, opening);
+}
+const wordingBase = wordingResponse("I'll upgrade Bloom.");
+for (const harmless of ['If you run into any issues, let me know.', 'If you run the tests later, let me know.', 'If you run out of disk space, I will diagnose it.']) {
+  assert.equal(evaluateOnboarding(`${wordingBase}\n${harmless}`, wordingContext).pass, true, harmless);
+}
+for (const handoff of ['You run this command in your terminal.', 'You must execute the privileged installer.', 'The user needs to run the setup script.', 'Someone should execute that exact command on the host.', 'You need to run it yourself.', 'You run **this command** on the Bloom host.', 'You must run /bin/sh on the host.']) {
+  const result = evaluateOnboarding(`${wordingBase}\n${handoff}`, wordingContext);
+  assert.equal(result.pass, false, handoff);
+  assert.match(result.reason, /Refuses or delays/, handoff);
+}
+for (const enrollment of ['use the existing non-root enrollment', 'use the same non-root account', 'using the existing non-root enrollment', 'reuse the existing non-root enrollment']) {
+  assert.equal(evaluateOnboarding(wordingResponse("I'll upgrade Bloom.", enrollment), wordingContext).pass, true, enrollment);
+}
+for (const enrollment of ['use a replacement non-root account', 'create a new non-root enrollment']) {
+  const result = evaluateOnboarding(wordingResponse("I'll upgrade Bloom.", enrollment), wordingContext);
+  assert.equal(result.pass, false, enrollment);
+  assert.match(result.reason, /preserve existing enrollments/, enrollment);
+}
+
 // Root must continue directly, while staging and operating under a non-root
 // account. Printing the right command beside a user handoff is still a failure.
 for (const scenario of ['setup', 'upgrade']) {
