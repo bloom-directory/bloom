@@ -206,7 +206,8 @@ pub struct EtherscanConfig {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MempoolChainConfig {
-    /// Provider id; the daemon currently accepts only `"alchemy"`.
+    /// Provider id — must match a `bloom_mempool::providers::*` adapter
+    /// id: `"alchemy"` or `"generic_eth_subscribe"`.
     pub provider: String,
     pub ws_url: String,
     #[serde(default = "default_max_index_size")]

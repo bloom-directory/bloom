@@ -4288,8 +4288,15 @@ impl Daemon {
 
             // Resolve the provider before allocating any state, so an
             // unknown provider id doesn't leave a half-mounted handler.
-            // Providers must deliver full tx bodies: hash-only records would
-            // break by-address filtering and nonce-conflict detection.
+            //
+            // `generic_eth_subscribe` exists at the crate level but isn't
+            // enabled here: it's hash-only, and without tx-body enrichment
+            // via `eth_getTransactionByHash` (a follow-up) it would push
+            // zeroed `from/nonce/fees/input` records into the index,
+            // breaking by-address filtering and nonce-conflict detection.
+            // The defensive `delivers_bodies()` check below would refuse
+            // it anyway; refusing here at the match keeps the failure
+            // mode obvious from the config surface.
             let provider: Arc<dyn bloom_mempool::MempoolProvider> = match mc.provider.as_str() {
                 "alchemy" => Arc::new(bloom_mempool::providers::alchemy::AlchemyProvider::new(
                     mc.ws_url.clone(),
@@ -4299,11 +4306,30 @@ impl Daemon {
                         chain = %chain_name,
                         provider = %other,
                         "daemon.mempool_skipped: unknown or unsupported provider \
-                         (only \"alchemy\" is currently enabled at the daemon layer)"
+                         (only \"alchemy\" is currently enabled at the daemon layer; \
+                         hash-only providers like generic_eth_subscribe are pending \
+                         tx-body enrichment)"
                     );
                     continue;
                 }
             };
+
+            // Defence in depth: even though the match above only admits
+            // body-delivering providers today, this guards against a
+            // future provider being added to the match without honouring
+            // the `delivers_bodies()` contract. A hash-only provider
+            // would push zeroed records into the index and break
+            // by-address filtering and nonce-conflict detection.
+            if !provider.delivers_bodies() {
+                warn!(
+                    chain = %chain_name,
+                    provider = %mc.provider,
+                    "daemon.mempool_skipped: provider does not deliver full tx bodies; \
+                     by-address index and nonce-conflict detection would be broken. \
+                     Configure a body-delivering provider (e.g. \"alchemy\")."
+                );
+                continue;
+            }
 
             // Clamp max_index_size = 0 → 1 so PendingTxIndex::new never
             // asserts. A zero value in config is almost certainly a mistake.

@@ -61,4 +61,16 @@ mod tests {
         assert_eq!(p.id(), "flashbots");
         assert_eq!(p.supported_chains(), &[MAINNET_CHAIN_ID, SEPOLIA_CHAIN_ID]);
     }
+
+    #[cfg(feature = "live-providers")]
+    #[tokio::test]
+    async fn health_against_live_endpoint() {
+        if std::env::var_os("BLOOM_RUN_LIVE_TESTS").is_none() {
+            eprintln!("skip: BLOOM_RUN_LIVE_TESTS is not set");
+            return;
+        }
+        let p = FlashbotsProvider::default_endpoint().unwrap();
+        let status = p.health().await.expect("health probe");
+        assert_eq!(status, HealthStatus::Healthy);
+    }
 }

@@ -2551,6 +2551,7 @@ name = "bloom-mempool"
 version = "0.5.0"
 dependencies = [
  "alloy 2.0.5",
+ "alloy-signer-local 2.0.5",
  "anyhow",
  "async-trait",
  "futures",
@@ -2559,10 +2560,12 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite 0.24.0",
  "tracing",
+ "tracing-subscriber 0.3.23",
 ]
 
 [[package]]

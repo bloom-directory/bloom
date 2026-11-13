@@ -27,6 +27,9 @@ impl MempoolProvider for AlchemyProvider {
     fn id(&self) -> &'static str {
         "alchemy"
     }
+    fn delivers_bodies(&self) -> bool {
+        true
+    }
 
     async fn subscribe(
         &self,
@@ -167,6 +170,25 @@ mod tests {
             tx.from.to_string().to_lowercase(),
             "0x2222222222222222222222222222222222222222"
         );
+    }
+
+    #[cfg(feature = "live-providers")]
+    #[tokio::test]
+    async fn alchemy_live_subscribe_yields_pending_tx() {
+        use crate::provider::MempoolProvider;
+        use futures::StreamExt;
+        let Ok(key) = std::env::var("ALCHEMY_API_KEY") else {
+            eprintln!("skip: ALCHEMY_API_KEY is not set");
+            return;
+        };
+        let url = format!("wss://eth-mainnet.g.alchemy.com/v2/{key}");
+        let provider = AlchemyProvider::new(url);
+        let mut stream = provider.subscribe().await.expect("subscribe");
+        let tx = tokio::time::timeout(std::time::Duration::from_secs(30), stream.next())
+            .await
+            .expect("timeout waiting for first pending tx")
+            .expect("stream ended before yielding");
+        assert_ne!(tx.hash, alloy::primitives::B256::ZERO);
     }
 
     #[test]
