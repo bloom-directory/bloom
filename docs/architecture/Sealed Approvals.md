@@ -303,11 +303,7 @@ that creates a circular release dependency. Older installations retain their
 pinned packages; upgraded wallets still require owner approval of new identities.
 Bloom #224 must remain unmergeable until the default Polymarket and Hyperliquid
 catalog pins select compatible published packages. Broker #103 landed as
-`e2f55a7e291eff32d3d544f0f94dc770945bafd7`. Bloom pins Broker
-`0a9a8dae12e86237cb9d6ba63a2456d7c0871cf9`, the landed Broker master commit for
-the ceremony page fixes (bloom-broker #128). It includes the Machine x402 and MPP
-payment review (#125), `e2f55a7`, the trusted clock rollback fix that Bloom
-v0.4.1 ships (#119), and the native SOL fee check (#127).
+`e2f55a7e291eff32d3d544f0f94dc770945bafd7`.
 
 Machine's own paid-HTTP payments (System subjects `paid-http.x402` and
 `paid-http.mpp`) send a message review envelope with every signature. Broker
