@@ -19,3 +19,13 @@ assert.deepEqual(attempts.map((attempt) => attempt.sourceIndex), [2, 3]);
 assert.ok(attempts.every((attempt) => attempt.response.error && !attempt.gradingResult));
 assert.equal(report.results.results.length, 4);
 console.log('provider error replay: 4 passed');
+
+// Successful provider-error replay must use the report's response contract.
+const brief = "I'll review the instructions and begin.";
+const preToolRow = row('CLI error', null, 'pre-tool sample');
+preToolRow.testCase.metadata = { responseContract: 'pre-tool-v1' };
+const replay = await retryProviderErrors({ ...report, results: { results: [preToolRow] } }, () => ({ callApi: async () => ({ output: brief }) }));
+assert.equal(replay[0].gradingResult.pass, true);
+const legacyReplay = await retryProviderErrors({ ...report, results: { results: [row('CLI error', null, 'legacy sample')] } }, () => ({ callApi: async () => ({ output: brief }) }));
+assert.equal(legacyReplay[0].gradingResult.pass, false);
+console.log('provider replay contract selection: 2 passed');

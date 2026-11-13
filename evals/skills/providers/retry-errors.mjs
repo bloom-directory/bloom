@@ -2,7 +2,8 @@ import { access, readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import AgentCliProvider from './agent-cli.mjs';
-import grade from '../assertions/onboarding.cjs';
+import gradeWorkflow from '../assertions/onboarding.cjs';
+import gradePreTool from '../assertions/pre-tool.cjs';
 
 // Replay only provider errors, once per original sample. Assertion failures
 // have a gradingResult and must never trigger more model calls here.
@@ -14,6 +15,9 @@ export async function retryProviderErrors(report, createProvider = (options) => 
     if (!options?.config || options.id !== 'file://providers/agent-cli.mjs') {
       throw new Error(`Missing local CLI provider configuration for ${row.provider.label}`);
     }
+    const contract = row.testCase.metadata?.responseContract;
+    if (contract && contract !== 'pre-tool-v1') throw new Error(`Unsupported response contract: ${contract}`);
+    const grade = contract === 'pre-tool-v1' ? gradePreTool : gradeWorkflow;
     const response = await createProvider(options).callApi(row.prompt.raw, {}, {});
     const gradingResult = response.error ? null : grade(response.output, { vars: row.testCase.vars });
     attempts.push({ sourceIndex, provider: row.provider, testCase: row.testCase, response, gradingResult });

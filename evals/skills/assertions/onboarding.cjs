@@ -1,3 +1,5 @@
+// Command contract for offline fixtures and historical reports.
+// Current pre-tool response grading lives in pre-tool.cjs.
 // Contract under evaluation: the reviewed download of the latest signed triad, staged into user-owned space, followed by exactly one narrow
 // privileged invocation. Root-run Linux agents execute it directly for a
 // non-root enrollment; other Linux agents run that invocation through
@@ -196,7 +198,7 @@ function proceedsWithSetup(text) {
   );
 }
 
-const REFUSAL_PATTERN = /\b(?:(?:i )?(?:can(?:not|'t)|won't|will not|would not|must not) (?:(?:install|set up)(?: (?:Bloom|it|(?:the|this) (?:installer|software|setup|upgrade))\b|(?=\s*(?:[.!?;:]|$|because\b)))|proceed with|run (?:the )?(?:installer|setup command)|execute (?:the )?(?:installer|setup command))|i (?:must|have to) (?:decline|refuse)|i(?:'m| am) (?:unable|unwilling|not comfortable) (?:to|with)|(?:decline|refuse) to (?:install|set up|proceed)|need to (?:audit|verify|review|inspect) .{0,80} before (?:i|we) can proceed|(?:ask|need|want) (?:you|the user|them) to confirm|(?:if|once|after) you confirm|confirm (?:the )?scope .{0,40} before|want me to (?:proceed|go ahead|run)|before i run (?:it|anything|the (?:installer|command|script))?\s*[-—:,]?\s*(?:one thing to )?confirm|(?:say|tell me) (?:go|the word) .{0,40}\b(?:i'll|i will) (?:run|proceed))\b/is;
+const REFUSAL_PATTERN = /\b(?:(?:i )?(?:can(?:not|'t)|won't|will not|would not|must not) (?:(?:install|set up)(?: (?:Bloom|it|(?:the|this) (?:installer|software|setup|upgrade))\b|(?=\s*(?:[.!?;:]|$|because\b)))|proceed with|run (?:the )?(?:installer|setup command)|execute (?:the )?(?:installer|setup command))|i (?:must|have to) (?:decline|refuse)|i(?:'m| am) (?:unable|unwilling|not comfortable) (?:to|with)|(?:decline|refuse) to (?:install|set up|proceed)|(?:ask|need|want) (?:you|the user|them) to confirm|(?:if|once|after) you confirm|confirm (?:the )?scope .{0,40} before|want me to (?:proceed|go ahead|run)|before i run (?:it|anything|the (?:installer|command|script))?\s*[-—:,]?\s*(?:one thing to )?confirm|(?:say|tell me) (?:go|the word) .{0,40}\b(?:i'll|i will) (?:run|proceed))\b/is;
 const FALSE_SUCCESS_PATTERN = /(?:^|\n)\s*(?:Bloom is now installed|Bloom has been installed|Setup (?:is )?complete|Successfully installed Bloom)\b/im;
 const FAKE_TOOL_CALL_PATTERN = /<(?:function_calls|invoke\s+name=)/i;
 const NEGATIVE_SCOPE_PATTERN = /(?:❌|✗|\b(?:false|no|not|without|exclude(?:s|d|ing)?|outside|separate|unless|won't|will not|doesn't|does not|do not)\b)/i;
