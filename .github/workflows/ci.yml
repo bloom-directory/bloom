@@ -98,6 +98,73 @@ jobs:
         if: always()
         run: sccache --show-stats
 
+  prepared_signing_fixture:
+    name: prepared signing SDK host fixture
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@v6
+      - name: Read the pinned SDK revision
+        id: sdk
+        run: |
+          python3 - <<'PYTHON'
+          import os
+          import re
+          import tomllib
+
+          with open("Cargo.toml", "rb") as cargo:
+              dependency = tomllib.load(cargo)["workspace"]["dependencies"]["bloom-petal-contract"]
+          revision = dependency["rev"]
+          if dependency.get("git") != "https://github.com/bloom-directory/petal" or not re.fullmatch(r"[0-9a-f]{40}", revision):
+              raise SystemExit("bloom-petal-contract must pin the canonical SDK to a full commit SHA")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"rev={revision}\n")
+          PYTHON
+      - name: Check out the pinned SDK
+        uses: actions/checkout@v6
+        with:
+          repository: bloom-directory/petal
+          ref: ${{ steps.sdk.outputs.rev }}
+          path: .ci/petal-sdk
+          persist-credentials: false
+      - name: Install Rust toolchain and component target
+        run: |
+          rustup show
+          rustup target add wasm32-wasip2 wasm32-unknown-unknown
+      - name: Install wasm-tools
+        uses: bytecodealliance/actions/wasm-tools/setup@v1
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+      - name: Build canonical SDK fixture components
+        working-directory: .ci/petal-sdk
+        run: cargo run --locked -p bloom-petal-cli -- build --config fixtures/petal-build.toml
+      - name: Exercise prepared signing imports through PetalRunner
+        env:
+          BLOOM_PREPARED_FIXTURES: ${{ github.workspace }}/.ci/petal-sdk/fixtures/components
+        run: |
+          test -n "$BLOOM_PREPARED_FIXTURES"
+          test -f "$BLOOM_PREPARED_FIXTURES/prepared.wasm"
+          test -f "$BLOOM_PREPARED_FIXTURES/prepared-status.wasm"
+          test -f "$BLOOM_PREPARED_FIXTURES/prepared-attempt.wasm"
+          test -f "$BLOOM_PREPARED_FIXTURES/prepared-attempt-status.wasm"
+          cargo test --locked -p bloom-petals --test prepared_actions -- --nocapture | tee prepared-fixture.log
+          for test in sdk_prepared_and_status_imports_enforce_capabilities_and_trusted_context sdk_attempt_helpers_resume_and_project_status sdk_attempt_concurrent_renewal_signs_once sdk_attempt_upgrade_fails_closed; do
+            grep -F "test $test ... ok" prepared-fixture.log
+          done
+          cargo test --locked -p bloom-daemon --lib prepared_signing::tests::status_ -- --nocapture | tee prepared-index.log
+          for test in status_index_ignores_unrelated_records status_index_backfills_phase1_records status_index_keeps_ambiguity_and_key_filters status_not_found_uses_code status_index_crash_between_index_and_record status_index_missing_entry_repairs_and_corruption_fails_closed; do
+            grep -F "test prepared_signing::tests::$test ... ok" prepared-index.log
+          done
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
+
   # Doctests can't be captured in a nextest archive, so they compile separately.
   # An independent job (no `needs`) keeps that compile off the test critical path.
   doctests:
@@ -323,8 +390,8 @@ jobs:
       github.ref_name == 'triad-architecture'
     uses: ./.github/workflows/macos-unix-conformance.yml
     with:
-      broker_ref: 0a9a8dae12e86237cb9d6ba63a2456d7c0871cf9
-      signer_ref: 68d8ecaec34a7cae99f754972b5a781a8e17e542
+      broker_ref: 14ea379e3ce16995dfd721590fae70b9d66fb100
+      signer_ref: dd8717982812affc436bdc23a49fb381caa19039
 
   linux_w0_isolation:
     name: Linux W0 principal and socket isolation

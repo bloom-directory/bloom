@@ -1043,6 +1043,7 @@ fn petal_capability(cap: &str) -> Option<Capability> {
         "bloom:http" => Some(Capability::NetFetch),
         "bloom:store" => Some(Capability::Store),
         "bloom:sign" => Some(Capability::Sign),
+        "bloom:sign.status" => Some(Capability::SignStatus),
         "bloom:chain" => Some(Capability::Chain),
         "bloom:tx.outbox" => Some(Capability::TxOutbox),
         "bloom:key.derive" => Some(Capability::KeyDerive),
@@ -1369,6 +1370,7 @@ namespaces = ["settings"]
             Token,
         };
         bloom_broker_api::ProvenanceRecord {
+            package_display_name: None,
             subject: ProvenanceSubject::Petal {
                 package_hash: Digest32::new(hash.to_owned()).unwrap(),
                 route: "message".into(),
@@ -1386,6 +1388,8 @@ namespaces = ["settings"]
                 active,
             }),
             operation_classes: vec![ProvenanceOperationClass {
+                zero_spend: false,
+                economic_effects_schema: None,
                 operation_class: Token::new("petal.run").unwrap(),
                 fee_asset: None,
             }],

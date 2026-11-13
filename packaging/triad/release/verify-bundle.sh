@@ -40,7 +40,9 @@ for required in \
   installer/relay/superseded-pins \
   installer/linux/bin/bloom-uninstall \
   installer/linux/systemd-user/bloom-machine.service \
+  installer/linux/systemd-user/bloom-onboarding.service \
   installer/macos/launchagents/com.bloom.machine.plist.in \
+  installer/macos/launchagents/com.bloom.onboarding.plist.in \
   installer/release/install-macos.sh \
   installer/release/macos-conformance-subject.sh \
   installer/release/sign-macos-conformance-report.sh \

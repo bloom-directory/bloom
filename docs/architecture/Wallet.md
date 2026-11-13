@@ -244,3 +244,49 @@ the cached authenticated account inventory. The path still fixes the sender;
 Solana artifacts also pin the full account fingerprint. Confirming, replacing, cancelling, restaging,
 session changes and Petal account context still require fresh Broker authority;
 cached membership never authorizes a signature.
+
+## Declared-effect persona permissions
+
+Persona discovery requires the generic `bloom.declared-effects.v1` Broker
+capability and the exact installed package's installer-signed route provenance.
+Only routes with `economic_effects_schema = 1` participate. Operation class
+spelling and package names do not determine automatic eligibility. Machine
+binds the selected account's exact `KeyRef`; the owner reviews an independent
+raw-token allowance for each package and key. The configured networks' reviewed
+token catalog and persona presets supply suggested limits; explicit selections
+may choose a narrower exact token policy.
+
+Broker trusts the reviewed package's declared effects. It checks provenance,
+ordered payload contexts, exact spending accounts, positive raw quantities,
+permission effects, token policy and limits. It does not verify a Petal's
+reported debit against its signing bytes. This trust boundary is explicit in
+owner review; declared amounts are not independently verified economics.
+
+`Spend::None` is distinct from an omitted declaration. Trader and Degen may
+cover only zero-spend classes certified by provenance and listed in the grant.
+Their aggregate per-grant limits are 60 and 300 uses per hour respectively;
+adding classes does not multiply that capacity. Institutional has no automatic
+tier. Undeclared actions and actions outside the grant use exact review.
+Cancels do not refund signed usage, and restart or rearm never replenishes it.
+
+## Prepared Petal signing
+
+The canonical prepared-action API supplies one exact signing payload, a
+`bloom.message.review` version 1 artifact, and an explicit spending declaration.
+Machine accepts EIP-712 typed data and EIP-191 personal messages generically.
+It reconstructs the standard signing preimage and rejects a mismatched payload
+or hash before discovering a reusable grant. No protocol-specific prepared
+record, login verifier or timestamp refresh exception exists.
+
+Machine retains a frozen operation keyed by exact package, route, wallet,
+account `KeyRef` and the Petal's operation key. A changed action conflicts;
+a retry recovers the original result without another charge. A terminal key
+remains terminal: a fresh action or reviewed attempt requires a new domain
+operation key. Status is read-only and separately capability-gated.
+
+`Spend::Bounded` requires positive, nonduplicate debits. `Spend::None` supplies
+an explicit zero-spend marker and an exact account context. `Spend::Unspecified`
+never obtains automatic authority. Supported declared effects are admitted
+under the existing owner-reviewed terms; they do not upgrade claim assurance.
+See [Persona-ready Petals revision 3](../specs/2026-11-02-persona-ready-petals.md)
+for the current delivery contract.

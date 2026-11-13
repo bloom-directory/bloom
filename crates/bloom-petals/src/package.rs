@@ -133,6 +133,10 @@ struct NetAllowToml {
 #[serde(deny_unknown_fields)]
 struct SignPolicy {
     #[serde(default)]
+    zero_spend_classes: Vec<String>,
+    #[serde(default)]
+    economic_effects_schema: Option<u16>,
+    #[serde(default)]
     allowed_intents: Vec<String>,
 }
 
@@ -339,6 +343,10 @@ pub struct RouteIndex {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteIndexRecord {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub zero_spend_classes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub economic_effects_schema: Option<u16>,
     pub route_id: String,
     pub pattern: String,
     pub source_path: String,
@@ -514,6 +522,31 @@ impl PreparedPetalPackage {
             .cloned()
             .collect::<BTreeSet<_>>();
         validate_sign_policy(&allowed_caps, &allowed_sign_intents)?;
+        if manifest
+            .sign
+            .zero_spend_classes
+            .iter()
+            .enumerate()
+            .any(|(index, class)| {
+                !allowed_sign_intents.contains(class)
+                    || manifest.sign.zero_spend_classes[..index].contains(class)
+            })
+            || (!manifest.sign.zero_spend_classes.is_empty()
+                && manifest.sign.economic_effects_schema != Some(1))
+        {
+            return Err(PetalError::InvalidWasm(
+                "zero-spend classes require effects schema 1 and must be allowed intents".into(),
+            ));
+        }
+        if manifest
+            .sign
+            .economic_effects_schema
+            .is_some_and(|version| version != 1)
+        {
+            return Err(PetalError::InvalidWasm(
+                "unsupported [sign].economic_effects_schema".into(),
+            ));
+        }
         let store_policy = store_policy_from_manifest(&manifest);
         validate_store_policy(&allowed_caps, &store_policy)?;
         validate_net_policy(&allowed_caps, &manifest.net)?;
@@ -669,6 +702,8 @@ impl PreparedPetalPackage {
                 ops.push(RouteOp::Write);
             }
             route_index.routes.push(RouteIndexRecord {
+                zero_spend_classes: manifest.sign.zero_spend_classes.clone(),
+                economic_effects_schema: manifest.sign.economic_effects_schema,
                 route_id: route.route_id,
                 pattern: route.pattern,
                 source_path,
@@ -2466,6 +2501,8 @@ enum ComponentHostInterface {
     StoreKv,
     SignSigningV1,
     SignSigningV2,
+    PreparedSigning,
+    PreparedStatus,
     KeyDerive,
     TxOutbox,
     ChainRead,
@@ -2487,6 +2524,8 @@ fn component_host_interface(name: &str) -> Option<ComponentHostInterface> {
         ContractHostInterface::HttpFetch => Some(ComponentHostInterface::HttpFetch),
         ContractHostInterface::StoreKv => Some(ComponentHostInterface::StoreKv),
         ContractHostInterface::SignSigning => Some(ComponentHostInterface::SignSigningV2),
+        ContractHostInterface::PreparedSigning => Some(ComponentHostInterface::PreparedSigning),
+        ContractHostInterface::PreparedStatus => Some(ComponentHostInterface::PreparedStatus),
         ContractHostInterface::KeyDerive => Some(ComponentHostInterface::KeyDerive),
         ContractHostInterface::TxOutbox => Some(ComponentHostInterface::TxOutbox),
         ContractHostInterface::ChainRead => Some(ComponentHostInterface::ChainRead),
@@ -2745,6 +2784,7 @@ enum HostFuncExport {
     SignHashesStructured,
     SafeSignPayloadStructured,
     PayloadBatchSignStructured,
+    PreparedSigning,
     PetalKeyRequest,
     EvmTxStage,
     EvmTxConfirm,
@@ -2931,6 +2971,10 @@ fn host_func_export(interface: ComponentHostInterface, name: &str) -> Option<Hos
         (ComponentHostInterface::SignSigningV2, "sign-payload-batch") => {
             Some(HostFuncExport::PayloadBatchSignStructured)
         }
+        (ComponentHostInterface::PreparedSigning, "sign")
+        | (ComponentHostInterface::PreparedStatus, "status") => {
+            Some(HostFuncExport::PreparedSigning)
+        }
         (ComponentHostInterface::KeyDerive, "request") => Some(HostFuncExport::PetalKeyRequest),
         (ComponentHostInterface::TxOutbox, "stage") => Some(HostFuncExport::EvmTxStage),
         (ComponentHostInterface::TxOutbox, "confirm") => Some(HostFuncExport::EvmTxConfirm),
@@ -3095,6 +3139,10 @@ fn host_func_export_matches(
                 HostOkType::PayloadBatchSignResultStructured,
             )
         }
+        HostFuncExport::PreparedSigning => {
+            params_match(params, types, &[("request", is_byte_list)])
+                && result_bytes_or_bytes(&ty.result, types)
+        }
         HostFuncExport::PetalKeyRequest => {
             params_match(params, types, &[("request", is_byte_list)])
                 && result_matches(&ty.result, types, HostOkType::Bytes)
@@ -3197,6 +3245,25 @@ enum HostOkType {
     PayloadBatchSignResultStructured,
     StagedTransaction,
     OutboxInspection,
+}
+
+fn result_bytes_or_bytes(
+    result: &Option<ComponentValType>,
+    types: &[ComponentTypeEntry<'_>],
+) -> bool {
+    let Some(result_ty) = single_component_result(result) else {
+        return false;
+    };
+    with_defined_type(result_ty, types, 0, |defined, types, depth| {
+        let ComponentDefinedType::Result {
+            ok: Some(ok),
+            err: Some(err),
+        } = defined
+        else {
+            return false;
+        };
+        is_byte_list(ok, types, depth) && is_byte_list(err, types, depth)
+    })
 }
 
 fn result_matches(
@@ -5076,6 +5143,82 @@ name = "echo"
     }
 
     #[test]
+    fn generic_effects_schema_is_explicit_versioned_installer_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let manifest=b"schema = \"bloom.petal.package.v1\"\nname = \"echo\"\n[caps]\nallowed = [\"bloom:sign\"]\n[sign]\nallowed_intents = [\"example.swap\"]\neconomic_effects_schema = 1\n";
+        write_petal_package_with_manifest_and_route(
+            root.path(),
+            manifest,
+            route_component_no_imports(),
+        );
+        let package = PreparedPetalPackage::from_dir(root.path()).unwrap();
+        assert!(
+            package
+                .route_index
+                .routes
+                .iter()
+                .all(|r| r.economic_effects_schema == Some(1))
+        );
+        let bad = String::from_utf8(manifest.to_vec())
+            .unwrap()
+            .replace("economic_effects_schema = 1", "economic_effects_schema = 2");
+        write_package_file(root.path(), "petal.toml", bad.as_bytes());
+        assert!(
+            PreparedPetalPackage::from_dir(root.path())
+                .unwrap_err()
+                .to_string()
+                .contains("economic_effects_schema")
+        );
+        write_petal_package(root.path());
+        assert!(
+            PreparedPetalPackage::from_dir(root.path())
+                .unwrap()
+                .route_index
+                .routes
+                .iter()
+                .all(|r| r.economic_effects_schema.is_none())
+        );
+    }
+
+    #[test]
+    fn zero_spend_metadata_requires_certified_allowed_classes() {
+        let root = tempfile::tempdir().unwrap();
+        let manifest = "schema = \"bloom.petal.package.v1\"\nname = \"echo\"\n[caps]\nallowed = [\"bloom:sign\"]\n[sign]\nallowed_intents = [\"example.login\"]\neconomic_effects_schema = 1\nzero_spend_classes = [\"example.login\"]\n";
+        write_petal_package_with_manifest_and_route(
+            root.path(),
+            manifest.as_bytes(),
+            route_component_no_imports(),
+        );
+        let package = PreparedPetalPackage::from_dir(root.path()).unwrap();
+        assert!(
+            package
+                .route_index
+                .routes
+                .iter()
+                .all(|route| route.zero_spend_classes == ["example.login"])
+        );
+        for invalid in [
+            manifest.replace(
+                "zero_spend_classes = [\"example.login\"]",
+                "zero_spend_classes = [\"another.login\"]",
+            ),
+            manifest.replace("economic_effects_schema = 1\n", ""),
+            manifest.replace(
+                "zero_spend_classes = [\"example.login\"]",
+                "zero_spend_classes = [\"example.login\",\"example.login\"]",
+            ),
+        ] {
+            write_package_file(root.path(), "petal.toml", invalid.as_bytes());
+            assert!(
+                PreparedPetalPackage::from_dir(root.path())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("zero-spend")
+            );
+        }
+    }
+
+    #[test]
     fn petal_consent_summary_includes_manifest_policy_docs_and_routes() {
         let tmp = tempfile::tempdir().unwrap();
         write_package_file(
@@ -6029,6 +6172,8 @@ name = "echo"
     #[test]
     fn petal_runtime_component_metadata_can_only_narrow_install_metadata() {
         let route = RouteIndexRecord {
+            zero_spend_classes: vec![],
+            economic_effects_schema: None,
             route_id: "r000001".into(),
             pattern: "[name].txt".into(),
             source_path: "petal/echo/[name].txt.wasm".into(),
@@ -6074,6 +6219,8 @@ name = "echo"
     #[test]
     fn petal_runtime_component_metadata_rejects_widening() {
         let route = RouteIndexRecord {
+            zero_spend_classes: vec![],
+            economic_effects_schema: None,
             route_id: "r000001".into(),
             pattern: "[name].txt".into(),
             source_path: "petal/echo/[name].txt.wasm".into(),
@@ -6354,6 +6501,8 @@ imports = ["components/helper.wasm"]
     #[test]
     fn petal_runtime_metadata_cache_ttl_is_unrestricted_only_for_parameterized_routes() {
         let record = |params: Vec<String>| RouteIndexRecord {
+            zero_spend_classes: vec![],
+            economic_effects_schema: None,
             route_id: "r000001".into(),
             pattern: "[name].txt".into(),
             source_path: "petal/echo/[name].txt.wasm".into(),
@@ -6659,6 +6808,45 @@ paths = ["/*"]
         assert!(component_host_interface("bloom:sign/signing@0.4.0").is_none());
         assert!(component_import_caps("bloom:sign/signing@9.9.9").is_none());
         assert!(component_host_interface("bloom:sign/signing@9.9.9").is_none());
+    }
+
+    #[test]
+    fn prepared_sign_and_status_imports_have_separate_capabilities_and_byte_results() {
+        assert_eq!(
+            component_import_caps("bloom:prepared-sign/signing@0.1.0"),
+            Some(&["bloom:sign"][..])
+        );
+        assert_eq!(
+            component_import_caps("bloom:prepared-sign/status@0.1.0"),
+            Some(&["bloom:sign.status"][..])
+        );
+        assert!(component_import_caps("bloom:prepared-sign/signing@0.2.0").is_none());
+        for (interface, import, function) in [
+            (
+                ComponentHostInterface::PreparedSigning,
+                "bloom:prepared-sign/signing@0.1.0",
+                "sign",
+            ),
+            (
+                ComponentHostInterface::PreparedStatus,
+                "bloom:prepared-sign/status@0.1.0",
+                "status",
+            ),
+        ] {
+            let wit = format!(
+                r#"(component (type $interface (instance
+                (type $bytes (list u8))
+                (type $outcome (result $bytes (error $bytes)))
+                (type $request (func (param "request" $bytes) (result $outcome)))
+                (export "{function}" (func (type $request)))))
+                (import "{import}" (instance (type $interface))))"#
+            );
+            assert!(host_import_instance_matches(interface, &wit));
+            assert!(!host_import_instance_matches(
+                interface,
+                &wit.replace("(error $bytes)", "(error string)")
+            ));
+        }
     }
 
     #[test]

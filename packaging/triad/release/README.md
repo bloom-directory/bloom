@@ -358,18 +358,22 @@ prerequisites; fixture tests do not substitute for those observations. No public
 DNS changes or deployment occur as part of ordinary tests.
 
 The Linux Broker service permits IPv4/IPv6 networking for its outbound relay,
-ACME and DNS clients. It retains its isolated UID, protected files and Unix-only
+ACME, DNS, keyless USD-price providers and native SOL validation clients. The
+session profile uses HTTPS to `api.coingecko.com`, `coins.llama.fi` and
+`api.mainnet-beta.solana.com`. These requests originate only in Broker; no
+pricing key or Machine pricing proxy is installed. It retains its isolated UID, protected files and Unix-only
 authority RPC; Signer retains `PrivateNetwork=yes`, `IPAddressDeny=any` and
 `RestrictAddressFamilies=AF_UNIX`. Broker's ceremony TLS listener is loopback-only.
 Deployments requiring network enforcement of exact outbound destinations need a
-reviewed egress proxy or firewall policy covering relay, ACME and DNS lifecycle;
+reviewed egress proxy or firewall policy covering relay, ACME, DNS and the three
+session endpoints above;
 static ingress addresses alone do not cover CA renewal endpoints.
 
 The shipped v0.4.0 bundle used Machine–Broker API 1.7 and Machine and Broker
-state/floor 2. This clear-signing candidate adopts the landed Broker's API 1.8
+state/floor 2. This generic-session candidate negotiates Machine–Broker API 1.11
 and moves both Machine and Broker to state/floor 3: Machine state 3 adds
 `review_payload_digest` to pending exact-signing state, which Machine 0.4.x
-rejects. Broker–Signer remains 1.6 and Signer state/floor remains 2. This is the
+rejects. Broker–Signer uses 1.8 and Signer state/floor remains 2. This is the
 coordinated release bump, not an additional bump for each PR. Both upgrades are
 forward-only. Take a compatible backup of Machine and Broker state before
 migration: neither the old v0.4.0 Machine nor the old v0.4.0 Broker can reopen

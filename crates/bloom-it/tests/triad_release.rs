@@ -459,6 +459,7 @@ fn make_installer_payload(root: &Path) -> PathBuf {
         "systemd/bloom-signer@.service.in",
         "systemd-user/bloom-session.service",
         "systemd-user/bloom-machine.service",
+        "systemd-user/bloom-onboarding.service",
     ] {
         let destination = payload.join("installer/linux").join(relative);
         fs::create_dir_all(destination.parent().unwrap()).unwrap();
@@ -777,7 +778,17 @@ fn triad_developer_launcher_accepts_explicit_prebuilt_petals() {
 
     assert!(launcher.contains("BLOOM_TRIAD_DEV_BUILD_PETALS:-1"));
     assert!(launcher.contains("BLOOM_TRIAD_DEV_BUILD_PETALS must be 0 or 1"));
-    assert!(launcher.contains("if [ \"$build_integration_petals\" -eq 1 ]; then"));
+    assert!(launcher.contains(
+        r#"if [ "$build_integration_petals" -eq 1 ] && [ -d "$integration_petal" ]; then"#
+    ));
+    // Both enrollment and installation accept an archive; only source
+    // directories may run a Petal build script.
+    assert_eq!(
+        launcher
+            .matches(r#"[ -d "$integration_petal" ] || [ -f "$integration_petal" ]"#)
+            .count(),
+        2
+    );
     assert!(launcher.contains("triad-enroll-developer-petal-provenance"));
     assert!(launcher.contains("machine_cli petals install"));
 }
@@ -1901,6 +1912,15 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
     let machine_unit =
         fs::read_to_string(root.join("usr/lib/systemd/user/bloom-machine.service")).unwrap();
     assert!(machine_unit.contains("ExecStart=/usr/bin/bloom serve --mount %h/bloom"));
+    let onboarding_unit =
+        fs::read_to_string(root.join("usr/lib/systemd/user/bloom-onboarding.service")).unwrap();
+    assert!(onboarding_unit.contains("ExecStart=/usr/bin/bloom onboard --if-needed"));
+    assert!(onboarding_unit.contains("WantedBy=graphical-session.target"));
+    assert!(onboarding_unit.contains("ConditionPathExists=/etc/bloom/%U/edge-manifest.json"));
+    assert!(onboarding_unit.contains("RuntimeMaxSec=30min"));
+    let instructions = String::from_utf8_lossy(&install.stdout);
+    assert!(instructions.contains("bloom onboard (without sudo)"));
+    assert!(instructions.contains("Log out and back in first"));
     let fstab = fs::read_to_string(root.join("etc/fstab")).unwrap();
     assert!(fstab.contains(
         "127.0.0.1:/ /home/alice/bloom nfs4 noauto,user,nosuid,nodev,noexec,actimeo=0,sync,vers=4.1,proto=tcp,port=20000,rsize=65536,wsize=65536,timeo=10 0 0 # x-bloom.login-uid=1000"
@@ -1929,6 +1949,9 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
             & 0o777,
         0o600
     );
+    let onboarding_path = root.join("usr/lib/systemd/user/bloom-onboarding.service");
+    let first_install_entrypoint = format!("{onboarding_unit}\n# first-install entrypoint\n");
+    fs::write(&onboarding_path, &first_install_entrypoint).unwrap();
     fs::write(payload.join("bin/bloom-broker"), b"upgraded-broker").unwrap();
     fs::write(payload.join("SHA256SUMS"), b"upgraded payload\n").unwrap();
     assert!(
@@ -1941,6 +1964,10 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
             .status()
             .unwrap()
             .success()
+    );
+    assert_eq!(
+        fs::read_to_string(&onboarding_path).unwrap(),
+        first_install_entrypoint
     );
     assert_eq!(
         fs::read(root.join("usr/libexec/bloom/current/bloom-broker")).unwrap(),
@@ -2526,6 +2553,7 @@ fn linux_services_send_structured_stderr_to_stable_journal_identifiers() {
     }
     for relative in [
         "systemd-user/bloom-machine.service",
+        "systemd-user/bloom-onboarding.service",
         "systemd-user/bloom-session.service",
     ] {
         assert!(
@@ -2841,6 +2869,30 @@ fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall(
         installed.status,
         String::from_utf8_lossy(&installed.stderr)
     );
+    let onboarding_plist = root.join("Library/Application Support/BloomTriad/onboarding/501.plist");
+    let onboarding_source = fs::read_to_string(&onboarding_plist).unwrap();
+    assert!(onboarding_source.contains("<string>onboard</string>"));
+    assert!(onboarding_source.contains("<string>--if-needed</string>"));
+    assert!(onboarding_source.contains("<string>Aqua</string>"));
+    assert!(!onboarding_source.contains("@BLOOM_"));
+    assert!(
+        !root
+            .join("Library/LaunchAgents/com.bloom.onboarding.plist")
+            .exists()
+    );
+    assert!(String::from_utf8_lossy(&installed.stdout).contains("bloom onboard (without sudo)"));
+    // Repair must not recreate or bootstrap a fresh-install browser job.
+    fs::write(&onboarding_plist, "preserved fresh-install job").unwrap();
+    let repaired = stage_macos_install(&installer, &root, &payload);
+    assert!(
+        repaired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&repaired.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&onboarding_plist).unwrap(),
+        "preserved fresh-install job"
+    );
     let broker_plist = root.join("Library/LaunchDaemons/com.bloom.broker.501.plist");
     let signer_plist = root.join("Library/LaunchDaemons/com.bloom.signer.501.plist");
     for (service, plist) in [("broker", &broker_plist), ("signer", &signer_plist)] {
@@ -3027,6 +3079,7 @@ fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall(
             .unwrap()
             .success()
     );
+    assert!(!onboarding_plist.exists());
     assert!(!broker_plist.exists());
     assert!(!signer_plist.exists());
     assert!(

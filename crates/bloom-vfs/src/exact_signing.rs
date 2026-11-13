@@ -94,11 +94,18 @@ fn exact_claim_value_limits(claim: &PetalUseClaim) -> Result<Vec<ValueLimit>, St
         .collect()
 }
 
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 #[derive(Clone)]
 pub struct BrokerExactPayloadSigner {
     broker: MachineBrokerClient,
     provenance_catalog: ProvenanceCatalog,
     account_key_ref: Option<bloom_broker_api::KeyRef>,
+    strict_recovery: bool,
+    expected_key_ref: Option<bloom_broker_api::KeyRef>,
+    allow_persona: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,6 +200,10 @@ struct ExactSigningState {
     expires_at_ms: DecimalU64,
     canonical_plan_facts_digest: Digest32,
     approval_id: Option<Digest32>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    signing_attempted: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    exact_fallback: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +228,10 @@ struct ExactBatchSigningState {
     expires_at_ms: DecimalU64,
     canonical_plan_facts_digest: Digest32,
     approval_id: Option<Digest32>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    signing_attempted: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    exact_fallback: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,6 +253,8 @@ struct ReusablePetalBatchSigningState {
     expires_at_ms: DecimalU64,
     canonical_plan_facts_digest: Digest32,
     approval_id: Option<Digest32>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    signing_attempted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,6 +284,54 @@ impl BrokerExactPayloadSigner {
             broker,
             provenance_catalog,
             account_key_ref: None,
+            strict_recovery: false,
+            expected_key_ref: None,
+            allow_persona: true,
+        }
+    }
+
+    pub fn with_persona_discovery(mut self, allowed: bool) -> Self {
+        self.allow_persona = allowed;
+        self
+    }
+
+    pub fn with_expected_key(mut self, expected: Option<bloom_broker_api::KeyRef>) -> Self {
+        self.expected_key_ref = expected;
+        self
+    }
+
+    pub fn with_strict_recovery(mut self, strict: bool) -> Self {
+        self.strict_recovery = strict;
+        self
+    }
+
+    async fn strict_expired_reason(
+        &self,
+        approval_id: Option<&Digest32>,
+        operation_id: &OperationId,
+    ) -> String {
+        let Some(approval_id) = approval_id else {
+            return "RECOVERY_REQUIRED: signing operation may have been attempted".into();
+        };
+        let Ok(approval) = self.broker.approval_status(approval_id.clone()).await else {
+            return "RECOVERY_REQUIRED: approval status is unavailable".into();
+        };
+        if approval.approval_id != *approval_id {
+            return "RECOVERY_REQUIRED: approval status identity mismatch".into();
+        }
+        let terminal = match approval.state {
+            bloom_broker_api::ApprovalLifecycleState::Expired => {
+                "APPROVAL_EXPIRED: approval expired"
+            }
+            bloom_broker_api::ApprovalLifecycleState::Cancelled
+            | bloom_broker_api::ApprovalLifecycleState::Revoked => {
+                "APPROVAL_REVOKED: approval cancelled or revoked"
+            }
+            _ => return "RECOVERY_REQUIRED: signing operation may have been attempted".into(),
+        };
+        match self.broker.operation_status(operation_id.clone()).await {
+            Err(error) if error.code == ProtocolErrorCode::ApprovalNotFound => terminal.into(),
+            _ => "RECOVERY_REQUIRED: signing operation may have been attempted".into(),
         }
     }
 
@@ -494,6 +559,8 @@ impl BrokerExactPayloadSigner {
                     expires_at_ms: DecimalU64::new(now.saturating_add(APPROVAL_TTL_MS)),
                     canonical_plan_facts_digest: canonical_plan_facts_digest.clone(),
                     approval_id: None,
+                    signing_attempted: false,
+                    exact_fallback: false,
                 }
             }
             Err(error) => return Err(format!("read exact signing state: {error}").into()),
@@ -528,6 +595,20 @@ impl BrokerExactPayloadSigner {
         // prepared, replay the same identity so Broker can recover its result
         // or report its authoritative expiry. In particular, do not replace
         // a ceremony that the owner is still completing.
+        if self.strict_recovery
+            && state.signing_attempted
+            && state.expires_at_ms.get() <= now
+            && self
+                .broker
+                .persona_operation_digest(&state.signing_operation_id)
+                .map_err(|error| error.to_string())?
+                .is_none()
+        {
+            return Err(self
+                .strict_expired_reason(state.approval_id.as_ref(), &state.signing_operation_id)
+                .await
+                .into());
+        }
         if state.expires_at_ms.get() <= now && state.approval_id.is_none() {
             state.approval_operation_id = random_operation_id();
             state.signing_operation_id = random_operation_id();
@@ -536,12 +617,16 @@ impl BrokerExactPayloadSigner {
             state.expires_at_ms = DecimalU64::new(now.saturating_add(APPROVAL_TTL_MS));
             state.approval_id = None;
         }
+        if self.strict_recovery {
+            state.signing_attempted = true;
+        }
         write_state(state_path, &state)?;
         let approval_value_limits = petal_claim
             .map(|(claim, _)| exact_claim_value_limits(claim))
             .transpose()?
             .unwrap_or_default();
         let request = ExactPayloadSignRequest {
+            session_use: None,
             evm_reported_token: None,
             wallet_id,
             preimage: preimage.to_vec(),
@@ -558,6 +643,8 @@ impl BrokerExactPayloadSigner {
             canonical_plan_facts_digest,
             approval_id: state.approval_id.clone(),
             account_key_ref: self.account_key_ref.clone(),
+            expected_key_ref: self.expected_key_ref.clone(),
+            allow_persona: self.allow_persona && !state.exact_fallback,
             petal_use_claim: petal_claim.map(|(claim, _)| claim.clone()),
             system_use_claim: None,
             claim_assurance_evidence: petal_claim
@@ -579,8 +666,23 @@ impl BrokerExactPayloadSigner {
                 ceremony_expires_at_ms,
             });
         }
-        match self.broker.sign_exact_payload_recovering(request).await {
+        let response = if self.strict_recovery {
+            self.broker.sign_exact_payload(request).await
+        } else {
+            self.broker.sign_exact_payload_recovering(request).await
+        };
+        match response {
             Ok(ExactPayloadSignOutcome::ApprovalRequired(prepared)) => {
+                if self.strict_recovery
+                    && !state.exact_fallback
+                    && self
+                        .broker
+                        .persona_exact_fallback(&state.signing_operation_id)
+                        .map_err(|error| error.to_string())?
+                {
+                    state.exact_fallback = true;
+                    state.signing_operation_id = random_operation_id();
+                }
                 state.approval_id = Some(prepared.approval_id.clone());
                 write_state(state_path, &state)?;
                 Ok(ExactPayloadOutcome::ApprovalRequired {
@@ -783,6 +885,7 @@ impl BrokerExactPayloadSigner {
                     expires_at_ms: DecimalU64::new(now.saturating_add(APPROVAL_TTL_MS)),
                     canonical_plan_facts_digest: canonical_plan_facts_digest.clone(),
                     approval_id: None,
+                    signing_attempted: false,
                 }
             }
             Err(error) => return Err(format!("read reusable batch signing state: {error}").into()),
@@ -860,6 +963,9 @@ impl BrokerExactPayloadSigner {
             state.expires_at_ms = DecimalU64::new(now.saturating_add(APPROVAL_TTL_MS));
             state.approval_id = None;
         }
+        if self.strict_recovery {
+            state.signing_attempted = true;
+        }
         write_state(state_path, &state)?;
         // A write made while the owner's ceremony is still open cannot sign.
         // Recording an attempt for its bytes would make the rebuild after the
@@ -904,6 +1010,9 @@ impl BrokerExactPayloadSigner {
             canonical_plan_facts_digest,
             approval_id: state.approval_id.clone(),
             account_key_ref: self.account_key_ref.clone(),
+            expected_key_ref: self.expected_key_ref.clone(),
+            allow_persona: self.allow_persona,
+            allow_limit_stepup: false,
             petal_use_claim: Some(claim.clone()),
             claim_assurance_evidence: claim_assurance_evidence.map(<[u8]>::to_vec),
         };
@@ -1044,6 +1153,8 @@ impl BrokerExactPayloadSigner {
                     expires_at_ms: DecimalU64::new(now.saturating_add(APPROVAL_TTL_MS)),
                     canonical_plan_facts_digest: canonical_plan_facts_digest.clone(),
                     approval_id: None,
+                    signing_attempted: false,
+                    exact_fallback: false,
                 }
             }
             Err(error) => return Err(format!("read exact batch signing state: {error}").into()),
@@ -1078,6 +1189,20 @@ impl BrokerExactPayloadSigner {
         let now = now_ms()?;
         // Preserve the operation across local expiry, including lost replies
         // and open ceremonies. Broker owns approval expiry and replay.
+        if self.strict_recovery
+            && state.signing_attempted
+            && state.expires_at_ms.get() <= now
+            && self
+                .broker
+                .persona_operation_digest(&state.signing_operation_id)
+                .map_err(|error| error.to_string())?
+                .is_none()
+        {
+            return Err(self
+                .strict_expired_reason(state.approval_id.as_ref(), &state.signing_operation_id)
+                .await
+                .into());
+        }
         if state.expires_at_ms.get() <= now && state.approval_id.is_none() {
             state.approval_operation_id = random_operation_id();
             state.signing_operation_id = random_operation_id();
@@ -1085,6 +1210,9 @@ impl BrokerExactPayloadSigner {
             state.issued_at_ms = DecimalU64::new(now);
             state.expires_at_ms = DecimalU64::new(now.saturating_add(APPROVAL_TTL_MS));
             state.approval_id = None;
+        }
+        if self.strict_recovery {
+            state.signing_attempted = true;
         }
         write_state(state_path, &state)?;
         let request = ExactPayloadBatchSignRequest {
@@ -1104,6 +1232,9 @@ impl BrokerExactPayloadSigner {
             canonical_plan_facts_digest,
             approval_id: state.approval_id.clone(),
             account_key_ref: self.account_key_ref.clone(),
+            expected_key_ref: self.expected_key_ref.clone(),
+            allow_persona: self.allow_persona && !state.exact_fallback,
+            allow_limit_stepup: self.strict_recovery && self.allow_persona && !state.exact_fallback,
             petal_use_claim: Some(claim.clone()),
             claim_assurance_evidence: claim_assurance_evidence.map(<[u8]>::to_vec),
         };
@@ -1116,12 +1247,25 @@ impl BrokerExactPayloadSigner {
                 ceremony_expires_at_ms,
             });
         }
-        match self
-            .broker
-            .sign_exact_payload_batch_recovering(request)
-            .await
-        {
+        let response = if self.strict_recovery {
+            self.broker.sign_exact_payload_batch(request).await
+        } else {
+            self.broker
+                .sign_exact_payload_batch_recovering(request)
+                .await
+        };
+        match response {
             Ok(ExactPayloadSignOutcome::ApprovalRequired(prepared)) => {
+                if self.strict_recovery
+                    && !state.exact_fallback
+                    && self
+                        .broker
+                        .persona_exact_fallback(&state.signing_operation_id)
+                        .map_err(|e| e.to_string())?
+                {
+                    state.exact_fallback = true;
+                    state.signing_operation_id = random_operation_id();
+                }
                 state.approval_id = Some(prepared.approval_id.clone());
                 write_state(state_path, &state)?;
                 Ok(ExactPayloadBatchOutcome::ApprovalRequired {
@@ -1209,7 +1353,8 @@ fn write_state<T: Serialize>(path: &Path, state: &T) -> Result<(), String> {
     let result = file
         .write_all(&bytes)
         .and_then(|()| file.sync_all())
-        .and_then(|()| fs::rename(&temporary, path));
+        .and_then(|()| fs::rename(&temporary, path))
+        .and_then(|()| fs::File::open(parent)?.sync_all());
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
@@ -1235,6 +1380,8 @@ mod tests {
     #[derive(Default)]
     struct MockBroker {
         requests: Mutex<Vec<MachineBrokerRequest>>,
+        conflict_sign_once: AtomicBool,
+        terminal_approval: Mutex<Option<bloom_broker_api::ApprovalLifecycleState>>,
         lose_sign_response_once: AtomicBool,
         /// Simulates the pre-#265 derivation defect for the negative twin: the
         /// approval presents no `value_limits` even though the claim declares
@@ -1459,11 +1606,15 @@ mod tests {
                             ApprovalPublicStatus {
                                 approval_id: request.id,
                                 wallet_id: token("wallet"),
-                                state: if waiting {
-                                    ApprovalLifecycleState::AwaitingCeremony
-                                } else {
-                                    ApprovalLifecycleState::Active
-                                },
+                                state: self.terminal_approval.lock().unwrap().unwrap_or_else(
+                                    || {
+                                        if waiting {
+                                            ApprovalLifecycleState::AwaitingCeremony
+                                        } else {
+                                            ApprovalLifecycleState::Active
+                                        }
+                                    },
+                                ),
                                 effective_claim_assurance: None,
                                 ceremony_url: waiting
                                     .then(|| "http://localhost:18734/ceremony/test".into()),
@@ -1514,6 +1665,12 @@ mod tests {
                         }))
                     }
                     MachineBrokerRequest::SigningSignBatch(request) => {
+                        if self.conflict_sign_once.swap(false, Ordering::SeqCst) {
+                            return Err(ProtocolError::new(
+                                ProtocolErrorCode::OperationIdConflict,
+                                "simulated ambiguous batch",
+                            ));
+                        }
                         self.record_signing(&request)?;
                         Ok(MachineBrokerResponse::SigningSignBatch(SigningResult {
                             operation_id: request.operation_id,
@@ -1600,6 +1757,7 @@ mod tests {
             ProvenanceCatalog {
                 schema: PROVENANCE_CATALOG_SCHEMA.into(),
                 records: vec![ProvenanceRecord {
+                    package_display_name: None,
                     subject: ProvenanceSubject::System {
                         component_id: token("bloom-machine"),
                         operation_class: token("transaction.confirm"),
@@ -1607,6 +1765,8 @@ mod tests {
                     publisher: token("bloom-installer"),
                     petal_lineage: None,
                     operation_classes: vec![ProvenanceOperationClass {
+                        zero_spend: false,
+                        economic_effects_schema: None,
                         operation_class: token("transaction.confirm"),
                         fee_asset: None,
                     }],
@@ -1700,6 +1860,7 @@ mod tests {
             ProvenanceCatalog {
                 schema: PROVENANCE_CATALOG_SCHEMA.into(),
                 records: vec![ProvenanceRecord {
+                    package_display_name: None,
                     subject: ProvenanceSubject::System {
                         component_id: token("bloom-machine"),
                         operation_class: token("transaction.confirm"),
@@ -1707,6 +1868,8 @@ mod tests {
                     publisher: token("bloom-installer"),
                     petal_lineage: None,
                     operation_classes: vec![ProvenanceOperationClass {
+                        zero_spend: false,
+                        economic_effects_schema: None,
                         operation_class: token("transaction.confirm"),
                         fee_asset: None,
                     }],
@@ -1775,6 +1938,7 @@ mod tests {
             ProvenanceCatalog {
                 schema: PROVENANCE_CATALOG_SCHEMA.into(),
                 records: vec![ProvenanceRecord {
+                    package_display_name: None,
                     subject: ProvenanceSubject::System {
                         component_id: token("bloom-machine"),
                         operation_class: token("transaction.confirm"),
@@ -1782,6 +1946,8 @@ mod tests {
                     publisher: token("bloom-installer"),
                     petal_lineage: None,
                     operation_classes: vec![ProvenanceOperationClass {
+                        zero_spend: false,
+                        economic_effects_schema: None,
                         operation_class: token("transaction.confirm"),
                         fee_asset: None,
                     }],
@@ -1860,10 +2026,13 @@ mod tests {
             ProvenanceCatalog {
                 schema: PROVENANCE_CATALOG_SCHEMA.into(),
                 records: vec![ProvenanceRecord {
+                    package_display_name: None,
                     subject: subject.clone(),
                     publisher: token("bloom-installer"),
                     petal_lineage: None,
                     operation_classes: vec![ProvenanceOperationClass {
+                        zero_spend: false,
+                        economic_effects_schema: None,
                         operation_class: token("order.place"),
                         fee_asset: None,
                     }],
@@ -1877,6 +2046,7 @@ mod tests {
         let payload = b"reusable batch payload";
         let ordered_hash = Digest32::from_bytes(Sha256::digest(payload).into());
         let claim = PetalUseClaim {
+            economic_effects: None,
             package_hash,
             route: "orders/place".into(),
             operation_class: token("order.place"),
@@ -1977,6 +2147,7 @@ mod tests {
                 ProvenanceCatalog {
                     schema: PROVENANCE_CATALOG_SCHEMA.into(),
                     records: vec![ProvenanceRecord {
+                        package_display_name: None,
                         subject: ProvenanceSubject::System {
                             component_id: token("bloom-machine"),
                             operation_class: token("transaction.confirm"),
@@ -1984,6 +2155,8 @@ mod tests {
                         publisher: token("bloom-installer"),
                         petal_lineage: None,
                         operation_classes: vec![ProvenanceOperationClass {
+                            zero_spend: false,
+                            economic_effects_schema: None,
                             operation_class: token("transaction.confirm"),
                             fee_asset: None,
                         }],
@@ -2039,10 +2212,13 @@ mod tests {
             ProvenanceCatalog {
                 schema: PROVENANCE_CATALOG_SCHEMA.into(),
                 records: vec![ProvenanceRecord {
+                    package_display_name: None,
                     subject: subject.clone(),
                     publisher: token("bloom-installer"),
                     petal_lineage: None,
                     operation_classes: vec![ProvenanceOperationClass {
+                        zero_spend: false,
+                        economic_effects_schema: None,
                         operation_class: token("order.place"),
                         fee_asset: None,
                     }],
@@ -2064,6 +2240,7 @@ mod tests {
             Digest32::from_bytes(digest.finalize().into())
         };
         let claim = PetalUseClaim {
+            economic_effects: None,
             package_hash,
             route: "orders/place".into(),
             operation_class: token("order.place"),
@@ -2209,6 +2386,118 @@ mod tests {
             }
         }
 
+        // A strict prepared operation preserves its first signing identity on
+        // ambiguity and after expiry; it never retries under a fresh ID.
+        let strict = signer.clone().with_strict_recovery(true);
+        let strict_path = temporary.path().join("strict-batch.json");
+        let payloads = vec![payload.to_vec()];
+        let facts = serde_json::json!({"asset": "BTC"});
+        strict
+            .sign_or_prepare_petal_batch(
+                &strict_path,
+                "strict",
+                "wallet",
+                "order.place",
+                &payloads,
+                &claim.ordered_hashes,
+                claim.crypto_suite,
+                &facts,
+                &subject,
+                &claim,
+                Some(b"assurance"),
+                None,
+            )
+            .await
+            .unwrap();
+        let initial: ExactBatchSigningState =
+            serde_json::from_slice(&fs::read(&strict_path).unwrap()).unwrap();
+        assert!(initial.signing_attempted);
+        broker.conflict_sign_once.store(true, Ordering::SeqCst);
+        let err = strict
+            .sign_or_prepare_petal_batch(
+                &strict_path,
+                "strict",
+                "wallet",
+                "order.place",
+                &payloads,
+                &claim.ordered_hashes,
+                claim.crypto_suite,
+                &facts,
+                &subject,
+                &claim,
+                Some(b"assurance"),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("OPERATION_ID_CONFLICT"));
+        let mut persisted: ExactBatchSigningState =
+            serde_json::from_slice(&fs::read(&strict_path).unwrap()).unwrap();
+        assert_eq!(persisted.signing_operation_id, initial.signing_operation_id);
+        persisted.expires_at_ms = DecimalU64::new(1);
+        write_state(&strict_path, &persisted).unwrap();
+        let before = broker.requests.lock().unwrap().len();
+        let err = strict
+            .sign_or_prepare_petal_batch(
+                &strict_path,
+                "strict",
+                "wallet",
+                "order.place",
+                &payloads,
+                &claim.ordered_hashes,
+                claim.crypto_suite,
+                &facts,
+                &subject,
+                &claim,
+                Some(b"assurance"),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("RECOVERY_REQUIRED"));
+        assert!(
+            broker.requests.lock().unwrap()[before..]
+                .iter()
+                .all(|request| !matches!(
+                    request,
+                    MachineBrokerRequest::SealedApprovalPrepare(_)
+                        | MachineBrokerRequest::SigningSignBatch(_)
+                ))
+        );
+        let after: ExactBatchSigningState =
+            serde_json::from_slice(&fs::read(&strict_path).unwrap()).unwrap();
+        assert_eq!(after.signing_operation_id, initial.signing_operation_id);
+        for (terminal, expected) in [
+            (
+                bloom_broker_api::ApprovalLifecycleState::Expired,
+                "APPROVAL_EXPIRED",
+            ),
+            (
+                bloom_broker_api::ApprovalLifecycleState::Cancelled,
+                "APPROVAL_REVOKED",
+            ),
+        ] {
+            *broker.terminal_approval.lock().unwrap() = Some(terminal);
+            let err = strict
+                .sign_or_prepare_petal_batch(
+                    &strict_path,
+                    "strict",
+                    "wallet",
+                    "order.place",
+                    &payloads,
+                    &claim.ordered_hashes,
+                    claim.crypto_suite,
+                    &facts,
+                    &subject,
+                    &claim,
+                    Some(b"assurance"),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains(expected), "{err}");
+        }
+
         let requests = broker.requests.lock().unwrap();
         let MachineBrokerRequest::SealedApprovalPrepare(prepared) = &requests[2] else {
             panic!("first exact attempt must prepare approval");
@@ -2250,11 +2539,8 @@ mod tests {
 
     #[tokio::test]
     async fn message_signatures_forward_their_review_envelopes_and_refuse_omission() {
-        for class in bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES {
+        for class in &["example.message", "another.login"] {
             review_envelope_forwarding(class, "bloom.message.review.v1", false).await;
-        }
-        for class in bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES {
-            review_envelope_forwarding(class, "prepared", true).await;
         }
     }
 
@@ -2270,10 +2556,13 @@ mod tests {
             ProvenanceCatalog {
                 schema: PROVENANCE_CATALOG_SCHEMA.into(),
                 records: vec![ProvenanceRecord {
+                    package_display_name: None,
                     subject: subject.clone(),
                     publisher: token("bloom-installer"),
                     petal_lineage: None,
                     operation_classes: vec![ProvenanceOperationClass {
+                        zero_spend: false,
+                        economic_effects_schema: None,
                         operation_class: token(class),
                         fee_asset: None,
                     }],
@@ -2286,6 +2575,7 @@ mod tests {
         let payload = b"\x19\x01safe preimage";
         let ordered_hash = Digest32::from_bytes(alloy::primitives::keccak256(payload).into());
         let claim = PetalUseClaim {
+            economic_effects: None,
             package_hash,
             route: "transactions/confirm".into(),
             operation_class: token(class),
@@ -2527,10 +2817,13 @@ mod tests {
             ProvenanceCatalog {
                 schema: PROVENANCE_CATALOG_SCHEMA.into(),
                 records: vec![ProvenanceRecord {
+                    package_display_name: None,
                     subject,
                     publisher: token("bloom-installer"),
                     petal_lineage: None,
                     operation_classes: vec![ProvenanceOperationClass {
+                        zero_spend: false,
+                        economic_effects_schema: None,
                         operation_class: token("fixture.withdraw"),
                         fee_asset: class_fee_asset,
                     }],
@@ -2543,6 +2836,7 @@ mod tests {
         let payload = b"exact withdraw payload";
         let ordered_hash = Digest32::from_bytes(Sha256::digest(payload).into());
         let claim = PetalUseClaim {
+            economic_effects: None,
             package_hash,
             route: "withdraw/request".into(),
             operation_class: token("fixture.withdraw"),
@@ -2736,6 +3030,8 @@ mod tests {
             expires_at_ms: DecimalU64::new(2),
             canonical_plan_facts_digest: digest(4),
             approval_id: None,
+            signing_attempted: false,
+            exact_fallback: false,
         };
         let batch = ExactBatchSigningState {
             schema: single.schema.clone(),
@@ -2755,6 +3051,8 @@ mod tests {
             expires_at_ms: DecimalU64::new(2),
             canonical_plan_facts_digest: digest(4),
             approval_id: None,
+            signing_attempted: false,
+            exact_fallback: false,
         };
         for value in [
             serde_json::to_value(&single).unwrap(),

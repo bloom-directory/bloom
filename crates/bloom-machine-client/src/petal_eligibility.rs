@@ -3,18 +3,36 @@
 //! These values grant no signing authority and persist no separate Petal journal.
 
 use bloom_broker_api::{
-    CanonicalWalletPolicy, CeremonyState, Digest32, OperationId, PolicyUpdatePrepareResponse,
-    SignedPolicySnapshot,
+    CanonicalWalletPolicy, CeremonyState, Digest32, OperationId, PolicyDestination,
+    PolicyUpdatePrepareResponse, SignedPolicySnapshot,
 };
 
-/// Preserve every existing restriction and append only the requested exact package hash.
-pub fn policy_with_package(
+/// Preserve every existing restriction and append each requested exact package
+/// hash once, in order.
+pub fn policy_with_packages(
     current: &CanonicalWalletPolicy,
-    package_hash: &Digest32,
+    package_hashes: &[Digest32],
 ) -> CanonicalWalletPolicy {
     let mut proposed = current.clone();
-    if !proposed.allowed_petal_packages.contains(package_hash) {
-        proposed.allowed_petal_packages.push(package_hash.clone());
+    for package_hash in package_hashes {
+        if !proposed.allowed_petal_packages.contains(package_hash) {
+            proposed.allowed_petal_packages.push(package_hash.clone());
+        }
+    }
+    proposed
+}
+
+/// Preserve every existing restriction and append each requested destination
+/// once, in order. Destinations are never removed or rewritten.
+pub fn policy_with_destinations(
+    current: &CanonicalWalletPolicy,
+    destinations: &[PolicyDestination],
+) -> CanonicalWalletPolicy {
+    let mut proposed = current.clone();
+    for destination in destinations {
+        if !proposed.allowed_destinations.contains(destination) {
+            proposed.allowed_destinations.push(destination.clone());
+        }
     }
     proposed
 }
@@ -34,5 +52,7 @@ pub struct PendingPolicyUpdate {
     pub prepare: Option<PolicyUpdatePrepareResponse>,
     pub status_path: String,
     pub challenge_path: String,
-    pub includes_requested_package: bool,
+    /// Whether this change carries every package and every destination the
+    /// caller asked for. False means it is somebody else's change.
+    pub includes_requested: bool,
 }

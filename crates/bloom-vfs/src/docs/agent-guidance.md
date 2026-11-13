@@ -123,8 +123,9 @@ fields.
 
 ## What the owner sees when approving
 
-The approval page shows Broker's own reading of the signed bytes: action,
-account, amounts, recipient and limits. Before forwarding the link, tell the
+The approval page shows Broker's review of the signing request: action,
+account, amounts, recipient and limits. Generic Petal amounts are declared by
+the installed package; Broker does not independently decode their economic effects. Before forwarding the link, tell the
 human in a sentence what you asked for, so they can cancel if the page shows
 something else. Name an unknown token only by its address and raw units,
 never a guessed ticker. Point out **No output protection**, **Spending limit:
@@ -148,6 +149,64 @@ use it but cannot create, broaden, renew or revoke it.
 Paid HTTP requests under `requests/` are actions: inspect the plan, payment
 protocol, maximum amount and wallet before confirming. A timeout does not
 prove non-payment; read the receipt, and never restage an unresolved payment.
+
+## Persona sessions
+
+Institutional, Trader and Degen are onboarding preferences. A saved preference or
+policy allowance does not activate signing authority. A covered confirm may
+consume a live owner-approved session without a new ceremony; use the same
+staging, review and outcome-reconciliation surfaces as usual.
+
+Trader and Degen can use owner-approved permissions for an installed package's
+supported declared effects on the selected account. Bounded spending consumes
+that permission's exact token allowance. Explicit zero-spend actions consume no
+token allowance, but require a certified operation class. All listed zero-spend
+classes within one permission share its rate cap: 60 per hour for Trader,
+300 per hour for Degen. Institutional keeps individual approval. An unspecified
+spend, an unsupported asset or an exceeded allowance needs separate review once
+Bloom has ruled out an unresolved signing attempt. These permissions trust the
+installed package's declared effects; they do not prove venue execution or
+settlement.
+
+Degen also supports owner-approved native-wallet ERC20 transfer sessions to any
+recipient on Ethereum and Polygon. Selected tokens and maximum native gas have
+independent per-action and rolling seven-day limits. Native currency sends,
+arbitrary calls and token approvals are not included in that permission.
+Explicit native transfer sessions also support local chain 31337 with reviewed
+asset and fee unit limits. Supported mainnet SOL transfers use live
+cluster/blockhash/fee checks; other native formats retain exact approval.
+Venue settings may impose tighter limits.
+
+Owner onboarding opens through `bloom init` or `bloom onboard` after install.
+The local browser delegates wallet and permission review to Broker ceremonies.
+If the CLI is available, `bloom wallet persona status main` reports grants,
+permission validity and per-Petal/account exact-asset rolling usage. Owner-requested
+changes use `bloom wallet persona set <wallet> <preset>`, then
+`bloom wallet default-policy <wallet>` and
+`bloom wallet persona activate <wallet> --account <n>`.
+Browser onboarding continues through each owner ceremony automatically. Rearm
+unlocks an unchanged permission while preserving its token usage and zero-spend
+rate usage; it does not create more capacity. `stop` disables local discovery
+before remote revocation.
+Never change a profile, revoke Broker authority, reset a budget or rotate an operation ID
+merely to work around a denial. A consumed, expired or unavailable grant is not
+authority for a replacement signature. Reconcile the original operation first;
+forward any required fresh ceremony to the owner. Recovering a completed
+signature after revocation authorizes no new action.
+
+An owner-approved persona session can cover selected native transfers and
+certified Petal actions for exact EVM/SVM accounts. Each Petal/account has an
+independent allowance per exact asset; its reviewed routes share that allowance.
+These allowances add together across Petals and accounts. Check the active
+permission's exact account, asset, recipient and raw-unit scope; a persona
+preference alone grants nothing. Broker accounts for signed volume in raw asset
+units under per-action and rolling-window limits, without price conversions.
+Cancelling signed orders does not refund usage, and open orders are not limited
+by the window. Separate venue limits may be lower. Restart and owner-requested
+rearm preserve the existing allowance and its usage. Unsupported actions keep
+ordinary owner approval. Retry the same staged action after approval; never
+restage an uncertain signature to obtain new capacity or bypass a stopped
+permission.
 
 ## Reporting Bloom problems
 
