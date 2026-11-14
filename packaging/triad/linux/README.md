@@ -51,8 +51,12 @@ records it in the root-owned enrollment and Machine environment, and renders the
 same port into that login's fstab authorization. The packaged Machine asks the
 existing system mount helper to resolve `~/bloom` from fstab; it cannot supply a
 different source, target, port, or mount option. Before mounting, Machine
-detects and force-detaches only the expected stale loopback NFS mount; a foreign
-filesystem at `~/bloom` is rejected. Machine still runs as the login principal
+looks up `~/bloom` in the mount table without touching it, because a mount left
+by a Machine that crashed blocks any access. If the mount is the expected
+loopback NFS export, Machine binds its fixed port: if another Machine holds the
+port, startup is refused; otherwise nothing serves the old mount, so Machine
+lazily detaches it (`umount -l`) and mounts again. A foreign filesystem at
+`~/bloom` is rejected. Machine still runs as the login principal
 and receives neither a sudoers rule nor `CAP_SYS_ADMIN`. The service deliberately
 does not block the distribution's setuid mount helper, because that helper is
 what enforces the exact fstab delegation. The unit therefore cannot use systemd
