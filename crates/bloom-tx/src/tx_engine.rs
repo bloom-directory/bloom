@@ -3104,6 +3104,28 @@ impl TxEngine {
         chain_next: u64,
         holders: &[(u64, String)],
     ) -> Result<(), TxEngineError> {
+        let (wallet, chain) = (&entry.staged.wallet, &entry.staged.chain);
+        let sent: Vec<&str> = holders
+            .iter()
+            .filter(|(_, id)| {
+                self.outbox
+                    .read_in_state(wallet, chain, id, OutboxState::Sent)
+                    .is_ok()
+            })
+            .map(|(_, id)| id.as_str())
+            .collect();
+        let advice = if holders.is_empty() {
+            format!(
+                "no pending transaction holds nonce {chain_next}; restage with an explicit `nonce` to fill the gap deliberately"
+            )
+        } else if sent.is_empty() {
+            "confirm the transactions listed in `blocked_by`, or discard them by writing `cancel` to their `confirm` file, which releases their nonces without an approval".to_owned()
+        } else {
+            format!(
+                "{} already broadcast and not mined: wait for it to mine, or cancel it with `bloom wallet cancel {wallet} {chain} <id>`, which needs an owner approval; confirm or discard any other `blocked_by` entry through its `confirm` file",
+                sent.join(", ")
+            )
+        };
         let body = serde_json::json!({
             "schema": "bloom.nonce_gap.v1",
             "id": entry.staged.id,
@@ -3116,13 +3138,7 @@ impl TxEngine {
                 .iter()
                 .map(|(nonce, id)| serde_json::json!({"nonce": nonce, "id": id}))
                 .collect::<Vec<_>>(),
-            "advice": if holders.is_empty() {
-                format!(
-                    "no pending transaction holds nonce {chain_next}; restage with an explicit `nonce` to fill the gap deliberately"
-                )
-            } else {
-                "confirm the transactions listed in `blocked_by`, or discard them by writing `cancel` to their `confirm` file, which releases their nonces without an approval".to_owned()
-            },
+            "advice": advice,
             "created_ms": now_ms(),
         });
         self.outbox.write_artefact(
@@ -6731,6 +6747,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(staged.nonce, 1);
+
+        // A sent blocker has no `confirm` file, so the gap advice names the
+        // owner-approved cancel instead.
+        let from: Address = TEST_SIGNER_ADDRESS.parse().unwrap();
+        let holders = engine.pending_nonce_holders("alice", "anvil", &from, 0, 1);
+        assert_eq!(holders, vec![(0, approve.id.clone())]);
+        let entry = engine.outbox.read("alice", "anvil", &staged.id).unwrap();
+        engine
+            .write_nonce_gap_advisory(&entry, 1, 0, &holders)
+            .unwrap();
+        let gap: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(entry.dir.join("nonce_gap.json")).unwrap())
+                .unwrap();
+        let advice = gap["advice"].as_str().unwrap();
+        assert!(
+            advice.contains("0017-approve already broadcast"),
+            "{advice}"
+        );
+        assert!(
+            advice.contains("bloom wallet cancel alice anvil <id>"),
+            "{advice}"
+        );
     }
 
     #[tokio::test]
