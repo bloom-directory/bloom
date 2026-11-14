@@ -2893,7 +2893,6 @@ impl Handler for ServingHandler {
 /// read over IPC; a hard denial still reads differently.
 #[test]
 fn vfs_write_names_the_approval_challenge_while_owner_approval_is_pending() {
-    let home = fresh_home();
     let outbox = "wallets/alice/0/chains/base/outbox/pending/0001-feed";
     for (error, expected) in [
         (
@@ -2907,6 +2906,9 @@ fn vfs_write_names_the_approval_challenge_while_owner_approval_is_pending() {
             "operation not permitted".to_owned(),
         ),
     ] {
+        // A home per case: the confirm reads the entry after its write, and
+        // the next server could find the first one's socket still closing.
+        let home = fresh_home();
         let handler = Arc::new(ServingHandler {
             write_error: error,
             ..ServingHandler::default()
@@ -2921,6 +2923,58 @@ fn vfs_write_names_the_approval_challenge_while_owner_approval_is_pending() {
             .stderr(predicate::str::contains("ceremony_url").not());
         stop_ipc_server(server, server_thread);
     }
+}
+
+/// Denies every policy write; the update's status appears with the first.
+#[derive(Default)]
+struct PolicyUpdateHandler {
+    written: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl Handler for PolicyUpdateHandler {
+    async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+        Ok(Entry::read_only_file(
+            p.segments().last().map(String::as_str).unwrap_or("file"),
+        ))
+    }
+
+    async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+        Err(HandlerError::NotADir(p.to_string_path()))
+    }
+
+    async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+        if !self.written.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(HandlerError::not_found(p.to_string_path()));
+        }
+        Ok(br#"{"state":"pending","ceremony_state":"AWAITING_USER","action_id":"a1","ceremony_url":"http://localhost:18734/c/policy","expiry_ms":99999999999999}"#.to_vec())
+    }
+
+    async fn write(&self, _p: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+        self.written
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Err(HandlerError::PermissionDenied)
+    }
+}
+
+/// A policy write that needs the owner's approval prints the ceremony link
+/// rather than a bare "permission denied".
+#[test]
+fn vfs_write_of_a_policy_prints_the_approval_link() {
+    let home = fresh_home();
+    let vfs = bloom_vfs::Vfs::builder()
+        .mount("wallets", Arc::new(PolicyUpdateHandler::default()))
+        .build();
+    let (server, server_thread) = spawn_ipc_server(home.path(), vfs);
+    bloom_cmd(home.path())
+        .args(["vfs", "write", "/wallets/alice/policy.json", "{}"])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains(
+            "Approval required: open http://localhost:18734/c/policy",
+        ))
+        .stdout(predicate::str::contains("run this same write again"));
+    stop_ipc_server(server, server_thread);
 }
 
 #[test]

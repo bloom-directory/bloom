@@ -3463,6 +3463,9 @@ async fn confirm_projection(
     None
 }
 
+/// How long a repeated policy write waits for the owner. Matches the
+/// daemon's confirm wait, which stays under common 60 s tool timeouts.
+const POLICY_APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(50);
 const IPC_ERR_NOT_FOUND: i32 = -32004;
 const IPC_ERR_PERMISSION_DENIED: i32 = -32007;
 
@@ -3944,15 +3947,19 @@ async fn run(cli: Cli) -> Result<()> {
                     buf
                 }
             };
+            let params = serde_json::json!({ "path": path, "bytes_b64": B64.encode(&body) });
+            if let ["wallets", wallet, "policy.json"] = path
+                .trim_matches('/')
+                .split('/')
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                return write_policy(&client_endpoint, wallet, params).await;
+            }
             let client = IpcClient::new(&client_endpoint.socket);
-            try_ipc(
-                &client,
-                &client_endpoint,
-                "write",
-                serde_json::json!({ "path": path, "bytes_b64": B64.encode(&body) }),
-            )
-            .await
-            .with_context(|| format!("ipc write via {}", client_endpoint.display))?;
+            try_ipc(&client, &client_endpoint, "write", params)
+                .await
+                .with_context(|| format!("ipc write via {}", client_endpoint.display))?;
             debug!(endpoint = %client_endpoint.display, "cli.vfs.write.via_ipc");
             Ok(())
         }
@@ -5240,6 +5247,76 @@ async fn wallet_confirm(
             Ok(())
         }
     }
+}
+
+/// The policy update still waiting for its owner: action id, ceremony link
+/// and expiry.
+async fn pending_policy_update(
+    endpoint: &ResolvedEndpoint,
+    wallet: &str,
+) -> Option<(String, String, u128)> {
+    let path = format!("/wallets/{wallet}/policy-updates/latest/status.json");
+    let status: serde_json::Value =
+        serde_json::from_slice(&ipc_read(endpoint, &path).await.ok()?).ok()?;
+    if status["state"] != "pending" || status["ceremony_state"] != "AWAITING_USER" {
+        return None;
+    }
+    Some((
+        status["action_id"].as_str()?.to_owned(),
+        status["ceremony_url"].as_str()?.to_owned(),
+        status["expiry_ms"].as_u64()?.into(),
+    ))
+}
+
+/// Write a wallet policy. A policy change needs the owner's approval, and the
+/// write alone reports that as a bare "permission denied". Print the ceremony
+/// link instead; a repeat of the same write waits for the owner, like a
+/// repeated confirm.
+async fn write_policy(
+    endpoint: &ResolvedEndpoint,
+    wallet: &str,
+    params: serde_json::Value,
+) -> Result<()> {
+    let client = IpcClient::new(&endpoint.socket);
+    let context = || format!("ipc write via {}", endpoint.display);
+    let before = pending_policy_update(endpoint, wallet).await;
+    let (code, error) = match try_ipc_coded(&client, endpoint, "write", params.clone()).await {
+        Ok(_) => {
+            println!("Policy updated.");
+            return Ok(());
+        }
+        Err(denied) => denied,
+    };
+    let Some((action, url, expires_at_ms)) = pending_policy_update(endpoint, wallet)
+        .await
+        .filter(|_| code == IPC_ERR_PERMISSION_DENIED)
+    else {
+        return Err(anyhow::Error::new(error).context(context()));
+    };
+    if before.is_some_and(|(earlier, ..)| earlier == action) {
+        let deadline = tokio::time::Instant::now() + POLICY_APPROVAL_WAIT;
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if pending_policy_update(endpoint, wallet)
+                .await
+                .is_some_and(|(current, ..)| current == action)
+            {
+                continue;
+            }
+            try_ipc(&client, endpoint, "write", params)
+                .await
+                .with_context(context)?;
+            println!("Policy updated.");
+            return Ok(());
+        }
+    }
+    let remaining = expires_at_ms.saturating_sub(unix_now_ms()) / 1000;
+    println!("Approval required: open {url}");
+    println!(
+        "Ceremony expires in {remaining}s. Show the owner that link, then run this same write again right away, without waiting for their reply: it waits for the approval, then installs the policy."
+    );
+    EXIT_CODE_OVERRIDE.store(EXIT_APPROVAL_PENDING, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
 }
 
 /// A `vfs write` to an account's `outbox/new.tx` or to a pending entry's
