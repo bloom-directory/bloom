@@ -5,7 +5,7 @@ homepage: https://bloom.directory
 license: MIT
 allowed-tools: Bash(bloom vfs ls:*) Bash(bloom vfs cat:*) Read
 metadata:
-  version: 0.5.0
+  version: 0.5.1
 ---
 
 # Bloom
