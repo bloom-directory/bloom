@@ -170,25 +170,9 @@ else
 fi
 
 command -v jq >/dev/null 2>&1 || die "jq is required"
-user_unit_dir=""
 if [ "$host_os" = Linux ]; then
-  command -v systemctl >/dev/null 2>&1 || die "Linux developer services require systemctl"
-  user_runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-  [ -d "$user_runtime_dir" ] && [ ! -L "$user_runtime_dir" ] ||
-    die "Linux developer services require a real user runtime directory"
-  [ "$(stat -c %u "$user_runtime_dir")" = "$(id -u)" ] ||
-    die "Linux developer user runtime directory has the wrong owner"
-  export XDG_RUNTIME_DIR="$user_runtime_dir"
-  export DBUS_SESSION_BUS_ADDRESS="unix:path=${user_runtime_dir}/bus"
-  systemctl --user show-environment >/dev/null 2>&1 ||
-    die "Linux developer services require an active systemd user manager (enable linger for this dedicated developer user)"
-  user_unit_dir="${user_runtime_dir}/systemd/user"
-  mkdir -p "$user_unit_dir"
-  [ -d "$user_unit_dir" ] && [ ! -L "$user_unit_dir" ] ||
-    die "Linux developer systemd user unit directory is unsafe"
-  [ "$(stat -c %u "$user_unit_dir")" = "$(id -u)" ] ||
-    die "Linux developer systemd user unit directory has the wrong owner"
-  chmod 0700 "$user_unit_dir"
+  command -v systemd-socket-activate >/dev/null 2>&1 ||
+    die "the Linux Broker receives its ceremony listeners from systemd-socket-activate, which is not installed"
 fi
 umask 077
 mkdir -p "$developer_root"
@@ -261,17 +245,6 @@ broker_bin="${BLOOM_INTEGRATION_BROKER_BIN:-${broker_repo}/target/debug/bloom-br
 signer_bin="${BLOOM_INTEGRATION_SIGNER_BIN:-${signer_repo}/target/debug/bloom-signer}"
 config_dir="${developer_root}/config"
 authority_edge_history="${config_dir}/authority-edge-history.json"
-if [ "$host_os" = Linux ]; then
-  for unit_value in \
-    "$developer_root" "$config_dir" "$log_dir" "$authority_edge_history" \
-    "$broker_bin" "$signer_bin"
-  do
-    case "$unit_value" in
-      *[!A-Za-z0-9_./:@+-]*)
-        die "Linux developer systemd unit paths may contain only ASCII letters, digits, and _./:@+-" ;;
-    esac
-  done
-fi
 if [ -z "${BLOOM_INTEGRATION_MACHINE_BIN:-}" ]; then
   (cd "$repo_root" && cargo build -p bloom --no-default-features --features mount,triad-dev-harness)
 fi
@@ -405,12 +378,6 @@ signer_socket="${runtime_dir}/signer/signer.sock"
 signer_control_socket="${runtime_dir}/signer/control.sock"
 broker_socket="${runtime_dir}/broker/broker.sock"
 broker_control_socket="${runtime_dir}/broker/control.sock"
-unit_token="$(basename "$runtime_dir")"
-unit_prefix="bloom-triad-dev-$(id -u)-${unit_token}"
-signer_service_unit="${unit_prefix}-signer.service"
-broker_service_unit="${unit_prefix}-broker.service"
-broker_ceremony_v4_socket_unit="${unit_prefix}-broker-ceremony-ipv4.socket"
-broker_ceremony_v6_socket_unit="${unit_prefix}-broker-ceremony-ipv6.socket"
 broker_checkpoint_dir="${developer_root}/audit-checkpoints/broker"
 signer_checkpoint_dir="${developer_root}/audit-checkpoints/signer"
 machine_checkpoint_dir="${machine_home}/audit-checkpoints/machine"
@@ -514,21 +481,6 @@ env_file="${log_dir}/triad.env"
 } > "$env_file"
 chmod 0600 "$env_file"
 session_pid=""; signer_pid=""; broker_pid=""; machine_pid=""; relay_admin_pid=""
-systemd_units_installed=0
-stop_linux_authority_units() {
-  [ "$host_os" = Linux ] || return 0
-  systemctl --user stop "$broker_service_unit" "$signer_service_unit" >/dev/null 2>&1 || true
-  systemctl --user stop "$broker_ceremony_v4_socket_unit" "$broker_ceremony_v6_socket_unit" >/dev/null 2>&1 || true
-  if [ "$systemd_units_installed" -eq 1 ]; then
-    rm -f -- \
-      "${user_unit_dir}/${broker_ceremony_v4_socket_unit}" \
-      "${user_unit_dir}/${broker_ceremony_v6_socket_unit}" \
-      "${user_unit_dir}/${broker_service_unit}" \
-      "${user_unit_dir}/${signer_service_unit}"
-    systemctl --user daemon-reload >/dev/null 2>&1 || true
-    systemd_units_installed=0
-  fi
-}
 cleanup() {
   status=$?
   trap - EXIT
@@ -539,9 +491,6 @@ cleanup() {
     sleep 1
     kill -9 "$relay_admin_pid" 2>/dev/null || true
     wait "$relay_admin_pid" 2>/dev/null || true
-  fi
-  if [ "$host_os" = Linux ]; then
-    stop_linux_authority_units
   fi
   for pid in "$machine_pid" "$broker_pid" "$signer_pid" "$session_pid"; do
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then kill "$pid" 2>/dev/null || true; fi
@@ -612,127 +561,18 @@ supervise_services() {
       tail -n 80 "${log_dir}/session.log" >&2 || true
       die "session exited while supervising triad services"
     fi
-    if [ "$host_os" = Linux ]; then
-      for label in signer broker; do
-        case "$label" in
-          signer) unit="$signer_service_unit" ;;
-          broker) unit="$broker_service_unit" ;;
-        esac
-        if ! systemctl --user is-active --quiet "$unit"; then
-          tail -n 80 "${log_dir}/${label}.log" >&2 || true
-          systemctl --user status "$unit" --no-pager >&2 || true
-          die "$label exited while supervising triad services"
-        fi
-      done
-    else
-      for label in signer broker; do
-        case "$label" in
-          signer) pid="$signer_pid" ;;
-          broker) pid="$broker_pid" ;;
-        esac
-        if ! kill -0 "$pid" 2>/dev/null; then
-          tail -n 80 "${log_dir}/${label}.log" >&2 || true
-          die "$label exited while supervising triad services"
-        fi
-      done
-    fi
+    for label in signer broker; do
+      case "$label" in
+        signer) pid="$signer_pid" ;;
+        broker) pid="$broker_pid" ;;
+      esac
+      if ! kill -0 "$pid" 2>/dev/null; then
+        tail -n 80 "${log_dir}/${label}.log" >&2 || true
+        die "$label exited while supervising triad services"
+      fi
+    done
     sleep 0.25
   done
-}
-
-# One socket unit per listener. systemd's FileDescriptorName= names every
-# fd a unit passes, so a unit with two ListenStream= lines hands the
-# Broker two fds under one name and the activation crate rejects the
-# duplicate. The Broker takes each family by its own name.
-write_linux_socket_unit() {
-  unit="$1"; description="$2"; path="$3"; descriptor="$4"; service="$5"
-  {
-    printf '%s\n' '[Unit]' "Description=$description" '' '[Socket]'
-    printf 'ListenStream=%s\n' "$path"
-    printf 'FileDescriptorName=%s\n' "$descriptor"
-    printf 'Service=%s\n' "$service"
-    printf '%s\n' 'SocketMode=0600' 'DirectoryMode=0700' 'RemoveOnStop=yes' 'Accept=no'
-  } > "${user_unit_dir}/${unit}"
-  chmod 0600 "${user_unit_dir}/${unit}"
-}
-
-start_linux_authority_services() {
-  # Mark ownership before the first write so the EXIT trap removes even a
-  # partially rendered unit set.
-  systemd_units_installed=1
-  write_linux_socket_unit "$broker_ceremony_v4_socket_unit" \
-    'Bloom developer Broker IPv4 ceremony listener' \
-    "127.0.0.1:${ceremony_port}" broker-ceremony-ipv4 "$broker_service_unit"
-  write_linux_socket_unit "$broker_ceremony_v6_socket_unit" \
-    'Bloom developer Broker IPv6 ceremony listener' \
-    "[::1]:${ceremony_port}" broker-ceremony-ipv6 "$broker_service_unit"
-
-  : > "${log_dir}/signer.log"
-  {
-    printf '%s\n' '[Unit]' 'Description=Bloom developer Signer' '' \
-      '[Service]' 'Type=simple' 'UMask=0077'
-    printf 'ExecStart=%s\n' "$signer_bin"
-    printf 'StandardOutput=append:%s\n' "${log_dir}/signer.log"
-    printf 'StandardError=append:%s\n' "${log_dir}/signer.log"
-    printf 'Environment=%s\n' \
-      "BLOOM_TRIAD_DEVELOPER_ROOT=$developer_root" \
-      "BLOOM_SIGNER_IDENTITY=${config_dir}/signer-identity.json" \
-      "BLOOM_EDGE_MANIFEST=${config_dir}/edge-manifest.json" \
-      "BLOOM_SIGNER_CONFIG=${config_dir}/signer.json" \
-      "BLOOM_SIGNER_AUDIT_CHECKPOINT_DIR=$signer_checkpoint_dir" \
-      "BLOOM_AUTHORITY_EDGE_HISTORY=$authority_edge_history" \
-      "BLOOM_SESSION_SOCKET=$session_socket" \
-      "BLOOM_SIGNER_SOCKET=$signer_socket" \
-      "BLOOM_SIGNER_CONTROL_SOCKET=$signer_control_socket"
-    if [ -n "$relay_ca" ]; then
-      # The Linux systemd unit does not inherit the launcher's environment.
-      # Signer needs this separate socket for dev-mode relay administration
-      # whenever relay pins are configured, with or without --hosted-relay.
-      printf 'Environment=%s\n' "BLOOM_SIGNER_ADMIN_SOCKET=$BLOOM_SIGNER_ADMIN_SOCKET"
-    fi
-  } > "${user_unit_dir}/${signer_service_unit}"
-  chmod 0600 "${user_unit_dir}/${signer_service_unit}"
-
-  : > "${log_dir}/broker.log"
-  {
-    printf '%s\n' '[Unit]' 'Description=Bloom developer Broker' \
-      "Requires=$broker_ceremony_v4_socket_unit $broker_ceremony_v6_socket_unit" \
-      "After=$signer_service_unit" '' \
-      '[Service]' 'Type=simple' 'UMask=0077'
-    printf 'ExecStart=%s\n' "$broker_bin"
-    printf 'StandardOutput=append:%s\n' "${log_dir}/broker.log"
-    printf 'StandardError=append:%s\n' "${log_dir}/broker.log"
-    printf 'Environment=%s\n' \
-      "BLOOM_TRIAD_DEVELOPER_ROOT=$developer_root" \
-      "BLOOM_BROKER_IDENTITY=${config_dir}/broker-identity.json" \
-      "BLOOM_EDGE_MANIFEST=${config_dir}/edge-manifest.json" \
-      "BLOOM_BROKER_CONFIG=${config_dir}/broker.json" \
-      "BLOOM_BROKER_AUDIT_CHECKPOINT_DIR=$broker_checkpoint_dir" \
-      "BLOOM_AUTHORITY_EDGE_HISTORY=$authority_edge_history" \
-      "BLOOM_SESSION_SOCKET=$session_socket" \
-      "BLOOM_BROKER_SOCKET=$broker_socket" \
-      "BLOOM_BROKER_CONTROL_SOCKET=$broker_control_socket" \
-      'BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV4=broker-ceremony-ipv4' \
-      'BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV6=broker-ceremony-ipv6'
-    printf 'Sockets=%s %s\n' "$broker_ceremony_v4_socket_unit" "$broker_ceremony_v6_socket_unit"
-  } > "${user_unit_dir}/${broker_service_unit}"
-  chmod 0600 "${user_unit_dir}/${broker_service_unit}"
-
-  systemctl --user daemon-reload
-  systemctl --user start "$broker_ceremony_v4_socket_unit" "$broker_ceremony_v6_socket_unit"
-  systemctl --user start "$signer_service_unit"
-  signer_pid="$(systemctl --user show "$signer_service_unit" -p MainPID --value)"
-  [ "$signer_pid" -gt 0 ] ||
-    die "Linux developer Signer did not publish a main process"
-  wait_for_socket "$signer_socket" "$signer_pid" signer
-
-  systemctl --user start "$broker_service_unit"
-  broker_pid="$(systemctl --user show "$broker_service_unit" -p MainPID --value)"
-  [ "$broker_pid" -gt 0 ] ||
-    die "Linux developer Broker did not publish a main process"
-  wait_for_socket "$broker_socket" "$broker_pid" broker
-  wait_for_socket "$broker_control_socket" "$broker_pid" broker
-  systemctl --user is-active --quiet "$signer_service_unit" "$broker_service_unit"
 }
 
 BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root" \
@@ -741,37 +581,56 @@ BLOOM_TRIAD_DEVELOPER_RUNTIME="$runtime_dir" \
 session_pid=$!
 wait_for_socket "$session_socket" "$session_pid" session
 
-if [ "$host_os" = Linux ]; then
-  start_linux_authority_services
-else
-  env -u BLOOM_OPERATOR_ACCEPT_CLOCK_UTC_MS \
-  -u BLOOM_OPERATOR_CONFIRM_EXPIRING_APPROVALS_DIGEST \
-  BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root" \
-  BLOOM_SIGNER_IDENTITY="${config_dir}/signer-identity.json" \
-  BLOOM_EDGE_MANIFEST="${config_dir}/edge-manifest.json" \
-  BLOOM_SIGNER_CONFIG="${config_dir}/signer.json" \
-  BLOOM_SIGNER_SOCKET="$signer_socket" \
-  BLOOM_SIGNER_CONTROL_SOCKET="$signer_control_socket" \
-  BLOOM_SIGNER_AUDIT_CHECKPOINT_DIR="$signer_checkpoint_dir" \
-  BLOOM_SESSION_SOCKET="$session_socket" \
-    "$signer_bin" >"${log_dir}/signer.log" 2>&1 &
-  signer_pid=$!
-  wait_for_socket "$signer_socket" "$signer_pid" signer
+env -u BLOOM_OPERATOR_ACCEPT_CLOCK_UTC_MS \
+-u BLOOM_OPERATOR_CONFIRM_EXPIRING_APPROVALS_DIGEST \
+BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root" \
+BLOOM_SIGNER_IDENTITY="${config_dir}/signer-identity.json" \
+BLOOM_EDGE_MANIFEST="${config_dir}/edge-manifest.json" \
+BLOOM_SIGNER_CONFIG="${config_dir}/signer.json" \
+BLOOM_SIGNER_SOCKET="$signer_socket" \
+BLOOM_SIGNER_CONTROL_SOCKET="$signer_control_socket" \
+BLOOM_SIGNER_AUDIT_CHECKPOINT_DIR="$signer_checkpoint_dir" \
+BLOOM_SESSION_SOCKET="$session_socket" \
+  "$signer_bin" >"${log_dir}/signer.log" 2>&1 &
+signer_pid=$!
+wait_for_socket "$signer_socket" "$signer_pid" signer
 
-  env -u BLOOM_OPERATOR_ACCEPT_CLOCK_UTC_MS \
-  -u BLOOM_OPERATOR_CONFIRM_EXPIRING_APPROVALS_DIGEST \
-  BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root" \
-  BLOOM_BROKER_IDENTITY="${config_dir}/broker-identity.json" \
-  BLOOM_EDGE_MANIFEST="${config_dir}/edge-manifest.json" \
-  BLOOM_BROKER_CONFIG="${config_dir}/broker.json" \
-  BLOOM_BROKER_SOCKET="$broker_socket" \
-  BLOOM_BROKER_CONTROL_SOCKET="$broker_control_socket" \
-  BLOOM_BROKER_AUDIT_CHECKPOINT_DIR="$broker_checkpoint_dir" \
-  BLOOM_SESSION_SOCKET="$session_socket" \
-    "$broker_bin" >"${log_dir}/broker.log" 2>&1 &
-  broker_pid=$!
-  wait_for_socket "$broker_socket" "$broker_pid" broker
+# The Linux Broker accepts its ceremony listeners only as named inherited
+# sockets, as in production. systemd-socket-activate binds them and execs
+# the Broker in place, with no systemd manager involved. It passes on only
+# the variables named with -E, so name every exported one. (The guarded
+# expansion keeps macOS bash 3.2 from rejecting an empty array.)
+broker_launch=()
+if [ "$host_os" = Linux ]; then
+  broker_launch=(systemd-socket-activate
+    -l "127.0.0.1:${ceremony_port}" -l "[::1]:${ceremony_port}"
+    --fdname=broker-ceremony-ipv4:broker-ceremony-ipv6)
+  while IFS= read -r name; do broker_launch+=(-E "$name"); done < <(compgen -e)
 fi
+${broker_launch[@]+"${broker_launch[@]}"} env -u BLOOM_OPERATOR_ACCEPT_CLOCK_UTC_MS \
+-u BLOOM_OPERATOR_CONFIRM_EXPIRING_APPROVALS_DIGEST \
+BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root" \
+BLOOM_BROKER_IDENTITY="${config_dir}/broker-identity.json" \
+BLOOM_EDGE_MANIFEST="${config_dir}/edge-manifest.json" \
+BLOOM_BROKER_CONFIG="${config_dir}/broker.json" \
+BLOOM_BROKER_SOCKET="$broker_socket" \
+BLOOM_BROKER_CONTROL_SOCKET="$broker_control_socket" \
+BLOOM_BROKER_AUDIT_CHECKPOINT_DIR="$broker_checkpoint_dir" \
+BLOOM_SESSION_SOCKET="$session_socket" \
+  "$broker_bin" >"${log_dir}/broker.log" 2>&1 &
+broker_pid=$!
+if [ "$host_os" = Linux ]; then
+  # Before systemd 258's --now, systemd-socket-activate starts the Broker on
+  # the first connection. Connect once both listeners are ours.
+  while kill -0 "$broker_pid" 2>/dev/null &&
+    ! grep -qF "Listening on [::1]:${ceremony_port}" "${log_dir}/broker.log"; do
+    sleep 0.1
+  done
+  if kill -0 "$broker_pid" 2>/dev/null; then
+    : 2>/dev/null <"/dev/tcp/127.0.0.1/${ceremony_port}" || true
+  fi
+fi
+wait_for_socket "$broker_socket" "$broker_pid" broker
 
 machine_config="${machine_home}/config.toml"
 if [ ! -e "$machine_config" ]; then
@@ -876,16 +735,9 @@ until machine_cli serve triad-health-check "$release_digest" >/dev/null 2>&1; do
   for service_pid in "$session_pid" "$machine_pid"; do
     kill -0 "$service_pid" 2>/dev/null || die "a Triad service exited before end-to-end readiness"
   done
-  if [ "$host_os" = Linux ]; then
-    for service_unit in "$signer_service_unit" "$broker_service_unit"; do
-      systemctl --user is-active --quiet "$service_unit" ||
-        die "an authority service exited before end-to-end readiness"
-    done
-  else
-    for service_pid in "$signer_pid" "$broker_pid"; do
-      kill -0 "$service_pid" 2>/dev/null || die "an authority service exited before end-to-end readiness"
-    done
-  fi
+  for service_pid in "$signer_pid" "$broker_pid"; do
+    kill -0 "$service_pid" 2>/dev/null || die "an authority service exited before end-to-end readiness"
+  done
   health_attempts=$((health_attempts + 1))
   [ "$health_attempts" -lt 30 ] || die "Triad did not pass authenticated end-to-end readiness"
   sleep 1
