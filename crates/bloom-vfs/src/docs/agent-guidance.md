@@ -10,6 +10,30 @@ walkthroughs (including contract deploys and local Anvil), `docs/wallets.md` cov
 passkeys and sessions, and `docs/petals.md` lists installed Petals. Read a
 Petal's `README.md` and `AGENTS.md` before using its routes.
 
+## Without a mount
+
+With no mounted filesystem, `bloom vfs cat|ls|write <path>` reaches the same
+paths (this file is `/AGENTS.md`). Put reads you need together in one shell
+command. Two commands run the transaction loop below for an outbox
+transaction:
+
+```sh
+bloom wallet stage <wallet> <chain> --intent '<body>'  # entry id, its plan and policy check
+bloom wallet confirm <wallet> <chain> <id>             # sends; prints the hash and receipt
+```
+
+Read the plan before you confirm. When confirm prints `Approval required`
+(exit 3), give the human the link and run the same confirm again: it waits
+for their approval, then sends. `<body>` is one of:
+
+```text
+send 0.25 ETH to 0x...
+{"kind":"send","to":"0x...","token":"USDC","amount":"10"}              human units
+{"kind":"approve","token":"0x...","spender":"0x...","amount":"1000000"}  raw units; "0" revokes
+{"kind":"raw","to":"0x...","data":"0x...","value":"0"}                  any contract call
+{"kind":"call","contract":"0x...","method":"transfer(address,uint256)","args":["0x...","1"]}
+```
+
 ## Funds and missing details
 
 `wallets/<wallet>/<n>/holdings.json` lists an account's non-zero native and

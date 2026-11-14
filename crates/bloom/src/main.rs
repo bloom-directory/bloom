@@ -3482,7 +3482,24 @@ fn print_approval_pending(url: &str, expires_at_ms: u128, petal_next: Option<&st
     println!("Approval required: open {url}");
     match petal_next {
         Some(next) => println!("Ceremony expires in {remaining}s. {next}"),
-        None => println!("Ceremony expires in {remaining}s; re-run this confirm after approving."),
+        None => println!(
+            "Ceremony expires in {remaining}s. Give the owner that link and re-run this confirm: it waits for the approval, then sends."
+        ),
+    }
+}
+
+/// Print the mined result when the node has already returned one, so the
+/// caller need not read `sent/<id>/receipt.json` separately.
+async fn print_receipt(
+    endpoint: &ResolvedEndpoint,
+    wallet: &str,
+    account: u32,
+    chain: &str,
+    id: &str,
+) {
+    let path = format!("/wallets/{wallet}/{account}/chains/{chain}/outbox/sent/{id}/receipt.json");
+    if let Ok(bytes) = ipc_read(endpoint, &path).await {
+        println!("Receipt: {}", String::from_utf8_lossy(&bytes).trim_end());
     }
 }
 
@@ -4220,6 +4237,20 @@ async fn run(cli: Cli) -> Result<()> {
                 .strip_prefix("pending/")
                 .context("ipc wallet stage: invalid latest target")?;
             println!("{id}");
+            // stdout stays the bare id for scripts. The review an agent would
+            // otherwise fetch with three more reads goes to stderr.
+            let entry = format!("/wallets/{wallet}/{account}/chains/{chain}/outbox/pending/{id}");
+            for file in ["plan.md", "policy_check.json"] {
+                if let Ok(bytes) = ipc_read(&client_endpoint, &format!("{entry}/{file}")).await {
+                    eprintln!("--- {file}\n{}", String::from_utf8_lossy(&bytes).trim_end());
+                }
+            }
+            let account_flag = if account == 0 {
+                String::new()
+            } else {
+                format!(" --account {account}")
+            };
+            eprintln!("--- next\nbloom wallet confirm {wallet} {chain} {id}{account_flag}");
             Ok(())
         }
         Cmd::Wallet(WalletCmd::Confirm {
@@ -4273,6 +4304,7 @@ async fn run(cli: Cli) -> Result<()> {
                 {
                     println!("Already broadcast: {tx_hash}");
                     println!("Entry: wallets/{wallet}/{account}/chains/{chain}/outbox/sent/{id}");
+                    print_receipt(&client_endpoint, &wallet, account, &chain, &id).await;
                     Ok(())
                 }
                 (Err((_, error)), Some(context)) => {
@@ -4308,6 +4340,7 @@ async fn run(cli: Cli) -> Result<()> {
                     );
                     println!("Broadcast: {tx_hash}");
                     println!("Entry: wallets/{wallet}/{account}/chains/{chain}/outbox/sent/{id}");
+                    print_receipt(&client_endpoint, &wallet, account, &chain, &id).await;
                     Ok(())
                 }
                 (Ok(_), None) => {

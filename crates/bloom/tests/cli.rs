@@ -2606,7 +2606,7 @@ fn wallet_confirm_reports_the_pending_ceremony_url() {
             "Approval required: open http://localhost:18734/c/secret",
         ))
         .stdout(predicate::str::contains(
-            "re-run this confirm after approving",
+            "re-run this confirm: it waits for the approval",
         ));
 
     stop_ipc_server(server, server_thread);
