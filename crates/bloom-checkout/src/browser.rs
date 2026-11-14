@@ -37,8 +37,8 @@ pub struct Browser {
     revoked: AtomicBool,
     unusable: AtomicBool,
     private_traveler_used: AtomicBool,
-    /// False once the person kept a sign-in without saying the account holds
-    /// no saved payment method. A merchant handler on any control may charge
+    /// False once the person kept a sign-in to an existing account, which may
+    /// hold a saved payment method. A merchant handler on any control may charge
     /// such a method; a session the person never signed into holds none.
     agent_may_act: AtomicBool,
     #[cfg(test)]
@@ -529,8 +529,8 @@ impl Browser {
     /// Closes every private page but keeps the context's cookies and storage,
     /// so the person stays signed in to the sites they used. Refused once saved
     /// traveler values were filled: a merchant may store and redisplay them.
-    /// `agent_may_act` is the person's word that no payment method is saved
-    /// on the accounts they used; otherwise the agent may only read.
+    /// `agent_may_act` is true after a new signup, which cannot hold a saved
+    /// payment method yet; otherwise the agent may only read.
     pub(crate) async fn return_control_signed_in(&self, agent_may_act: bool) -> Result<()> {
         if self.has_private_traveler_data() {
             bail!("Saved traveler details were used here; this session cannot be kept");

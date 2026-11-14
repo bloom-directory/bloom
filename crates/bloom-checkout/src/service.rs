@@ -201,7 +201,7 @@ impl Store {
     fn unresolved_except(&self, shop: &str, except: &str) -> Result<Option<String>> {
         let conn = self.0.lock();
         match conn.query_row(
-            "SELECT id FROM operations WHERE shop=?1 AND id!=?2 AND kind IN ('card','site','take_over') AND state IN \
+            "SELECT id FROM operations WHERE shop=?1 AND id!=?2 AND kind IN ('card','site') AND state IN \
              ('submitted','needs_input','uncertain','declined','disclosure_unknown','partially_filled','filled','release_started','restart_cancelling') \
              LIMIT 1",
             [shop, except],
@@ -343,8 +343,18 @@ struct CompletedView {
     status: Status,
 }
 
+/// What the take-over watcher has seen of a sign-in in the private view.
+#[derive(Default)]
+struct SignIn {
+    operation: String,
+    secret_seen: bool,
+    signup: bool,
+    quiet: u8,
+}
+
 pub struct CheckoutService {
     action_gate: AsyncMutex<()>,
+    sign_in: Mutex<SignIn>,
     saved: Mutex<Option<saved::SavedState>>,
     pub browser: Arc<Browser>,
     store: Store,
@@ -445,6 +455,7 @@ impl CheckoutService {
         let store = Store::open(state)?;
         Ok(Arc::new(Self {
             action_gate: AsyncMutex::new(()),
+            sign_in: Mutex::new(SignIn::default()),
             saved: Mutex::new(None),
             browser,
             store,
@@ -1078,13 +1089,9 @@ pub enum ViewAction {
     },
     /// `stay_signed_in` keeps a take-over's cookies for later shopping. Only
     /// the person chooses it; the agent then sees signed-in pages.
-    /// `agent_continues` also lets the agent click and type there: the
-    /// person's word that no payment method is saved on that account.
     Finish {
         #[serde(default)]
         stay_signed_in: bool,
-        #[serde(default)]
-        agent_continues: bool,
     },
 }
 
@@ -1268,6 +1275,80 @@ impl CheckoutService {
         }
     }
 
+    /// Closes the private view. A take-over keeps its sign-in when asked; the
+    /// agent may then act only if that sign-in created a new account, which
+    /// cannot hold a saved payment method yet.
+    async fn finish(&self, operation_id: &str, mode: Mode, stay_signed_in: bool) -> Result<()> {
+        if mode == Mode::TakeOver {
+            if stay_signed_in {
+                let signup = {
+                    let sign_in = self.sign_in.lock();
+                    sign_in.operation == operation_id && sign_in.signup
+                };
+                self.saved.lock().take();
+                self.browser.return_control_signed_in(signup).await?;
+            } else {
+                self.return_control().await?;
+            }
+            let current = self.store.get(operation_id)?.state;
+            self.set_state(
+                operation_id,
+                if current == "human_control" {
+                    "returned"
+                } else {
+                    closing_state(&current)
+                },
+            );
+        } else {
+            let current = self.store.get(operation_id)?.state;
+            self.set_state(operation_id, closing_state(&current));
+            self.return_control().await?;
+        }
+        let mut private = self.private.lock().await;
+        if let Some(checkout) = private
+            .as_ref()
+            .filter(|checkout| checkout.operation_id == operation_id)
+        {
+            self.retain_completed(checkout, self.store.get(operation_id)?);
+            *private = None;
+        }
+        Ok(())
+    }
+
+    /// True once the person has finished signing in: a password or code
+    /// field appeared, and then none showed on a loaded page for three seconds.
+    async fn sign_in_finished(&self, id: &str, tab: &PrivateTab, session: &str) -> bool {
+        let Some(page) = tokio::time::timeout(
+            Duration::from_secs(2),
+            tab.cdp.call(
+                Some(session),
+                "Runtime.evaluate",
+                json!({"expression":include_str!("sign-in.js"),"returnByValue":true}),
+            ),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok) else {
+            return false;
+        };
+        let page = &page["result"]["value"];
+        let mut sign_in = self.sign_in.lock();
+        if sign_in.operation != id {
+            *sign_in = SignIn {
+                operation: id.into(),
+                ..SignIn::default()
+            };
+        }
+        sign_in.signup |= page["signup"] == true;
+        if page["secret"] == true {
+            sign_in.secret_seen = true;
+            sign_in.quiet = 0;
+        } else if sign_in.secret_seen && page["ready"] == true {
+            sign_in.quiet += 1;
+        }
+        sign_in.quiet >= 6
+    }
+
     async fn watch_outcome(&self, id: String) {
         let started = tokio::time::Instant::now();
         let mut copied_contact = false;
@@ -1279,7 +1360,7 @@ impl CheckoutService {
             }
             // Outcome polling must not own the private-view lock while Chromium
             // is slow. Copy the stable browser handles, then do bounded calls.
-            let (mode, tab, submitted) = {
+            let (mode, tab, submitted, view_session) = {
                 let private = self.private.lock().await;
                 let Some(checkout) = private.as_ref().filter(|p| p.operation_id == id) else {
                     return;
@@ -1288,8 +1369,15 @@ impl CheckoutService {
                     checkout.mode,
                     checkout.tab.clone(),
                     checkout.submitted || checkout.manual_submission,
+                    checkout.view_session.clone(),
                 )
             };
+            if mode == Mode::TakeOver && self.sign_in_finished(&id, &tab, &view_session).await {
+                if self.finish(&id, mode, true).await.is_err() {
+                    self.mark_paused(&id);
+                }
+                return;
+            }
             let Ok(mut status) = self.store.get(&id) else {
                 return;
             };
@@ -1855,11 +1943,7 @@ impl CheckoutService {
                 checkout.view_target = target;
                 checkout.view_session = session;
             }
-            ViewAction::Finish {
-                stay_signed_in,
-                agent_continues,
-            } => {
-                let stay_signed_in = stay_signed_in || agent_continues;
+            ViewAction::Finish { stay_signed_in } => {
                 let (operation_id, mode) = {
                     let private = self.private.lock().await;
                     let checkout = private.as_ref().context("No active private checkout")?;
@@ -1869,37 +1953,7 @@ impl CheckoutService {
                 if stay_signed_in && mode != Mode::TakeOver {
                     bail!("Only a take-over can keep its sign-in");
                 }
-                if mode == Mode::TakeOver {
-                    if stay_signed_in {
-                        self.saved.lock().take();
-                        self.browser
-                            .return_control_signed_in(agent_continues)
-                            .await?;
-                    } else {
-                        self.return_control().await?;
-                    }
-                    let current = self.store.get(&operation_id)?.state;
-                    self.set_state(
-                        &operation_id,
-                        if current == "human_control" {
-                            "returned"
-                        } else {
-                            closing_state(&current)
-                        },
-                    );
-                } else {
-                    let current = self.store.get(&operation_id)?.state;
-                    self.set_state(&operation_id, closing_state(&current));
-                    self.return_control().await?;
-                }
-                let mut private = self.private.lock().await;
-                if let Some(checkout) = private
-                    .as_ref()
-                    .filter(|checkout| checkout.operation_id == operation_id)
-                {
-                    self.retain_completed(checkout, self.store.get(&operation_id)?);
-                    *private = None;
-                }
+                self.finish(&operation_id, mode, stay_signed_in).await?;
             }
         }
         Ok(())
@@ -2010,9 +2064,8 @@ fn browse_error(error: &anyhow::Error) -> Value {
     }})
 }
 
-const MERCHANT_APPROVAL: &str = "The person is signed in here and may have a saved payment method, so \
-     clicks and typing need them; request a take-over and ask them to choose \
-     \"No card saved, agent continues\" if this account has none";
+const MERCHANT_APPROVAL: &str = "The person signed in to an existing account here, which may hold a \
+     saved payment method, so clicks and typing need them; request a take-over";
 
 const BROWSE_ERRORS: &[&str] = &[
     MERCHANT_APPROVAL,
@@ -2383,7 +2436,6 @@ mod tests {
             parsed,
             ViewAction::Finish {
                 stay_signed_in: false,
-                agent_continues: false
             }
         ));
         let token = hex_token(&[46; 32]);
@@ -2427,7 +2479,6 @@ mod tests {
             assert_eq!(state["agent_description"], "Fixture");
             let stay = ViewAction::Finish {
                 stay_signed_in: true,
-                agent_continues: false,
             };
             if mode == Mode::Site {
                 assert!(service.private_action(&token, stay).await.is_err());
@@ -2436,7 +2487,6 @@ mod tests {
                         &token,
                         ViewAction::Finish {
                             stay_signed_in: false,
-                            agent_continues: false,
                         },
                     )
                     .await
@@ -2483,7 +2533,6 @@ mod tests {
                 &token,
                 ViewAction::Finish {
                     stay_signed_in: false,
-                    agent_continues: false,
                 },
             )
             .await;
@@ -2529,6 +2578,96 @@ mod tests {
         assert!(error.to_string().contains("private view"), "{error}");
         assert_eq!(service.store.get(&id).unwrap().state, "needs_input");
         server.abort();
+    }
+
+    #[test]
+    fn an_uncertain_take_over_does_not_block_the_shop_but_a_card_checkout_does() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(&root.path().join("state.db")).unwrap();
+        let shop = "https://shop.example";
+        for (id, kind) in [("take", "take_over"), ("card", "card")] {
+            let status = Status {
+                operation_id: id.into(),
+                state: "uncertain".into(),
+                ceremony_url: None,
+                filled_fields: vec![],
+                outcome: None,
+                paused: false,
+                reason: None,
+                view_url: None,
+            };
+            store.insert(&status, kind, "Fixture").unwrap();
+            store.record_order(id, Some(shop), None, None).unwrap();
+            let blocked = store.unresolved(shop).unwrap();
+            assert_eq!(blocked.as_deref(), (kind == "card").then_some(id), "{kind}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_finished_sign_in_closes_the_view_and_only_a_signup_lets_the_agent_act() {
+        let login = "<form><input name=email><input type=password></form>";
+        let signup =
+            "<form><input name=email><input type=password autocomplete=new-password></form>";
+        for (page, agent_may_act) in [(login, false), (signup, true)] {
+            let (service, browser, _, server) = shopping_service(page).await;
+            let tab = browser.handoff().await.unwrap();
+            let id = "f".repeat(64);
+            let mut status = Status {
+                operation_id: id.clone(),
+                state: "human_control".into(),
+                ceremony_url: None,
+                filled_fields: vec![],
+                outcome: None,
+                paused: false,
+                reason: None,
+                view_url: None,
+            };
+            service
+                .store
+                .insert(&status, "take_over", "Sign in")
+                .unwrap();
+            // Typing in the view records uncertainty, as a real take-over does.
+            status.state = "uncertain".into();
+            service.store.update(&status).unwrap();
+            let token = hex_token(&[61; 32]);
+            *service.private.lock().await = Some(PrivateCheckout {
+                operation_id: id.clone(),
+                mode: Mode::TakeOver,
+                view_target: tab.target.clone(),
+                view_session: tab.session.clone(),
+                seen_pages: std::collections::HashSet::from([tab.target.clone()]),
+                tab: tab.clone(),
+                discovery: None,
+                recipient: None,
+                capability: token.clone(),
+                session: Some(token.clone()),
+                approved: true,
+                manual_submission: true,
+                submitted: false,
+            });
+            let watcher = tokio::spawn({
+                let service = service.clone();
+                let id = id.clone();
+                async move { service.watch_outcome(id).await }
+            });
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            // The form stays open while the person types.
+            assert!(service.private.lock().await.is_some());
+            tab.cdp
+                .evaluate(
+                    &tab.session,
+                    "document.body.innerHTML='<h1>Dashboard</h1>'".into(),
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), watcher)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(service.private.lock().await.is_none(), "{page}");
+            assert_eq!(browser.agent_may_act(), agent_may_act, "{page}");
+            server.abort();
+        }
     }
 
     #[tokio::test]
@@ -3596,7 +3735,6 @@ mod tests {
                 &token,
                 ViewAction::Finish {
                     stay_signed_in: false,
-                    agent_continues: false,
                 },
             )
             .await
@@ -3987,7 +4125,6 @@ mod tests {
                 session_token,
                 ViewAction::Finish {
                     stay_signed_in: false,
-                    agent_continues: false,
                 },
             )
             .await
@@ -4106,7 +4243,6 @@ mod tests {
                 &token,
                 ViewAction::Finish {
                     stay_signed_in: false,
-                    agent_continues: false,
                 },
             )
             .await

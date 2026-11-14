@@ -182,7 +182,6 @@ async fn traveler_approval_keeps_private_session_and_never_exposes_review_url() 
                 &token,
                 ViewAction::Finish {
                     stay_signed_in: false,
-                    agent_continues: false,
                 }
             )
             .await
@@ -371,7 +370,6 @@ async fn approved_payment_submits_once_and_keeps_confirmation_private() {
             &token,
             ViewAction::Finish {
                 stay_signed_in: false,
-                agent_continues: false,
             },
         )
         .await
