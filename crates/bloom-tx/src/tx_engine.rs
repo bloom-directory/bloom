@@ -1674,11 +1674,10 @@ impl TxEngine {
                 let chain_nonce = chain.nonce(from).await?;
                 let pending_high = self
                     .outbox
-                    .highest_pending_nonce(wallet, &spec.name, from)?;
-                // If there are staged-but-unconfirmed txs, use the slot
-                // after the highest pending nonce. After broadcast they
-                // move to sent/ and the chain RPC returns the updated
-                // next nonce — no stale-data risk once the queue drains.
+                    .highest_reserved_nonce(wallet, &spec.name, from)?;
+                // Use the slot after the highest nonce still held by a
+                // pending or unmined sent entry: the RPC's pending count can
+                // lag a broadcast that just happened.
                 pending_high.map_or(chain_nonce, |h| chain_nonce.max(h + 1))
             }
         };
@@ -2964,7 +2963,7 @@ impl TxEngine {
     /// Refuse to broadcast a tx whose nonce is ahead of the account's next
     /// on-chain nonce with nothing filling the gap.
     ///
-    /// The auto-increment nonce default ([`Outbox::highest_pending_nonce`]) is
+    /// The auto-increment nonce default ([`Outbox::highest_reserved_nonce`]) is
     /// optimistic: a pending entry reserves its slot before it broadcasts, so a
     /// staged-but-never-broadcast (or later-abandoned) entry can push a
     /// subsequent tx one nonce past a gap that never fills. The RPC accepts such
@@ -3074,12 +3073,19 @@ impl TxEngine {
         staged: u64,
     ) -> Vec<(u64, String)> {
         let sender = bloom_proto::checksum_address(from);
-        let Ok(ids) = self.outbox.list(wallet, chain, OutboxState::Pending) else {
-            return Vec::new();
-        };
-        let mut holders: Vec<(u64, String)> = ids
-            .iter()
-            .filter_map(|id| self.outbox.read(wallet, chain, id).ok())
+        // An unmined sent entry holds its nonce too; if it was dropped, it is
+        // the one to replace or cancel.
+        let entries = [OutboxState::Pending, OutboxState::Sent]
+            .into_iter()
+            .flat_map(|state| {
+                self.outbox
+                    .list(wallet, chain, state)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(move |id| self.outbox.read_in_state(wallet, chain, &id, state).ok())
+            })
+            .filter(|entry| !entry.dir.join(crate::outbox::RECEIPT_FILE).exists());
+        let mut holders: Vec<(u64, String)> = entries
             .filter(|entry| {
                 entry.staged.from.eq_ignore_ascii_case(&sender)
                     && entry.staged.nonce >= chain_next
@@ -6692,6 +6698,41 @@ mod tests {
         );
     }
 
+    /// bloom#217: step one of a multi-step action has just broadcast and sits
+    /// in `sent/`, but the RPC's pending nonce (0 here) has not caught up.
+    /// Step two must take the next nonce, not the one already in flight.
+    #[tokio::test]
+    async fn staging_skips_the_nonce_of_an_unmined_sent_entry_when_the_rpc_lags() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let mut approve = fake_staged_1559("0017-approve");
+        approve.nonce = 0;
+        outbox.write_pending(&approve, "approve").unwrap();
+        let pending = outbox.read("alice", "anvil", &approve.id).unwrap();
+        outbox
+            .transition_with_status(&pending, TxStatus::Sent)
+            .unwrap();
+        let engine = TxEngine::new(outbox, 60_000);
+        let permit = permit_for(&directory);
+        let deposit = crate::intent_parser::parse(
+            r#"{"kind":"send","to":"0x0000000000000000000000000000000000000001","value":"1 wei"}"#,
+        )
+        .unwrap();
+        let staged = engine
+            .stage(
+                &permit,
+                "alice",
+                TEST_SIGNER_ADDRESS.parse().unwrap(),
+                deposit,
+                &stage_chain(&spawn_stage_rpc(false).await),
+                &Policy::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(staged.nonce, 1);
+    }
+
     #[tokio::test]
     async fn cancel_replacement_keeps_sent_original_available_for_reconciliation() {
         check_cancel_keeps_original(None, false).await;
@@ -6779,11 +6820,13 @@ mod tests {
         assert!(original.dir.join("cancel_tx_hash").exists());
         assert!(original.dir.join("cancel_intent.json").exists());
         assert_eq!(outbox.walk_all_sent().unwrap().len(), 1);
-        assert!(
+        // The original or its cancellation still holds the nonce until one
+        // is mined, so new staging must not reuse it.
+        assert_eq!(
             outbox
-                .highest_pending_nonce("alice", "anvil", TEST_SIGNER_ADDRESS.parse().unwrap())
-                .unwrap()
-                .is_none()
+                .highest_reserved_nonce("alice", "anvil", TEST_SIGNER_ADDRESS.parse().unwrap())
+                .unwrap(),
+            Some(staged.nonce)
         );
         let err = engine
             .replace_fees(
@@ -6859,7 +6902,7 @@ mod tests {
         assert_eq!(original.state, OutboxState::Pending);
         assert_eq!(
             outbox
-                .highest_pending_nonce("alice", "anvil", TEST_SIGNER_ADDRESS.parse().unwrap())
+                .highest_reserved_nonce("alice", "anvil", TEST_SIGNER_ADDRESS.parse().unwrap())
                 .unwrap(),
             Some(staged.nonce)
         );
@@ -6909,7 +6952,7 @@ mod tests {
         assert!(
             engine
                 .outbox
-                .highest_pending_nonce("alice", "anvil", TEST_SIGNER_ADDRESS.parse().unwrap())
+                .highest_reserved_nonce("alice", "anvil", TEST_SIGNER_ADDRESS.parse().unwrap())
                 .unwrap()
                 .is_none()
         );
