@@ -2758,9 +2758,15 @@ enum VfsCmd {
     },
     /// `stat /bloom/<path>` — inspect VFS metadata without a kernel mount.
     Stat { path: String },
-    /// Write data to a writable VFS path. Reads from stdin if `--data` is omitted.
+    /// Write data to a writable VFS path. Reads from stdin if no data is given.
+    ///
+    /// Writing an account's `outbox/new.tx` or a pending entry's `confirm`
+    /// prints what `wallet stage` and `wallet confirm` print.
     Write {
         path: String,
+        /// The data, as a second argument.
+        #[arg(conflicts_with = "data")]
+        body: Option<String>,
         #[arg(long)]
         data: Option<String>,
     },
@@ -3735,7 +3741,7 @@ async fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
-    match cli.cmd.context("a command is required")? {
+    match outbox_write_as_wallet_command(cli.cmd.context("a command is required")?)? {
         Cmd::Init { internal } => {
             if let Some(internal) = internal {
                 return match internal {
@@ -3925,8 +3931,8 @@ async fn run(cli: Cli) -> Result<()> {
             print_vfs_stat_json(&path, &res)?;
             Ok(())
         }
-        Cmd::Vfs(VfsCmd::Write { path, data }) => {
-            let body = match data {
+        Cmd::Vfs(VfsCmd::Write { path, body, data }) => {
+            let body = match data.or(body) {
                 Some(s) => s.into_bytes(),
                 None => {
                     let mut buf = Vec::new();
@@ -5202,6 +5208,67 @@ fn request_body_with_wallet(mut request: String, wallet: Option<&str>) -> String
     };
     request.insert_str(first_newline, &format!(" wallet={wallet}"));
     request
+}
+
+/// A `vfs write` to an account's `outbox/new.tx` or to a pending entry's
+/// `confirm` runs as `wallet stage` or `wallet confirm`. The plain write
+/// prints nothing, so a caller needed more commands to find the new entry,
+/// read its plan, find the approval link and read the receipt.
+fn outbox_write_as_wallet_command(cmd: Cmd) -> Result<Cmd> {
+    let Cmd::Vfs(VfsCmd::Write { path, body, data }) = &cmd else {
+        return Ok(cmd);
+    };
+    let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+    let (wallet, account, chain, pending) = match parts.as_slice() {
+        [
+            "wallets",
+            wallet,
+            account,
+            "chains",
+            chain,
+            "outbox",
+            "new.tx",
+        ] => (wallet, account, chain, None),
+        [
+            "wallets",
+            wallet,
+            account,
+            "chains",
+            chain,
+            "outbox",
+            "pending",
+            id,
+            "confirm",
+        ] => (wallet, account, chain, Some(id)),
+        _ => return Ok(cmd),
+    };
+    let Some(account) = account.parse().ok().filter(|n| *n <= 2_147_483_647u32) else {
+        return Ok(cmd);
+    };
+    let (wallet, chain) = (wallet.to_string(), chain.to_string());
+    let intent = data.clone().or_else(|| body.clone());
+    Ok(Cmd::Wallet(match pending {
+        None => WalletCmd::Stage {
+            wallet,
+            chain,
+            account,
+            intent,
+        },
+        Some(id) => WalletCmd::Confirm {
+            wallet,
+            chain,
+            id: id.to_string(),
+            account,
+            text: match intent {
+                Some(text) => text,
+                None => {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                    buf
+                }
+            },
+        },
+    }))
 }
 
 fn parse_batch_tx_ref(s: &str) -> Result<(String, String)> {

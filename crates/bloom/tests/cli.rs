@@ -1933,9 +1933,27 @@ fn wallet_stage_routes_via_ipc_when_home_write_lock_is_live() {
             "bloom wallet confirm alice anvil tx-2 --account 7",
         ));
 
+    // A write to the same path prints the same result, with the data given
+    // as a second argument.
+    bloom_cmd(home.path())
+        .args([
+            "vfs",
+            "write",
+            "wallets/alice/7/chains/anvil/outbox/new.tx",
+            intent,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::eq("tx-3\n"))
+        .stderr(predicate::str::contains(
+            "bloom wallet confirm alice anvil tx-3 --account 7",
+        ));
+
     stop_ipc_server(server, server_thread);
     let writes = wallets.writes();
-    assert_eq!(writes.len(), 2, "writes={writes:?}");
+    assert_eq!(writes.len(), 3, "writes={writes:?}");
+    assert_eq!(writes[2].0, "/alice/7/chains/anvil/outbox/new.tx");
+    assert_eq!(String::from_utf8_lossy(&writes[2].1), intent);
     assert_eq!(writes[1].0, "/alice/7/chains/anvil/outbox/new.tx");
     assert_eq!(writes[0].0, "/alice/0/chains/anvil/outbox/new.tx");
     assert_eq!(String::from_utf8_lossy(&writes[0].1), intent);
@@ -2617,6 +2635,21 @@ fn wallet_confirm_reports_the_pending_ceremony_url() {
             "Approval required: open http://localhost:18734/c/secret",
         ))
         .stdout(predicate::str::contains("re-run this confirm right away"));
+
+    // Writing the entry's confirm file reports the same link.
+    bloom_cmd(home.path())
+        .args([
+            "vfs",
+            "write",
+            "/wallets/alice/7/chains/base/outbox/pending/0001-cafe/confirm",
+            "--data",
+            "y",
+        ])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains(
+            "Approval required: open http://localhost:18734/c/secret",
+        ));
 
     stop_ipc_server(server, server_thread);
 }
