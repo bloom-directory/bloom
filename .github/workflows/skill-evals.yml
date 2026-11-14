@@ -5,6 +5,7 @@ on:
     paths: &skill_paths
       - ".github/workflows/skill-evals.yml"
       - "skills/**"
+      - "install/**"
       - "evals/skills/**"
   push:
     branches:

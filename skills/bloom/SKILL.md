@@ -1,8 +1,11 @@
 ---
 name: bloom
-description: "Bloom financial harness: balances, payments, trades, wallet. The programmable financial harness for AI agents. Use when the user mentions Bloom, asks to set it up, or asks to check balances or positions, send, receive, or pay (including paid APIs via x402 or MPP), swap, trade, lend, or use prediction markets, or to work with wallets, addresses, stablecoins, or other digital assets on EVM chains or Solana. Use it instead of writing SDK code or asking for keys. Transactions need the user's passkey or a Sealed Approval they signed."
+description: "Bloom financial harness: balances, payments, trades, wallet. The programmable financial harness for AI agents. Use when the user mentions Bloom, asks to set it up, or asks to check balances or positions, send, receive, or pay money or crypto (including paid APIs via x402 or MPP), swap, trade, lend, or use prediction markets, or to work with wallets, addresses, stablecoins, or other digital assets on EVM chains or Solana. Use it instead of writing SDK code or asking for keys. Transactions need the user's passkey or a Sealed Approval they signed."
+homepage: https://bloom.directory
+license: MIT
+allowed-tools: Bash(bloom vfs ls:*) Bash(bloom vfs cat:*) Read
 metadata:
-  version: "0.5.1"
+  version: 0.5.1
 ---
 
 # Bloom
@@ -30,18 +33,21 @@ saying Bloom cannot do something.
 The CLI goes first because it fails fast; a read from a stale mount can hang.
 If the user gave a mount path, read from that path instead.
 
-- It works: follow the printed `AGENTS.md`. It is the contract for the
-  installed version and overrides this skill. Without a mount, use
+- It works: follow the printed `/AGENTS.md`. It is the contract for the
+  installed version; where its operating steps differ from this skill, use
+  its steps. The rules below always apply. Without a mount, use
   `bloom vfs ls|cat`.
-- It fails: report the error. If the user asked to install Bloom, read
-  [references/install.md](references/install.md) (beside this file, or beside
-  its URL) in full first. Otherwise do not install, restart, or launch another
+- It fails: report the error. If the user asked to install Bloom, read the
+  install guide at <https://bloom.directory/references/install.md> in full first;
+  installing needs the user's administrator approval in their operating
+  system's own dialog. Otherwise do not install, restart, or launch another
   Bloom; a remote or sandboxed agent uses its existing connection.
 
 ## Rules
 
-- Do what the user asked without asking them to confirm it again. Their
-  passkey approval, or a valid Sealed Approval, is the authorization.
+- The user approves each transaction with their passkey in Bloom's browser
+  ceremony, or with a Sealed Approval they signed. That approval is the
+  confirmation for a request they made; one request is enough.
 - Installing Bloom or this skill does not authorize creating a wallet, adding
   a passkey, recovery, or transactions. Do those only when asked.
 - Never request or handle private keys, seed phrases, passwords, or passkey

@@ -9,10 +9,10 @@ const DIRECT_PIPE_COMMAND = 'curl -fsSL https://bloom.directory/setup.sh | sh';
 const REVIEW_FETCH_COMMAND = 'curl -fsSL "$setup_url" -o "$review_dir/setup.sh"';
 const REVIEW_INSPECT_COMMAND = 'cat "$review_dir/setup.sh"';
 const REVIEW_RUN_COMMAND = 'sh "$review_dir/setup.sh"';
-// The handoff commands come from the skill's install reference, so the grader
-// and the skill cannot drift apart.
+// The handoff commands come from the install guide, so the grader and the
+// guide cannot drift apart.
 const INSTALL_REFERENCE = require('node:fs').readFileSync(
-  require('node:path').resolve(__dirname, '../../../skills/bloom/references/install.md'),
+  require('node:path').resolve(__dirname, '../../../install/install.md'),
   'utf8',
 );
 const SUDO_HANDOFF_COMMAND = INSTALL_REFERENCE.match(/^sudo \/bin\/sh -c [^\n]+$/m)[0];
