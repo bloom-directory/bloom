@@ -52,6 +52,12 @@ fn mount_probe_path(path: &Path) -> Result<PathBuf, MountError> {
             path.display()
         )));
     };
+    // A bare name like `bloom` has an empty parent; it means the current directory.
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
     let parent = std::fs::canonicalize(parent).map_err(|_| {
         MountError::Config(format!("mount path does not exist: {}", path.display()))
     })?;
@@ -887,6 +893,14 @@ mod tests {
             mount_probe_path(&orphan),
             Err(MountError::Config(msg)) if msg.contains("does not exist")
         ));
+        assert_eq!(
+            mount_probe_path(Path::new("bloom")).unwrap(),
+            std::env::current_dir()
+                .unwrap()
+                .canonicalize()
+                .unwrap()
+                .join("bloom")
+        );
     }
 
     /// Aborting the server task as part of `unmount` should cause the
