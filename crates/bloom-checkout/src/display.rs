@@ -242,7 +242,7 @@ mod tests {
         // A headed browser quits when its last window closes; both handbacks
         // close every private page and must leave a usable browser.
         drop(tab);
-        browser.return_control_signed_in().await.unwrap();
+        browser.return_control_signed_in(false).await.unwrap();
         browser.handoff().await.unwrap();
         browser.return_control().await.unwrap();
         assert!(!browser.needs_restart());

@@ -562,10 +562,12 @@ impl CheckoutService {
                     BrowseRequest::Click { .. }
                         | BrowseRequest::Type { .. }
                         | BrowseRequest::Select { .. }
-                ) {
-                    // Any merchant event handler can place an order, even on
-                    // a field or a control labelled "Continue". Only the
-                    // approved private flow may dispatch these effects.
+                ) && !self.browser.agent_may_act()
+                {
+                    // Any merchant event handler can charge a payment method
+                    // saved on a signed-in account, even from a control
+                    // labelled "Continue". Pay buttons and card and password
+                    // fields are refused in every session.
                     bail!(MERCHANT_APPROVAL);
                 }
                 self.browser.browse(request).await
@@ -1076,9 +1078,13 @@ pub enum ViewAction {
     },
     /// `stay_signed_in` keeps a take-over's cookies for later shopping. Only
     /// the person chooses it; the agent then sees signed-in pages.
+    /// `agent_continues` also lets the agent click and type there: the
+    /// person's word that no payment method is saved on that account.
     Finish {
         #[serde(default)]
         stay_signed_in: bool,
+        #[serde(default)]
+        agent_continues: bool,
     },
 }
 
@@ -1849,7 +1855,11 @@ impl CheckoutService {
                 checkout.view_target = target;
                 checkout.view_session = session;
             }
-            ViewAction::Finish { stay_signed_in } => {
+            ViewAction::Finish {
+                stay_signed_in,
+                agent_continues,
+            } => {
+                let stay_signed_in = stay_signed_in || agent_continues;
                 let (operation_id, mode) = {
                     let private = self.private.lock().await;
                     let checkout = private.as_ref().context("No active private checkout")?;
@@ -1862,7 +1872,9 @@ impl CheckoutService {
                 if mode == Mode::TakeOver {
                     if stay_signed_in {
                         self.saved.lock().take();
-                        self.browser.return_control_signed_in().await?;
+                        self.browser
+                            .return_control_signed_in(agent_continues)
+                            .await?;
                     } else {
                         self.return_control().await?;
                     }
@@ -1998,8 +2010,9 @@ fn browse_error(error: &anyhow::Error) -> Value {
     }})
 }
 
-const MERCHANT_APPROVAL: &str =
-    "Merchant interaction requires approval; request a private take-over";
+const MERCHANT_APPROVAL: &str = "The person is signed in here and may have a saved payment method, so \
+     clicks and typing need them; request a take-over and ask them to choose \
+     \"No card saved, agent continues\" if this account has none";
 
 const BROWSE_ERRORS: &[&str] = &[
     MERCHANT_APPROVAL,
@@ -2284,14 +2297,26 @@ mod tests {
         (service, browser, url, server)
     }
 
-    #[tokio::test]
-    async fn public_merchant_events_require_approval_regardless_of_labels() {
-        let (service, browser, _, server) = shopping_service(
-            "<body><form onsubmit=\"document.title='charged';return false\"><button>Continue</button></form><button type='button' onclick=\"document.title='charged'\">Proceed</button><input oninput=\"document.title='charged'\"><select onchange=\"document.title='charged'\"><option value='a'>A</option><option value='b'>B</option></select></body>"
-        ).await;
+    /// Every control here "charges" through a merchant handler, as a shop
+    /// with a saved payment method could.
+    async fn act_on_every_control(
+        service: &Arc<CheckoutService>,
+        browser: &Browser,
+        url: &str,
+    ) -> Vec<Result<Value>> {
+        browser
+            .browse(BrowseRequest::Open { url: url.into() })
+            .await
+            .unwrap();
+        wait_for_shopping_page(browser, url).await;
         let page = browser.browse(BrowseRequest::Snapshot).await.unwrap();
-        assert!(page["elements"].as_array().unwrap().len() >= 4, "{page}");
-        for element in page["elements"].as_array().unwrap() {
+        let count = page["elements"].as_array().unwrap().len();
+        assert!(count >= 4, "{page}");
+        let mut results = vec![];
+        for index in 0..count {
+            // Refs expire after every action.
+            let page = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+            let element = &page["elements"][index];
             let element_ref = element["ref"].as_str().unwrap().to_owned();
             let request = match element["role"].as_str().unwrap_or("") {
                 "input" => BrowseRequest::Type {
@@ -2304,12 +2329,38 @@ mod tests {
                 },
                 _ => BrowseRequest::Click { element_ref },
             };
-            let error = service
-                .request(Request::Browse { request })
-                .await
-                .unwrap_err();
+            results.push(service.request(Request::Browse { request }).await);
+        }
+        results
+    }
+
+    fn assert_all_acted(results: Vec<Result<Value>>) {
+        for result in results {
+            assert_eq!(
+                result.map_err(|e| format!("{e:#}")).unwrap()["state"],
+                "acted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_acts_unless_the_person_kept_a_sign_in_that_may_hold_a_saved_method() {
+        let (service, browser, url, server) = shopping_service(
+            "<body><form onsubmit=\"document.title='charged';return false\"><button>Continue</button></form><button type='button' onclick=\"document.title='charged'\">Proceed</button><input oninput=\"document.title='charged'\"><select onchange=\"document.title='charged'\"><option value='a'>A</option><option value='b'>B</option></select></body>"
+        ).await;
+        // No one has signed in to this session, so nothing saved can be charged.
+        assert_all_acted(act_on_every_control(&service, &browser, &url).await);
+        // The person says the account they kept holds no saved method.
+        browser.return_control_signed_in(true).await.unwrap();
+        assert_all_acted(act_on_every_control(&service, &browser, &url).await);
+        // A kept sign-in without that answer leaves the agent read-only.
+        browser.return_control_signed_in(false).await.unwrap();
+        for result in act_on_every_control(&service, &browser, &url).await {
             // The agent must see the refusal itself, not the generic failure.
-            assert_eq!(browse_error(&error)["error"], MERCHANT_APPROVAL);
+            assert_eq!(
+                browse_error(&result.unwrap_err())["error"],
+                MERCHANT_APPROVAL
+            );
         }
         let tab = browser.handoff().await.unwrap();
         let title = tab
@@ -2318,6 +2369,9 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(title, "charged");
+        // Signing out discards the sign-in, and with it the restriction.
+        browser.return_control().await.unwrap();
+        assert_all_acted(act_on_every_control(&service, &browser, &url).await);
         server.abort();
     }
 
@@ -2328,7 +2382,8 @@ mod tests {
         assert!(matches!(
             parsed,
             ViewAction::Finish {
-                stay_signed_in: false
+                stay_signed_in: false,
+                agent_continues: false
             }
         ));
         let token = hex_token(&[46; 32]);
@@ -2372,6 +2427,7 @@ mod tests {
             assert_eq!(state["agent_description"], "Fixture");
             let stay = ViewAction::Finish {
                 stay_signed_in: true,
+                agent_continues: false,
             };
             if mode == Mode::Site {
                 assert!(service.private_action(&token, stay).await.is_err());
@@ -2380,6 +2436,7 @@ mod tests {
                         &token,
                         ViewAction::Finish {
                             stay_signed_in: false,
+                            agent_continues: false,
                         },
                     )
                     .await
@@ -2426,6 +2483,7 @@ mod tests {
                 &token,
                 ViewAction::Finish {
                     stay_signed_in: false,
+                    agent_continues: false,
                 },
             )
             .await;
@@ -3538,6 +3596,7 @@ mod tests {
                 &token,
                 ViewAction::Finish {
                     stay_signed_in: false,
+                    agent_continues: false,
                 },
             )
             .await
@@ -3928,6 +3987,7 @@ mod tests {
                 session_token,
                 ViewAction::Finish {
                     stay_signed_in: false,
+                    agent_continues: false,
                 },
             )
             .await
@@ -4046,6 +4106,7 @@ mod tests {
                 &token,
                 ViewAction::Finish {
                     stay_signed_in: false,
+                    agent_continues: false,
                 },
             )
             .await

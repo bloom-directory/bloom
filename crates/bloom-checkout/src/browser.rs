@@ -37,6 +37,10 @@ pub struct Browser {
     revoked: AtomicBool,
     unusable: AtomicBool,
     private_traveler_used: AtomicBool,
+    /// False once the person kept a sign-in without saying the account holds
+    /// no saved payment method. A merchant handler on any control may charge
+    /// such a method; a session the person never signed into holds none.
+    agent_may_act: AtomicBool,
     #[cfg(test)]
     fixture_payment_hosts: bool,
 }
@@ -59,6 +63,10 @@ impl Browser {
 
     pub(crate) fn has_private_traveler_data(&self) -> bool {
         self.private_traveler_used.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn agent_may_act(&self) -> bool {
+        self.agent_may_act.load(Ordering::SeqCst)
     }
 
     pub fn needs_restart(&self) -> bool {
@@ -142,6 +150,7 @@ impl Browser {
             revoked: AtomicBool::new(false),
             unusable: AtomicBool::new(false),
             private_traveler_used: AtomicBool::new(false),
+            agent_may_act: AtomicBool::new(true),
         }))
     }
 
@@ -520,10 +529,14 @@ impl Browser {
     /// Closes every private page but keeps the context's cookies and storage,
     /// so the person stays signed in to the sites they used. Refused once saved
     /// traveler values were filled: a merchant may store and redisplay them.
-    pub(crate) async fn return_control_signed_in(&self) -> Result<()> {
+    /// `agent_may_act` is the person's word that no payment method is saved
+    /// on the accounts they used; otherwise the agent may only read.
+    pub(crate) async fn return_control_signed_in(&self, agent_may_act: bool) -> Result<()> {
         if self.has_private_traveler_data() {
             bail!("Saved traveler details were used here; this session cannot be kept");
         }
+        // Set before shopping resumes, so no action runs under the old answer.
+        self.agent_may_act.store(agent_may_act, Ordering::SeqCst);
         self.reset_shopping(true).await.inspect_err(|_| {
             self.unusable.store(true, Ordering::SeqCst);
         })
@@ -597,6 +610,10 @@ impl Browser {
         tab.journey = journey;
         // The pages that held saved traveler values are gone.
         self.private_traveler_used.store(false, Ordering::SeqCst);
+        // A new context holds no sign-in, so nothing saved can be charged.
+        if !keep_session {
+            self.agent_may_act.store(true, Ordering::SeqCst);
+        }
         self.revoked.store(false, Ordering::SeqCst);
         Ok(())
     }
@@ -1950,7 +1967,7 @@ mod tests {
         assert!(visit().await.contains("stored:|"));
         // The person may keep the session: pages close, cookies and storage stay.
         browser.handoff().await.unwrap();
-        browser.return_control_signed_in().await.unwrap();
+        browser.return_control_signed_in(false).await.unwrap();
         let pages = browser
             .cdp
             .call(None, "Target.getTargets", json!({}))
@@ -1971,7 +1988,7 @@ mod tests {
         // Never after saved traveler values were filled into the merchant's pages.
         browser.handoff().await.unwrap();
         browser.remember_private_traveler_use();
-        assert!(browser.return_control_signed_in().await.is_err());
+        assert!(browser.return_control_signed_in(false).await.is_err());
         assert!(!browser.needs_restart());
         browser.return_control().await.unwrap();
         assert!(visit().await.contains("stored:|"));

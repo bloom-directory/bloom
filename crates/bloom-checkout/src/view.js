@@ -79,6 +79,7 @@ document.getElementById('typing').addEventListener('submit', event => {
 document.querySelectorAll('[data-key]').forEach(button=>button.addEventListener('click',()=>act({action:'key',key:button.dataset.key})));
 document.getElementById('finish').addEventListener('click',()=>act({action:'finish'}));
 document.getElementById('stay-signed-in').addEventListener('click',()=>act({action:'finish',stay_signed_in:true}));
+document.getElementById('agent-continues').addEventListener('click',()=>act({action:'finish',stay_signed_in:true,agent_continues:true}));
 async function savedOptions() {
   const response = await privateFetch('/saved');
   if (!response.ok) return;
@@ -174,7 +175,7 @@ async function refresh() {
     }
     const state=await response.json();status.textContent=describe(state);
     document.getElementById('saved-tools').hidden = !state.can_use_saved || !hasSaved;
-    for (const id of ['stay-signed-in', 'stay-note']) document.getElementById(id).hidden = !state.can_stay_signed_in;
+    for (const id of ['agent-continues', 'stay-signed-in', 'stay-note']) document.getElementById(id).hidden = !state.can_stay_signed_in;
     document.getElementById('finish').classList.toggle('primary', !state.can_stay_signed_in);
     document.getElementById('task').hidden = !state.agent_description;
     document.getElementById('task-text').textContent = state.agent_description || '';
