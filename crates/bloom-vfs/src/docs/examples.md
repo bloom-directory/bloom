@@ -81,10 +81,11 @@ Numbered outboxes expose only actions staged by that account.
 ## Intent shapes
 
 `outbox/new.tx` and `simulate/new` take one JSON object with its fields at the
-top level, plus an optional `chain`:
+top level, plus an optional `chain`. `outbox/new.tx` also takes the one-line
+form:
 
 ```text
-send 0.25 ETH to 0x...                                  native send, one line
+send 0.25 ETH to 0x...                                  native send, one line; outbox/new.tx only
 {"kind":"send","to":"0x...","value":"0.25 eth"}           native send
 {"kind":"send","to":"0x...","token":"USDC","amount":"10"} token send, human units
 {"kind":"approve","token":"0x...","spender":"0x...","amount":"1000000"}
