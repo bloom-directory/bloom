@@ -1428,7 +1428,7 @@ impl IpcServer {
                     format!("{url} (also in {challenge_file})")
                 };
                 return Err(WriteError::Approval(format!(
-                    "permission denied: owner approval required. Give the human the ceremony link {link}, then write confirm to {} again; it waits for the approval and sends.",
+                    "permission denied: owner approval required. Show the human the ceremony link {link}, then write confirm to {} again right away, without waiting for their reply; it waits for the approval and sends.",
                     path.to_string_path()
                 )));
             }
@@ -2818,7 +2818,7 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         assert_eq!(error.code, -32007);
         for needle in [
-            "give the human the ceremony link http://localhost:28735/c/abc",
+            "show the human the ceremony link http://localhost:28735/c/abc",
             "/wallets/w/0/chains/base/outbox/pending/tx-1/approval_challenge.json",
             "write confirm to /wallets/w/0/chains/base/outbox/pending/tx-1/confirm again",
         ] {

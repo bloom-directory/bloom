@@ -936,9 +936,11 @@ mod tests {
             text.contains("cat docs/README.md"),
             "guidance should use mounted filesystem examples"
         );
+        // The published skill reads this file through `bloom vfs cat` before
+        // any mount, so the guide also names the CLI path for a transaction.
         assert!(
-            !text.contains("bloom vfs"),
-            "guidance should not mention the bloom vfs CLI"
+            text.contains("bloom wallet stage") && text.contains("bloom wallet confirm"),
+            "guidance should name the two-command transaction path"
         );
         // Documentation assertion (plan:
         // docs/plans/2026-07-21-async-vfs-passkey-registration.md): agent

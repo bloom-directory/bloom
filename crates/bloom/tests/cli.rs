@@ -1050,8 +1050,8 @@ fn vfs_cat_root_agent_guidance_returns_identical_content() {
         "guidance should use mounted filesystem examples"
     );
     assert!(
-        !text.contains("bloom vfs"),
-        "guidance should not mention the bloom vfs CLI"
+        text.contains("bloom wallet stage") && text.contains("bloom wallet confirm"),
+        "guidance should name the two-command transaction path"
     );
 }
 
@@ -2605,9 +2605,7 @@ fn wallet_confirm_reports_the_pending_ceremony_url() {
         .stdout(predicate::str::contains(
             "Approval required: open http://localhost:18734/c/secret",
         ))
-        .stdout(predicate::str::contains(
-            "re-run this confirm: it waits for the approval",
-        ));
+        .stdout(predicate::str::contains("re-run this confirm right away"));
 
     stop_ipc_server(server, server_thread);
 }

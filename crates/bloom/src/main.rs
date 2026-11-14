@@ -3483,7 +3483,7 @@ fn print_approval_pending(url: &str, expires_at_ms: u128, petal_next: Option<&st
     match petal_next {
         Some(next) => println!("Ceremony expires in {remaining}s. {next}"),
         None => println!(
-            "Ceremony expires in {remaining}s. Give the owner that link and re-run this confirm: it waits for the approval, then sends."
+            "Ceremony expires in {remaining}s. Show the owner that link, then re-run this confirm right away, without waiting for their reply: it waits for the approval, then sends."
         ),
     }
 }

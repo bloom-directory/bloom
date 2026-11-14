@@ -23,8 +23,9 @@ bloom wallet confirm <wallet> <chain> <id>             # sends; prints the hash 
 ```
 
 Read the plan before you confirm. When confirm prints `Approval required`
-(exit 3), give the human the link and run the same confirm again: it waits
-for their approval, then sends. `<body>` is one of:
+(exit 3), show the human the link in a message and run the same confirm
+again in the same turn: it waits for their approval, then sends. Do not end
+your turn to wait for them. `<body>` is one of:
 
 ```text
 send 0.25 ETH to 0x...
@@ -94,9 +95,10 @@ For outbox transactions:
 3. If the human asked only to prepare it, stop and report the entry.
    Otherwise write `confirm` to that entry's `confirm` file.
 4. If confirm fails:
-   - **Permission denied**: the owner must approve. Give the human the
-     ceremony link from the error, then write `confirm` again: it waits for
-     their approval and sends. Repeat if it times out. On a mount it does not
+   - **Permission denied**: the owner must approve. Show the human the
+     ceremony link from the error in a message, then write `confirm` again
+     in the same turn: it waits for their approval and sends. Do not end
+     your turn to wait for them; repeat if it times out. On a mount it does not
      wait: read `approval_challenge.json`, check its wallet, action, intent
      and expiry, and follow its `next`. For `expired`, `cancelled` or
      `refused`, tell the human.
