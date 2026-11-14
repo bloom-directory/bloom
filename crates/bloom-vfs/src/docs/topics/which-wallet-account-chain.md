@@ -26,4 +26,4 @@ same account.
 
 Writing a petname to `wallets/new` requests asynchronous passkey registration;
 it does not create a local wallet. Follow
-`wallets/registrations/<petname>/status.json`. Details are in `wallets.md`.
+`wallets/registrations/<petname>/status.json`. Details are in `wallets/creating-a-wallet.md`.

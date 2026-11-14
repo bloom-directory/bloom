@@ -56,7 +56,7 @@ forward `ceremony_url` to the human. Wait for `ceremony_state: COMPLETED`,
 then read `result.json` and the new wallet projection. Cancel through the
 registration's `cancel` control before acceptance. Do not start a second
 registration because the first is waiting. Commands are in
-`docs/examples.md`.
+`docs/examples/creating-a-wallet.md`.
 
 A localhost ceremony needs a browser on the Bloom host; an assigned HTTPS relay
 ceremony can use another device.

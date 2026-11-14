@@ -8,8 +8,8 @@ relative to this file's directory. Without a mount,
 - `next.md`: what is pending.
 - `wallets/<wallet>/<n>/holdings.json`: balances of account `<n>`; the first
   is `0`.
-- `docs/`: one short file per topic. The filenames are the index, and
-  `cat docs/README.md` lists every route.
+- `docs/`: one short file per topic; the filenames are the index
+  (`cat docs/README.md` is the full route table).
 
 Send, approve or call a contract:
 

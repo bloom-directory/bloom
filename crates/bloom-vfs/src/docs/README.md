@@ -1,7 +1,7 @@
 # Bloom virtual filesystem
 
 Route reference. Rules are in the mount's `AGENTS.md`; procedures are in
-[examples.md](./examples.md) and [wallets.md](./wallets.md).
+`examples/` and `wallets/` (one file per topic).
 
 ## Top-level routes
 
@@ -55,11 +55,11 @@ for example `petals/enso/intents/<wallet>/<n>/new`.
 
 | Operation | Route / procedure |
 |---|---|
-| Register wallet | `wallets/new`; [wallet creation](./examples.md#creating-a-wallet), [wallets.md](./wallets.md) |
-| Recover wallet | `wallets/recover`; [recovery](./examples.md#recovering-a-wallet) |
-| EVM transaction | `wallets/<wallet>/0/chains/<chain>/outbox/new.tx`; [Anvil workflow](./examples.md#local-anvil-transaction) |
-| Solana transaction | Same outbox shape with strict JSON; [Solana workflow](./examples.md#solana-account-aware-reads-and-transfer) |
-| Update policy | `wallets/<wallet>/policy.json`; [policy workflow](./examples.md#updating-wallet-policy) |
+| Register wallet | `wallets/new`; [wallet creation](./examples/creating-a-wallet.md), `wallets/` |
+| Recover wallet | `wallets/recover`; [recovery](./examples/recovering-a-wallet.md) |
+| EVM transaction | `wallets/<wallet>/0/chains/<chain>/outbox/new.tx`; [Anvil workflow](./examples/local-anvil-transaction.md) |
+| Solana transaction | Same outbox shape with strict JSON; [Solana workflow](./examples/solana-account-aware-reads-and-transfer.md) |
+| Update policy | `wallets/<wallet>/policy.json`; [policy workflow](./examples/updating-wallet-policy.md) |
 | Reusable authority | `wallets/<wallet>/sealed-approvals/` |
-| Petal operation | Package-defined `<wallet>/<index>` routes; [installed package workflow](./examples.md#installed-petal-workflow) |
+| Petal operation | Package-defined `<wallet>/<index>` routes; [installed package workflow](./examples/installed-petal-workflow.md) |
 | Paid HTTP | `requests/`; inspect plan, wallet, payment protocol, cap, approval, and receipt |

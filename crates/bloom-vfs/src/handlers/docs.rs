@@ -54,11 +54,42 @@ fn topic(name: &str) -> Option<&'static str> {
         .map(|(_, text)| *text)
 }
 
+/// A long doc is served as a directory with one file per `## ` section,
+/// named after its heading, so a reader takes only the part it needs.
+/// `intro` keeps the text before the first section in every file; the
+/// examples define `$BLOOM` there.
+fn sections(source: &str, intro: bool) -> Vec<(String, String)> {
+    let mut parts = source.split("\n## ");
+    let preamble = parts.next().unwrap_or_default();
+    let preamble = preamble
+        .split_once('\n')
+        .map_or("", |(_, rest)| rest.trim());
+    parts
+        .map(|part| {
+            let (title, body) = part.split_once('\n').unwrap_or((part, ""));
+            let slug = title
+                .to_ascii_lowercase()
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .filter(|word| !word.is_empty())
+                .collect::<Vec<_>>()
+                .join("-");
+            let text = if intro {
+                format!("# {title}\n\n{preamble}\n\n{}\n", body.trim())
+            } else {
+                format!("# {title}\n\n{}\n", body.trim())
+            };
+            (format!("{slug}.md"), text)
+        })
+        .collect()
+}
+
+type Sections = Arc<Vec<(String, String)>>;
+
 #[derive(Clone)]
 pub struct DocsHandler {
     readme: String,
-    examples: String,
-    wallets: String,
+    examples: Sections,
+    wallets: Sections,
     petals: Arc<dyn Fn() -> Vec<u8> + Send + Sync>,
 }
 
@@ -66,8 +97,8 @@ impl Default for DocsHandler {
     fn default() -> Self {
         Self {
             readme: include_str!("../docs/README.md").to_string(),
-            examples: include_str!("../docs/examples.md").to_string(),
-            wallets: include_str!("../docs/wallets.md").to_string(),
+            examples: Arc::new(sections(include_str!("../docs/examples.md"), true)),
+            wallets: Arc::new(sections(include_str!("../docs/wallets.md"), false)),
             petals: Arc::new(|| {
                 b"# Installed Petals\n\nNo Petals are currently installed.\n".to_vec()
             }),
@@ -117,14 +148,27 @@ impl Handler for DocsHandler {
 }
 
 impl DocsHandler {
+    fn dir(&self, name: &str) -> Option<&Sections> {
+        match name {
+            "examples" => Some(&self.examples),
+            "wallets" => Some(&self.wallets),
+            _ => None,
+        }
+    }
+
+    fn section(&self, dir: &str, file: &str) -> Option<&str> {
+        let found = self.dir(dir)?.iter().find(|(name, _)| name == file)?;
+        Some(&found.1)
+    }
+
     async fn lookup_inner(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
         match path.segments() {
             [] => Ok(Entry::dir("")),
             [s] if s == "README.md" => Ok(Entry::file("README.md")),
-            [s] if s == "examples.md" => Ok(Entry::file("examples.md")),
-            [s] if s == "wallets.md" => Ok(Entry::file("wallets.md")),
             [s] if s == "petals.md" => Ok(Entry::file("petals.md")),
             [s] if topic(s).is_some() => Ok(Entry::file(s)),
+            [dir] if self.dir(dir).is_some() => Ok(Entry::dir(dir)),
+            [dir, file] if self.section(dir, file).is_some() => Ok(Entry::file(file)),
             _ => Err(HandlerError::not_found(path.to_string_path())),
         }
     }
@@ -132,9 +176,12 @@ impl DocsHandler {
     async fn read_inner(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
         match path.segments() {
             [s] if s == "README.md" => Ok(self.readme.as_bytes().to_vec()),
-            [s] if s == "examples.md" => Ok(self.examples.as_bytes().to_vec()),
-            [s] if s == "wallets.md" => Ok(self.wallets.as_bytes().to_vec()),
             [s] if s == "petals.md" => Ok((self.petals)()),
+            [dir, file] if self.section(dir, file).is_some() => Ok(self
+                .section(dir, file)
+                .unwrap_or_default()
+                .as_bytes()
+                .to_vec()),
             [s] if topic(s).is_some() => Ok(topic(s).unwrap_or_default().as_bytes().to_vec()),
             _ => Err(HandlerError::NotAFile(path.to_string_path())),
         }
@@ -144,12 +191,16 @@ impl DocsHandler {
         if path.is_root() {
             let mut entries = vec![
                 Entry::file("README.md"),
-                Entry::file("examples.md"),
-                Entry::file("wallets.md"),
+                Entry::dir("examples"),
+                Entry::dir("wallets"),
                 Entry::file("petals.md"),
             ];
             entries.extend(TOPICS.iter().map(|(name, _)| Entry::file(name)));
             Ok(entries)
+        } else if let [dir] = path.segments()
+            && let Some(sections) = self.dir(dir)
+        {
+            Ok(sections.iter().map(|(name, _)| Entry::file(name)).collect())
         } else {
             Err(HandlerError::NotADir(path.to_string_path()))
         }
@@ -168,7 +219,7 @@ mod tests {
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(
             names[..4],
-            ["README.md", "examples.md", "wallets.md", "petals.md"]
+            ["README.md", "examples", "wallets", "petals.md"]
         );
         assert_eq!(names.len(), 4 + TOPICS.len());
         for (name, text) in TOPICS {
@@ -176,6 +227,10 @@ mod tests {
             assert_eq!(h.read(&path).await.unwrap(), text.as_bytes());
         }
         for e in &entries {
+            if matches!(e.name.as_str(), "examples" | "wallets") {
+                assert_eq!(e.kind, EntryKind::Dir);
+                continue;
+            }
             assert_eq!(e.kind, EntryKind::File);
             // Entry::file => read-only mode.
             assert_eq!(e.mode, 0o444);
@@ -203,11 +258,58 @@ mod tests {
     #[tokio::test]
     async fn lookup_known_files_are_files() {
         let h = DocsHandler::new();
-        for name in ["README.md", "examples.md", "wallets.md", "petals.md"] {
+        for name in ["README.md", "petals.md"] {
             let p = VfsPath::parse(&format!("/{name}")).unwrap();
             let e = h.lookup(&p).await.unwrap();
             assert_eq!(e.kind, EntryKind::File);
             assert_eq!(e.name, name);
+        }
+    }
+
+    /// Every section of a long doc, read back through the handler.
+    async fn whole(h: &DocsHandler, dir: &str) -> String {
+        let root = VfsPath::parse(&format!("/{dir}")).unwrap();
+        let mut text = String::new();
+        for entry in h.list(&root).await.unwrap() {
+            let path = VfsPath::parse(&format!("/{dir}/{}", entry.name)).unwrap();
+            assert_eq!(h.lookup(&path).await.unwrap().kind, EntryKind::File);
+            text += std::str::from_utf8(&h.read(&path).await.unwrap()).unwrap();
+        }
+        text
+    }
+
+    /// The long docs are directories of sections named after their headings.
+    #[tokio::test]
+    async fn long_docs_are_served_one_section_per_file() {
+        let h = DocsHandler::new();
+        let names = |dir: &'static str| {
+            let h = h.clone();
+            async move {
+                let listed = h.list(&VfsPath::parse(dir).unwrap()).await.unwrap();
+                listed.into_iter().map(|e| e.name).collect::<Vec<_>>()
+            }
+        };
+        let examples = names("/examples").await;
+        assert!(
+            examples.contains(&"deploying-an-evm-contract.md".to_owned()),
+            "{examples:?}"
+        );
+        assert!(
+            examples.contains(&"updating-wallet-policy.md".to_owned()),
+            "{examples:?}"
+        );
+        let wallets = names("/wallets").await;
+        assert!(
+            wallets.contains(&"creating-a-wallet.md".to_owned()),
+            "{wallets:?}"
+        );
+        // Each example carries the setup its commands rely on.
+        let deploy = VfsPath::parse("/examples/deploying-an-evm-contract.md").unwrap();
+        let deploy = String::from_utf8(h.read(&deploy).await.unwrap()).unwrap();
+        assert!(deploy.starts_with("# Deploying an EVM contract\n"));
+        assert!(deploy.contains("BLOOM=\"<bloom-vfs-mount>\""));
+        for gone in ["/examples.md", "/wallets.md"] {
+            assert!(h.lookup(&VfsPath::parse(gone).unwrap()).await.is_err());
         }
     }
 
@@ -253,12 +355,7 @@ mod tests {
             "README.md should mention bloom: {s:.80}..."
         );
 
-        let examples = h
-            .read(&VfsPath::parse("/examples.md").unwrap())
-            .await
-            .unwrap();
-        assert!(!examples.is_empty(), "examples.md must have content");
-        assert!(std::str::from_utf8(&examples).is_ok());
+        assert!(!whole(&h, "examples").await.is_empty());
     }
 
     #[tokio::test]
@@ -324,12 +421,8 @@ mod tests {
     #[tokio::test]
     async fn wallet_creation_docs_describe_async_registration_not_local_wallet() {
         let h = DocsHandler::new();
-        for name in ["wallets.md", "examples.md"] {
-            let bytes = h
-                .read(&VfsPath::parse(&format!("/{name}")).unwrap())
-                .await
-                .unwrap();
-            let s = String::from_utf8(bytes).unwrap();
+        for name in ["wallets", "examples"] {
+            let s = whole(&h, name).await;
             let normalized = s.to_ascii_lowercase();
             assert!(
                 s.contains("wallets/registrations/") && s.contains("status.json"),
