@@ -1789,7 +1789,7 @@ async fn execute_machine_command(
             id,
             text,
         } => {
-            execute_wallet_outbox_action(
+            let result = execute_wallet_outbox_action(
                 &daemon.vfs,
                 &wallet,
                 account,
@@ -1798,7 +1798,22 @@ async fn execute_machine_command(
                 "cancel",
                 text.as_bytes(),
             )
-            .await?;
+            .await;
+            if let Err(error) = &result
+                && let Some(bloom_vfs::HandlerError::ApprovalPending(challenge)) =
+                    error.downcast_ref::<bloom_vfs::HandlerError>()
+                && let Some((url, expires_at_ms)) =
+                    approval_challenge_link(&daemon.vfs, challenge).await
+            {
+                // The cancellation is prepared and waits on the owner; this is
+                // not a failure. Exit 3, as `wallet confirm` does.
+                return Ok(MachineCommandOutput {
+                    stdout: approval_pending_text(&url, expires_at_ms, None, "cancel"),
+                    stderr: String::new(),
+                    exit_code: EXIT_APPROVAL_PENDING,
+                });
+            }
+            result?;
             emit_machine_mutation("wallet_outbox_cancel", Some(&id), "committed");
             format!("cancel submitted for {id}\n")
         }
@@ -3409,22 +3424,7 @@ async fn confirm_projection(
     );
     if let Ok(bytes) = ipc_read(endpoint, &challenge_path).await {
         let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-        let url = value
-            .get("ceremony_url")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        let expires_at_ms = value
-            .get("expiry_ms")
-            .and_then(|field| {
-                field
-                    .as_u64()
-                    .or_else(|| field.as_str().and_then(|s| s.parse::<u64>().ok()))
-            })
-            .map(u128::from);
-        if let Some(url) = url
-            && !url.trim().is_empty()
-            && expires_at_ms.is_some_and(|expires| expires > unix_now_ms())
-        {
+        if let Some((url, expires_at_ms)) = live_ceremony(&value) {
             let petal_next = value
                 .get("staged_by")
                 .is_some_and(serde_json::Value::is_string)
@@ -3433,7 +3433,7 @@ async fn confirm_projection(
                 .map(str::to_string);
             return Some(ConfirmProjection::Ceremony {
                 url,
-                expires_at_ms: expires_at_ms.unwrap_or(0),
+                expires_at_ms,
                 petal_next,
             });
         }
@@ -3478,12 +3478,49 @@ async fn try_ipc_coded(
 }
 
 fn print_approval_pending(url: &str, expires_at_ms: u128, petal_next: Option<&str>) {
+    print!(
+        "{}",
+        approval_pending_text(url, expires_at_ms, petal_next, "confirm")
+    );
+}
+
+fn approval_pending_text(
+    url: &str,
+    expires_at_ms: u128,
+    petal_next: Option<&str>,
+    command: &str,
+) -> String {
     let remaining = expires_at_ms.saturating_sub(unix_now_ms()) / 1000;
-    println!("Approval required: open {url}");
     match petal_next {
-        Some(next) => println!("Ceremony expires in {remaining}s. {next}"),
-        None => println!("Ceremony expires in {remaining}s; re-run this confirm after approving."),
+        Some(next) => {
+            format!("Approval required: open {url}\nCeremony expires in {remaining}s. {next}\n")
+        }
+        None => format!(
+            "Approval required: open {url}\nCeremony expires in {remaining}s; re-run this {command} after approving.\n"
+        ),
     }
+}
+
+/// The live link and expiry from a projected `approval_challenge.json`, if
+/// the ceremony is still open.
+async fn approval_challenge_link(vfs: &bloom_vfs::Vfs, path: &str) -> Option<(String, u128)> {
+    let path = bloom_vfs::VfsPath::parse(&format!("/{}", path.trim_start_matches('/'))).ok()?;
+    let bytes = bloom_vfs::Handler::read(vfs, &path).await.ok()?;
+    live_ceremony(&serde_json::from_slice(&bytes).ok()?)
+}
+
+/// The ceremony link and expiry of an `approval_challenge.json` whose
+/// ceremony has not expired.
+fn live_ceremony(challenge: &serde_json::Value) -> Option<(String, u128)> {
+    let url = challenge.get("ceremony_url")?.as_str()?;
+    let expires_at_ms = challenge.get("expiry_ms").and_then(|field| {
+        field
+            .as_u64()
+            .or_else(|| field.as_str().and_then(|text| text.parse().ok()))
+    })?;
+    let expires_at_ms = u128::from(expires_at_ms);
+    (!url.trim().is_empty() && expires_at_ms > unix_now_ms())
+        .then(|| (url.to_string(), expires_at_ms))
 }
 
 fn confirm_context_note(projection: &ConfirmProjection) -> Option<String> {

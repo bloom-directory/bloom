@@ -142,8 +142,9 @@ still revokes them.
 
 ## Outbox recovery
 
-`bloom wallet confirm` exits 3 when owner approval is pending and 4 when
-confirmation has no recorded result yet; `--text cancel` discards an unsigned
+`bloom wallet confirm` and `bloom wallet cancel` exit 3 when owner approval is
+pending and print its link; confirm exits 4 when confirmation has no recorded
+result yet; `--text cancel` discards an unsigned
 entry. Discard is refused while another operation is active, and an expired
 entry that may be signed stays pending.
 

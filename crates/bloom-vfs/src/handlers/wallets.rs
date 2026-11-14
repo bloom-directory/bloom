@@ -3380,7 +3380,7 @@ impl Handler for WalletsHandler {
                         "account has no Broker-projected address for chain '{chain}'"
                     ))
                 })?;
-                self.require_staged_by(wallet, chain, id, address)?;
+                self.require_staged_by(wallet, chain, id, address, false)?;
                 let (_, policy) = self.planning_wallet_inputs(wallet, chain).await?;
                 let client = self
                     .chains
@@ -4486,20 +4486,27 @@ impl WalletsHandler {
         }
     }
 
-    /// A pending entry is actionable only when the path's account key staged
-    /// it (`wallets/<w>/<n>/`); another account's entry is not found.
+    /// A pending entry (or, with `sent_ok`, a sent one) is actionable only
+    /// when the path's account key staged it (`wallets/<w>/<n>/`); another
+    /// account's entry is not found.
     fn require_staged_by(
         &self,
         wallet: &str,
         chain: &str,
         id: &str,
         sender: &str,
+        sent_ok: bool,
     ) -> Result<(), HandlerError> {
-        let entry = self
-            .tx_engine
-            .outbox
-            .read_in_state(wallet, chain, id, OutboxState::Pending)
-            .map_err(outbox_err)?;
+        let outbox = &self.tx_engine.outbox;
+        // Cancel and replace also act on a broadcast entry, which the
+        // engine moves to `sent/`; it is still addressed through `pending/`.
+        let entry = match outbox.read_in_state(wallet, chain, id, OutboxState::Pending) {
+            Err(OutboxError::StateMismatch { actual: "sent", .. }) if sent_ok => {
+                outbox.read_in_state(wallet, chain, id, OutboxState::Sent)
+            }
+            other => other,
+        }
+        .map_err(outbox_err)?;
         if !entry.staged.from.eq_ignore_ascii_case(sender) {
             return Err(HandlerError::not_found(format!("outbox/pending/{id}")));
         }
@@ -4555,7 +4562,7 @@ impl WalletsHandler {
             [state, id, fname]
                 if state == "pending" && (fname == "confirm" || fname == "confirm.override") =>
             {
-                self.require_staged_by(wallet, chain, id, &scope)?;
+                self.require_staged_by(wallet, chain, id, &scope, false)?;
                 // Fix #9: confirm must have non-empty content. Quietly
                 // accepting an empty body (the old behaviour) made every
                 // empty `> confirm` a footgun that broadcast a tx.
@@ -4635,7 +4642,7 @@ impl WalletsHandler {
             // outbox/pending/<id>/cancel — fire a self-send replacement.
             // Same content rules as confirm (fix #9 / #10).
             [state, id, fname] if state == "pending" && fname == "cancel" => {
-                self.require_staged_by(wallet, chain, id, &scope)?;
+                self.require_staged_by(wallet, chain, id, &scope, true)?;
                 let cancel_text = std::str::from_utf8(data)
                     .map_err(|_| HandlerError::invalid("non-utf8 cancel content"))?
                     .trim();
@@ -4646,17 +4653,31 @@ impl WalletsHandler {
                 }
                 self.require_outbox_petal_eligibility_for_action(wallet, chain, id, true)
                     .await?;
-                let _ = self
+                match self
                     .tx_engine
                     .cancel(self.write_permit()?, wallet, chain, id, &client, 10, policy)
                     .await
-                    .map_err(err_be)?;
-                Ok(())
+                {
+                    Ok(_) => Ok(()),
+                    // The cancellation waits on the owner; its challenge is
+                    // projected wherever the entry now is (usually `sent/`).
+                    Err(TxEngineError::ApprovalRequired(_)) => {
+                        let state = self
+                            .tx_engine
+                            .outbox
+                            .read(wallet, chain, id)
+                            .map_or("pending", |entry| entry.state.dirname());
+                        Err(HandlerError::ApprovalPending(format!(
+                            "{outbox}/{state}/{id}/{APPROVAL_CHALLENGE_FILE}"
+                        )))
+                    }
+                    Err(other) => Err(err_be(other)),
+                }
             }
             // outbox/pending/<id>/replace accepts only an exact EIP-1559 fee
             // pair. Any other body is refused before anything is recorded.
             [state, id, fname] if state == "pending" && fname == "replace" => {
-                self.require_staged_by(wallet, chain, id, &scope)?;
+                self.require_staged_by(wallet, chain, id, &scope, true)?;
                 #[derive(serde::Deserialize)]
                 #[serde(deny_unknown_fields)]
                 struct FeeRepair {
@@ -9007,6 +9028,77 @@ value = "0""#,
         assert_eq!(request.wallet_id.as_ref(), Some(&token(&name)));
     }
 
+    /// bloom#285: a cancel of a broadcast entry that waits on the owner is
+    /// readable at `sent/<id>/approval_challenge.json`, the path the cancel
+    /// write's approval-pending error names.
+    #[tokio::test]
+    async fn a_waiting_cancel_of_a_sent_entry_is_projected_from_sent() {
+        let mut f = make_handler_with_chain(true);
+        let w = f.wallet_name.clone();
+        let approval = digest(22);
+        let mut waiting = approval_status(
+            approval.clone(),
+            &w,
+            ApprovalLifecycleState::AwaitingCeremony,
+        );
+        waiting.ceremony_url = Some("https://relay.test/ceremony/#cap=cancel".into());
+        waiting.ceremony_expires_at_ms = Some(DecimalU64::new(60_000));
+        f.handler = f
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(approval_broker(vec![
+                waiting,
+            ]))));
+        seed_pending(&f, "sent-cancel");
+        let outbox = &f.handler.tx_engine.outbox;
+        let pending = outbox
+            .read_in_state(&w, "anvil", "sent-cancel", OutboxState::Pending)
+            .unwrap();
+        let sent_dir = outbox.transition(&pending, OutboxState::Sent).unwrap();
+        std::fs::write(
+            sent_dir.join("ceremony.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "bloom.machine-evm-signing.1",
+                "action_id": "31337:sent-cancel:cancel",
+                "approval_id": approval.as_str(),
+                "ceremony_url": "https://relay.test/ceremony/#cap=cancel",
+                "ceremony_expires_at_ms": "60000",
+                "sign_dispatched": false,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let dir = format!("/{w}/0/chains/anvil/outbox/sent/sent-cancel");
+        let names: Vec<String> = f
+            .handler
+            .list(&vfs(dir.clone()))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert!(
+            names.contains(&"approval_challenge.json".to_string()),
+            "{names:?}"
+        );
+        let challenge: serde_json::Value = serde_json::from_slice(
+            &f.handler
+                .read(&vfs(format!("{dir}/approval_challenge.json")))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(challenge["state"], "awaiting_ceremony");
+        assert_eq!(
+            challenge["ceremony_url"],
+            "https://relay.test/ceremony/#cap=cancel"
+        );
+        assert_eq!(
+            challenge["retry_path"],
+            format!("wallets/{w}/0/chains/anvil/outbox/pending/sent-cancel/cancel")
+        );
+        assert_eq!(challenge["value_wei"], "0");
+    }
+
     #[tokio::test]
     async fn evm_approval_challenge_is_public_and_tracks_the_live_approval() {
         let mut f = make_handler_with_chain(true);
@@ -10801,6 +10893,39 @@ value = "0""#,
         .unwrap();
         let r = f.handler.write(&p, b"").await;
         assert!(matches!(r, Err(HandlerError::Invalid(_))), "got: {r:?}");
+    }
+
+    /// A broadcast entry is in `sent/` but is still cancelled and replaced
+    /// through `pending/<id>/`, as the cancel challenge's `retry_path` says;
+    /// the sender fence still hides another account's entry.
+    #[tokio::test]
+    async fn cancel_and_replace_reach_a_sent_entry_of_the_same_sender() {
+        let f = make_handler_with_chain(true);
+        let w = f.wallet_name.clone();
+        let hash = format!("{:?}", alloy::primitives::B256::repeat_byte(1));
+        let mine = bloom_proto::checksum_address(&f.wallet_addr);
+        seed_sent_from(&f, "mine", &mine, 0, &hash);
+        seed_sent_from(
+            &f,
+            "theirs",
+            &format!("{:?}", Address::repeat_byte(0xaa)),
+            0,
+            &hash,
+        );
+        let fees = br#"{"max_fee_per_gas":"200","max_priority_fee_per_gas":"20"}"#;
+        for (control, body) in [("cancel", &b"y"[..]), ("replace", &fees[..])] {
+            let path = |id: &str| vfs(format!("/{w}/0/chains/anvil/outbox/pending/{id}/{control}"));
+            let mine = f.handler.write(&path("mine"), body).await;
+            assert!(
+                !matches!(mine, Err(HandlerError::NotFound(_))),
+                "{control} of my sent entry: {mine:?}"
+            );
+            let theirs = f.handler.write(&path("theirs"), body).await;
+            assert!(
+                matches!(theirs, Err(HandlerError::NotFound(_))),
+                "{control} of another account's sent entry: {theirs:?}"
+            );
+        }
     }
 
     /// `replace` accepts only the exact fee pair; every other body is

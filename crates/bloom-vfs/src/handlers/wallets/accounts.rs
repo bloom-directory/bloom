@@ -2188,19 +2188,33 @@ fn is_private_evm_outbox_artifact(name: &str) -> bool {
     name == EVM_SIGNING_STATE || name.starts_with('.')
 }
 
-/// The pending entry's signing state, when it is waiting on or holds an owner
-/// approval. Sent and failed entries project no challenge.
+/// The entry's signing state, when it is waiting on or holds an owner
+/// approval: a pending entry's own, or a cancellation of a sent entry that
+/// has not been submitted yet (`bloom wallet cancel`). Other sent entries and
+/// failed entries project no challenge.
 fn evm_signing_state(entry: &bloom_tx::outbox::OutboxEntry) -> Option<serde_json::Value> {
-    if entry.state != OutboxState::Pending {
-        return None;
-    }
     let bytes = std::fs::read(entry.dir.join(EVM_SIGNING_STATE)).ok()?;
     let state: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    state
-        .get("approval_id")
-        .and_then(|id| id.as_str())
-        .is_some_and(|id| !id.is_empty())
-        .then_some(state)
+    let cancelling =
+        state.get("action_id").and_then(|id| id.as_str()) == Some(&evm_cancel_action(entry));
+    // A broadcast cancel is no longer awaiting approval, even when its
+    // possibly-signed original stays in pending/.
+    let cancel_sent = cancelling && entry.dir.join("cancel_tx_hash").exists();
+    let live = match entry.state {
+        OutboxState::Pending => !cancel_sent,
+        OutboxState::Sent => cancelling && !cancel_sent,
+        OutboxState::Failed => false,
+    };
+    (live
+        && state
+            .get("approval_id")
+            .and_then(|id| id.as_str())
+            .is_some_and(|id| !id.is_empty()))
+    .then_some(state)
+}
+
+fn evm_cancel_action(entry: &bloom_tx::outbox::OutboxEntry) -> String {
+    bloom_tx::tx_engine::cancel_action_id(&entry.staged)
 }
 
 /// The public approval challenge for a pending EVM entry, in the same shape
@@ -2263,6 +2277,14 @@ fn evm_approval_challenge(
         retry_body = request;
         control = "replace";
         plan = "replacement_plan.md";
+    } else if signing.get("action_id").and_then(|value| value.as_str())
+        == Some(&evm_cancel_action(entry))
+    {
+        // A same-nonce self-send of nothing that replaces the original; the
+        // plan is the original's, which is what gets cancelled.
+        staged = bloom_tx::tx_engine::cancellation_candidate(&staged).map_err(err_be)?;
+        retry_body = serde_json::Value::String("y".into());
+        control = "cancel";
     }
     let expiry_ms = signing.get("ceremony_expires_at_ms").and_then(|value| {
         value
@@ -2283,7 +2305,7 @@ fn evm_approval_challenge(
         "approval_id": signing.get("approval_id"),
         "ceremony_url": signing.get("ceremony_url"),
         "expiry_ms": expiry_ms,
-        "plan_path": format!("{outbox}/pending/{}/{plan}", staged.id),
+        "plan_path": format!("{outbox}/{}/{}/{plan}", entry.state.dirname(), staged.id),
         "retry_path": format!("{outbox}/pending/{}/{control}", staged.id),
         "retry_body": retry_body,
     });
@@ -2434,6 +2456,82 @@ impl WalletsHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bloom#285: `bloom wallet cancel` on a broadcast entry waits on an owner
+    /// approval. Its challenge is projected from `sent/` and describes the
+    /// cancellation, not the original, until the cancel is submitted.
+    #[test]
+    fn a_waiting_cancel_of_a_sent_entry_projects_a_cancel_challenge() {
+        let directory = tempfile::tempdir().unwrap();
+        let staged: bloom_proto::StagedTx = serde_json::from_value(serde_json::json!({
+            "id": "0005-72611", "wallet": "main", "chain": "base", "chain_id": 8453,
+            "from": "0x1111111111111111111111111111111111111111",
+            "to": "0x2222222222222222222222222222222222222222",
+            "value_wei": "7", "data_hex": "0x12345678", "nonce": 4,
+            "gas_limit": 84000, "max_fee_per_gas": "50000000000",
+            "max_priority_fee_per_gas": "2500000000", "policy_checks": [],
+            "created_ms": 1, "expires_ms": 10000, "status": "sent",
+            "action_kind": "contract_call"
+        }))
+        .unwrap();
+        let entry = bloom_tx::outbox::OutboxEntry {
+            state: OutboxState::Sent,
+            staged,
+            dir: directory.path().to_path_buf(),
+        };
+        let write_signing = |action: &str| {
+            std::fs::write(
+                directory.path().join(EVM_SIGNING_STATE),
+                serde_json::to_vec(&serde_json::json!({
+                    "action_id": action, "approval_id": "ap-1",
+                    "ceremony_url": "https://approve.example/c", "ceremony_expires_at_ms": "99"
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+
+        // The original's completed confirm approval projects nothing once sent.
+        write_signing("8453:0005-72611:confirm");
+        assert!(evm_signing_state(&entry).is_none());
+
+        write_signing("8453:0005-72611:cancel");
+        let signing = evm_signing_state(&entry).expect("waiting cancel is projected");
+        let root = "wallets/main/0/chains/base/outbox";
+        let challenge = evm_approval_challenge(&entry, &signing, root, &|_| None).unwrap();
+        assert_eq!(
+            challenge["retry_path"],
+            format!("{root}/pending/0005-72611/cancel")
+        );
+        assert_eq!(challenge["retry_body"], "y");
+        assert_eq!(
+            challenge["plan_path"],
+            format!("{root}/sent/0005-72611/plan.md")
+        );
+        assert_eq!(challenge["to"], entry.staged.from.as_str());
+        assert_eq!(challenge["value_wei"], "0");
+        assert_eq!(challenge["nonce"], 4);
+        assert_eq!(challenge["ceremony_url"], "https://approve.example/c");
+
+        // Once the cancellation is submitted, nothing waits on the owner.
+        std::fs::write(directory.path().join("cancel_tx_hash"), b"0xabc").unwrap();
+        assert!(evm_signing_state(&entry).is_none());
+        // The same holds for a possibly-signed original kept in pending/.
+        let pending = bloom_tx::outbox::OutboxEntry {
+            state: OutboxState::Pending,
+            ..entry.clone()
+        };
+        assert!(evm_signing_state(&pending).is_none());
+        std::fs::remove_file(directory.path().join("cancel_tx_hash")).unwrap();
+        assert!(evm_signing_state(&pending).is_some());
+
+        // Failed entries never project a challenge.
+        let failed = bloom_tx::outbox::OutboxEntry {
+            state: OutboxState::Failed,
+            ..entry
+        };
+        assert!(evm_signing_state(&failed).is_none());
+    }
 
     #[test]
     fn fee_repair_challenge_binds_the_retry_body_and_unchanged_call() {
