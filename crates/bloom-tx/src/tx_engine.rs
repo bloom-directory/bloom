@@ -180,7 +180,7 @@ pub enum TxEngineError {
     )]
     SimulationReverted { reason: String },
     #[error(
-        "nonce gap: tx for {from} uses nonce {staged} but the account's next on-chain nonce is {chain_next} — the node would queue it behind the missing nonce(s) and it could never mine.{blocking} Broadcast the earlier transaction, or discard it and restage with the explicit missing `nonce`. Discarding alone does not renumber this transaction."
+        "nonce gap: tx for {from} uses nonce {staged} but the account's next on-chain nonce is {chain_next} — the node would queue it behind the missing nonce(s) and it could never mine.{blocking} Broadcast the earlier transaction (if it is already broadcast, wait for it to mine or cancel it), or discard it and restage with the explicit missing `nonce`. Discarding alone does not renumber this transaction."
     )]
     NonceGap {
         from: String,
@@ -1674,11 +1674,10 @@ impl TxEngine {
                 let chain_nonce = chain.nonce(from).await?;
                 let pending_high = self
                     .outbox
-                    .highest_pending_nonce(wallet, &spec.name, from)?;
-                // If there are staged-but-unconfirmed txs, use the slot
-                // after the highest pending nonce. After broadcast they
-                // move to sent/ and the chain RPC returns the updated
-                // next nonce — no stale-data risk once the queue drains.
+                    .highest_reserved_nonce(wallet, &spec.name, from)?;
+                // Use the slot after the highest nonce still held by a
+                // pending or unmined sent entry: the RPC's pending count can
+                // lag a broadcast that just happened.
                 pending_high.map_or(chain_nonce, |h| chain_nonce.max(h + 1))
             }
         };
@@ -2405,7 +2404,7 @@ impl TxEngine {
             }
             if let Some(chain_next) = next_nonces.get_mut(&key).and_then(Option::as_mut) {
                 if staged.nonce > *chain_next {
-                    let holders = self.pending_nonce_holders(
+                    let holders = self.nonce_holders(
                         &staged.wallet,
                         &staged.chain,
                         &from,
@@ -2964,7 +2963,7 @@ impl TxEngine {
     /// Refuse to broadcast a tx whose nonce is ahead of the account's next
     /// on-chain nonce with nothing filling the gap.
     ///
-    /// The auto-increment nonce default ([`Outbox::highest_pending_nonce`]) is
+    /// The auto-increment nonce default ([`Outbox::highest_reserved_nonce`]) is
     /// optimistic: a pending entry reserves its slot before it broadcasts, so a
     /// staged-but-never-broadcast (or later-abandoned) entry can push a
     /// subsequent tx one nonce past a gap that never fills. The RPC accepts such
@@ -3065,27 +3064,38 @@ impl TxEngine {
     /// told to "broadcast nonce N first" with nothing saying which row that
     /// is. Discarding a never-signed row releases its nonce and needs no
     /// approval, so naming the holder is the whole fix.
-    fn pending_nonce_holders(
+    fn nonce_holders(
         &self,
         wallet: &str,
         chain: &str,
         from: &Address,
         chain_next: u64,
         staged: u64,
-    ) -> Vec<(u64, String)> {
+    ) -> Vec<NonceHolder> {
         let sender = bloom_proto::checksum_address(from);
-        let Ok(ids) = self.outbox.list(wallet, chain, OutboxState::Pending) else {
-            return Vec::new();
-        };
-        let mut holders: Vec<(u64, String)> = ids
-            .iter()
-            .filter_map(|id| self.outbox.read(wallet, chain, id).ok())
+        // An unmined sent entry holds its nonce too; if it was dropped, it is
+        // the one to replace or cancel.
+        let entries = [OutboxState::Pending, OutboxState::Sent]
+            .into_iter()
+            .flat_map(|state| {
+                self.outbox
+                    .list(wallet, chain, state)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(move |id| self.outbox.read_in_state(wallet, chain, &id, state).ok())
+            })
+            .filter(|entry| !entry.dir.join(crate::outbox::RECEIPT_FILE).exists());
+        let mut holders: Vec<NonceHolder> = entries
             .filter(|entry| {
                 entry.staged.from.eq_ignore_ascii_case(&sender)
                     && entry.staged.nonce >= chain_next
                     && entry.staged.nonce < staged
             })
-            .map(|entry| (entry.staged.nonce, entry.staged.id.clone()))
+            .map(|entry| NonceHolder {
+                nonce: entry.staged.nonce,
+                id: entry.staged.id.clone(),
+                sent: entry.state == OutboxState::Sent,
+            })
             .collect();
         holders.sort();
         holders
@@ -3096,8 +3106,26 @@ impl TxEngine {
         entry: &crate::outbox::OutboxEntry,
         staged: u64,
         chain_next: u64,
-        holders: &[(u64, String)],
+        holders: &[NonceHolder],
     ) -> Result<(), TxEngineError> {
+        let (wallet, chain) = (&entry.staged.wallet, &entry.staged.chain);
+        let sent: Vec<&str> = holders
+            .iter()
+            .filter(|holder| holder.sent)
+            .map(|holder| holder.id.as_str())
+            .collect();
+        let advice = if holders.is_empty() {
+            format!(
+                "no pending transaction holds nonce {chain_next}; restage with an explicit `nonce` to fill the gap deliberately"
+            )
+        } else if sent.is_empty() {
+            "confirm the transactions listed in `blocked_by`, or discard them by writing `cancel` to their `confirm` file, which releases their nonces without an approval".to_owned()
+        } else {
+            format!(
+                "{} already broadcast and not mined: wait for it to mine, or cancel it with `bloom wallet cancel {wallet} {chain} <id> --account <n>`, where `n` is the account that staged it, which needs an owner approval; confirm or discard any other `blocked_by` entry through its `confirm` file",
+                sent.join(", ")
+            )
+        };
         let body = serde_json::json!({
             "schema": "bloom.nonce_gap.v1",
             "id": entry.staged.id,
@@ -3108,15 +3136,9 @@ impl TxEngine {
             "chain_next_nonce": chain_next,
             "blocked_by": holders
                 .iter()
-                .map(|(nonce, id)| serde_json::json!({"nonce": nonce, "id": id}))
+                .map(|holder| serde_json::json!({"nonce": holder.nonce, "id": holder.id}))
                 .collect::<Vec<_>>(),
-            "advice": if holders.is_empty() {
-                format!(
-                    "no pending transaction holds nonce {chain_next}; restage with an explicit `nonce` to fill the gap deliberately"
-                )
-            } else {
-                "confirm the transactions listed in `blocked_by`, or discard them by writing `cancel` to their `confirm` file, which releases their nonces without an approval".to_owned()
-            },
+            "advice": advice,
             "created_ms": now_ms(),
         });
         self.outbox.write_artefact(
@@ -3275,13 +3297,8 @@ impl TxEngine {
                 ..
             } = &e
             {
-                let holders = self.pending_nonce_holders(
-                    &staged.wallet,
-                    &staged.chain,
-                    &from,
-                    *chain_next,
-                    *s,
-                );
+                let holders =
+                    self.nonce_holders(&staged.wallet, &staged.chain, &from, *chain_next, *s);
                 let _ = self.write_nonce_gap_advisory(entry, *s, *chain_next, &holders);
                 return Err(TxEngineError::NonceGap {
                     from: bloom_proto::checksum_address(&from),
@@ -4792,18 +4809,33 @@ fn bump_fees_in_place(staged: &mut StagedTx, pct: u32) {
 /// One sentence naming the pending rows that hold the missing nonces, or
 /// nothing at all when none does — an empty string keeps the generic advice
 /// intact rather than claiming a holder that is not there.
-fn render_nonce_holders(holders: &[(u64, String)]) -> String {
+/// An outbox entry holding a nonce below the one being broadcast.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct NonceHolder {
+    nonce: u64,
+    id: String,
+    /// Broadcast and not mined, in `sent/`; otherwise staged in `pending/`.
+    sent: bool,
+}
+
+fn render_nonce_holders(holders: &[NonceHolder]) -> String {
+    let kind = |holder: &NonceHolder| if holder.sent { "broadcast" } else { "staged" };
     match holders {
         [] => String::new(),
-        [(nonce, id)] => format!(" Nonce {nonce} is held by staged transaction {id}."),
+        [holder] => format!(
+            " Nonce {} is held by {} transaction {}.",
+            holder.nonce,
+            kind(holder),
+            holder.id
+        ),
         many => format!(
-            " Nonces {} are held by staged transactions {}.",
+            " Nonces {} are held by transactions {}.",
             many.iter()
-                .map(|(nonce, _)| nonce.to_string())
+                .map(|holder| holder.nonce.to_string())
                 .collect::<Vec<_>>()
                 .join(", "),
             many.iter()
-                .map(|(_, id)| id.clone())
+                .map(|holder| format!("{} ({})", holder.id, kind(holder)))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -6692,6 +6724,68 @@ mod tests {
         );
     }
 
+    /// bloom#217: step one of a multi-step action has just broadcast and sits
+    /// in `sent/`, but the RPC's pending nonce (0 here) has not caught up.
+    /// Step two must take the next nonce, not the one already in flight.
+    #[tokio::test]
+    async fn staging_skips_the_nonce_of_an_unmined_sent_entry_when_the_rpc_lags() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let mut approve = fake_staged_1559("0017-approve");
+        approve.nonce = 0;
+        outbox.write_pending(&approve, "approve").unwrap();
+        let pending = outbox.read("alice", "anvil", &approve.id).unwrap();
+        outbox
+            .transition_with_status(&pending, TxStatus::Sent)
+            .unwrap();
+        let engine = TxEngine::new(outbox, 60_000);
+        let permit = permit_for(&directory);
+        let deposit = crate::intent_parser::parse(
+            r#"{"kind":"send","to":"0x0000000000000000000000000000000000000001","value":"1 wei"}"#,
+        )
+        .unwrap();
+        let staged = engine
+            .stage(
+                &permit,
+                "alice",
+                TEST_SIGNER_ADDRESS.parse().unwrap(),
+                deposit,
+                &stage_chain(&spawn_stage_rpc(false).await),
+                &Policy::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(staged.nonce, 1);
+
+        // A sent blocker has no `confirm` file, so the gap advice names the
+        // owner-approved cancel instead.
+        let from: Address = TEST_SIGNER_ADDRESS.parse().unwrap();
+        let holders = engine.nonce_holders("alice", "anvil", &from, 0, 1);
+        assert_eq!(holders, vec![holder(0, &approve.id, true)]);
+        let rendered = render_nonce_holders(&holders);
+        assert!(
+            rendered.contains("held by broadcast transaction 0017-approve"),
+            "{rendered}"
+        );
+        let entry = engine.outbox.read("alice", "anvil", &staged.id).unwrap();
+        engine
+            .write_nonce_gap_advisory(&entry, 1, 0, &holders)
+            .unwrap();
+        let gap: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(entry.dir.join("nonce_gap.json")).unwrap())
+                .unwrap();
+        let advice = gap["advice"].as_str().unwrap();
+        assert!(
+            advice.contains("0017-approve already broadcast"),
+            "{advice}"
+        );
+        assert!(
+            advice.contains("bloom wallet cancel alice anvil <id> --account <n>"),
+            "{advice}"
+        );
+    }
+
     #[tokio::test]
     async fn cancel_replacement_keeps_sent_original_available_for_reconciliation() {
         check_cancel_keeps_original(None, false).await;
@@ -6779,11 +6873,13 @@ mod tests {
         assert!(original.dir.join("cancel_tx_hash").exists());
         assert!(original.dir.join("cancel_intent.json").exists());
         assert_eq!(outbox.walk_all_sent().unwrap().len(), 1);
-        assert!(
+        // The original or its cancellation still holds the nonce until one
+        // is mined, so new staging must not reuse it.
+        assert_eq!(
             outbox
-                .highest_pending_nonce("alice", "anvil", TEST_SIGNER_ADDRESS.parse().unwrap())
-                .unwrap()
-                .is_none()
+                .highest_reserved_nonce("alice", "anvil", TEST_SIGNER_ADDRESS.parse().unwrap())
+                .unwrap(),
+            Some(staged.nonce)
         );
         let err = engine
             .replace_fees(
@@ -6859,7 +6955,7 @@ mod tests {
         assert_eq!(original.state, OutboxState::Pending);
         assert_eq!(
             outbox
-                .highest_pending_nonce("alice", "anvil", TEST_SIGNER_ADDRESS.parse().unwrap())
+                .highest_reserved_nonce("alice", "anvil", TEST_SIGNER_ADDRESS.parse().unwrap())
                 .unwrap(),
             Some(staged.nonce)
         );
@@ -6909,7 +7005,7 @@ mod tests {
         assert!(
             engine
                 .outbox
-                .highest_pending_nonce("alice", "anvil", TEST_SIGNER_ADDRESS.parse().unwrap())
+                .highest_reserved_nonce("alice", "anvil", TEST_SIGNER_ADDRESS.parse().unwrap())
                 .unwrap()
                 .is_none()
         );
@@ -11103,10 +11199,10 @@ mod tests {
         let from: Address = TEST_SIGNER_ADDRESS.parse().unwrap();
 
         // Confirming nonce 3 is blocked by the two rows ahead of it, named.
-        let holders = engine.pending_nonce_holders("clearsign", "anvil", &from, 1, 3);
+        let holders = engine.nonce_holders("clearsign", "anvil", &from, 1, 3);
         assert_eq!(
             holders,
-            vec![(1, "0002-aaaa".to_owned()), (2, "0003-bbbb".to_owned())]
+            vec![holder(1, "0002-aaaa", false), holder(2, "0003-bbbb", false)]
         );
         let rendered = render_nonce_holders(&holders);
         assert!(rendered.contains("0002-aaaa"), "{rendered}");
@@ -11116,8 +11212,8 @@ mod tests {
         // block it: a row that already mined does not, and neither does one
         // staged further out.
         assert_eq!(
-            engine.pending_nonce_holders("clearsign", "anvil", &from, 2, 3),
-            vec![(2, "0003-bbbb".to_owned())]
+            engine.nonce_holders("clearsign", "anvil", &from, 2, 3),
+            vec![holder(2, "0003-bbbb", false)]
         );
 
         // Discarding the refused row releases its nonce, with no approval and
@@ -11127,16 +11223,24 @@ mod tests {
             .cancel("clearsign", "anvil", "0002-aaaa")
             .unwrap();
         assert_eq!(
-            engine.pending_nonce_holders("clearsign", "anvil", &from, 1, 3),
-            vec![(2, "0003-bbbb".to_owned())]
+            engine.nonce_holders("clearsign", "anvil", &from, 1, 3),
+            vec![holder(2, "0003-bbbb", false)]
         );
 
         // A gap nothing is holding says so rather than naming a row.
         assert_eq!(
-            engine.pending_nonce_holders("clearsign", "anvil", &from, 7, 9),
+            engine.nonce_holders("clearsign", "anvil", &from, 7, 9),
             Vec::new()
         );
         assert_eq!(render_nonce_holders(&[]), "");
+    }
+
+    fn holder(nonce: u64, id: &str, sent: bool) -> NonceHolder {
+        NonceHolder {
+            nonce,
+            id: id.to_owned(),
+            sent,
+        }
     }
 
     #[test]

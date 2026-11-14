@@ -937,9 +937,9 @@ impl Outbox {
         Ok(out)
     }
 
-    /// Return the highest nonce among all `pending/<wallet>/<chain>/<id>/intent.json`
-    /// entries whose `from` address matches `addr`. Returns `None` when the pending
-    /// directory is empty or doesn't exist yet (no staged txs for this sender).
+    /// Return the highest nonce `addr` has reserved on this chain: every
+    /// `pending/` entry, and every `sent/` entry with no mined receipt yet.
+    /// Returns `None` when there are none.
     ///
     /// Called by `TxEngine::stage()` under a per-(wallet, chain, from) async mutex
     /// to compute the auto-increment next nonce when multiple txs are staged
@@ -955,31 +955,42 @@ impl Outbox {
     /// stays optimistic, broadcast stays safe. Callers that need an exact nonce
     /// bypass this entirely via the intent `nonce` override.
     ///
-    /// Scans all pending entries for `addr` on each call — acceptable for
-    /// single-user CLI where the pending queue is small.
-    pub fn highest_pending_nonce(
+    /// Unmined `sent/` entries count because the RPC's pending nonce can lag
+    /// a broadcast (load-balanced endpoints), and the next step of a
+    /// multi-step Petal action is staged the moment the previous one
+    /// broadcasts. Without them that step could take the nonce of a
+    /// transaction already in flight and never be sendable. A sent entry
+    /// that is mined (its nonce is below the chain's) or replaced at its
+    /// nonce no longer raises the result; one that is stuck keeps its nonce
+    /// until it is replaced or cancelled, as the explicit-nonce check in
+    /// `TxEngine::stage()` already requires.
+    pub fn highest_reserved_nonce(
         &self,
         wallet: &str,
         chain: &str,
         addr: alloy::primitives::Address,
     ) -> Result<Option<u64>, OutboxError> {
-        let dir = self.state_dir(wallet, chain, OutboxState::Pending)?;
-        if !dir.exists() {
-            return Ok(None);
-        }
         let mut max_nonce: Option<u64> = None;
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
+        for state in [OutboxState::Pending, OutboxState::Sent] {
+            let dir = self.state_dir(wallet, chain, state)?;
+            if !dir.exists() {
                 continue;
             }
-            let intent_path = entry.path().join("intent.json");
-            if !intent_path.exists() {
-                continue;
-            }
-            let staged: StagedTx = serde_json::from_slice(&fs::read(&intent_path)?)?;
-            if staged.from.parse::<alloy::primitives::Address>().ok() == Some(addr) {
-                max_nonce = Some(max_nonce.map_or(staged.nonce, |m| m.max(staged.nonce)));
+            for entry in fs::read_dir(&dir)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let intent_path = entry.path().join("intent.json");
+                if !intent_path.exists()
+                    || (state == OutboxState::Sent && entry.path().join(RECEIPT_FILE).exists())
+                {
+                    continue;
+                }
+                let staged: StagedTx = serde_json::from_slice(&fs::read(&intent_path)?)?;
+                if staged.from.parse::<alloy::primitives::Address>().ok() == Some(addr) {
+                    max_nonce = Some(max_nonce.map_or(staged.nonce, |m| m.max(staged.nonce)));
+                }
             }
         }
         Ok(max_nonce)
@@ -1934,7 +1945,7 @@ mod tests {
     }
 
     #[test]
-    fn highest_pending_nonce_auto_increments_over_all_pending() {
+    fn highest_reserved_nonce_auto_increments_over_all_pending() {
         let dir = tempfile::tempdir().unwrap();
         let ob = Outbox::new(dir.path()).unwrap();
         let from: alloy::primitives::Address = "0x0000000000000000000000000000000000000001"
@@ -1943,7 +1954,7 @@ mod tests {
 
         // No pending entries → no reservation (caller falls back to chain nonce).
         assert_eq!(
-            ob.highest_pending_nonce("alice", "anvil", from).unwrap(),
+            ob.highest_reserved_nonce("alice", "anvil", from).unwrap(),
             None
         );
 
@@ -1953,16 +1964,58 @@ mod tests {
         a.nonce = 0;
         ob.write_pending(&a, "# plan").unwrap();
         assert_eq!(
-            ob.highest_pending_nonce("alice", "anvil", from).unwrap(),
+            ob.highest_reserved_nonce("alice", "anvil", from).unwrap(),
             Some(0)
         );
         let mut b = fake_staged("0002-b");
         b.nonce = 1;
         ob.write_pending(&b, "# plan").unwrap();
         assert_eq!(
-            ob.highest_pending_nonce("alice", "anvil", from).unwrap(),
+            ob.highest_reserved_nonce("alice", "anvil", from).unwrap(),
             Some(1),
             "reservation advances so the next stage gets nonce 2"
+        );
+    }
+
+    /// bloom#217: an approve broadcasts (pending → sent) and the next step is
+    /// staged at once, while the RPC's pending nonce may not include it yet.
+    /// The sent entry keeps its nonce until it has a mined receipt.
+    #[test]
+    fn highest_reserved_nonce_counts_sent_entries_until_mined() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::new(dir.path()).unwrap();
+        let from: alloy::primitives::Address = "0x0000000000000000000000000000000000000001"
+            .parse()
+            .unwrap();
+        let mut approve = fake_staged("0017-approve");
+        approve.nonce = 5;
+        ob.write_pending(&approve, "# plan").unwrap();
+        let pending = ob.read("alice", "anvil", "0017-approve").unwrap();
+        let sent_dir = ob.transition_with_status(&pending, TxStatus::Sent).unwrap();
+        assert_eq!(
+            ob.read("alice", "anvil", "0017-approve").unwrap().state,
+            OutboxState::Sent
+        );
+        assert_eq!(
+            ob.highest_reserved_nonce("alice", "anvil", from).unwrap(),
+            Some(5),
+            "the in-flight approve holds nonce 5, so the deposit gets 6"
+        );
+
+        // Other senders' entries never count.
+        let other: alloy::primitives::Address = "0x0000000000000000000000000000000000000002"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            ob.highest_reserved_nonce("alice", "anvil", other).unwrap(),
+            None
+        );
+
+        // Once mined, the chain nonce covers it and the entry stops counting.
+        fs::write(sent_dir.join(RECEIPT_FILE), b"{}").unwrap();
+        assert_eq!(
+            ob.highest_reserved_nonce("alice", "anvil", from).unwrap(),
+            None
         );
     }
 
