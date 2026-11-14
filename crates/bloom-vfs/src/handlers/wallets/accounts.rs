@@ -2197,9 +2197,12 @@ fn evm_signing_state(entry: &bloom_tx::outbox::OutboxEntry) -> Option<serde_json
     let state: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     let cancelling =
         state.get("action_id").and_then(|id| id.as_str()) == Some(&evm_cancel_action(entry));
+    // A broadcast cancel is no longer awaiting approval, even when its
+    // possibly-signed original stays in pending/.
+    let cancel_sent = cancelling && entry.dir.join("cancel_tx_hash").exists();
     let live = match entry.state {
-        OutboxState::Pending => true,
-        OutboxState::Sent => cancelling && !entry.dir.join("cancel_tx_hash").exists(),
+        OutboxState::Pending => !cancel_sent,
+        OutboxState::Sent => cancelling && !cancel_sent,
         OutboxState::Failed => false,
     };
     (live
@@ -2514,13 +2517,20 @@ mod tests {
         // Once the cancellation is submitted, nothing waits on the owner.
         std::fs::write(directory.path().join("cancel_tx_hash"), b"0xabc").unwrap();
         assert!(evm_signing_state(&entry).is_none());
+        // The same holds for a possibly-signed original kept in pending/.
+        let pending = bloom_tx::outbox::OutboxEntry {
+            state: OutboxState::Pending,
+            ..entry.clone()
+        };
+        assert!(evm_signing_state(&pending).is_none());
+        std::fs::remove_file(directory.path().join("cancel_tx_hash")).unwrap();
+        assert!(evm_signing_state(&pending).is_some());
 
         // Failed entries never project a challenge.
         let failed = bloom_tx::outbox::OutboxEntry {
             state: OutboxState::Failed,
             ..entry
         };
-        std::fs::remove_file(directory.path().join("cancel_tx_hash")).unwrap();
         assert!(evm_signing_state(&failed).is_none());
     }
 
