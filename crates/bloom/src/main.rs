@@ -5296,10 +5296,21 @@ async fn write_policy(
         }
         Err(denied) => denied,
     };
-    let Some(update) = policy_update(endpoint, wallet)
+    let update = policy_update(endpoint, wallet)
         .await
-        .filter(|update| code == IPC_ERR_PERMISSION_DENIED && update["status"] == WAITING)
-    else {
+        .filter(|_| code == IPC_ERR_PERMISSION_DENIED);
+    // The owner approved between the write and this read.
+    if update
+        .as_ref()
+        .is_some_and(|update| update["status"] == "ready_to_commit")
+    {
+        try_ipc(&client, endpoint, "write", params)
+            .await
+            .with_context(context)?;
+        println!("Policy updated.");
+        return Ok(());
+    }
+    let Some(update) = update.filter(|update| update["status"] == WAITING) else {
         return Err(anyhow::Error::new(error).context(context()));
     };
     if waiting_before.as_ref() == Some(&update["action_id"]) {
@@ -5309,11 +5320,13 @@ async fn write_policy(
             let Some(now) = policy_update(endpoint, wallet).await else {
                 continue;
             };
-            if now["action_id"] != update["action_id"] {
-                break;
-            }
+            anyhow::ensure!(
+                now["action_id"] == update["action_id"],
+                "another policy update replaced this one; read wallets/{wallet}/policy-updates/latest/status.json"
+            );
             match now["status"].as_str() {
-                Some(WAITING) => continue,
+                // prepare_pending: Broker has not opened the ceremony yet.
+                Some(WAITING | "prepare_pending") => continue,
                 Some("confirmed") => {}
                 // Approved: the same bytes written again install the policy.
                 Some("ready_to_commit") => {
@@ -5322,8 +5335,8 @@ async fn write_policy(
                         .with_context(context)?;
                 }
                 status => bail!(
-                    "the owner did not approve this policy change (status: {}). Do not propose it again unless they ask.",
-                    status.unwrap_or("unknown")
+                    "policy not changed: the update is {} (declined, expired, or the policy changed meanwhile); see wallets/{wallet}/policy-updates/latest/status.json",
+                    status.unwrap_or("in an unknown state")
                 ),
             }
             println!("Policy updated.");
