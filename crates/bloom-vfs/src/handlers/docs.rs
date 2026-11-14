@@ -6,6 +6,54 @@ use std::sync::Arc;
 use crate::handler::{Entry, Handler, HandlerError};
 use crate::path::VfsPath;
 
+/// One short file per topic. The names are the index an agent sees in
+/// `ls docs`, so each says what its file answers.
+const TOPICS: &[(&str, &str)] = &[
+    (
+        "cancel-replace-and-unknown-signing.md",
+        include_str!("../docs/topics/cancel-replace-and-unknown-signing.md"),
+    ),
+    (
+        "confirm-denied-or-failed.md",
+        include_str!("../docs/topics/confirm-denied-or-failed.md"),
+    ),
+    (
+        "error-meanings.md",
+        include_str!("../docs/topics/error-meanings.md"),
+    ),
+    (
+        "paid-http-requests.md",
+        include_str!("../docs/topics/paid-http-requests.md"),
+    ),
+    (
+        "policy-change.md",
+        include_str!("../docs/topics/policy-change.md"),
+    ),
+    (
+        "report-a-bloom-problem.md",
+        include_str!("../docs/topics/report-a-bloom-problem.md"),
+    ),
+    (
+        "sending-by-file-writes.md",
+        include_str!("../docs/topics/sending-by-file-writes.md"),
+    ),
+    (
+        "what-the-owner-sees.md",
+        include_str!("../docs/topics/what-the-owner-sees.md"),
+    ),
+    (
+        "which-wallet-account-chain.md",
+        include_str!("../docs/topics/which-wallet-account-chain.md"),
+    ),
+];
+
+fn topic(name: &str) -> Option<&'static str> {
+    TOPICS
+        .iter()
+        .find(|(topic, _)| *topic == name)
+        .map(|(_, text)| *text)
+}
+
 #[derive(Clone)]
 pub struct DocsHandler {
     readme: String,
@@ -76,6 +124,7 @@ impl DocsHandler {
             [s] if s == "examples.md" => Ok(Entry::file("examples.md")),
             [s] if s == "wallets.md" => Ok(Entry::file("wallets.md")),
             [s] if s == "petals.md" => Ok(Entry::file("petals.md")),
+            [s] if topic(s).is_some() => Ok(Entry::file(s)),
             _ => Err(HandlerError::not_found(path.to_string_path())),
         }
     }
@@ -86,18 +135,21 @@ impl DocsHandler {
             [s] if s == "examples.md" => Ok(self.examples.as_bytes().to_vec()),
             [s] if s == "wallets.md" => Ok(self.wallets.as_bytes().to_vec()),
             [s] if s == "petals.md" => Ok((self.petals)()),
+            [s] if topic(s).is_some() => Ok(topic(s).unwrap_or_default().as_bytes().to_vec()),
             _ => Err(HandlerError::NotAFile(path.to_string_path())),
         }
     }
 
     async fn list_inner(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
         if path.is_root() {
-            Ok(vec![
+            let mut entries = vec![
                 Entry::file("README.md"),
                 Entry::file("examples.md"),
                 Entry::file("wallets.md"),
                 Entry::file("petals.md"),
-            ])
+            ];
+            entries.extend(TOPICS.iter().map(|(name, _)| Entry::file(name)));
+            Ok(entries)
         } else {
             Err(HandlerError::NotADir(path.to_string_path()))
         }
@@ -115,9 +167,14 @@ mod tests {
         let entries = h.list(&VfsPath::root()).await.unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(
-            names,
+            names[..4],
             ["README.md", "examples.md", "wallets.md", "petals.md"]
         );
+        assert_eq!(names.len(), 4 + TOPICS.len());
+        for (name, text) in TOPICS {
+            let path = VfsPath::parse(&format!("/{name}")).unwrap();
+            assert_eq!(h.read(&path).await.unwrap(), text.as_bytes());
+        }
         for e in &entries {
             assert_eq!(e.kind, EntryKind::File);
             // Entry::file => read-only mode.
