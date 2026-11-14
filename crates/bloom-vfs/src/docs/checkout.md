@@ -35,10 +35,14 @@ is running.
 ## Browse
 
 Write `checkout/browse/<slot>/in.json`, then read `out.json` (kept five
-minutes). Reuse the slot. Actions: `open` + `url`, `snapshot`, `back`.
-Generic `click`, `type` and `select` are refused: any merchant event handler
-can charge a saved payment method, regardless of the control's label. Request
-a private take-over for those interactions.
+minutes). Reuse the slot. Actions: `open` + `url`, `snapshot`, `back`,
+`click` + `element_ref`, `type` + `element_ref` + `text`, `select` +
+`element_ref` + `value`. Do the browsing, signup forms and configuration
+yourself. Pay buttons and card and password fields are always refused; the
+person handles those in a take-over or a payment. Once the person stays signed
+in to an account, `click`, `type` and `select` are refused until the next
+sign-out, unless they chose "agent continues": a merchant handler on any
+control can charge a card saved on that account.
 
 - Take a fresh snapshot after every action; refs expire. Pages load in
   stages: if a control is missing or the page changed, snapshot again before
@@ -93,6 +97,8 @@ Any interaction may charge a shop-saved method, so the result remains
 view can return as `returned`. Shopping restarts on a blank page, without the
 page they left. It also loses their login unless they choose to stay signed in
 (not offered after a saved traveler was filled); you then see signed-in pages.
+After a signup or a login to an account with no saved card, tell them to
+choose "Done, no card saved here: agent continues" so you can keep working.
 If a shop needs a login to browse, say so in `agent_description`. Reopen the
 shop and recheck the basket.
 The first cardless take-over enrolls a passkey without requiring a saved card
