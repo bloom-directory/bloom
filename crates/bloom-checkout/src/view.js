@@ -77,9 +77,8 @@ document.getElementById('typing').addEventListener('submit', event => {
   event.preventDefault();const input = document.getElementById('text');const text=input.value;input.value='';act({action:'type',text});
 });
 document.querySelectorAll('[data-key]').forEach(button=>button.addEventListener('click',()=>act({action:'key',key:button.dataset.key})));
-document.getElementById('finish').addEventListener('click',()=>act({action:'finish'}));
-document.getElementById('stay-signed-in').addEventListener('click',()=>act({action:'finish',stay_signed_in:true}));
-document.getElementById('agent-continues').addEventListener('click',()=>act({action:'finish',stay_signed_in:true,agent_continues:true}));
+let staySignedIn=false;
+document.getElementById('finish').addEventListener('click',()=>act({action:'finish',stay_signed_in:staySignedIn}));
 async function savedOptions() {
   const response = await privateFetch('/saved');
   if (!response.ok) return;
@@ -175,15 +174,15 @@ async function refresh() {
     }
     const state=await response.json();status.textContent=describe(state);
     document.getElementById('saved-tools').hidden = !state.can_use_saved || !hasSaved;
-    for (const id of ['agent-continues', 'stay-signed-in', 'stay-note']) document.getElementById(id).hidden = !state.can_stay_signed_in;
-    document.getElementById('finish').classList.toggle('primary', !state.can_stay_signed_in);
+    staySignedIn = Boolean(state.can_stay_signed_in);
+    document.getElementById('stay-note').hidden = !staySignedIn;
     document.getElementById('task').hidden = !state.agent_description;
     document.getElementById('task-text').textContent = state.agent_description || '';
     showSaved(state.saved);
     if(state.state==='human_control'){
       document.getElementById('heading').textContent="Your turn in Bloom's browser";
       document.getElementById('purpose').hidden=true;
-      document.getElementById('finish').textContent=state.can_stay_signed_in ? 'Done, sign me out' : 'Done';
+      document.getElementById('finish').textContent='Done';
       document.getElementById('note').hidden=true;
     }
     if(state.state==='needs_input') {
