@@ -1342,8 +1342,8 @@ impl IpcServer {
         };
         let waiting_for = self.approval_id(&challenge).await;
         match self.vfs.write(&path, &bytes).await {
-            Err(HandlerError::PermissionDenied) => {
-                self.await_approval(&path, &bytes, &challenge, waiting_for, context)
+            Err(denied @ (HandlerError::PermissionDenied | HandlerError::ApprovalPending(_))) => {
+                self.await_approval(&path, &bytes, &challenge, waiting_for, denied, context)
                     .await
             }
             result => Ok(result?),
@@ -1369,6 +1369,7 @@ impl IpcServer {
         bytes: &[u8],
         challenge_path: &VfsPath,
         waiting_for: Option<String>,
+        denied: HandlerError,
         context: &IpcOperationContext,
     ) -> Result<(), WriteError> {
         let deadline = tokio::time::Instant::now() + self.approval_wait;
@@ -1381,7 +1382,7 @@ impl IpcServer {
                 // challenge that disappears mid-wait means the entry left
                 // `pending/` (sent, cancelled, expired): report where it went.
                 if first {
-                    return Err(HandlerError::PermissionDenied.into());
+                    return Err(denied.into());
                 }
                 return Ok(self.vfs.write(path, bytes).await?);
             };
@@ -1406,7 +1407,9 @@ impl IpcServer {
                 "active" => {
                     retried_active = true;
                     match self.vfs.write(path, bytes).await {
-                        Err(HandlerError::PermissionDenied) => continue,
+                        Err(HandlerError::PermissionDenied | HandlerError::ApprovalPending(_)) => {
+                            continue;
+                        }
                         result => return Ok(result?),
                     }
                 }
@@ -1425,7 +1428,7 @@ impl IpcServer {
                     format!("{url} (also in {challenge_file})")
                 };
                 return Err(WriteError::Approval(format!(
-                    "permission denied: owner approval required. Give the human the ceremony link {link}, then write confirm to {} again; it waits for the approval and sends.",
+                    "permission denied: owner approval required. Show the human the ceremony link {link}, then write confirm to {} again right away, without waiting for their reply; it waits for the approval and sends.",
                     path.to_string_path()
                 )));
             }
@@ -2768,7 +2771,8 @@ mod tests {
             }
             self.challenged.store(true, Ordering::SeqCst);
             if *self.state.lock().unwrap() != "active" {
-                return Err(HandlerError::PermissionDenied);
+                // The variant the real wallet handler returns.
+                return Err(HandlerError::ApprovalPending(path.to_string_path()));
             }
             self.signatures.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -2814,7 +2818,7 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         assert_eq!(error.code, -32007);
         for needle in [
-            "give the human the ceremony link http://localhost:28735/c/abc",
+            "show the human the ceremony link http://localhost:28735/c/abc",
             "/wallets/w/0/chains/base/outbox/pending/tx-1/approval_challenge.json",
             "write confirm to /wallets/w/0/chains/base/outbox/pending/tx-1/confirm again",
         ] {

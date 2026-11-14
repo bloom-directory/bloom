@@ -10,6 +10,31 @@ walkthroughs (including contract deploys and local Anvil), `docs/wallets.md` cov
 passkeys and sessions, and `docs/petals.md` lists installed Petals. Read a
 Petal's `README.md` and `AGENTS.md` before using its routes.
 
+## Without a mount
+
+With no mounted filesystem, `bloom vfs cat|ls|write <path>` reaches the same
+paths (this file is `/AGENTS.md`). Put reads you need together in one shell
+command. Two commands run the transaction loop below for an outbox
+transaction:
+
+```sh
+bloom wallet stage <wallet> <chain> --intent '<body>'  # entry id, its plan and policy check
+bloom wallet confirm <wallet> <chain> <id>             # sends; prints the hash and receipt
+```
+
+Read the plan before you confirm. When confirm prints `Approval required`
+(exit 3), show the human the link in a message and run the same confirm
+again in the same turn: it waits for their approval, then sends. Do not end
+your turn to wait for them. `<body>` is one of:
+
+```text
+send 0.25 ETH to 0x...
+{"kind":"send","to":"0x...","token":"USDC","amount":"10"}              human units
+{"kind":"approve","token":"0x...","spender":"0x...","amount":"1000000"}  raw units; "0" revokes
+{"kind":"raw","to":"0x...","data":"0x...","value":"0"}                  any contract call
+{"kind":"call","contract":"0x...","method":"transfer(address,uint256)","args":["0x...","1"]}
+```
+
 ## Funds and missing details
 
 `wallets/<wallet>/<n>/holdings.json` lists an account's non-zero native and
@@ -70,9 +95,10 @@ For outbox transactions:
 3. If the human asked only to prepare it, stop and report the entry.
    Otherwise write `confirm` to that entry's `confirm` file.
 4. If confirm fails:
-   - **Permission denied**: the owner must approve. Give the human the
-     ceremony link from the error, then write `confirm` again: it waits for
-     their approval and sends. Repeat if it times out. On a mount it does not
+   - **Permission denied**: the owner must approve. Show the human the
+     ceremony link from the error in a message, then write `confirm` again
+     in the same turn: it waits for their approval and sends. Do not end
+     your turn to wait for them; repeat if it times out. On a mount it does not
      wait: read `approval_challenge.json`, check its wallet, action, intent
      and expiry, and follow its `next`. For `expired`, `cancelled` or
      `refused`, tell the human.

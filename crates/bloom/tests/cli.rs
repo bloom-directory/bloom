@@ -1050,8 +1050,8 @@ fn vfs_cat_root_agent_guidance_returns_identical_content() {
         "guidance should use mounted filesystem examples"
     );
     assert!(
-        !text.contains("bloom vfs"),
-        "guidance should not mention the bloom vfs CLI"
+        text.contains("bloom wallet stage") && text.contains("bloom wallet confirm"),
+        "guidance should name the two-command transaction path"
     );
 }
 
@@ -1906,7 +1906,11 @@ fn wallet_stage_routes_via_ipc_when_home_write_lock_is_live() {
         .args(["wallet", "stage", "alice", "anvil", "--intent", intent])
         .assert()
         .success()
+        // stdout stays the bare id for scripts; the next step goes to stderr.
         .stdout(predicate::eq("tx-1\n"))
+        .stderr(predicate::str::contains(
+            "bloom wallet confirm alice anvil tx-1\n",
+        ))
         .stderr(predicate::str::contains("already open for writing").not());
 
     bloom_cmd(home.path())
@@ -1922,7 +1926,10 @@ fn wallet_stage_routes_via_ipc_when_home_write_lock_is_live() {
         ])
         .assert()
         .success()
-        .stdout(predicate::eq("tx-2\n"));
+        .stdout(predicate::eq("tx-2\n"))
+        .stderr(predicate::str::contains(
+            "bloom wallet confirm alice anvil tx-2 --account 7",
+        ));
 
     stop_ipc_server(server, server_thread);
     let writes = wallets.writes();
@@ -2605,9 +2612,7 @@ fn wallet_confirm_reports_the_pending_ceremony_url() {
         .stdout(predicate::str::contains(
             "Approval required: open http://localhost:18734/c/secret",
         ))
-        .stdout(predicate::str::contains(
-            "re-run this confirm after approving",
-        ));
+        .stdout(predicate::str::contains("re-run this confirm right away"));
 
     stop_ipc_server(server, server_thread);
 }
