@@ -76,7 +76,7 @@ struct LooseIntent {
 
 impl LooseIntent {
     fn into_raw(self) -> Result<RawIntent, ParseError> {
-        if self.extra.contains_key("intent") {
+        if self.extra.get("intent").is_some_and(|v| v.is_object()) {
             return Err(ParseError::Invalid(format!(
                 "put the intent's fields at the top level, not under \"intent\"; expected {SHAPES}"
             )));
@@ -480,6 +480,8 @@ mod tests {
                 r#"{{"kind":"call","contract":"{to}","method":"transfer(address,uint256)","args":["{to}","1"]}}"#
             ),
             r#"{"kind":"deploy","data":"0x60006000f3","value":"0"}"#.into(),
+            // A stray string field named "intent" is ignored like any other extra field.
+            format!(r#"{{"kind":"send","to":"{to}","value":"1 eth","intent":"note"}}"#),
         ] {
             super::parse(&input).unwrap();
         }
