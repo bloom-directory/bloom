@@ -6,11 +6,12 @@ all paths mount-relative. Keep scratch files outside the mount.
 
 Before acting, read `next.md` (pending outbox entries, approvals and policy
 updates) and `wallets/<wallet>/<n>/holdings.json` (balances) in one command;
-`ls wallets` names the wallets. Read on demand:
-`cat docs/README.md` lists every route, `docs/examples.md` has command
-walkthroughs (including contract deploys and local Anvil), `docs/wallets.md` covers accounts, wallet creation, recovery,
-passkeys and sessions, and `docs/petals.md` lists installed Petals. Read a
-Petal's `README.md` and `AGENTS.md` before using its routes.
+`ls wallets` names the wallets. This file covers sending, approving, contract
+calls and policy changes. Read another doc only when the task needs it:
+`docs/petals.md` to use an installed Petal (then that Petal's `README.md` and
+`AGENTS.md`), `docs/wallets.md` for wallet creation, recovery, passkeys and
+sessions, `docs/examples.md` for contract deploys, fee repair, NFTs, Solana
+and local Anvil, `cat docs/README.md` for any other route.
 
 ## Without a mount
 
@@ -86,9 +87,8 @@ it does not create a local wallet. Follow
 
 For outbox transactions:
 
-1. Stage once: write the body to `outbox/new.tx` (every shape, including
-   approve and contract calls, in `docs/examples.md`) or to a Petal's `new`
-   (its README). Wherever these
+1. Stage once: write the body (shapes above) to `outbox/new.tx` or to a
+   Petal's `new` (its README). Wherever these
    steps say to write `confirm`, including after approval, confirm a
    Petal's entry where its README says instead. That confirm never waits
    for approval: retry it there once the owner approves.
@@ -165,11 +165,13 @@ outcomes from receipts and the Petal's status files.
 
 Only propose a policy change when the owner explicitly asks for that change;
 do not initiate one to make a refused transaction succeed.
-Replacing `wallets/<wallet>/policy.json` starts a Broker ceremony. Keep the
-exact same proposed bytes through `policy.validate_update`, approval and the
-`policy.commit_update` retry, then read
-`policy-updates/confirmed/<action_id>/status.json`. See
-`docs/examples.md`.
+Writing the complete new policy to `wallets/<wallet>/policy.json` starts a
+Broker ceremony (`policy.validate_update`). Show the human the link, then
+write the exact same proposed bytes again (`policy.commit_update`).
+`bloom vfs write` prints the link, and its repeat waits for the
+approval and installs the policy. On a mount the link is in
+`policy-updates/latest/status.json`; write again after they approve, then
+read `policy-updates/confirmed/<action_id>/status.json`.
 
 Reusable authority is under `wallets/<wallet>/sealed-approvals/`. A Petal can
 use it but cannot create, broaden, renew or revoke it.
