@@ -851,6 +851,15 @@ fn confirm_challenge_path(path: &VfsPath) -> Option<VfsPath> {
     }
 }
 
+/// `.../outbox/pending/<id>/confirm` → `.../outbox/sent/<id>`.
+fn sent_entry_path(confirm: &VfsPath) -> Option<VfsPath> {
+    let mut segments = confirm.segments().to_vec();
+    segments.pop();
+    let state = segments.len().checked_sub(2)?;
+    segments[state] = "sent".into();
+    VfsPath::parse(&format!("/{}", segments.join("/"))).ok()
+}
+
 impl IpcServer {
     pub fn new(vfs: Vfs, version: impl Into<String>, chains: Vec<String>) -> Self {
         Self {
@@ -1383,6 +1392,12 @@ impl IpcServer {
                 // `pending/` (sent, cancelled, expired): report where it went.
                 if first {
                     return Err(denied.into());
+                }
+                // Another confirm signed with this approval and sent it.
+                if let Some(sent) = sent_entry_path(path)
+                    && self.vfs.lookup(&sent).await.is_ok()
+                {
+                    return Ok(());
                 }
                 return Ok(self.vfs.write(path, bytes).await?);
             };
@@ -2746,6 +2761,10 @@ mod tests {
     #[async_trait::async_trait]
     impl Handler for ApprovalEntry {
         async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+            // A signed entry leaves pending/ for sent/.
+            if path.segments().iter().any(|s| s == "sent") && self.signatures() == 0 {
+                return Err(HandlerError::NotFound(path.to_string_path()));
+            }
             Ok(Entry::file(path.segments().last().unwrap()))
         }
 
@@ -2838,12 +2857,9 @@ mod tests {
             approve_after(&entry, 700, "active")
         );
         assert_eq!(entry.signatures(), 1);
+        // Both report the send; neither tells its agent the confirm failed.
         let outcomes = [first.map(|e| e.code), second.map(|e| e.code)];
-        assert!(outcomes.contains(&None), "{outcomes:?}");
-        assert!(
-            outcomes.iter().all(|o| matches!(o, None | Some(-32004))),
-            "{outcomes:?}"
-        );
+        assert_eq!(outcomes, [None, None]);
     }
 
     #[tokio::test]
