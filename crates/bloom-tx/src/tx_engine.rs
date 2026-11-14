@@ -427,6 +427,8 @@ type EntryLocks =
     Arc<parking_lot::Mutex<HashMap<(String, String, String), Weak<tokio::sync::Mutex<()>>>>>;
 
 const TRIAD_SIGNING_STATE_FILE: &str = crate::outbox::SIGNING_STATE_FILE;
+/// Why a policy-denied entry is in `failed/`.
+pub const DENIED_MARKER: &str = "denied.txt";
 const TRIAD_BATCH_STATE_DIR: &str = crate::outbox::BATCH_SIGNING_STATE_DIR;
 const TRIAD_BATCH_STATE_FILE: &str = crate::outbox::SIGNING_STATE_FILE;
 const TRIAD_EXACT_APPROVAL_TTL_MS: u64 = 10 * 60 * 1_000;
@@ -2165,10 +2167,7 @@ impl TxEngine {
 
         let hard = policy_engine::has_hard_violation(&staged.policy_checks);
         if hard {
-            // The denial stands even if recording it fails.
-            if let Err(e) = self.outbox.transition_with_status(&entry, TxStatus::Failed) {
-                warn!(id = %staged.id, error = %e, "tx.policy_denied_record_failed");
-            }
+            self.record_policy_denial(&entry);
             debug!(
                 id = %staged.id,
                 wallet,
@@ -2609,10 +2608,7 @@ impl TxEngine {
         // Policy gate.
         let hard = policy_engine::has_hard_violation(&staged.policy_checks);
         if hard {
-            // The denial stands even if recording it fails.
-            if let Err(e) = self.outbox.transition_with_status(&entry, TxStatus::Failed) {
-                warn!(id = %staged.id, error = %e, "tx.policy_denied_record_failed");
-            }
+            self.record_policy_denial(&entry);
             debug!(
                 id = %staged.id,
                 wallet,
@@ -3065,6 +3061,30 @@ impl TxEngine {
     /// told to "broadcast nonce N first" with nothing saying which row that
     /// is. Discarding a never-signed row releases its nonce and needs no
     /// approval, so naming the holder is the whole fix.
+    /// Move a policy-denied entry to `failed/` and write `denied.txt` naming
+    /// the refusing rules, beside expiry's `expired.txt` and a user cancel's
+    /// `cancel.txt`, so a reader can tell why it failed. The denial stands
+    /// even if recording it fails.
+    fn record_policy_denial(&self, entry: &crate::outbox::OutboxEntry) {
+        let reasons: String = entry
+            .staged
+            .policy_checks
+            .iter()
+            .filter(|check| check.outcome == bloom_proto::PolicyOutcome::Deny)
+            .map(|check| format!("denied by policy: {}: {}\n", check.rule, check.message))
+            .collect();
+        if let Err(e) = self
+            .outbox
+            .transition_with_status(entry, TxStatus::Failed)
+            .and_then(|dir| {
+                self.outbox
+                    .write_artefact(&dir, DENIED_MARKER, reasons.as_bytes())
+            })
+        {
+            warn!(id = %entry.staged.id, error = %e, "tx.policy_denied_record_failed");
+        }
+    }
+
     fn pending_nonce_holders(
         &self,
         wallet: &str,
@@ -12116,6 +12136,12 @@ mod tests {
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(entry.dir.join("intent.json")).unwrap()).unwrap();
         assert_eq!(raw["status"], "failed");
+        // bloom#285: the entry says why it failed, unlike an expiry.
+        assert_eq!(
+            std::fs::read_to_string(entry.dir.join(DENIED_MARKER)).unwrap(),
+            "denied by policy: caps.max_value_eth: value exceeds max\n"
+        );
+        assert!(!entry.dir.join("expired.txt").exists());
 
         // The mounted confirm path prepares before it submits. It must expose
         // the same terminal outcome to a Petal reconciling its execution.
@@ -12130,6 +12156,7 @@ mod tests {
         let entry = engine.outbox.read("alice", "anvil", &staged.id).unwrap();
         assert_eq!(entry.state, OutboxState::Failed);
         assert_eq!(entry.staged.status, TxStatus::Failed);
+        assert!(entry.dir.join(DENIED_MARKER).exists());
     }
 
     #[tokio::test]

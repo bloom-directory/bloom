@@ -4646,12 +4646,26 @@ impl WalletsHandler {
                 }
                 self.require_outbox_petal_eligibility_for_action(wallet, chain, id, true)
                     .await?;
-                let _ = self
+                match self
                     .tx_engine
                     .cancel(self.write_permit()?, wallet, chain, id, &client, 10, policy)
                     .await
-                    .map_err(err_be)?;
-                Ok(())
+                {
+                    Ok(_) => Ok(()),
+                    // The cancellation waits on the owner; its challenge is
+                    // projected wherever the entry now is (usually `sent/`).
+                    Err(TxEngineError::ApprovalRequired(_)) => {
+                        let state = self
+                            .tx_engine
+                            .outbox
+                            .read(wallet, chain, id)
+                            .map_or("pending", |entry| entry.state.dirname());
+                        Err(HandlerError::ApprovalPending(format!(
+                            "{outbox}/{state}/{id}/{APPROVAL_CHALLENGE_FILE}"
+                        )))
+                    }
+                    Err(other) => Err(err_be(other)),
+                }
             }
             // outbox/pending/<id>/replace accepts only an exact EIP-1559 fee
             // pair. Any other body is refused before anything is recorded.
@@ -9005,6 +9019,77 @@ value = "0""#,
             panic!("expected wallet registration prepare request")
         };
         assert_eq!(request.wallet_id.as_ref(), Some(&token(&name)));
+    }
+
+    /// bloom#285: a cancel of a broadcast entry that waits on the owner is
+    /// readable at `sent/<id>/approval_challenge.json`, the path the cancel
+    /// write's approval-pending error names.
+    #[tokio::test]
+    async fn a_waiting_cancel_of_a_sent_entry_is_projected_from_sent() {
+        let mut f = make_handler_with_chain(true);
+        let w = f.wallet_name.clone();
+        let approval = digest(22);
+        let mut waiting = approval_status(
+            approval.clone(),
+            &w,
+            ApprovalLifecycleState::AwaitingCeremony,
+        );
+        waiting.ceremony_url = Some("https://relay.test/ceremony/#cap=cancel".into());
+        waiting.ceremony_expires_at_ms = Some(DecimalU64::new(60_000));
+        f.handler = f
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(approval_broker(vec![
+                waiting,
+            ]))));
+        seed_pending(&f, "sent-cancel");
+        let outbox = &f.handler.tx_engine.outbox;
+        let pending = outbox
+            .read_in_state(&w, "anvil", "sent-cancel", OutboxState::Pending)
+            .unwrap();
+        let sent_dir = outbox.transition(&pending, OutboxState::Sent).unwrap();
+        std::fs::write(
+            sent_dir.join("ceremony.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "bloom.machine-evm-signing.1",
+                "action_id": "31337:sent-cancel:cancel",
+                "approval_id": approval.as_str(),
+                "ceremony_url": "https://relay.test/ceremony/#cap=cancel",
+                "ceremony_expires_at_ms": "60000",
+                "sign_dispatched": false,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let dir = format!("/{w}/0/chains/anvil/outbox/sent/sent-cancel");
+        let names: Vec<String> = f
+            .handler
+            .list(&vfs(dir.clone()))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert!(
+            names.contains(&"approval_challenge.json".to_string()),
+            "{names:?}"
+        );
+        let challenge: serde_json::Value = serde_json::from_slice(
+            &f.handler
+                .read(&vfs(format!("{dir}/approval_challenge.json")))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(challenge["state"], "awaiting_ceremony");
+        assert_eq!(
+            challenge["ceremony_url"],
+            "https://relay.test/ceremony/#cap=cancel"
+        );
+        assert_eq!(
+            challenge["retry_path"],
+            format!("wallets/{w}/0/chains/anvil/outbox/pending/sent-cancel/cancel")
+        );
+        assert_eq!(challenge["value_wei"], "0");
     }
 
     #[tokio::test]
