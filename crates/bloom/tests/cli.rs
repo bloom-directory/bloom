@@ -1906,7 +1906,11 @@ fn wallet_stage_routes_via_ipc_when_home_write_lock_is_live() {
         .args(["wallet", "stage", "alice", "anvil", "--intent", intent])
         .assert()
         .success()
+        // stdout stays the bare id for scripts; the next step goes to stderr.
         .stdout(predicate::eq("tx-1\n"))
+        .stderr(predicate::str::contains(
+            "bloom wallet confirm alice anvil tx-1\n",
+        ))
         .stderr(predicate::str::contains("already open for writing").not());
 
     bloom_cmd(home.path())
@@ -1922,7 +1926,10 @@ fn wallet_stage_routes_via_ipc_when_home_write_lock_is_live() {
         ])
         .assert()
         .success()
-        .stdout(predicate::eq("tx-2\n"));
+        .stdout(predicate::eq("tx-2\n"))
+        .stderr(predicate::str::contains(
+            "bloom wallet confirm alice anvil tx-2 --account 7",
+        ));
 
     stop_ipc_server(server, server_thread);
     let writes = wallets.writes();
