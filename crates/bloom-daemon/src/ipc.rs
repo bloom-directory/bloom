@@ -871,6 +871,12 @@ impl IpcServer {
         }
     }
 
+    /// How long a repeated confirm waits for the owner's approval.
+    pub fn with_approval_wait(mut self, wait: std::time::Duration) -> Self {
+        self.approval_wait = wait;
+        self
+    }
+
     /// Enable `petals.*` IPC methods. Without this the methods return
     /// `-32601 method not found`.
     pub fn with_petals(mut self, runner: PetalRunner) -> Self {

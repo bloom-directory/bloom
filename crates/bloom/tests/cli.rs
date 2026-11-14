@@ -500,7 +500,9 @@ fn spawn_ipc_server(
         .enable_all()
         .build()
         .expect("build tokio runtime");
-    let server = IpcServer::new(vfs, "ipc-test-version", vec!["ipc-chain".into()]);
+    let server = IpcServer::new(vfs, "ipc-test-version", vec!["ipc-chain".into()])
+        // A repeated confirm waits this long for the owner; no test has one.
+        .with_approval_wait(Duration::from_millis(200));
     let server_for_thread = server.clone();
     let socket_for_thread = socket.clone();
     let server_thread = std::thread::spawn(move || {
@@ -2300,7 +2302,9 @@ fn vfs_routes_via_ipc_when_socket_exists() {
         .enable_all()
         .build()
         .expect("build tokio runtime");
-    let server = IpcServer::new(vfs, "ipc-test-version", vec!["ipc-chain".into()]);
+    let server = IpcServer::new(vfs, "ipc-test-version", vec!["ipc-chain".into()])
+        // A repeated confirm waits this long for the owner; no test has one.
+        .with_approval_wait(Duration::from_millis(200));
     let server_for_thread = server.clone();
     let socket_for_thread = socket.clone();
     let server_thread = std::thread::spawn(move || {
@@ -2668,6 +2672,10 @@ fn wallet_confirm_reports_an_already_broadcast_transaction_instead_of_not_found(
         "/alice/0/chains/base/outbox/sent/0001-beef/intent.json".to_string(),
         b"{\"tx_hash\":\"0xabc123\"}".to_vec(),
     );
+    files.insert(
+        "/alice/0/chains/base/outbox/sent/0001-beef/receipt.json".to_string(),
+        b"{\"outcome\":\"success\"}\n".to_vec(),
+    );
     let handler = Arc::new(ServingHandler {
         files,
         write_error: HandlerError::NotFound("state mismatch".into()),
@@ -2690,7 +2698,10 @@ fn wallet_confirm_reports_an_already_broadcast_transaction_instead_of_not_found(
         .assert()
         .success()
         .stdout(predicate::str::contains("Already broadcast: 0xabc123"))
-        .stdout(predicate::str::contains("outbox/sent/0001-beef"));
+        .stdout(predicate::str::contains("outbox/sent/0001-beef"))
+        .stdout(predicate::str::contains(
+            "Receipt: {\"outcome\":\"success\"}\n",
+        ));
 
     stop_ipc_server(server, server_thread);
 }

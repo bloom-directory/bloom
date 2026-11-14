@@ -3489,8 +3489,8 @@ fn print_approval_pending(url: &str, expires_at_ms: u128, petal_next: Option<&st
 }
 
 /// Print the mined result, waiting a few seconds for it, so the caller need
-/// not read `sent/<id>/receipt.json` separately. Silent when the chain has not
-/// mined the transaction by then.
+/// not read `sent/<id>/receipt.json` separately. On a chain that has not mined
+/// the transaction by then, say where the receipt will appear.
 async fn print_receipt(
     endpoint: &ResolvedEndpoint,
     wallet: &str,
@@ -3506,6 +3506,7 @@ async fn print_receipt(
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
+    println!("Receipt: not mined yet; read {}", &path[1..]);
 }
 
 fn confirm_context_note(projection: &ConfirmProjection) -> Option<String> {
