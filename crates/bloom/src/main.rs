@@ -3424,22 +3424,7 @@ async fn confirm_projection(
     );
     if let Ok(bytes) = ipc_read(endpoint, &challenge_path).await {
         let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-        let url = value
-            .get("ceremony_url")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        let expires_at_ms = value
-            .get("expiry_ms")
-            .and_then(|field| {
-                field
-                    .as_u64()
-                    .or_else(|| field.as_str().and_then(|s| s.parse::<u64>().ok()))
-            })
-            .map(u128::from);
-        if let Some(url) = url
-            && !url.trim().is_empty()
-            && expires_at_ms.is_some_and(|expires| expires > unix_now_ms())
-        {
+        if let Some((url, expires_at_ms)) = live_ceremony(&value) {
             let petal_next = value
                 .get("staged_by")
                 .is_some_and(serde_json::Value::is_string)
@@ -3448,7 +3433,7 @@ async fn confirm_projection(
                 .map(str::to_string);
             return Some(ConfirmProjection::Ceremony {
                 url,
-                expires_at_ms: expires_at_ms.unwrap_or(0),
+                expires_at_ms,
                 petal_next,
             });
         }
@@ -3521,15 +3506,21 @@ fn approval_pending_text(
 async fn approval_challenge_link(vfs: &bloom_vfs::Vfs, path: &str) -> Option<(String, u128)> {
     let path = bloom_vfs::VfsPath::parse(&format!("/{}", path.trim_start_matches('/'))).ok()?;
     let bytes = bloom_vfs::Handler::read(vfs, &path).await.ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let url = value.get("ceremony_url")?.as_str()?.trim().to_string();
-    let expires_at_ms = value.get("expiry_ms").and_then(|field| {
+    live_ceremony(&serde_json::from_slice(&bytes).ok()?)
+}
+
+/// The ceremony link and expiry of an `approval_challenge.json` whose
+/// ceremony has not expired.
+fn live_ceremony(challenge: &serde_json::Value) -> Option<(String, u128)> {
+    let url = challenge.get("ceremony_url")?.as_str()?;
+    let expires_at_ms = challenge.get("expiry_ms").and_then(|field| {
         field
             .as_u64()
             .or_else(|| field.as_str().and_then(|text| text.parse().ok()))
     })?;
-    (!url.is_empty() && u128::from(expires_at_ms) > unix_now_ms())
-        .then_some((url, u128::from(expires_at_ms)))
+    let expires_at_ms = u128::from(expires_at_ms);
+    (!url.trim().is_empty() && expires_at_ms > unix_now_ms())
+        .then(|| (url.to_string(), expires_at_ms))
 }
 
 fn confirm_context_note(projection: &ConfirmProjection) -> Option<String> {

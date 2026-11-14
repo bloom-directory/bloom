@@ -2214,7 +2214,7 @@ fn evm_signing_state(entry: &bloom_tx::outbox::OutboxEntry) -> Option<serde_json
 }
 
 fn evm_cancel_action(entry: &bloom_tx::outbox::OutboxEntry) -> String {
-    format!("{}:{}:cancel", entry.staged.chain_id, entry.staged.id)
+    bloom_tx::tx_engine::cancel_action_id(&entry.staged)
 }
 
 /// The public approval challenge for a pending EVM entry, in the same shape
@@ -2282,8 +2282,7 @@ fn evm_approval_challenge(
     {
         // A same-nonce self-send of nothing that replaces the original; the
         // plan is the original's, which is what gets cancelled.
-        staged.to = Some(staged.from.clone());
-        staged.value_wei = "0".into();
+        staged = bloom_tx::tx_engine::cancellation_candidate(&staged).map_err(err_be)?;
         retry_body = serde_json::Value::String("y".into());
         control = "cancel";
     }

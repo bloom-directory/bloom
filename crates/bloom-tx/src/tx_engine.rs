@@ -3048,19 +3048,6 @@ impl TxEngine {
         Ok(())
     }
 
-    /// Persist a machine-readable advisory beside a pending entry when its
-    /// broadcast was refused by [`Self::assert_nonce_not_ahead_of_chain`], so an
-    /// agent can see the exact gap and how to resolve it without re-deriving it.
-    /// The pending transactions of the same sender holding nonces in
-    /// `[chain_next, staged)`, lowest first.
-    ///
-    /// Staging reserves a nonce before anything is approved, so a transaction
-    /// that is later refused — by wallet policy, or simply never confirmed —
-    /// goes on holding one. Everything staged after it is then correctly
-    /// refused for a gap it did not create, and without this the owner is
-    /// told to "broadcast nonce N first" with nothing saying which row that
-    /// is. Discarding a never-signed row releases its nonce and needs no
-    /// approval, so naming the holder is the whole fix.
     /// Move a policy-denied entry to `failed/` and write `denied.txt` naming
     /// the refusing rules, beside expiry's `expired.txt` and a user cancel's
     /// `cancel.txt`, so a reader can tell why it failed. The denial stands
@@ -3085,6 +3072,19 @@ impl TxEngine {
         }
     }
 
+    /// Persist a machine-readable advisory beside a pending entry when its
+    /// broadcast was refused by [`Self::assert_nonce_not_ahead_of_chain`], so an
+    /// agent can see the exact gap and how to resolve it without re-deriving it.
+    /// The pending transactions of the same sender holding nonces in
+    /// `[chain_next, staged)`, lowest first.
+    ///
+    /// Staging reserves a nonce before anything is approved, so a transaction
+    /// that is later refused — by wallet policy, or simply never confirmed —
+    /// goes on holding one. Everything staged after it is then correctly
+    /// refused for a gap it did not create, and without this the owner is
+    /// told to "broadcast nonce N first" with nothing saying which row that
+    /// is. Discarding a never-signed row releases its nonce and needs no
+    /// approval, so naming the holder is the whole fix.
     fn pending_nonce_holders(
         &self,
         wallet: &str,
@@ -4762,7 +4762,9 @@ impl TxEngine {
     }
 }
 
-fn cancellation_candidate(original: &StagedTx) -> Result<StagedTx, TxEngineError> {
+/// The same-nonce, zero-value self-send that cancels `original`, before
+/// its fee bump.
+pub fn cancellation_candidate(original: &StagedTx) -> Result<StagedTx, TxEngineError> {
     let from_addr: Address = original
         .from
         .parse()
@@ -5545,8 +5547,13 @@ fn outbox_action_id(staged: &StagedTx, action_kind: EvmOutboxActionKind) -> Stri
             .clone()
             .unwrap_or_else(|| format!("{}:{}", staged.chain_id, staged.id)),
         EvmOutboxActionKind::Replace => format!("{}:{}:replace", staged.chain_id, staged.id),
-        EvmOutboxActionKind::Cancel => format!("{}:{}:cancel", staged.chain_id, staged.id),
+        EvmOutboxActionKind::Cancel => cancel_action_id(staged),
     }
+}
+
+/// The signing action id of `bloom wallet cancel` for `staged`.
+pub fn cancel_action_id(staged: &StagedTx) -> String {
+    format!("{}:{}:cancel", staged.chain_id, staged.id)
 }
 
 /// True when the node answered with a validation error for these exact
