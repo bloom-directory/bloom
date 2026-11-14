@@ -326,6 +326,9 @@ if [ ! -e "$authority_edge_history" ]; then
   chmod 0600 "$authority_edge_history"
 fi
 export BLOOM_AUTHORITY_EDGE_HISTORY="$authority_edge_history"
+# Never inherit the installed Triad's root-owned Machine audit history; a
+# fresh developer root has none.
+export BLOOM_MACHINE_AUDIT_HISTORY="${config_dir}/machine-audit-history.json"
 
 for name in edge-manifest.json machine-identity.json broker-identity.json \
   signer-identity.json session-identity.json broker.json signer.json \
@@ -466,6 +469,7 @@ env_file="${log_dir}/triad.env"
   printf 'export BLOOM_TRIAD_DEV_CEREMONY_ORIGIN=%q\n' "$ceremony_origin"
   printf 'export BLOOM_TRIAD_DEV_REMOTE_UPSTREAM_PORT=%q\n' "$remote_upstream_port"
   printf 'export BLOOM_AUTHORITY_EDGE_HISTORY=%q\n' "$authority_edge_history"
+  printf 'export BLOOM_MACHINE_AUDIT_HISTORY=%q\n' "$BLOOM_MACHINE_AUDIT_HISTORY"
   printf 'export BLOOM_MACHINE_IDENTITY=%q\n' "${config_dir}/machine-identity.json"
   printf 'export BLOOM_EDGE_MANIFEST=%q\n' "${config_dir}/edge-manifest.json"
   printf 'export BLOOM_PROVENANCE_CATALOG=%q\n' "${config_dir}/provenance-catalog.json"

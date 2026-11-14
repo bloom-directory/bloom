@@ -156,18 +156,10 @@ jobs:
           echo "7d588d188cb9ea550434cabc62a9927cf75de22e1aeb2a87f2352071812944fb  /tmp/agave-install.sh" | sha256sum -c -
           sh /tmp/agave-install.sh v3.0.0
           echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
-      # The developer launcher runs the services as systemd user units and
-      # mounts the Machine over loopback NFS with a noninteractive sudo rule;
-      # the runner's unrestricted sudo satisfies that rule.
+      # The developer launcher mounts the Machine over loopback NFS with a
+      # noninteractive sudo rule; the runner's unrestricted sudo satisfies it.
       - name: Install the launcher's Linux prerequisites
-        run: |
-          sudo apt-get update && sudo apt-get install -y nfs-common
-          sudo loginctl enable-linger "$(id -un)"
-          for _ in $(seq 1 30); do
-            [ -S "/run/user/$(id -u)/bus" ] && break
-            sleep 1
-          done
-          XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user show-environment >/dev/null
+        run: sudo apt-get update && sudo apt-get install -y nfs-common
       - name: Smoke the real Triad without a model
         run: scripts/evals/run-harbor.sh solana-transfer "$AGENT" --smoke
       # One task at a time, as the baseline procedure requires. A failed

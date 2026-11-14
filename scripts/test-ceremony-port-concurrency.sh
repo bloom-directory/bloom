@@ -15,8 +15,8 @@
 # a dormant chain entry (name validation only; verified with no node
 # running) so the script never depends on ambient ~/.bloom configuration.
 #
-# Linux-only: the collision assertion reads the contender's socket-unit
-# bind-conflict evidence from the user journal.
+# Linux-only: the collision assertion reads the bind conflict that
+# systemd-socket-activate writes to the contender's own Broker log.
 #
 # Binaries are selected explicitly so the exact files under test stay in
 # the record (no sibling discovery):
@@ -210,54 +210,15 @@ stop_candidate() {
   say "$label launcher stopped"
 }
 
-# True when one exact socket unit journals the bind conflict on the port.
-unit_shows_conflict() {
-  journalctl --user -u "$1" --since "$3" 2>/dev/null |
-    grep -F "Address already in use" | grep -F ":$2" >/dev/null
-}
-
-# Require a bind conflict on the expected port from either of the
-# contender's exact socket units, naming which one reported it. One report
+# Require the bind conflict on the expected port in the contender's own
+# Broker log, where systemd-socket-activate reports it. One report
 # establishes the cause (the requested port was occupied); dual-stack
 # listener validation belongs to the targeted listener tests.
 require_contender_conflict() {
-  token=$1; port=$2; since=$3
-  prefix="bloom-triad-dev-$(id -u)-$token"
-  attempt=0
-  while [ "$attempt" -lt 3 ]; do
-    for family in ipv4 ipv6; do
-      unit=$prefix-broker-ceremony-$family.socket
-      if unit_shows_conflict "$unit" "$port" "$since"; then
-        say "colliding launch on :$port failed on its own unit $unit (address in use) as required"
-        return 0
-      fi
-    done
-    sleep 2; attempt=$((attempt + 1))
-  done
-  die "contender units $prefix-broker-ceremony-ipv4.socket and $prefix-broker-ceremony-ipv6.socket lack journaled bind conflicts on :$port"
-  return $?
-}
-
-# Read the contender's runtime token from its own launcher metadata: the
-# launcher writes logs/triad.env (including BLOOM_TRIAD_DEVELOPER_RUNTIME)
-# before starting socket units, and the log directory survives the
-# contender's cleanup. Only that one line is read; the file is never
-# sourced. Prints the runtime directory basename.
-contender_runtime_token() {
-  env_file=$1
-  [ -f "$env_file" ] || return 1
-  line=$(sed -n 's/^export BLOOM_TRIAD_DEVELOPER_RUNTIME=//p' "$env_file" | head -n 1)
-  [ -n "$line" ] || return 1
-  # Values are shell-quoted (%q); strip one layer of surrounding quotes
-  # defensively without evaluating the contents.
-  case "$line" in
-    \'*\') line=${line#\'}; line=${line%\'} ;;
-    \"*\") line=${line#\"}; line=${line%\"} ;;
-  esac
-  [ -n "$line" ] || return 1
-  token=$(basename "$line")
-  case "$token" in ''|*[^A-Za-z0-9._-]*|.*) return 1 ;; esac
-  printf '%s' "$token"
+  log=$1; port=$2
+  grep -F "Address already in use" "$log" 2>/dev/null | grep -F ":$port" >/dev/null ||
+    { die "contender Broker log $log lacks a bind conflict on :$port"; return $?; }
+  say "colliding launch on :$port failed on its own listener (address in use) as required"
 }
 
 # Launch the colliding contender, supervise it with a deadline, and prove
@@ -267,7 +228,6 @@ contender_runtime_token() {
 run_contender() {
   collide_root="$run_root/collide"
   mkdir -p "$collide_root/developer/machine-home" "$collide_root/logs" "$collide_root/run"
-  contender_start="$(date '+%Y-%m-%d %H:%M:%S')"
   BLOOM_TRIAD_DEV_MACHINE_CONFIG="$machine_config" \
   BLOOM_INTEGRATION_MACHINE_BIN="$bloom_bin" \
   BLOOM_INTEGRATION_BROKER_BIN="$broker_bin" \
@@ -298,9 +258,7 @@ run_contender() {
   wait "$contender_pid" 2>/dev/null || contender_status=$?
   contender_pid=""
   [ "$contender_status" -ne 0 ] || { die "fresh-root launch on occupied port :$port_a unexpectedly succeeded"; return $?; }
-  contender_token="$(contender_runtime_token "$collide_root/logs/triad.env")" ||
-    { die "contender left no runtime metadata; cannot attribute units"; return $?; }
-  require_contender_conflict "$contender_token" "$port_a" "$contender_start" || return $?
+  require_contender_conflict "$collide_root/logs/broker.log" "$port_a" || return $?
 }
 
 cli_for() {
@@ -363,16 +321,19 @@ policy_change() {
   operation_id="$(printf '%s\n' "$policy_launch" | sed -n 's/^operation_id: //p')"
   cli_for "$socket" "$home" wallet commit-policy "$operation_id" >/dev/null ||
     die "$label: policy commit failed"
-  updated="$(cli_for "$socket" "$home" vfs cat "/wallets/${wallet_id}/policy.json")"
   if [ "$operation" = "allow" ]; then
-    printf '%s' "$updated" | jq -e --arg dest "$address" \
-      'any(.allowed_destinations[]; .destination == $dest)' >/dev/null ||
-      die "$label: committed policy lacks the allowlisted destination"
+    expect='any(.allowed_destinations[]; .destination == $dest)'
   else
-    printf '%s' "$updated" | jq -e --arg dest "$address" \
-      'all(.allowed_destinations[]; .destination != $dest)' >/dev/null ||
-      die "$label: committed policy still lists the removed destination"
+    expect='all(.allowed_destinations[]; .destination != $dest)'
   fi
+  # Machine refreshes its policy projection shortly after the commit.
+  attempt=0
+  until cli_for "$socket" "$home" vfs cat "/wallets/${wallet_id}/policy.json" |
+    jq -e --arg dest "$address" "$expect" >/dev/null; do
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 20 ] || die "$label: committed policy change ($operation $address) never appeared"
+    sleep 0.5
+  done
   say "$label assertion ceremony (sign-count $sign_count, $operation destination) committed on :$expect_port"
 }
 
@@ -388,11 +349,10 @@ free_port() {
 }
 
 main() {
-  [ "$(uname -s)" = "Linux" ] || die "Linux with a systemd user manager is required"
+  [ "$(uname -s)" = "Linux" ] || die "Linux is required"
   check_ports
 
   command -v jq >/dev/null 2>&1 || die "jq is required"
-  command -v journalctl >/dev/null 2>&1 || die "journalctl (systemd user journal) is required"
   [ -x "$launcher" ] || die "launcher is not executable: $launcher"
   [ -x "$bloom_bin" ] || die "Machine binary is not executable: $bloom_bin"
   [ -x "$broker_bin" ] || die "Broker binary is not executable: $broker_bin"
@@ -417,8 +377,7 @@ main() {
   say "ports A=$port_a B=$port_b (custody 18734 untouched)"
 
   # Unix socket paths must stay under SUN_LEN (108 bytes), so the run root
-  # stays short under /tmp regardless of the caller's TMPDIR; unit paths
-  # must additionally use only ASCII letters, digits, and `_./:@+-`.
+  # stays short under /tmp regardless of the caller's TMPDIR.
   run_root="$(mktemp -d /tmp/bcp.XXXXXX)"
   trap cleanup EXIT INT TERM
 

@@ -52,7 +52,7 @@ boundaries; see the [development workflow](./DEVELOPMENT.md).
 The full custody acceptance entrypoint is `scripts/acceptance.sh`. It runs
 projection fidelity, raw-key import/transfer, and BIP39 import/transfer through
 the real Machine, Broker, and Signer. It requires Foundry, sibling repositories,
-the Broker debug ceremony driver, and the systemd, trusted-time, and kernel
+the Broker debug ceremony driver, and the trusted-time and kernel
 mount prerequisites documented in the development guide.
 
 Solana package tests can run without a validator:
