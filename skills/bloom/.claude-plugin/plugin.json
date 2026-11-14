@@ -1,7 +1,7 @@
 {
   "name": "bloom",
   "displayName": "Bloom",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Use Bloom, the programmable financial harness for AI agents: balances, payments, trades, and wallets on EVM chains and Solana, with every transaction approved by the user's passkey.",
   "author": {
     "name": "Bloom Directory",
