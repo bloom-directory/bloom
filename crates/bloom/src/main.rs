@@ -3492,12 +3492,10 @@ async fn try_ipc_coded(
 
 fn print_approval_pending(url: &str, expires_at_ms: u128, petal_next: Option<&str>, retry: &str) {
     let remaining = expires_at_ms.saturating_sub(unix_now_ms()) / 1000;
-    println!("Approval required: open {url}");
+    println!("Approval required: {url} (expires in {remaining}s)");
     match petal_next {
-        Some(next) => println!("Ceremony expires in {remaining}s. {next}"),
-        None => println!(
-            "Ceremony expires in {remaining}s. Show the owner that link, then run `{retry}` right away, without waiting for their reply: it waits for the approval, then sends."
-        ),
+        Some(next) => println!("{next}"),
+        None => println!("Next: {retry} (waits for the owner's approval, then sends)"),
     }
 }
 
@@ -4264,13 +4262,33 @@ async fn run(cli: Cli) -> Result<()> {
             // stdout stays the bare id for scripts. The review an agent would
             // otherwise fetch with three more reads goes to stderr.
             let entry = format!("/wallets/{wallet}/{account}/chains/{chain}/outbox/pending/{id}");
-            for file in ["plan.md", "policy_check.json"] {
-                match ipc_read(&client_endpoint, &format!("{entry}/{file}")).await {
-                    Ok(bytes) => {
-                        eprintln!("--- {file}\n{}", String::from_utf8_lossy(&bytes).trim_end());
-                    }
-                    Err(_) => eprintln!("--- {file}\nnot available; read {}/{file}", &entry[1..]),
+            // The plan's last section explains the confirm file; the command
+            // printed below replaces it.
+            match ipc_read(&client_endpoint, &format!("{entry}/plan.md")).await {
+                Ok(bytes) => {
+                    let plan = String::from_utf8_lossy(&bytes);
+                    let plan = plan.split("\n## Confirm").next().unwrap_or_default();
+                    eprintln!("{}", plan.trim_end());
                 }
+                Err(_) => eprintln!("plan not available; read {}/plan.md", &entry[1..]),
+            }
+            // The plan lists each policy result. The full check is worth its
+            // lines only when something did not pass.
+            match ipc_read(&client_endpoint, &format!("{entry}/policy_check.json")).await {
+                Ok(bytes) => {
+                    let passed = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes)
+                        .is_ok_and(|checks| checks.iter().all(|check| check["outcome"] == "pass"));
+                    if !passed {
+                        eprintln!(
+                            "--- policy_check.json\n{}",
+                            String::from_utf8_lossy(&bytes).trim_end()
+                        );
+                    }
+                }
+                Err(_) => eprintln!(
+                    "policy check not available; read {}/policy_check.json",
+                    &entry[1..]
+                ),
             }
             if confirm {
                 return wallet_confirm(
@@ -4284,7 +4302,7 @@ async fn run(cli: Cli) -> Result<()> {
                 .await;
             }
             eprintln!(
-                "--- next\nbloom wallet confirm {wallet} {chain} {id}{}",
+                "Next: bloom wallet confirm {wallet} {chain} {id}{}",
                 account_flag(account)
             );
             Ok(())
@@ -5311,9 +5329,9 @@ async fn write_policy(
         }
     }
     let remaining = expires_at_ms.saturating_sub(unix_now_ms()) / 1000;
-    println!("Approval required: open {url}");
+    println!("Approval required: {url} (expires in {remaining}s)");
     println!(
-        "Ceremony expires in {remaining}s. Show the owner that link, then run this same write again right away, without waiting for their reply: it waits for the approval, then installs the policy."
+        "Next: the same write again (waits for the owner's approval, then installs the policy)"
     );
     EXIT_CODE_OVERRIDE.store(EXIT_APPROVAL_PENDING, std::sync::atomic::Ordering::SeqCst);
     Ok(())

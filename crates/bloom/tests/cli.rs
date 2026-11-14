@@ -2653,10 +2653,10 @@ fn wallet_confirm_reports_the_pending_ceremony_url() {
         // ceremony. Distinct from 0 (broadcast recorded) and 1 (failed).
         .code(3)
         .stdout(predicate::str::contains(
-            "Approval required: open http://localhost:18734/c/secret",
+            "Approval required: http://localhost:18734/c/secret",
         ))
         .stdout(predicate::str::contains(
-            "run `bloom wallet confirm alice base 0001-cafe --account 7` right away",
+            "Next: bloom wallet confirm alice base 0001-cafe --account 7 (waits",
         ));
 
     // Writing the entry's confirm file reports the same link.
@@ -2671,7 +2671,7 @@ fn wallet_confirm_reports_the_pending_ceremony_url() {
         .assert()
         .code(3)
         .stdout(predicate::str::contains(
-            "Approval required: open http://localhost:18734/c/secret",
+            "Approval required: http://localhost:18734/c/secret",
         ));
 
     stop_ipc_server(server, server_thread);
@@ -2971,9 +2971,9 @@ fn vfs_write_of_a_policy_prints_the_approval_link() {
         .assert()
         .code(3)
         .stdout(predicate::str::contains(
-            "Approval required: open http://localhost:18734/c/policy",
+            "Approval required: http://localhost:18734/c/policy",
         ))
-        .stdout(predicate::str::contains("run this same write again"));
+        .stdout(predicate::str::contains("Next: the same write again"));
     stop_ipc_server(server, server_thread);
 }
 
