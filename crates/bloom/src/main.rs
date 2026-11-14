@@ -3488,8 +3488,9 @@ fn print_approval_pending(url: &str, expires_at_ms: u128, petal_next: Option<&st
     }
 }
 
-/// Print the mined result when the node has already returned one, so the
-/// caller need not read `sent/<id>/receipt.json` separately.
+/// Print the mined result, waiting a few seconds for it, so the caller need
+/// not read `sent/<id>/receipt.json` separately. Silent when the chain has not
+/// mined the transaction by then.
 async fn print_receipt(
     endpoint: &ResolvedEndpoint,
     wallet: &str,
@@ -3498,8 +3499,12 @@ async fn print_receipt(
     id: &str,
 ) {
     let path = format!("/wallets/{wallet}/{account}/chains/{chain}/outbox/sent/{id}/receipt.json");
-    if let Ok(bytes) = ipc_read(endpoint, &path).await {
-        println!("Receipt: {}", String::from_utf8_lossy(&bytes).trim_end());
+    for _ in 0..20 {
+        if let Ok(bytes) = ipc_read(endpoint, &path).await {
+            println!("Receipt: {}", String::from_utf8_lossy(&bytes).trim_end());
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
 }
 
