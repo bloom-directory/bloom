@@ -2924,7 +2924,7 @@ impl Handler for PolicyUpdateHandler {
         if !self.written.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(HandlerError::not_found(p.to_string_path()));
         }
-        Ok(br#"{"state":"pending","ceremony_state":"AWAITING_USER","action_id":"a1","ceremony_url":"http://localhost:18734/c/policy","expiry_ms":99999999999999}"#.to_vec())
+        Ok(br#"{"state":"pending","status":"awaiting_custody","action_id":"a1","ceremony_url":"http://localhost:18734/c/policy","expiry_ms":99999999999999}"#.to_vec())
     }
 
     async fn write(&self, _p: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
