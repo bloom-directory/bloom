@@ -284,7 +284,7 @@ stage_triad() {
   fi
 
   # The checks above only fail early. Root trusts none of this stage: the
-  # privileged command in references/install.md copies it, verifies it again
+  # privileged command in the install.md beside this script copies it, verifies it again
   # with the same release key, and only then runs the signed installer.
 
   # Replace only a stage this script made: owned by the user, with an intact

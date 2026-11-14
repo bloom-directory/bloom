@@ -76,6 +76,9 @@ openssl-sys = { version = "0.9", features = ["vendored"] }
 oslog = { version = "0.2", default-features = false }
 
 [dev-dependencies]
+# Release-profile tests lack debug_assertions, so the daemon test
+# constructors are reached only through this feature.
+bloom-daemon = { workspace = true, features = ["unsigned-audit-test-seam"] }
 assert_cmd = "2"
 predicates = "3"
 async-trait.workspace = true
