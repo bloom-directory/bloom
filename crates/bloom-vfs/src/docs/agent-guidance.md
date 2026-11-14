@@ -18,14 +18,16 @@ command. Two commands run the transaction loop below for an outbox
 transaction:
 
 ```sh
-bloom wallet stage <wallet> <chain> --intent '<body>'  # entry id, its plan and policy check
-bloom wallet confirm <wallet> <chain> <id>             # sends; prints the hash and receipt
+bloom wallet stage <wallet> <chain> --confirm --intent '<body>'  # entry id, plan, policy check, approval link
+bloom wallet confirm <wallet> <chain> <id>                       # waits for approval, sends; prints hash and receipt
 ```
 
-Read the plan before you confirm. When confirm prints `Approval required`
-(exit 3), show the human the link in a message and run the same confirm
-again in the same turn: it waits for their approval, then sends. Do not end
-your turn to wait for them. `<body>` is one of:
+Check the plan before you show the link. If it is wrong, discard the entry
+with `bloom wallet confirm <wallet> <chain> <id> --text cancel`. Leave out
+`--confirm` when the human asked only to prepare. On `Approval required`
+(exit 3), show the human the link in a message and run confirm in the same
+turn: it waits for their approval, then sends. Do not end your turn to wait
+for them. `<body>` is one of:
 
 ```text
 send 0.25 ETH to 0x...

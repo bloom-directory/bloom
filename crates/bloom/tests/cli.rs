@@ -1949,9 +1949,30 @@ fn wallet_stage_routes_via_ipc_when_home_write_lock_is_live() {
             "bloom wallet confirm alice anvil tx-3 --account 7",
         ));
 
+    // --confirm also writes the new entry's confirm file. This handler
+    // records no broadcast, so the result is unknown (exit 4).
+    bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "stage",
+            "alice",
+            "anvil",
+            "--confirm",
+            "--intent",
+            intent,
+        ])
+        .assert()
+        .code(4)
+        .stdout(predicate::str::starts_with("tx-4\nConfirmed;"));
+
     stop_ipc_server(server, server_thread);
     let writes = wallets.writes();
-    assert_eq!(writes.len(), 3, "writes={writes:?}");
+    assert_eq!(writes.len(), 5, "writes={writes:?}");
+    assert_eq!(
+        writes[4].0,
+        "/alice/0/chains/anvil/outbox/pending/tx-4/confirm"
+    );
+    assert_eq!(writes[4].1, b"y");
     assert_eq!(writes[2].0, "/alice/7/chains/anvil/outbox/new.tx");
     assert_eq!(String::from_utf8_lossy(&writes[2].1), intent);
     assert_eq!(writes[1].0, "/alice/7/chains/anvil/outbox/new.tx");
@@ -2634,7 +2655,9 @@ fn wallet_confirm_reports_the_pending_ceremony_url() {
         .stdout(predicate::str::contains(
             "Approval required: open http://localhost:18734/c/secret",
         ))
-        .stdout(predicate::str::contains("re-run this confirm right away"));
+        .stdout(predicate::str::contains(
+            "run `bloom wallet confirm alice base 0001-cafe --account 7` right away",
+        ));
 
     // Writing the entry's confirm file reports the same link.
     bloom_cmd(home.path())
@@ -2692,7 +2715,7 @@ fn wallet_confirm_points_a_petal_staged_entry_back_to_its_petal() {
         .assert()
         .code(3)
         .stdout(predicate::str::contains("retry through petals/pendle/"))
-        .stdout(predicate::str::contains("re-run this confirm").not());
+        .stdout(predicate::str::contains("bloom wallet confirm").not());
 
     stop_ipc_server(server, server_thread);
 }
