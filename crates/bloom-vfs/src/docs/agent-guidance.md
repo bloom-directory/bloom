@@ -4,18 +4,20 @@ This is the operating contract for agents using the mounted Bloom virtual
 filesystem. Treat the directory containing this file as the VFS root and keep
 all paths mount-relative. Keep scratch files outside the mount.
 
-`ls` the mount and read `next.md` (pending outbox entries, approvals and policy updates). Read on demand:
-`cat docs/README.md` lists every route, `docs/examples.md` has command
-walkthroughs (including contract deploys and local Anvil), `docs/wallets.md` covers accounts, wallet creation, recovery,
-passkeys and sessions, and `docs/petals.md` lists installed Petals. Read a
-Petal's `README.md` and `AGENTS.md` before using its routes.
+This file is enough to read balances and to send, approve or call a contract.
+`next.md` lists anything already pending (outbox entries, approvals, policy
+updates). Open another doc only for what it names: `cat docs/README.md` lists
+every route, `docs/examples.md` has policy changes, contract deploys and local
+Anvil, `docs/wallets.md` covers accounts, wallet creation, recovery, passkeys
+and sessions, and `docs/petals.md` lists installed Petals. Read a Petal's
+`README.md` and `AGENTS.md` before using its routes.
 
 ## Without a mount
 
 With no mounted filesystem, `bloom vfs cat|ls|write <path>` reaches the same
 paths (this file is `/AGENTS.md`). Put reads you need together in one shell
 command. Two commands run the transaction loop below for an outbox
-transaction:
+transaction; use them rather than writing `new.tx` and `confirm` yourself:
 
 ```sh
 bloom wallet stage <wallet> <chain> --intent '<body>'  # entry id, its plan and policy check
