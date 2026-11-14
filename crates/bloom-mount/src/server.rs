@@ -37,6 +37,31 @@ type CommandAttempt = (String, Vec<String>);
 struct MountedFilesystem {
     source: String,
     filesystem_type: String,
+    /// NFS server port from the mount options, when the platform lists it.
+    port: Option<u16>,
+}
+
+/// The mount path with only its parent resolved. Anything that stats the
+/// mount point itself (`exists`, `canonicalize`, `findmnt` without
+/// `--nocanonicalize`) blocks forever on a `hard` NFS mount whose server
+/// was a Machine that has since died.
+fn mount_probe_path(path: &Path) -> Result<PathBuf, MountError> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(MountError::Config(format!(
+            "mount path has no parent directory: {}",
+            path.display()
+        )));
+    };
+    // A bare name like `bloom` has an empty parent; it means the current directory.
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let parent = std::fs::canonicalize(parent).map_err(|_| {
+        MountError::Config(format!("mount path does not exist: {}", path.display()))
+    })?;
+    Ok(parent.join(name))
 }
 
 fn unmount_args(path: &Path) -> Vec<String> {
@@ -144,8 +169,9 @@ fn run_command_attempts(
 fn mounted_filesystem(path: &Path) -> Result<Option<MountedFilesystem>, MountError> {
     let args = vec![
         "--noheadings".to_string(),
+        "--nocanonicalize".to_string(),
         "--output".to_string(),
-        "SOURCE,FSTYPE".to_string(),
+        "SOURCE,FSTYPE,OPTIONS".to_string(),
         "--mountpoint".to_string(),
         path.display().to_string(),
     ];
@@ -160,20 +186,31 @@ fn mounted_filesystem(path: &Path) -> Result<Option<MountedFilesystem>, MountErr
             String::from_utf8_lossy(&output.stderr)
         )));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_findmnt(&String::from_utf8_lossy(&output.stdout))
+        .map(Some)
+        .ok_or_else(|| {
+            MountError::Mount(format!(
+                "findmnt returned an ambiguous mount for {}",
+                path.display()
+            ))
+        })
+}
+
+/// One `SOURCE FSTYPE OPTIONS` line; anything else is ambiguous.
+#[cfg(target_os = "linux")]
+fn parse_findmnt(stdout: &str) -> Option<MountedFilesystem> {
     let mut fields = stdout.split_whitespace();
-    let source = fields.next().unwrap_or_default();
-    let filesystem_type = fields.next().unwrap_or_default();
-    if source.is_empty() || filesystem_type.is_empty() || fields.next().is_some() {
-        return Err(MountError::Mount(format!(
-            "findmnt returned an ambiguous mount for {}",
-            path.display()
-        )));
+    let (source, filesystem_type, options) = (fields.next()?, fields.next()?, fields.next()?);
+    if fields.next().is_some() {
+        return None;
     }
-    Ok(Some(MountedFilesystem {
+    Some(MountedFilesystem {
         source: source.to_string(),
         filesystem_type: filesystem_type.to_string(),
-    }))
+        port: options
+            .split(',')
+            .find_map(|option| option.strip_prefix("port=")?.parse().ok()),
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -193,6 +230,7 @@ fn mounted_filesystem(path: &Path) -> Result<Option<MountedFilesystem>, MountErr
         Some(MountedFilesystem {
             source: source.to_string(),
             filesystem_type: filesystem_type.to_string(),
+            port: None,
         })
     });
     let mounted = matches.next();
@@ -223,15 +261,23 @@ fn validate_stale_mount(mounted: &MountedFilesystem, cfg: &MountConfig) -> Resul
     )))
 }
 
-fn reconcile_stale_mount(cfg: &MountConfig, _from_fstab: bool) -> Result<(), MountError> {
-    let Some(mounted) = mounted_filesystem(&cfg.mount_path)? else {
-        return Ok(());
-    };
-    validate_stale_mount(&mounted, cfg)?;
-    Err(MountError::Mount(format!(
-        "refusing to replace an existing Bloom mount at {}",
-        cfg.mount_path.display()
-    )))
+/// A Bloom mount left behind by a Machine that died (crash, SIGKILL, OOM).
+/// The caller has just bound `listen_port`, so no live Machine serves that
+/// port. If the stale mount used the same port, nothing serves it and it is
+/// safe to detach. Linux only: the macOS mount listing has no port.
+fn stale_mount_is_unserved(mounted: &MountedFilesystem, listen_port: u16) -> bool {
+    cfg!(target_os = "linux") && mounted.port == Some(listen_port)
+}
+
+/// Lazy detach returns at once even though the old server is gone; a plain
+/// `umount` would wait on it.
+fn stale_detach_attempts(path: &Path, from_fstab: bool) -> Vec<CommandAttempt> {
+    let args = vec!["-l".to_string(), path.display().to_string()];
+    let mut attempts = vec![("umount".to_string(), args.clone())];
+    if !from_fstab {
+        attempts.push(("sudo".to_string(), sudo_args("umount", &args)));
+    }
+    attempts
 }
 
 fn linux_mount_fallback_args(cfg: &MountConfig, server: SocketAddr) -> Vec<String> {
@@ -413,6 +459,51 @@ async fn serve_nfs_config(
     cfg: MountConfig,
     from_fstab: bool,
 ) -> Result<NfsMountHandle, MountError> {
+    // Look for a leftover mount before anything stats the mount point.
+    let probe = mount_probe_path(&cfg.mount_path)?;
+    let stale = tokio::task::spawn_blocking({
+        let probe = probe.clone();
+        move || mounted_filesystem(&probe)
+    })
+    .await
+    .map_err(|e| MountError::Mount(format!("stale mount lookup join: {e}")))??;
+    if let Some(mounted) = &stale {
+        validate_stale_mount(mounted, &cfg)?;
+    }
+
+    // Bind the embednfs server on the requested address. Resolve the
+    // OS-assigned port immediately so we can wire it into the mount
+    // command — `mount.nfs4 port=N` needs the real number. Binding before
+    // touching a stale mount also proves no live Machine owns its port.
+    let listener = match TcpListener::bind(cfg.nfs_listen).await {
+        Ok(listener) => listener,
+        Err(error) if stale.is_some() && error.kind() == std::io::ErrorKind::AddrInUse => {
+            return Err(MountError::Mount(format!(
+                "another Machine is serving the Bloom mount at {} on {}",
+                cfg.mount_path.display(),
+                cfg.nfs_listen
+            )));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let local = listener.local_addr()?;
+    if let Some(mounted) = stale {
+        if !stale_mount_is_unserved(&mounted, local.port()) {
+            return Err(MountError::Mount(format!(
+                "refusing to replace an existing Bloom mount at {}",
+                cfg.mount_path.display()
+            )));
+        }
+        tokio::task::spawn_blocking(move || {
+            run_command_attempts(
+                stale_detach_attempts(&probe, from_fstab),
+                UMOUNT_COMMAND_TIMEOUT,
+            )
+        })
+        .await
+        .map_err(|e| MountError::Mount(format!("stale mount detach join: {e}")))??;
+        warn!(mount_path = %cfg.mount_path.display(), port = local.port(), "mount.stale_detached");
+    }
     if !cfg.mount_path.exists() {
         return Err(MountError::Config(format!(
             "mount path does not exist: {}",
@@ -425,17 +516,6 @@ async fn serve_nfs_config(
             cfg.mount_path.display()
         )));
     }
-
-    let reconcile_cfg = cfg.clone();
-    tokio::task::spawn_blocking(move || reconcile_stale_mount(&reconcile_cfg, from_fstab))
-        .await
-        .map_err(|e| MountError::Mount(format!("stale mount reconciliation join: {e}")))??;
-
-    // Bind the embednfs server on the requested address. Resolve the
-    // OS-assigned port immediately so we can wire it into the mount
-    // command — `mount.nfs4 port=N` needs the real number.
-    let listener = TcpListener::bind(cfg.nfs_listen).await?;
-    let local = listener.local_addr()?;
     info!(addr = %local, mount_path = %cfg.mount_path.display(), "mount.nfs_listening");
 
     let fs = BloomFs::new(vfs);
@@ -729,15 +809,98 @@ mod tests {
         let expected = MountedFilesystem {
             source: "127.0.0.1:/".to_string(),
             filesystem_type: "nfs4".to_string(),
+            port: Some(20000),
         };
         assert!(validate_stale_mount(&expected, &cfg).is_ok());
 
         let foreign = MountedFilesystem {
             source: "/dev/sda1".to_string(),
             filesystem_type: "ext4".to_string(),
+            port: None,
         };
         let error = validate_stale_mount(&foreign, &cfg).unwrap_err();
         assert!(error.to_string().contains("foreign filesystem"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn findmnt_line_yields_source_type_and_nfs_port() {
+        let mounted = parse_findmnt(
+            "127.0.0.1:/ nfs4 rw,nosuid,nodev,noexec,relatime,sync,vers=4.1,hard,proto=tcp,port=20000,timeo=10,addr=127.0.0.1\n",
+        )
+        .unwrap();
+        assert_eq!(
+            mounted,
+            MountedFilesystem {
+                source: "127.0.0.1:/".to_string(),
+                filesystem_type: "nfs4".to_string(),
+                port: Some(20000),
+            }
+        );
+        assert_eq!(
+            parse_findmnt("/dev/sda1 ext4 rw,relatime").unwrap().port,
+            None
+        );
+        assert!(parse_findmnt("127.0.0.1:/ nfs4").is_none());
+        assert!(parse_findmnt("a nfs4 rw\nb nfs4 rw").is_none());
+    }
+
+    /// Only a mount whose own port this process just bound is detached: a
+    /// different or unknown port may belong to a live Machine.
+    #[test]
+    fn only_a_stale_mount_on_the_bound_port_is_unserved() {
+        let mounted = |port| MountedFilesystem {
+            source: "127.0.0.1:/".to_string(),
+            filesystem_type: "nfs4".to_string(),
+            port,
+        };
+        assert_eq!(
+            stale_mount_is_unserved(&mounted(Some(20000)), 20000),
+            cfg!(target_os = "linux")
+        );
+        assert!(!stale_mount_is_unserved(&mounted(Some(20000)), 41234));
+        assert!(!stale_mount_is_unserved(&mounted(None), 20000));
+    }
+
+    #[test]
+    fn stale_detach_is_lazy_and_needs_sudo_only_outside_fstab() {
+        let path = Path::new("/home/alice/bloom");
+        assert_eq!(
+            stale_detach_attempts(path, true),
+            vec![(
+                "umount".to_string(),
+                vec!["-l".to_string(), "/home/alice/bloom".to_string()]
+            )]
+        );
+        let developer = stale_detach_attempts(path, false);
+        assert_eq!(developer.len(), 2);
+        assert_eq!(developer[0], stale_detach_attempts(path, true)[0]);
+        assert_eq!(developer[1].0, "sudo");
+    }
+
+    /// The probe resolves only the parent, so a missing (or hung) final
+    /// component is never stat'ed.
+    #[test]
+    fn mount_probe_path_does_not_touch_the_mount_point() {
+        let parent = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let path = unique_nonexistent_path();
+        assert_eq!(
+            mount_probe_path(&path).unwrap(),
+            parent.join(path.file_name().unwrap())
+        );
+        let orphan = unique_nonexistent_path().join("bloom");
+        assert!(matches!(
+            mount_probe_path(&orphan),
+            Err(MountError::Config(msg)) if msg.contains("does not exist")
+        ));
+        assert_eq!(
+            mount_probe_path(Path::new("bloom")).unwrap(),
+            std::env::current_dir()
+                .unwrap()
+                .canonicalize()
+                .unwrap()
+                .join("bloom")
+        );
     }
 
     /// Aborting the server task as part of `unmount` should cause the
