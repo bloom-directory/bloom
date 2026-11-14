@@ -4247,8 +4247,11 @@ async fn run(cli: Cli) -> Result<()> {
             // otherwise fetch with three more reads goes to stderr.
             let entry = format!("/wallets/{wallet}/{account}/chains/{chain}/outbox/pending/{id}");
             for file in ["plan.md", "policy_check.json"] {
-                if let Ok(bytes) = ipc_read(&client_endpoint, &format!("{entry}/{file}")).await {
-                    eprintln!("--- {file}\n{}", String::from_utf8_lossy(&bytes).trim_end());
+                match ipc_read(&client_endpoint, &format!("{entry}/{file}")).await {
+                    Ok(bytes) => {
+                        eprintln!("--- {file}\n{}", String::from_utf8_lossy(&bytes).trim_end());
+                    }
+                    Err(_) => eprintln!("--- {file}\nnot available; read {}/{file}", &entry[1..]),
                 }
             }
             let account_flag = if account == 0 {

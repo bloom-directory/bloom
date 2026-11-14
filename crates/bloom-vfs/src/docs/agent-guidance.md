@@ -98,7 +98,7 @@ For outbox transactions:
    - **Permission denied**: the owner must approve. Show the human the
      ceremony link from the error in a message, then write `confirm` again
      in the same turn: it waits for their approval and sends. Do not end
-     your turn to wait for them; repeat if it times out. On a mount it does not
+     your turn to wait for them; repeat if it times out, until the link expires. On a mount it does not
      wait: read `approval_challenge.json`, check its wallet, action, intent
      and expiry, and follow its `next`. For `expired`, `cancelled` or
      `refused`, tell the human.
