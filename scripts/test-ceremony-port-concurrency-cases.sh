@@ -171,80 +171,20 @@ else
 fi
 if [ -n "$got" ]; then kill "$got" 2>/dev/null || true; wait "$got" 2>/dev/null || true; fi
 
-# 7. Contender attribution: the stub journal emulates per-unit filtering,
-# so only the contender's exact units can satisfy the assertion.
-UNIT_SCOPE="bloom-triad-dev-$(id -u)-"
-CTR=CTRTOKEN
-OTHER=OTHERTOKEN
-journalctl() {
-  units=""; prev=""
-  for arg in "$@"; do
-    if [ "$prev" = "-u" ]; then units="$units $arg"; fi
-    prev="$arg"
-  done
-  for u in $units; do
-    printf '%s\n' "$STUB_JOURNAL" | grep -F "$u" || true
-  done
-}
-conflict_line() {
-  # conflict_line UNIT_FAMILY_SUFFIX TOKEN ADDR
-  printf 'systemd[1762]: %s%s-broker-ceremony-%s.socket: Failed to create listening socket (%s): Address already in use\n' \
-    "$UNIT_SCOPE" "$2" "$1" "$3"
-}
-CTR_V4_LINES="$(conflict_line ipv4 "$CTR" 127.0.0.1:28735)
-$(conflict_line ipv4 "$CTR" 127.0.0.1:28735)"
-CTR_V6_LINES="$(conflict_line ipv6 "$CTR" '[::1]:28735')"
-OTHER_LINES="$(conflict_line ipv4 "$OTHER" 127.0.0.1:28735)
-$(conflict_line ipv6 "$OTHER" '[::1]:28735')"
-
-# 7a. Both exact units with conflicts: accepted.
-STUB_JOURNAL="$CTR_V4_LINES
-$CTR_V6_LINES"
+# 7. Contender attribution: only a bind conflict on the expected port in
+# the contender's own Broker log satisfies the assertion.
+printf '%s\n' "Failed to listen on 127.0.0.1:28735: Address already in use" \
+  "Failed to open '127.0.0.1:28735': Address already in use" > "$work/conflict.log"
+printf '%s\n' "Failed to listen on 127.0.0.1:28736: Address already in use" > "$work/other-port.log"
 status=0
-DIE_MSG=""
-require_contender_conflict "$CTR" 28735 "2026-01-01 00:00:00" >/dev/null 2>&1 || status=$?
-[ "$status" -eq 0 ] && report 0 "attribution accepts contender pair" || report 1 "attribution accepts contender pair" "status=$status msg=$DIE_MSG"
-
-# 7b. Only another runtime's matching pair: rejected.
-STUB_JOURNAL="$OTHER_LINES"
+require_contender_conflict "$work/conflict.log" 28735 >/dev/null 2>&1 || status=$?
+[ "$status" -eq 0 ] && report 0 "attribution accepts the contender's conflict" || report 1 "attribution accepts the contender's conflict" "status=$status msg=$DIE_MSG"
 status=0
-DIE_MSG=""
-require_contender_conflict "$CTR" 28735 "2026-01-01 00:00:00" >/dev/null 2>&1 || status=$?
-[ "$status" -ne 0 ] && report 0 "attribution rejects unrelated runtime pair" || report 1 "attribution rejects unrelated runtime pair" "accepted"
-
-# 7c. A single unit reporting the conflict suffices (dual-stack listener
-# validation belongs to the targeted listener tests).
-STUB_JOURNAL="$CTR_V4_LINES"
+require_contender_conflict "$work/other-port.log" 28735 >/dev/null 2>&1 || status=$?
+[ "$status" -ne 0 ] && report 0 "attribution rejects a conflict on another port" || report 1 "attribution rejects a conflict on another port" "accepted"
 status=0
-DIE_MSG=""
-require_contender_conflict "$CTR" 28735 "2026-01-01 00:00:00" >/dev/null 2>&1 || status=$?
-[ "$status" -eq 0 ] && report 0 "attribution accepts a single unit" || report 1 "attribution accepts a single unit" "status=$status msg=$DIE_MSG"
-unset -f journalctl
-
-# 7d. The contender runtime token comes from its own launcher metadata
-# (read, never sourced).
-cat > "$work/fixture-triad.env" <<'EOF'
-export BLOOM_TRIAD_DEVELOPER_ROOT='/tmp/bcp.Ab12Cd/developer'
-export BLOOM_TRIAD_DEVELOPER_RUNTIME='/tmp/bcp.Ab12Cd/developer/runtime.9XyZ12'
-export BLOOM_HOME='/tmp/bcp.Ab12Cd/developer/machine-home'
-export BLOOM_TRIAD_DEV_CEREMONY_PORT='28735'
-EOF
-if token="$(contender_runtime_token "$work/fixture-triad.env")"; then
-  [ "$token" = "runtime.9XyZ12" ] && report 0 "runtime token read from metadata" || report 1 "runtime token read from metadata" "got $token"
-else
-  report 1 "runtime token read from metadata" "rejected"
-fi
-if contender_runtime_token "$work/does-not-exist.env" >/dev/null 2>&1; then
-  report 1 "runtime token rejects missing file" "accepted"
-else
-  report 0 "runtime token rejects missing file"
-fi
-printf 'export BLOOM_HOME=/tmp/x\n' > "$work/noruntime.env"
-if contender_runtime_token "$work/noruntime.env" >/dev/null 2>&1; then
-  report 1 "runtime token rejects absent key" "accepted"
-else
-  report 0 "runtime token rejects absent key"
-fi
+require_contender_conflict "$work/missing.log" 28735 >/dev/null 2>&1 || status=$?
+[ "$status" -ne 0 ] && report 0 "attribution rejects a missing log" || report 1 "attribution rejects a missing log" "accepted"
 
 # 8. Contender-path PID retention: a contender that ignores SIGTERM keeps
 # its handle for EXIT cleanup instead of losing it.

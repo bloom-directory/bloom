@@ -149,10 +149,12 @@ mountpoint. VFS commands and services-only mode do not.
 
 The launcher uses real protocol implementations and authenticated triad
 transport. The developer profile runs them under the same non-root login and
-therefore makes no production principal-isolation claim. On Linux it installs
-temporary per-user systemd socket units for Broker and Signer; an active
-systemd user manager is required. Paths embedded in those units may contain
-only ASCII letters, digits, and `_./:@+-`.
+therefore makes no production principal-isolation claim. Broker and Signer
+run as the launcher's own child processes, so no systemd user manager is
+needed and an agent sandbox can launch a Triad. On Linux the Broker takes its
+ceremony listeners only as named inherited sockets, as in production, so the
+launcher hands them over with `systemd-socket-activate` (shipped with
+systemd).
 
 On Linux the launcher writes the trusted-time source `linux-chrony-nts`. That
 is a legacy wire name kept for rollback compatibility; the runtime reads it as
@@ -210,11 +212,9 @@ Record the actual checkout revisions and dirty state as described under
 ### Hosted-relay developer acceptance
 
 On macOS or Linux, a `triad-dev-harness` build can provision a disposable hosted
-relay installation without elevating the test services. Linux requires an
-active systemd user manager and an owned `XDG_RUNTIME_DIR`, as for the regular
-developer triad. The Signer systemd user unit receives the separate dev-mode
-administrator socket whenever relay trust pins are configured, with or without
-`--hosted-relay`. By default the launcher
+relay installation without elevating the test services. The Signer receives
+the separate dev-mode administrator socket whenever relay trust pins are
+configured, with or without `--hosted-relay`. By default the launcher
 trusts the same public pins the signed release payload ships,
 `packaging/triad/relay/control-ca.pem` and `receipt-public-keys.hex` (see
 [hosted relay trust](./packaging/triad/relay/README.md)). They are public, so
@@ -368,7 +368,7 @@ together, which is why it belongs only in the terminal addressing that
 candidate: source each candidate's `triad.env` only in its own shell. An
 unsourced shell addresses `~/.bloom`, which is usually nobody's triad.
 
-On Linux the launcher starts that candidate's systemd socket before checking
+The launcher binds that candidate's ceremony port before checking
 `--services-only`, so that mode also reserves the candidate's port. Use the
 existing VFS-only launcher mode (omit `--mount`) for the concurrency test; a
 kernel mount adds no evidence about ceremony-port isolation.
@@ -581,7 +581,7 @@ Common failures:
 | Cargo appears hung | Look for another Cargo process sharing the target directory |
 | `Bloom home is already open for writing` | Another Machine owns that home; run one Machine and point clients at its socket |
 | `ipc ... via unix:<path>` | No Machine on that endpoint; check `BLOOM_IPC_SOCKET`, `BLOOM_HOME`, and that `triad.env` was sourced |
-| Linux services never become ready | Confirm an active systemd user manager and inspect Broker/Signer logs |
+| Linux services never become ready | Inspect the Broker and Signer logs in `--log-dir` |
 | Ceremony cannot bind | The selected ceremony port is already owned; choose another port and restart only that candidate, leaving the conflicting triad and the custody port `18734` alone |
 | Enrollment is rejected as stale | Start with a new developer root; do not mutate custody files by hand |
 | Wallet/account data is missing | Inspect the authenticated Broker projection and its freshness, not a legacy Machine wallet store |

@@ -56,7 +56,7 @@ to trade at.
 ## Prerequisites
 
 - macOS with the passkey available to the current login's browser/keychain, or
-  Linux with an active systemd user manager for the eval login;
+  Linux with `systemd-socket-activate`;
 - Rust/Cargo and `jq` (`brew install jq` on macOS);
 - a wallet enrolled through a real Broker registration or import ceremony in
   the persistent developer triad root;
@@ -66,13 +66,9 @@ to trade at.
 - no other local process listening on port 18734 on either loopback family (`127.0.0.1` or `[::1]`);
 - IPv6 loopback enabled; the Broker requires a `[::1]:18734` listener.
 
-Linux launches Broker and Signer through temporary per-user systemd socket and
-service units, exercising the same named-descriptor activation interface as
-production. A dedicated persistent eval account normally needs a one-time
-administrator setup such as `loginctl enable-linger LOGIN_USER`. The launcher
-does not enable linger itself and fails before service startup when the user
-manager is unavailable. Generated unit paths are intentionally restricted to
-ASCII letters, digits, and `_./:@+-`.
+On Linux the launcher hands the Broker its ceremony listeners through
+`systemd-socket-activate`, exercising the same named-descriptor activation
+interface as production without a systemd user manager.
 
 The last rule is fail-closed. If the root-installed Broker is active, unload
 only its job before the test:
