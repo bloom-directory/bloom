@@ -1,6 +1,6 @@
 # Outbox
 
-Write one body to `new.tx` to stage a transaction:
+Write a body to `new.tx` to stage a transaction, in one of these forms:
 
 ```text
 send 0.25 ETH to 0x...

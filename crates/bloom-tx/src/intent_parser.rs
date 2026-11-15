@@ -269,6 +269,18 @@ pub fn parse(input: &str) -> Result<RawIntent, ParseError> {
     if s.is_empty() {
         return Err(ParseError::Empty);
     }
+    // One write stages one transaction. Two forms in one body (a `send` line
+    // and a JSON object, or two JSON objects) would otherwise fail deep in a
+    // parser with an error that does not say so.
+    let lines = s.lines().filter(|line| !line.trim().is_empty());
+    let bodies = lines
+        .filter(|line| line.starts_with("send ") || line.starts_with("{\""))
+        .count();
+    if bodies > 1 {
+        return Err(ParseError::Invalid(format!(
+            "this write holds {bodies} bodies; write one body per transaction"
+        )));
+    }
     if s.starts_with('{') {
         let loose: LooseIntent = serde_json::from_str(s)?;
         return loose.into_raw();
@@ -446,6 +458,16 @@ fn parse_nft_shell(line: &str) -> Result<RawIntent, ParseError> {
 mod tests {
     use super::*;
     use bloom_proto::RawIntentBody;
+
+    #[test]
+    fn two_bodies_in_one_write_are_refused_plainly() {
+        let both = "send 0.25 ETH to 0x70997970C51812dc3A010C7d01b50e0d17dc79C8\n{\"kind\":\"send\",\"to\":\"0x70997970C51812dc3A010C7d01b50e0d17dc79C8\",\"value\":\"0.25 eth\"}";
+        let error = parse(both).unwrap_err().to_string();
+        assert!(error.contains("2 bodies"), "{error}");
+        // A pretty-printed JSON body is still one body.
+        let pretty = "{\n  \"kind\": \"send\",\n  \"to\": \"0x70997970C51812dc3A010C7d01b50e0d17dc79C8\",\n  \"value\": \"0.25 eth\"\n}";
+        assert!(parse(pretty).is_ok());
+    }
 
     #[test]
     fn errors_name_the_accepted_shapes() {

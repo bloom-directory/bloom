@@ -11,7 +11,7 @@ relative to this file's directory. Without a mount,
 - `docs/`: one short file per topic; the filenames are the index.
 
 Send, approve or call a contract through the account's outbox,
-`wallets/<wallet>/<n>/chains/<chain>/outbox/`. Write one body to `new.tx`:
+`wallets/<wallet>/<n>/chains/<chain>/outbox/`. Write a body to `new.tx`, in one of these forms:
 
 ```text
 send 0.25 ETH to 0x...
