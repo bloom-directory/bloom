@@ -10028,6 +10028,37 @@ value = "0""#,
         assert_eq!(new_tx.mode, 0o644);
     }
 
+    /// The outbox carries its own instructions, sized so a mount serves them.
+    #[tokio::test]
+    async fn outbox_readme_says_how_to_stage_and_confirm() {
+        let f = make_handler_with_chain(true);
+        let root = format!("/{}/0/chains/anvil/outbox", f.wallet_name);
+        let listed = f
+            .handler
+            .list(&VfsPath::parse(&root).unwrap())
+            .await
+            .unwrap();
+        let readme = listed
+            .iter()
+            .find(|entry| entry.name == "README.md")
+            .unwrap();
+        let path = VfsPath::parse(&format!("{root}/README.md")).unwrap();
+        let text = String::from_utf8(f.handler.read(&path).await.unwrap()).unwrap();
+        assert_eq!(readme.size, text.len() as u64);
+        assert_eq!(f.handler.lookup(&path).await.unwrap().size, readme.size);
+        for word in [
+            "`new.tx`",
+            "`latest/`",
+            "`plan.md`",
+            "`confirm`",
+            "receipt.json",
+        ] {
+            assert!(text.contains(word), "{word} missing from {text}");
+        }
+    }
+        }
+    }
+
     #[tokio::test]
     async fn outbox_latest_is_advertised_and_resolves_the_pending_identity() {
         let f = make_handler_with_chain(true);

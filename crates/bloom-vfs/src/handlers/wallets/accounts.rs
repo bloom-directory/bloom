@@ -104,6 +104,15 @@ pub(super) struct FamilyKey {
     derived: Option<DerivedAccountPublic>,
 }
 
+/// The outbox explains itself where it is used, so the root guide need not.
+const OUTBOX_README: &str = "README.md";
+const EVM_OUTBOX_README: &str = include_str!("../../docs/outbox-evm.md");
+const SOLANA_OUTBOX_README: &str = include_str!("../../docs/outbox-solana.md");
+
+fn outbox_readme_entry(text: &str) -> Entry {
+    Entry::file(OUTBOX_README).with_size(text.len() as u64)
+}
+
 impl FamilyKey {
     /// The display address the outbox fence compares staged senders
     /// against (EVM, case-insensitively).
@@ -1103,6 +1112,7 @@ impl WalletsHandler {
     ) -> Result<Entry, HandlerError> {
         match rest {
             [] => Ok(Entry::dir("outbox")),
+            [leaf] if leaf == OUTBOX_README => Ok(outbox_readme_entry(EVM_OUTBOX_README)),
             [leaf] if leaf == "new.tx" => Ok(Entry::writable_file("new.tx")),
             [leaf] if leaf == "latest" => {
                 let target = self
@@ -1151,6 +1161,7 @@ impl WalletsHandler {
         rest: &[String],
     ) -> Result<Vec<u8>, HandlerError> {
         match rest {
+            [leaf] if leaf == OUTBOX_README => Ok(EVM_OUTBOX_README.as_bytes().to_vec()),
             [state, id, fname] => {
                 let entry = self.evm_outbox_entry(wallet, family, chain, state, id)?;
                 if fname == APPROVAL_CHALLENGE {
@@ -1184,6 +1195,7 @@ impl WalletsHandler {
         match rest {
             [] => {
                 let mut entries = vec![
+                    outbox_readme_entry(EVM_OUTBOX_README),
                     Entry::writable_file("new.tx"),
                     Entry::dir("pending"),
                     Entry::dir("sent"),
@@ -1566,6 +1578,7 @@ impl WalletsHandler {
         })?;
         match rest {
             [] => Ok(Entry::dir("outbox")),
+            [leaf] if leaf == OUTBOX_README => Ok(outbox_readme_entry(SOLANA_OUTBOX_README)),
             [leaf] if leaf == "new.tx" => Ok(Entry::writable_file("new.tx")),
             [leaf] if leaf == "latest" => {
                 let target = self
@@ -1617,6 +1630,7 @@ impl WalletsHandler {
         rest: &[String],
     ) -> Result<Vec<u8>, HandlerError> {
         match rest {
+            [leaf] if leaf == OUTBOX_README => Ok(SOLANA_OUTBOX_README.as_bytes().to_vec()),
             [state, id, fname] => {
                 if !is_public_solana_outbox_artifact(fname) {
                     return Err(HandlerError::not_found(fname));
@@ -1652,6 +1666,7 @@ impl WalletsHandler {
         match rest {
             [] => {
                 let mut entries = vec![
+                    outbox_readme_entry(SOLANA_OUTBOX_README),
                     Entry::writable_file("new.tx"),
                     Entry::dir("pending"),
                     Entry::dir("sent"),

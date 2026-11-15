@@ -12,21 +12,7 @@ relative to this file's directory. Without a mount,
   (`cat docs/README.md` is the full route table).
 
 Send, approve or call a contract through the account's outbox,
-`wallets/<wallet>/<n>/chains/<chain>/outbox/`:
-
-- `new.tx`: write a body to stage it.
-- `latest/`: the entry staged last. `plan.md` is what will be signed.
-  Writing `y` to `confirm` asks the owner and gives their approval link;
-  written again, it waits for the approval and sends. `cancel` discards.
-- `sent/<id>/receipt.json`: the result. `failed/<id>/` holds refusals.
-
-```text
-send 0.25 ETH to 0x...
-{"kind":"send","to":"0x...","token":"USDC","amount":"10"}              human units
-{"kind":"approve","token":"0x...","spender":"0x...","amount":"1000000"}  raw units; "0" revokes
-{"kind":"raw","to":"0x...","data":"0x...","value":"0"}                  any contract call
-{"kind":"call","contract":"0x...","method":"transfer(address,uint256)","args":["0x...","1"]}
-```
+`wallets/<wallet>/<n>/chains/<chain>/outbox/`. Its `README.md` shows how.
 
 ## Rules
 
