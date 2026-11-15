@@ -11,10 +11,10 @@ send 0.25 ETH to 0x...
 ```
 
 That stages it and asks the owner, giving their approval link. `latest/` is
-that entry, before and after it is sent: `plan.md` is what will be signed,
-writing `y` to `confirm` waits for the approval and sends, and then
-`receipt.json` holds the result. `new.tx` takes the same body and only stages
-it; `cancel` written to `confirm` discards an entry.
+that entry, before and after it is sent: `latest/plan.md` is what will be
+signed, writing `y` to `latest/confirm` waits for the approval and sends, and
+then `latest/receipt.json` holds the result. `new.tx` takes the same body and
+only stages it; `cancel` written to `latest/confirm` discards an entry.
 
 Several staged entries can go under one approval: stage each through
 `new.tx`, write `<chain>:pending` (or their `chain:id` references in order) to

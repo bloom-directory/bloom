@@ -10163,12 +10163,16 @@ value = "0""#,
             "`send.tx`",
             "`new.tx`",
             "`latest/`",
-            "`plan.md`",
-            "`confirm`",
+            "`latest/plan.md`",
+            "`latest/confirm`",
             "receipt.json",
         ] {
             assert!(text.contains(word), "{word} missing from {text}");
         }
+        // A control written to the outbox itself says where it belongs.
+        let stray = VfsPath::parse(&format!("{root}/confirm")).unwrap();
+        let error = f.handler.write(&stray, b"y").await.unwrap_err();
+        assert!(error.to_string().contains("latest/confirm"), "{error}");
     }
 
     #[tokio::test]

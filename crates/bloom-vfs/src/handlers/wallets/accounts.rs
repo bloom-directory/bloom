@@ -1074,6 +1074,13 @@ impl WalletsHandler {
             .chain_id;
         let policy =
             crate::advisory_exact_evm_policy(&projection, chain, chain_id).map_err(err_be)?;
+        if let [control] = chain_rest {
+            if EVM_PENDING_CONTROLS.contains(&control.as_str()) {
+                return Err(HandlerError::invalid(format!(
+                    "`{control}` belongs to an entry: write `latest/{control}` or `pending/<id>/{control}`"
+                )));
+            }
+        }
         if chain_rest == [SEND_TX] {
             return self
                 .stage_and_confirm(wallet, chain, family, from, &policy, data, number)
