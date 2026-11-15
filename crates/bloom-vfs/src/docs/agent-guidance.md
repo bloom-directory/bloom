@@ -8,6 +8,9 @@ relative to this file's directory. Without a mount,
 - `next.md`: what is pending.
 - `wallets/<wallet>/<n>/holdings.json`: balances of account `<n>`; the first
   is `0`.
+- `wallets/<wallet>/<n>/confirm-batch`: several staged entries under one
+  approval, in order (an approve, then the call that spends it).
+- `simulate/new`: a dry run of a body. Nothing is signed or sent.
 - `docs/`: one short file per topic; the filenames are the index.
 
 Send, approve or call a contract through the account's outbox,
