@@ -1,6 +1,6 @@
 # Outbox
 
-Write a body to `new.tx` to stage a transaction, in one of these forms:
+Write a body to `send.tx`, in one of these forms:
 
 ```text
 send 0.25 ETH to 0x...
@@ -10,17 +10,14 @@ send 0.25 ETH to 0x...
 {"kind":"call","contract":"0x...","method":"transfer(address,uint256)","args":["0x...","1"]}
 ```
 
-`latest/` is the entry staged last, before and after it is sent. Its
-`plan.md` is what will be signed. Writing `y` to its `confirm` asks the owner
-and gives their approval link; written again, it waits for the approval and
-sends. Then `receipt.json` holds the result. Writing `cancel` to `confirm`
-discards the entry. `pending/`, `sent/` and `failed/` hold every entry by id.
+That stages it and asks the owner, giving their approval link. `latest/` is
+that entry, before and after it is sent: `plan.md` is what will be signed,
+writing `y` to `confirm` waits for the approval and sends, and then
+`receipt.json` holds the result. `new.tx` takes the same body and only stages
+it; `cancel` written to `confirm` discards an entry.
 
-Several staged entries can go under one approval: write `<chain>:pending`
-(or their `chain:id` references in order) to `../../../confirm-batch` for the
-link, then write it again: it waits for the approval and sends. Reading that
-file gives the hashes.
-
-Each step can be one command: write `new.tx`, write `latest/confirm` and
-read `latest/plan.md`; then write `latest/confirm` again and read
-`latest/receipt.json`.
+Several staged entries can go under one approval: stage each through
+`new.tx`, write `<chain>:pending` (or their `chain:id` references in order) to
+`../../../confirm-batch` for the link, then write it again: it waits for the
+approval and sends. Reading that file gives the hashes. `pending/`, `sent/`
+and `failed/` hold every entry by id.

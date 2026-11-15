@@ -1490,7 +1490,27 @@ impl IpcServer {
             return self.write_batch_confirm(&path, &bytes, context).await;
         }
         let Some(challenge) = confirm_challenge_path(&path) else {
-            return Ok(self.vfs.write(&path, &bytes).await?);
+            return match self.vfs.write(&path, &bytes).await {
+                // `outbox/send.tx` stages and asks the owner in one write:
+                // answer as a first confirm does, with the link.
+                Err(HandlerError::ApprovalPending(challenge))
+                    if path.segments().last().is_some_and(|leaf| leaf == "send.tx") =>
+                {
+                    let url = match VfsPath::parse(&format!("/{challenge}")) {
+                        Ok(challenge) => self.vfs.read(&challenge).await.ok(),
+                        Err(_) => None,
+                    }
+                    .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+                    .and_then(|doc| doc["ceremony_url"].as_str().map(str::to_owned));
+                    Err(match url {
+                        Some(url) => WriteError::Approval(format!(
+                            "permission denied: owner approval required: {url} . Write y to latest/confirm: it waits for their approval, then sends."
+                        )),
+                        None => HandlerError::ApprovalPending(challenge).into(),
+                    })
+                }
+                written => Ok(written?),
+            };
         };
         let waiting_for = self.approval_id(&challenge).await;
         match self.vfs.write(&path, &bytes).await {

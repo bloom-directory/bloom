@@ -34,10 +34,6 @@ const TOPICS: &[(&str, &str)] = &[
         include_str!("../docs/topics/report-a-bloom-problem.md"),
     ),
     (
-        "sending-by-file-writes.md",
-        include_str!("../docs/topics/sending-by-file-writes.md"),
-    ),
-    (
         "what-the-owner-sees.md",
         include_str!("../docs/topics/what-the-owner-sees.md"),
     ),

@@ -109,6 +109,9 @@ pub(super) struct FamilyKey {
 const CONFIRM_BATCH: &str = "confirm-batch";
 const CONFIRM_BATCH_HELP: &str = "write the staged entries to send under one approval, in order, as chain:id separated by spaces (ethereum:0001-abcde ethereum:0002-fghij), or chain:pending for every pending entry on that chain. Read this file for the result: the approval link, then each transaction hash.\n";
 
+/// `outbox/send.tx`: stage a body and ask the owner in one write.
+const SEND_TX: &str = "send.tx";
+
 /// The outbox explains itself where it is used, so the root guide need not.
 const OUTBOX_README: &str = "README.md";
 const EVM_OUTBOX_README: &str = include_str!("../../docs/outbox-evm.md");
@@ -1071,7 +1074,72 @@ impl WalletsHandler {
             .chain_id;
         let policy =
             crate::advisory_exact_evm_policy(&projection, chain, chain_id).map_err(err_be)?;
+        if chain_rest == [SEND_TX] {
+            return self
+                .stage_and_confirm(wallet, chain, family, from, &policy, data, number)
+                .await;
+        }
         self.write_outbox_from(wallet, chain, from, &policy, chain_rest, data, number)
+            .await
+    }
+
+    /// `outbox/send.tx`: stage the body and confirm it in the same write, as
+    /// `bloom wallet stage --confirm` does. The owner is asked at once (the
+    /// write is denied with the entry's challenge), or the entry is sent when
+    /// no approval is needed.
+    #[allow(clippy::too_many_arguments)]
+    async fn stage_and_confirm(
+        &self,
+        wallet: &str,
+        chain: &str,
+        family: &FamilyKey,
+        from: alloy::primitives::Address,
+        policy: &Policy,
+        data: &[u8],
+        number: u32,
+    ) -> Result<(), HandlerError> {
+        let pending = |handler: &Self| -> Result<Vec<String>, HandlerError> {
+            let ids = handler
+                .tx_engine
+                .outbox
+                .list(wallet, chain, OutboxState::Pending);
+            Ok(ids
+                .map_err(err_be)?
+                .into_iter()
+                .filter(|id| {
+                    let entry = handler.tx_engine.outbox.read_in_state(
+                        wallet,
+                        chain,
+                        id,
+                        OutboxState::Pending,
+                    );
+                    entry.is_ok_and(|e| Self::evm_entry_belongs(family, &e.staged.from))
+                })
+                .collect())
+        };
+        let before = pending(self)?;
+        self.write_outbox_from(
+            wallet,
+            chain,
+            from,
+            policy,
+            &["new.tx".to_owned()],
+            data,
+            number,
+        )
+        .await?;
+        // Confirm exactly the entry this write staged, never "the newest".
+        let staged: Vec<String> = pending(self)?
+            .into_iter()
+            .filter(|id| !before.contains(id))
+            .collect();
+        let [id] = staged.as_slice() else {
+            return Err(HandlerError::backend(
+                "staged, but another entry was staged at the same moment; confirm yours by id under pending/",
+            ));
+        };
+        let confirm = ["pending".to_owned(), id.clone(), "confirm".to_owned()];
+        self.write_outbox_from(wallet, chain, from, policy, &confirm, b"y", number)
             .await
     }
 
@@ -1239,6 +1307,7 @@ impl WalletsHandler {
             [] => Ok(Entry::dir("outbox")),
             [leaf] if leaf == OUTBOX_README => Ok(outbox_readme_entry(EVM_OUTBOX_README)),
             [leaf] if leaf == "new.tx" => Ok(Entry::writable_file("new.tx")),
+            [leaf] if leaf == SEND_TX => Ok(Entry::writable_file(SEND_TX)),
             [leaf] if leaf == "latest" => {
                 let target = self
                     .evm_latest_target(wallet, family, chain)?
@@ -1322,6 +1391,7 @@ impl WalletsHandler {
                 let mut entries = vec![
                     outbox_readme_entry(EVM_OUTBOX_README),
                     Entry::writable_file("new.tx"),
+                    Entry::writable_file(SEND_TX),
                     Entry::dir("pending"),
                     Entry::dir("sent"),
                     Entry::dir("failed"),

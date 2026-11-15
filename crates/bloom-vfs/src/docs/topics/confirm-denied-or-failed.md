@@ -19,3 +19,7 @@ check its wallet, action, intent and expiry, and follow its `next`. For
 
 Do not restage while an approval is pending, or because a pending path
 disappeared: list `sent/` and `failed/` first.
+
+An entry a Petal staged is confirmed where that Petal's README says, and that
+confirm never waits for approval: retry it there once the owner approves.
+Identify an entry by its `intent.json` and `plan.md`, never by position.

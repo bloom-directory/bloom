@@ -14,7 +14,8 @@ relative to this file's directory. Without a mount,
 - `docs/`: one short file per topic; the filenames are the index.
 
 Send, approve or call a contract through the account's outbox,
-`wallets/<wallet>/<n>/chains/<chain>/outbox/`. Write a body to `new.tx`, in one of these forms:
+`wallets/<wallet>/<n>/chains/<chain>/outbox/`. Write a body to `send.tx`, in
+one of these forms:
 
 ```text
 send 0.25 ETH to 0x...
@@ -24,12 +25,11 @@ send 0.25 ETH to 0x...
 {"kind":"call","contract":"0x...","method":"transfer(address,uint256)","args":["0x...","1"]}
 ```
 
-`latest/` is the entry staged last, before and after it is sent. Its
-`plan.md` is what will be signed. Writing `y` to its `confirm` asks the owner
-and gives their approval link; written again, it waits for the approval and
-sends. Then `receipt.json` holds the result. Each step can be one command:
-write `new.tx`, write `latest/confirm` and read `latest/plan.md`; then write
-`latest/confirm` again and read `latest/receipt.json`.
+That stages it and asks the owner, giving their approval link. `latest/` is
+that entry, before and after it is sent: `plan.md` is what will be signed,
+writing `y` to `confirm` waits for the approval and sends, and then
+`receipt.json` holds the result. `new.tx` takes the same body and only stages
+it; `cancel` written to `confirm` discards an entry.
 
 ## Rules
 

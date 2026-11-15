@@ -5478,8 +5478,57 @@ async fn render_next_actions_with_timeout(
         md.push_str(
             &render_pending_actions(wallet_tree, installed, &wallet_ids, live_timeout).await,
         );
+        md.push_str(&render_wallet_paths(wallet_tree, &wallet_ids, live_timeout).await);
     }
     md.into_bytes()
+}
+
+/// Where each account's balances and outboxes are, so a reader of `next.md`
+/// has real paths without listing the tree first.
+async fn render_wallet_paths(
+    wallet_tree: &dyn Handler,
+    wallet_ids: &[String],
+    live_timeout: Duration,
+) -> String {
+    const SHOWN: usize = 8;
+    let names = |path: String| async move {
+        let path = VfsPath::parse(&path).ok()?;
+        let listed = tokio::time::timeout(live_timeout, wallet_tree.list(&path)).await;
+        Some(
+            listed
+                .ok()?
+                .ok()?
+                .into_iter()
+                .filter(|entry| entry.kind == bloom_vfs::handler::EntryKind::Dir)
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>(),
+        )
+    };
+    let mut lines = String::new();
+    for wallet in wallet_ids.iter().take(SHOWN) {
+        let accounts = names(format!("/{wallet}")).await.unwrap_or_default();
+        for account in accounts
+            .iter()
+            .filter(|name| name.parse::<u32>().is_ok())
+            .take(SHOWN)
+        {
+            let chains = names(format!("/{wallet}/{account}/chains"))
+                .await
+                .unwrap_or_default();
+            if chains.is_empty() {
+                continue;
+            }
+            lines.push_str(&format!(
+                "- `{wallet}` account `{account}`: balances `wallets/{wallet}/{account}/holdings.json`; outbox `wallets/{wallet}/{account}/chains/<chain>/outbox/` on {}\n",
+                chains.join(", ")
+            ));
+        }
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("\n## Wallets\n\n{lines}")
+    }
 }
 
 /// Child directories of `wallets/<path>`. A missing path has none; any other
