@@ -18,22 +18,14 @@ command. Two commands run the transaction loop below for an outbox
 transaction:
 
 ```sh
-bloom wallet stage <wallet> <chain> --intent '<body>'  # entry id, its plan and policy check
-bloom wallet confirm <wallet> <chain> <id>             # sends; prints the hash and receipt
+bloom wallet stage <wallet> <chain> --intent '<body>' [--account <n>]  # entry id, plan, policy check
+bloom wallet confirm <wallet> <chain> <id> [--account <n>]             # sends; prints the receipt
 ```
 
 Read the plan before you confirm. When confirm prints `Approval required`
 (exit 3), show the human the link in a message and run the same confirm
 again in the same turn: it waits for their approval, then sends. Do not end
-your turn to wait for them. `<body>` is one of:
-
-```text
-send 0.25 ETH to 0x...
-{"kind":"send","to":"0x...","token":"USDC","amount":"10"}              human units
-{"kind":"approve","token":"0x...","spender":"0x...","amount":"1000000"}  raw units; "0" revokes
-{"kind":"raw","to":"0x...","data":"0x...","value":"0"}                  any contract call
-{"kind":"call","contract":"0x...","method":"transfer(address,uint256)","args":["0x...","1"]}
-```
+your turn to wait for them. `<body>` is any shape in `docs/examples.md`.
 
 ## Funds and missing details
 
