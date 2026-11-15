@@ -1052,8 +1052,8 @@ fn vfs_cat_root_agent_guidance_returns_identical_content() {
         "guidance should point at the docs directory"
     );
     assert!(
-        text.contains("outbox/") && text.contains("README.md"),
-        "guidance should name the outbox and its README"
+        text.contains("outbox/") && text.contains("`new.tx`") && text.contains("`confirm`"),
+        "guidance should name the outbox files a transaction goes through"
     );
 }
 

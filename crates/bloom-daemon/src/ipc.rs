@@ -1308,6 +1308,9 @@ impl IpcServer {
                 | HandlerError::NotADir(_)
                 | HandlerError::NotAFile(_)
                 | HandlerError::PermissionDenied
+                // A write under a linked name (`chains/1`) is refused as
+                // invalid rather than absent.
+                | HandlerError::Invalid(_)
         ) {
             return None;
         }
@@ -4750,6 +4753,8 @@ summary = "Demo app used by IPC tests."
                     self.0.lock().await.push(path.to_string_path());
                     Ok(())
                 }
+                "/latest/new.tx" => Err(HandlerError::invalid("unknown name")),
+                "/pending/x1/new.tx" => Ok(()),
                 _ => Err(HandlerError::PermissionDenied),
             }
         }
@@ -4785,6 +4790,9 @@ summary = "Demo app used by IPC tests."
         let write = json!({"path": "/box/latest/confirm", "bytes_b64": B64.encode("y")});
         assert!(server.do_write(&write, &context).await.is_ok());
         assert_eq!(*handler.0.lock().await, ["/pending/x1/confirm"]);
+        // A handler may refuse a linked name as invalid rather than absent.
+        let staged = json!({"path": "/box/latest/new.tx", "bytes_b64": ""});
+        assert!(server.do_write(&staged, &context).await.is_ok());
 
         let link = server
             .do_lookup(&json!({"path": "/box/latest"}))
