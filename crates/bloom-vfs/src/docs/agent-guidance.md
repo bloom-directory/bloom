@@ -36,7 +36,8 @@ write `new.tx`, write `latest/confirm` and read `latest/plan.md`; then write
 - Secrets (mnemonics, recovery secrets, passkeys) go only in the Broker
   page, never in a write, shell argument, environment variable or log.
 - Give the human the complete approval link, unchanged, and say in a
-  sentence what you asked for.
+  sentence what you asked for. Then confirm again in the same turn: that
+  write waits for them, so there is nothing to stop and wait for.
 - A refusal (`Operation not permitted`, a policy `deny`) is final. Do not
   change policy, switch accounts or try another interface to get around it.
   Propose a policy change only when the owner asks for that change.

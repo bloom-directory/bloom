@@ -17,8 +17,9 @@ sends. Then `receipt.json` holds the result. Writing `cancel` to `confirm`
 discards the entry. `pending/`, `sent/` and `failed/` hold every entry by id.
 
 Several staged entries can go under one approval: write `<chain>:pending`
-(or their `chain:id` references in order) to `../../../confirm-batch` and read
-that file for the link, then write it again and read it for the hashes.
+(or their `chain:id` references in order) to `../../../confirm-batch` for the
+link, then write it again: it waits for the approval and sends. Reading that
+file gives the hashes.
 
 Each step can be one command: write `new.tx`, write `latest/confirm` and
 read `latest/plan.md`; then write `latest/confirm` again and read

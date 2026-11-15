@@ -820,6 +820,7 @@ pub struct IpcServer {
 /// It stays under the 60 s request timeout common MCP clients default to.
 const APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(50);
 const APPROVAL_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+const BATCH_APPROVAL_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 /// A receipt read waits this many polls (5 s) for the transaction to be mined.
 const RECEIPT_POLLS: u32 = 10;
 
@@ -1484,6 +1485,10 @@ impl IpcServer {
             return Err(HandlerError::PermissionDenied.into());
         }
         let bytes = parse_write_bytes(params)?;
+        if matches!(path.segments(), [root, _, _, leaf] if root == "wallets" && leaf == "confirm-batch")
+        {
+            return self.write_batch_confirm(&path, &bytes, context).await;
+        }
         let Some(challenge) = confirm_challenge_path(&path) else {
             return Ok(self.vfs.write(&path, &bytes).await?);
         };
@@ -1494,6 +1499,51 @@ impl IpcServer {
                     .await
             }
             result => Ok(result?),
+        }
+    }
+
+    /// The batch a `confirm-batch` file reports as waiting for the owner.
+    async fn awaited_batch(&self, path: &VfsPath) -> Option<(String, String)> {
+        let status: Value = serde_json::from_slice(&self.vfs.read(path).await.ok()?).ok()?;
+        (status["status"] == "awaiting_ceremony").then(|| {
+            (
+                status["action_id"].as_str().unwrap_or_default().to_owned(),
+                status["ceremony_url"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        })
+    }
+
+    /// `confirm-batch` behaves as a single confirm does: the first write
+    /// returns the owner's link at once, and a repeat for the same batch
+    /// waits for their approval, then sends.
+    async fn write_batch_confirm(
+        &self,
+        path: &VfsPath,
+        bytes: &[u8],
+        context: &IpcOperationContext,
+    ) -> Result<(), WriteError> {
+        let waiting_for = self.awaited_batch(path).await.map(|(action, _)| action);
+        let deadline = tokio::time::Instant::now() + self.approval_wait;
+        loop {
+            match self.vfs.write(path, bytes).await {
+                Err(HandlerError::ApprovalPending(_)) => {}
+                result => return Ok(result?),
+            }
+            let (action, url) = self.awaited_batch(path).await.unwrap_or_default();
+            if waiting_for.as_deref() != Some(action.as_str())
+                || context.is_cancelled()
+                || tokio::time::Instant::now() >= deadline
+            {
+                return Err(WriteError::Approval(format!(
+                    "permission denied: owner approval required: {url} . Write confirm-batch again: it waits for their approval, then sends."
+                )));
+            }
+            // Each attempt is an audited request, so poll less often than a
+            // single confirm does.
+            tokio::time::sleep(BATCH_APPROVAL_POLL).await;
         }
     }
 
@@ -4808,6 +4858,57 @@ summary = "Demo app used by IPC tests."
         );
         let denied = json!({"path": "/box/pending/x1/other", "bytes_b64": ""});
         assert!(server.do_write(&denied, &context).await.is_err());
+    }
+
+    /// A `confirm-batch` file whose batch is approved after two writes.
+    struct BatchFile(std::sync::atomic::AtomicU32);
+
+    #[async_trait::async_trait]
+    impl Handler for BatchFile {
+        async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+            Ok(Entry::writable_file(
+                path.segments().last().map_or("w", String::as_str),
+            ))
+        }
+
+        async fn read(&self, _path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            Ok(match self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                0 => b"usage".to_vec(),
+                1 | 2 => br#"{"status":"awaiting_ceremony","action_id":"b1","ceremony_url":"http://localhost:1/c/b"}"#.to_vec(),
+                _ => br#"{"status":"succeeded"}"#.to_vec(),
+            })
+        }
+
+        async fn write(&self, _path: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+            match self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 | 1 => Err(HandlerError::ApprovalPending("w/0/confirm-batch".into())),
+                _ => Ok(()),
+            }
+        }
+    }
+
+    /// The first batch write returns the owner's link at once; the repeat
+    /// waits for their approval, as a repeated confirm does.
+    #[tokio::test]
+    async fn a_repeated_batch_confirm_waits_for_the_owner() {
+        let handler = Arc::new(BatchFile(std::sync::atomic::AtomicU32::new(0)));
+        let server = IpcServer::new(
+            Vfs::builder().mount("wallets", handler.clone()).build(),
+            "0",
+            vec![],
+        );
+        let context = IpcOperationContext::detached();
+        let write =
+            json!({"path": "/wallets/w/0/confirm-batch", "bytes_b64": B64.encode("base:pending")});
+        let started = std::time::Instant::now();
+        let Err(WriteError::Approval(message)) = server.do_write(&write, &context).await else {
+            panic!("the first write must report the approval link");
+        };
+        assert!(message.contains("http://localhost:1/c/b"), "{message}");
+        assert!(started.elapsed() < BATCH_APPROVAL_POLL);
+        // Still waiting on this write; approved by the next attempt.
+        assert!(server.do_write(&write, &context).await.is_ok());
+        assert!(started.elapsed() >= BATCH_APPROVAL_POLL);
     }
 
     /// A sent entry whose receipt is recorded only on the fourth read.
