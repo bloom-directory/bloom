@@ -820,6 +820,8 @@ pub struct IpcServer {
 /// It stays under the 60 s request timeout common MCP clients default to.
 const APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(50);
 const APPROVAL_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+/// A receipt read waits this many polls (5 s) for the transaction to be mined.
+const RECEIPT_POLLS: u32 = 10;
 
 enum WriteError {
     Handler(HandlerError),
@@ -1369,10 +1371,59 @@ impl IpcServer {
         match self.read_direct(params, context).await {
             Err(error) => match self.relinked(params, &error, true).await {
                 Some(real) => self.read_direct(&real, context).await,
+                None if self.receipt_is_due(params, &error).await => {
+                    self.read_receipt_when_mined(params, context, error).await
+                }
                 None => Err(error),
             },
             read => read,
         }
+    }
+
+    /// Whether `params` names the receipt of an outbox entry that was
+    /// broadcast (it has a `tx_hash`) but has no receipt recorded yet.
+    async fn receipt_is_due(&self, params: &Value, error: &HandlerError) -> bool {
+        let Ok(path) = parse_path(params) else {
+            return false;
+        };
+        let segments = path.segments();
+        let [.., outbox, sent, _, leaf] = segments else {
+            return false;
+        };
+        if !matches!(error, HandlerError::NotFound(_))
+            || outbox != "outbox"
+            || sent != "sent"
+            || leaf != "receipt.json"
+        {
+            return false;
+        }
+        let sibling = format!("/{}/tx_hash", segments[..segments.len() - 1].join("/"));
+        match VfsPath::parse(&sibling) {
+            Ok(tx_hash) => self.vfs.lookup(&tx_hash).await.is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// A receipt is recorded once the transaction is mined, moments after the
+    /// confirm that sent it returns. Wait for it briefly, so a caller that
+    /// confirms and reads the receipt in one command gets it.
+    async fn read_receipt_when_mined(
+        &self,
+        params: &Value,
+        context: &IpcOperationContext,
+        absent: HandlerError,
+    ) -> Result<Value, HandlerError> {
+        for _ in 0..RECEIPT_POLLS {
+            if context.is_cancelled() {
+                break;
+            }
+            tokio::time::sleep(APPROVAL_POLL).await;
+            match self.read_direct(params, context).await {
+                Err(HandlerError::NotFound(_)) => continue,
+                read => return read,
+            }
+        }
+        Err(absent)
     }
 
     async fn read_direct(
@@ -4742,6 +4793,51 @@ summary = "Demo app used by IPC tests."
         );
         let denied = json!({"path": "/box/pending/x1/other", "bytes_b64": ""});
         assert!(server.do_write(&denied, &context).await.is_err());
+    }
+
+    /// A sent entry whose receipt is recorded only on the third read.
+    struct LateReceipt(std::sync::atomic::AtomicU32);
+
+    #[async_trait::async_trait]
+    impl Handler for LateReceipt {
+        async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+            match path.to_string_path().as_str() {
+                "/outbox/sent/x1/tx_hash" => Ok(Entry::file("tx_hash")),
+                other => Err(HandlerError::NotFound(other.to_owned())),
+            }
+        }
+
+        async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            let reads = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match path.to_string_path().as_str() {
+                "/outbox/sent/x1/receipt.json" if reads >= 2 => Ok(b"{}".to_vec()),
+                other => Err(HandlerError::NotFound(other.to_owned())),
+            }
+        }
+    }
+
+    /// Confirm-then-read-the-receipt in one command must not miss a receipt
+    /// that is recorded a moment after the send. Only a broadcast entry waits.
+    #[tokio::test]
+    async fn a_receipt_read_waits_for_a_broadcast_entry_to_be_mined() {
+        let handler = Arc::new(LateReceipt(std::sync::atomic::AtomicU32::new(0)));
+        let server = IpcServer::new(
+            Vfs::builder().mount("w", handler.clone()).build(),
+            "0",
+            vec![],
+        );
+        let context = IpcOperationContext::detached();
+        let receipt = json!({"path": "/w/outbox/sent/x1/receipt.json"});
+        let read = server.do_read(&receipt, &context).await.unwrap();
+        assert_eq!(read["bytes_b64"], B64.encode("{}"));
+
+        let started = std::time::Instant::now();
+        let unknown = json!({"path": "/w/outbox/sent/nope/receipt.json"});
+        assert!(server.do_read(&unknown, &context).await.is_err());
+        assert!(
+            started.elapsed() < APPROVAL_POLL,
+            "an unknown entry must not wait"
+        );
     }
 
     #[tokio::test]
