@@ -11,12 +11,14 @@ relative to this file's directory. Without a mount,
 - `docs/`: one short file per topic; the filenames are the index
   (`cat docs/README.md` is the full route table).
 
-Send, approve or call a contract:
+Send, approve or call a contract through the account's outbox,
+`wallets/<wallet>/<n>/chains/<chain>/outbox/`:
 
-```sh
-bloom wallet stage <wallet> <chain> --confirm --intent '<body>'  # entry id, plan, approval link
-bloom wallet confirm <wallet> <chain> <id>                       # waits for approval, sends, prints the receipt
-```
+- `new.tx`: write a body to stage it.
+- `latest/`: the entry staged last. `plan.md` is what will be signed.
+  Writing `y` to `confirm` asks the owner and gives their approval link;
+  written again, it waits for the approval and sends. `cancel` discards.
+- `sent/<id>/receipt.json`: the result. `failed/<id>/` holds refusals.
 
 ```text
 send 0.25 ETH to 0x...
@@ -25,9 +27,6 @@ send 0.25 ETH to 0x...
 {"kind":"raw","to":"0x...","data":"0x...","value":"0"}                  any contract call
 {"kind":"call","contract":"0x...","method":"transfer(address,uint256)","args":["0x...","1"]}
 ```
-
-Without `--confirm`, stage only prepares the entry.
-`bloom wallet confirm <wallet> <chain> <id> --text cancel` discards it.
 
 ## Rules
 

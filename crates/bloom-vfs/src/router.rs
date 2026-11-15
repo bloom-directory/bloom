@@ -945,8 +945,8 @@ mod tests {
         // The published skill reads this file through `bloom vfs cat` before
         // any mount, so the guide also names the CLI path for a transaction.
         assert!(
-            text.contains("bloom wallet stage") && text.contains("bloom wallet confirm"),
-            "guidance should name the two-command transaction path"
+            text.contains("outbox/") && text.contains("`new.tx`") && text.contains("`confirm`"),
+            "guidance should name the outbox files a transaction goes through"
         );
         // Documentation assertion (plan:
         // docs/plans/2026-07-21-async-vfs-passkey-registration.md): agent

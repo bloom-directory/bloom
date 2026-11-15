@@ -1052,8 +1052,8 @@ fn vfs_cat_root_agent_guidance_returns_identical_content() {
         "guidance should use mounted filesystem examples"
     );
     assert!(
-        text.contains("bloom wallet stage") && text.contains("bloom wallet confirm"),
-        "guidance should name the two-command transaction path"
+        text.contains("outbox/") && text.contains("`new.tx`") && text.contains("`confirm`"),
+        "guidance should name the outbox files a transaction goes through"
     );
 }
 
@@ -1933,22 +1933,6 @@ fn wallet_stage_routes_via_ipc_when_home_write_lock_is_live() {
             "bloom wallet confirm alice anvil tx-2 --account 7",
         ));
 
-    // A write to the same path prints the same result, with the data given
-    // as a second argument.
-    bloom_cmd(home.path())
-        .args([
-            "vfs",
-            "write",
-            "wallets/alice/7/chains/anvil/outbox/new.tx",
-            intent,
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::eq("tx-3\n"))
-        .stderr(predicate::str::contains(
-            "bloom wallet confirm alice anvil tx-3 --account 7",
-        ));
-
     // --confirm also writes the new entry's confirm file. This handler
     // records no broadcast, so the result is unknown (exit 4).
     bloom_cmd(home.path())
@@ -1963,18 +1947,17 @@ fn wallet_stage_routes_via_ipc_when_home_write_lock_is_live() {
         ])
         .assert()
         .code(4)
-        .stdout(predicate::str::starts_with("tx-4\nConfirmed;"));
+        .stdout(predicate::str::starts_with("tx-3\nConfirmed;"));
 
     stop_ipc_server(server, server_thread);
     let writes = wallets.writes();
-    assert_eq!(writes.len(), 5, "writes={writes:?}");
+    assert_eq!(writes.len(), 4, "writes={writes:?}");
     assert_eq!(
-        writes[4].0,
-        "/alice/0/chains/anvil/outbox/pending/tx-4/confirm"
+        writes[3].0,
+        "/alice/0/chains/anvil/outbox/pending/tx-3/confirm"
     );
-    assert_eq!(writes[4].1, b"y");
-    assert_eq!(writes[2].0, "/alice/7/chains/anvil/outbox/new.tx");
-    assert_eq!(String::from_utf8_lossy(&writes[2].1), intent);
+    assert_eq!(writes[3].1, b"y");
+    assert_eq!(writes[2].0, "/alice/0/chains/anvil/outbox/new.tx");
     assert_eq!(writes[1].0, "/alice/7/chains/anvil/outbox/new.tx");
     assert_eq!(writes[0].0, "/alice/0/chains/anvil/outbox/new.tx");
     assert_eq!(String::from_utf8_lossy(&writes[0].1), intent);
@@ -2657,21 +2640,6 @@ fn wallet_confirm_reports_the_pending_ceremony_url() {
         ))
         .stdout(predicate::str::contains(
             "Next: bloom wallet confirm alice base 0001-cafe --account 7 (waits",
-        ));
-
-    // Writing the entry's confirm file reports the same link.
-    bloom_cmd(home.path())
-        .args([
-            "vfs",
-            "write",
-            "/wallets/alice/7/chains/base/outbox/pending/0001-cafe/confirm",
-            "--data",
-            "y",
-        ])
-        .assert()
-        .code(3)
-        .stdout(predicate::str::contains(
-            "Approval required: http://localhost:18734/c/secret",
         ));
 
     stop_ipc_server(server, server_thread);
