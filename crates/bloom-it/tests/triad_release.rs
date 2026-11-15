@@ -817,38 +817,18 @@ fn triad_developer_launcher_supports_linux_without_weakening_root_boundary() {
     assert!(launcher.contains("sudo -n -l -- \"$umount_bin\" -l -f \"$mount_dir\""));
     assert!(launcher.contains("Linux developer mount privilege is not installed"));
     assert!(launcher.contains("packaging/triad/linux/config/${name}"));
-    assert!(launcher.contains("systemctl --user"));
     assert!(launcher.contains("export LC_ALL=C"));
-    assert!(launcher.contains("Linux developer systemd user unit directory is unsafe"));
-    assert!(launcher.contains("Linux developer systemd unit paths may contain only ASCII"));
-    assert!(launcher.contains("write_linux_socket_unit \"$broker_ceremony_v4_socket_unit\""));
-    assert!(launcher.contains("write_linux_socket_unit \"$broker_ceremony_v6_socket_unit\""));
-    assert!(!launcher.contains("write_linux_loopback_socket_unit"));
-    assert!(launcher.contains("printf 'FileDescriptorName=%s\\n' \"$descriptor\""));
-    assert!(!launcher.contains("signer_socket_unit"));
-    assert!(!launcher.contains("BLOOM_SIGNER_ACTIVATION_NAME"));
-    assert!(!launcher.contains("BLOOM_SIGNER_CONTROL_ACTIVATION_NAME"));
-    assert!(launcher.contains("\"BLOOM_SIGNER_SOCKET=$signer_socket\""));
-    assert!(launcher.contains("\"BLOOM_SIGNER_CONTROL_SOCKET=$signer_control_socket\""));
-    assert!(!launcher.contains("broker_socket_unit"));
-    assert!(!launcher.contains("broker_control_socket_unit"));
-    assert!(!launcher.contains("BLOOM_BROKER_ACTIVATION_NAME"));
-    assert!(!launcher.contains("BLOOM_BROKER_CONTROL_ACTIVATION_NAME"));
-    assert!(launcher.contains("\"BLOOM_BROKER_SOCKET=$broker_socket\""));
-    assert!(launcher.contains("\"BLOOM_BROKER_CONTROL_SOCKET=$broker_control_socket\""));
-    assert!(launcher.contains("broker_ceremony_v4_socket_unit"));
-    assert!(launcher.contains("broker_ceremony_v6_socket_unit"));
-    assert!(launcher.contains("\"127.0.0.1:${ceremony_port}\" broker-ceremony-ipv4"));
-    assert!(launcher.contains("\"[::1]:${ceremony_port}\" broker-ceremony-ipv6"));
-    assert!(launcher.contains("BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV4=broker-ceremony-ipv4"));
-    assert!(launcher.contains("BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV6=broker-ceremony-ipv6"));
-    assert_eq!(
-        launcher
-            .matches("\"BLOOM_AUTHORITY_EDGE_HISTORY=$authority_edge_history\"")
-            .count(),
-        2
-    );
-    assert!(launcher.contains("Linux developer services require an active systemd user manager"));
+    // Linux hands the Broker its ceremony listeners the way production
+    // does, as named inherited sockets, but without a systemd manager.
+    assert!(!launcher.contains("systemctl"));
+    assert!(launcher.contains("command -v systemd-socket-activate"));
+    assert!(launcher.contains("-l \"127.0.0.1:${ceremony_port}\" -l \"[::1]:${ceremony_port}\""));
+    assert!(launcher.contains("--fdname=broker-ceremony-ipv4:broker-ceremony-ipv6"));
+    assert!(launcher.contains("systemd-socket-activate did not report both ceremony listeners"));
+    assert!(launcher.contains("BLOOM_SIGNER_SOCKET=\"$signer_socket\""));
+    assert!(launcher.contains("BLOOM_BROKER_SOCKET=\"$broker_socket\""));
+    assert!(launcher.contains("wait_for_socket \"$broker_control_socket\""));
+    assert!(launcher.contains("export BLOOM_AUTHORITY_EDGE_HISTORY=\"$authority_edge_history\""));
     assert!(launcher.contains("BLOOM_TRIAD_DEV_SOCKET_TIMEOUT_SECONDS"));
 
     let linux_manifest =
@@ -2086,6 +2066,13 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
         root.join("usr/libexec/bloom/bloom-linux-maintenance")
             .is_file()
     );
+    for service in ["broker", "signer"] {
+        assert!(
+            !root
+                .join(format!("usr/lib/systemd/system/bloom-{service}@.service"))
+                .exists()
+        );
+    }
 
     assert!(
         Command::new(&installer)
@@ -2102,6 +2089,12 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
     assert!(root.join("etc/bloom/enrollments/1000.json").is_file());
     assert!(!root.join("etc/bloom/retained/1000.json").exists());
     assert!(root.join("usr/bin/bloom").is_file());
+    for service in ["broker", "signer"] {
+        assert!(
+            root.join(format!("usr/lib/systemd/system/bloom-{service}@.service"))
+                .is_file()
+        );
+    }
     assert!(
         fs::read_to_string(root.join("etc/fstab"))
             .unwrap()
@@ -5053,6 +5046,139 @@ fn install_linux_logins(root: &Path, payload: &Path, logins: &[(&str, &str)]) {
             installed.status.success(),
             "{}",
             String::from_utf8_lossy(&installed.stderr)
+        );
+    }
+}
+
+#[test]
+fn linux_same_release_reinstall_skips_only_services_a_retained_uninstall_removed() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let payload = make_installer_payload(&directory.path().join("payload"));
+    install_linux_logins(&root, &payload, &[("1000", "alice")]);
+    // systemctl knows a unit exactly while its template is installed. The
+    // reinstall selects the retained release before this dispatch runs.
+    let release_digest = hex::encode(Sha256::digest(b"test payload\n"));
+    let harness = write_linux_live_harness(
+        directory.path(),
+        r#"
+systemctl() {
+  printf '%s\n' "$*" >> "$log"
+  local template="$root/usr/lib/systemd/system/${2%@*}@.service"
+  case "$1:${3:-}" in
+    show:--property=LoadState)
+      if [[ -f "$template" ]]; then echo loaded; else echo not-found; fi ;;
+    show:--property=ActiveState) echo inactive ;;
+    stop:*) [[ -f "$template" ]] || { echo "Unit $2 not loaded" >&2; return 5; } ;;
+    *) return 64 ;;
+  esac
+}
+switch_linux_release "$root" "$arg1"
+stop_linux_same_release_services "$root" 1000
+"#,
+    );
+    let service_stops = |name: &str| -> Vec<String> {
+        let log = directory.path().join(name);
+        let output = Command::new(&harness)
+            .arg(release_script("install-linux.sh"))
+            .arg(&root)
+            .arg(&log)
+            .arg(&release_digest)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix("stop "))
+            .filter(|unit| unit.ends_with("@1000.service"))
+            .map(str::to_owned)
+            .collect()
+    };
+    assert_eq!(
+        service_stops("installed.log"),
+        ["bloom-broker@1000.service", "bloom-signer@1000.service"]
+    );
+
+    let uninstalled = Command::new(release_script("install-linux.sh"))
+        .args(["uninstall", "--retain-custody"])
+        .arg(&root)
+        .arg("1000")
+        .output()
+        .unwrap();
+    assert!(
+        uninstalled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&uninstalled.stderr)
+    );
+    for service in ["broker", "signer"] {
+        assert!(
+            !root
+                .join(format!("usr/lib/systemd/system/bloom-{service}@.service"))
+                .exists()
+        );
+    }
+    assert!(service_stops("retained.log").is_empty());
+}
+
+#[test]
+fn linux_reinstall_service_stop_only_skips_missing_inactive_units() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let harness = write_linux_live_harness(
+        directory.path(),
+        r#"
+systemctl() {
+  printf '%s\n' "$*" >> "$log"
+  case "$1:${3:-}" in
+    show:--property=LoadState)
+      [[ "$arg1" != query-failed ]] || return 9
+      echo "$arg1" ;;
+    show:--property=ActiveState)
+      [[ "$arg2" != query-failed ]] || return 10
+      echo "$arg2" ;;
+    stop:*) return "$arg3" ;;
+    *) return 64 ;;
+  esac
+}
+stop_linux_service_if_present bloom-broker@1000.service
+"#,
+    );
+    for (load, active, stop, expected, calls_stop) in [
+        ("not-found", "inactive", "5", 0, false),
+        ("loaded", "active", "0", 0, true),
+        ("loaded", "inactive", "7", 7, true),
+        ("not-found", "active", "7", 7, true),
+        ("query-failed", "inactive", "0", 9, false),
+        ("not-found", "query-failed", "0", 10, false),
+        ("error", "inactive", "7", 7, true),
+    ] {
+        let log = directory.path().join(format!("{load}-{active}-{stop}.log"));
+        let output = Command::new(&harness)
+            .arg(release_script("install-linux.sh"))
+            .arg(&root)
+            .arg(&log)
+            .args([load, active, stop])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "{load}/{active}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .any(|line| line.starts_with("stop ")),
+            calls_stop
         );
     }
 }

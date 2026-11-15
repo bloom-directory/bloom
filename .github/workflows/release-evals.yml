@@ -4,10 +4,9 @@ name: Release evals
 # selected agent: build the Machine from this ref with the Broker and Signer
 # the release matrix pins, prove the three services with the Solana smoke
 # (no model), then run every Harbor task with that agent and record reward,
-# tool calls, tokens and time. The report fails on a smoke failure, a missing
-# result or a regression against evals/harbor/baselines/README.md; the rest is a
-# number for the release reviewer. A failed trial is retried once, so one
-# nondeterministic miss does not fail a release. Runs on release-proposal PRs
+# tool calls, tokens and time. The gates that fail the report are described
+# once, in evals/harbor/README.md ("Results"); the rest is a number for the
+# release reviewer. Runs on release-proposal PRs
 # and on dispatch. Model credentials are repository secrets, OAuth where the
 # agent supports it: CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`) or
 # ANTHROPIC_API_KEY for Claude Code; CODEX_AUTH_JSON (the contents of
@@ -157,18 +156,10 @@ jobs:
           echo "7d588d188cb9ea550434cabc62a9927cf75de22e1aeb2a87f2352071812944fb  /tmp/agave-install.sh" | sha256sum -c -
           sh /tmp/agave-install.sh v3.0.0
           echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
-      # The developer launcher runs the services as systemd user units and
-      # mounts the Machine over loopback NFS with a noninteractive sudo rule;
-      # the runner's unrestricted sudo satisfies that rule.
+      # The developer launcher mounts the Machine over loopback NFS with a
+      # noninteractive sudo rule; the runner's unrestricted sudo satisfies it.
       - name: Install the launcher's Linux prerequisites
-        run: |
-          sudo apt-get update && sudo apt-get install -y nfs-common
-          sudo loginctl enable-linger "$(id -un)"
-          for _ in $(seq 1 30); do
-            [ -S "/run/user/$(id -u)/bus" ] && break
-            sleep 1
-          done
-          XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user show-environment >/dev/null
+        run: sudo apt-get update && sudo apt-get install -y nfs-common
       - name: Smoke the real Triad without a model
         run: scripts/evals/run-harbor.sh solana-transfer "$AGENT" --smoke
       # One task at a time, as the baseline procedure requires. A failed
@@ -241,6 +232,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh pr comment ${{ github.event.pull_request.number }} --body-file report.md
-      - name: Fail on a smoke failure, a baseline regression or a slower task
+      - name: Fail on a release gate
         if: steps.report.outputs.failed == 'true'
         run: exit 1

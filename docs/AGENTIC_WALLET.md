@@ -20,7 +20,7 @@ The happy path for a new user is:
 Tell your agent: "Read https://bloom.directory/SKILL.md and set up Bloom."
 ```
 
-That [skill](../skills/bloom/SKILL.md) connects to an existing Bloom first. Only when asked to install does it stage the signed release and hand the one privileged step to the user's operating system. It then follows the mounted `AGENTS.md` and prefers the filesystem over custom Web3 code.
+That [skill](../skills/bloom/SKILL.md) connects to an existing Bloom first. Only when asked to install does it follow the [install guide](../install/install.md), which stages the signed release and hand the one privileged step to the user's operating system. It then follows the mounted `AGENTS.md` and prefers the filesystem over custom Web3 code.
 
 ## What the wallet enables
 
