@@ -5295,6 +5295,7 @@ mod tests {
         operation_cancel_remote_result, persist_ceremony_projection, policy_commit_remote_result,
         request_body_with_wallet, wallet_import_kind,
     };
+    use super::{approval_pending_text, live_ceremony, unix_now_ms};
     use bloom_daemon::ipc::{
         MachineCeremonyAction, MachineCommand, MachineCustodyKind, MachineOperationAction,
     };
@@ -6582,5 +6583,27 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("unix:/restricted/bloom.sock"), "{message}");
         assert!(message.contains("bloom serve"), "{message}");
+    }
+
+    /// A waiting cancel tells the agent to re-run the cancel, not a confirm,
+    /// and only a challenge with an open ceremony yields a link.
+    #[test]
+    fn approval_pending_names_the_command_and_needs_a_live_ceremony() {
+        let later = unix_now_ms() + 60_000;
+        let text = approval_pending_text("https://relay.test/c", later, None, "cancel");
+        assert!(text.contains("open https://relay.test/c"), "{text}");
+        assert!(
+            text.contains("re-run this cancel after approving"),
+            "{text}"
+        );
+        let challenge = |url: &str, expiry: serde_json::Value| {
+            live_ceremony(&serde_json::json!({"ceremony_url": url, "expiry_ms": expiry}))
+        };
+        assert_eq!(
+            challenge("https://relay.test/c", later.to_string().into()),
+            Some(("https://relay.test/c".into(), later))
+        );
+        assert_eq!(challenge("https://relay.test/c", 1.into()), None);
+        assert_eq!(challenge(" ", later.to_string().into()), None);
     }
 }

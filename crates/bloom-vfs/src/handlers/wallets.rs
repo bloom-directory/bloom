@@ -4498,8 +4498,8 @@ impl WalletsHandler {
         sent_ok: bool,
     ) -> Result<(), HandlerError> {
         let outbox = &self.tx_engine.outbox;
-        // Cancel and replace also act on a broadcast entry, which the
-        // engine moves to `sent/`; it is still addressed through `pending/`.
+        // Cancel also acts on a broadcast entry, which the engine moves to
+        // `sent/`; it is still addressed through `pending/`.
         let entry = match outbox.read_in_state(wallet, chain, id, OutboxState::Pending) {
             Err(OutboxError::StateMismatch { actual: "sent", .. }) if sent_ok => {
                 outbox.read_in_state(wallet, chain, id, OutboxState::Sent)
@@ -4677,7 +4677,7 @@ impl WalletsHandler {
             // outbox/pending/<id>/replace accepts only an exact EIP-1559 fee
             // pair. Any other body is refused before anything is recorded.
             [state, id, fname] if state == "pending" && fname == "replace" => {
-                self.require_staged_by(wallet, chain, id, &scope, true)?;
+                self.require_staged_by(wallet, chain, id, &scope, false)?;
                 #[derive(serde::Deserialize)]
                 #[serde(deny_unknown_fields)]
                 struct FeeRepair {
@@ -10895,11 +10895,12 @@ value = "0""#,
         assert!(matches!(r, Err(HandlerError::Invalid(_))), "got: {r:?}");
     }
 
-    /// A broadcast entry is in `sent/` but is still cancelled and replaced
-    /// through `pending/<id>/`, as the cancel challenge's `retry_path` says;
-    /// the sender fence still hides another account's entry.
+    /// A broadcast entry is in `sent/` but is still cancelled through
+    /// `pending/<id>/`, as the cancel challenge's `retry_path` says; the
+    /// sender fence still hides another account's entry. Replace is refused,
+    /// because its approval is not projected for a sent entry.
     #[tokio::test]
-    async fn cancel_and_replace_reach_a_sent_entry_of_the_same_sender() {
+    async fn cancel_reaches_a_sent_entry_of_the_same_sender() {
         let f = make_handler_with_chain(true);
         let w = f.wallet_name.clone();
         let hash = format!("{:?}", alloy::primitives::B256::repeat_byte(1));
@@ -10912,20 +10913,25 @@ value = "0""#,
             0,
             &hash,
         );
+        let path = |id: &str, control: &str| {
+            vfs(format!("/{w}/0/chains/anvil/outbox/pending/{id}/{control}"))
+        };
+        let cancel = f.handler.write(&path("mine", "cancel"), b"y").await;
+        assert!(
+            !matches!(cancel, Err(HandlerError::NotFound(_))),
+            "cancel of my sent entry: {cancel:?}"
+        );
+        let theirs = f.handler.write(&path("theirs", "cancel"), b"y").await;
+        assert!(
+            matches!(theirs, Err(HandlerError::NotFound(_))),
+            "cancel of another account's sent entry: {theirs:?}"
+        );
         let fees = br#"{"max_fee_per_gas":"200","max_priority_fee_per_gas":"20"}"#;
-        for (control, body) in [("cancel", &b"y"[..]), ("replace", &fees[..])] {
-            let path = |id: &str| vfs(format!("/{w}/0/chains/anvil/outbox/pending/{id}/{control}"));
-            let mine = f.handler.write(&path("mine"), body).await;
-            assert!(
-                !matches!(mine, Err(HandlerError::NotFound(_))),
-                "{control} of my sent entry: {mine:?}"
-            );
-            let theirs = f.handler.write(&path("theirs"), body).await;
-            assert!(
-                matches!(theirs, Err(HandlerError::NotFound(_))),
-                "{control} of another account's sent entry: {theirs:?}"
-            );
-        }
+        let replace = f.handler.write(&path("mine", "replace"), fees).await;
+        assert!(
+            matches!(replace, Err(HandlerError::NotFound(_))),
+            "replace of a sent entry: {replace:?}"
+        );
     }
 
     /// `replace` accepts only the exact fee pair; every other body is
