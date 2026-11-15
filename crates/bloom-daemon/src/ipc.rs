@@ -1292,7 +1292,59 @@ impl IpcServer {
         }
     }
 
+    /// The parameters with `path` rewritten through the symlink it crosses,
+    /// when `error` is how a handler reports a path it does not serve.
+    ///
+    /// A kernel mount follows `outbox/latest` itself; this gives IPC and MCP
+    /// callers the same paths. The operation is repeated in full on the real
+    /// path, so every check sees the path that is acted on. `leaf` also
+    /// follows a link that is the last segment.
+    async fn relinked(&self, params: &Value, error: &HandlerError, leaf: bool) -> Option<Value> {
+        if !matches!(
+            error,
+            HandlerError::NotFound(_)
+                | HandlerError::NotADir(_)
+                | HandlerError::NotAFile(_)
+                | HandlerError::PermissionDenied
+        ) {
+            return None;
+        }
+        let path = parse_path(params).ok()?;
+        let segments = path.segments();
+        let last = if leaf {
+            segments.len()
+        } else {
+            segments.len().saturating_sub(1)
+        };
+        for end in 1..=last {
+            let prefix = VfsPath::parse(&format!("/{}", segments[..end].join("/"))).ok()?;
+            let target = self.vfs.lookup(&prefix).await.ok()?.link_target;
+            let Some(target) = target else { continue };
+            // Targets are relative to the link's directory and stay inside it.
+            if target.starts_with('/') || target.split('/').any(|part| part == "..") {
+                return None;
+            }
+            let mut real = segments[..end - 1].to_vec();
+            real.extend(target.split('/').map(str::to_owned));
+            real.extend_from_slice(&segments[end..]);
+            let mut params = params.clone();
+            params["path"] = Value::String(format!("/{}", real.join("/")));
+            return Some(params);
+        }
+        None
+    }
+
     async fn do_lookup(&self, params: &Value) -> Result<Value, HandlerError> {
+        match self.lookup_direct(params).await {
+            Err(error) => match self.relinked(params, &error, false).await {
+                Some(real) => self.lookup_direct(&real).await,
+                None => Err(error),
+            },
+            found => found,
+        }
+    }
+
+    async fn lookup_direct(&self, params: &Value) -> Result<Value, HandlerError> {
         let path = parse_path(params)?;
         let e = self.vfs.lookup(&path).await?;
         let mut entry = entry_to_json(&e);
@@ -1310,6 +1362,20 @@ impl IpcServer {
     }
 
     async fn do_read(
+        &self,
+        params: &Value,
+        context: &IpcOperationContext,
+    ) -> Result<Value, HandlerError> {
+        match self.read_direct(params, context).await {
+            Err(error) => match self.relinked(params, &error, true).await {
+                Some(real) => self.read_direct(&real, context).await,
+                None => Err(error),
+            },
+            read => read,
+        }
+    }
+
+    async fn read_direct(
         &self,
         params: &Value,
         context: &IpcOperationContext,
@@ -1334,6 +1400,20 @@ impl IpcServer {
     }
 
     async fn do_write(
+        &self,
+        params: &Value,
+        context: &IpcOperationContext,
+    ) -> Result<(), WriteError> {
+        match self.write_direct(params, context).await {
+            Err(WriteError::Handler(error)) => match self.relinked(params, &error, false).await {
+                Some(real) => self.write_direct(&real, context).await,
+                None => Err(error.into()),
+            },
+            written => written,
+        }
+    }
+
+    async fn write_direct(
         &self,
         params: &Value,
         context: &IpcOperationContext,
@@ -1466,6 +1546,16 @@ impl IpcServer {
     }
 
     async fn do_list(&self, params: &Value) -> Result<Value, HandlerError> {
+        match self.list_direct(params).await {
+            Err(error) => match self.relinked(params, &error, true).await {
+                Some(real) => self.list_direct(&real).await,
+                None => Err(error),
+            },
+            listed => listed,
+        }
+    }
+
+    async fn list_direct(&self, params: &Value) -> Result<Value, HandlerError> {
         let path = parse_path(params)?;
         let entries = self.vfs.list(&path).await?;
         Ok(json!(entries.iter().map(entry_to_json).collect::<Vec<_>>()))
@@ -4563,6 +4653,95 @@ summary = "Demo app used by IPC tests."
             .await
             .unwrap();
         handle.await.unwrap();
+    }
+
+    /// A box with `latest -> pending/x1`, as the wallet outbox has.
+    struct LinkedEntry(tokio::sync::Mutex<Vec<String>>);
+
+    #[async_trait::async_trait]
+    impl Handler for LinkedEntry {
+        async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+            let segments: Vec<&str> = path.segments().iter().map(String::as_str).collect();
+            match segments.as_slice() {
+                [] => Ok(Entry::dir("box")),
+                ["latest"] => Ok(Entry::symlink("latest", "pending/x1")),
+                ["pending"] | ["pending", "x1"] => Ok(Entry::dir(segments[segments.len() - 1])),
+                ["pending", "x1", "plan.md"] => Ok(Entry::file("plan.md")),
+                ["pending", "x1", "confirm"] => Ok(Entry::writable_file("confirm")),
+                _ => Err(HandlerError::NotFound(path.to_string_path())),
+            }
+        }
+
+        async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            match path.to_string_path().as_str() {
+                "/pending/x1/plan.md" => Ok(b"the plan".to_vec()),
+                other => Err(HandlerError::NotAFile(other.to_owned())),
+            }
+        }
+
+        async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            match path.to_string_path().as_str() {
+                "/pending/x1" => Ok(vec![Entry::file("plan.md")]),
+                other => Err(HandlerError::NotFound(other.to_owned())),
+            }
+        }
+
+        async fn write(&self, path: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+            match path.to_string_path().as_str() {
+                "/pending/x1/confirm" => {
+                    self.0.lock().await.push(path.to_string_path());
+                    Ok(())
+                }
+                _ => Err(HandlerError::PermissionDenied),
+            }
+        }
+    }
+
+    /// A kernel mount follows `outbox/latest`; IPC and MCP callers get the
+    /// same paths, and the link itself still reads as a link.
+    #[tokio::test]
+    async fn paths_through_a_symlink_reach_what_it_points_at() {
+        let handler = Arc::new(LinkedEntry(tokio::sync::Mutex::new(Vec::new())));
+        let server = IpcServer::new(
+            Vfs::builder().mount("box", handler.clone()).build(),
+            "0",
+            vec![],
+        );
+        let context = IpcOperationContext::detached();
+
+        let read = server
+            .do_read(&json!({"path": "/box/latest/plan.md"}), &context)
+            .await
+            .unwrap();
+        assert_eq!(read["bytes_b64"], B64.encode("the plan"));
+        let listed = server
+            .do_list(&json!({"path": "/box/latest"}))
+            .await
+            .unwrap();
+        assert_eq!(listed[0]["name"], "plan.md");
+        let inside = server
+            .do_lookup(&json!({"path": "/box/latest/plan.md"}))
+            .await
+            .unwrap();
+        assert_eq!(inside["kind"], "file");
+        let write = json!({"path": "/box/latest/confirm", "bytes_b64": B64.encode("y")});
+        assert!(server.do_write(&write, &context).await.is_ok());
+        assert_eq!(*handler.0.lock().await, ["/pending/x1/confirm"]);
+
+        let link = server
+            .do_lookup(&json!({"path": "/box/latest"}))
+            .await
+            .unwrap();
+        assert_eq!(link["kind"], "symlink");
+        // A path that is simply absent still fails as before.
+        assert!(
+            server
+                .do_read(&json!({"path": "/box/latest/nope"}), &context)
+                .await
+                .is_err()
+        );
+        let denied = json!({"path": "/box/pending/x1/other", "bytes_b64": ""});
+        assert!(server.do_write(&denied, &context).await.is_err());
     }
 
     #[tokio::test]
