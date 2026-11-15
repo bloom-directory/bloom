@@ -49,7 +49,8 @@ and the workflow and release driver checked into the commit being released.
    the new stable release and uses the reviewed key. It discovers the release
    tag dynamically; do not add a floating `latest` Git tag.
 8. Publish the skill at the tag, following [docs/agent-skill.md](docs/agent-skill.md):
-   publish `skills/bloom` to ClawHub as `X.Y.Z`, repin the website to the tag's
+   publish `skills/bloom` to ClawHub as `X.Y.Z`, staged without `.claude-plugin/`,
+   update the plugin's Claude directory listing, repin the website to the tag's
    commit, and test the upgrade from the previous release's skill on skills.sh
    and ClawHub (a fresh install for v0.4.2, the first skill release).
 
