@@ -57,7 +57,7 @@ for example `petals/enso/intents/<wallet>/<n>/new`.
 |---|---|
 | Register wallet | `wallets/new`; [wallet creation](./examples/creating-a-wallet.md), `wallets/` |
 | Recover wallet | `wallets/recover`; [recovery](./examples/recovering-a-wallet.md) |
-| EVM transaction | `wallets/<wallet>/0/chains/<chain>/outbox/new.tx`; [Anvil workflow](./examples/local-anvil-transaction.md) |
+| EVM transaction | `wallets/<wallet>/0/chains/<chain>/outbox/`; its `README.md` |
 | Solana transaction | Same outbox shape with strict JSON; [Solana workflow](./examples/solana-account-aware-reads-and-transfer.md) |
 | Update policy | `wallets/<wallet>/policy.json`; [policy workflow](./examples/updating-wallet-policy.md) |
 | Reusable authority | `wallets/<wallet>/sealed-approvals/` |

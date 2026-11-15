@@ -10028,6 +10028,18 @@ value = "0""#,
         assert_eq!(new_tx.mode, 0o644);
     }
 
+    /// A request usually names a chain by id; `chains/<id>` links to its name.
+    #[tokio::test]
+    async fn a_chain_is_reachable_by_its_numeric_id() {
+        let f = make_handler_with_chain(true);
+        let id = f.handler.chains.get("anvil").unwrap().spec().chain_id;
+        let path = vfs(format!("/{}/0/chains/{id}", f.wallet_name));
+        let entry = f.handler.lookup(&path).await.unwrap();
+        assert_eq!(entry.link_target.as_deref(), Some("anvil"));
+        let unknown = vfs(format!("/{}/0/chains/999999999", f.wallet_name));
+        assert!(f.handler.lookup(&unknown).await.is_err());
+    }
+
     /// The outbox carries its own instructions, sized so a mount serves them.
     #[tokio::test]
     async fn outbox_readme_says_how_to_stage_and_confirm() {

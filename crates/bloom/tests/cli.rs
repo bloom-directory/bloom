@@ -1048,8 +1048,8 @@ fn vfs_cat_root_agent_guidance_returns_identical_content() {
     assert_eq!(agents, claude);
     let text = String::from_utf8(agents).expect("guidance is utf-8");
     assert!(
-        text.contains("cat docs/README.md"),
-        "guidance should use mounted filesystem examples"
+        text.contains("`docs/`"),
+        "guidance should point at the docs directory"
     );
     assert!(
         text.contains("outbox/") && text.contains("README.md"),
@@ -2891,6 +2891,40 @@ fn vfs_write_names_the_approval_challenge_while_owner_approval_is_pending() {
             .stderr(predicate::str::contains("ceremony_url").not());
         stop_ipc_server(server, server_thread);
     }
+}
+
+/// `bloom vfs cat a b` and `bloom vfs ls a b` take several paths, as the
+/// shell commands they stand in for do.
+#[test]
+fn vfs_cat_and_ls_take_several_paths() {
+    let home = fresh_home();
+    let mut files = std::collections::HashMap::new();
+    files.insert("/a".to_string(), b"one\n".to_vec());
+    files.insert("/b".to_string(), b"two\n".to_vec());
+    let handler = Arc::new(ServingHandler {
+        files,
+        ..ServingHandler::default()
+    });
+    let vfs = bloom_vfs::Vfs::builder().mount("wallets", handler).build();
+    let (server, server_thread) = spawn_ipc_server(home.path(), vfs);
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/wallets/a", "/wallets/b"])
+        .assert()
+        .success()
+        .stdout(predicate::eq("one\ntwo\n"));
+    // One missing path is reported; the others still print.
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/wallets/nope", "/wallets/b"])
+        .assert()
+        .failure()
+        .stdout(predicate::eq("two\n"))
+        .stderr(predicate::str::contains("/wallets/nope"));
+    bloom_cmd(home.path())
+        .args(["vfs", "ls", "/wallets", "/wallets"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("/wallets:").count(2));
+    stop_ipc_server(server, server_thread);
 }
 
 /// Denies every policy write; the update's status appears with the first.

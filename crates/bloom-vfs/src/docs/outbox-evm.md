@@ -15,3 +15,7 @@ send 0.25 ETH to 0x...
 and gives their approval link; written again, it waits for the approval and
 sends. Then `receipt.json` holds the result. Writing `cancel` to `confirm`
 discards the entry. `pending/`, `sent/` and `failed/` hold every entry by id.
+
+Each step can be one command: write `new.tx`, write `latest/confirm` and
+read `latest/plan.md`; then write `latest/confirm` again and read
+`latest/receipt.json`.

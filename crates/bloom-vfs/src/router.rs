@@ -939,8 +939,8 @@ mod tests {
             text += &std::fs::read_to_string(entry.unwrap().path()).unwrap();
         }
         assert!(
-            text.contains("cat docs/README.md"),
-            "guidance should use mounted filesystem examples"
+            text.contains("`docs/`"),
+            "guidance should point at the docs directory"
         );
         // The published skill reads this file through `bloom vfs cat` before
         // any mount, so the guide also names the CLI path for a transaction.

@@ -2749,12 +2749,15 @@ enum OperationCmd {
 
 #[derive(Subcommand, Debug)]
 enum VfsCmd {
-    /// `cat /bloom/<path>` — read a file via the VFS.
-    Cat { path: String },
-    /// `ls /bloom/<path>` — list a directory via the VFS.
+    /// `cat /bloom/<path>...` — read files via the VFS.
+    Cat {
+        #[arg(required = true)]
+        paths: Vec<String>,
+    },
+    /// `ls /bloom/<path>...` — list directories via the VFS.
     Ls {
         #[arg(default_value = "/")]
-        path: String,
+        paths: Vec<String>,
     },
     /// `stat /bloom/<path>` — inspect VFS metadata without a kernel mount.
     Stat { path: String },
@@ -3877,47 +3880,84 @@ async fn run(cli: Cli) -> Result<()> {
             };
             call_machine_command(&client_endpoint, command).await
         }
-        Cmd::Vfs(VfsCmd::Cat { path }) => {
+        // Like `cat a b` and `ls a b`: every path is tried, a failure is
+        // reported and the rest still print, and the exit code says one failed.
+        Cmd::Vfs(VfsCmd::Cat { paths }) => {
             let client = IpcClient::new(&client_endpoint.socket);
-            let res = try_ipc(
-                &client,
-                &client_endpoint,
-                "read",
-                serde_json::json!({ "path": path }),
-            )
-            .await
-            .with_context(|| format!("ipc read via {}", client_endpoint.display))?;
-            debug!(endpoint = %client_endpoint.display, "cli.vfs.cat.via_ipc");
-            let b64 = res
-                .get("bytes_b64")
-                .and_then(|v| v.as_str())
-                .context("ipc read: missing bytes_b64")?;
-            let bytes = B64.decode(b64).context("ipc read: bad base64")?;
-            std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
-            Ok(())
-        }
-        Cmd::Vfs(VfsCmd::Ls { path }) => {
-            let client = IpcClient::new(&client_endpoint.socket);
-            let res = try_ipc(
-                &client,
-                &client_endpoint,
-                "list",
-                serde_json::json!({ "path": path }),
-            )
-            .await
-            .with_context(|| format!("ipc list via {}", client_endpoint.display))?;
-            debug!(endpoint = %client_endpoint.display, "cli.vfs.ls.via_ipc");
-            let arr = res.as_array().context("ipc list: expected array")?;
-            for e in arr {
-                let name = e.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                let kind = match e.get("kind").and_then(|v| v.as_str()).unwrap_or("file") {
-                    "dir" => "Dir",
-                    "symlink" => "Symlink",
-                    _ => "File",
+            let mut failed = None;
+            for path in &paths {
+                let read = async {
+                    let res = try_ipc(
+                        &client,
+                        &client_endpoint,
+                        "read",
+                        serde_json::json!({ "path": path }),
+                    )
+                    .await
+                    .with_context(|| format!("ipc read via {}", client_endpoint.display))?;
+                    let b64 = res
+                        .get("bytes_b64")
+                        .and_then(|v| v.as_str())
+                        .context("ipc read: missing bytes_b64")?;
+                    let bytes = B64.decode(b64).context("ipc read: bad base64")?;
+                    std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
+                    anyhow::Ok(())
                 };
-                println!("{}\t{}", name, kind);
+                if let Err(error) = read.await {
+                    if paths.len() == 1 {
+                        return Err(error);
+                    }
+                    eprintln!("error: {path}: {error:#}");
+                    failed = Some(path);
+                }
             }
-            Ok(())
+            debug!(endpoint = %client_endpoint.display, "cli.vfs.cat.via_ipc");
+            match failed {
+                Some(path) => bail!("could not read {path}"),
+                None => Ok(()),
+            }
+        }
+        Cmd::Vfs(VfsCmd::Ls { paths }) => {
+            let client = IpcClient::new(&client_endpoint.socket);
+            let mut failed = None;
+            for path in &paths {
+                let list = async {
+                    let res = try_ipc(
+                        &client,
+                        &client_endpoint,
+                        "list",
+                        serde_json::json!({ "path": path }),
+                    )
+                    .await
+                    .with_context(|| format!("ipc list via {}", client_endpoint.display))?;
+                    let arr = res.as_array().context("ipc list: expected array")?;
+                    if paths.len() > 1 {
+                        println!("{path}:");
+                    }
+                    for e in arr {
+                        let name = e.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                        let kind = match e.get("kind").and_then(|v| v.as_str()).unwrap_or("file") {
+                            "dir" => "Dir",
+                            "symlink" => "Symlink",
+                            _ => "File",
+                        };
+                        println!("{}\t{}", name, kind);
+                    }
+                    anyhow::Ok(())
+                };
+                if let Err(error) = list.await {
+                    if paths.len() == 1 {
+                        return Err(error);
+                    }
+                    eprintln!("error: {path}: {error:#}");
+                    failed = Some(path);
+                }
+            }
+            debug!(endpoint = %client_endpoint.display, "cli.vfs.ls.via_ipc");
+            match failed {
+                Some(path) => bail!("could not list {path}"),
+                None => Ok(()),
+            }
         }
         Cmd::Vfs(VfsCmd::Stat { path }) => {
             let client = IpcClient::new(&client_endpoint.socket);

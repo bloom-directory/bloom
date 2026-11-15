@@ -495,6 +495,24 @@ impl WalletsHandler {
         petals.sessions(&Self::account_context(wallet, view))
     }
 
+    /// The configured EVM chain whose chain id is `id`, unless a chain is
+    /// already named that.
+    fn chain_named_by_id(&self, id: &str) -> Option<String> {
+        let id: u64 = id.parse().ok()?;
+        let names = self.chains.list_names();
+        if names
+            .iter()
+            .any(|name| name.parse::<u64>().is_ok_and(|n| n == id))
+        {
+            return None;
+        }
+        names.into_iter().find(|name| {
+            self.chains
+                .get(name)
+                .is_some_and(|c| c.spec().chain_id == id)
+        })
+    }
+
     fn chain_name_entries(&self, view: &AccountView) -> Vec<Entry> {
         self.chain_names(view)
             .into_iter()
@@ -728,6 +746,11 @@ impl WalletsHandler {
                 Ok(Entry::file(leaf))
             }
             [dir] if dir == "chains" => Ok(Entry::dir("chains")),
+            // A chain is also reachable by its numeric id (`chains/1`), as a
+            // link to its name: requests usually give the id.
+            [dir, id] if dir == "chains" && self.chain_named_by_id(id).is_some() => Ok(
+                Entry::symlink(id, &self.chain_named_by_id(id).unwrap_or_default()),
+            ),
             [dir, chain, chain_rest @ ..] if dir == "chains" => {
                 if self.is_solana_chain(chain) {
                     let (family, _) = Self::solana_family(&view, chain)?;
