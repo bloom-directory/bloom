@@ -10155,7 +10155,12 @@ value = "0""#,
         let text = String::from_utf8(f.handler.read(&path).await.unwrap()).unwrap();
         assert_eq!(readme.size, text.len() as u64);
         assert_eq!(f.handler.lookup(&path).await.unwrap().size, readme.size);
+        // `send.tx` (stage and ask the owner in one write) sits beside `new.tx`.
+        assert!(listed.iter().any(|entry| entry.name == "send.tx"));
+        let send = VfsPath::parse(&format!("{root}/send.tx")).unwrap();
+        assert_eq!(f.handler.lookup(&send).await.unwrap().name, "send.tx");
         for word in [
+            "`send.tx`",
             "`new.tx`",
             "`latest/`",
             "`plan.md`",
