@@ -489,15 +489,26 @@ async fn serve_nfs_config(
     let local = listener.local_addr()?;
     if let Some(mounted) = stale {
         if !stale_mount_is_unserved(&mounted, local.port()) {
+            let served_by = mounted
+                .port
+                .map_or("an unknown port".to_string(), |port| format!("port {port}"));
             return Err(MountError::Mount(format!(
-                "refusing to replace an existing Bloom mount at {}",
+                "refusing to replace an existing Bloom mount at {}: it is served on {served_by}, \
+                 not this Machine's port {}, so it may still be live. If no Machine is running, \
+                 detach it with `umount -l {}` and restart",
+                cfg.mount_path.display(),
+                local.port(),
                 cfg.mount_path.display()
             )));
         }
         tokio::task::spawn_blocking(move || {
             run_command_attempts(
                 stale_detach_attempts(&probe, from_fstab),
-                UMOUNT_COMMAND_TIMEOUT,
+                if from_fstab {
+                    FSTAB_UMOUNT_COMMAND_TIMEOUT
+                } else {
+                    UMOUNT_COMMAND_TIMEOUT
+                },
             )
         })
         .await
