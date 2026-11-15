@@ -322,6 +322,20 @@ pub trait AccountPetalMount: Send + Sync {
     fn installed_package(&self, petal: &str) -> Option<String>;
 }
 
+/// Confirms a batch: wallet, account, ordered `chain:id` references and the
+/// confirmation text. Returns the batch status document.
+pub type BatchConfirm = Arc<
+    dyn Fn(
+            String,
+            u32,
+            Vec<String>,
+            String,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send>,
+        > + Send
+        + Sync,
+>;
+
 #[derive(Clone)]
 pub struct WalletsHandler {
     pub chains: ChainRegistry,
@@ -362,6 +376,13 @@ pub struct WalletsHandler {
     /// host needs this handler, so there is exactly one of each and the
     /// session seam is attached once both exist.
     account_petals: Arc<parking_lot::RwLock<Option<Arc<dyn AccountPetalMount>>>>,
+    /// Sends several staged entries under one owner approval. Set by the
+    /// daemon once its batch service exists; `confirm-batch` is refused until
+    /// then.
+    batch_confirm: Arc<parking_lot::RwLock<Option<BatchConfirm>>>,
+    /// The last `confirm-batch` result per wallet and account, read back
+    /// from the same file.
+    batch_results: Arc<parking_lot::Mutex<std::collections::HashMap<(String, u32), Vec<u8>>>>,
 }
 
 impl WalletsHandler {
@@ -388,10 +409,16 @@ impl WalletsHandler {
             solana: None,
             solana_reads: None,
             account_petals: Arc::new(parking_lot::RwLock::new(None)),
+            batch_confirm: Arc::new(parking_lot::RwLock::new(None)),
+            batch_results: Arc::new(parking_lot::Mutex::new(Default::default())),
         }
     }
 
     /// Attach the session seam that serves `wallets/<w>/<n>/sessions/`.
+    pub fn set_batch_confirm(&self, confirm: BatchConfirm) {
+        *self.batch_confirm.write() = Some(confirm);
+    }
+
     pub fn set_account_petals(&self, petals: Arc<dyn AccountPetalMount>) {
         *self.account_petals.write() = Some(petals);
     }
@@ -10026,6 +10053,73 @@ value = "0""#,
         let new_tx = entries.iter().find(|entry| entry.name == "new.tx").unwrap();
 
         assert_eq!(new_tx.mode, 0o644);
+    }
+
+    /// `confirm-batch` is written with the entries and read for the result,
+    /// so a mount reaches what `bloom wallet confirm-batch` does.
+    #[tokio::test]
+    async fn confirm_batch_is_written_with_entries_and_read_for_the_result() {
+        let f = make_handler_with_chain(true);
+        seed_pending(&f, "0001-first");
+        seed_pending(&f, "0002-second");
+        let path = vfs(format!("/{}/0/confirm-batch", f.wallet_name));
+        let account = vfs(format!("/{}/0", f.wallet_name));
+        let listed = f.handler.list(&account).await.unwrap();
+        assert!(listed.iter().any(|entry| entry.name == "confirm-batch"));
+        let help = String::from_utf8(f.handler.read(&path).await.unwrap()).unwrap();
+        assert!(help.contains("chain:id"), "{help}");
+
+        // Without the daemon's batch service the write is refused.
+        let unavailable = f.handler.write(&path, b"anvil:0001-first").await;
+        assert!(matches!(unavailable, Err(HandlerError::Unsupported(_))));
+
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let calls = seen.clone();
+        f.handler.set_batch_confirm(Arc::new(move |_wallet, _account, txs, _text| {
+            let first = calls.lock().is_empty();
+            calls.lock().push(txs);
+            Box::pin(async move {
+                Ok(if first {
+                    serde_json::json!({"status": "awaiting_ceremony", "ceremony_url": "http://localhost:1/c/x"})
+                } else {
+                    serde_json::json!({"status": "succeeded", "transactions": []})
+                })
+            })
+        }));
+
+        // The owner has to approve: the write is denied and the file holds the link.
+        let pending = f.handler.write(&path, b"anvil:pending\n").await;
+        assert!(
+            matches!(pending, Err(HandlerError::ApprovalPending(_))),
+            "{pending:?}"
+        );
+        let status = String::from_utf8(f.handler.read(&path).await.unwrap()).unwrap();
+        assert!(status.contains("http://localhost:1/c/x"), "{status}");
+        assert_eq!(
+            f.handler.lookup(&path).await.unwrap().size,
+            status.len() as u64
+        );
+        // Written again after approval, it sends; explicit references keep their order.
+        f.handler
+            .write(&path, b"anvil:0002-second anvil:0001-first")
+            .await
+            .unwrap();
+        let status = String::from_utf8(f.handler.read(&path).await.unwrap()).unwrap();
+        assert!(status.contains("succeeded"), "{status}");
+        assert_eq!(
+            *seen.lock(),
+            [
+                vec![
+                    "anvil:0001-first".to_owned(),
+                    "anvil:0002-second".to_owned()
+                ],
+                vec![
+                    "anvil:0002-second".to_owned(),
+                    "anvil:0001-first".to_owned()
+                ],
+            ]
+        );
+        assert!(f.handler.write(&path, b"not-a-reference").await.is_err());
     }
 
     /// A request usually names a chain by id; `chains/<id>` links to its name.

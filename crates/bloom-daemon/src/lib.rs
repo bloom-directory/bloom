@@ -4160,14 +4160,35 @@ impl Daemon {
         let home_write_permit = self.home_write_permit.clone().ok_or_else(|| {
             "batch confirmation is unavailable without the Machine home write permit".to_owned()
         })?;
-        Ok(Arc::new(CanonicalBatchConfirmation {
-            tx_engine: self.tx_engine.clone(),
-            home_write_permit,
-            chains: self.chains.clone(),
-            wallet_projections: self.wallet_projections.clone(),
-            wallets: self.wallets.clone(),
-            audit: self.audit.clone(),
-        }))
+        let service: Arc<dyn ipc::BatchConfirmationService> =
+            Arc::new(CanonicalBatchConfirmation {
+                tx_engine: self.tx_engine.clone(),
+                home_write_permit,
+                chains: self.chains.clone(),
+                wallet_projections: self.wallet_projections.clone(),
+                wallets: self.wallets.clone(),
+                audit: self.audit.clone(),
+            });
+        // The same service backs `wallets/<wallet>/<n>/confirm-batch`, so a
+        // mount and MCP reach what `bloom wallet confirm-batch` does. Weak:
+        // the service holds the handler.
+        let weak = Arc::downgrade(&service);
+        self.wallets
+            .set_batch_confirm(Arc::new(move |wallet, account, txs, text| {
+                let service = weak.upgrade();
+                Box::pin(async move {
+                    let service = service
+                        .ok_or_else(|| "batch confirmation service has stopped".to_owned())?;
+                    let request = ipc::BatchConfirmIpcRequest {
+                        wallet,
+                        account,
+                        txs,
+                        text,
+                    };
+                    service.confirm_batch(request).await
+                })
+            }));
+        Ok(service)
     }
 
     /// Build a fully-wired daemon from the home directory, materialising

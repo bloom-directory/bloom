@@ -104,6 +104,11 @@ pub(super) struct FamilyKey {
     derived: Option<DerivedAccountPublic>,
 }
 
+/// `wallets/<wallet>/<n>/confirm-batch`: one owner approval for several
+/// staged entries. Written with the entries, read for the result.
+const CONFIRM_BATCH: &str = "confirm-batch";
+const CONFIRM_BATCH_HELP: &str = "write the staged entries to send under one approval, in order, as chain:id separated by spaces (ethereum:0001-abcde ethereum:0002-fghij), or chain:pending for every pending entry on that chain. Read this file for the result: the approval link, then each transaction hash.\n";
+
 /// The outbox explains itself where it is used, so the root guide need not.
 const OUTBOX_README: &str = "README.md";
 const EVM_OUTBOX_README: &str = include_str!("../../docs/outbox-evm.md");
@@ -423,7 +428,96 @@ impl WalletsHandler {
         );
         entries.push(Entry::dir("chains"));
         entries.push(Entry::dir("sessions"));
+        entries.push(Entry::writable_file(CONFIRM_BATCH));
         entries
+    }
+
+    /// What `confirm-batch` reads as: the last batch's status, or how to
+    /// write one.
+    fn batch_status(&self, wallet: &str, number: u32) -> Vec<u8> {
+        let results = self.batch_results.lock();
+        match results.get(&(wallet.to_owned(), number)) {
+            Some(status) => status.clone(),
+            None => CONFIRM_BATCH_HELP.as_bytes().to_vec(),
+        }
+    }
+
+    /// `confirm-batch`: send several staged entries under one owner
+    /// approval, in the order written. `<chain>:pending` names every pending
+    /// entry of this account on that chain, oldest first.
+    async fn write_confirm_batch(
+        &self,
+        wallet: &str,
+        number: u32,
+        view: &AccountView,
+        data: &[u8],
+    ) -> Result<(), HandlerError> {
+        let body = std::str::from_utf8(data)
+            .map_err(|_| HandlerError::invalid("non-utf8 confirm-batch content"))?;
+        let mut refs = Vec::new();
+        for reference in body.split_whitespace() {
+            match reference.split_once(':') {
+                Some((chain, "pending")) => {
+                    let family = Self::evm_family(view, chain)?;
+                    let mut ids = self
+                        .tx_engine
+                        .outbox
+                        .list(wallet, chain, OutboxState::Pending)
+                        .map_err(err_be)?;
+                    ids.sort();
+                    for id in ids {
+                        let entry = self.tx_engine.outbox.read_in_state(
+                            wallet,
+                            chain,
+                            &id,
+                            OutboxState::Pending,
+                        );
+                        if entry.is_ok_and(|e| Self::evm_entry_belongs(family, &e.staged.from)) {
+                            refs.push(format!("{chain}:{id}"));
+                        }
+                    }
+                }
+                Some(_) => refs.push(reference.to_owned()),
+                None => {
+                    return Err(HandlerError::invalid(format!(
+                        "'{reference}' is not chain:id; {CONFIRM_BATCH_HELP}"
+                    )));
+                }
+            }
+        }
+        if refs.is_empty() {
+            return Err(HandlerError::invalid(format!(
+                "no entries to confirm; {CONFIRM_BATCH_HELP}"
+            )));
+        }
+        let confirm = self.batch_confirm.read().clone().ok_or_else(|| {
+            HandlerError::Unsupported("batch confirmation is not available on this Bloom".into())
+        })?;
+        let outcome = confirm(wallet.to_owned(), number, refs, "y".into()).await;
+        let (status, result) = match outcome {
+            Ok(status) => {
+                let awaiting = status["status"] == "awaiting_ceremony";
+                let path = format!("wallets/{wallet}/{number}/{CONFIRM_BATCH}");
+                (
+                    status,
+                    if awaiting {
+                        Err(HandlerError::ApprovalPending(path))
+                    } else {
+                        Ok(())
+                    },
+                )
+            }
+            Err(error) => (
+                serde_json::json!({"status": "failed", "error": error}),
+                Err(HandlerError::backend(error)),
+            ),
+        };
+        let mut text = serde_json::to_vec_pretty(&status).map_err(err_be)?;
+        text.push(b'\n');
+        self.batch_results
+            .lock()
+            .insert((wallet.to_owned(), number), text);
+        result
     }
 
     /// The key one of the [`ACCOUNT_KEY_FILES`] presents, or `None` when the
@@ -745,6 +839,8 @@ impl WalletsHandler {
             {
                 Ok(Entry::file(leaf))
             }
+            [leaf] if leaf == CONFIRM_BATCH => Ok(Entry::writable_file(CONFIRM_BATCH)
+                .with_size(self.batch_status(wallet, number).len() as u64)),
             [dir] if dir == "chains" => Ok(Entry::dir("chains")),
             // A chain is also reachable by its numeric id (`chains/1`), as a
             // link to its name: requests usually give the id.
@@ -784,6 +880,7 @@ impl WalletsHandler {
         match rest {
             [leaf] if leaf == "account.json" => self.account_json(wallet, &view),
             [leaf] if leaf == "holdings.json" => self.holdings_json(&view).await,
+            [leaf] if leaf == CONFIRM_BATCH => Ok(self.batch_status(wallet, number)),
             [leaf] if ACCOUNT_KEY_FILES.contains(&leaf.as_str()) => {
                 Self::read_account_key_file(&view, leaf)
             }
@@ -885,6 +982,11 @@ impl WalletsHandler {
         } else {
             self.account_view(wallet, number).await?
         };
+        if let [leaf] = rest
+            && leaf == CONFIRM_BATCH
+        {
+            return self.write_confirm_batch(wallet, number, &view, data).await;
+        }
         if let [dir, mount, slot, leaf] = rest
             && dir == "sessions"
             && leaf == "stop"
