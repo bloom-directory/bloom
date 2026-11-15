@@ -280,7 +280,7 @@ mod tests {
             &crate::test_chromium(),
             &dir.path().join("profile"),
             &["--no-sandbox".into()],
-            &environment,
+            Some(&environment),
         )
         .await
         .unwrap();

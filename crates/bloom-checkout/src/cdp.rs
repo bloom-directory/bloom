@@ -233,25 +233,32 @@ impl Cdp {
         }
         Ok(contexts)
     }
-    /// `display` holds the X display variables for a headed browser; without
-    /// it Chromium runs headless.
+    /// `display` runs the ordinary browser instead of headless Chromium, which
+    /// names itself "HeadlessChrome" in every request so shops that screen for
+    /// automation refuse it. Empty variables keep the display this process
+    /// inherited, a real screen or a virtual one; non-empty ones select a
+    /// private X display.
     pub fn launch(
         executable: &Path,
         profile: &Path,
         test_flags: &[String],
-        display: &[(&str, std::ffi::OsString)],
+        display: Option<&[(&str, std::ffi::OsString)]>,
     ) -> Result<Arc<Self>> {
         let (command_read, command_write) = pipe()?;
         let (event_read, event_write) = pipe()?;
         let child_read = child_fd(&command_read)?;
         let child_write = child_fd(&event_write)?;
         let mut command = Command::new(executable);
-        if display.is_empty() {
-            command.arg("--headless=new");
-        } else {
-            command
-                .arg("--ozone-platform=x11")
-                .envs(display.iter().cloned());
+        match display {
+            None => {
+                command.arg("--headless=new");
+            }
+            Some([]) => {}
+            Some(display) => {
+                command
+                    .arg("--ozone-platform=x11")
+                    .envs(display.iter().cloned());
+            }
         }
         command.args(["--remote-debugging-pipe","--no-first-run",
             "--no-default-browser-check","--disable-sync","--disable-breakpad",
@@ -507,7 +514,7 @@ mod tests {
             &crate::test_chromium(),
             &root,
             &["--no-sandbox".into()],
-            &[],
+            None,
         )
         .unwrap();
         let target = cdp
