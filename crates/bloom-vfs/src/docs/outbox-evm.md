@@ -10,9 +10,8 @@ send 0.25 ETH to 0x...
 {"kind":"call","contract":"0x...","method":"transfer(address,uint256)","args":["0x...","1"]}
 ```
 
-`latest/` is the entry staged last, and `plan.md` in it is what will be
-signed. Writing `y` to its `confirm` asks the owner and gives their approval
-link; written again, it waits for the approval and sends. Writing `cancel`
-discards the entry.
-
-The result is `sent/<id>/receipt.json`. A refusal is in `failed/<id>/`.
+`latest/` is the entry staged last, before and after it is sent. Its
+`plan.md` is what will be signed. Writing `y` to its `confirm` asks the owner
+and gives their approval link; written again, it waits for the approval and
+sends. Then `receipt.json` holds the result. Writing `cancel` to `confirm`
+discards the entry. `pending/`, `sent/` and `failed/` hold every entry by id.

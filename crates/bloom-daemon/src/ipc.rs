@@ -1559,14 +1559,15 @@ impl IpcServer {
                 }
             }
             if new_approval || context.is_cancelled() || tokio::time::Instant::now() >= deadline {
+                // Short on purpose: naming the challenge file here sent
+                // agents off to read it before retrying.
                 let link = if url.is_empty() {
-                    format!("in {challenge_file}")
+                    format!("the link in {challenge_file}")
                 } else {
-                    format!("{url} (also in {challenge_file})")
+                    url.to_owned()
                 };
                 return Err(WriteError::Approval(format!(
-                    "permission denied: owner approval required. Show the human the ceremony link {link}, then write confirm to {} again right away, without waiting for their reply; it waits for the approval and sends.",
-                    path.to_string_path()
+                    "permission denied: owner approval required: {link} . Write confirm again: it waits for their approval, then sends."
                 )));
             }
             first = false;
@@ -2965,9 +2966,8 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         assert_eq!(error.code, -32007);
         for needle in [
-            "show the human the ceremony link http://localhost:28735/c/abc",
-            "/wallets/w/0/chains/base/outbox/pending/tx-1/approval_challenge.json",
-            "write confirm to /wallets/w/0/chains/base/outbox/pending/tx-1/confirm again",
+            "owner approval required: http://localhost:28735/c/abc ",
+            "write confirm again: it waits for their approval",
         ] {
             assert!(
                 error

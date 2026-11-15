@@ -10108,9 +10108,11 @@ value = "0""#,
             .outbox
             .transition(&entry, OutboxState::Failed)
             .unwrap();
+        // The entry staged last was refused: `latest` follows it, so the
+        // path it was staged through still leads to its outcome.
         let listed = f.handler.list(&root).await.unwrap();
         let latest = listed.iter().find(|entry| entry.name == "latest").unwrap();
-        assert_eq!(latest.link_target.as_deref(), Some("pending/0002-newer"));
+        assert_eq!(latest.link_target.as_deref(), Some("failed/0003-newest"));
     }
 
     #[tokio::test]
@@ -10152,7 +10154,7 @@ value = "0""#,
         // A confirm renames the entry into `sent` after the listing saw it
         // (StateMismatch on read); a cancel removes one outright (NotFound).
         // Neither is a pending candidate any more, and neither may break the
-        // listing.
+        // listing. The sent entry was staged last, so `latest` follows it.
         std::fs::create_dir_all(outbox.join("sent")).unwrap();
         std::fs::rename(
             outbox.join("pending").join("0003-moved"),
@@ -10171,7 +10173,7 @@ value = "0""#,
             .into_iter()
             .find(|entry| entry.name == "latest")
             .expect("latest is advertised");
-        assert_eq!(latest.link_target.as_deref(), Some("pending/0001-pending"));
+        assert_eq!(latest.link_target.as_deref(), Some("sent/0003-moved"));
     }
 
     #[tokio::test]

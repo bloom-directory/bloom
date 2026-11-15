@@ -1323,7 +1323,43 @@ impl WalletsHandler {
             }
             pending.push((entry.staged.created_ms, id));
         }
-        Ok(newest_pending_target(pending))
+        let newest_pending = newest_pending_target(pending);
+        // Once the entry staged last is sent or refused, `latest` follows it,
+        // so the path a caller staged and confirmed through still leads to
+        // the receipt. Ids are allocated in increasing order, so the greatest
+        // id that belongs to this account is the newest.
+        let mut done = Vec::new();
+        for state in [OutboxState::Sent, OutboxState::Failed] {
+            for id in self
+                .tx_engine
+                .outbox
+                .list(wallet, chain, state)
+                .map_err(err_be)?
+            {
+                done.push((id, state));
+            }
+        }
+        done.sort_by(|a, b| b.0.cmp(&a.0));
+        let newest_done = done.into_iter().find_map(|(id, state)| {
+            let entry = self
+                .tx_engine
+                .outbox
+                .read_in_state(wallet, chain, &id, state);
+            entry
+                .is_ok_and(|entry| Self::evm_entry_belongs(family, &entry.staged.from))
+                .then(|| format!("{}/{id}", state.dirname()))
+        });
+        Ok(match (newest_pending, newest_done) {
+            (Some(pending), Some(done)) => {
+                let id = |target: &str| target.split_once('/').map(|(_, id)| id.to_owned());
+                Some(if id(&done) > id(&pending) {
+                    done
+                } else {
+                    pending
+                })
+            }
+            (pending, done) => pending.or(done),
+        })
     }
 
     /// The outbox entries `family` staged on `chain` in `state`, as
