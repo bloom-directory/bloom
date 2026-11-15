@@ -10056,8 +10056,6 @@ value = "0""#,
             assert!(text.contains(word), "{word} missing from {text}");
         }
     }
-        }
-    }
 
     #[tokio::test]
     async fn outbox_latest_is_advertised_and_resolves_the_pending_identity() {
