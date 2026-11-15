@@ -336,6 +336,9 @@ pub type BatchConfirm = Arc<
         + Sync,
 >;
 
+/// The last batch status document per wallet and account.
+type BatchResults = std::collections::HashMap<(String, u32), Vec<u8>>;
+
 #[derive(Clone)]
 pub struct WalletsHandler {
     pub chains: ChainRegistry,
@@ -382,7 +385,7 @@ pub struct WalletsHandler {
     batch_confirm: Arc<parking_lot::RwLock<Option<BatchConfirm>>>,
     /// The last `confirm-batch` result per wallet and account, read back
     /// from the same file.
-    batch_results: Arc<parking_lot::Mutex<std::collections::HashMap<(String, u32), Vec<u8>>>>,
+    batch_results: Arc<parking_lot::Mutex<BatchResults>>,
 }
 
 impl WalletsHandler {
