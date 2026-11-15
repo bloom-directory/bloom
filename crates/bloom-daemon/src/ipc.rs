@@ -1315,29 +1315,48 @@ impl IpcServer {
         ) {
             return None;
         }
-        let path = parse_path(params).ok()?;
-        let segments = path.segments();
-        let last = if leaf {
-            segments.len()
-        } else {
-            segments.len().saturating_sub(1)
-        };
-        for end in 1..=last {
-            let prefix = VfsPath::parse(&format!("/{}", segments[..end].join("/"))).ok()?;
-            let target = self.vfs.lookup(&prefix).await.ok()?.link_target;
-            let Some(target) = target else { continue };
-            // Targets are relative to the link's directory and stay inside it.
-            if target.starts_with('/') || target.split('/').any(|part| part == "..") {
-                return None;
+        // A path may cross more than one link (`chains/1/outbox/latest/...`).
+        let mut segments = parse_path(params).ok()?.segments().to_vec();
+        let mut followed = false;
+        for _hop in 0..4 {
+            let last = if leaf {
+                segments.len()
+            } else {
+                segments.len().saturating_sub(1)
+            };
+            let mut next = None;
+            for end in 1..=last {
+                let prefix = VfsPath::parse(&format!("/{}", segments[..end].join("/"))).ok()?;
+                let Ok(entry) = self.vfs.lookup(&prefix).await else {
+                    break;
+                };
+                let Some(target) = entry.link_target else {
+                    continue;
+                };
+                // Targets are relative to the link's directory and stay inside it.
+                if target.starts_with('/') || target.split('/').any(|part| part == "..") {
+                    return None;
+                }
+                let mut real = segments[..end - 1].to_vec();
+                real.extend(target.split('/').map(str::to_owned));
+                real.extend_from_slice(&segments[end..]);
+                next = Some(real);
+                break;
             }
-            let mut real = segments[..end - 1].to_vec();
-            real.extend(target.split('/').map(str::to_owned));
-            real.extend_from_slice(&segments[end..]);
-            let mut params = params.clone();
-            params["path"] = Value::String(format!("/{}", real.join("/")));
-            return Some(params);
+            match next {
+                Some(real) => {
+                    segments = real;
+                    followed = true;
+                }
+                None => break,
+            }
         }
-        None
+        if !followed {
+            return None;
+        }
+        let mut params = params.clone();
+        params["path"] = Value::String(format!("/{}", segments.join("/")));
+        Some(params)
     }
 
     async fn do_lookup(&self, params: &Value) -> Result<Value, HandlerError> {
@@ -4796,6 +4815,7 @@ summary = "Demo app used by IPC tests."
             match segments.as_slice() {
                 [] => Ok(Entry::dir("box")),
                 ["latest"] => Ok(Entry::symlink("latest", "pending/x1")),
+                ["first"] => Ok(Entry::symlink("first", "latest")),
                 ["pending"] | ["pending", "x1"] => Ok(Entry::dir(segments[segments.len() - 1])),
                 ["pending", "x1", "plan.md"] => Ok(Entry::file("plan.md")),
                 ["pending", "x1", "confirm"] => Ok(Entry::writable_file("confirm")),
@@ -4847,6 +4867,12 @@ summary = "Demo app used by IPC tests."
             .await
             .unwrap();
         assert_eq!(read["bytes_b64"], B64.encode("the plan"));
+        // A path may cross two links.
+        let twice = server
+            .do_read(&json!({"path": "/box/first/plan.md"}), &context)
+            .await
+            .unwrap();
+        assert_eq!(twice["bytes_b64"], B64.encode("the plan"));
         let listed = server
             .do_list(&json!({"path": "/box/latest"}))
             .await
