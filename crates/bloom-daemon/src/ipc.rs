@@ -1368,16 +1368,23 @@ impl IpcServer {
         params: &Value,
         context: &IpcOperationContext,
     ) -> Result<Value, HandlerError> {
-        match self.read_direct(params, context).await {
-            Err(error) => match self.relinked(params, &error, true).await {
-                Some(real) => self.read_direct(&real, context).await,
-                None if self.receipt_is_due(params, &error).await => {
-                    self.read_receipt_when_mined(params, context, error).await
-                }
-                None => Err(error),
+        let error = match self.read_direct(params, context).await {
+            Err(error) => error,
+            read => return read,
+        };
+        // The receipt may be asked for through `latest`, so the wait applies
+        // to the real path.
+        let (params, error) = match self.relinked(params, &error, true).await {
+            Some(real) => match self.read_direct(&real, context).await {
+                Err(error) => (real, error),
+                read => return read,
             },
-            read => read,
+            None => (params.clone(), error),
+        };
+        if self.receipt_is_due(&params, &error).await {
+            return self.read_receipt_when_mined(&params, context, error).await;
         }
+        Err(error)
     }
 
     /// Whether `params` names the receipt of an outbox entry that was
@@ -4795,7 +4802,7 @@ summary = "Demo app used by IPC tests."
         assert!(server.do_write(&denied, &context).await.is_err());
     }
 
-    /// A sent entry whose receipt is recorded only on the third read.
+    /// A sent entry whose receipt is recorded only on the fourth read.
     struct LateReceipt(std::sync::atomic::AtomicU32);
 
     #[async_trait::async_trait]
@@ -4803,6 +4810,8 @@ summary = "Demo app used by IPC tests."
         async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
             match path.to_string_path().as_str() {
                 "/outbox/sent/x1/tx_hash" => Ok(Entry::file("tx_hash")),
+                "/outbox/latest" => Ok(Entry::symlink("latest", "sent/x1")),
+                "/outbox" => Ok(Entry::dir("outbox")),
                 other => Err(HandlerError::NotFound(other.to_owned())),
             }
         }
@@ -4810,7 +4819,7 @@ summary = "Demo app used by IPC tests."
         async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
             let reads = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             match path.to_string_path().as_str() {
-                "/outbox/sent/x1/receipt.json" if reads >= 2 => Ok(b"{}".to_vec()),
+                "/outbox/sent/x1/receipt.json" if reads >= 3 => Ok(b"{}".to_vec()),
                 other => Err(HandlerError::NotFound(other.to_owned())),
             }
         }
@@ -4829,6 +4838,12 @@ summary = "Demo app used by IPC tests."
         let context = IpcOperationContext::detached();
         let receipt = json!({"path": "/w/outbox/sent/x1/receipt.json"});
         let read = server.do_read(&receipt, &context).await.unwrap();
+        assert_eq!(read["bytes_b64"], B64.encode("{}"));
+
+        // The same wait applies when the entry is reached through a link.
+        handler.0.store(0, std::sync::atomic::Ordering::SeqCst);
+        let linked = json!({"path": "/w/outbox/latest/receipt.json"});
+        let read = server.do_read(&linked, &context).await.unwrap();
         assert_eq!(read["bytes_b64"], B64.encode("{}"));
 
         let started = std::time::Instant::now();
