@@ -626,8 +626,12 @@ broker_pid=$!
 if [ "$host_os" = Linux ]; then
   # Before systemd 258's --now, systemd-socket-activate starts the Broker on
   # the first connection. Connect once both listeners are ours.
+  attempts=0
   while kill -0 "$broker_pid" 2>/dev/null &&
     ! grep -qF "Listening on [::1]:${ceremony_port}" "${log_dir}/broker.log"; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt "$socket_wait_attempts" ] ||
+      die "systemd-socket-activate did not report both ceremony listeners; see ${log_dir}/broker.log"
     sleep 0.1
   done
   if kill -0 "$broker_pid" 2>/dev/null; then
@@ -635,6 +639,7 @@ if [ "$host_os" = Linux ]; then
   fi
 fi
 wait_for_socket "$broker_socket" "$broker_pid" broker
+wait_for_socket "$broker_control_socket" "$broker_pid" broker
 
 machine_config="${machine_home}/config.toml"
 if [ ! -e "$machine_config" ]; then
