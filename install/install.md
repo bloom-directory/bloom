@@ -55,66 +55,48 @@ Windows is not supported. Do not attempt a local Windows installation.
 Instead, direct Windows users to use Bloom through a cloud agent
 running on a supported platform, such as OpenClaw, Hermes, or GrokBot.
 
-### Select the Linux login before staging (first install and upgrade)
+### Select the Linux login before staging
 
-On Linux, discover the effective identity with `id` and check the root-owned
-public enrollment records in `/etc/bloom/enrollments/*.json` and
-`/etc/bloom/retained/*.json` before selecting an account. Use existing
-administrative access for discovery when needed; do not read private identity,
-wallet, credential, or service configuration files.
+Check `id` and the public enrollment records in `/etc/bloom/enrollments/*.json`
+and `/etc/bloom/retained/*.json`. Require regular root-owned records that are
+not writable by the login; do not read private identities, credentials, or
+service configuration. For an upgrade or retained install, verify the
+`bloom.linux-enrollment.1` schema, filename UID, `login_user`, and `login_uid`
+against `getent passwd USER`, `getent passwd UID`, and `id USER`. Reuse that
+nonzero UID and its absolute non-root home; preserve enrollment, data, and
+configuration. Missing or conflicting records/accounts, ambiguous selection,
+or an installation without a verifiable enrollment are blockers.
 
-For an upgrade or retained install, reuse the record's `login_user` and
-`login_uid`. Verify the `bloom.linux-enrollment.1` schema, filename UID, and
-account against `getent passwd USER`, `getent passwd UID`, and `id USER`;
-require the same nonzero UID, username, and absolute non-root home. Do not
-create a replacement user or reset configuration, enrollment, or data. Stop
-on a missing account, inconsistent record, or ambiguous enrollment selection;
-report the identities that need clarification. An existing Bloom installation
-without a verifiable enrollment is a blocker, not permission to start over.
-
-For a first install, use the non-root login that requested setup, or an account
-the user explicitly selected. Do not choose an unrelated account just because
-it exists. If none is suitable, an authorized administrator (including an agent
-already running as root) may create a dedicated login:
+For a first install, use the requesting non-root login or an account explicitly
+selected by the user; never adopt an unrelated account. If none is suitable,
+an authorized root agent may create a dedicated login. If `getent passwd bloom`
+succeeds, stop and report the conflict; otherwise run:
 
 ```sh
 useradd --create-home --shell /bin/bash bloom
+loginctl enable-linger bloom
 ```
 
-First check `getent passwd bloom`; if the name is occupied and its purpose is
-unknown, stop and report the conflict. Leave the new account's password locked;
-no password, sudo membership, or interactive login is needed. Resolve its UID
-and home using `getent` and `id`, as above. The commands here assume the agent
-is already root; otherwise use only existing authorized noninteractive access.
-
-Prepare the selected user's systemd session, substituting its verified name
-and decimal UID for `USER` and `UID`:
-
-```sh
-loginctl enable-linger 'USER'
-systemctl start 'user@UID.service'
-```
-
+Leave its password locked; do not grant sudo access. Resolve its UID and home
+with `id`/`getent`. Linger is authorized only for this newly created dedicated
+login. For any selected login, an administrator may start a missing user manager
+with `systemctl start 'user@UID.service'`; preserve existing linger settings.
 Require `/run/user/UID/bus` to be a socket and a working `systemctl --user`
-connection as that user. For upgrades, preserve the existing session settings;
-prepare a missing session only when necessary. Report missing systemd, account
-administration tools, or insufficient access as concrete blockers.
+connection as that user. Report missing tools, systemd, or access as blockers.
 
-Run the review/download, staging, and post-install CLI/VFS/audit checks **as
-this selected user**, from `/tmp`, with its actual home, a writable temporary
-directory, and its user bus. A root agent can prefix each such command with:
+Run review/download, staging, and CLI/VFS/audit checks as the selected login,
+from `/tmp`, with its actual home, writable TMPDIR, and user bus. Root can use:
 
 ```sh
-runuser -u 'USER' -- env -i HOME='/home/USER' USER='USER' LOGNAME='USER' PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin TMPDIR=/tmp XDG_RUNTIME_DIR='/run/user/UID' DBUS_SESSION_BUS_ADDRESS='unix:path=/run/user/UID/bus' /bin/sh -c 'cd /tmp && COMMAND'
+runuser -u 'USER' -- env -i HOME='HOME' USER='USER' LOGNAME='USER' PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin TMPDIR=/tmp XDG_RUNTIME_DIR='/run/user/UID' DBUS_SESSION_BUS_ADDRESS='unix:path=/run/user/UID/bus' /bin/sh -c 'cd /tmp && COMMAND'
 ```
 
-Substitute the verified home (which may differ from `/home/USER`) and quote the
-actual command normally. Create the review directory as that user too; a
-root-private review directory cannot be read after switching identities.
-Do not carry root's HOME, Bloom endpoint overrides, or an unwritable inherited
-TMPDIR into that context. `setup.sh` also falls back to `/tmp` if TMPDIR cannot
-be used. Staging as root is refused. Administrative system-service checks and
-the verified privileged handoff run in the administrator context.
+Replace the placeholders with verified values and quote the command normally.
+Each invocation starts a fresh shell: print the review directory from `mktemp`
+and substitute its literal path in later commands; variables do not persist.
+Create that directory as the selected user, and do not inherit root's HOME or
+Bloom endpoint overrides. Staging as root is refused. Run the privileged
+handoff and administrative service checks in the administrator context.
 
 Use this review-before-execute path instead of piping a remote response directly
 into a shell. Use the `setup.sh` that ships with this guide. If you read this
@@ -191,7 +173,7 @@ change the root, or substitute a different stage.
 | --- | --- |
 | macOS arm64 | the agent runs the command through `/usr/bin/osascript` |
 | Linux with effective UID 0 | the agent runs the same `/bin/sh -c …` command directly, omitting only `pkexec` or `sudo` |
-| Linux with existing authorized noninteractive sudo access | the agent runs the same command with `sudo -n` |
+| Linux with existing authorized noninteractive sudo access | the agent runs the same command with `sudo -n -k` |
 | Linux x86_64 or aarch64 with `pkexec` | the agent runs the command through `pkexec` |
 | Otherwise, Linux x86_64 or aarch64 without `pkexec` | the user runs the command under `sudo` |
 
@@ -205,8 +187,10 @@ stop rather than retrying through a different privileged path.
 Check `id -u` first. If already root, run the fixed command below directly by
 omitting only the leading `pkexec`; do not invoke pkexec, sudo, or a dialog.
 If the agent already has authorized noninteractive sudo access to this handoff,
-replace only `pkexec` with `sudo -n` and run it. A denied noninteractive handoff
+replace only `pkexec` with `sudo -n -k` and run it. A denied noninteractive handoff
 is a blocker for that path; never request a password or broaden sudo rules.
+With a command, `-k` ignores cached authentication; only preconfigured
+passwordless authorization may satisfy this path.
 Both paths use the non-root login and stage captured above, and preserve the
 root-owned copy, pinned key, signature, and checksum verification.
 
@@ -261,27 +245,24 @@ the command at least 15 minutes, and do not interrupt, time out, or rerun it
 while it runs. A relay that is not ready yet does not fail the install: approvals
 in a browser on this computer still work, and the installer prints a
 `sudo ... admin provision` retry command. Pass that command to the user; do not
-run it yourself or broaden the reviewed invocation to include it.
+run it yourself or broaden the reviewed invocation to include it. Report pending
+relay readiness separately; it does not block local readiness.
 
 ### Linux post-install readiness
 
-On Linux, success includes `BLOOM_RELOGIN_REQUIRED`. `0` means an upgrade. `1`
-means the invoking session may lack Bloom's access groups: it is printed for
-first installs and same-release reinstalls. Either way, run the checks below
-as the selected login. A fresh `runuser` process loads the installed groups
-for CLI checks, but an already-running systemd user manager retains its previous groups. For the new
-dedicated account created during this setup, with no other workloads, the
-administrator can refresh that account's manager after installation:
+`BLOOM_RELOGIN_REQUIRED=1` means a first install or same-release reinstall;
+`0` means an upgrade. Check readiness as the selected login using a fresh
+`runuser` process for installed groups. A running systemd user manager retains
+its old groups: only for the new dedicated login created during this setup,
+with no other workloads, refresh it after installation:
 
 ```sh
 systemctl restart 'user@UID.service'
 ```
 
-This starts the enabled packaged user services with the new groups, without a
-human login. Do not restart an existing shared user manager or change group
-permissions. For an existing session, check its packaged services and report a
-fresh-login blocker if its manager lacks the installed groups. An upgrade
-normally retains its existing groups and requires no session restart.
+Never restart a shared user manager or alter group permissions. If an existing
+manager lacks the installed groups, report a fresh-login blocker. Upgrades
+normally keep their groups and need no manager restart.
 
 Once the session has the groups, the package starts Machine and mounts `~/bloom` through
 `bloom-machine.service`; the agent must not launch a second Machine. Ensure
@@ -307,8 +288,8 @@ tag (ignoring the tag's `v` prefix). A mismatch is a blocker.
 
 For a failed unit, capture `systemctl status` and `journalctl` diagnostics rather
 than declaring readiness. The packaged Linux mount is the only persistence this
-setup authorizes; do not create additional systemd, launchd, cron, shell-profile
-auto-start, or restart configuration.
+setup authorizes, alongside linger for the new dedicated login above; do not
+create additional systemd, launchd, cron, shell-profile, or restart configuration.
 
 ### macOS post-install readiness
 
@@ -333,8 +314,7 @@ configuration beyond it.
 
 ## Mounted VFS and audit readiness
 
-On either supported target, require the service checks above, CLI and daemon
-versions matching the staged release (`bloom --version` and `bloom vfs cat /status/version`), both VFS reads,
+On either supported target, require the service checks above, both VFS reads,
 and audit health before reporting Bloom fully ready. Use the mounted reads below
 when available. If native mounting is unavailable, run `bloom vfs cat /AGENTS.md`
 and `bloom vfs cat /status/daemon.json` instead; a working CLI VFS connection

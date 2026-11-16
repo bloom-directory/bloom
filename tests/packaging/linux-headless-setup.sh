@@ -24,7 +24,8 @@ import glob, json, os, pwd
 records = glob.glob('/etc/bloom/enrollments/*.json')
 assert len(records) == 1, 'Expected one unambiguous active enrollment'
 path = records[0]
-assert not os.path.islink(path) and os.stat(path).st_uid == 0
+assert not os.path.islink(path)
+assert os.stat(path).st_uid == 0 and not os.stat(path).st_mode & 0o022
 record = json.load(open(path))
 assert record['schema'] == 'bloom.linux-enrollment.1'
 uid, user = record['login_uid'], record['login_user']
@@ -45,7 +46,7 @@ test -S "/run/user/$uid/bus"
 
 # Retain evidence, without removing shared paths or printing private contents.
 evidence=$(mktemp -d /var/tmp/bloom-headless-test.XXXXXX)
-chmod 755 "$evidence"
+chmod 711 "$evidence"
 install -m 644 "$repo/install/setup.sh" "$evidence/setup.sh"
 if sh "$evidence/setup.sh" > "$evidence/root-staging.txt" 2>&1; then
   echo 'FAIL: staging accepted root.' >&2; exit 1
@@ -61,6 +62,7 @@ as_login() {
 if [[ $1 == upgrade ]]; then
   # Metadata checks detect replacement of enrollment identities; no secret reads.
   find "/etc/bloom/$uid" -name '*identity.json' -type f -printf '%p %i %s %T@\n' | sort > "$evidence/before.metadata"
+  [[ -s $evidence/before.metadata ]]
   # shellcheck disable=SC2016 # HOME belongs to the selected login.
   as_login sh -c 'printf preserve-me > "$HOME/.bloom/headless-test-marker"'
   as_login /usr/bin/bloom vfs cat /status/version > "$evidence/before.version"
@@ -69,6 +71,7 @@ as_login sh "$evidence/setup.sh" > "$evidence/staging.txt"
 cat "$evidence/staging.txt"
 stage=$(sed -n 's/^BLOOM_STAGE=//p' "$evidence/staging.txt")
 tag=$(sed -n 's/^BLOOM_RELEASE_TAG=//p' "$evidence/staging.txt")
+[[ -n $stage && -n $tag ]]
 grep -qx "BLOOM_LOGIN_UID=$uid" "$evidence/staging.txt"
 grep -qx "BLOOM_LOGIN_USER=$user" "$evidence/staging.txt"
 
@@ -102,8 +105,6 @@ ready || { echo "FAIL readiness; inspect systemctl/journalctl. Evidence: $eviden
 grep -qx "${tag#v}" "$evidence/after.version"
 as_login /usr/bin/bloom --version | tee "$evidence/cli.version"
 grep -qx "bloom ${tag#v}" "$evidence/cli.version"
-as_login /usr/bin/bloom vfs cat /AGENTS.md > "$evidence/agents.md"
-as_login /usr/bin/bloom vfs cat /status/daemon.json > "$evidence/daemon.json"
 as_login cat "$home/bloom/AGENTS.md" > "$evidence/mounted-agents.md"
 as_login cat "$home/bloom/status/daemon.json" > "$evidence/mounted-daemon.json"
 as_login /usr/bin/bloom audit status | tee "$evidence/audit.json"
@@ -117,5 +118,10 @@ if [[ $1 == upgrade ]]; then
   find "/etc/bloom/$uid" -name '*identity.json' -type f -printf '%p %i %s %T@\n' | sort > "$evidence/after.metadata"
   cmp "$evidence/before.metadata" "$evidence/after.metadata"
   [[ $(as_login cat "$home/.bloom/headless-test-marker") == preserve-me ]]
+  if cmp -s "$evidence/before.version" "$evidence/after.version"; then
+    echo 'NOTE: same-release reinstall, not a version upgrade'
+  else
+    echo "PASS version upgrade: $(cat "$evidence/before.version") -> ${tag#v}"
+  fi
 fi
-echo "PASS $1: installed versions, services, and CLI VFS reads; evidence: $evidence"
+echo "PASS $1 checks: installed versions, services, VFS, and audit; evidence: $evidence"

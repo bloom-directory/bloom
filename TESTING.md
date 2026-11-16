@@ -53,17 +53,14 @@ BLOOM_DISPOSABLE_INSTALL_TEST=1 bash tests/packaging/linux-headless-setup.sh fir
 BLOOM_DISPOSABLE_INSTALL_TEST=1 bash tests/packaging/linux-headless-setup.sh upgrade
 ```
 
-The first command creates the dedicated `bloom` login and refreshes only that
-new user's manager after installation. The second verifies and reuses one
-existing enrollment; use a host with an older signed release to prove a version
-upgrade, rather than just a same-release reinstall. Both exercise signed
-staging with an unwritable inherited TMPDIR and the guide's exact root-owned
-handoff, then check versions, services, CLI VFS, and audit health. Upgrade also
-checks identity-file metadata and a harmless Machine-home marker survive.
-No wallets, passkeys, or transactions are created. Evidence is retained under
-`/var/tmp/bloom-headless-test.*`; do not publish raw runtime logs. A container
-that cannot mount NFS is insufficient for full installed readiness. Run the
-[skill checks and local model evals](evals/skills/README.md) separately.
+The first mode creates a dedicated login; the second reuses a verified
+enrollment and reports whether the version changed or it was a reinstall.
+Both exercise the [install guide](install/install.md), root-private TMPDIR,
+signed handoff, versions, services, VFS, and audit readiness; upgrade also
+checks identity metadata and a Machine-home marker. No wallet operations run.
+Evidence stays in `/var/tmp/bloom-headless-test.*`; do not publish raw logs.
+Full readiness needs NFS support, not a container that rejects mounts.
+Run [skill checks and model evals](evals/skills/README.md) separately.
 
 ## Triad and Solana ladders
 

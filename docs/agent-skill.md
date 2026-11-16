@@ -95,20 +95,12 @@ Release workflow bumps it with `Cargo.toml`. After tagging `vX.Y.Z`:
    first skill release, so it gets a fresh-install check instead; upgrade
    tests start at v0.5.0.
 
-## Headless Linux install rollout
+## Headless Linux rollout
 
-For the issue #480 fix, ship the setup guidance together with the next signed
-release. After merge, repin the website to the landed commit containing
-`skills/bloom/SKILL.md`, `install/install.md`, and `install/setup.sh`. The
-website sync must fetch the latter two from `install/`, rather than the retired
-`skills/bloom/references/` and `skills/bloom/scripts/` locations. Follow the
-website's own review and deployment checks; do not update generated copies.
-
-Check the published `SKILL.md`, `/references/install.md`, `/scripts/setup.sh`,
-and legacy `/setup.sh` against that commit. If `SETUP.md` is served as an entry
-point or alias, verify that it reaches the updated guide too. Test both a root
-first install with a new dedicated login and an upgrade reusing an existing
-login, including a root-private inherited TMPDIR. Verify CLI/daemon versions,
-services, VFS reads, and audit readiness. Publish the skill from the release
-tag through the channels above. A Bloom PR or release alone does not update
-the separately pinned website; report publication as pending until verified.
+Ship the updated guidance with the signed release, then repin/deploy the website
+at the landed commit. Its sync must fetch the guide and script from `install/`,
+not the retired paths under `skills/bloom/`. Check published `SKILL.md`,
+`/references/install.md`, `/scripts/setup.sh`, legacy `/setup.sh`, and `SETUP.md`
+if served. Publish the skill from the release tag as above; use the
+[Linux acceptance check](../TESTING.md#headless-linux-setup-acceptance).
+Publication remains pending until those separately hosted files are verified.

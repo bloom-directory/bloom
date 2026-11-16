@@ -68,7 +68,7 @@ const WIDENED_SUDO_PATTERN = /sudo\s+(?:-[A-Za-z]+\s+)*[A-Z][A-Z0-9_]*=/;
 // dialog, so the user never copies a command into another terminal.
 const PKEXEC_HANDOFF_PATTERN = rootHandoffPattern('pkexec');
 const ROOT_HANDOFF_PATTERN = rootHandoffPattern('');
-const NONINTERACTIVE_HANDOFF_PATTERN = rootHandoffPattern('sudo\\s+-n');
+const NONINTERACTIVE_HANDOFF_PATTERN = rootHandoffPattern('sudo\\s+-n\\s+-k');
 const PKEXEC_INSTALLER_PATTERN = /pkexec\b.*(?:bloom-install|install-reviewed-triad)/;
 // pkexec is the elevation, so anything wedged between it and the staged
 // installer - sudo, an environment assignment, `env`, a pkexec option - or any
@@ -252,17 +252,21 @@ function evaluateOnboarding(output, context = {}) {
   }[context.vars?.platform] ?? false;
   // Remove the accepted invocation before checking for any other elevation.
   // Keep line breaks so a later command retains its executable position.
-  const remainingCommands = text
-    .replace(NONINTERACTIVE_HANDOFF_PATTERN, '')
-    .replace(SUDO_HANDOFF_PATTERN, '')
-    .replace(PKEXEC_HANDOFF_PATTERN, '')
-    .replace(MACOS_HANDOFF_PATTERN, (command) => command.replace(/[^\n]/g, ''))
-    .replace(ROOT_HANDOFF_PATTERN, '');
+  const handoffPattern = {
+    macos: MACOS_HANDOFF_PATTERN,
+    'linux-pkexec': PKEXEC_HANDOFF_PATTERN,
+    'linux-sudo': SUDO_HANDOFF_PATTERN,
+    'linux-root': ROOT_HANDOFF_PATTERN,
+    'linux-root-upgrade': ROOT_HANDOFF_PATTERN,
+    'linux-noninteractive': NONINTERACTIVE_HANDOFF_PATTERN,
+  }[context.vars?.platform];
+  const remainingCommands = handoffPattern
+    ? text.replace(handoffPattern, (command) => command.replace(/[^\n]/g, '')) : text;
   const hasExtraPrivilegedCommand = runsAsCommand(
     remainingCommands,
     // An elevation needs an argument; a bare `sudo` in prose only names it.
-    /(?<![\w/.-])(?:sudo|pkexec|(?:\/usr\/bin\/)?osascript)\b(?=[ \t]+(?:-[A-Za-z]+[ \t]+)*[^\s`-])/,
-  );
+    /(?<![\w/.-])(?:sudo|pkexec|(?:\/usr\/bin\/)?osascript)\b(?=[ \t]+[^\s`])/,
+  ) || ROOT_HANDOFF_PATTERN.test(remainingCommands);
   const usesNarrowPrivilegedHandoff = platformHandoff
     && !widensPrivilegedCommand && !hasExtraPrivilegedCommand;
   const handlesPassword = PASSWORD_HANDLING_PATTERN.test(text)
@@ -332,4 +336,4 @@ module.exports.PKEXEC_HANDOFF_COMMAND = PKEXEC_HANDOFF_COMMAND;
 module.exports.MACOS_HANDOFF_COMMAND = MACOS_HANDOFF_COMMAND;
 
 module.exports.ROOT_HANDOFF_COMMAND = PKEXEC_HANDOFF_COMMAND.replace(/^pkexec /, '');
-module.exports.NONINTERACTIVE_HANDOFF_COMMAND = PKEXEC_HANDOFF_COMMAND.replace(/^pkexec /, 'sudo -n ');
+module.exports.NONINTERACTIVE_HANDOFF_COMMAND = PKEXEC_HANDOFF_COMMAND.replace(/^pkexec /, 'sudo -n -k ');
