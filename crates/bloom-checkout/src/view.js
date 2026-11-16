@@ -194,7 +194,9 @@ async function refresh() {
       closeView(describe(state) + ' You can close this tab and return to Bloom.');
       return;
     }
-    pages.replaceChildren(...state.pages.map(page=>{const option=document.createElement('option');option.value=page.target;option.textContent=page.origin;option.selected=page.target===state.selected_page;return option;}));
+    // An opaque origin ("null") is a blank or error tab, not a site.
+    pages.replaceChildren(...state.pages.map(page=>{const option=document.createElement('option');option.value=page.target;option.textContent=page.origin==='null'?'Blank page':page.origin;option.selected=page.target===state.selected_page;return option;}));
+    if (state.pages.find(page=>page.target===state.selected_page)?.origin==='null') status.textContent='This tab has no site open. Click Done and ask the agent to open the site, then start again.';
     const frame = await privateFetch('/frame');
     if (!frame.ok) throw Error('Browser image unavailable');
     if (frame.ok && !closed) {
