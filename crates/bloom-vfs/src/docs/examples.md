@@ -71,7 +71,7 @@ write the challenge's exact `retry_body` to its `retry_path` (an omitted
 Follow `$ID` into its resulting state and read its intent and receipt before
 reporting success; listing `sent/` alone does not prove confirmation. A missing
 pending path or transport error is not a reason to repeat the write. Never use
-a glob, list position, or `latest` as action identity.
+a glob or list position as action identity.
 
 The explicit account-0 outbox above spends from account 0. For another account,
 verify `wallets/alice/<n>/account.json` and use
@@ -97,14 +97,14 @@ send 0.25 ETH to 0x...                                  native send, one line; o
 ```
 
 A swap or other DeFi action is an approve, then a raw call. Encode calldata
-with your normal tools, for example `cast calldata`. Stage the second only
-after the first is in `sent/`:
+with your normal tools, for example `cast calldata`. Write both to `send.tx`,
+one per line: they go under one approval and are sent in order.
 
 ```sh
 O="$BLOOM/wallets/alice/0/chains/base/outbox"
-printf '{"kind":"approve","token":"<usdc>","spender":"<router>","amount":"10000000"}' > "$O/new.tx"
-# Confirm it and read sent/<id>/ (transaction loop above), then:
-printf '{"kind":"raw","to":"<router>","data":"<calldata>","value":"0"}' > "$O/new.tx"
+printf '%s\n' \
+  '{"kind":"approve","token":"<usdc>","spender":"<router>","amount":"10000000"}' \
+  '{"kind":"raw","to":"<router>","data":"<calldata>","value":"0"}' > "$O/send.tx"
 ```
 
 ## Repairing rejected EIP-1559 fees

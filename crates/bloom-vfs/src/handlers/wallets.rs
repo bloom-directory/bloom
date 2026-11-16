@@ -4546,6 +4546,37 @@ impl WalletsHandler {
         Ok(())
     }
 
+    /// Stage `body` for `from` on `chain` and return the new entry's id.
+    pub(super) async fn stage_from(
+        &self,
+        wallet: &str,
+        chain: &str,
+        from: alloy::primitives::Address,
+        policy: &Policy,
+        body: &str,
+    ) -> Result<String, HandlerError> {
+        let client = self
+            .chains
+            .get(chain)
+            .ok_or_else(|| HandlerError::not_found(format!("chain '{}'", chain)))?;
+        let intent: RawIntent = intent_parser::parse(body).map_err(err_be)?;
+        let staged = self
+            .tx_engine
+            .stage(
+                self.write_permit()?,
+                wallet,
+                from,
+                intent,
+                &client,
+                policy,
+                Some(&self.address_book),
+            )
+            .await
+            .map_err(err_be)?;
+        tracing::info!(wallet, chain, id = %staged.id, "outbox.staged");
+        Ok(staged.id)
+    }
+
     /// The EVM outbox write surface for one explicit sender. `from` is the
     /// address every new stage is built for; the key that later signs is
     /// resolved from that address by the transaction engine, so a stage from
@@ -4574,22 +4605,9 @@ impl WalletsHandler {
             [s] if s == "new.tx" => {
                 let body = std::str::from_utf8(data)
                     .map_err(|_| HandlerError::invalid("non-utf8 intent"))?;
-                let intent: RawIntent = intent_parser::parse(body).map_err(err_be)?;
-                let staged = self
-                    .tx_engine
-                    .stage(
-                        self.write_permit()?,
-                        wallet,
-                        from,
-                        intent,
-                        &client,
-                        policy,
-                        Some(&self.address_book),
-                    )
+                self.stage_from(wallet, chain, from, policy, body)
                     .await
-                    .map_err(err_be)?;
-                tracing::info!(wallet, chain, id = %staged.id, "outbox.staged");
-                Ok(())
+                    .map(drop)
             }
             // outbox/pending/<id>/confirm — broadcast
             [state, id, fname]
@@ -10123,31 +10141,24 @@ value = "0""#,
             f.handler.lookup(&path).await.unwrap().size,
             status.len() as u64
         );
-        // Written again after approval, it sends; explicit references keep their order.
+        // `y` after approval repeats the waiting batch, which sends.
+        f.handler.write(&path, b"y\n").await.unwrap();
+        let status = String::from_utf8(f.handler.read(&path).await.unwrap()).unwrap();
+        assert!(status.contains("succeeded"), "{status}");
+        // A batch that is over is not asked for again.
+        let over = f.handler.write(&path, b"y").await.unwrap_err();
+        assert!(over.to_string().contains("no batch is waiting"), "{over}");
+        // Explicit references keep their order.
         f.handler
             .write(&path, b"anvil:0002-second anvil:0001-first")
             .await
             .unwrap();
-        let status = String::from_utf8(f.handler.read(&path).await.unwrap()).unwrap();
-        assert!(status.contains("succeeded"), "{status}");
-        assert_eq!(
-            *seen.lock(),
-            [
-                vec![
-                    "anvil:0001-first".to_owned(),
-                    "anvil:0002-second".to_owned()
-                ],
-                vec![
-                    "anvil:0002-second".to_owned(),
-                    "anvil:0001-first".to_owned()
-                ],
-            ]
-        );
-        // `y` repeats the batch the file last reported.
-        assert!(status.contains("anvil:0002-second"), "{status}");
-        f.handler.write(&path, b"y\n").await.unwrap();
-        let calls = seen.lock().clone();
-        assert_eq!(calls[2], calls[1]);
+        let both = vec![
+            "anvil:0001-first".to_owned(),
+            "anvil:0002-second".to_owned(),
+        ];
+        let reversed: Vec<String> = both.iter().rev().cloned().collect();
+        assert_eq!(*seen.lock(), [both.clone(), both, reversed]);
         assert!(f.handler.write(&path, b"not-a-reference").await.is_err());
     }
 
@@ -10233,6 +10244,11 @@ value = "0""#,
         // and the other entry is no longer confirmed as part of it.
         let status = String::from_utf8(f.handler.read(&batch).await.unwrap()).unwrap();
         assert!(status.contains("\"ended\""), "{status}");
+        let repeat = f.handler.write(&batch, b"y").await.unwrap_err();
+        assert!(
+            repeat.to_string().contains("no batch is waiting"),
+            "{repeat}"
+        );
         let plan = f
             .handler
             .read(&vfs(format!("{outbox}/pending/0002-second/plan.md")))

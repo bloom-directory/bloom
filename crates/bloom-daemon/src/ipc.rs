@@ -1551,8 +1551,11 @@ impl IpcServer {
             };
         };
         // An entry asked for as part of a batch waits as its batch does.
-        if let [root, wallet, number, _, chain, _, _, id, _] = path.segments()
+        // Only `confirm`, as the handler does: `confirm.override` is its own
+        // request and is never turned into the batch's plain `y`.
+        if let [root, wallet, number, _, chain, _, _, id, control] = path.segments()
             && root == "wallets"
+            && control == "confirm"
             && bytes.trim_ascii() == b"y"
             && let Ok(batch) = VfsPath::parse(&format!("/wallets/{wallet}/{number}/confirm-batch"))
             && let Ok(raw) = self.vfs.read(&batch).await
@@ -4987,6 +4990,59 @@ summary = "Demo app used by IPC tests."
         // Still waiting on this write; approved by the next attempt.
         assert!(server.do_write(&write, &context).await.is_ok());
         assert!(started.elapsed() >= BATCH_APPROVAL_POLL);
+    }
+
+    /// A batch of `tx-1` waiting for the owner; records the paths written.
+    struct AwaitedBatch(parking_lot::Mutex<Vec<String>>);
+
+    #[async_trait::async_trait]
+    impl Handler for AwaitedBatch {
+        async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+            Ok(Entry::writable_file(
+                path.segments().last().map_or("w", String::as_str),
+            ))
+        }
+
+        async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            if path
+                .segments()
+                .last()
+                .is_some_and(|leaf| leaf == "confirm-batch")
+            {
+                return Ok(br#"{"status":"awaiting_ceremony","entries":["base:tx-1"]}"#.to_vec());
+            }
+            Err(HandlerError::NotFound(path.to_string_path()))
+        }
+
+        async fn write(&self, path: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+            self.0.lock().push(path.to_string_path());
+            Ok(())
+        }
+    }
+
+    /// `y` to a batched entry's `confirm` continues its batch;
+    /// `confirm.override` is written as asked, never as the batch's `y`.
+    #[tokio::test]
+    async fn an_override_of_a_batched_entry_is_not_sent_as_the_batch() {
+        let handler = Arc::new(AwaitedBatch(parking_lot::Mutex::new(Vec::new())));
+        let server = IpcServer::new(
+            Vfs::builder().mount("wallets", handler.clone()).build(),
+            "0",
+            vec![],
+        );
+        let context = IpcOperationContext::detached();
+        let entry = "/wallets/w/0/chains/base/outbox/pending/tx-1";
+        for control in ["confirm.override", "confirm"] {
+            let write = json!({"path": format!("{entry}/{control}"), "bytes_b64": B64.encode("y")});
+            assert!(server.do_write(&write, &context).await.is_ok());
+        }
+        assert_eq!(
+            *handler.0.lock(),
+            [
+                "/w/0/chains/base/outbox/pending/tx-1/confirm.override".to_owned(),
+                "/w/0/confirm-batch".to_owned()
+            ]
+        );
     }
 
     /// An outbox whose `send.tx` stages `tx-9` and asks the owner.
