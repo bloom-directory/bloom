@@ -4,7 +4,9 @@ use crate::{
     hpke::Recipient,
 };
 use anyhow::{Context, Result, bail};
-use bloom_checkout_api::{BrowseRequest, PreparationReason};
+#[cfg(test)]
+use bloom_checkout_api::BrowseRequest;
+use bloom_checkout_api::PreparationReason;
 use bloom_signer_api::{
     CardOperationState, CardOperationStatus, CheckoutFacts, CustodyOutputHpkeAad, CustodyResult,
     OperationId, RenewalPeriod, Token,
@@ -348,7 +350,6 @@ struct CompletedView {
 struct SignIn {
     operation: String,
     secret_seen: bool,
-    signup: bool,
     quiet: u8,
 }
 
@@ -567,22 +568,9 @@ impl CheckoutService {
 
     pub async fn request(self: &Arc<Self>, request: Request) -> Result<Value> {
         match request {
-            Request::Browse { request } => {
-                if matches!(
-                    request,
-                    BrowseRequest::Click { .. }
-                        | BrowseRequest::Type { .. }
-                        | BrowseRequest::Select { .. }
-                ) && !self.browser.agent_may_act()
-                {
-                    // Any merchant event handler can charge a payment method
-                    // saved on a signed-in account, even from a control
-                    // labelled "Continue". Pay buttons and card and password
-                    // fields are refused in every session.
-                    bail!(MERCHANT_APPROVAL);
-                }
-                self.browser.browse(request).await
-            }
+            // Pay buttons and card and password fields are refused in every
+            // session, including one the person signed in to.
+            Request::Browse { request } => self.browser.browse(request).await,
             Request::Status { operation_id } => {
                 let mut status = self.store.get(&operation_id)?;
                 if self.private.lock().await.as_ref().is_some_and(|checkout| {
@@ -1281,12 +1269,8 @@ impl CheckoutService {
     async fn finish(&self, operation_id: &str, mode: Mode, stay_signed_in: bool) -> Result<()> {
         if mode == Mode::TakeOver {
             if stay_signed_in {
-                let signup = {
-                    let sign_in = self.sign_in.lock();
-                    sign_in.operation == operation_id && sign_in.signup
-                };
                 self.saved.lock().take();
-                self.browser.return_control_signed_in(signup).await?;
+                self.browser.return_control_signed_in().await?;
             } else {
                 self.return_control().await?;
             }
@@ -1339,7 +1323,6 @@ impl CheckoutService {
                 ..SignIn::default()
             };
         }
-        sign_in.signup |= page["signup"] == true;
         if page["secret"] == true {
             sign_in.secret_seen = true;
             sign_in.quiet = 0;
@@ -2064,11 +2047,7 @@ fn browse_error(error: &anyhow::Error) -> Value {
     }})
 }
 
-const MERCHANT_APPROVAL: &str = "The person signed in to an existing account here, which may hold a \
-     saved payment method, so clicks and typing need them; request a take-over";
-
 const BROWSE_ERRORS: &[&str] = &[
-    MERCHANT_APPROVAL,
     "Invalid browsing URL",
     "Only ordinary HTTP(S) shopping URLs are supported",
     "Only ordinary shopping documents can be observed",
@@ -2397,33 +2376,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_acts_unless_the_person_kept_a_sign_in_that_may_hold_a_saved_method() {
+    async fn agent_keeps_acting_after_the_person_signs_in() {
         let (service, browser, url, server) = shopping_service(
-            "<body><form onsubmit=\"document.title='charged';return false\"><button>Continue</button></form><button type='button' onclick=\"document.title='charged'\">Proceed</button><input oninput=\"document.title='charged'\"><select onchange=\"document.title='charged'\"><option value='a'>A</option><option value='b'>B</option></select></body>"
+            "<body><form onsubmit=\"return false\"><button>Continue</button></form><button type='button'>Proceed</button><input><select><option value='a'>A</option><option value='b'>B</option></select></body>"
         ).await;
-        // No one has signed in to this session, so nothing saved can be charged.
         assert_all_acted(act_on_every_control(&service, &browser, &url).await);
-        // The person says the account they kept holds no saved method.
-        browser.return_control_signed_in(true).await.unwrap();
-        assert_all_acted(act_on_every_control(&service, &browser, &url).await);
-        // A kept sign-in without that answer leaves the agent read-only.
-        browser.return_control_signed_in(false).await.unwrap();
-        for result in act_on_every_control(&service, &browser, &url).await {
-            // The agent must see the refusal itself, not the generic failure.
-            assert_eq!(
-                browse_error(&result.unwrap_err())["error"],
-                MERCHANT_APPROVAL
-            );
-        }
-        let tab = browser.handoff().await.unwrap();
-        let title = tab
-            .cdp
-            .evaluate(&tab.session, "document.title".into())
-            .await
-            .unwrap();
-        assert_ne!(title, "charged");
-        // Signing out discards the sign-in, and with it the restriction.
-        browser.return_control().await.unwrap();
+        browser.return_control_signed_in().await.unwrap();
         assert_all_acted(act_on_every_control(&service, &browser, &url).await);
         server.abort();
     }
@@ -2604,11 +2562,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_finished_sign_in_closes_the_view_and_only_a_signup_lets_the_agent_act() {
+    async fn a_finished_sign_in_closes_the_view() {
         let login = "<form><input name=email><input type=password></form>";
         let signup =
             "<form><input name=email><input type=password autocomplete=new-password></form>";
-        for (page, agent_may_act) in [(login, false), (signup, true)] {
+        for page in [login, signup] {
             let (service, browser, _, server) = shopping_service(page).await;
             let tab = browser.handoff().await.unwrap();
             let id = "f".repeat(64);
@@ -2665,7 +2623,6 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert!(service.private.lock().await.is_none(), "{page}");
-            assert_eq!(browser.agent_may_act(), agent_may_act, "{page}");
             server.abort();
         }
     }

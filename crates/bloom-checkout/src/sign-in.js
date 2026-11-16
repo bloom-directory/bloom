@@ -1,6 +1,5 @@
 (() => {
-  // Password and code fields mark a sign-in in progress. A new-password field,
-  // or a password with its confirmation, marks a new account.
+  // Password and code fields mark a sign-in in progress.
   const inputs = [...document.querySelectorAll('input')]
     .filter(e => e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden');
   const passwords = inputs.filter(e => e.type === 'password');
@@ -9,7 +8,6 @@
     || /\b(code|otp|verification|pin)\b/i.test(words(e)));
   return {
     secret: passwords.length > 0 || code,
-    signup: passwords.length > 1 || passwords.some(e => (e.getAttribute('autocomplete') || '').includes('new-password')),
     ready: document.readyState === 'complete',
   };
 })()
