@@ -284,7 +284,15 @@ fresh-login blocker if its manager lacks the installed groups. An upgrade
 normally retains its existing groups and requires no session restart.
 
 Once the session has the groups, the package starts Machine and mounts `~/bloom` through
-`bloom-machine.service`; the agent must not launch a second Machine. Require:
+`bloom-machine.service`; the agent must not launch a second Machine. Ensure
+those packaged user units are started as the selected login (enabling an
+already-enabled unit during a reinstall does not start it):
+
+```sh
+systemctl --user start bloom-session.service bloom-machine.service
+```
+
+Require:
 
 ```sh
 systemctl --user is-active bloom-session.service bloom-machine.service

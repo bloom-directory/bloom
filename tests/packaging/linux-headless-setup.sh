@@ -83,6 +83,7 @@ PY
 if [[ $1 == first-install ]]; then
   systemctl restart "user@$uid.service"
 fi
+as_login systemctl --user start bloom-session.service bloom-machine.service
 ready() {
   local unit
   for unit in "bloom-session@$uid.path" "bloom-broker@$uid.service" "bloom-signer@$uid.service"; do
