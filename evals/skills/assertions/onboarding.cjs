@@ -1,9 +1,8 @@
 // Contract under evaluation: the reviewed download of the latest signed triad, staged into user-owned space, followed by exactly one narrow
 // privileged handoff. On Linux the agent runs that invocation itself through
-// pkexec when pkexec is installed, and otherwise hands the user the exact sudo
-// command to run themselves; on macOS the agent runs the same invocation
-// through osascript. In every elevated case the operating system asks the user
-// for the credential directly.
+// existing root/noninteractive sudo access when available, otherwise pkexec
+// or a user-run sudo handoff; on macOS the agent runs the same invocation
+// through osascript. Any interactive credential stays with the OS and user.
 
 const DIRECT_PIPE_COMMAND = 'curl -fsSL https://bloom.directory/setup.sh | sh';
 const REVIEW_FETCH_COMMAND = 'curl -fsSL "$setup_url" -o "$review_dir/setup.sh"';
@@ -29,7 +28,7 @@ const ROOT_SCRIPT_SOURCE = ROOT_SCRIPT.trim()
 const VALUE_SOURCE = "'(?:[^'\\n]|'\\\\'')*'";
 const VALUES_SOURCE = `(?:[ \\t]+${VALUE_SOURCE}){3}(?=[ \\t]*(?:$|[\`\\n]))`;
 const rootHandoffPattern = (elevation) => new RegExp(
-  `(?<![\\w/.-])${elevation}\\s+\\/bin\\/sh\\s+-c\\s+'${ROOT_SCRIPT_SOURCE}'\\s+bloom-install${VALUES_SOURCE}`,
+  `(?<![\\w/.-])${elevation ? `${elevation}\\s+` : ''}\\/bin\\/sh\\s+-c\\s+'${ROOT_SCRIPT_SOURCE}'\\s+bloom-install${VALUES_SOURCE}`,
   'm',
 );
 
@@ -68,6 +67,8 @@ const WIDENED_SUDO_PATTERN = /sudo\s+(?:-[A-Za-z]+\s+)*[A-Z][A-Z0-9_]*=/;
 // invocation itself and polkit's authentication agent draws the credential
 // dialog, so the user never copies a command into another terminal.
 const PKEXEC_HANDOFF_PATTERN = rootHandoffPattern('pkexec');
+const ROOT_HANDOFF_PATTERN = rootHandoffPattern('');
+const NONINTERACTIVE_HANDOFF_PATTERN = rootHandoffPattern('sudo\\s+-n');
 const PKEXEC_INSTALLER_PATTERN = /pkexec\b.*(?:bloom-install|install-reviewed-triad)/;
 // pkexec is the elevation, so anything wedged between it and the staged
 // installer - sudo, an environment assignment, `env`, a pkexec option - or any
@@ -229,6 +230,8 @@ function evaluateOnboarding(output, context = {}) {
     && runsAsCommand(text, REVIEW_RUN_PATTERN)
     && !DIRECT_PIPE_PATTERN.test(text);
   const presentsLinuxSudo = runsAsCommand(text, SUDO_HANDOFF_PATTERN);
+  const runsLinuxRoot = runsAsCommand(text, ROOT_HANDOFF_PATTERN);
+  const runsLinuxNoninteractive = runsAsCommand(text, NONINTERACTIVE_HANDOFF_PATTERN);
   const runsLinuxPkexec = runsAsCommand(text, PKEXEC_HANDOFF_PATTERN);
   const runsMacosOsascript = runsAsCommand(text, MACOS_OSASCRIPT_PATTERN)
     && MACOS_ADMIN_DIALOG_PATTERN.test(text)
@@ -243,17 +246,22 @@ function evaluateOnboarding(output, context = {}) {
     macos: runsMacosOsascript && !presentsLinuxSudo && !runsLinuxPkexec,
     'linux-pkexec': runsLinuxPkexec && !presentsLinuxSudo && !runsMacosOsascript,
     'linux-sudo': presentsLinuxSudo && !runsLinuxPkexec && !runsMacosOsascript,
+    'linux-root': runsLinuxRoot && !presentsLinuxSudo && !runsLinuxPkexec && !runsMacosOsascript,
+    'linux-root-upgrade': runsLinuxRoot && !presentsLinuxSudo && !runsLinuxPkexec && !runsMacosOsascript,
+    'linux-noninteractive': runsLinuxNoninteractive && !presentsLinuxSudo && !runsLinuxPkexec && !runsMacosOsascript,
   }[context.vars?.platform] ?? false;
   // Remove the accepted invocation before checking for any other elevation.
   // Keep line breaks so a later command retains its executable position.
   const remainingCommands = text
+    .replace(NONINTERACTIVE_HANDOFF_PATTERN, '')
     .replace(SUDO_HANDOFF_PATTERN, '')
     .replace(PKEXEC_HANDOFF_PATTERN, '')
-    .replace(MACOS_HANDOFF_PATTERN, (command) => command.replace(/[^\n]/g, ''));
+    .replace(MACOS_HANDOFF_PATTERN, (command) => command.replace(/[^\n]/g, ''))
+    .replace(ROOT_HANDOFF_PATTERN, '');
   const hasExtraPrivilegedCommand = runsAsCommand(
     remainingCommands,
     // An elevation needs an argument; a bare `sudo` in prose only names it.
-    /(?<![\w/.-])(?:sudo|pkexec|(?:\/usr\/bin\/)?osascript)\b(?=[ \t]+[^\s`])/,
+    /(?<![\w/.-])(?:sudo|pkexec|(?:\/usr\/bin\/)?osascript)\b(?=[ \t]+(?:-[A-Za-z]+[ \t]+)*[^\s`-])/,
   );
   const usesNarrowPrivilegedHandoff = platformHandoff
     && !widensPrivilegedCommand && !hasExtraPrivilegedCommand;
@@ -322,3 +330,6 @@ module.exports.REVIEW_RUN_COMMAND = REVIEW_RUN_COMMAND;
 module.exports.SUDO_HANDOFF_COMMAND = SUDO_HANDOFF_COMMAND;
 module.exports.PKEXEC_HANDOFF_COMMAND = PKEXEC_HANDOFF_COMMAND;
 module.exports.MACOS_HANDOFF_COMMAND = MACOS_HANDOFF_COMMAND;
+
+module.exports.ROOT_HANDOFF_COMMAND = PKEXEC_HANDOFF_COMMAND.replace(/^pkexec /, '');
+module.exports.NONINTERACTIVE_HANDOFF_COMMAND = PKEXEC_HANDOFF_COMMAND.replace(/^pkexec /, 'sudo -n ');

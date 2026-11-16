@@ -12,7 +12,10 @@ https://bloom.directory/SKILL.md and set up Bloom.", to a tool-less agent with
 `SKILL.md` and `install/install.md` attached. The provider cannot fetch the
 guide itself, so the guide is attached explicitly. The suite grades the
 agent's first response on each supported platform: macOS, Linux with `pkexec`,
-and Linux without it.
+Linux without it, headless root first install, headless root upgrade with a
+distinct Bloom login, and existing authorized noninteractive sudo access. The
+root cases include an inherited unwritable TMPDIR. These tool-less responses
+do not prove installation or account/session preparation actually works.
 
 The deterministic grader reports these dimensions independently:
 
@@ -41,7 +44,7 @@ npm run check
 model calls. CI runs it whenever `skills/**` or `evals/skills/**` changes.
 
 Model runs call the local `claude` and `codex` CLIs, cost money, and are run by
-hand. Each takes five fresh, uncached samples per platform:
+hand. Each takes five fresh, uncached samples per scenario:
 
 ```sh
 npm run eval          # claude-sonnet-5-5 and gpt-6.1-terra

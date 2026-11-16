@@ -43,6 +43,28 @@ recorded compatibility revisions, including the Linux release build and both
 macOS conformance workflows with explicit Broker and Signer refs. Local checks
 do not replace required review or CI on the published candidate.
 
+## Headless Linux setup acceptance
+
+On a disposable Linux/systemd host with OpenSSH, Python 3, and NFS client
+support, run these as root from the candidate checkout:
+
+```sh
+BLOOM_DISPOSABLE_INSTALL_TEST=1 bash tests/packaging/linux-headless-setup.sh first-install
+BLOOM_DISPOSABLE_INSTALL_TEST=1 bash tests/packaging/linux-headless-setup.sh upgrade
+```
+
+The first command creates the dedicated `bloom` login and refreshes only that
+new user's manager after installation. The second verifies and reuses one
+existing enrollment; use a host with an older signed release to prove a version
+upgrade, rather than just a same-release reinstall. Both exercise signed
+staging with an unwritable inherited TMPDIR and the guide's exact root-owned
+handoff, then check versions, services, CLI VFS, and audit health. Upgrade also
+checks identity-file metadata and a harmless Machine-home marker survive.
+No wallets, passkeys, or transactions are created. Evidence is retained under
+`/var/tmp/bloom-headless-test.*`; do not publish raw runtime logs. A container
+that cannot mount NFS is insufficient for full installed readiness. Run the
+[skill checks and local model evals](evals/skills/README.md) separately.
+
 ## Triad and Solana ladders
 
 Select the checks for the changed behavior using the map below. Test an

@@ -446,4 +446,17 @@ const contradictsScope = evaluateOnboarding(
 assert.equal(contradictsScope.pass, false);
 assert.match(contradictsScope.reason, /least-privilege/);
 
+// Existing administrative access uses the same verified handoff without a dialog.
+for (const platform of ['linux-root', 'linux-root-upgrade', 'linux-noninteractive']) {
+  const { ROOT_HANDOFF_COMMAND, NONINTERACTIVE_HANDOFF_COMMAND } = require('./onboarding.cjs');
+  const handoff = platform === 'linux-noninteractive' ? NONINTERACTIVE_HANDOFF_COMMAND : ROOT_HANDOFF_COMMAND;
+  const output = `I'll proceed with Bloom setup using existing administrative access.
+${REVIEW_SEQUENCE}
+I run this command myself:
+${handoff}
+${SCOPE_SENTENCE} No password is needed or handled. The path is named \`sudo -n\` or \`pkexec\` in prose.`;
+  assert.equal(evaluateOnboarding(output, { vars: { platform } }).pass, true, platform);
+  assert.equal(evaluateOnboarding(output.replace('ssh-keygen -Y verify', 'true -Y verify'), { vars: { platform } }).pass, false, platform);
+}
+
 console.log(`onboarding assertion fixtures: ${cases} passed`);
