@@ -2375,7 +2375,7 @@ dependencies = [
 
 [[package]]
 name = "bloom"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "anyhow",
@@ -2443,7 +2443,7 @@ dependencies = [
 [[package]]
 name = "bloom-broker-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=8ee8842bc218bf4051455136ce43e3c862f25e0c#8ee8842bc218bf4051455136ce43e3c862f25e0c"
+source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=039ecc438406cc40ced7c474eac38aed4d36249b#039ecc438406cc40ced7c474eac38aed4d36249b"
 dependencies = [
  "bech32",
  "bloom-rpc-wire",
@@ -2458,7 +2458,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-checkout"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2488,7 +2488,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-checkout-api"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2496,7 +2496,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-daemon"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "anyhow",
@@ -2545,7 +2545,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-ens"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "bloom-evm",
@@ -2560,7 +2560,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-etherscan"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "async-trait",
@@ -2578,7 +2578,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-evm"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "bloom-proto",
@@ -2596,7 +2596,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-it"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "alloy-signer-local 2.0.5",
@@ -2632,7 +2632,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-machine"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "bloom-broker-api",
@@ -2649,7 +2649,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-machine-client"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "bloom-audit-checkpoint",
@@ -2674,7 +2674,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-mcp"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2692,7 +2692,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-mempool"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "alloy-signer-local 2.0.5",
@@ -2714,7 +2714,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-mount"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "bloom-vfs",
@@ -2731,7 +2731,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-paid-http"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2746,7 +2746,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-paid-mpp"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "async-trait",
@@ -2763,7 +2763,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-paid-x402"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "alloy-dyn-abi",
@@ -2790,7 +2790,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-petals"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2825,7 +2825,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-prices"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "parking_lot",
  "reqwest 0.12.28",
@@ -2838,7 +2838,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-proto"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "blake3",
@@ -2860,7 +2860,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-revert"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "alloy-dyn-abi",
@@ -2882,7 +2882,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-rpc"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "bloom-proto",
@@ -2899,7 +2899,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-rpc-common"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "parking_lot",
  "serde",
@@ -2945,7 +2945,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=97f2c8e852ed3330e680fef3f11643e6e0e63e6d#97f2c8e852ed3330e680fef3f11643e6e0e63e6d"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=8f4a56175434acebac866fbd0c64d25a7eaefd9a#8f4a56175434acebac866fbd0c64d25a7eaefd9a"
 dependencies = [
  "bloom-rpc-wire",
  "ed25519-dalek",
@@ -2961,7 +2961,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-derive"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=97f2c8e852ed3330e680fef3f11643e6e0e63e6d#97f2c8e852ed3330e680fef3f11643e6e0e63e6d"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=8f4a56175434acebac866fbd0c64d25a7eaefd9a#8f4a56175434acebac866fbd0c64d25a7eaefd9a"
 dependencies = [
  "bip39",
  "ed25519-dalek",
@@ -2977,7 +2977,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-solana"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "bloom-proto",
  "bloom-rpc-common",
@@ -2992,7 +2992,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-solana-tx"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3021,7 +3021,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-tools"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "alloy-dyn-abi",
@@ -3063,7 +3063,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-tx"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "alloy-signer-local 2.0.5",
@@ -3095,7 +3095,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-update"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "parking_lot",
  "reqwest 0.12.28",
@@ -3110,7 +3110,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-vfs"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "async-trait",
@@ -3161,7 +3161,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-watch"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "anyhow",
@@ -9545,7 +9545,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.2",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.6",
  "windows-sys 0.61.2",
