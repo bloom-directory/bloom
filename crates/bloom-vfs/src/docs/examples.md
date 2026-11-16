@@ -280,6 +280,9 @@ a single-token approval and should be clearly visible in the policy projection.
 
 ## Updating wallet policy
 
+Use this workflow only for an explicitly requested policy change. A denied
+payment is a refusal to report, not permission to expand an allowlist.
+
 ```sh
 # The proposal is a scratch file in the working directory, outside the mount.
 cat "$BLOOM/wallets/alice/policy.json" > proposed-policy.json

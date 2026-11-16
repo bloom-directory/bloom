@@ -569,9 +569,7 @@ mod tests {
         let mut t = fixture_tx(1);
         t.input = Bytes::from(
             alloy::hex::decode(
-                std::fs::read_to_string("../bloom-mempool/tests/fixtures/uniswap_v2_swap.hex")
-                    .unwrap()
-                    .trim(),
+                include_str!("../../../bloom-mempool/tests/fixtures/uniswap_v2_swap.hex").trim(),
             )
             .unwrap(),
         );

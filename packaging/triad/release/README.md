@@ -250,6 +250,9 @@ purge requires `--purge` and the exact `delete-bloom-login-LOGIN_UID`
 confirmation. Shared runtime files are removed only after the last active
 enrollment, while the uninstaller remains available until all retained custody
 has also been purged.
+Reinstalling the retained release recreates removed service units before activation.
+The same-release stop step skips only services systemd reports as missing and
+inactive; inspection errors and failures to stop existing services still abort.
 
 ```sh
 sudo bloom-uninstall
