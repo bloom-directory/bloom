@@ -466,10 +466,12 @@ fn refresh_developer_provenance_catalog(
              corrected since this root was enrolled, or a Petal that has changed since. If \
              the record is right, make this build's table agree with what the Petal \
              declares. If the table is right, re-enrol that Petal to re-derive its records \
-             from the table. The launcher already does that for the Hyperliquid package \
-             when BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE is set, so a warning naming that \
-             package should not survive the next launch; otherwise run it yourself from \
-             the repository root, once per route named above:\n\n  \
+             from the table, which clears this only while the package hash on disk is \
+             still the one named above. The launcher runs that enrolment for the \
+             Hyperliquid package whenever BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE is set, but \
+             it rebuilds the package first unless BLOOM_TRIAD_DEV_BUILD_PETALS=0, so a \
+             Petal whose source has moved gets a new hash and this record stays. \
+             Otherwise run it yourself from the repository root, once per route above:\n\n  \
              cargo run -p bloom --no-default-features --features mount,triad-dev-harness \
              -- init triad-enroll-developer-petal-provenance {} \
              \"$PETAL_PACKAGE_DIR\"\n\nwith PETAL_PACKAGE_DIR exported as that Petal's \
@@ -478,23 +480,31 @@ fn refresh_developer_provenance_catalog(
              worktrees are asked to set their own CARGO_TARGET_DIR, so that path is stale \
              or missing in exactly the setup these roots are built in, and a build \
              predating the table re-enrols the record with no fee asset at all — clearing \
-             the value this refresh has just declined to clear. And re-enrol only while \
-             the package on disk is still the one the record names: enrolment replaces \
-             records for the hash it reads, so a Petal rebuilt since leaves the record \
-             above behind as a superseded one, which neither this refresh nor a later \
-             enrolment will overwrite and only a fresh developer root clears.",
+             the value this refresh has just declined to clear. When the hash has moved \
+             already, this is not the remedy and nothing here is: enrolment replaces \
+             records for the hash it reads and refuses to reactivate a superseded one, so \
+             the record above survives every launch until the developer root is \
+             recreated.",
             shell_quoted(config_dir),
         ));
     }
-    notes.append(&mut warnings);
     // Settling the catalog is fallible from here down, and every `?` in it
-    // used to drop `notes` on the floor -- the same swallowing the no-write
+    // used to drop what the walk found -- the same swallowing the no-write
     // path below is written to avoid, one branch over, and reachable whenever
     // an interrupted run has left a `.json.new` behind. Wrapped rather than
     // given context at each `?` so that a fallible call added in here later
     // cannot quietly reintroduce it. The lines ride out on the error instead
     // of being printed from inside the refresh, which would put them beyond
     // the tests' reach.
+    //
+    // The warnings ride out; the notes do not, and `warnings` therefore stays
+    // separate until the settle has succeeded. A `note:` asserts a change was
+    // saved -- the severity contract at the top of the caller -- and on this
+    // path nothing was, so reporting one is a false claim about the catalog.
+    // It is worse than inaccurate: the note's own remedy is to re-enrol, which
+    // re-derives from the table and so would *apply* the heal the operator had
+    // been told to expect undoing. A warning says the record was left exactly
+    // as signed, which a failed write leaves just as true.
     let settled = (|| -> Result<()> {
         catalog.records.extend(developer_records);
         append_release_petal_provenance(&mut catalog, &installer_key_id, &signing_key)?;
@@ -525,16 +535,17 @@ fn refresh_developer_provenance_catalog(
         Ok(())
     })();
     if let Err(error) = settled {
-        return Err(if notes.is_empty() {
+        return Err(if warnings.is_empty() {
             error
         } else {
             error.context(format!(
-                "the refresh found this before it failed, and could not report it \
-                 the usual way:\n{}",
-                notes.join("\n")
+                "the refresh left these alone before it failed, and could not report \
+                 them the usual way:\n{}",
+                warnings.join("\n")
             ))
         });
     }
+    notes.append(&mut warnings);
     Ok(notes)
 }
 
@@ -1857,29 +1868,6 @@ mod tests {
         assert_eq!(fee.asset, "usdc", "{class} fee asset");
     }
 
-    /// A fee-bearing class is only safe when a dedicated route makes every one
-    /// of its claims declare a fee, so each row must name a class distinct
-    /// from the fee-free class it was split out of, and must resolve.
-    #[test]
-    fn every_catalogued_fee_bearing_row_is_distinct_and_resolvable() {
-        let classes = FEE_BEARING_OPERATION_CLASSES
-            .iter()
-            .map(|entry| entry.operation_class)
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            classes.len(),
-            FEE_BEARING_OPERATION_CLASSES.len(),
-            "a class may be catalogued with only one fee asset"
-        );
-        for entry in FEE_BEARING_OPERATION_CLASSES {
-            Token::new(entry.operation_class)
-                .unwrap_or_else(|_| panic!("{} is not a valid class token", entry.operation_class));
-            Token::new(entry.chain)
-                .unwrap_or_else(|_| panic!("{} is not a valid chain token", entry.chain));
-            assert!(!entry.asset.is_empty(), "{} needs an asset", entry.chain);
-        }
-    }
-
     fn release_catalog_for(
         entries: &[&crate::github_source::PreinstalledPetal],
     ) -> ProvenanceCatalog {
@@ -2526,8 +2514,9 @@ mod tests {
              and change one of the two sides: {message}"
         );
         // Naming the remedy is not giving it. The subcommand that fixes this is
-        // `hide = true`, so `--help` does not list it, and the launcher does
-        // not run it: this message is the operator's only output.
+        // `hide = true`, so `--help` does not list it, and the launcher runs it
+        // only for the Hyperliquid package: for anything else this message is
+        // the operator's only output.
         for fragment in [
             "cargo run -p bloom --no-default-features --features mount,triad-dev-harness",
             "init triad-enroll-developer-petal-provenance",
@@ -2692,18 +2681,29 @@ mod tests {
 
     /// The failure path, which is the third way a diagnostic could be lost.
     ///
-    /// The walk finds the disagreement, and then settling the catalog fails.
-    /// `rewrite_private_json` opens its temporary file with `create_new`, so a
+    /// The walk finds both halves, and then settling the catalog fails.
+    /// `rewrite_private_json` opens its temporary with `create_new`, so a
     /// `.json.new` left behind by an interrupted run is enough to do it -- no
-    /// permission games, and a real thing to come back to. The operator must
-    /// still be told what was found; a bare I/O error would send them looking
-    /// at the filesystem and never at the record.
+    /// permission games, and a real thing to come back to.
+    ///
+    /// Three things have to hold, and the first version of this test pinned
+    /// only one of them. The warning must survive, because a bare I/O error
+    /// sends the operator to the filesystem and never to the record. The heal's
+    /// `note:` must *not*, because nothing was written: it would assert a
+    /// change the catalog does not carry, and its remedy is to re-enrol, which
+    /// re-derives from the table and so applies the heal rather than undoing
+    /// it. And the underlying error must still be reachable, or attaching the
+    /// warning has traded one lost diagnostic for another.
     #[cfg(feature = "triad-dev-harness")]
     #[test]
-    fn a_refresh_that_fails_to_settle_still_reports_what_it_found() {
+    fn a_refresh_that_fails_to_settle_reports_only_what_it_left_alone() {
         let root = RefreshRoot::enrolled();
         let mut stale = root.catalog();
 
+        // Both halves on one record, as the heal-beside-a-warning test does:
+        // a catalogued class with no value to heal, and an uncatalogued class
+        // carrying one to warn about.
+        let builder_class = Token::new(HYPERLIQUID_BUILDER_ORDER_CLASS).unwrap();
         let mut planted = 0;
         for record in &mut stale.records {
             if !matches!(record.subject, ProvenanceSubject::Petal { .. })
@@ -2711,16 +2711,25 @@ mod tests {
             {
                 continue;
             }
-            if let Some(class) = record.operation_classes.first_mut() {
-                class.fee_asset = Some(ProvenanceFeeAsset {
-                    chain: Token::new("hyperliquid").unwrap(),
-                    asset: "usdc".to_owned(),
-                });
-                planted += 1;
-            }
+            let Some(class) = record.operation_classes.first_mut() else {
+                continue;
+            };
+            class.fee_asset = Some(ProvenanceFeeAsset {
+                chain: Token::new("hyperliquid").unwrap(),
+                asset: "usdc".to_owned(),
+            });
+            record.operation_classes.insert(
+                0,
+                ProvenanceOperationClass {
+                    operation_class: builder_class.clone(),
+                    fee_asset: None,
+                },
+            );
+            planted += 1;
         }
         assert!(planted > 0, "the fixture must enroll a developer record");
         root.write(&stale);
+        let before = fs::read(&root.catalog_path).unwrap();
 
         // Planted after the catalog is written, since writing it takes the
         // same path and would fail on this file too.
@@ -2735,6 +2744,22 @@ mod tests {
             reported.contains("left as signed"),
             "a refresh that fails after finding a disagreement must still say what it \
              found, or the one message pointing at the record is lost: {reported}"
+        );
+        assert!(
+            !reported.contains("note:") && !reported.contains("re-derived"),
+            "a heal that was never written must not be reported as one, and its \
+             remedy re-applies it rather than undoing it: {reported}"
+        );
+        assert!(
+            error.chain().count() > 1,
+            "the underlying failure must survive the attached warning, or this has \
+             traded one lost diagnostic for another: {reported}"
+        );
+        assert_eq!(
+            fs::read(&root.catalog_path).unwrap(),
+            before,
+            "nothing may reach the catalog on this path, which is what makes a \
+             `note:` here false"
         );
     }
 

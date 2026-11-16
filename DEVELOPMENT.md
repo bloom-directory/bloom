@@ -572,11 +572,14 @@ with.
 Correcting a row in that table is therefore a breaking change for every
 developer root enrolled against the old value. The remedy is per-Petal:
 re-enrolling the Petal re-derives its records from the table, for the package
-hash on disk. For the Hyperliquid package the launcher already does this on
-every launch when `BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE` is set, immediately
-after the refresh, so a warning naming it should not survive the next launch.
-For any other Petal, or with that variable unset, run it yourself from the
-repository root, once per Petal the warning names:
+hash on disk — so it clears a warning only while that hash is still the one the
+record names. The launcher runs this enrolment for the Hyperliquid package
+whenever `BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE` is set, immediately after the
+refresh, but it rebuilds the package first unless
+`BLOOM_TRIAD_DEV_BUILD_PETALS=0`: a Petal whose source has moved therefore gets
+a new hash, and the warned-about record survives. For any other Petal, or with
+that variable unset, run it yourself from the repository root, once per Petal
+the warning names:
 
 ```sh
 cargo run -p bloom --no-default-features --features mount,triad-dev-harness -- \

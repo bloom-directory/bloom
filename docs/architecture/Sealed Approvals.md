@@ -354,8 +354,9 @@ description of what the class *may* charge; it is a requirement on every
 claim in the class. Broker matches the class's `fee_asset` against the
 claim's `declared_fee` and denies the mismatches outright: a class with a
 `fee_asset` denies a claim declaring no fee (`FEE_REQUIRED`), a class
-without one denies a claim declaring a fee (`FEE_NOT_ALLOWED`), and a
-declared asset other than the named one is `FEE_ASSET_MISMATCH`.
+without one denies a claim declaring a fee (`FEE_NOT_ALLOWED`), and a declared
+fee naming any other chain or asset is `FEE_ASSET_MISMATCH` — the chain is
+compared as well as the asset, so a right asset on a wrong chain is denied too.
 
 So a `fee_asset` is only correct on a class whose every operation is
 fee-bearing, and a class has to be uniformly one or the other. A venue's
@@ -442,10 +443,12 @@ answers `FEE_ASSET_MISMATCH`.
 
 Cataloguing makes the claim authorizable. Whether it is also *reviewed* is not
 answered by the two tables, and reading them alone gets it wrong. The pinned
-Broker's exact path chains a third entry after them
+Broker chains a third entry after them
 (`service.rs`, `.chain([&message_review::hyperliquid::BUILDER_ORDER_CLASS])`),
-so an **exact** builder order does require the decoded order review, exactly as
-`hyperliquid.order` does, even though the class is registered in neither table.
+in the Petal-subject work shared by both selector arms rather than in the exact
+path alone, so an **exact** builder order does require the decoded order review,
+exactly as `hyperliquid.order` does, even though the class is registered in
+neither table.
 Broker's own comment gives the reason: builder orders stay out of the
 exact-only list because sessions sign them under reusable grants, "but an exact
 one is reviewed". The reusable form is not unreviewed either — its fee is
@@ -489,16 +492,25 @@ The delegated-action witness already covers the builder class, as above, so a
 builder-class claim does not bypass it: without a witness the claim is refused,
 `SelectorMismatch`, "Agent action requires its full use-time witness; upgrade
 the Hyperliquid package". What the session path still needs is value limits on
-the key-scope approval, which `prepare_petal_key_reusable_approval` leaves
-empty.
+the key-scope approval, which Machine's own
+`prepare_petal_key_reusable_approval` (`bloom-daemon`, not Broker) leaves empty.
 
 The fee's asset is not Petal-asserted: `validate_builder_fee` requires
 `chain == "hyperliquid" && asset == "usdc"` outright, and a declared amount at
-or above the bound it computes from limit price and size, so the catalogued row
-and Broker's own check must agree before a claim is authorized. The remaining
-soft edge is narrower than this section used to claim — the market is named to
-the owner whenever its id parses, and the identity-unverified label survives
-only for asset ids the venue has not mapped.
+or above the bound the review carries, computed from the leg's limit price, size
+and the builder's rate, so the catalogued row and Broker's own check must agree
+before a claim is authorized. Only core perpetual limit legs are bounded at all;
+trigger orders, asset ids at or above 10,000 and non-`Alo` sells are refused
+rather than bounded.
+
+What the owner sees of the market is weaker than the fee binding, in the
+opposite direction to what this section used to say. The
+`Market ID (identity unverified)` label is replaced whenever the id parses as a
+`u32`, whether or not Broker can name that market: an id outside the bundled
+mainnet list renders as `Market <id> (not in this Bloom release's market list)`,
+and on any other network as `Market <id> (testnet; Bloom has no testnet market
+names)`. So the caveat is dropped precisely where the market cannot be named,
+and survives only for a value that is not a number at all.
 
 ## Ceremony and public projection
 
