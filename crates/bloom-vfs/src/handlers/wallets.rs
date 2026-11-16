@@ -7878,6 +7878,26 @@ value = "0""#,
         );
     }
 
+    /// A chain id resolves to its chain's name only while one configured
+    /// chain has it: a fork shares its network's id, and guessing between
+    /// them could send on the wrong one.
+    #[tokio::test]
+    async fn a_chain_id_shared_by_two_chains_names_neither() {
+        let f = make_handler_with_chain(true);
+        let by_id = VfsPath::parse(&format!("/{}/0/chains/31337", f.wallet_name)).unwrap();
+        let entry = f.handler.lookup(&by_id).await.unwrap();
+        assert_eq!(entry.link_target.as_deref(), Some("anvil"), "{entry:?}");
+        let mut fork = f.handler.chains.get("anvil").unwrap().spec().clone();
+        fork.name = "anvil-fork".into();
+        f.handler
+            .chains
+            .add(bloom_evm::ChainClient::new(fork).unwrap());
+        assert!(matches!(
+            f.handler.lookup(&by_id).await,
+            Err(HandlerError::NotFound(_))
+        ));
+    }
+
     #[tokio::test]
     async fn solana_chain_outbox_dispatches_through_the_solana_engine() {
         let f = make_handler_with_chain(true);
