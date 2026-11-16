@@ -265,3 +265,46 @@ async fn await_approval(
         tokio::time::sleep(APPROVAL_POLL).await;
     }
 }
+
+/// Whether `path` names the receipt of an outbox entry that was broadcast
+/// (it has a `tx_hash`) but has no receipt recorded yet.
+pub async fn receipt_is_due(vfs: &Vfs, path: &VfsPath, error: &HandlerError) -> bool {
+    let segments = path.segments();
+    let [.., outbox, sent, _, leaf] = segments else {
+        return false;
+    };
+    if !matches!(error, HandlerError::NotFound(_))
+        || outbox != "outbox"
+        || sent != "sent"
+        || leaf != "receipt.json"
+    {
+        return false;
+    }
+    let sibling = format!("/{}/tx_hash", segments[..segments.len() - 1].join("/"));
+    match VfsPath::parse(&sibling) {
+        Ok(tx_hash) => vfs.lookup(&tx_hash).await.is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Look `path` up. A receipt is recorded once the transaction is mined,
+/// moments after the confirm that sent it returns, so a receipt that is due
+/// is waited for briefly: a caller that confirms and then reads the receipt
+/// finds it.
+pub async fn lookup(vfs: &Vfs, path: &VfsPath) -> Result<crate::Entry, HandlerError> {
+    let absent = match vfs.lookup(path).await {
+        Err(error) => error,
+        found => return found,
+    };
+    if !receipt_is_due(vfs, path, &absent).await {
+        return Err(absent);
+    }
+    for _ in 0..RECEIPT_POLLS {
+        tokio::time::sleep(APPROVAL_POLL).await;
+        match vfs.lookup(path).await {
+            Err(HandlerError::NotFound(_)) => continue,
+            found => return found,
+        }
+    }
+    Err(absent)
+}

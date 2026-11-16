@@ -36,6 +36,7 @@ use parking_lot::Mutex;
 use tokio::time::Instant;
 use tracing::{debug, trace, warn};
 
+use bloom_vfs::owner_wait::WriteError;
 use bloom_vfs::{Entry, EntryKind, Handler, HandlerError, Vfs, VfsPath, percent_decode_segment};
 
 /// Maximum bytes we'll buffer for a single open file before forcing a
@@ -79,6 +80,13 @@ pub(crate) const RENDER_CACHE_CAPACITY: usize = 1024;
 /// `FsError::Io` so the client surface is EIO with a logged reason
 /// rather than hanging past the kernel's retry threshold.
 pub(crate) const RENDER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a repeated confirm on a mount waits for the owner. Shorter than
+/// the 50 s `bloom vfs` waits: the write holds an NFS request slot meanwhile.
+pub(crate) const OWNER_WAIT: Duration = Duration::from_secs(30);
+/// How many writes may wait for the owner at once, of the connection's 64
+/// request slots.
+pub(crate) const OWNER_WAITERS: usize = 8;
 
 /// Directory snapshots bridge the GETATTR used to compute NFS's cookie
 /// verifier with every READDIR page in the same enumeration.
@@ -831,6 +839,8 @@ pub struct BloomFs {
     /// the replay cache in the NFS layer does not cover it. Answering it from
     /// here keeps one refused command from running twice.
     failed_writes: Arc<Mutex<LruCache<VfsPath, FailedWrite>>>,
+    /// Bounds how many writes wait for the owner at once.
+    owner_waiters: Arc<tokio::sync::Semaphore>,
 }
 
 /// A command write that the handler refused, kept for
@@ -856,6 +866,7 @@ impl BloomFs {
             failed_writes: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(FAILED_WRITE_CAPACITY).expect("capacity > 0"),
             ))),
+            owner_waiters: Arc::new(tokio::sync::Semaphore::new(OWNER_WAITERS)),
         }
     }
 
@@ -1026,6 +1037,26 @@ impl BloomFs {
         }
     }
 
+    /// Write through the layer `bloom vfs` and MCP use, so a repeated confirm
+    /// waits for the owner here too. A waiting write holds one of the
+    /// connection's request slots (64 by default), so only
+    /// [`OWNER_WAITERS`] may wait at once; any further one is answered at
+    /// once, as every one was before.
+    async fn write_for_owner(&self, path: &VfsPath, bytes: &[u8]) -> FsResult<()> {
+        let permit = self.owner_waiters.clone().try_acquire_owned();
+        let wait = if permit.is_ok() {
+            OWNER_WAIT
+        } else {
+            Duration::ZERO
+        };
+        match bloom_vfs::owner_wait::write(&self.vfs, path, bytes, wait, &|| false).await {
+            Ok(()) => Ok(()),
+            Err(WriteError::Handler(error)) => Err(map_err(error)),
+            // The link is in the entry's `plan.md`; a mount returns a code.
+            Err(WriteError::Approval(_)) => Err(FsError::AccessDenied),
+        }
+    }
+
     /// Flush any buffered writes for `path` through to the VFS. No-op
     /// if the buffer is empty or non-contiguous; incomplete buffers can
     /// only be completed by a follow-up WRITE or discarded by
@@ -1036,7 +1067,7 @@ impl BloomFs {
                 return Err(FsError::PermissionDenied);
             }
             trace!(path = %path.to_string_path(), bytes = bytes.len(), "mount.adapter.flush");
-            self.vfs.write(path, &bytes).await.map_err(map_err)?;
+            self.write_for_owner(path, &bytes).await?;
             // The rendered view is now stale; drop it so the next read re-renders.
             self.invalidate_after_write(path);
         } else {
@@ -1289,7 +1320,9 @@ impl FileSystem for BloomFs {
         })?;
         let parent_path = Self::path_of(parent);
         let child = parent_path.join(&decoded);
-        let e = self.vfs.lookup(&child).await.map_err(map_err)?;
+        let e = bloom_vfs::owner_wait::lookup(&self.vfs, &child)
+            .await
+            .map_err(map_err)?;
         Ok(BloomHandle::Path {
             entry: e,
             path: child,
@@ -1596,13 +1629,12 @@ impl FileSystem for BloomFs {
                 // or the command's published outcome.
                 self.invalidate_after_write(&path);
             } else {
-                match self.vfs.write(&path, &payload).await {
+                match self.write_for_owner(&path, &payload).await {
                     Ok(()) => {
                         // Persisted new bytes — invalidate stale rendered views.
                         self.invalidate_after_write(&path);
                     }
                     Err(error) => {
-                        let error = map_err(error);
                         self.record_failed_write(&path, &payload, error);
                         return Err(error);
                     }
@@ -2194,6 +2226,140 @@ mod tests {
             1,
             "open should stage the approval challenge exactly once"
         );
+    }
+
+    /// One pending outbox entry: a confirm is refused until the owner's
+    /// approval is active, and the challenge beside it reports that state.
+    struct OwnerApproval {
+        active: std::sync::atomic::AtomicBool,
+        challenged: std::sync::atomic::AtomicBool,
+        sent: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Handler for OwnerApproval {
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            Ok(Entry::writable_file(p.segments().last().unwrap()))
+        }
+        async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            if !self.challenged.load(Ordering::SeqCst) || self.sent.load(Ordering::SeqCst) > 0 {
+                return Err(HandlerError::NotFound(p.to_string_path()));
+            }
+            let state = if self.active.load(Ordering::SeqCst) {
+                "active"
+            } else {
+                "awaiting_ceremony"
+            };
+            Ok(format!(
+                r#"{{"approval_id":"a1","state":"{state}","ceremony_url":"http://localhost/c"}}"#
+            )
+            .into_bytes())
+        }
+        async fn write(&self, p: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+            self.challenged.store(true, Ordering::SeqCst);
+            if !self.active.load(Ordering::SeqCst) {
+                return Err(HandlerError::ApprovalPending(p.to_string_path()));
+            }
+            self.sent.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A mount behaves as `bloom vfs` does: the first confirm is refused at
+    /// once, and a repeat waits for the owner, then sends.
+    #[tokio::test(start_paused = true)]
+    async fn a_repeated_confirm_waits_for_the_owner() {
+        let entry = Arc::new(OwnerApproval {
+            active: false.into(),
+            challenged: false.into(),
+            sent: 0.into(),
+        });
+        let fs = BloomFs::new(Vfs::builder().mount("wallets", entry.clone()).build());
+        let ctx = fake_ctx();
+        let confirm = BloomHandle::Path {
+            entry: Entry::writable_file("confirm"),
+            path: VfsPath::parse("/wallets/w/0/chains/base/outbox/pending/tx-1/confirm").unwrap(),
+        };
+        let write = || {
+            fs.write(
+                &ctx,
+                &confirm,
+                0,
+                Bytes::from_static(b"y"),
+                WriteStability::FileSync,
+            )
+        };
+
+        let started = Instant::now();
+        assert_eq!(write().await.unwrap_err(), FsError::AccessDenied);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the first is answered at once"
+        );
+
+        // Past the window in which an identical re-send is a kernel re-flush.
+        tokio::time::sleep(FAILED_WRITE_REPLAY_WINDOW * 2).await;
+        let owner = entry.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            owner.active.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        write().await.unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(5));
+        assert_eq!(entry.sent.load(Ordering::SeqCst), 1);
+    }
+
+    /// The owner never answers: the repeat gives up after [`OWNER_WAIT`], and
+    /// with every waiting slot taken a confirm is answered at once.
+    #[tokio::test(start_paused = true)]
+    async fn the_owner_wait_is_bounded() {
+        let entry = Arc::new(OwnerApproval {
+            active: false.into(),
+            challenged: true.into(),
+            sent: 0.into(),
+        });
+        let fs = BloomFs::new(Vfs::builder().mount("wallets", entry.clone()).build());
+        let ctx = fake_ctx();
+        let confirm = BloomHandle::Path {
+            entry: Entry::writable_file("confirm"),
+            path: VfsPath::parse("/wallets/w/0/chains/base/outbox/pending/tx-1/confirm").unwrap(),
+        };
+        let started = Instant::now();
+        let refused = fs
+            .write(
+                &ctx,
+                &confirm,
+                0,
+                Bytes::from_static(b"y"),
+                WriteStability::FileSync,
+            )
+            .await;
+        assert_eq!(refused.unwrap_err(), FsError::AccessDenied);
+        let waited = started.elapsed();
+        assert!(
+            waited >= OWNER_WAIT && waited < OWNER_WAIT + Duration::from_secs(2),
+            "{waited:?}"
+        );
+
+        tokio::time::sleep(FAILED_WRITE_REPLAY_WINDOW * 2).await;
+        let _held = fs
+            .owner_waiters
+            .clone()
+            .try_acquire_many_owned(OWNER_WAITERS as u32)
+            .unwrap();
+        let started = Instant::now();
+        let refused = fs
+            .write(
+                &ctx,
+                &confirm,
+                0,
+                Bytes::from_static(b"y"),
+                WriteStability::FileSync,
+            )
+            .await;
+        assert_eq!(refused.unwrap_err(), FsError::AccessDenied);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

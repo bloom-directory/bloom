@@ -1376,23 +1376,8 @@ impl IpcServer {
     /// Whether `params` names the receipt of an outbox entry that was
     /// broadcast (it has a `tx_hash`) but has no receipt recorded yet.
     async fn receipt_is_due(&self, params: &Value, error: &HandlerError) -> bool {
-        let Ok(path) = parse_path(params) else {
-            return false;
-        };
-        let segments = path.segments();
-        let [.., outbox, sent, _, leaf] = segments else {
-            return false;
-        };
-        if !matches!(error, HandlerError::NotFound(_))
-            || outbox != "outbox"
-            || sent != "sent"
-            || leaf != "receipt.json"
-        {
-            return false;
-        }
-        let sibling = format!("/{}/tx_hash", segments[..segments.len() - 1].join("/"));
-        match VfsPath::parse(&sibling) {
-            Ok(tx_hash) => self.vfs.lookup(&tx_hash).await.is_ok(),
+        match parse_path(params) {
+            Ok(path) => owner_wait::receipt_is_due(&self.vfs, &path, error).await,
             Err(_) => false,
         }
     }
