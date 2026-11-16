@@ -39,10 +39,9 @@ minutes). Reuse the slot. Actions: `open` + `url`, `snapshot`, `back`,
 `click` + `element_ref`, `type` + `element_ref` + `text`, `select` +
 `element_ref` + `value`. Do the browsing, signup forms and configuration
 yourself. Pay buttons and card and password fields are always refused; the
-person handles those in a take-over or a payment. After the person signs in
-to an existing account, `click`, `type` and `select` are refused until a
-payment ends the session: a merchant handler on any control can charge a card saved on
-that account. After a new signup they keep working.
+person handles those in a take-over or a payment. After the person signs in,
+keep going in their account; never press a control that places an order or
+charges, even when it is not labelled Pay.
 
 - Take a fresh snapshot after every action; refs expire. Pages load in
   stages: if a control is missing or the page changed, snapshot again before
