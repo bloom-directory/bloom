@@ -445,6 +445,18 @@ impl WalletsHandler {
         }
     }
 
+    /// The batch waiting for the owner that `entry` (`chain:id`) is part of.
+    fn awaited_batch_with(&self, wallet: &str, number: u32, entry: &str) -> Option<Vec<String>> {
+        let status: serde_json::Value =
+            serde_json::from_slice(&self.batch_status(wallet, number)).ok()?;
+        let refs: Vec<String> = status["entries"]
+            .as_array()?
+            .iter()
+            .filter_map(|e| e.as_str().map(str::to_owned))
+            .collect();
+        (status["status"] == "awaiting_ceremony" && refs.iter().any(|r| r == entry)).then_some(refs)
+    }
+
     /// `confirm-batch`: send several staged entries under one owner
     /// approval, in the order written. `<chain>:pending` names every pending
     /// entry of this account on that chain, oldest first.
@@ -1104,6 +1116,16 @@ impl WalletsHandler {
             .chain_id;
         let policy =
             crate::advisory_exact_evm_policy(&projection, chain, chain_id).map_err(err_be)?;
+        // An entry asked for as part of a batch is confirmed with its batch:
+        // `latest/confirm` continues whatever `send.tx` started.
+        if let [state, id, control] = chain_rest
+            && state == "pending"
+            && control == "confirm"
+            && data.trim_ascii() == b"y"
+            && let Some(refs) = self.awaited_batch_with(wallet, number, &format!("{chain}:{id}"))
+        {
+            return self.confirm_batch_entries(wallet, number, refs).await;
+        }
         if let [control] = chain_rest
             && EVM_PENDING_CONTROLS.contains(&control.as_str())
         {

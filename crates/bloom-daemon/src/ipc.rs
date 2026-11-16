@@ -1521,15 +1521,9 @@ impl IpcServer {
                     }
                     .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
                     .and_then(|doc| doc["ceremony_url"].as_str().map(str::to_owned));
-                    // Several bodies went under one approval: the batch
-                    // file is what waits for it.
-                    let next = match challenge.strip_suffix("/confirm-batch") {
-                        Some(_) => format!("/{challenge}"),
-                        None => "latest/confirm".to_owned(),
-                    };
                     Err(match url {
                         Some(url) => WriteError::Approval(format!(
-                            "permission denied: owner approval required: {url} . Write y to {next}: it waits for their approval, then sends."
+                            "permission denied: owner approval required: {url} . Write y to latest/confirm: it waits for their approval, then sends."
                         )),
                         None => HandlerError::ApprovalPending(challenge).into(),
                     })
@@ -1537,6 +1531,20 @@ impl IpcServer {
                 written => Ok(written?),
             };
         };
+        // An entry asked for as part of a batch waits as its batch does.
+        if let [root, wallet, number, _, chain, _, _, id, _] = path.segments()
+            && root == "wallets"
+            && bytes.trim_ascii() == b"y"
+            && let Ok(batch) = VfsPath::parse(&format!("/wallets/{wallet}/{number}/confirm-batch"))
+            && let Ok(raw) = self.vfs.read(&batch).await
+            && let Ok(status) = serde_json::from_slice::<Value>(&raw)
+            && status["status"] == "awaiting_ceremony"
+            && status["entries"]
+                .as_array()
+                .is_some_and(|entries| entries.iter().any(|e| *e == format!("{chain}:{id}")))
+        {
+            return self.write_batch_confirm(&batch, b"y", context).await;
+        }
         let waiting_for = self.approval_id(&challenge).await;
         match self.vfs.write(&path, &bytes).await {
             Err(denied @ (HandlerError::PermissionDenied | HandlerError::ApprovalPending(_))) => {

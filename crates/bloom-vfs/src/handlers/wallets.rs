@@ -10138,6 +10138,40 @@ value = "0""#,
         assert!(f.handler.write(&path, b"not-a-reference").await.is_err());
     }
 
+    /// `latest/confirm` continues a batch: an entry the owner was asked for
+    /// as part of a batch is confirmed with that batch, not alone.
+    #[tokio::test]
+    async fn confirming_an_entry_of_an_awaited_batch_confirms_the_batch() {
+        let f = make_handler_with_chain(true);
+        seed_pending(&f, "0001-first");
+        seed_pending(&f, "0002-second");
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let calls = seen.clone();
+        f.handler
+            .set_batch_confirm(Arc::new(move |_wallet, _account, txs, _text| {
+                calls.lock().push(txs);
+                Box::pin(async move { Ok(serde_json::json!({"status": "awaiting_ceremony"})) })
+            }));
+        let batch = vfs(format!("/{}/0/confirm-batch", f.wallet_name));
+        assert!(f.handler.write(&batch, b"anvil:0001-first").await.is_err());
+        let confirm = |id: &str| {
+            vfs(format!(
+                "/{}/0/chains/anvil/outbox/pending/{id}/confirm",
+                f.wallet_name
+            ))
+        };
+        let again = f.handler.write(&confirm("0001-first"), b"y\n").await;
+        assert!(
+            matches!(again, Err(HandlerError::ApprovalPending(_))),
+            "{again:?}"
+        );
+        let batched = seen.lock().clone();
+        assert_eq!(batched, vec![vec!["anvil:0001-first".to_owned()]; 2]);
+        // An entry outside that batch is confirmed on its own.
+        let _ = f.handler.write(&confirm("0002-second"), b"y").await;
+        assert_eq!(seen.lock().len(), 2);
+    }
+
     /// A request usually names a chain by id; `chains/<id>` links to its name.
     #[tokio::test]
     async fn a_chain_is_reachable_by_its_numeric_id() {
