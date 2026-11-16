@@ -9,6 +9,8 @@ let savedNotice = '';
 const sessionKey = 'bloom.checkout.session';
 let session = '';
 let frameUrl;
+// Saved-details controls appear only for records the person has.
+let hasSaved = false;
 document.getElementById('controls').disabled = true;
 function privateFetch(path, options = {}) {
   return fetch(path, {...options, credentials:'omit', headers:{...options.headers,Authorization:`Bearer ${session}`}});
@@ -22,6 +24,8 @@ function closeView(message) {
   document.getElementById('controls').disabled = true;
   document.getElementById('text').value = '';
   document.getElementById('saved-tools').hidden = true;
+  document.getElementById('task').hidden = true;
+  document.getElementById('purpose').hidden = true;
   document.getElementById('saved-approval').removeAttribute('href');
   pages.replaceChildren();
   screen.hidden = true;
@@ -79,10 +83,12 @@ async function savedOptions() {
   const response = await privateFetch('/saved');
   if (!response.ok) return;
   const records = await response.json();
-  for (const [id, list, key] of [
-    ['saved-traveler', records.travelers, 'traveler_id'],
-    ['saved-card', records.cards, 'card_id'],
+  for (const [id, row, list, key] of [
+    ['saved-traveler', 'traveler-row', records.travelers, 'traveler_id'],
+    ['saved-card', 'card-row', records.cards, 'card_id'],
   ]) {
+    document.getElementById(row).hidden = !list.length;
+    hasSaved ||= list.length > 0;
     const select = document.getElementById(id);
     for (const item of list) {
       const option = document.createElement('option');
@@ -156,6 +162,7 @@ const describe = state => ({
   declined: 'The payment was declined. Bloom will not try again.',
   uncertain: 'Bloom could not confirm the result. Do not pay again yet: check your email and bank or card app first.',
   manual_required: 'Finish the payment yourself in this window.',
+  human_control: "You're in control. The agent can't see this view.",
 }[state.state] || state.state.replaceAll('_', ' '));
 async function refresh() {
   try {
@@ -166,13 +173,16 @@ async function refresh() {
       return;
     }
     const state=await response.json();status.textContent=describe(state);
-    document.getElementById('saved-tools').hidden = !state.can_use_saved;
+    document.getElementById('saved-tools').hidden = !state.can_use_saved || !hasSaved;
     for (const id of ['stay-signed-in', 'stay-note']) document.getElementById(id).hidden = !state.can_stay_signed_in;
+    document.getElementById('finish').classList.toggle('primary', !state.can_stay_signed_in);
+    document.getElementById('task').hidden = !state.agent_description;
+    document.getElementById('task-text').textContent = state.agent_description || '';
     showSaved(state.saved);
     if(state.state==='human_control'){
-      document.getElementById('heading').textContent="Bloom's browser";
-      document.getElementById('purpose').textContent='Select your itinerary or basket here. Use saved travelers and cards above without leaving this session. The agent cannot see this view.';
-      document.getElementById('finish').textContent='Close private browser';
+      document.getElementById('heading').textContent="Your turn in Bloom's browser";
+      document.getElementById('purpose').hidden=true;
+      document.getElementById('finish').textContent=state.can_stay_signed_in ? 'Done, sign me out' : 'Done';
       document.getElementById('note').hidden=true;
     }
     if(state.state==='needs_input') {
