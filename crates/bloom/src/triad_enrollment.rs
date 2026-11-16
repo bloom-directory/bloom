@@ -487,32 +487,54 @@ fn refresh_developer_provenance_catalog(
         ));
     }
     notes.append(&mut warnings);
-    catalog.records.extend(developer_records);
-    append_release_petal_provenance(&mut catalog, &installer_key_id, &signing_key)?;
-    for record in &mut catalog.records {
-        record.installer_key_id = installer_key_id.clone();
-        let mut message = PROVENANCE_RECORD_SIGNATURE_DOMAIN.to_vec();
-        message.extend_from_slice(&record.unsigned_canonical_bytes()?);
-        record.installer_signature =
-            Base64UrlBytes::from_bytes(&signing_key.sign(&message).to_bytes());
-        message.zeroize();
+    // Settling the catalog is fallible from here down, and every `?` in it
+    // used to drop `notes` on the floor -- the same swallowing the no-write
+    // path below is written to avoid, one branch over, and reachable whenever
+    // an interrupted run has left a `.json.new` behind. Wrapped rather than
+    // given context at each `?` so that a fallible call added in here later
+    // cannot quietly reintroduce it. The lines ride out on the error instead
+    // of being printed from inside the refresh, which would put them beyond
+    // the tests' reach.
+    let settled = (|| -> Result<()> {
+        catalog.records.extend(developer_records);
+        append_release_petal_provenance(&mut catalog, &installer_key_id, &signing_key)?;
+        for record in &mut catalog.records {
+            record.installer_key_id = installer_key_id.clone();
+            let mut message = PROVENANCE_RECORD_SIGNATURE_DOMAIN.to_vec();
+            message.extend_from_slice(&record.unsigned_canonical_bytes()?);
+            record.installer_signature =
+                Base64UrlBytes::from_bytes(&signing_key.sign(&message).to_bytes());
+            message.zeroize();
+        }
+        catalog.records.sort_by_key(|record| {
+            serde_jcs::to_vec(&record.subject).expect("provenance subject is serializable")
+        });
+        catalog.validate_shape()?;
+        let mut current = existing;
+        current.records.sort_by_key(|record| {
+            serde_jcs::to_vec(&record.subject).expect("provenance subject is serializable")
+        });
+        // A disagreement writes nothing, so the catalog comes out unchanged in
+        // exactly the case the warning exists for. Returning before the write
+        // keeps that case from touching the file, and `notes` is handed back by
+        // the caller below on both paths, so neither can drop it.
+        if current == catalog {
+            return Ok(());
+        }
+        rewrite_private_json(&catalog_path, &serde_json::to_value(catalog)?)?;
+        Ok(())
+    })();
+    if let Err(error) = settled {
+        return Err(if notes.is_empty() {
+            error
+        } else {
+            error.context(format!(
+                "the refresh found this before it failed, and could not report it \
+                 the usual way:\n{}",
+                notes.join("\n")
+            ))
+        });
     }
-    catalog.records.sort_by_key(|record| {
-        serde_jcs::to_vec(&record.subject).expect("provenance subject is serializable")
-    });
-    catalog.validate_shape()?;
-    let mut current = existing;
-    current.records.sort_by_key(|record| {
-        serde_jcs::to_vec(&record.subject).expect("provenance subject is serializable")
-    });
-    if current == catalog {
-        // Not `Vec::new()`. A disagreement writes nothing, so the catalog
-        // comes out unchanged in exactly the case the warning exists for, and
-        // returning nothing here would swallow it. A heal always changes the
-        // catalog, so anything still in hand on this path is a warning.
-        return Ok(notes);
-    }
-    rewrite_private_json(&catalog_path, &serde_json::to_value(catalog)?)?;
     Ok(notes)
 }
 
@@ -2640,16 +2662,24 @@ mod tests {
             "the first refresh must report the disagreement: {first:?}"
         );
         let settled = fs::read(&root.catalog_path).unwrap();
+        // The inode, not the bytes. `rewrite_private_json` renames a temporary
+        // over the target, so a write always changes it -- while the bytes it
+        // writes on this path are identical to what is already there, which is
+        // the whole reason the path exists. Comparing contents here passed
+        // whether or not the write was skipped, and so proved nothing.
+        let inode = std::os::unix::fs::MetadataExt::ino(&fs::metadata(&root.catalog_path).unwrap());
 
         let second = root.refresh().expect("a disagreement must not refuse");
-        // Order matters: without this the test still passes when the refresh
-        // writes every time, and then it is asserting the ordinary path again
-        // rather than the early return it exists for.
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::ino(&fs::metadata(&root.catalog_path).unwrap()),
+            inode,
+            "the second refresh must not rewrite the catalog, or this test no \
+             longer reaches the no-write path it covers"
+        );
         assert_eq!(
             fs::read(&root.catalog_path).unwrap(),
             settled,
-            "the second refresh must write nothing, or this test no longer \
-             reaches the early return it covers"
+            "and it must leave the contents alone"
         );
         assert!(
             second
@@ -2657,6 +2687,54 @@ mod tests {
                 .any(|line| line.starts_with("warning:") && line.contains("left as signed")),
             "a refresh that writes nothing must still report the disagreement, \
              because this is every launch after the first: {second:?}"
+        );
+    }
+
+    /// The failure path, which is the third way a diagnostic could be lost.
+    ///
+    /// The walk finds the disagreement, and then settling the catalog fails.
+    /// `rewrite_private_json` opens its temporary file with `create_new`, so a
+    /// `.json.new` left behind by an interrupted run is enough to do it -- no
+    /// permission games, and a real thing to come back to. The operator must
+    /// still be told what was found; a bare I/O error would send them looking
+    /// at the filesystem and never at the record.
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
+    fn a_refresh_that_fails_to_settle_still_reports_what_it_found() {
+        let root = RefreshRoot::enrolled();
+        let mut stale = root.catalog();
+
+        let mut planted = 0;
+        for record in &mut stale.records {
+            if !matches!(record.subject, ProvenanceSubject::Petal { .. })
+                || record.publisher == Token::new("bloom-release-pins").unwrap()
+            {
+                continue;
+            }
+            if let Some(class) = record.operation_classes.first_mut() {
+                class.fee_asset = Some(ProvenanceFeeAsset {
+                    chain: Token::new("hyperliquid").unwrap(),
+                    asset: "usdc".to_owned(),
+                });
+                planted += 1;
+            }
+        }
+        assert!(planted > 0, "the fixture must enroll a developer record");
+        root.write(&stale);
+
+        // Planted after the catalog is written, since writing it takes the
+        // same path and would fail on this file too.
+        let blocker = root.catalog_path.with_extension("json.new");
+        fs::write(&blocker, b"{}").unwrap();
+
+        let error = root
+            .refresh()
+            .expect_err("a `.json.new` in the way must fail the refresh");
+        let reported = format!("{error:#}");
+        assert!(
+            reported.contains("left as signed"),
+            "a refresh that fails after finding a disagreement must still say what it \
+             found, or the one message pointing at the record is lost: {reported}"
         );
     }
 
