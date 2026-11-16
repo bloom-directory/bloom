@@ -81,8 +81,9 @@ Numbered outboxes expose only actions staged by that account.
 ## Intent shapes
 
 `outbox/new.tx` and `simulate/new` take one JSON object with its fields at the
-top level, plus an optional `chain`. `outbox/new.tx` also takes the one-line
-form:
+top level, plus an optional `chain`. `simulate/new` also takes `from` (the
+simulated sender) and `state_override`. `outbox/new.tx` also takes the
+one-line form:
 
 ```text
 send 0.25 ETH to 0x...                                  native send, one line; outbox/new.tx only
