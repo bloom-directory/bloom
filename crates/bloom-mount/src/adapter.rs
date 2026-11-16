@@ -1044,7 +1044,9 @@ impl BloomFs {
     /// once, as every one was before.
     async fn write_for_owner(&self, path: &VfsPath, bytes: &[u8]) -> FsResult<()> {
         let permit = self.owner_waiters.clone().try_acquire_owned();
-        let wait = if permit.is_ok() {
+        // A command the mount dispatches off the request path (a policy
+        // write) is never waited for here; its status file reports it.
+        let wait = if permit.is_ok() && !self.vfs.is_async_write_command(path) {
             OWNER_WAIT
         } else {
             Duration::ZERO

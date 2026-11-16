@@ -61,6 +61,12 @@ pub async fn write(
     wait: Duration,
     cancelled: Cancelled<'_>,
 ) -> Result<(), WriteError> {
+    if let [root, wallet, leaf] = path.segments()
+        && root == "wallets"
+        && leaf == "policy.json"
+    {
+        return write_policy(vfs, wallet, path, bytes, wait, cancelled).await;
+    }
     if matches!(path.segments(), [root, _, _, leaf] if root == "wallets" && leaf == "confirm-batch")
     {
         return write_batch_confirm(vfs, path, bytes, wait, cancelled).await;
@@ -190,6 +196,7 @@ async fn approval_id(vfs: &Vfs, challenge_path: &VfsPath) -> Option<String> {
 /// the ordinary confirm path: it re-verifies the approval with Broker and
 /// signs at most once under the entry's dispatch marker. Waiting never
 /// starts a ceremony or restages anything.
+#[allow(clippy::too_many_arguments)] // the write, its challenge and the wait's limits
 async fn await_approval(
     vfs: &Vfs,
     path: &VfsPath,
@@ -307,4 +314,147 @@ pub async fn lookup(vfs: &Vfs, path: &VfsPath) -> Result<crate::Entry, HandlerEr
         }
     }
     Err(absent)
+}
+
+/// A policy change needs the owner's approval, and the write alone reports
+/// that as a bare "permission denied". The first write answers with the
+/// ceremony link; a repeat of it waits for the owner, as a repeated confirm
+/// does, and installs the policy only if they approved.
+async fn write_policy(
+    vfs: &Vfs,
+    wallet: &str,
+    path: &VfsPath,
+    bytes: &[u8],
+    wait: Duration,
+    cancelled: Cancelled<'_>,
+) -> Result<(), WriteError> {
+    const WAITING: &str = "awaiting_custody";
+    let status_file = format!("wallets/{wallet}/policy-updates/latest/status.json");
+    let status_path = VfsPath::parse(&format!("/{status_file}"))
+        .map_err(|e| HandlerError::invalid(e.to_string()))?;
+    let update =
+        || async { serde_json::from_slice::<Value>(&vfs.read(&status_path).await.ok()?).ok() };
+    let waiting_before = update()
+        .await
+        .filter(|update| update["status"] == WAITING)
+        .map(|update| update["action_id"].clone());
+    let denied = match vfs.write(path, bytes).await {
+        Err(denied @ (HandlerError::PermissionDenied | HandlerError::ApprovalPending(_))) => denied,
+        written => return Ok(written?),
+    };
+    let asked = update().await;
+    // The owner approved between the write and this read.
+    if asked
+        .as_ref()
+        .is_some_and(|update| update["status"] == "ready_to_commit")
+    {
+        return Ok(vfs.write(path, bytes).await?);
+    }
+    let Some(asked) = asked.filter(|update| update["status"] == WAITING) else {
+        return Err(denied.into());
+    };
+    if waiting_before.as_ref() == Some(&asked["action_id"]) {
+        let deadline = tokio::time::Instant::now() + wait;
+        while tokio::time::Instant::now() < deadline && !cancelled() {
+            tokio::time::sleep(APPROVAL_POLL).await;
+            let Some(now) = update().await else {
+                continue;
+            };
+            if now["action_id"] != asked["action_id"] {
+                return Err(WriteError::Approval(format!(
+                    "permission denied: another policy update replaced this one; read {status_file}"
+                )));
+            }
+            return match now["status"].as_str() {
+                // prepare_pending: Broker has not opened the ceremony yet.
+                Some(WAITING | "prepare_pending") => continue,
+                Some("confirmed") => Ok(()),
+                // Approved: the same bytes written again install the policy.
+                Some("ready_to_commit") => Ok(vfs.write(path, bytes).await?),
+                status => Err(WriteError::Approval(format!(
+                    "permission denied: policy not changed: the update is {} (declined, expired, or the policy changed meanwhile); see {status_file}",
+                    status.unwrap_or("in an unknown state")
+                ))),
+            };
+        }
+    }
+    let url = asked["ceremony_url"].as_str().unwrap_or_default();
+    Err(WriteError::Approval(format!(
+        "permission denied: owner approval required: {url} . Write the same policy again: it waits for their approval, then installs it."
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::Entry;
+
+    /// A wallet whose policy write is refused until the owner approves: the
+    /// update's status appears with the first write.
+    #[derive(Default)]
+    struct PolicyUpdate {
+        writes: AtomicUsize,
+        approved: std::sync::atomic::AtomicBool,
+        installed: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Handler for PolicyUpdate {
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            Ok(Entry::file(p.segments().last().unwrap()))
+        }
+        async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            if self.writes.load(Ordering::SeqCst) == 0 {
+                return Err(HandlerError::not_found(p.to_string_path()));
+            }
+            let status = if self.approved.load(Ordering::SeqCst) {
+                "ready_to_commit"
+            } else {
+                "awaiting_custody"
+            };
+            Ok(format!(
+                r#"{{"status":"{status}","action_id":"a1","ceremony_url":"http://localhost/c/policy"}}"#
+            )
+            .into_bytes())
+        }
+        async fn write(&self, _p: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            if !self.approved.load(Ordering::SeqCst) {
+                return Err(HandlerError::PermissionDenied);
+            }
+            self.installed.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// The first policy write answers with the link at once; the repeat
+    /// waits for the owner and installs the policy. MCP callers get this
+    /// too, not only `bloom vfs write`.
+    #[tokio::test]
+    async fn a_repeated_policy_write_waits_for_the_owner() {
+        let wallet = Arc::new(PolicyUpdate::default());
+        let vfs = Vfs::builder().mount("wallets", wallet.clone()).build();
+        let path = VfsPath::parse("/wallets/alice/policy.json").unwrap();
+        let wait = Duration::from_secs(50);
+
+        let started = tokio::time::Instant::now();
+        let Err(WriteError::Approval(first)) = write(&vfs, &path, b"{}", wait, &|| false).await
+        else {
+            panic!("the first write is refused with the link");
+        };
+        assert!(first.contains("http://localhost/c/policy"), "{first}");
+        assert!(started.elapsed() < APPROVAL_POLL);
+
+        let owner = wallet.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(APPROVAL_POLL).await;
+            owner.approved.store(true, Ordering::SeqCst);
+        });
+        assert!(write(&vfs, &path, b"{}", wait, &|| false).await.is_ok());
+        assert!(started.elapsed() >= APPROVAL_POLL);
+        assert_eq!(wallet.installed.load(Ordering::SeqCst), 1);
+    }
 }

@@ -2751,7 +2751,7 @@ fn approval_next_step(
         S::Prepared | S::AwaitingCeremony => (
             "awaiting_ceremony",
             if direct {
-                "Show ceremony_url to the owner. Through bloom vfs write or MCP, write retry_body to retry_path right away, without waiting for their reply: it waits for their approval and sends. On a mount, write retry_body to retry_path after they approve; earlier it is denied. Neither starts a new ceremony. Stop when ceremony_expires_at_ms passes and tell the owner.".into()
+                "Show ceremony_url to the owner. Write retry_body to retry_path right away, without waiting for their reply: it waits for their approval and sends. It starts no new ceremony. Stop when ceremony_expires_at_ms passes and tell the owner.".into()
             } else {
                 format!("Give ceremony_url to the owner. As soon as they approve, {retry}. Retrying earlier is safe: it starts no new ceremony and returns permission denied again.")
             },
