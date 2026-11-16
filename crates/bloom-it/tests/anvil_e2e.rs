@@ -205,6 +205,19 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
         Some(format!("wallets/alice/0/chains/anvil/outbox/pending/{pending_id}/confirm").as_str()),
         "approval_challenge.json must name the exact retry path: {challenge}"
     );
+    // The refusal names the challenge to read, not the logged-unsafe link.
+    let refusal = first_confirm.unwrap_err().to_string();
+    assert!(
+        refusal.starts_with("permission denied: owner approval pending; read ")
+            && refusal.contains(&format!(
+                "wallets/alice/0/chains/anvil/outbox/pending/{pending_id}/approval_challenge.json"
+            )),
+        "{refusal}"
+    );
+    assert!(
+        !refusal.contains("ceremony/") && !refusal.contains("exact-signing-test-secret"),
+        "{refusal}"
+    );
     // The engine's private signing state is not part of the mount.
     let private_path = VfsPath::parse(&format!(
         "/wallets/alice/0/chains/anvil/outbox/pending/{pending_id}/ceremony.json"

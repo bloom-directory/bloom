@@ -175,7 +175,9 @@ pub enum TxEngineError {
     InvalidTxStatus { id: String, status: String },
     #[error("dependency '{dep_id}' not satisfied: {reason}")]
     DependencyNotSatisfied { dep_id: String, reason: String },
-    #[error("pre-broadcast simulation reverted: {reason} — write 'override' to broadcast anyway")]
+    #[error(
+        "pre-broadcast simulation reverted: {reason} — inspect the request and revert reason; rebuild malformed calldata before retrying"
+    )]
     SimulationReverted { reason: String },
     #[error(
         "nonce gap: tx for {from} uses nonce {staged} but the account's next on-chain nonce is {chain_next} — the node would queue it behind the missing nonce(s) and it could never mine.{blocking} Broadcast the earlier transaction, or discard it and restage with the explicit missing `nonce`. Discarding alone does not renumber this transaction."
@@ -2701,15 +2703,18 @@ impl TxEngine {
         self.outbox
             .transition(&entry, crate::outbox::OutboxState::Sent)?;
         if let Some(action_id) = staged.action_id.as_deref() {
-            self.write_central_evm_result(EvmCentralResult {
-                action_id,
-                state: OutboxState::Sent,
-                outcome: "sent",
-                tx_hash,
-                nonce: staged.nonce,
-                signing_hash: &signing_hash,
-                action_kind: EvmOutboxActionKind::Confirm.action_kind(),
-            })?;
+            write_central_evm_result(
+                &self.outbox,
+                EvmCentralResult {
+                    action_id,
+                    state: OutboxState::Sent,
+                    outcome: "sent",
+                    tx_hash,
+                    nonce: staged.nonce,
+                    signing_hash: &signing_hash,
+                    action_kind: EvmOutboxActionKind::Confirm.action_kind(),
+                },
+            )?;
         }
 
         Ok(staged)
@@ -2915,72 +2920,23 @@ impl TxEngine {
             && let Err(error) = self
                 .build_unsigned_evm_tx(&staged, chain)
                 .and_then(|unsigned| {
-                    self.write_central_evm_result(EvmCentralResult {
-                        action_id,
-                        state: OutboxState::Sent,
-                        outcome: "sent",
-                        tx_hash,
-                        nonce: staged.nonce,
-                        signing_hash: &Self::unsigned_signing_hash(&unsigned),
-                        action_kind: action_kind.action_kind(),
-                    })
+                    write_central_evm_result(
+                        &self.outbox,
+                        EvmCentralResult {
+                            action_id,
+                            state: OutboxState::Sent,
+                            outcome: "sent",
+                            tx_hash,
+                            nonce: staged.nonce,
+                            signing_hash: &Self::unsigned_signing_hash(&unsigned),
+                            action_kind: action_kind.action_kind(),
+                        },
+                    )
                 })
         {
             warn!(id = %staged.id, %action_id, %error, "tx.central_result_unwritten");
         }
         Ok(staged)
-    }
-
-    fn write_central_evm_result(&self, central: EvmCentralResult<'_>) -> Result<(), TxEngineError> {
-        let result = serde_json::json!({
-            "schema": "bloom.evm_execution_result.v1",
-            "action_id": central.action_id,
-            "state": central.state.dirname(),
-            "outcome": central.outcome,
-            "action_kind": central.action_kind,
-            "tx_hash": format!("{:#x}", central.tx_hash),
-            "nonce": central.nonce,
-            "signing_hash": format!("{:#x}", central.signing_hash),
-            "created_ms": now_ms(),
-        });
-        let mut status = self.central_status_base(central.action_id, central.state)?;
-        let status_obj = status.as_object_mut().expect("central status is object");
-        status_obj.insert("outcome".into(), serde_json::json!(central.outcome));
-        status_obj.insert(
-            "tx_hash".into(),
-            serde_json::json!(format!("{:#x}", central.tx_hash)),
-        );
-        status_obj.insert("action_kind".into(), serde_json::json!(central.action_kind));
-        self.outbox.write_central_action_artifact(
-            central.action_id,
-            central.state,
-            "result.json",
-            &serde_json::to_vec_pretty(&result).unwrap(),
-        )?;
-        self.outbox.write_central_action_artifact(
-            central.action_id,
-            central.state,
-            "status.json",
-            &serde_json::to_vec_pretty(&status).unwrap(),
-        )?;
-        Ok(())
-    }
-
-    fn central_status_base(
-        &self,
-        action_id: &str,
-        state: OutboxState,
-    ) -> Result<serde_json::Value, TxEngineError> {
-        let mut status = self
-            .outbox
-            .read_central_action_artifact(action_id, state, "status.json")?
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-            .filter(|value| value.is_object())
-            .unwrap_or_else(|| serde_json::json!({}));
-        let status_obj = status.as_object_mut().expect("central status is object");
-        status_obj.insert("action_id".into(), serde_json::json!(action_id));
-        status_obj.insert("state".into(), serde_json::json!(state.dirname()));
-        Ok(status)
     }
 
     fn write_reconcile_ambiguous(
@@ -5384,6 +5340,105 @@ fn protocol_signing_error(error: bloom_broker_api::ProtocolError) -> TxEngineErr
     }
 }
 
+fn write_central_evm_result(
+    outbox: &Outbox,
+    central: EvmCentralResult<'_>,
+) -> Result<(), TxEngineError> {
+    let result = serde_json::json!({
+        "schema": "bloom.evm_execution_result.v1",
+        "action_id": central.action_id,
+        "state": central.state.dirname(),
+        "outcome": central.outcome,
+        "action_kind": central.action_kind,
+        "tx_hash": format!("{:#x}", central.tx_hash),
+        "nonce": central.nonce,
+        "signing_hash": format!("{:#x}", central.signing_hash),
+        "created_ms": now_ms(),
+    });
+    let mut status = central_status(outbox, central.action_id, central.state)?.unwrap_or_default();
+    status.insert("action_id".into(), serde_json::json!(central.action_id));
+    status.insert("state".into(), serde_json::json!(central.state.dirname()));
+    status.insert("outcome".into(), serde_json::json!(central.outcome));
+    status.insert(
+        "tx_hash".into(),
+        serde_json::json!(format!("{:#x}", central.tx_hash)),
+    );
+    status.insert("action_kind".into(), serde_json::json!(central.action_kind));
+    outbox.write_central_action_artifact(
+        central.action_id,
+        central.state,
+        "result.json",
+        &serde_json::to_vec_pretty(&result).unwrap(),
+    )?;
+    outbox.write_central_action_artifact(
+        central.action_id,
+        central.state,
+        "status.json",
+        &serde_json::to_vec_pretty(&status).unwrap(),
+    )?;
+    Ok(())
+}
+
+fn central_status(
+    outbox: &Outbox,
+    action_id: &str,
+    state: OutboxState,
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>, TxEngineError> {
+    Ok(outbox
+        .read_central_action_artifact(action_id, state, "status.json")?
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok()))
+}
+
+/// Rebuild a sent row's central result when a crash interrupted
+/// `write_central_evm_result`. The result is written before the status, so a
+/// status naming the wallet's hash means both are current; an older hash
+/// (from before a fee replacement) is rebuilt. Without a recorded hash and
+/// the broadcast attempt that produced it, nothing is inferred.
+pub(crate) fn repair_central_evm_result(
+    outbox: &Outbox,
+    entry: &crate::outbox::OutboxEntry,
+) -> Result<(), TxEngineError> {
+    let staged = &entry.staged;
+    let (Some(action_id), Some(hash)) = (staged.action_id.as_deref(), staged.tx_hash.as_deref())
+    else {
+        return Ok(());
+    };
+    if central_status(outbox, action_id, OutboxState::Sent)?.is_some_and(|status| {
+        status
+            .get("tx_hash")
+            .and_then(|v| v.as_str())
+            .is_some_and(|central| central.eq_ignore_ascii_case(hash))
+    }) {
+        return Ok(());
+    }
+    for (kind, action_kind) in [
+        (BroadcastAttemptKind::Confirm, EvmOutboxActionKind::Confirm),
+        (
+            BroadcastAttemptKind::Replacement,
+            EvmOutboxActionKind::Replace,
+        ),
+    ] {
+        if outbox
+            .read_broadcast_attempt(entry, kind)?
+            .is_some_and(|attempt| attempt.tx_hash.eq_ignore_ascii_case(hash))
+        {
+            return write_central_evm_result(
+                outbox,
+                EvmCentralResult {
+                    action_id,
+                    state: OutboxState::Sent,
+                    outcome: "sent",
+                    tx_hash: parse_tx_hash(hash)?,
+                    nonce: staged.nonce,
+                    signing_hash: &TxEngine::unsigned_signing_hash(&unsigned_evm_tx(staged)?),
+                    action_kind: action_kind.action_kind(),
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The unsigned EVM transaction a staged plan signs.
 fn unsigned_evm_tx(staged: &StagedTx) -> Result<UnsignedEvmTx, TxEngineError> {
     let _from: Address = staged
@@ -5570,12 +5625,15 @@ fn insufficient_native_funds_check(
 }
 
 /// Approve amount: accepts `"max"` (alias for 2^256 - 1) or a decimal
-/// integer string. Empty falls through to max so the common case
-/// (`{"kind":"approve","token":"…","spender":"…"}`) doesn't require a
-/// magic constant.
+/// integer string in raw token units. Unlimited approval must be explicit.
 fn parse_approve_amount(s: &str) -> Result<U256, String> {
     let t = s.trim();
-    if t.is_empty() || t.eq_ignore_ascii_case("max") {
+    if t.is_empty() {
+        return Err(
+            "amount is required: use raw token units, 0 to revoke, or max for unlimited".into(),
+        );
+    }
+    if t.eq_ignore_ascii_case("max") {
         return Ok(U256::MAX);
     }
     U256::from_str_radix(t, 10).map_err(|e| format!("invalid uint256 '{s}': {e}"))
@@ -5713,6 +5771,22 @@ const _PARSE_UNITS: fn(&str, u8) -> Result<U256, bloom_proto::units::UnitError> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_approval_amounts_and_simulation_guidance() {
+        for amount in ["", " ", "1.5", "-1"] {
+            assert!(super::parse_approve_amount(amount).is_err());
+        }
+        assert_eq!(super::parse_approve_amount("0").unwrap(), U256::ZERO);
+        assert_eq!(super::parse_approve_amount("max").unwrap(), U256::MAX);
+        assert_eq!(super::parse_approve_amount("123").unwrap(), U256::from(123));
+        let error = super::TxEngineError::SimulationReverted {
+            reason: "contract paused".into(),
+        }
+        .to_string();
+        assert!(error.contains("contract paused"));
+        assert!(error.contains("inspect the request"));
+        assert!(!error.contains("override"));
+    }
     use std::{
         sync::atomic::{AtomicBool, Ordering},
         time::Duration,

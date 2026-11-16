@@ -26,6 +26,8 @@ pub enum ParseError {
 
 #[derive(serde::Deserialize, Debug, Clone)]
 struct LooseIntent {
+    #[serde(flatten)]
+    extra: std::collections::BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     kind: Option<String>,
     #[serde(default)]
@@ -176,11 +178,30 @@ impl LooseIntent {
                     value: self.value.unwrap_or_default(),
                 }
             }
-            "approve" => RawIntentBody::Approve {
-                token: self.token.ok_or(ParseError::Ambiguous)?,
-                spender: self.spender.ok_or(ParseError::Ambiguous)?,
-                amount: self.amount.unwrap_or_else(|| "max".into()),
-            },
+            "approve" => {
+                if !self.extra.is_empty()
+                    || self.to.is_some()
+                    || self.value.is_some()
+                    || self.data.is_some()
+                    || self.contract.is_some()
+                    || self.method.is_some()
+                    || self.args.is_some()
+                    || self.operator.is_some()
+                    || self.token_id.is_some()
+                    || self.standard.is_some()
+                    || self.safe.is_some()
+                    || self.approved.is_some()
+                {
+                    return Err(ParseError::Invalid("approve accepts token, spender and amount plus transaction options; remove unknown or incompatible fields".into()));
+                }
+                let amount = self.amount.filter(|v| !v.trim().is_empty()).ok_or_else(||
+                    ParseError::Invalid("approve requires amount in raw token units; use 0 to revoke or explicit max for unlimited".into()))?;
+                RawIntentBody::Approve {
+                    token: self.token.ok_or(ParseError::Ambiguous)?,
+                    spender: self.spender.ok_or(ParseError::Ambiguous)?,
+                    amount,
+                }
+            }
             "nft_transfer" => RawIntentBody::NftTransfer {
                 contract: self.contract.ok_or(ParseError::Ambiguous)?,
                 to: self.to.ok_or(ParseError::Ambiguous)?,
@@ -573,9 +594,34 @@ value = "0"
     }
 
     #[test]
+    fn approval_requires_explicit_unambiguous_amount() {
+        for amount in ["0", "123", "max"] {
+            let input = serde_json::json!({"kind":"approve", "token":"USDC", "spender":"router", "amount":amount});
+            assert!(parse(&input.to_string()).is_ok());
+        }
+        for extra in [
+            serde_json::json!({}),
+            serde_json::json!({"amount":""}),
+            serde_json::json!({"amount":" "}),
+            serde_json::json!({"ammount":"max"}),
+            serde_json::json!({"amount":"0", "value":"0"}),
+            serde_json::json!({"amount":"0", "unknown":true}),
+        ] {
+            let mut input =
+                serde_json::json!({"kind":"approve", "token":"USDC", "spender":"router"});
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(parse(&input.to_string()).is_err(), "{input}");
+        }
+        assert!(parse("kind = 'approve'\ntoken = 'USDC'\nspender = 'router'").is_err());
+    }
+
+    #[test]
     fn json_approve_inferred_from_fields() {
         // No kind; presence of token+spender disambiguates.
-        let r = parse(r#"{"token":"0xUSDC","spender":"0xRouter"}"#).unwrap();
+        let r = parse(r#"{"token":"0xUSDC","spender":"0xRouter","amount":"max"}"#).unwrap();
         match r.body {
             RawIntentBody::Approve { amount, .. } => assert_eq!(amount, "max"),
             _ => panic!("wrong variant"),

@@ -8,7 +8,7 @@ Route reference. Rules are in the mount's `AGENTS.md`; procedures are in
 | Path | Purpose |
 |---|---|
 | `AGENTS.md`, `CLAUDE.md` | Identical operator instructions |
-| `next.md` | Actions and projections needing attention |
+| `next.md` | Pending outbox entries, approvals, policy updates and stale projections |
 | `chains/` | Configured EVM chain reads |
 | `wallets/` | Public wallet/account projections, policy, transaction outboxes |
 | `petals/` | Installed packages and their instructions |

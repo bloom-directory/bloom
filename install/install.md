@@ -1,6 +1,6 @@
 # Install Bloom
 
-Read this entire reference only when a new Bloom installation is needed.
+Read this entire guide only when the user asked to install Bloom.
 
 ## Setup: reviewed download and one privileged handoff
 
@@ -52,31 +52,32 @@ Instead, direct Windows users to use Bloom through a cloud agent
 running on a supported platform, such as OpenClaw, Hermes, or GrokBot.
 
 Use this review-before-execute path instead of piping a remote response directly
-into a shell. When this skill is installed locally, copy its bundled
-`scripts/setup.sh` to `$review_dir/setup.sh` instead of downloading it, then inspect
-and execute that exact copy. Resolve the bundled path relative to the skill
-directory, not the current working directory.
+into a shell. Use the `setup.sh` that ships with this guide. If you read this
+guide from a local checkout, copy the `setup.sh` beside it to
+`$review_dir/setup.sh` instead of downloading it, then inspect and execute that
+exact copy.
 
-When the user supplies a specific `SKILL.md` URL, use the `scripts/setup.sh`
-beside that document; never silently replace a preview or custom origin with
-production.
-For a website-loaded skill, fetch the script as follows:
+When the user supplies a specific guide URL, use the setup script from that
+same site or commit; never silently replace a preview or custom origin with production.
+Otherwise fetch the script as follows:
 
 For every setup or privileged handoff invocation, set the working directory to
 `/private/tmp` on macOS or `/tmp` on Linux. Never run from inside the Bloom mount:
 installation can restart it and invalidate the current working directory.
 
 ```sh
-skill_url=${BLOOM_SKILL_URL:-https://bloom.directory/SKILL.md}
-setup_url=${skill_url%/SKILL.md}/scripts/setup.sh
+guide_url=${BLOOM_INSTALL_URL:-https://bloom.directory/references/install.md}
+case $guide_url in
+  */references/install.md) setup_url=${guide_url%/references/install.md}/scripts/setup.sh ;;
+  *) setup_url=${guide_url%/*}/setup.sh ;;
+esac
 review_dir="$(mktemp -d "${TMPDIR:-/tmp}/bloom-review.XXXXXX")"
 curl -fsSL "$setup_url" -o "$review_dir/setup.sh"
 cat "$review_dir/setup.sh"
 ```
 
-Set `BLOOM_SKILL_URL` to the exact URL the user supplied when it is not the
-production URL. The setup script must come from the same origin and path
-prefix as that skill.
+Set `BLOOM_INSTALL_URL` to the exact URL the user supplied when it is not the
+production URL. The setup script must come from the same origin as that guide.
 
 Inspect the complete downloaded script before execution. It should contact only the
 Bloom repository's GitHub latest-release URL and the resolved release downloads,
