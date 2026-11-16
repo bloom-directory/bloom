@@ -4826,10 +4826,14 @@ mod tests {
 
     #[tokio::test]
     async fn reusable_petal_batch_binds_declared_value_to_the_approval_limits() {
-        // Regression: this path left value_limits empty while requiring a
-        // claim. Broker rejects any nonzero debit or fee whose asset is
-        // absent from the approval's limits (VALUE_ASSET_NOT_ALLOWED), so an
-        // approval prepared here could never sign the batch it was for.
+        // Coverage, not a fix: `petal_claim_value_limits` already fills these
+        // limits, and nothing in this change alters that. It was untested, and
+        // emptying it is silent here while being fatal at Broker, which
+        // rejects any nonzero debit or fee whose asset the approval's limits
+        // omit (VALUE_ASSET_NOT_ALLOWED) -- an approval prepared here could
+        // then never sign the batch it was prepared for. A fee-bearing class
+        // is what makes the fee reach these limits at all, so this is the
+        // first change for which the gap is reachable.
         let broker = Arc::new(MockBroker {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),

@@ -547,13 +547,21 @@ Every launch refreshes the developer provenance catalog before enrolling, and
 that refresh re-derives each Petal operation class's `fee_asset` from
 `FEE_BEARING_OPERATION_CLASSES` in `crates/bloom/src/triad_enrollment.rs`. A
 class enrolled before the table catalogued it is healed, with a `note:` on
-stderr. A heal is one-way: rolling the binary back does not restore the old
-value, because the older build then finds a value it does not derive and takes
-the keep-as-signed branch below. Re-enrolling the Petal against that build is
-the way back. A class the record already carries any other value for is never
-overwritten, whether this build catalogues it differently or no longer
+stderr. A heal is one-way, and no rollback undoes it: a build predating the
+table carries developer records over verbatim and never reads `fee_asset`, so
+the healed value is left untouched, and a build that has the table but not that
+row takes the keep-as-signed branch below. Only re-enrolling the Petal against
+the older build re-derives the record, so that is the way back.
+
+A **developer-published** class the record already carries any other value for
+is never overwritten, whether this build catalogues it differently or no longer
 catalogues it at all: one of the record and the table is stale, the refresh
-cannot tell which, and it will not re-sign on a guess. It prints a `warning:`
+cannot tell which, and it will not re-sign on a guess. Records published by
+`bloom-release-pins` are the exception and are not protected this way — the
+refresh rebuilds them wholesale from this binary's own pins, so their fee
+assets follow the table silently, with no note and no warning. Editing a
+catalogued row therefore changes a release record without telling anyone, while
+the same change to a developer record is reported. It prints a `warning:`
 naming the route, the package hash, the value the record carries and the value
 this build derives, and carries on — so a stale record on one class does not
 stop a launch, and does not stop a legitimate heal on another. What it does
@@ -564,7 +572,10 @@ with.
 Correcting a row in that table is therefore a breaking change for every
 developer root enrolled against the old value. The remedy is per-Petal:
 re-enrolling the Petal re-derives its records from the table, for the package
-hash on disk. The launcher does not do this for you. Run it yourself from the
+hash on disk. For the Hyperliquid package the launcher already does this on
+every launch when `BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE` is set, immediately
+after the refresh, so a warning naming it should not survive the next launch.
+For any other Petal, or with that variable unset, run it yourself from the
 repository root, once per Petal the warning names:
 
 ```sh
@@ -579,6 +590,14 @@ cargo run -p bloom --no-default-features --features mount,triad-dev-harness -- \
 the setup these roots are built in. A build older than the table re-enrols the
 record with no fee asset at all, clearing the value the refresh declined to
 clear.
+
+Re-enrol only while the package on disk is still the one the warning names.
+Enrolment replaces records for the package hash it reads and leaves every other
+hash alone, so re-enrolling a Petal that has been rebuilt since enrols the new
+hash and leaves the warned-about record behind as a superseded one. Nothing
+clears that but a fresh root, as below — so for the "Petal has changed" cause,
+running this command moves the record out of reach of the very remedy it is
+offered for.
 
 The first path is the `config` directory under the `--developer-root` the
 launcher was given; the second is that Petal's built package directory, the

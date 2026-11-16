@@ -447,11 +447,14 @@ Broker's exact path chains a third entry after them
 so an **exact** builder order does require the decoded order review, exactly as
 `hyperliquid.order` does, even though the class is registered in neither table.
 Broker's own comment gives the reason: builder orders stay out of the
-exact-only list because sessions sign them under reusable grants, and only the
-exact form is reviewed. This is a property of bloom-broker#131, not of the
-tables: before it, the exact path chained the two tables alone. A live claim on
-the exact path confirms it, answering `SelectorMismatch`, "this message
-operation requires a review envelope".
+exact-only list because sessions sign them under reusable grants, "but an exact
+one is reviewed". The reusable form is not unreviewed either — its fee is
+checked at use time instead of at preparation (`service.rs`, where a
+builder-class claim under a Petal selector joins `agent_action`). This is a
+property of bloom-broker#131, not of the tables: before it, the exact path
+chained the two tables alone. A live claim on the exact path confirms it,
+answering `SelectorMismatch`, "This message operation requires a review
+envelope; upgrade Bloom Machine and the Petal".
 
 A session-signed builder order is *not* outside Broker's delegated-action
 witness. `message_review` selects that witness on
@@ -484,11 +487,18 @@ builder-bound session scopes unpreparable; a plain session, which requests
 
 The delegated-action witness already covers the builder class, as above, so a
 builder-class claim does not bypass it: without a witness the claim is refused,
-`SelectorMismatch`, "Agent action requires its full use-time witness". What the
-session path still needs is value limits on the key-scope approval. Broker can bind the recipient
-and the rate unconditionally, and the amount for perps, but it labels the
-market id identity-unverified, so the fee's *asset* stays Petal-asserted
-however far the witness is widened.
+`SelectorMismatch`, "Agent action requires its full use-time witness; upgrade
+the Hyperliquid package". What the session path still needs is value limits on
+the key-scope approval, which `prepare_petal_key_reusable_approval` leaves
+empty.
+
+The fee's asset is not Petal-asserted: `validate_builder_fee` requires
+`chain == "hyperliquid" && asset == "usdc"` outright, and a declared amount at
+or above the bound it computes from limit price and size, so the catalogued row
+and Broker's own check must agree before a claim is authorized. The remaining
+soft edge is narrower than this section used to claim — the market is named to
+the owner whenever its id parses, and the identity-unverified label survives
+only for asset ids the venue has not mapped.
 
 ## Ceremony and public projection
 

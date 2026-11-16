@@ -425,11 +425,13 @@ fn refresh_developer_provenance_catalog(
                 // compares chain and asset, so reporting the asset alone
                 // described a chain-only change as "usdc to usdc".
                 //
-                // Naming re-enrolment here, not just in the warning: a heal is
-                // one-way. Rolling the binary back does not put the old value
-                // back, because the older build reaches the branch above
-                // instead — it finds a value it does not derive and leaves it
-                // as signed. Re-enrolling against that build is the way back.
+                // Naming re-enrolment here, not just in the warning: a heal
+                // is one-way, and no rollback undoes it. A build predating the
+                // table carries developer records over verbatim and never
+                // reads `fee_asset`, so the healed value is simply untouched;
+                // a build that has the table but not this row reaches the
+                // branch above and leaves it as signed. Only re-enrolment
+                // re-derives the record, which is why it is the way back.
                 notes.push(format!(
                     "note: re-derived fee asset for {} from {:?} to {:?}; re-enrol this \
                      Petal to go back, as an older build leaves the new value signed \
@@ -444,9 +446,18 @@ fn refresh_developer_provenance_catalog(
     }
     if !warnings.is_empty() {
         // The subcommand that fixes this is `hide = true`, so `--help` does
-        // not list it. Printing the remedy without the command to run it is
-        // what the earlier refusal did, and it left the operator stuck at the
-        // one moment this message was their only output.
+        // not list it. Naming the remedy without the command to run it would
+        // leave the operator stuck at the one moment this message is their
+        // only output.
+        //
+        // It does not say the launcher will not do this, because for the only
+        // Petal in the table it does: triad-dev-launch.sh re-enrols the
+        // Hyperliquid package on every launch when
+        // BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE is set, a few lines after the
+        // refresh that produced this warning. That enrolment re-derives from
+        // the table, so it resolves the disagreement the refresh declined to
+        // resolve -- correctly, since it reads the package on disk and the
+        // refresh cannot.
         warnings.push(format!(
             "warning: each record above keeps the fee asset it was signed with, and Broker \
              will judge its claims against that value, not against this build's \
@@ -455,8 +466,10 @@ fn refresh_developer_provenance_catalog(
              corrected since this root was enrolled, or a Petal that has changed since. If \
              the record is right, make this build's table agree with what the Petal \
              declares. If the table is right, re-enrol that Petal to re-derive its records \
-             from the table, which the launcher does not do for you. From the repository \
-             root, once per Petal named above:\n\n  \
+             from the table. The launcher already does that for the Hyperliquid package \
+             when BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE is set, so a warning naming that \
+             package should not survive the next launch; otherwise run it yourself from \
+             the repository root, once per route named above:\n\n  \
              cargo run -p bloom --no-default-features --features mount,triad-dev-harness \
              -- init triad-enroll-developer-petal-provenance {} \
              \"$PETAL_PACKAGE_DIR\"\n\nwith PETAL_PACKAGE_DIR exported as that Petal's \
@@ -465,9 +478,11 @@ fn refresh_developer_provenance_catalog(
              worktrees are asked to set their own CARGO_TARGET_DIR, so that path is stale \
              or missing in exactly the setup these roots are built in, and a build \
              predating the table re-enrols the record with no fee asset at all — clearing \
-             the value this refresh has just declined to clear. Re-enrolling covers only \
-             the package hash on disk; recreating the developer root clears every record \
-             at once.",
+             the value this refresh has just declined to clear. And re-enrol only while \
+             the package on disk is still the one the record names: enrolment replaces \
+             records for the hash it reads, so a Petal rebuilt since leaves the record \
+             above behind as a superseded one, which neither this refresh nor a later \
+             enrolment will overwrite and only a fresh developer root clears.",
             shell_quoted(config_dir),
         ));
     }
@@ -2511,9 +2526,10 @@ mod tests {
         // `cargo run` builds and runs the one binary, wherever it lands.
         //
         // And a `<placeholder>` is a redirect to bash, so pasting the line
-        // failed with a syntax error before it reached the subcommand. Nothing
-        // else in this message is shell input, so the check is narrow: the
-        // command is the only line that has to survive a paste.
+        // failed with a syntax error before it reached the subcommand. These
+        // two checks read the `cargo run` line alone, so they would not catch
+        // a second command line added beside it; the fragment check above is
+        // what holds the message to one runnable command.
         //
         // Scoped to the command line, not the whole message: the prose names
         // `target/debug/bloom` in order to warn against it, and a check over
@@ -2569,6 +2585,79 @@ mod tests {
                  with, or its claims start failing FEE_NOT_ALLOWED"
             );
         }
+    }
+
+    /// The steady state, which is where a stale record actually lives.
+    ///
+    /// Every other warn test plants its conflict by editing the catalog on
+    /// disk without re-signing it. The refresh re-signs every record, so its
+    /// output differs from what it read in the signatures alone, `current ==
+    /// catalog` is false, and the catalog is rewritten. The early return is
+    /// never executed by those tests. In production the stale record is
+    /// correctly signed: the refresh reproduces byte-identical output, takes
+    /// the early return, and that is the path on which returning `Vec::new()`
+    /// would silently drop the warning -- from the second launch onward, and
+    /// for every launch after it.
+    ///
+    /// So this refreshes twice. The first call re-signs and writes; the second
+    /// must write nothing, which is what proves the early return was taken,
+    /// and must still report the disagreement.
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
+    fn a_disagreement_survives_a_refresh_that_writes_nothing() {
+        let root = RefreshRoot::enrolled();
+        let mut stale = root.catalog();
+
+        let mut planted = 0;
+        for record in &mut stale.records {
+            if !matches!(record.subject, ProvenanceSubject::Petal { .. })
+                || record.publisher == Token::new("bloom-release-pins").unwrap()
+            {
+                continue;
+            }
+            if let Some(class) = record.operation_classes.first_mut() {
+                assert!(
+                    catalogued_fee_asset(class.operation_class.as_str())
+                        .unwrap()
+                        .is_none(),
+                    "the fixture class must be uncatalogued for this to be a disagreement"
+                );
+                class.fee_asset = Some(ProvenanceFeeAsset {
+                    chain: Token::new("hyperliquid").unwrap(),
+                    asset: "usdc".to_owned(),
+                });
+                planted += 1;
+            }
+        }
+        assert!(planted > 0, "the fixture must enroll a developer record");
+        root.write(&stale);
+
+        let first = root.refresh().expect("a disagreement must not refuse");
+        assert!(
+            first
+                .iter()
+                .any(|line| line.starts_with("warning:") && line.contains("left as signed")),
+            "the first refresh must report the disagreement: {first:?}"
+        );
+        let settled = fs::read(&root.catalog_path).unwrap();
+
+        let second = root.refresh().expect("a disagreement must not refuse");
+        // Order matters: without this the test still passes when the refresh
+        // writes every time, and then it is asserting the ordinary path again
+        // rather than the early return it exists for.
+        assert_eq!(
+            fs::read(&root.catalog_path).unwrap(),
+            settled,
+            "the second refresh must write nothing, or this test no longer \
+             reaches the early return it covers"
+        );
+        assert!(
+            second
+                .iter()
+                .any(|line| line.starts_with("warning:") && line.contains("left as signed")),
+            "a refresh that writes nothing must still report the disagreement, \
+             because this is every launch after the first: {second:?}"
+        );
     }
 
     /// A developer root enrolled before a class was catalogued carries its
@@ -2682,12 +2771,10 @@ mod tests {
     /// uncatalogued class carrying one. The heal must land and the
     /// disagreement must be reported, in the same pass.
     ///
-    /// This is the case the earlier refusing design got wrong in both
-    /// directions. It walked the whole catalog before deciding, so the heal was
-    /// always reached and always thrown away — and the refusal then told the
-    /// operator to read notes describing a change that had not been written.
-    /// Neither half happened: a root needing a legitimate heal on one class
-    /// while holding a disagreement on another got nothing, and no launch.
+    /// The two halves are independent, and this is what pins that: a root
+    /// needing a legitimate heal on one class while holding a disagreement on
+    /// another must get the heal, on disk, and the warning, in the same pass.
+    /// Deciding for the record as a whole would cost it one or the other.
     #[cfg(feature = "triad-dev-harness")]
     #[test]
     fn a_disagreement_warns_without_blocking_the_heal_beside_it() {
@@ -2696,10 +2783,9 @@ mod tests {
         let mut stale = root.catalog();
 
         // One record carrying both halves: a catalogued class with no value,
-        // which the walk heals in memory, and an uncatalogued class carrying
-        // one, which makes the walk refuse. The refusal lands only after every
-        // record has been walked, so the heal is always reached, and always
-        // thrown away.
+        // which the walk heals, and an uncatalogued class carrying one, which
+        // the walk reports and leaves alone. Both are reached in the same pass
+        // over the record's classes, and neither decides the other.
         let builder_class = Token::new(HYPERLIQUID_BUILDER_ORDER_CLASS).unwrap();
         let mut planted = 0;
         let mut uncatalogued = None;
@@ -2757,7 +2843,8 @@ mod tests {
         );
 
         // A note must describe something written, so the catalog has to have
-        // moved — the half the refusing design announced and then discarded.
+        // moved. Asserting only on the printed lines would pass on a heal that
+        // was computed and then dropped.
         assert_ne!(
             fs::read(catalog_path).unwrap(),
             before,
