@@ -4283,6 +4283,10 @@ impl WalletsHandler {
             }
         };
         match rest {
+            // The root guide's `send.tx` and its bodies are EVM's.
+            [s] if s == "send.tx" => Err(HandlerError::invalid(
+                "a Solana outbox has no send.tx and takes its own body: read README.md here, write the body to new.tx, then y to latest/confirm",
+            )),
             // outbox/new.tx — stage a native transfer.
             [s] if s == "new.tx" => {
                 self.write_permit()?;
@@ -10105,7 +10109,10 @@ value = "0""#,
         }));
 
         // The owner has to approve: the write is denied and the file holds the link.
-        let pending = f.handler.write(&path, b"anvil:pending\n").await;
+        let pending = f
+            .handler
+            .write(&path, b"anvil:0001-first anvil:0002-second\n")
+            .await;
         assert!(
             matches!(pending, Err(HandlerError::ApprovalPending(_))),
             "{pending:?}"
@@ -10193,7 +10200,10 @@ value = "0""#,
                 })
             }));
         let batch = vfs(format!("/{}/0/confirm-batch", f.wallet_name));
-        let _ = f.handler.write(&batch, b"anvil:pending").await;
+        let _ = f
+            .handler
+            .write(&batch, b"anvil:0001-first anvil:0002-second")
+            .await;
         let outbox = format!("/{}/0/chains/anvil/outbox", f.wallet_name);
         let plan = f
             .handler
@@ -10218,6 +10228,48 @@ value = "0""#,
             .await
             .unwrap_err();
         assert!(moved.to_string().contains("sent/0001-first/"), "{moved}");
+
+        // The batch is over once an entry left `pending`: its file says so,
+        // and the other entry is no longer confirmed as part of it.
+        let status = String::from_utf8(f.handler.read(&batch).await.unwrap()).unwrap();
+        assert!(status.contains("\"ended\""), "{status}");
+        let plan = f
+            .handler
+            .read(&vfs(format!("{outbox}/pending/0002-second/plan.md")))
+            .await
+            .unwrap();
+        assert!(
+            !String::from_utf8(plan)
+                .unwrap()
+                .contains("one of 2 entries")
+        );
+    }
+
+    /// Several bodies in one `send.tx` write are all checked before any is
+    /// staged, so a mistake in a later line leaves nothing to duplicate.
+    #[tokio::test]
+    async fn a_multi_body_send_with_a_bad_line_stages_nothing() {
+        let f = make_handler_with_chain(true);
+        let (projection, _evm0, _evm1) = two_account_projection(&f);
+        let mut handler = f.handler.clone();
+        handler.wallet_projections = Some(projection);
+        let to = "0x0000000000000000000000000000000000000002";
+        let body = format!(
+            "{{\"kind\":\"send\",\"to\":\"{to}\",\"value\":\"1 wei\"}}\n{{\"kind\":\"approve\",\"token\":\"{to}\",\"amount\":\"1\"}}\n"
+        );
+        let send = vfs(format!("/{}/0/chains/anvil/outbox/send.tx", f.wallet_name));
+        let error = handler.write(&send, body.as_bytes()).await.unwrap_err();
+        assert!(
+            error.to_string().contains("approve needs spender")
+                && error.to_string().contains("nothing was staged"),
+            "{error}"
+        );
+        let pending = handler
+            .tx_engine
+            .outbox
+            .list(&f.wallet_name, "anvil", OutboxState::Pending)
+            .unwrap();
+        assert!(pending.is_empty(), "{pending:?}");
     }
 
     /// A request usually names a chain by id; `chains/<id>` links to its name.

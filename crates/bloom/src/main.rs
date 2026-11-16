@@ -3511,13 +3511,19 @@ async fn print_receipt(
     id: &str,
 ) -> Result<()> {
     let path = format!("/wallets/{wallet}/{account}/chains/{chain}/outbox/sent/{id}/receipt.json");
-    for _ in 0..20 {
+    // The Machine's read already waits for a receipt that is due, so bound
+    // the two waits together by the clock, not by a count of reads.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
         if let Ok(bytes) = ipc_read(endpoint, &path).await {
             println!("Receipt: {}", String::from_utf8_lossy(&bytes).trim_end());
             let reverted = serde_json::from_slice::<serde_json::Value>(&bytes)
                 .is_ok_and(|receipt| receipt["outcome"] == "reverted");
             anyhow::ensure!(!reverted, "the transaction was mined but reverted");
             return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }

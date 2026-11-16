@@ -107,7 +107,7 @@ pub(super) struct FamilyKey {
 /// `wallets/<wallet>/<n>/confirm-batch`: one owner approval for several
 /// staged entries. Written with the entries, read for the result.
 const CONFIRM_BATCH: &str = "confirm-batch";
-const CONFIRM_BATCH_HELP: &str = "write the staged entries to send under one approval, in order, as chain:id separated by spaces (ethereum:0001-abcde ethereum:0002-fghij), or chain:pending for every pending entry on that chain; y repeats the last batch. Read this file for the result: the approval link, then each transaction hash.\n";
+const CONFIRM_BATCH_HELP: &str = "write the staged entries to send under one approval, in order, as chain:id separated by spaces (ethereum:0001-abcde ethereum:0002-fghij); y repeats the last batch. Read this file for the result: the approval link, then each transaction hash.\n";
 
 /// `outbox/send.tx`: stage a body and ask the owner in one write.
 const SEND_TX: &str = "send.tx";
@@ -438,11 +438,41 @@ impl WalletsHandler {
     /// What `confirm-batch` reads as: the last batch's status, or how to
     /// write one.
     fn batch_status(&self, wallet: &str, number: u32) -> Vec<u8> {
-        let results = self.batch_results.lock();
-        match results.get(&(wallet.to_owned(), number)) {
-            Some(status) => status.clone(),
-            None => CONFIRM_BATCH_HELP.as_bytes().to_vec(),
+        let stored = self
+            .batch_results
+            .lock()
+            .get(&(wallet.to_owned(), number))
+            .cloned();
+        let Some(stored) = stored else {
+            return CONFIRM_BATCH_HELP.as_bytes().to_vec();
+        };
+        // A batch waits for the owner only while every entry is still
+        // pending. Once one was cancelled or sent on its own, the rest are
+        // confirmed singly again, so a later `y` asks for no more than it names.
+        let Ok(mut status) = serde_json::from_slice::<serde_json::Value>(&stored) else {
+            return stored;
+        };
+        let pending = |entry: &serde_json::Value| {
+            let named = entry.as_str().and_then(|r| r.split_once(':'));
+            named.is_some_and(|(chain, id)| {
+                self.tx_engine
+                    .outbox
+                    .read_in_state(wallet, chain, id, OutboxState::Pending)
+                    .is_ok()
+            })
+        };
+        if status["status"] != "awaiting_ceremony"
+            || status["entries"]
+                .as_array()
+                .is_some_and(|entries| entries.iter().all(pending))
+        {
+            return stored;
         }
+        status["status"] = "ended".into();
+        status["note"] = "an entry of this batch is no longer pending; confirm the others on their own or write a new batch".into();
+        let mut text = serde_json::to_vec_pretty(&status).unwrap_or(stored);
+        text.push(b'\n');
+        text
     }
 
     /// The batch waiting for the owner that `entry` (`chain:id`) is part of.
@@ -458,13 +488,11 @@ impl WalletsHandler {
     }
 
     /// `confirm-batch`: send several staged entries under one owner
-    /// approval, in the order written. `<chain>:pending` names every pending
-    /// entry of this account on that chain, oldest first.
+    /// approval, in the order written.
     async fn write_confirm_batch(
         &self,
         wallet: &str,
         number: u32,
-        view: &AccountView,
         data: &[u8],
     ) -> Result<(), HandlerError> {
         let body = std::str::from_utf8(data)
@@ -488,26 +516,6 @@ impl WalletsHandler {
         }
         for reference in body.split_whitespace() {
             match reference.split_once(':') {
-                Some((chain, "pending")) => {
-                    let family = Self::evm_family(view, chain)?;
-                    let mut ids = self
-                        .tx_engine
-                        .outbox
-                        .list(wallet, chain, OutboxState::Pending)
-                        .map_err(err_be)?;
-                    ids.sort();
-                    for id in ids {
-                        let entry = self.tx_engine.outbox.read_in_state(
-                            wallet,
-                            chain,
-                            &id,
-                            OutboxState::Pending,
-                        );
-                        if entry.is_ok_and(|e| Self::evm_entry_belongs(family, &e.staged.from)) {
-                            refs.push(format!("{chain}:{id}"));
-                        }
-                    }
-                }
                 Some(_) => refs.push(reference.to_owned()),
                 None => {
                     return Err(HandlerError::invalid(format!(
@@ -645,11 +653,14 @@ impl WalletsHandler {
         {
             return None;
         }
-        names.into_iter().find(|name| {
+        // A fork and the network it copies share an id: name neither.
+        let mut named = names.into_iter().filter(|name| {
             self.chains
                 .get(name)
                 .is_some_and(|c| c.spec().chain_id == id)
-        })
+        });
+        let only = named.next()?;
+        named.next().is_none().then_some(only)
     }
 
     fn chain_name_entries(&self, view: &AccountView) -> Vec<Entry> {
@@ -1030,7 +1041,7 @@ impl WalletsHandler {
         if let [leaf] = rest
             && leaf == CONFIRM_BATCH
         {
-            return self.write_confirm_batch(wallet, number, &view, data).await;
+            return self.write_confirm_batch(wallet, number, data).await;
         }
         if let [dir, mount, slot, leaf] = rest
             && dir == "sessions"
@@ -1195,18 +1206,37 @@ impl WalletsHandler {
             .map_err(|_| HandlerError::invalid("non-utf8 outbox content"))?;
         let bodies = bloom_tx::intent_parser::bodies(text);
         let mut before = pending(self)?;
-        let mut staged = Vec::new();
+        let mut staged: Vec<String> = Vec::new();
+        // Every body is checked before any is staged, so a mistake in a
+        // later line leaves nothing behind for a retry to duplicate.
+        for body in bodies.iter().filter(|_| bodies.len() > 1) {
+            bloom_tx::intent_parser::parse(body)
+                .map_err(|e| HandlerError::invalid(format!("{e}; nothing was staged")))?;
+        }
         for body in &bodies {
-            self.write_outbox_from(
-                wallet,
-                chain,
-                from,
-                policy,
-                &["new.tx".to_owned()],
-                body.as_bytes(),
-                number,
-            )
-            .await?;
+            let new_tx = ["new.tx".to_owned()];
+            let written = self
+                .write_outbox_from(
+                    wallet,
+                    chain,
+                    from,
+                    policy,
+                    &new_tx,
+                    body.as_bytes(),
+                    number,
+                )
+                .await;
+            if let Err(error) = written {
+                // A body the chain or policy refused: discard the ones
+                // before it, which were only ever meant to go together.
+                for id in &staged {
+                    let cancel = ["pending".to_owned(), id.clone(), "confirm".to_owned()];
+                    let _ = self
+                        .write_outbox_from(wallet, chain, from, policy, &cancel, b"cancel", number)
+                        .await;
+                }
+                return Err(error);
+            }
             // Confirm exactly the entries this write staged, never "the
             // newest".
             let now = pending(self)?;
@@ -1468,12 +1498,17 @@ impl WalletsHandler {
                 let mut link = None;
                 if let (true, Some(signing)) = (fname == "plan.md", evm_signing_state(&entry)) {
                     let outbox = format!("wallets/{wallet}/{number}/chains/{chain}/outbox");
+                    // Best effort: the plan stays readable when the
+                    // approval's state cannot be fetched.
                     let challenge = evm_approval_challenge(&entry, &signing, &outbox, &|petal| {
                         self.installed_petal_package(petal)
-                    })?;
-                    let live = self.live_approval_challenge(wallet, challenge).await?;
-                    let live: serde_json::Value = serde_json::from_slice(&live).map_err(err_be)?;
-                    link = live["ceremony_url"].as_str().map(str::to_owned);
+                    });
+                    if let Ok(challenge) = challenge
+                        && let Ok(live) = self.live_approval_challenge(wallet, challenge).await
+                        && let Ok(live) = serde_json::from_slice::<serde_json::Value>(&live)
+                    {
+                        link = live["ceremony_url"].as_str().map(str::to_owned);
+                    }
                 }
                 // An entry asked for with others is sent with them.
                 if state == "pending"

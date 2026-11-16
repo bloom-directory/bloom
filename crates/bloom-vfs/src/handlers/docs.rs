@@ -152,6 +152,23 @@ impl DocsHandler {
         }
     }
 
+    /// `examples.md` and `wallets.md` were single long files before they
+    /// became directories. The old names still read, unlisted, as the list
+    /// of files that replaced them, so a published skill or Petal README
+    /// that names one does not hit "not found".
+    fn moved(&self, name: &str) -> Option<String> {
+        let dir = name.strip_suffix(".md")?;
+        let files: Vec<String> = self
+            .dir(dir)?
+            .iter()
+            .map(|(file, _)| format!("- {file}\n"))
+            .collect();
+        Some(format!(
+            "# Moved\n\nThis is now one file per section in `docs/{dir}/`:\n\n{}",
+            files.concat()
+        ))
+    }
+
     fn section(&self, dir: &str, file: &str) -> Option<&str> {
         let found = self.dir(dir)?.iter().find(|(name, _)| name == file)?;
         Some(&found.1)
@@ -162,7 +179,7 @@ impl DocsHandler {
             [] => Ok(Entry::dir("")),
             [s] if s == "README.md" => Ok(Entry::file("README.md")),
             [s] if s == "petals.md" => Ok(Entry::file("petals.md")),
-            [s] if topic(s).is_some() => Ok(Entry::file(s)),
+            [s] if topic(s).is_some() || self.moved(s).is_some() => Ok(Entry::file(s)),
             [dir] if self.dir(dir).is_some() => Ok(Entry::dir(dir)),
             [dir, file] if self.section(dir, file).is_some() => Ok(Entry::file(file)),
             _ => Err(HandlerError::not_found(path.to_string_path())),
@@ -179,6 +196,7 @@ impl DocsHandler {
                 .as_bytes()
                 .to_vec()),
             [s] if topic(s).is_some() => Ok(topic(s).unwrap_or_default().as_bytes().to_vec()),
+            [s] if self.moved(s).is_some() => Ok(self.moved(s).unwrap_or_default().into_bytes()),
             _ => Err(HandlerError::NotAFile(path.to_string_path())),
         }
     }
@@ -304,9 +322,18 @@ mod tests {
         let deploy = String::from_utf8(h.read(&deploy).await.unwrap()).unwrap();
         assert!(deploy.starts_with("# Deploying an EVM contract\n"));
         assert!(deploy.contains("BLOOM=\"<bloom-vfs-mount>\""));
-        for gone in ["/examples.md", "/wallets.md"] {
-            assert!(h.lookup(&VfsPath::parse(gone).unwrap()).await.is_err());
-        }
+        // The old single-file names still read, as the list of their parts.
+        let moved = VfsPath::parse("/examples.md").unwrap();
+        assert!(h.lookup(&moved).await.is_ok());
+        let moved = String::from_utf8(h.read(&moved).await.unwrap()).unwrap();
+        assert!(
+            moved.contains("docs/examples/") && moved.contains("- deploying-an-evm-contract.md")
+        );
+        assert!(
+            h.read(&VfsPath::parse("/wallets.md").unwrap())
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
