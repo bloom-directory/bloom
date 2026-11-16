@@ -373,34 +373,34 @@ fn refresh_developer_provenance_catalog(
     // cleared, `FEE_ASSET_MISMATCH` where it was replaced. So the record is
     // left exactly as signed and the disagreement is reported instead.
     //
-    // Reported, not refused. An earlier revision aborted the refresh on any
-    // disagreement, which meant one stale record stopped every launch — the
-    // launcher runs this before enrolment, so there was no way through it from
-    // inside the launcher at all. Warning keeps what refusing was for, which
-    // is that a record must never silently disagree with the table, without
-    // holding a developer hostage to a record no claim in their session will
-    // touch. The failure the warning prevents is a Broker denial at claim time
+    // Reported, not refused. Refusing would stop every launch over one stale
+    // record: the launcher runs this before enrolment, so there is no way
+    // through it from inside the launcher. A warning keeps the point of
+    // refusing — a record must never silently disagree with the table —
+    // without holding a developer hostage to a record no claim in their
+    // session will touch. What it prevents is a Broker denial at claim time
     // with nothing pointing back here.
     //
     // Lineage `active` is not consulted. A superseded record's `fee_asset`
     // still decides a claim that names its package hash, so there is no reason
     // to treat one differently, and nothing here overwrites a signed value in
-    // either case. (No claim can name a superseded hash in practice:
+    // either case. No claim can name a superseded hash in practice anyway:
     // `bloom-petals`' store flips a single owner pointer under the install
     // commit, and every dispatch path resolves through `resolve_petal_owner`.
-    // That is why the distinction stopped being worth its machinery.)
     let mut developer_records = developer_records;
     let mut notes = Vec::new();
     let mut warnings = Vec::new();
     for record in &mut developer_records {
-        if matches!(record.subject, ProvenanceSubject::Petal { .. }) {
-            let (package_hash, route) = match &record.subject {
-                ProvenanceSubject::Petal {
-                    package_hash,
-                    route,
-                } => (package_hash.as_str().to_owned(), route.clone()),
-                _ => (String::new(), String::new()),
-            };
+        // `if let`, not a `matches!` guard over a second `match`: the two read
+        // the same subject, so the fallback arm the guard made unreachable
+        // could only ever have reported a blank route. Binding once means
+        // widening this later is a compile error rather than a blank field.
+        if let ProvenanceSubject::Petal {
+            package_hash,
+            route,
+        } = &record.subject
+        {
+            let (package_hash, route) = (package_hash.as_str(), route.as_str());
             for class in &mut record.operation_classes {
                 let derived = catalogued_fee_asset(class.operation_class.as_str())?;
                 if derived == class.fee_asset {
@@ -424,8 +424,16 @@ fn refresh_developer_provenance_catalog(
                 // The whole value, not just the asset: the guard above
                 // compares chain and asset, so reporting the asset alone
                 // described a chain-only change as "usdc to usdc".
+                //
+                // Naming re-enrolment here, not just in the warning: a heal is
+                // one-way. Rolling the binary back does not put the old value
+                // back, because the older build reaches the branch above
+                // instead — it finds a value it does not derive and leaves it
+                // as signed. Re-enrolling against that build is the way back.
                 notes.push(format!(
-                    "note: re-derived fee asset for {} from {:?} to {:?}",
+                    "note: re-derived fee asset for {} from {:?} to {:?}; re-enrol this \
+                     Petal to go back, as an older build leaves the new value signed \
+                     rather than restoring the old one",
                     class.operation_class.as_str(),
                     class.fee_asset,
                     derived,
@@ -449,12 +457,17 @@ fn refresh_developer_provenance_catalog(
              declares. If the table is right, re-enrol that Petal to re-derive its records \
              from the table, which the launcher does not do for you. From the repository \
              root, once per Petal named above:\n\n  \
-             cargo build -p bloom --no-default-features --features mount,triad-dev-harness\n  \
-             target/debug/bloom init triad-enroll-developer-petal-provenance {} \
-             <petal-package-dir>\n\nwhere <petal-package-dir> is that Petal's built \
-             package directory, the same path the launcher takes from \
-             BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE. That re-derives only the package hash on \
-             disk; recreating the developer root clears every record at once.",
+             cargo run -p bloom --no-default-features --features mount,triad-dev-harness \
+             -- init triad-enroll-developer-petal-provenance {} \
+             \"$PETAL_PACKAGE_DIR\"\n\nwith PETAL_PACKAGE_DIR exported as that Petal's \
+             built package directory, the same path the launcher takes from \
+             BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE. `cargo run`, not target/debug/bloom: \
+             worktrees are asked to set their own CARGO_TARGET_DIR, so that path is stale \
+             or missing in exactly the setup these roots are built in, and a build \
+             predating the table re-enrols the record with no fee asset at all — clearing \
+             the value this refresh has just declined to clear. Re-enrolling covers only \
+             the package hash on disk; recreating the developer root clears every record \
+             at once.",
             shell_quoted(config_dir),
         ));
     }
@@ -1873,11 +1886,10 @@ mod tests {
         // beside it. Only the synthetic package carries the routes above.
         const SYNTHETIC_HASH: &str =
             "abababababababababababababababababababababababababababababababab";
-        // Master's lineage grows whenever a release ships — #224 added
-        // hyperliquid v0.1.7 — so the synthetic successor is derived from
-        // whatever the lineage holds now instead of pinning its length or its
-        // hashes. An earlier version of this test destructured a single
-        // baseline and broke the moment that release landed.
+        // Master's lineage grows whenever a release ships, so the synthetic
+        // successor is derived from whatever the lineage holds now rather than
+        // pinning its length or its hashes. Destructuring a fixed number of
+        // baselines here breaks on the next release instead.
         let lineage = crate::github_source::release_lineage_predecessors("hyperliquid");
         let (Some(baseline), Some(newest)) = (lineage.first(), lineage.last()) else {
             panic!("hyperliquid's lineage must hold at least its baseline");
@@ -2480,9 +2492,9 @@ mod tests {
         // `hide = true`, so `--help` does not list it, and the launcher does
         // not run it: this message is the operator's only output.
         for fragment in [
-            "cargo build -p bloom --no-default-features --features mount,triad-dev-harness",
-            "target/debug/bloom init triad-enroll-developer-petal-provenance",
-            "<petal-package-dir>",
+            "cargo run -p bloom --no-default-features --features mount,triad-dev-harness",
+            "init triad-enroll-developer-petal-provenance",
+            "\"$PETAL_PACKAGE_DIR\"",
         ] {
             assert!(
                 message.contains(fragment),
@@ -2490,6 +2502,37 @@ mod tests {
                  {fragment:?} in: {message}"
             );
         }
+        // Two ways this command stopped being runnable, both found in review.
+        //
+        // `target/debug/bloom` is the wrong binary whenever CARGO_TARGET_DIR is
+        // set, which DEVELOPMENT.md asks every worktree to do. It is then stale
+        // or absent, and a build older than the table re-enrols the record with
+        // no fee asset — the clearing this refresh just declined to perform.
+        // `cargo run` builds and runs the one binary, wherever it lands.
+        //
+        // And a `<placeholder>` is a redirect to bash, so pasting the line
+        // failed with a syntax error before it reached the subcommand. Nothing
+        // else in this message is shell input, so the check is narrow: the
+        // command is the only line that has to survive a paste.
+        //
+        // Scoped to the command line, not the whole message: the prose names
+        // `target/debug/bloom` in order to warn against it, and a check over
+        // the message would read that mention as the defect it describes.
+        let command = message
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("cargo run"))
+            .expect("the warning must carry the recovery command on a line of its own");
+        assert!(
+            !command.contains("target/debug"),
+            "the recovery must not run a built path, which CARGO_TARGET_DIR moves: \
+             {command}"
+        );
+        assert!(
+            !command.contains('<'),
+            "a <placeholder> is a shell redirect, so the pasted command must not carry \
+             one: {command}"
+        );
         assert!(
             message.contains(&format!("'{}'", output.display())),
             "the command must name this root's own config directory, shell-quoted so a \

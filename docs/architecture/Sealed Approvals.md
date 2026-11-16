@@ -448,28 +448,22 @@ so an **exact** builder order does require the decoded order review, exactly as
 `hyperliquid.order` does, even though the class is registered in neither table.
 Broker's own comment gives the reason: builder orders stay out of the
 exact-only list because sessions sign them under reusable grants, and only the
-exact form is reviewed. The pin is what introduced this — `0a9a8dae` chained
-only the two tables — so it is a property of bloom-broker#131, not of the
-tables. A live claim on the exact path confirms it, answering
-`SelectorMismatch`, "this message operation requires a review envelope".
+exact form is reviewed. This is a property of bloom-broker#131, not of the
+tables: before it, the exact path chained the two tables alone. A live claim on
+the exact path confirms it, answering `SelectorMismatch`, "this message
+operation requires a review envelope".
+
 A session-signed builder order is *not* outside Broker's delegated-action
-witness either, which an earlier revision of this paragraph claimed. The pin
-widened both halves of it: `message_review.rs:34` selects on
+witness. `message_review` selects that witness on
 `builder_order || operation_class == "hyperliquid.agent_action"`, and the gate
 inside admits a declared fee for the builder class alone
 (`!builder_order && claim.declared_fee != DeclaredFee::None` is what refuses).
 So such a claim is refused without a use-time witness rather than waved past
 one. It still cannot be authorized today, but for the remaining reason only:
 the reusable key-scope approval carries empty `value_limits`, and a declared
-fee is the first value to reach it.
-The pin moved with master, and the revision pinned here now *does* have
-`message_review.rs` with its per-venue modules, and `agent_action` in
-`service.rs`. An earlier revision of this section said it had neither; the
-merge on this branch made that false. The class is in neither table, but that
-no longer means unreviewed: the exact path chains it in separately, as above.
-The reusable path does not chain it in, but the delegated-action witness covers
-the builder class on both paths, so a session-signed builder order is inside
-that check rather than outside it.
+fee is the first value to reach it. The class is in neither table, and that
+does not mean unreviewed: the exact path chains it in separately, as above, and
+the reusable path, which does not, is covered by the delegated-action witness.
 
 **Registering a fee-bearing class in those tables is not the remedy, and for
 Polymarket it is the opposite of one.** `validate_petal_profile` rejects any
@@ -488,13 +482,10 @@ a builder bound asks for the builder class. So listing it would make
 builder-bound session scopes unpreparable; a plain session, which requests
 `hyperliquid.agent_action` alone, is unaffected.
 
-The widening of the delegated-action witness this section used to call for has
-happened. `message_review.rs:34` selects the witness on
-`builder_order || operation_class == "hyperliquid.agent_action"`, where
-`0a9a8dae` selected on `agent_action` alone, so a builder-class claim no longer
-bypasses it — without a witness the claim is refused, `SelectorMismatch`,
-"Agent action requires its full use-time witness". What the session path still
-needs is value limits on the key-scope approval. Broker can bind the recipient
+The delegated-action witness already covers the builder class, as above, so a
+builder-class claim does not bypass it: without a witness the claim is refused,
+`SelectorMismatch`, "Agent action requires its full use-time witness". What the
+session path still needs is value limits on the key-scope approval. Broker can bind the recipient
 and the rate unconditionally, and the amount for perps, but it labels the
 market id identity-unverified, so the fee's *asset* stays Petal-asserted
 however far the witness is widened.

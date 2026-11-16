@@ -99,11 +99,11 @@ jobs:
       # `--all-features` without `-D warnings` or `cfg(test)`. A lint inside a
       # gated function is therefore invisible to CI, which this step fixes.
       #
-      # It is not what catches the inverse case — an ungated item whose only
-      # consumer is gated, which went red here once. That one needs default
-      # features, where the consumer is absent and the item is dead, so the step
-      # above is what catches it and this one is green on it. The two
-      # configurations cover opposite defects; neither substitutes.
+      # It does not catch the inverse case — an ungated item whose only
+      # consumer is gated. That one needs default features, where the consumer
+      # is absent and the item is dead, so the step above catches it and this
+      # one stays green on it. The two configurations cover opposite defects;
+      # neither substitutes for the other, so neither is redundant.
       - name: Run clippy with the dev harness enabled
         run: cargo clippy --workspace --all-targets --features triad-dev-harness -- -D warnings
       - name: Show sccache stats
@@ -294,32 +294,7 @@ jobs:
       # launcher no longer needs a sibling-repo layout to reject a bad
       # argument, so the whole Linux-capable set runs here.
       - name: Install bsdtar for reproducible bundle packaging
-        # Ubuntu mirror DNS on the hosted runners fails transiently often
-        # enough to redden this job on its own: `apt-get update` then logs
-        # `Temporary failure resolving 'azure.archive.ubuntu.com'`, exits 0 on
-        # its warnings, and the install that follows exits 100 with nothing
-        # fetched. A resolver blip is not a result worth reporting, so retry
-        # before failing, and fail loudly rather than carry on without bsdtar,
-        # which GNU tar cannot stand in for: build-bundle.sh pins ownership
-        # with bsdtar's `--uid`/`--gid`.
-        run: |
-          set -u
-          if command -v bsdtar > /dev/null 2>&1; then
-            bsdtar --version
-            exit 0
-          fi
-          for attempt in $(seq 1 4); do
-            if sudo apt-get update \
-              && sudo apt-get install -y --no-install-recommends libarchive-tools; then
-              bsdtar --version
-              exit 0
-            fi
-            delay=$((attempt * 15))
-            echo "::warning::apt attempt ${attempt} failed; retrying in ${delay}s" >&2
-            sleep "${delay}"
-          done
-          echo "::error::could not install libarchive-tools after 4 attempts" >&2
-          exit 1
+        run: sudo apt-get update && sudo apt-get install -y libarchive-tools
       - name: Check native macOS mount preflight
         run: bash tests/packaging/macos-native-mount-preflight.sh
       - name: Run triad release packaging tests from archive

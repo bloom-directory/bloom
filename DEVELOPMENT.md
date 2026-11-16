@@ -547,7 +547,10 @@ Every launch refreshes the developer provenance catalog before enrolling, and
 that refresh re-derives each Petal operation class's `fee_asset` from
 `FEE_BEARING_OPERATION_CLASSES` in `crates/bloom/src/triad_enrollment.rs`. A
 class enrolled before the table catalogued it is healed, with a `note:` on
-stderr. A class the record already carries any other value for is never
+stderr. A heal is one-way: rolling the binary back does not restore the old
+value, because the older build then finds a value it does not derive and takes
+the keep-as-signed branch below. Re-enrolling the Petal against that build is
+the way back. A class the record already carries any other value for is never
 overwritten, whether this build catalogues it differently or no longer
 catalogues it at all: one of the record and the table is stale, the refresh
 cannot tell which, and it will not re-sign on a guess. It prints a `warning:`
@@ -565,11 +568,17 @@ hash on disk. The launcher does not do this for you. Run it yourself from the
 repository root, once per Petal the warning names:
 
 ```sh
-cargo build -p bloom --no-default-features --features mount,triad-dev-harness
-target/debug/bloom init triad-enroll-developer-petal-provenance \
+cargo run -p bloom --no-default-features --features mount,triad-dev-harness -- \
+  init triad-enroll-developer-petal-provenance \
   "$HOME/.bloom/triad-dev/config" \
   "$HOME/Bloom/bloom-petal-hyperliquid"
 ```
+
+`cargo run`, not a built path: worktrees are asked to set their own
+`CARGO_TARGET_DIR` above, so `target/debug/bloom` is stale or missing in exactly
+the setup these roots are built in. A build older than the table re-enrols the
+record with no fee asset at all, clearing the value the refresh declined to
+clear.
 
 The first path is the `config` directory under the `--developer-root` the
 launcher was given; the second is that Petal's built package directory, the
