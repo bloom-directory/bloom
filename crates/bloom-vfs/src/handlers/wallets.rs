@@ -3060,7 +3060,13 @@ fn read_json<T: for<'de> serde::Deserialize<'de>>(
 /// Parse a state segment (`pending` / `sent` / `failed`) into an
 /// [`OutboxState`], rejecting anything else as NotFound.
 fn parse_state_seg(s: &str) -> Result<OutboxState, HandlerError> {
-    OutboxState::parse(s).ok_or_else(|| HandlerError::not_found(format!("outbox state '{}'", s)))
+    OutboxState::parse(s).ok_or_else(|| {
+        HandlerError::not_found(if s == "latest" {
+            "outbox/latest: nothing is staged here yet".to_owned()
+        } else {
+            format!("outbox state '{s}'")
+        })
+    })
 }
 
 fn solana_state(s: &str) -> Option<bloom_solana_tx::outbox::SolanaOutboxState> {
@@ -10170,6 +10176,48 @@ value = "0""#,
         // An entry outside that batch is confirmed on its own.
         let _ = f.handler.write(&confirm("0002-second"), b"y").await;
         assert_eq!(seen.lock().len(), 2);
+    }
+
+    /// The plan of an entry asked for with others names them all, and a
+    /// control written to an entry that already left `pending` says where
+    /// it went.
+    #[tokio::test]
+    async fn a_batched_plan_names_its_batch_and_a_moved_entry_its_place() {
+        let f = make_handler_with_chain(true);
+        seed_pending(&f, "0001-first");
+        seed_pending(&f, "0002-second");
+        f.handler
+            .set_batch_confirm(Arc::new(move |_wallet, _account, _txs, _text| {
+                Box::pin(async move {
+                    Ok(serde_json::json!({"status": "awaiting_ceremony", "ceremony_url": "https://relay.test/c"}))
+                })
+            }));
+        let batch = vfs(format!("/{}/0/confirm-batch", f.wallet_name));
+        let _ = f.handler.write(&batch, b"anvil:pending").await;
+        let outbox = format!("/{}/0/chains/anvil/outbox", f.wallet_name);
+        let plan = f
+            .handler
+            .read(&vfs(format!("{outbox}/pending/0002-second/plan.md")))
+            .await
+            .unwrap();
+        let plan = String::from_utf8(plan).unwrap();
+        assert!(
+            plan.contains("one of 2 entries") && plan.contains("0001-first, 0002-second"),
+            "{plan}"
+        );
+        assert!(plan.contains("https://relay.test/c"), "{plan}");
+
+        let outbox_store = &f.handler.tx_engine.outbox;
+        let first = outbox_store
+            .read_in_state(&f.wallet_name, "anvil", "0001-first", OutboxState::Pending)
+            .unwrap();
+        outbox_store.transition(&first, OutboxState::Sent).unwrap();
+        let moved = f
+            .handler
+            .write(&vfs(format!("{outbox}/pending/0001-first/confirm")), b"y")
+            .await
+            .unwrap_err();
+        assert!(moved.to_string().contains("sent/0001-first/"), "{moved}");
     }
 
     /// A request usually names a chain by id; `chains/<id>` links to its name.

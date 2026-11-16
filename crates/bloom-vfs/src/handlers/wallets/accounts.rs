@@ -1116,6 +1116,21 @@ impl WalletsHandler {
             .chain_id;
         let policy =
             crate::advisory_exact_evm_policy(&projection, chain, chain_id).map_err(err_be)?;
+        // An entry that already left `pending` (its batch was sent, say) is
+        // reported where it now is, so the caller reads the result instead
+        // of guessing what a bare "not found" means.
+        if let [state, id, control] = chain_rest
+            && state == "pending"
+            && EVM_PENDING_CONTROLS.contains(&control.as_str())
+            && let Some(now) = ["sent", "failed"].into_iter().find(|now| {
+                self.evm_outbox_entry(wallet, family, chain, now, id)
+                    .is_ok()
+            })
+        {
+            return Err(HandlerError::not_found(format!(
+                "pending/{id}: it is no longer pending; its result is in `{now}/{id}/`"
+            )));
+        }
         // An entry asked for as part of a batch is confirmed with its batch:
         // `latest/confirm` continues whatever `send.tx` started.
         if let [state, id, control] = chain_rest
@@ -1460,7 +1475,30 @@ impl WalletsHandler {
                     let live: serde_json::Value = serde_json::from_slice(&live).map_err(err_be)?;
                     link = live["ceremony_url"].as_str().map(str::to_owned);
                 }
-                if let Some(link) = link {
+                // An entry asked for with others is sent with them.
+                if state == "pending"
+                    && let Some(refs) =
+                        self.awaited_batch_with(wallet, number, &format!("{chain}:{id}"))
+                    && refs.len() > 1
+                    && fname == "plan.md"
+                {
+                    let status: serde_json::Value =
+                        serde_json::from_slice(&self.batch_status(wallet, number))
+                            .unwrap_or_default();
+                    let ids: Vec<&str> = refs
+                        .iter()
+                        .map(|r| r.split_once(':').map_or(r.as_str(), |(_, id)| id))
+                        .collect();
+                    bytes.extend_from_slice(
+                        format!(
+                            "\n## Approval\n\nThis is one of {} entries the owner was asked to approve together, sent in this order: {}. Each has its own `pending/<id>/plan.md`.\nLink: {}\nWrite `y` to `confirm`: it sends them all once the owner has approved.\n",
+                            ids.len(),
+                            ids.join(", "),
+                            status["ceremony_url"].as_str().unwrap_or_default(),
+                        )
+                        .as_bytes(),
+                    );
+                } else if let Some(link) = link {
                     bytes.extend_from_slice(
                         format!(
                             "\n## Approval\n\nThe owner was asked: {link}\nWrite `y` to `confirm` again: it sends once they have approved.\n"

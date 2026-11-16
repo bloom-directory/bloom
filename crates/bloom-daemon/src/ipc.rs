@@ -1519,11 +1519,21 @@ impl IpcServer {
                         Ok(challenge) => self.vfs.read(&challenge).await.ok(),
                         Err(_) => None,
                     }
-                    .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
-                    .and_then(|doc| doc["ceremony_url"].as_str().map(str::to_owned));
+                    .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok());
+                    // Several bodies were staged: say so, or the caller
+                    // checks each entry before asking the owner.
+                    let staged = url
+                        .as_ref()
+                        .and_then(|doc| doc["entries"].as_array())
+                        .filter(|entries| entries.len() > 1)
+                        .map(|entries| {
+                            format!(" for {} staged transactions, sent in order", entries.len())
+                        })
+                        .unwrap_or_default();
+                    let url = url.and_then(|doc| doc["ceremony_url"].as_str().map(str::to_owned));
                     Err(match url {
                         Some(url) => WriteError::Approval(format!(
-                            "permission denied: owner approval required: {url} . Write y to latest/confirm: it waits for their approval, then sends."
+                            "permission denied: owner approval required{staged}: {url} . Write y to latest/confirm: it waits for their approval, then sends."
                         )),
                         None => HandlerError::ApprovalPending(challenge).into(),
                     })
