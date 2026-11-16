@@ -5,10 +5,11 @@ action on a Broker browser page; Bloom signs and sends. Paths here are
 relative to this file's directory. Without a mount,
 `bloom vfs cat|ls|write <path>` reaches them (this file is `/AGENTS.md`).
 
-- `next.md`: what is pending.
+- `next.md`: this machine's wallets, with their paths, and what is pending.
 - `wallets/<wallet>/<n>/holdings.json`: balances of account `<n>`; the first
   is `0`.
-- `docs/`: one short file per topic; the filenames are the index.
+- `docs/`: for when a write is refused or fails; one short file per
+  situation, named for it.
 
 Send, approve or call a contract through the account's outbox,
 `wallets/<wallet>/<n>/chains/<chain>/outbox/`. Write a body to `send.tx`, in
