@@ -1041,12 +1041,17 @@ impl BloomFs {
     /// waits for the owner here too. A waiting write holds one of the
     /// connection's request slots (64 by default), so only
     /// [`OWNER_WAITERS`] may wait at once; any further one is answered at
-    /// once, as every one was before.
+    /// once, as every one was before. Only a write that can wait takes one.
+    /// NFS does not say when a caller gave up, so a wait runs to its end: an
+    /// approval given within it sends even if the caller has gone.
     async fn write_for_owner(&self, path: &VfsPath, bytes: &[u8]) -> FsResult<()> {
-        let permit = self.owner_waiters.clone().try_acquire_owned();
         // A command the mount dispatches off the request path (a policy
         // write) is never waited for here; its status file reports it.
-        let wait = if permit.is_ok() && !self.vfs.is_async_write_command(path) {
+        let permit = (bloom_vfs::owner_wait::may_wait(path)
+            && !self.vfs.is_async_write_command(path))
+        .then(|| self.owner_waiters.clone().try_acquire_owned().ok())
+        .flatten();
+        let wait = if permit.is_some() {
             OWNER_WAIT
         } else {
             Duration::ZERO
@@ -1322,11 +1327,20 @@ impl FileSystem for BloomFs {
         })?;
         let parent_path = Self::path_of(parent);
         let child = parent_path.join(&decoded);
-        // A receipt that is due is waited for, which holds a request slot:
-        // past [`OWNER_WAITERS`] such waits the lookup answers at once.
-        let e = match self.owner_waiters.clone().try_acquire_owned() {
-            Ok(_permit) => bloom_vfs::owner_wait::lookup(&self.vfs, &child).await,
-            Err(_) => self.vfs.lookup(&child).await,
+        let e = match self.vfs.lookup(&child).await {
+            // A receipt that is due is waited for, which holds a request
+            // slot: past [`OWNER_WAITERS`] such waits it is answered at once.
+            Err(absent)
+                if bloom_vfs::owner_wait::receipt_is_due(&self.vfs, &child, &absent).await =>
+            {
+                match self.owner_waiters.clone().try_acquire_owned() {
+                    Ok(_permit) => {
+                        bloom_vfs::owner_wait::await_receipt(&self.vfs, &child, absent).await
+                    }
+                    Err(_) => Err(absent),
+                }
+            }
+            found => found,
         }
         .map_err(map_err)?;
         Ok(BloomHandle::Path {
@@ -1818,7 +1832,11 @@ impl CloseSupport<BloomHandle> for BloomFs {
         // Whole-file semantics, same as COMMIT: dispatch whatever complete
         // payload is still held. An incomplete buffer is left for the idle
         // reaper — a partial command must never run.
-        self.flush_path(&path).await
+        let flushed = self.flush_path(&path).await;
+        // A re-flush of a refused write comes before its file is closed, so
+        // the same bytes written after this are the caller's own repeat.
+        self.failed_writes.lock().pop(&path);
+        flushed
     }
 }
 
@@ -2314,6 +2332,95 @@ mod tests {
         write().await.unwrap();
         assert!(started.elapsed() >= Duration::from_secs(5));
         assert_eq!(entry.sent.load(Ordering::SeqCst), 1);
+    }
+
+    /// Closing the file ends the window in which the same bytes are taken
+    /// for the kernel's re-flush: a repeat made straight after waits.
+    #[tokio::test(start_paused = true)]
+    async fn a_repeat_after_close_is_not_taken_for_a_reflush() {
+        let entry = Arc::new(OwnerApproval {
+            active: false.into(),
+            challenged: false.into(),
+            sent: 0.into(),
+        });
+        let fs = BloomFs::new(Vfs::builder().mount("wallets", entry.clone()).build());
+        let ctx = fake_ctx();
+        let confirm = BloomHandle::Path {
+            entry: Entry::writable_file("confirm"),
+            path: VfsPath::parse("/wallets/w/0/chains/base/outbox/pending/tx-1/confirm").unwrap(),
+        };
+        let write = || {
+            fs.write(
+                &ctx,
+                &confirm,
+                0,
+                Bytes::from_static(b"y"),
+                WriteStability::FileSync,
+            )
+        };
+        assert_eq!(write().await.unwrap_err(), FsError::AccessDenied);
+        let closer = fs.close_support().expect("BloomFs must advertise CLOSE");
+        closer.close(&ctx, &confirm).await.unwrap();
+
+        let owner = entry.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            owner.active.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        write().await.unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(5));
+        assert_eq!(entry.sent.load(Ordering::SeqCst), 1);
+    }
+
+    /// Answers every lookup and write after ten seconds.
+    struct Slow;
+
+    #[async_trait]
+    impl Handler for Slow {
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok(Entry::writable_file(p.segments().last().unwrap()))
+        }
+        async fn write(&self, _p: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok(())
+        }
+    }
+
+    /// Lookups and writes that cannot wait for the owner take no waiting
+    /// slot, however many are in flight, so they never cost a confirm its wait.
+    #[tokio::test(start_paused = true)]
+    async fn ordinary_requests_take_no_waiting_slot() {
+        let fs = Arc::new(BloomFs::new(
+            Vfs::builder().mount("wallets", Arc::new(Slow)).build(),
+        ));
+        let outbox = VfsPath::parse("/wallets/w/0/chains/base/outbox").unwrap();
+        let mut in_flight = Vec::new();
+        for n in 0..OWNER_WAITERS + 1 {
+            let (fs, dir) = (fs.clone(), outbox.clone());
+            in_flight.push(tokio::spawn(async move {
+                let ctx = fake_ctx();
+                let parent = BloomHandle::Path {
+                    entry: Entry::dir("outbox"),
+                    path: dir.clone(),
+                };
+                let stage = BloomHandle::Path {
+                    entry: Entry::writable_file("new.tx"),
+                    path: dir.join("new.tx"),
+                };
+                let body = Bytes::from(format!("send {n} ETH to 0x01"));
+                let _ = tokio::join!(
+                    fs.lookup(&ctx, &parent, "plan.md"),
+                    fs.write(&ctx, &stage, 0, body, WriteStability::FileSync),
+                );
+            }));
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(fs.owner_waiters.available_permits(), OWNER_WAITERS);
+        for task in in_flight {
+            task.await.unwrap();
+        }
     }
 
     /// The owner never answers: the repeat gives up after [`OWNER_WAIT`], and

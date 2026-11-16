@@ -52,6 +52,13 @@ fn confirm_challenge_path(path: &VfsPath) -> Option<VfsPath> {
     }
 }
 
+/// Whether a write to `path` is one [`write`] may wait for the owner on.
+pub fn may_wait(path: &VfsPath) -> bool {
+    matches!(path.segments(), [root, _, leaf] if root == "wallets" && leaf == "policy.json")
+        || matches!(path.segments(), [root, _, _, leaf] if root == "wallets" && leaf == "confirm-batch")
+        || confirm_challenge_path(path).is_some()
+}
+
 /// Write `bytes` to `path`, waiting for the owner where a repeat of the
 /// same request is the caller's next step. `wait` bounds that wait.
 pub async fn write(
@@ -114,8 +121,11 @@ pub async fn write(
         };
     };
     // An entry asked for as part of a batch waits as its batch does.
-    if let [root, wallet, number, _, chain, _, _, id, _] = path.segments()
+    // Only `confirm`, as the handler does: `confirm.override` is its own
+    // request and is never turned into the batch's plain `y`.
+    if let [root, wallet, number, _, chain, _, _, id, control] = path.segments()
         && root == "wallets"
+        && control == "confirm"
         && bytes.trim_ascii() == b"y"
         && let Ok(batch) = VfsPath::parse(&format!("/wallets/{wallet}/{number}/confirm-batch"))
         && let Ok(raw) = vfs.read(&batch).await
@@ -303,18 +313,15 @@ pub async fn receipt_is_due(vfs: &Vfs, path: &VfsPath, error: &HandlerError) -> 
     }
 }
 
-/// Look `path` up. A receipt is recorded once the transaction is mined,
-/// moments after the confirm that sent it returns, so a receipt that is due
-/// is waited for briefly: a caller that confirms and then reads the receipt
-/// finds it.
-pub async fn lookup(vfs: &Vfs, path: &VfsPath) -> Result<crate::Entry, HandlerError> {
-    let absent = match vfs.lookup(path).await {
-        Err(error) => error,
-        found => return found,
-    };
-    if !receipt_is_due(vfs, path, &absent).await {
-        return Err(absent);
-    }
+/// A receipt is recorded once the transaction is mined, moments after the
+/// confirm that sent it returns. Wait briefly for one that
+/// [`receipt_is_due`], so a caller that confirms and then looks the receipt
+/// up finds it; `absent` is the answer if it does not arrive.
+pub async fn await_receipt(
+    vfs: &Vfs,
+    path: &VfsPath,
+    absent: HandlerError,
+) -> Result<crate::Entry, HandlerError> {
     for _ in 0..RECEIPT_POLLS {
         tokio::time::sleep(APPROVAL_POLL).await;
         match vfs.lookup(path).await {

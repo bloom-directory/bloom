@@ -107,7 +107,7 @@ pub(super) struct FamilyKey {
 /// `wallets/<wallet>/<n>/confirm-batch`: one owner approval for several
 /// staged entries. Written with the entries, read for the result.
 const CONFIRM_BATCH: &str = "confirm-batch";
-const CONFIRM_BATCH_HELP: &str = "write the staged entries to send under one approval, in order, as chain:id separated by spaces (ethereum:0001-abcde ethereum:0002-fghij); y repeats the last batch. Read this file for the result: the approval link, then each transaction hash.\n";
+const CONFIRM_BATCH_HELP: &str = "write the staged entries to send under one approval, in order, as chain:id separated by spaces (ethereum:0001-abcde ethereum:0002-fghij); y repeats the batch while it waits for approval. Read this file for the result: the approval link, then each transaction hash.\n";
 
 /// `outbox/send.tx`: stage a body and ask the owner in one write.
 const SEND_TX: &str = "send.tx";
@@ -507,9 +507,11 @@ impl WalletsHandler {
                 .iter()
                 .filter_map(|entry| entry.as_str().map(str::to_owned))
                 .collect();
-            if refs.is_empty() {
+            // Only a batch still waiting for the owner is repeated: one that
+            // was sent, failed or lost an entry is not asked for again.
+            if refs.is_empty() || last["status"] != "awaiting_ceremony" {
                 return Err(HandlerError::invalid(format!(
-                    "no batch to repeat; {CONFIRM_BATCH_HELP}"
+                    "no batch is waiting to repeat; {CONFIRM_BATCH_HELP}"
                 )));
             }
             return self.confirm_batch_entries(wallet, number, refs).await;
@@ -1161,7 +1163,7 @@ impl WalletsHandler {
         }
         if chain_rest == [SEND_TX] {
             return self
-                .stage_and_confirm(wallet, chain, family, from, &policy, data, number)
+                .stage_and_confirm(wallet, chain, from, &policy, data, number)
                 .await;
         }
         self.write_outbox_from(wallet, chain, from, &policy, chain_rest, data, number)
@@ -1172,40 +1174,18 @@ impl WalletsHandler {
     /// `bloom wallet stage --confirm` does. The owner is asked at once (the
     /// write is denied with the entry's challenge), or the entry is sent when
     /// no approval is needed.
-    #[allow(clippy::too_many_arguments)]
     async fn stage_and_confirm(
         &self,
         wallet: &str,
         chain: &str,
-        family: &FamilyKey,
         from: alloy::primitives::Address,
         policy: &Policy,
         data: &[u8],
         number: u32,
     ) -> Result<(), HandlerError> {
-        let pending = |handler: &Self| -> Result<Vec<String>, HandlerError> {
-            let ids = handler
-                .tx_engine
-                .outbox
-                .list(wallet, chain, OutboxState::Pending);
-            Ok(ids
-                .map_err(err_be)?
-                .into_iter()
-                .filter(|id| {
-                    let entry = handler.tx_engine.outbox.read_in_state(
-                        wallet,
-                        chain,
-                        id,
-                        OutboxState::Pending,
-                    );
-                    entry.is_ok_and(|e| Self::evm_entry_belongs(family, &e.staged.from))
-                })
-                .collect())
-        };
         let text = std::str::from_utf8(data)
             .map_err(|_| HandlerError::invalid("non-utf8 outbox content"))?;
         let bodies = bloom_tx::intent_parser::bodies(text);
-        let mut before = pending(self)?;
         let mut staged: Vec<String> = Vec::new();
         // Every body is checked before any is staged, so a mistake in a
         // later line leaves nothing behind for a retry to duplicate.
@@ -1214,53 +1194,42 @@ impl WalletsHandler {
                 .map_err(|e| HandlerError::invalid(format!("{e}; nothing was staged")))?;
         }
         for body in &bodies {
-            let new_tx = ["new.tx".to_owned()];
-            let written = self
-                .write_outbox_from(
-                    wallet,
-                    chain,
-                    from,
-                    policy,
-                    &new_tx,
-                    body.as_bytes(),
-                    number,
-                )
-                .await;
-            if let Err(error) = written {
-                // A body the chain or policy refused: discard the ones
-                // before it, which were only ever meant to go together.
-                for id in &staged {
-                    let cancel = ["pending".to_owned(), id.clone(), "confirm".to_owned()];
-                    let _ = self
-                        .write_outbox_from(wallet, chain, from, policy, &cancel, b"cancel", number)
-                        .await;
+            match self.stage_from(wallet, chain, from, policy, body).await {
+                Ok(id) => staged.push(id),
+                Err(error) => {
+                    // A body the chain or policy refused: discard the ones
+                    // before it, which were only ever meant to go together.
+                    let mut left = Vec::new();
+                    for id in staged {
+                        let cancel = ["pending".to_owned(), id.clone(), "confirm".to_owned()];
+                        let discarded = self
+                            .write_outbox_from(
+                                wallet, chain, from, policy, &cancel, b"cancel", number,
+                            )
+                            .await;
+                        if discarded.is_err() {
+                            left.push(format!("pending/{id}"));
+                        }
+                    }
+                    if left.is_empty() {
+                        return Err(error);
+                    }
+                    return Err(HandlerError::backend(format!(
+                        "{error}; still staged, cancel before retrying: {}",
+                        left.join(", ")
+                    )));
                 }
-                return Err(error);
             }
-            // Confirm exactly the entries this write staged, never "the
-            // newest".
-            let now = pending(self)?;
-            staged.extend(now.iter().filter(|id| !before.contains(id)).cloned());
-            before = now;
         }
-        if bodies.len() > 1 {
-            // Several bodies go under one approval, in the order written.
-            if staged.len() != bodies.len() {
-                return Err(HandlerError::backend(
-                    "staged, but another entry was staged at the same moment; confirm yours by id through confirm-batch",
-                ));
-            }
-            let refs = staged.iter().map(|id| format!("{chain}:{id}")).collect();
-            return self.confirm_batch_entries(wallet, number, refs).await;
+        if let [id] = staged.as_slice() {
+            let confirm = ["pending".to_owned(), id.clone(), "confirm".to_owned()];
+            return self
+                .write_outbox_from(wallet, chain, from, policy, &confirm, b"y", number)
+                .await;
         }
-        let [id] = staged.as_slice() else {
-            return Err(HandlerError::backend(
-                "staged, but another entry was staged at the same moment; confirm yours by id under pending/",
-            ));
-        };
-        let confirm = ["pending".to_owned(), id.clone(), "confirm".to_owned()];
-        self.write_outbox_from(wallet, chain, from, policy, &confirm, b"y", number)
-            .await
+        // Several bodies go under one approval, in the order written.
+        let refs = staged.iter().map(|id| format!("{chain}:{id}")).collect();
+        self.confirm_batch_entries(wallet, number, refs).await
     }
 
     pub(super) fn solana_sender(family: &FamilyKey) -> SolanaSender<'_> {

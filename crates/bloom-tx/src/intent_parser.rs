@@ -279,12 +279,12 @@ fn is_empty_or_zero_value(value: &str) -> bool {
 /// The bodies one write holds: one per line when more than one line opens a
 /// body (a `send` line or a single-line JSON object), else the whole input.
 pub fn bodies(input: &str) -> Vec<&str> {
-    let opens = |line: &&str| line.starts_with("send ") || line.starts_with("{\"");
     let lines: Vec<&str> = input
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .collect();
+    let opens = |line: &&str| line.starts_with("send ") || line.starts_with("{\"");
     if lines.len() > 1 && lines.iter().all(opens) {
         lines
     } else {
@@ -301,10 +301,7 @@ pub fn parse(input: &str) -> Result<RawIntent, ParseError> {
     // One write stages one transaction. Two forms in one body (a `send` line
     // and a JSON object, or two JSON objects) would otherwise fail deep in a
     // parser with an error that does not say so.
-    let lines = s.lines().filter(|line| !line.trim().is_empty());
-    let bodies = lines
-        .filter(|line| line.starts_with("send ") || line.starts_with("{\""))
-        .count();
+    let bodies = bodies(s).len();
     if bodies > 1 {
         return Err(ParseError::Invalid(format!(
             "this write holds {bodies} bodies; `send.tx` takes several, one per line, under one approval"

@@ -21,8 +21,8 @@ mod stub {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
-    use bloom_vfs::handler::{Entry, Handler, HandlerError};
     use bloom_vfs::VfsPath;
+    use bloom_vfs::handler::{Entry, Handler, HandlerError};
 
     /// The one entry: `wallets/w/0/chains/c/outbox/pending/e1/`.
     const ENTRY: [&str; 7] = ["w", "0", "chains", "c", "outbox", "pending", "e1"];

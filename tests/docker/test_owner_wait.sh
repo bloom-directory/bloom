@@ -3,9 +3,10 @@
 # client. `owner_wait_mount` serves one stub outbox entry whose owner
 # approves APPROVE_AFTER seconds after the first confirm. Asserts:
 #   1. the first confirm is refused at once, and the link is readable;
-#   2. the kernel re-sending the refused write does not reach the handler;
-#   3. a repeated confirm blocks until the owner approves, then succeeds,
-#      and the entry is sent exactly once.
+#   2. a confirm repeated straight away is not taken for the kernel
+#      re-sending the refused write: it blocks until the owner approves,
+#      then succeeds;
+#   3. the handler saw exactly those writes, and sent the entry once.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -45,22 +46,19 @@ confirm
 grep -q 'http://localhost/c/e1' "$ENTRY/approval_challenge.json" \
     || fail "the approval link is not readable beside the entry"
 
-# Past the adapter's replay window: a late kernel re-send would show here.
-sleep 3
-counts=$(cat "$ENTRY/counts")
-[ "$counts" = "writes=1 sent=0" ] || fail "the refused write reached the handler again: $counts"
-
+# Straight away, inside the window in which the adapter answers the kernel's
+# re-send of a refused write from memory.
 confirm
 [ "$confirm_ok" -eq 1 ] || fail "the repeated confirm must succeed once the owner approves"
-[ "$confirm_took" -ge 3 ] || fail "the repeated confirm did not wait for the owner (took ${confirm_took}s)"
-[ "$confirm_took" -le "$APPROVE_AFTER" ] || fail "the repeated confirm outlasted the approval (took ${confirm_took}s)"
+[ "$confirm_took" -ge $((APPROVE_AFTER - 3)) ] \
+    || fail "the repeated confirm did not wait for the owner (took ${confirm_took}s)"
+[ "$confirm_took" -le $((APPROVE_AFTER + 2)) ] \
+    || fail "the repeated confirm outlasted the approval (took ${confirm_took}s)"
 
+# The refused confirm, the repeat's own attempt, and its send once approved.
+# A kernel re-send that reached the handler would add to these.
 sleep 3
 counts=$(cat "$ENTRY/counts")
-case "$counts" in
-    *"sent=1") ;;
-    *) fail "the entry must be sent exactly once: $counts" ;;
-esac
-log "counts after the repeat: $counts"
+[ "$counts" = "writes=3 sent=1" ] || fail "unexpected writes reached the handler: $counts"
 
 echo "owner wait behaves on a kernel mount"

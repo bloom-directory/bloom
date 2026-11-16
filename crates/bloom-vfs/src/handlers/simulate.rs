@@ -231,11 +231,17 @@ fn decode_hex(s: &str) -> Result<Bytes, HandlerError> {
     Ok(Bytes::from(v))
 }
 
+/// What a `send` body moves, resolved on its chain as staging resolves it.
+enum SendAsset {
+    Native(U256),
+    Token { contract: Address, decimals: u8 },
+}
+
 /// Build the `TransactionRequest` we'll feed to `eth_call`.
 fn build_tx_request(
     intent: &RawIntent,
     addr_book: &AddressBook,
-    token_meta: Option<(Address, u8)>,
+    asset: Option<SendAsset>,
 ) -> Result<TransactionRequest, HandlerError> {
     use alloy::network::TransactionBuilder;
 
@@ -248,43 +254,43 @@ fn build_tx_request(
             data,
         } => {
             let to_addr = resolve_addr(to, addr_book)?;
-            if token.is_some() {
-                if amount.trim().is_empty() {
+            match asset {
+                Some(SendAsset::Native(v)) => {
+                    (to_addr, v, data.clone().unwrap_or_else(|| "0x".into()))
+                }
+                Some(SendAsset::Token { contract, decimals }) => {
+                    use alloy::sol_types::SolCall;
+                    if amount.trim().is_empty() {
+                        return Err(HandlerError::invalid(
+                            "token sends require amount; value is only for native sends",
+                        ));
+                    }
+                    if !value.trim().is_empty() && value.trim() != "0" {
+                        return Err(HandlerError::invalid(
+                            "token sends must use amount; value is reserved for native sends",
+                        ));
+                    }
+                    // The same transfer staging builds from this body.
+                    let (amount, _) = bloom_tx::tx_engine::token_amount_base_units(
+                        amount,
+                        decimals,
+                        token.as_deref().unwrap_or_default(),
+                    )
+                    .map_err(|e| HandlerError::invalid(e.to_string()))?;
+                    let call = bloom_evm::IERC20::transferCall {
+                        to: to_addr,
+                        amount,
+                    };
+                    return Ok(TransactionRequest::default()
+                        .with_to(contract)
+                        .with_input(call.abi_encode()));
+                }
+                None => {
                     return Err(HandlerError::invalid(
-                        "token sends require amount; value is only for native sends",
+                        "a send is simulated on a chain, which decides what it moves",
                     ));
                 }
-                if !value.trim().is_empty() && value.trim() != "0" {
-                    return Err(HandlerError::invalid(
-                        "token sends must use amount; value is reserved for native sends",
-                    ));
-                }
-                // The same transfer staging would build from this body.
-                let (contract, decimals) = token_meta.ok_or_else(|| {
-                    HandlerError::invalid("token sends need the token resolved on a chain")
-                })?;
-                let (base, _) = bloom_tx::tx_engine::token_amount_base_units(
-                    amount,
-                    decimals,
-                    token.as_deref().unwrap_or_default(),
-                )
-                .map_err(|e| HandlerError::invalid(e.to_string()))?;
-                let mut call = vec![0xa9, 0x05, 0x9c, 0xbb];
-                call.extend_from_slice(&[0u8; 12]);
-                call.extend_from_slice(to_addr.as_slice());
-                call.extend_from_slice(&base.to_be_bytes::<32>());
-                return Ok(TransactionRequest::default()
-                    .with_to(contract)
-                    .with_input(call));
             }
-            if !amount.trim().is_empty() {
-                return Err(HandlerError::invalid(
-                    "native sends must use value; amount is only for token sends",
-                ));
-            }
-            let v = resolve_value(value, token)?;
-            let d = data.clone().unwrap_or_else(|| "0x".into());
-            (to_addr, v, d)
         }
         RawIntentBody::Deploy { data, value } => {
             let data = decode_hex(data)?;
@@ -293,7 +299,7 @@ fn build_tx_request(
             }
             let mut req = TransactionRequest::default()
                 .with_kind(alloy::primitives::TxKind::Create)
-                .with_value(resolve_value(value, &None)?)
+                .with_value(resolve_value(value)?)
                 .with_input(data);
             if let Some(nonce) = intent.nonce {
                 req = req.with_nonce(nonce);
@@ -386,22 +392,17 @@ fn resolve_addr(s: &str, book: &AddressBook) -> Result<Address, HandlerError> {
     )))
 }
 
-fn resolve_value(value: &str, token: &Option<String>) -> Result<U256, HandlerError> {
+fn resolve_value(value: &str) -> Result<U256, HandlerError> {
     if value.is_empty() {
         return Ok(U256::ZERO);
     }
-    if let Some(t) = token.as_deref() {
-        match t.to_ascii_lowercase().as_str() {
-            "eth" | "ether" | "wei" | "gwei" => {
-                parse_eth(value).map_err(|e| HandlerError::invalid(e.to_string()))
-            }
-            other => Err(HandlerError::Unsupported(format!(
-                "ERC-20 token '{other}' simulation requires a contract-call intent"
-            ))),
-        }
-    } else {
-        parse_eth(value).map_err(|e| HandlerError::invalid(e.to_string()))
-    }
+    parse_eth(value).map_err(|e| HandlerError::invalid(e.to_string()))
+}
+
+/// The newest session id. Ids are `sim-<counter>`, zero-padded to four
+/// digits, so a longer one is later.
+fn newest_session<'a>(ids: impl Iterator<Item = &'a String>) -> Option<&'a String> {
+    ids.max_by_key(|id| (id.len(), id.as_str()))
 }
 
 /// Render a tiny plan.md. We don't have a full StagedTx in /simulate (no
@@ -576,33 +577,50 @@ impl SimulateHandler {
             )
         };
         let client = self.pick_client(&intent)?;
-        let token_meta = match &intent.body {
+        let asset = match &intent.body {
             RawIntentBody::Send {
-                token: Some(token), ..
+                value,
+                token,
+                amount,
+                ..
             } => {
-                // The sender's balance decides a transfer, so a simulation
-                // from nobody would only report that nobody holds the token.
-                if from.is_none() {
-                    return Err(HandlerError::invalid(
-                        "a token send is simulated from an account: add \"from\":\"0x...\" (your account's address) to the body",
-                    ));
-                }
-                let chain_id = client.spec().chain_id;
-                let (contract, _) =
-                    bloom_tx::tx_engine::TxEngine::resolve_token_address(token, chain_id)
+                let spec = client.spec();
+                let native =
+                    bloom_tx::tx_engine::TxEngine::native_send_value(spec, value, token, amount)
                         .map_err(|e| HandlerError::invalid(e.to_string()))?;
-                let decimals = client
-                    .erc20_decimals(contract)
-                    .await
-                    .map_err(err_be)?
-                    .ok_or_else(|| {
-                        HandlerError::invalid(format!("{contract} does not report ERC-20 decimals"))
-                    })?;
-                Some((contract, decimals))
+                Some(match native {
+                    Some(value) => SendAsset::Native(value),
+                    None => {
+                        // The sender's balance decides a transfer, so a
+                        // simulation from nobody would only report that
+                        // nobody holds the token.
+                        if from.is_none() {
+                            return Err(HandlerError::invalid(
+                                "a token send is simulated from an account: add \"from\":\"0x...\" (your account's address) to the body",
+                            ));
+                        }
+                        let token = token.as_deref().unwrap_or_default();
+                        let (contract, _) = bloom_tx::tx_engine::TxEngine::resolve_token_address(
+                            token,
+                            spec.chain_id,
+                        )
+                        .map_err(|e| HandlerError::invalid(e.to_string()))?;
+                        let decimals = client
+                            .erc20_decimals(contract)
+                            .await
+                            .map_err(err_be)?
+                            .ok_or_else(|| {
+                                HandlerError::invalid(format!(
+                                    "{contract} does not report ERC-20 decimals"
+                                ))
+                            })?;
+                        SendAsset::Token { contract, decimals }
+                    }
+                })
             }
             _ => None,
         };
-        let mut req = build_tx_request(&intent, &self.addr_book, token_meta)?;
+        let mut req = build_tx_request(&intent, &self.addr_book, asset)?;
         if let Some(addr) = from {
             use alloy::network::TransactionBuilder;
             req = req.with_from(addr);
@@ -821,7 +839,7 @@ impl SimulateHandler {
                 // The newest session at a fixed path, as `outbox/latest` is.
                 "latest" => {
                     let g = self.sessions.read();
-                    let newest = g.keys().max().ok_or_else(|| {
+                    let newest = newest_session(g.keys()).ok_or_else(|| {
                         HandlerError::not_found("simulate/latest: nothing was simulated yet")
                     })?;
                     Ok(Entry::symlink("latest", newest))
@@ -864,9 +882,7 @@ impl SimulateHandler {
             }
             1 if segs[0] == "last" => {
                 let g = self.sessions.read();
-                let mut ids: Vec<&String> = g.keys().collect();
-                ids.sort();
-                let last = ids.last().map(|s| s.as_str()).unwrap_or("");
+                let last = newest_session(g.keys()).map_or("", |s| s.as_str());
                 Ok(format!("{}\n", last).into_bytes())
             }
             2 => {
@@ -901,7 +917,7 @@ impl SimulateHandler {
                 let g = self.sessions.read();
                 let mut ids: Vec<&String> = g.keys().collect();
                 ids.sort();
-                if let Some(newest) = ids.last() {
+                if let Some(newest) = newest_session(g.keys()) {
                     out.push(Entry::symlink("latest", newest));
                 }
                 for id in ids {
@@ -943,13 +959,66 @@ mod tests {
             .parse()
             .unwrap();
         let book = bloom_proto::AddressBook::default();
-        let req = super::build_tx_request(&intent, &book, Some((token, 6))).unwrap();
+        let asset = super::SendAsset::Token {
+            contract: token,
+            decimals: 6,
+        };
+        let req = super::build_tx_request(&intent, &book, Some(asset)).unwrap();
         assert_eq!(req.to, Some(alloy::primitives::TxKind::Call(token)));
-        let input = req.input.input().unwrap();
-        assert_eq!(&input[..4], [0xa9, 0x05, 0x9c, 0xbb]);
-        assert_eq!(U256::from_be_slice(&input[36..]), U256::from(1_500_000u64));
+        let staged = bloom_evm::IERC20::transferCall {
+            to: "0x0000000000000000000000000000000000000002"
+                .parse()
+                .unwrap(),
+            amount: U256::from(1_500_000u64),
+        };
+        assert_eq!(
+            req.input.input().unwrap().as_ref(),
+            alloy::sol_types::SolCall::abi_encode(&staged)
+        );
         // Unresolved, it is refused rather than sent as a native transfer.
         assert!(super::build_tx_request(&intent, &book, None).is_err());
+    }
+
+    /// A body naming the chain's own asset as `token` is the native send
+    /// staging makes of it, not an ERC-20 lookup.
+    #[test]
+    fn the_native_symbol_simulates_a_native_send() {
+        let intent = bloom_tx::intent_parser::parse(
+            r#"{"kind":"send","to":"0x0000000000000000000000000000000000000002","token":"POL","amount":"0.01"}"#,
+        )
+        .unwrap();
+        let spec: bloom_proto::ChainSpec = serde_json::from_value(serde_json::json!({
+            "name": "polygon", "chain_id": 137, "rpc_urls": ["http://127.0.0.1:9"],
+            "native_symbol": "POL", "native_decimals": 18,
+        }))
+        .unwrap();
+        let RawIntentBody::Send {
+            value,
+            token,
+            amount,
+            ..
+        } = &intent.body
+        else {
+            panic!("a send");
+        };
+        let native = bloom_tx::tx_engine::TxEngine::native_send_value(&spec, value, token, amount)
+            .unwrap()
+            .expect("POL is polygon's native asset");
+        let book = bloom_proto::AddressBook::default();
+        let req = super::build_tx_request(&intent, &book, Some(super::SendAsset::Native(native)))
+            .unwrap();
+        assert_eq!(req.value, Some(U256::from(10_000_000_000_000_000u64)));
+        assert!(req.input.input().is_none_or(|input| input.is_empty()));
+        // USDC there is a token: staging and simulation both look it up.
+        let usdc = Some("USDC".to_owned());
+        let token = bloom_tx::tx_engine::TxEngine::native_send_value(&spec, "", &usdc, "1");
+        assert!(matches!(token, Ok(None)));
+    }
+
+    #[test]
+    fn simulate_latest_is_the_newest_session_past_four_digits() {
+        let ids = ["sim-9999".to_owned(), "sim-10000".to_owned()];
+        assert_eq!(super::newest_session(ids.iter()).unwrap(), "sim-10000");
     }
 
     #[test]
