@@ -494,9 +494,12 @@ developer launcher does the same on every launch
 (`init triad-refresh-developer-provenance-catalog`), keeping developer-owned
 records such as locally enrolled Petals. A long-lived developer root therefore
 picks up new pinned releases on its next launch. An installation without
-source provenance (a manual local install of a default Petal) is never
-replaced: uninstall it first, then relaunch. It is reused while its package
-hash equals the pinned release's hash.
+source provenance (a local install of a default release archive) is reused
+when its package hash equals the pinned release's hash. If its hash is an
+explicit predecessor in the pinned catalog, provisioning upgrades it through
+the same verified download, signed activation and private-state carry-forward
+checks as a source-tracked installation. No uninstall is needed. Unknown
+package hashes and conflicting source identities are not overwritten.
 
 ## General local operation
 

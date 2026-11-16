@@ -41,8 +41,9 @@ The shortest agent setup path is:
 > Tell your agent: **"Read https://bloom.directory/SKILL.md and set up Bloom."**
 
 To install the agent skill from this repository, use
-`npx skills add bloom-directory/bloom --skill bloom`. This installs guidance,
-not the Bloom software. The [skill](./skills/bloom/SKILL.md) connects an existing
+`npx skills add bloom-directory/bloom --skill bloom`, or on ClawHub
+`clawhub install @bloom-directory/bloom`. This installs guidance, not the Bloom
+software. The [skill](./skills/bloom/SKILL.md) connects an existing
 session first and hands operation over to Bloom's filesystem. See
 [skill distribution](./docs/agent-skill.md) for publishing and website updates.
 
