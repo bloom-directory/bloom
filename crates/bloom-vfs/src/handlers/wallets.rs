@@ -4283,12 +4283,9 @@ impl WalletsHandler {
             }
         };
         match rest {
-            // The root guide's `send.tx` and its bodies are EVM's.
-            [s] if s == "send.tx" => Err(HandlerError::invalid(
-                "a Solana outbox has no send.tx and takes its own body: read README.md here, write the body to new.tx, then y to latest/confirm",
-            )),
-            // outbox/new.tx — stage a native transfer.
-            [s] if s == "new.tx" => {
+            // outbox/new.tx — stage a native transfer. outbox/send.tx —
+            // stage it and confirm it in the same write, as on EVM.
+            [s] if s == "new.tx" || s == "send.tx" => {
                 self.write_permit()?;
                 let mut intent: bloom_solana_tx::SolanaTransferIntent =
                     serde_json::from_slice(data).map_err(|e| {
@@ -4324,6 +4321,13 @@ impl WalletsHandler {
                     .await
                     .map_err(|e| HandlerError::backend(e.to_string()))?;
                 tracing::info!(wallet, chain, id = %staged.id, "solana_outbox.staged");
+                if s == "send.tx" {
+                    let confirm = ["pending".to_owned(), staged.id, "confirm".to_owned()];
+                    return Box::pin(self.write_solana_outbox(
+                        wallet, chain, &confirm, b"y", engine, pinned, account,
+                    ))
+                    .await;
+                }
                 Ok(())
             }
             // outbox/pending/<id>/confirm — sign (ceremony) then broadcast.
@@ -7821,6 +7825,24 @@ value = "0""#,
             .await
             .unwrap();
         assert_eq!(listed.len(), 1);
+        // `send.tx` also confirms, so without live authority it is refused
+        // before anything is staged.
+        let error = handler
+            .write(
+                &VfsPath::parse("/alice/0/chains/solana-devnet/outbox/send.tx").unwrap(),
+                serde_json::to_vec(&intent).unwrap().as_slice(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, HandlerError::Backend(message) if message.contains("authority unavailable")),
+            "{error:?}"
+        );
+        let pending = handler
+            .list(&VfsPath::parse("/alice/0/chains/solana-devnet/outbox/pending").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
         let error = handler
             .write(
                 &VfsPath::parse(&format!(
@@ -7964,6 +7986,7 @@ value = "0""#,
             .list(&VfsPath::parse("/alice/0/chains/solana-devnet/outbox").unwrap())
             .await
             .unwrap();
+        assert!(outbox_entries.iter().any(|entry| entry.name == "send.tx"));
         assert!(outbox_entries.iter().any(|entry| entry.name == "new.tx"));
         assert_eq!(
             outbox_entries

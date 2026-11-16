@@ -1979,6 +1979,7 @@ impl WalletsHandler {
             [] => Ok(Entry::dir("outbox")),
             [leaf] if leaf == OUTBOX_README => Ok(outbox_readme_entry(SOLANA_OUTBOX_README)),
             [leaf] if leaf == "new.tx" => Ok(Entry::writable_file("new.tx")),
+            [leaf] if leaf == SEND_TX => Ok(Entry::writable_file(SEND_TX)),
             [leaf] if leaf == "latest" => {
                 let target = self
                     .solana_latest_target(wallet, family, chain)?
@@ -2067,6 +2068,7 @@ impl WalletsHandler {
                 let mut entries = vec![
                     outbox_readme_entry(SOLANA_OUTBOX_README),
                     Entry::writable_file("new.tx"),
+                    Entry::writable_file(SEND_TX),
                     Entry::dir("pending"),
                     Entry::dir("sent"),
                     Entry::dir("failed"),
