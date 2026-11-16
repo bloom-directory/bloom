@@ -267,7 +267,7 @@ impl ChainsHandler {
         Ok((decimals, symbol))
     }
 
-    /// Build the `tokens/known.json` payload: curated majors for this
+    /// Build the `tokens/known.json` payload: Bloom's token list for this
     /// chain plus, when an address-history backend is available, tokens
     /// the holder has recently transferred. `discovery_backend` tells the
     /// agent whether history-based discovery actually ran.
@@ -282,12 +282,11 @@ impl ChainsHandler {
         let chain_id = client.spec().chain_id;
 
         let known: Vec<KnownEntry> = wkt::for_chain(chain_id)
-            .iter()
             .filter_map(|t| {
                 let addr = t.address.parse::<alloy::primitives::Address>().ok()?;
                 Some(KnownEntry {
                     address: checksum_address(&addr),
-                    symbol: t.symbol.to_string(),
+                    symbol: t.symbol.clone(),
                     decimals: t.decimals,
                     source: "well-known",
                 })
@@ -313,10 +312,10 @@ impl ChainsHandler {
             };
 
         let note = if discovery_backend == "etherscan" {
-            "known = curated majors; discovered = tokens this address recently \
+            "known = Bloom's token list; discovered = tokens this address recently \
              transferred. Read tokens/<address>/balance.json for any token."
         } else {
-            "known = curated majors. History-based discovery is unavailable on \
+            "known = Bloom's token list. History-based discovery is unavailable on \
              this chain/backend; read tokens/<address>/balance.json for any token \
              you know."
         }
@@ -850,6 +849,7 @@ impl ChainsHandler {
                 3 => Ok(Entry::dir(&segs[2])),
                 4 => {
                     let f = segs[3].as_str();
+                    super::balances::require_native_asset(client.spec(), f)?;
                     if ADDRESS_FILES_CORE.contains(&f) {
                         Ok(Entry::file(f))
                     } else if ADDRESS_FILES_ETHERSCAN.contains(&f) {
@@ -984,6 +984,7 @@ impl ChainsHandler {
             "addresses" if segs.len() == 4 => {
                 let addr = parse_addr(&segs[2])?;
                 let spec = client.spec();
+                super::balances::require_native_asset(spec, &segs[3])?;
                 match segs[3].as_str() {
                     "balance" => {
                         let bal = client.balance(addr).await.map_err(err_be)?;
@@ -1289,7 +1290,16 @@ impl ChainsHandler {
             "contracts" if segs.len() >= 4 => self.read_contracts(path, segs, &client).await,
             "gas" if segs.get(2).map(|s| s.as_str()) == Some("current.json") => {
                 let gp = client.gas_price().await.map_err(err_be)?;
-                let body = serde_json::json!({ "gas_price_wei": gp });
+                let eip1559 = if client.spec().legacy_tx {
+                    None
+                } else {
+                    let (max_fee, priority) = client.eip1559_fees(gp).await;
+                    Some(serde_json::json!({
+                        "max_fee_per_gas": max_fee.to_string(),
+                        "max_priority_fee_per_gas": priority.to_string(),
+                    }))
+                };
+                let body = serde_json::json!({ "gas_price_wei": gp, "eip1559": eip1559 });
                 Ok(serde_json::to_vec_pretty(&body).unwrap())
             }
             "mempool" => match self.mempool_handlers.get(chain.as_str()) {
@@ -1344,6 +1354,7 @@ impl ChainsHandler {
             "addresses" if segs.len() == 4 => {
                 let addr = parse_addr(&segs[2])?;
                 let spec = client.spec().clone();
+                super::balances::require_native_asset(&spec, &segs[3])?;
                 let session = client.open_session_at(block_number).await.map_err(err_be)?;
                 match segs[3].as_str() {
                     "balance" => {
@@ -1458,8 +1469,12 @@ impl ChainsHandler {
             2 if segs[1] == "gas" => Ok(vec![Entry::file("current.json")]),
             3 if segs[1] == "addresses" => {
                 // /chains/<chain>/addresses/<addr>
-                let mut entries: Vec<Entry> =
-                    ADDRESS_FILES_CORE.iter().map(|n| Entry::file(n)).collect();
+                let no_native = super::balances::native_balance_leaves(client.spec()).is_empty();
+                let mut entries: Vec<Entry> = ADDRESS_FILES_CORE
+                    .iter()
+                    .filter(|n| !(no_native && super::balances::NATIVE_BALANCE_LEAVES.contains(n)))
+                    .map(|n| Entry::file(n))
+                    .collect();
                 entries.push(Entry::dir("tokens"));
                 entries.push(Entry::dir("nfts"));
                 if self.address_history_ready() {
@@ -3583,6 +3598,49 @@ mod tests {
         assert_eq!(json["symbol"], "ETH");
         assert_eq!(json["raw"], "1000000000000000000");
         assert_eq!(json["display"], "1 ETH");
+    }
+
+    #[tokio::test]
+    async fn tempo_native_balance_is_refused_not_rendered() {
+        // Tempo's RPC returns this placeholder for every address (bloom#288).
+        let mut responses = std::collections::HashMap::new();
+        responses.insert(
+            "eth_getBalance".to_string(),
+            serde_json::Value::String(
+                "0x9612084f0316e0ebd5182f398e5195a51b5ca47667d4c9b26c9b26c9b26c9b2".into(),
+            ),
+        );
+        let tempo = bloom_proto::chain::TEMPO_MAINNET_CHAIN_ID;
+        let h = ChainsHandler::new(registry_for_rpc(spawn_rpc(tempo, responses), tempo));
+        for leaf in ["balance", "balance.raw", "balance.json"] {
+            let path = VfsPath::parse(&format!("/test/addresses/{HOLDER_ADDR}/{leaf}")).unwrap();
+            match h.read(&path).await {
+                Err(HandlerError::Unsupported(message)) => {
+                    assert!(message.contains("no native token"), "{message}")
+                }
+                other => panic!("{leaf}: expected Unsupported, got {other:?}"),
+            }
+            assert!(matches!(
+                h.lookup(&path).await,
+                Err(HandlerError::Unsupported(_))
+            ));
+        }
+        // A typo is an ordinary missing path, not the native refusal.
+        let typo = VfsPath::parse(&format!("/test/addresses/{HOLDER_ADDR}/balance.bad")).unwrap();
+        assert!(matches!(
+            h.lookup(&typo).await,
+            Err(HandlerError::NotFound(_))
+        ));
+        let dir = VfsPath::parse(&format!("/test/addresses/{HOLDER_ADDR}")).unwrap();
+        let names: Vec<_> = h
+            .list(&dir)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.iter().any(|n| n == "nonce"), "{names:?}");
+        assert!(!names.iter().any(|n| n.starts_with("balance")), "{names:?}");
     }
 
     // ---- methods/ enumeration + EIP-1967 proxy resolution ----------------

@@ -898,13 +898,12 @@ mod tests {
     }
 
     #[test]
-    fn agent_guidance_anvil_example_is_a_valid_chain_config() {
-        let guidance = std::str::from_utf8(AGENT_GUIDANCE).expect("guidance is utf-8");
-        let example = guidance
+    fn examples_anvil_config_is_a_valid_chain_config() {
+        let example = include_str!("docs/examples.md")
             .split_once("```toml\n[chains.anvil]")
             .and_then(|(_, rest)| rest.split_once("```"))
             .map(|(body, _)| format!("[chains.anvil]{body}"))
-            .expect("guidance documents an opt-in Anvil chain");
+            .expect("examples document an opt-in Anvil chain");
         // Operators add the documented entry to their existing configuration.
         let fragment: bloom_proto::config::Config = toml::from_str(&example).unwrap();
         let anvil = fragment.chains.get("anvil").unwrap().clone();

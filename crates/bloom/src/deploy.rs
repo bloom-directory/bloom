@@ -20,8 +20,8 @@ pub struct DeployArgs {
     wallet: String,
     #[arg(long)]
     chain: String,
-    /// Review for contract calls; use clear on a clear-signing wallet.
-    #[arg(long, value_parser = ["clear", "opaque_exact"])]
+    /// Deprecated: Broker determines review from the complete signing request.
+    #[arg(long, hide = true, value_parser = ["clear", "opaque_exact"])]
     review_mode: Option<String>,
     #[command(subcommand)]
     command: DeployCommand,
@@ -78,6 +78,7 @@ impl Bridge {
             return error(-32600, "method is required", Value::Null);
         };
         let mut params = req.get("params").cloned().unwrap_or_else(|| json!([]));
+        // Preserve old retry IDs; this metadata no longer selects authority.
         if method == "eth_sendTransaction"
             && let Some(mode) = &self.review_mode
             && let Some(transaction) = params.get_mut(0).and_then(Value::as_object_mut)
@@ -265,6 +266,11 @@ async fn handle(
 }
 
 pub async fn run(endpoint: ResolvedEndpoint, args: DeployArgs) -> Result<()> {
+    if args.review_mode.is_some() {
+        eprintln!(
+            "--review-mode is deprecated: retained only for retry identity; Broker determines signing review"
+        );
+    }
     super::validate_wallet_name(&args.wallet)?;
     super::validate_wallet_name(&args.chain)?;
     let mut bridge = Bridge {
@@ -339,6 +345,27 @@ pub async fn run(endpoint: ResolvedEndpoint, args: DeployArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deprecated_review_mode_remains_parseable() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: super::DeployArgs,
+        }
+        let parsed = Cli::try_parse_from([
+            "bloom",
+            "--wallet",
+            "alice",
+            "--chain",
+            "anvil",
+            "--review-mode",
+            "clear",
+            "rpc",
+        ])
+        .unwrap();
+        assert_eq!(parsed.args.review_mode.as_deref(), Some("clear"));
+    }
     use super::*;
     use crate::ResolvedEndpoint;
     use axum::extract::State;

@@ -49,8 +49,9 @@ the workflow.
 
 Run **Actions → Propose Release → Run workflow** with the next version without
 `v`. Review changes to `Cargo.toml`, workspace metadata in `Cargo.lock`, and
-the Machine version in `packaging/triad/release/compatibility-v1.toml`. The
-workflow refuses to upgrade unrelated external dependencies. The compatibility
+the Machine version in `packaging/triad/release/compatibility-v1.toml`, and the
+skill version in `skills/bloom/SKILL.md`; the release workflow requires all
+three to equal the tag. The workflow refuses to upgrade unrelated external dependencies. The compatibility
 matrix also pins the reviewed Broker and Signer source commits; changes to
 those pins require review independently of the version bump.
 
@@ -116,7 +117,9 @@ The publish job rechecks that the tag still names the built SHA, then publishes
 all targets together as a normal GitHub Release. A retry compares existing
 assets byte for byte, rejects unexpected or changed assets, and uploads only
 missing assets. The current retry path marks the release latest; maintainers
-should account for that when retrying an older tag. GitHub's
+should account for that when retrying an older tag. It refreshes the generated
+changes section and preserves maintainer notes outside it. Older tags execute
+their own workflow and may overwrite curated notes. GitHub's
 `/releases/latest/download/...` routes follow the release marked latest and do
 not need a floating `latest` Git tag.
 

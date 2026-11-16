@@ -1,0 +1,93 @@
+{
+  "current": {
+    "wallet_id": "wallet",
+    "maximum_approval_lifetime_ms": 300000,
+    "allowed_petal_packages": [
+      "1111111111111111111111111111111111111111111111111111111111111111"
+    ],
+    "allowed_destinations": [
+      {
+        "chain": "ethereum",
+        "destination": "kept"
+      }
+    ],
+    "required_verifiers": [
+      {
+        "verifier_id": "evm-clear-signing-v1",
+        "verifier_digest": "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a"
+      },
+      {
+        "verifier_id": "human",
+        "verifier_digest": "3333333333333333333333333333333333333333333333333333333333333333"
+      }
+    ],
+    "clear_signing": {
+      "catalog_id": "evm-v1",
+      "trusted_keys": [
+        {
+          "key_id": "catalog-key",
+          "verifying_key": "AQID"
+        }
+      ],
+      "signature_threshold": 1,
+      "maximum_observation_age_ms": 86400000,
+      "opaque_exact_allowed": false,
+      "unlimited_allowance_allowed": false,
+      "verifier": {
+        "verifier_id": "evm-clear-signing-v1",
+        "verifier_digest": "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a"
+      }
+    }
+  },
+  "proposed": {
+    "wallet_id": "wallet",
+    "maximum_approval_lifetime_ms": 300000,
+    "allowed_petal_packages": [
+      "1111111111111111111111111111111111111111111111111111111111111111"
+    ],
+    "allowed_destinations": [
+      {
+        "chain": "ethereum",
+        "destination": "kept"
+      }
+    ],
+    "required_verifiers": [
+      {
+        "verifier_id": "human",
+        "verifier_digest": "3333333333333333333333333333333333333333333333333333333333333333"
+      }
+    ]
+  },
+  "authority_diff": {
+    "maximum_approval_lifetime_ms_before": "300000",
+    "maximum_approval_lifetime_ms_after": "300000",
+    "added_petal_packages": [],
+    "removed_petal_packages": [],
+    "added_destinations": [],
+    "removed_destinations": [],
+    "added_required_verifiers": [],
+    "removed_required_verifiers": [
+      {
+        "verifier_id": "evm-clear-signing-v1",
+        "verifier_digest": "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a"
+      }
+    ],
+    "removed_legacy_clear_signing": {
+      "catalog_id": "evm-v1",
+      "trusted_keys": [
+        {
+          "key_id": "catalog-key",
+          "verifying_key": "AQID"
+        }
+      ],
+      "signature_threshold": 1,
+      "maximum_observation_age_ms": 86400000,
+      "opaque_exact_allowed": false,
+      "unlimited_allowance_allowed": false,
+      "verifier": {
+        "verifier_id": "evm-clear-signing-v1",
+        "verifier_digest": "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a"
+      }
+    }
+  }
+}

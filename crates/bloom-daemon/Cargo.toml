@@ -68,4 +68,7 @@ tempfile.workspace = true
 
 [dev-dependencies]
 bloom-proto = { workspace = true, features = ["audit-test-seam"] }
+# Dependent test targets, and release-profile tests (no debug_assertions),
+# reach the test constructors only through this feature.
+bloom-daemon = { workspace = true, features = ["unsigned-audit-test-seam"] }
 bs58.workspace = true

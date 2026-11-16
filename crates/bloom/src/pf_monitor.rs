@@ -122,12 +122,15 @@ pub fn run_once() -> Result<()> {
         // directories before status publication or the login sentinel can start.
         crate::macos_runtime::prepare(
             Path::new("/private/var/run/bloom"),
-            login_uid,
-            required_u32(&enrollment, "broker_uid")?,
-            required_u32(&enrollment, "signer_uid")?,
-            required_u32(&enrollment, "machine_broker_gid")?,
-            required_u32(&enrollment, "broker_signer_gid")?,
-            revoke_gid,
+            crate::macos_runtime::Principals {
+                login_uid,
+                broker_uid: required_u32(&enrollment, "broker_uid")?,
+                signer_uid: required_u32(&enrollment, "signer_uid")?,
+                signer_gid: required_u32(&enrollment, "signer_gid")?,
+                machine_broker_gid: required_u32(&enrollment, "machine_broker_gid")?,
+                broker_signer_gid: required_u32(&enrollment, "broker_signer_gid")?,
+                revoke_gid,
+            },
         )
         .context("prepare macOS authority runtime")?;
         stop_sentinel_if_gui_ended(
