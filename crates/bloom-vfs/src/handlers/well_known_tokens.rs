@@ -1,16 +1,14 @@
 //! `tokens/known.json` payload types for the VFS token surface.
 //!
-//! The well-known token *table* itself now lives in `bloom_proto::tokens`
-//! (the single source of truth shared by the send path, the route path, and
-//! this VFS surface). `KnownToken`/`for_chain` are re-exported here so the
-//! `addresses/<a>/tokens/` handler keeps its existing import path.
+//! The token list itself is `bloom_broker_api::known_tokens`, the one list
+//! Broker and Machine both compile in.
 //!
 //! Addresses are stored lowercase and re-checksummed at serialization time,
 //! so casing can never be wrong.
 
 use serde::Serialize;
 
-pub use bloom_proto::tokens::for_chain;
+pub use bloom_broker_api::tokens_on as for_chain;
 
 /// One curated token in `known.json`.
 #[derive(Serialize)]

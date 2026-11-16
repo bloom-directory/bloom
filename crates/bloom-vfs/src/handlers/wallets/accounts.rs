@@ -42,6 +42,47 @@ pub const ACCOUNT_KEY_FILES: [&str; 7] = [
 /// only with outbox entries that account's EVM key staged.
 const EVM_MEMPOOL_LEAVES: [&str; 2] = ["pending_external.jsonl", "nonce_conflicts.json"];
 
+/// How long `holdings.json` waits for each chain. Chains are read
+/// concurrently, so this bounds the whole read; reads finished by then are
+/// kept and the rest are named under `errors`.
+const HOLDINGS_CHAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The token symbols `holdings.json` checks on each EVM chain. The token
+/// catalog lists hundreds of tokens on major chains, far too many reads for
+/// one file; this keeps each chain to a handful of `balanceOf` calls. Other
+/// tokens are read one at a time under `chains/<chain>/addresses/<a>/tokens/`.
+const HOLDINGS_SYMBOLS: [&str; 11] = [
+    "USDC", "USDC.e", "USDT", "USDT0", "DAI", "USDS", "pathUSD", "WETH", "wstETH", "WBTC", "cbBTC",
+];
+
+/// Token balance reads in flight per chain.
+const HOLDINGS_CONCURRENCY: usize = 4;
+
+/// The catalog rows on `chain_id` whose symbol is in `HOLDINGS_SYMBOLS`.
+pub(super) fn holdings_tokens(chain_id: u64) -> Vec<(alloy::primitives::Address, String, u8)> {
+    // A loop, not slice methods: the catalog may be a slice or an iterator.
+    let mut rows = Vec::new();
+    for token in crate::handlers::well_known_tokens::for_chain(chain_id) {
+        if HOLDINGS_SYMBOLS
+            .iter()
+            .any(|symbol| token.symbol.eq_ignore_ascii_case(symbol))
+            && let Ok(address) = token.address.parse()
+        {
+            rows.push((address, token.symbol.to_string(), token.decimals));
+        }
+    }
+    rows
+}
+
+/// One chain's part of `holdings.json`.
+#[derive(Default)]
+struct ChainHoldings {
+    found: Vec<serde_json::Value>,
+    /// Symbols whose balance could not be read.
+    unread: Vec<String>,
+    timed_out: bool,
+}
+
 /// Sorted account-owned nonces and the transaction hashes grouped by nonce.
 type EvmOutboxNonces = (Vec<u64>, std::collections::BTreeMap<u64, Vec<String>>);
 
@@ -364,7 +405,7 @@ impl WalletsHandler {
     }
 
     fn account_dir_entries(view: &AccountView) -> Vec<Entry> {
-        let mut entries = vec![Entry::file("account.json")];
+        let mut entries = vec![Entry::file("account.json"), Entry::file("holdings.json")];
         entries.extend(
             ACCOUNT_KEY_FILES
                 .into_iter()
@@ -446,6 +487,13 @@ impl WalletsHandler {
     }
 
     fn chain_name_entries(&self, view: &AccountView) -> Vec<Entry> {
+        self.chain_names(view)
+            .into_iter()
+            .map(|name| Entry::dir(&name))
+            .collect()
+    }
+
+    fn chain_names(&self, view: &AccountView) -> std::collections::BTreeSet<String> {
         let mut names = std::collections::BTreeSet::new();
         if view.evm.as_ref().and_then(FamilyKey::address).is_some() {
             names.extend(self.chains.list_names());
@@ -456,7 +504,197 @@ impl WalletsHandler {
                 names.extend(solana.keys().cloned());
             }
         }
-        names.into_iter().map(|name| Entry::dir(&name)).collect()
+        names
+    }
+
+    /// `holdings.json`: the account's non-zero native and major token
+    /// balances on every chain it lists. Chains are read concurrently, each
+    /// under one deadline; a chain keeps the rows it read and lists what it
+    /// could not read under `errors`.
+    async fn holdings_json(&self, view: &AccountView) -> Result<Vec<u8>, HandlerError> {
+        let names = self.chain_names(view);
+        let deadline = tokio::time::Instant::now() + HOLDINGS_CHAIN_TIMEOUT;
+        let reads =
+            futures::future::join_all(names.iter().map(|chain| async move {
+                (chain, self.chain_holdings(view, chain, deadline).await)
+            }))
+            .await;
+        let mut holdings = Vec::new();
+        let mut errors = serde_json::Map::new();
+        for (chain, read) in reads {
+            match read {
+                Ok(read) => {
+                    holdings.extend(read.found);
+                    if !read.unread.is_empty() {
+                        let prefix = if read.timed_out { "timed out; " } else { "" };
+                        let message = format!("{prefix}could not read {}", read.unread.join(", "));
+                        errors.insert(chain.clone(), message.into());
+                    }
+                }
+                Err(error) => {
+                    errors.insert(chain.clone(), error.to_string().into());
+                }
+            }
+        }
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "holdings": holdings,
+            "errors": errors,
+        }))
+        .map_err(err_be)
+    }
+
+    /// One chain's non-zero balances for `holdings.json`: the native asset
+    /// (none on a chain without one) and, on EVM chains, the major tokens of
+    /// `HOLDINGS_SYMBOLS`. Reads that fail or miss `deadline` are named in
+    /// `unread`; completed rows are kept.
+    async fn chain_holdings(
+        &self,
+        view: &AccountView,
+        chain: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<ChainHoldings, HandlerError> {
+        use crate::handlers::balances::{SOL_DECIMALS, SOL_SYMBOL, amount_fields};
+        use alloy::primitives::U256;
+        use futures::StreamExt;
+        let mut read = ChainHoldings::default();
+        if self.is_solana_chain(chain) {
+            let (_, account) = Self::solana_family(view, chain)?;
+            match tokio::time::timeout_at(deadline, self.solana_balance(chain, &account.address))
+                .await
+            {
+                Ok(lamports) => read.found.push(amount_fields(
+                    chain,
+                    "native",
+                    SOL_SYMBOL,
+                    SOL_DECIMALS,
+                    U256::from(lamports?),
+                )),
+                Err(_) => {
+                    read.timed_out = true;
+                    read.unread.push(SOL_SYMBOL.into());
+                }
+            }
+        } else {
+            let client = self
+                .chains
+                .get(chain)
+                .ok_or_else(|| HandlerError::not_found(format!("chain '{chain}'")))?;
+            let holder = Self::evm_address(Self::evm_family(view, chain)?)?;
+            let spec = client.spec();
+            if spec.has_native_asset() {
+                match tokio::time::timeout_at(deadline, client.balance(holder)).await {
+                    Ok(Ok(native)) => read.found.push(amount_fields(
+                        chain,
+                        "native",
+                        &spec.native_symbol,
+                        spec.native_decimals,
+                        native,
+                    )),
+                    Ok(Err(_)) => read.unread.push(spec.native_symbol.clone()),
+                    Err(_) => {
+                        read.timed_out = true;
+                        read.unread.push(spec.native_symbol.clone());
+                    }
+                }
+            }
+            let tokens = holdings_tokens(spec.chain_id);
+            if !spec.has_native_asset() && tokens.is_empty() {
+                // Otherwise the chain would look checked and empty.
+                return Err(HandlerError::not_found(format!(
+                    "no balances checked: chain '{chain}' has no native token and no known \
+                     tokens; read chains/{chain}/addresses/<address>/tokens/<token>/ by address"
+                )));
+            }
+            let client = &client;
+            let contracts: Vec<_> = tokens.iter().map(|(contract, ..)| *contract).collect();
+            let mut done = vec![None; tokens.len()];
+            // One Multicall3 request where the node has it. If the batch is
+            // unavailable there, read tokens one by one; if the node failed or
+            // throttled, send it nothing more.
+            let batch = if contracts.is_empty() {
+                Ok(Ok(Some(Vec::new())))
+            } else {
+                tokio::time::timeout_at(
+                    deadline,
+                    client.token_balances_by_multicall(holder, &contracts),
+                )
+                .await
+            };
+            match batch {
+                Ok(Ok(Some(balances))) => {
+                    for (slot, balance) in done.iter_mut().zip(balances) {
+                        *slot = Some(balance);
+                    }
+                }
+                Ok(Ok(None)) => {
+                    // Owned (index, contract) pairs keep the futures free of
+                    // borrowed closure arguments, which async-trait's Send
+                    // bound rejects. `buffer_unordered` runs at most
+                    // HOLDINGS_CONCURRENCY and yields each read as it
+                    // finishes, so a slow token does not hide later ones.
+                    let reads =
+                        contracts
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, contract)| async move {
+                                (index, client.erc20_balance(contract, holder).await)
+                            });
+                    let mut balances =
+                        futures::stream::iter(reads).buffer_unordered(HOLDINGS_CONCURRENCY);
+                    loop {
+                        let Ok(next) = tokio::time::timeout_at(deadline, balances.next()).await
+                        else {
+                            read.timed_out = true;
+                            break;
+                        };
+                        let Some((index, balance)) = next else { break };
+                        match balance {
+                            Ok(balance) => done[index] = Some(balance),
+                            // The node failed or throttled: stop asking it.
+                            Err(_) => break,
+                        }
+                    }
+                }
+                Ok(Err(_)) => {}
+                Err(_) => read.timed_out = true,
+            }
+            for ((contract, symbol, decimals), balance) in tokens.iter().zip(done) {
+                match balance {
+                    Some(Some(raw)) => {
+                        let mut held = amount_fields(chain, "erc20", symbol, *decimals, raw);
+                        held["address"] = bloom_proto::checksum_address(contract).into();
+                        read.found.push(held);
+                    }
+                    _ => read.unread.push(symbol.clone()),
+                }
+            }
+        }
+        read.found.retain(|held| held["raw"] != "0");
+        Ok(read)
+    }
+
+    /// Fence batch confirmation to the selected account, as single-item controls do.
+    pub async fn require_outbox_account(
+        &self,
+        wallet: &str,
+        number: u32,
+        chain: &str,
+        id: &str,
+    ) -> Result<(), HandlerError> {
+        let view = self.account_view(wallet, number).await?;
+        let from = Self::evm_address(Self::evm_family(&view, chain)?)?;
+        // Batch retries also reconcile already-sent children.
+        let entry = self
+            .tx_engine
+            .outbox
+            .read(wallet, chain, id)
+            .map_err(super::outbox_err)?;
+        if !entry.staged.from.eq_ignore_ascii_case(&from.to_string()) {
+            return Err(HandlerError::not_found(format!(
+                "account {number}/outbox/{id}"
+            )));
+        }
+        Ok(())
     }
 
     pub(super) async fn lookup_account(
@@ -473,7 +711,11 @@ impl WalletsHandler {
                 let sessions = self.account_sessions(wallet, &view)?;
                 Self::lookup_account_session(&sessions, sessions_rest)
             }
-            [leaf] if leaf == "account.json" || Self::key_file_key(&view, leaf).is_some() => {
+            [leaf]
+                if leaf == "account.json"
+                    || leaf == "holdings.json"
+                    || Self::key_file_key(&view, leaf).is_some() =>
+            {
                 Ok(Entry::file(leaf))
             }
             [dir] if dir == "chains" => Ok(Entry::dir("chains")),
@@ -509,6 +751,7 @@ impl WalletsHandler {
         };
         match rest {
             [leaf] if leaf == "account.json" => self.account_json(wallet, &view),
+            [leaf] if leaf == "holdings.json" => self.holdings_json(&view).await,
             [leaf] if ACCOUNT_KEY_FILES.contains(&leaf.as_str()) => {
                 Self::read_account_key_file(&view, leaf)
             }
@@ -694,7 +937,7 @@ impl WalletsHandler {
             .chain_id;
         let policy =
             crate::advisory_exact_evm_policy(&projection, chain, chain_id).map_err(err_be)?;
-        self.write_outbox_from(wallet, chain, from, &policy, chain_rest, data)
+        self.write_outbox_from(wallet, chain, from, &policy, chain_rest, data, number)
             .await
     }
 
@@ -732,9 +975,13 @@ impl WalletsHandler {
         chain: &str,
         rest: &[String],
     ) -> Result<Entry, HandlerError> {
-        self.chains
+        let client = self
+            .chains
             .get(chain)
             .ok_or_else(|| HandlerError::not_found(format!("chain '{chain}'")))?;
+        if let [leaf] = rest {
+            crate::handlers::balances::require_native_asset(client.spec(), leaf)?;
+        }
         match rest {
             [] => Ok(Entry::dir(chain)),
             [leaf]
@@ -767,6 +1014,9 @@ impl WalletsHandler {
             .get(chain)
             .ok_or_else(|| HandlerError::not_found(format!("chain '{chain}'")))?;
         let address = Self::evm_address(family)?;
+        if let [leaf] = rest {
+            crate::handlers::balances::require_native_asset(client.spec(), leaf)?;
+        }
         match rest {
             [leaf] if leaf == "balance" => {
                 let balance = client.balance(address).await.map_err(err_be)?;
@@ -818,19 +1068,19 @@ impl WalletsHandler {
         chain: &str,
         rest: &[String],
     ) -> Result<Vec<Entry>, HandlerError> {
-        self.chains
+        let client = self
+            .chains
             .get(chain)
             .ok_or_else(|| HandlerError::not_found(format!("chain '{chain}'")))?;
         match rest {
-            [] => Ok(vec![
-                Entry::file("balance"),
-                Entry::file("balance.raw"),
-                Entry::file("balance.json"),
-                Entry::file("nonce"),
-                Entry::file("pending_external.jsonl"),
-                Entry::file("nonce_conflicts.json"),
-                Entry::dir("outbox"),
-            ]),
+            [] => Ok(
+                crate::handlers::balances::native_balance_leaves(client.spec())
+                    .iter()
+                    .chain(&["nonce", "pending_external.jsonl", "nonce_conflicts.json"])
+                    .map(|leaf| Entry::file(leaf))
+                    .chain([Entry::dir("outbox")])
+                    .collect(),
+            ),
             [dir] if dir == "outbox" => self.evm_outbox_list(wallet, family, chain, &[]).await,
             [dir, outbox_rest @ ..] if dir == "outbox" => {
                 self.evm_outbox_list(wallet, family, chain, outbox_rest)
@@ -907,7 +1157,9 @@ impl WalletsHandler {
                     let signing = evm_signing_state(&entry)
                         .ok_or_else(|| HandlerError::not_found(rest.join("/")))?;
                     let outbox = format!("wallets/{wallet}/{number}/chains/{chain}/outbox");
-                    let challenge = evm_approval_challenge(&entry, &signing, &outbox);
+                    let challenge = evm_approval_challenge(&entry, &signing, &outbox, &|petal| {
+                        self.installed_petal_package(petal)
+                    })?;
                     return self.live_approval_challenge(wallet, challenge).await;
                 }
                 if is_private_evm_outbox_artifact(fname) {
@@ -1371,6 +1623,13 @@ impl WalletsHandler {
                 }
                 let entry = self.solana_outbox_entry(wallet, family, chain, state, id)?;
                 let mut file = open_regular_outbox_artifact(&entry.dir, fname)?;
+                if fname == "intent.json" {
+                    // Serve the status the outbox itself uses. A crash between
+                    // a state move and the intent rewrite leaves stale bytes.
+                    let mut public = entry.staged;
+                    public.signature = None;
+                    return serde_json::to_vec_pretty(&public).map_err(err_be);
+                }
                 let mut bytes = Vec::new();
                 std::io::Read::read_to_end(&mut file, &mut bytes)?;
                 if fname == APPROVAL_CHALLENGE {
@@ -1660,7 +1919,9 @@ impl WalletsHandler {
             return Ok(());
         }
 
-        let projection = self.wallet_projection(wallet).await?;
+        // Allocation terms bind policy and revocation versions; display cache
+        // freshness is not authority to prepare a new custody operation.
+        let projection = self.wallet_projection_authority(wallet).await?;
         if projection.wallet.root_key_ref.is_some() {
             return Err(HandlerError::invalid(
                 "account creation requires a BIP-39 wallet; imported and legacy wallets have no \
@@ -1835,6 +2096,10 @@ impl WalletsHandler {
         record.state = AccountCreationState::Created;
         record.number = number;
         write_atomic_json(path, &record)?;
+        // Navigation may reuse a projection observed before the ceremony
+        // finished. Refresh it now so the reported account is readable at
+        // once. A failed refresh leaves the old view to age out normally.
+        let _ = self.wallet_projection_authority(&record.wallet_id).await;
         Self::render_record(&record, true)
     }
 
@@ -1945,14 +2210,66 @@ fn evm_approval_challenge(
     entry: &bloom_tx::outbox::OutboxEntry,
     signing: &serde_json::Value,
     outbox: &str,
-) -> serde_json::Value {
-    let staged = &entry.staged;
+    installed: &dyn Fn(&str) -> Option<String>,
+) -> Result<serde_json::Value, HandlerError> {
+    use sha2::Digest as _;
+    let mut staged = entry.staged.clone();
+    let mut retry_body = serde_json::Value::String("confirm".into());
+    // A warning-bearing entry only ever reaches approval through
+    // `confirm.override`; plain `confirm` is refused before signing.
+    let mut control = if bloom_tx::policy_engine::has_warning(&staged.policy_checks) {
+        "confirm.override"
+    } else {
+        "confirm"
+    };
+    let mut plan = "plan.md";
+    let replacement_action = format!("{}:{}:replace", staged.chain_id, staged.id);
+    if signing.get("action_id").and_then(|value| value.as_str()) == Some(&replacement_action)
+        && entry.dir.join("replacement_request.json").exists()
+    {
+        let replacement: bloom_proto::StagedTx =
+            read_json(entry.dir.join("replacement_intent.json"))?;
+        let mut expected = staged.clone();
+        expected.max_fee_per_gas = replacement.max_fee_per_gas.clone();
+        expected.max_priority_fee_per_gas = replacement.max_priority_fee_per_gas.clone();
+        let canonical = serde_jcs::to_vec(&replacement).map_err(err_be)?;
+        let digest = hex::encode(sha2::Sha256::digest(&canonical));
+        if serde_jcs::to_vec(&expected).map_err(err_be)? != canonical
+            || signing
+                .get("canonical_plan_facts_digest")
+                .and_then(|value| value.as_str())
+                != Some(&digest)
+        {
+            return Err(HandlerError::backend(
+                "fee replacement differs from the exact signing plan",
+            ));
+        }
+        let request: serde_json::Value = read_json(entry.dir.join("replacement_request.json"))?;
+        if request.as_object().is_none_or(|fields| fields.len() != 2)
+            || request
+                .get("max_fee_per_gas")
+                .and_then(|value| value.as_str())
+                != replacement.max_fee_per_gas.as_deref()
+            || request
+                .get("max_priority_fee_per_gas")
+                .and_then(|value| value.as_str())
+                != replacement.max_priority_fee_per_gas.as_deref()
+        {
+            return Err(HandlerError::backend(
+                "fee replacement retry body differs from its signing plan",
+            ));
+        }
+        staged = replacement;
+        retry_body = request;
+        control = "replace";
+        plan = "replacement_plan.md";
+    }
     let expiry_ms = signing.get("ceremony_expires_at_ms").and_then(|value| {
         value
             .as_u64()
             .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
     });
-    serde_json::json!({
+    let mut challenge = serde_json::json!({
         "schema": "bloom.evm-approval-challenge/1",
         "action_id": signing.get("action_id"),
         "tx_id": staged.id,
@@ -1966,9 +2283,25 @@ fn evm_approval_challenge(
         "approval_id": signing.get("approval_id"),
         "ceremony_url": signing.get("ceremony_url"),
         "expiry_ms": expiry_ms,
-        "plan_path": format!("{outbox}/pending/{}/plan.md", staged.id),
-        "retry_path": format!("{outbox}/pending/{}/confirm", staged.id),
-    })
+        "plan_path": format!("{outbox}/pending/{}/{plan}", staged.id),
+        "retry_path": format!("{outbox}/pending/{}/{control}", staged.id),
+        "retry_body": retry_body,
+    });
+    let petal = staged
+        .execution_origin
+        .as_ref()
+        .and_then(|origin| crate::handlers::outbox::staging_petal(origin, installed));
+    if let (Some((petal, can_confirm)), "confirm" | "confirm.override") = (petal, control) {
+        challenge["staged_by"] = petal.into();
+        if !can_confirm {
+            challenge["restage"] = true.into();
+        }
+        if let Some(object) = challenge.as_object_mut() {
+            object.remove("retry_path");
+            object.remove("retry_body");
+        }
+    }
+    Ok(challenge)
 }
 
 /// Applies Broker's live approval status to a projected challenge. While the
@@ -1981,13 +2314,28 @@ fn reconcile_approval_challenge(
     challenge: &mut serde_json::Value,
     live: Option<&bloom_broker_api::ApprovalPublicStatus>,
 ) {
-    let (state, next) = match live {
-        Some(status) => approval_next_step(status.state),
+    let petal = challenge["staged_by"].as_str().map(str::to_owned);
+    let retry = match &petal {
+        Some(petal) => format!(
+            "retry {}",
+            crate::handlers::outbox::through_staging_petal(petal)
+        ),
+        None => "write retry_body to retry_path".into(),
+    };
+    let (state, mut next) = match live {
+        Some(status) => approval_next_step(status.state, &retry, petal.is_none()),
         None => (
             "unknown",
-            "Bloom could not read this approval's state. Writing confirm to retry_path is safe and reports it.",
+            format!(
+                "Bloom could not read this approval's state. It is safe to {retry}; that reports it."
+            ),
         ),
     };
+    // Approval cannot help an entry its Petal can no longer confirm.
+    let restage = challenge["restage"] == true && !matches!(state, "exhausted" | "refused");
+    if let (true, Some(petal)) = (restage, &petal) {
+        next = crate::handlers::outbox::restage_through(petal);
+    }
     let Some(object) = challenge.as_object_mut() else {
         return;
     };
@@ -1996,7 +2344,7 @@ fn reconcile_approval_challenge(
     let Some(status) = live else {
         return;
     };
-    if state == "awaiting_ceremony" {
+    if state == "awaiting_ceremony" && !restage {
         object.insert("ceremony_url".into(), status.ceremony_url.clone().into());
         object.insert(
             "expiry_ms".into(),
@@ -2012,35 +2360,42 @@ fn reconcile_approval_challenge(
 }
 
 /// What the approval's live Broker state means for the agent holding the
-/// challenge, as `(state, next)`.
+/// challenge, as `(state, next)`. `retry` says how to retry the confirm;
+/// `direct` means it is the entry's own confirm, which waits over IPC.
 fn approval_next_step(
     state: bloom_broker_api::ApprovalLifecycleState,
-) -> (&'static str, &'static str) {
+    retry: &str,
+    direct: bool,
+) -> (&'static str, String) {
     use bloom_broker_api::ApprovalLifecycleState as S;
     match state {
         S::Prepared | S::AwaitingCeremony => (
             "awaiting_ceremony",
-            "Give ceremony_url to the owner. As soon as they approve, write confirm to retry_path. Retrying earlier is safe: it starts no new ceremony and returns permission denied again.",
+            if direct {
+                "Give ceremony_url to the owner, then write retry_body to retry_path. Through bloom vfs write or MCP it waits for their approval and sends; on a mount it is denied until they approve, so write it again after. Neither starts a new ceremony.".into()
+            } else {
+                format!("Give ceremony_url to the owner. As soon as they approve, {retry}. Retrying earlier is safe: it starts no new ceremony and returns permission denied again.")
+            },
         ),
         S::Active => (
             "active",
-            "The owner approved. Write confirm to retry_path now to sign and broadcast.",
+            format!("The owner approved. Now {retry} to sign and broadcast."),
         ),
         S::Exhausted => (
             "exhausted",
-            "This approval has been used. Read the transaction's outbox state before doing anything else.",
+            "This approval has been used. Read the transaction's outbox state before doing anything else.".into(),
         ),
         S::Expired => (
             "expired",
-            "This approval expired unused. Ask the owner before writing confirm to retry_path again, which starts over or says why it cannot.",
+            format!("This approval expired unused. Ask the owner whether to retry; if so, {retry}, which starts over or says why it cannot."),
         ),
         S::Cancelled => (
             "cancelled",
-            "This approval was cancelled unused. Ask the owner before writing confirm to retry_path again, which starts over or says why it cannot.",
+            format!("This approval was cancelled unused. Ask the owner whether to retry; if so, {retry}, which starts over or says why it cannot."),
         ),
         S::Orphaned | S::Revoked | S::Failed => (
             "refused",
-            "This approval can no longer authorize the transaction. Tell the owner; do not retry it.",
+            "This approval can no longer authorize the transaction. Tell the owner; do not retry it.".into(),
         ),
     }
 }
@@ -2079,6 +2434,203 @@ impl WalletsHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fee_repair_challenge_binds_the_retry_body_and_unchanged_call() {
+        use sha2::Digest as _;
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = bloom_tx::Outbox::new(directory.path().join("outbox")).unwrap();
+        let original: bloom_proto::StagedTx = serde_json::from_value(serde_json::json!({
+            "id": "fee-repair", "wallet": "main", "chain": "polygon", "chain_id": 137,
+            "from": "0x1111111111111111111111111111111111111111",
+            "to": "0x2222222222222222222222222222222222222222",
+            "value_wei": "0", "data_hex": "0x12345678", "nonce": 1,
+            "gas_limit": 84000, "max_fee_per_gas": "50000000000",
+            "max_priority_fee_per_gas": "2500000000", "policy_checks": [],
+            "created_ms": 1, "expires_ms": 10000, "status": "pending",
+            "action_kind": "contract_call"
+        }))
+        .unwrap();
+        outbox.write_pending(&original, "original plan").unwrap();
+        let entry = outbox.read("main", "polygon", "fee-repair").unwrap();
+        let mut replacement = original.clone();
+        replacement.max_fee_per_gas = Some("60000000000".into());
+        replacement.max_priority_fee_per_gas = Some("30000000000".into());
+        let request = serde_json::json!({
+            "max_fee_per_gas": "60000000000", "max_priority_fee_per_gas": "30000000000"
+        });
+        outbox
+            .write_artefact(
+                &entry.dir,
+                "replacement_intent.json",
+                &serde_json::to_vec(&replacement).unwrap(),
+            )
+            .unwrap();
+        outbox
+            .write_artefact(
+                &entry.dir,
+                "replacement_request.json",
+                &serde_json::to_vec(&request).unwrap(),
+            )
+            .unwrap();
+        let signing = serde_json::json!({
+            "action_id": "137:fee-repair:replace",
+            "canonical_plan_facts_digest": hex::encode(sha2::Sha256::digest(serde_jcs::to_vec(&replacement).unwrap())),
+        });
+        let root = "wallets/main/0/chains/polygon/outbox";
+        let challenge = evm_approval_challenge(&entry, &signing, root, &|_| None).unwrap();
+        assert_eq!(
+            challenge["retry_path"],
+            format!("{root}/pending/fee-repair/replace")
+        );
+        assert_eq!(challenge["retry_body"], request);
+        assert_eq!(
+            challenge["plan_path"],
+            format!("{root}/pending/fee-repair/replacement_plan.md")
+        );
+        assert_eq!(challenge["to"], original.to.as_ref().unwrap().as_str());
+
+        // An ordinary approval of a warning-bearing entry retries through
+        // confirm.override, the only control that can sign it.
+        let mut warned = original.clone();
+        warned.id = "warned".into();
+        warned.policy_checks = vec![bloom_proto::PolicyCheck {
+            rule: "caps.per_tx_usd".into(),
+            outcome: bloom_proto::PolicyOutcome::Warn,
+            class: bloom_proto::PolicyRuleClass::Soft,
+            message: "over cap".into(),
+        }];
+        outbox.write_pending(&warned, "warned plan").unwrap();
+        let warned_entry = outbox.read("main", "polygon", "warned").unwrap();
+        let ordinary = serde_json::json!({ "action_id": "137:warned:confirm" });
+        let challenge = evm_approval_challenge(&warned_entry, &ordinary, root, &|_| None).unwrap();
+        assert_eq!(
+            challenge["retry_path"],
+            format!("{root}/pending/warned/confirm.override")
+        );
+
+        let mut altered = request.clone();
+        altered["max_priority_fee_per_gas"] = "25000000000".into();
+        outbox
+            .write_artefact(
+                &entry.dir,
+                "replacement_request.json",
+                &serde_json::to_vec(&altered).unwrap(),
+            )
+            .unwrap();
+        assert!(evm_approval_challenge(&entry, &signing, root, &|_| None).is_err());
+        outbox
+            .write_artefact(
+                &entry.dir,
+                "replacement_request.json",
+                &serde_json::to_vec(&request).unwrap(),
+            )
+            .unwrap();
+        replacement.value_wei = "1".into();
+        outbox
+            .write_artefact(
+                &entry.dir,
+                "replacement_intent.json",
+                &serde_json::to_vec(&replacement).unwrap(),
+            )
+            .unwrap();
+        let changed_signing = serde_json::json!({
+            "action_id": "137:fee-repair:replace",
+            "canonical_plan_facts_digest": hex::encode(sha2::Sha256::digest(serde_jcs::to_vec(&replacement).unwrap())),
+        });
+        assert!(evm_approval_challenge(&entry, &changed_signing, root, &|_| None).is_err());
+    }
+
+    #[test]
+    fn petal_staged_challenge_retries_through_its_petal() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = bloom_tx::Outbox::new(directory.path().join("outbox")).unwrap();
+        let staged = |id: &str, origin: Option<serde_json::Value>| {
+            let staged: bloom_proto::StagedTx = serde_json::from_value(serde_json::json!({
+                "id": id, "wallet": "main", "chain": "arbitrum", "chain_id": 42161,
+                "from": "0x1111111111111111111111111111111111111111",
+                "to": "0x2222222222222222222222222222222222222222",
+                "value_wei": "0", "data_hex": "0x12345678", "nonce": 1,
+                "gas_limit": 84000, "max_fee_per_gas": "50000000000",
+                "max_priority_fee_per_gas": "2500000000", "policy_checks": [],
+                "created_ms": 1, "expires_ms": 10000, "status": "pending",
+                "action_kind": "contract_call", "execution_origin": origin
+            }))
+            .unwrap();
+            outbox.write_pending(&staged, "plan").unwrap();
+            outbox.read("main", "arbitrum", id).unwrap()
+        };
+        let root = "wallets/main/0/chains/arbitrum/outbox";
+        let active = |challenge: &mut serde_json::Value| {
+            let status = bloom_broker_api::ApprovalPublicStatus {
+                approval_id: bloom_broker_api::Digest32::from_bytes([7; 32]),
+                wallet_id: bloom_broker_api::Token::new("main").unwrap(),
+                state: bloom_broker_api::ApprovalLifecycleState::Active,
+                effective_claim_assurance: None,
+                ceremony_url: None,
+                ceremony_expires_at_ms: None,
+            };
+            reconcile_approval_challenge(challenge, Some(&status));
+            challenge["next"].as_str().unwrap().to_owned()
+        };
+
+        // Confirming the raw entry would skip the Petal's confirm-time checks.
+        let petal = staged(
+            "buy",
+            Some(serde_json::json!({
+                "petal_id": "petal:pendle", "petal_digest": "ab".repeat(32),
+                "petal_version": "v1-package", "route_id": "r000003"
+            })),
+        );
+        let signing = serde_json::json!({ "action_id": "42161:buy:confirm" });
+        let installed = |petal: &str| (petal == "pendle").then(|| "ab".repeat(32));
+        let mut challenge = evm_approval_challenge(&petal, &signing, root, &installed).unwrap();
+        assert!(challenge.get("retry_path").is_none(), "{challenge}");
+        assert!(challenge.get("retry_body").is_none(), "{challenge}");
+        assert_eq!(challenge["staged_by"], "petals/pendle/");
+        let next = active(&mut challenge);
+        assert!(
+            next.contains("retry through the Petal that staged this entry (petals/pendle/"),
+            "{next}"
+        );
+        assert!(!next.contains("retry_path"), "{next}");
+
+        // After an upgrade the Petal's confirm rejects the old origin, and an
+        // origin without a route never had one: no approval can send either.
+        let legacy = staged(
+            "legacy",
+            Some(serde_json::json!({
+                "petal_id": "petal:pendle", "petal_digest": "ab".repeat(32),
+                "petal_version": "v1-package"
+            })),
+        );
+        let upgraded = |_: &str| Some("cd".repeat(32));
+        for (entry, installed) in [
+            (&petal, &upgraded as &dyn Fn(&str) -> Option<String>),
+            (&legacy, &installed),
+        ] {
+            let mut challenge = evm_approval_challenge(entry, &signing, root, installed).unwrap();
+            assert!(challenge.get("retry_path").is_none(), "{challenge}");
+            let next = active(&mut challenge);
+            assert!(
+                next.contains("petals/pendle/ can no longer confirm this entry")
+                    && !next.contains("retry through"),
+                "{next}"
+            );
+        }
+
+        // An entry staged directly through the wallet outbox keeps its control.
+        let direct = staged("send", None);
+        let signing = serde_json::json!({ "action_id": "42161:send:confirm" });
+        let mut challenge = evm_approval_challenge(&direct, &signing, root, &|_| None).unwrap();
+        assert_eq!(
+            challenge["retry_path"],
+            format!("{root}/pending/send/confirm")
+        );
+        assert!(challenge.get("staged_by").is_none());
+        let next = active(&mut challenge);
+        assert!(next.contains("write retry_body to retry_path"), "{next}");
+    }
 
     #[test]
     fn challenge_follows_brokers_live_ceremony_link() {

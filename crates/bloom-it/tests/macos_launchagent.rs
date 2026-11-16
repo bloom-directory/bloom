@@ -194,7 +194,7 @@ fn legacy_monitor_preserves_session_lifecycle_without_claiming_network_containme
     assert!(monitor.contains("status.json"));
     assert!(monitor.contains("restart_services_for_live_session"));
     assert!(monitor.contains("if enrollment_state == \"active\""));
-    assert!(monitor.contains("gui/{login_uid}/com.bloom.session"));
+    assert!(monitor.contains("user/{login_uid}/com.bloom.session"));
     assert!(monitor.contains("session.sock"));
     assert!(monitor.contains("metadata.file_type().is_socket()"));
     assert!(monitor.contains("system/com.bloom.{service}.{login_uid}"));
@@ -204,10 +204,13 @@ fn legacy_monitor_preserves_session_lifecycle_without_claiming_network_containme
     assert_ordered(
         &monitor,
         &[
-            "gui/{login_uid}/com.bloom.session",
-            "state = running",
+            "fn restart_services_for_live_session",
+            "prepare_login_sentinel(",
             "session.sock",
             "[\"signer\", \"broker\"]",
+            "fn prepare_login_sentinel",
+            "user/{login_uid}/com.bloom.session",
+            "state = running",
         ],
     );
 
@@ -307,16 +310,6 @@ fn macos_installer_manages_the_path_entry_and_migrates_legacy_cli_post_activatio
         ],
     );
     assert!(!source.contains("rm -rf -- \"$login_home/.local"));
-}
-
-#[test]
-#[cfg(target_os = "macos")]
-fn staged_macos_installer_cli_lifecycle_passes() {
-    let status = Command::new("bash")
-        .arg(workspace().join("tests/packaging/macos-installer-staged.sh"))
-        .status()
-        .expect("run staged macOS installer CLI lifecycle");
-    assert!(status.success());
 }
 
 #[test]
@@ -446,6 +439,12 @@ fn macos_conformance_workflows_consume_unified_candidates() {
     };
     let broker_commit = pinned_revision("broker_commit");
     let signer_commit = pinned_revision("signer_commit");
+    // Every Broker/Signer literal (input defaults, fallbacks, checkout refs,
+    // reusable-workflow arguments) must carry the manifest pin, so a partial
+    // repin fails here instead of in release conformance.
+    let assert_every_pin = |workflow: &str, source: &str| {
+        assert_workflow_pins(workflow, source, broker_commit, signer_commit)
+    };
 
     for workflow in [
         "macos-unix-conformance.yml",
@@ -457,13 +456,28 @@ fn macos_conformance_workflows_consume_unified_candidates() {
         assert!(source.contains("bloom-triad-test-unclaimed.tar.gz"));
         assert!(source.contains("Reject mutable sibling refs"));
         assert!(source.contains("^[0-9a-f]{40}$"));
-        assert!(source.contains(broker_commit));
-        assert!(source.contains(signer_commit));
+        assert_every_pin(workflow, &source);
     }
 
     let ci = fs::read_to_string(workspace().join(".github/workflows/ci.yml")).unwrap();
-    assert!(ci.contains(&format!("broker_ref: {broker_commit}")));
-    assert!(ci.contains(&format!("signer_ref: {signer_commit}")));
+    assert_every_pin("ci.yml", &ci);
+
+    // These assertions read both conformance workflows, so editing either
+    // must trigger CI, which runs this binary on Linux. The Unix-principal
+    // workflow runs the packaging scripts directly.
+    let code_paths = ci.split("- \"Cargo.toml\"").next().unwrap();
+    assert!(code_paths.contains("- \".github/workflows/macos-unix-conformance.yml\""));
+    assert!(code_paths.contains("- \".github/workflows/macos-two-login-conformance.yml\""));
+    assert!(ci.contains("-E 'package(bloom-it) and binary(macos_launchagent)'"));
+    let unix = fs::read_to_string(workspace().join(".github/workflows/macos-unix-conformance.yml"))
+        .unwrap();
+    for script in [
+        "macos-installer-staged.sh",
+        "macos-pf-retirement.sh",
+        "macos-upgrade-rollback.sh",
+    ] {
+        assert!(unix.contains(&format!("bash bloom/tests/packaging/{script}")));
+    }
 }
 
 #[test]
@@ -504,7 +518,15 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     assert!(source.contains("task-access-probe"));
     assert!(source.contains("Machine login sampled"));
     assert!(source.contains("session sentinel did not reject an unauthorized login-UID peer"));
-    assert!(source.contains("services did not drain after the login-session sentinel disappeared"));
+    assert!(source.contains("source \"$conformance_dir/logout-drain.sh\""));
+    assert!(source.contains(
+        "wait_for_logout_services \"$broker_uid\" \"$signer_uid\" \"$broker_label\" \"$signer_label\""
+    ));
+    let logout_drain = fs::read_to_string(
+        workspace().join("tests/conformance/macos-unix-principals/logout-drain.sh"),
+    )
+    .unwrap();
+    assert!(logout_drain.contains("services did not exit successfully after login-session logout"));
     assert!(
         source.contains(
             "Broker retained the ceremony listener on $ceremony_host after session logout"
@@ -702,5 +724,113 @@ report_legacy_wallet_migrations
     assert!(
         stdout.contains("Migrate legacy passkey wallet pending"),
         "{stdout}"
+    );
+}
+
+/// Asserts that every Broker/Signer commit literal in a workflow equals the
+/// manifest pin. A literal is a pin only when its own line names `broker_ref`
+/// or `signer_ref`, or when it is the `default:` of a `broker_ref:` or
+/// `signer_ref:` input key. Other 40-hex values (unrelated commits, digests)
+/// are not attributed to either service.
+fn assert_workflow_pins(workflow: &str, source: &str, broker_commit: &str, signer_commit: &str) {
+    let indent = |line: &str| line.len() - line.trim_start().len();
+    // Service and indentation of an input key whose default is still unseen.
+    let mut pending: Option<(usize, usize)> = None;
+    let mut copies = [0, 0];
+    for line in source.lines().filter(|line| !line.contains("uses:")) {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if pending.is_some_and(|(_, key_indent)| indent(line) <= key_indent) {
+            pending = None;
+        }
+        let lower = line.to_ascii_lowercase();
+        let named = if lower.contains("broker_ref") {
+            Some(0)
+        } else if lower.contains("signer_ref") {
+            Some(1)
+        } else {
+            None
+        };
+        let hexes: Vec<&str> = line
+            .split(|c: char| !c.is_ascii_hexdigit())
+            .filter(|word| word.len() == 40)
+            .collect();
+        let service = match named {
+            Some(service) if hexes.is_empty() => {
+                pending = Some((service, indent(line)));
+                continue;
+            }
+            Some(service) => Some(service),
+            None if trimmed.starts_with("default:") => pending.take().map(|(service, _)| service),
+            None => None,
+        };
+        let Some(service) = service else { continue };
+        for word in hexes {
+            let expected = [broker_commit, signer_commit][service];
+            assert_eq!(word, expected, "{workflow}: stale pin in `{}`", line.trim());
+            copies[service] += 1;
+        }
+    }
+    assert!(
+        copies.iter().all(|&count| count > 0),
+        "{workflow}: {copies:?}"
+    );
+}
+
+const PIN_FIXTURE: &str = "\
+on:
+  workflow_dispatch:
+    inputs:
+      broker_ref:
+        required: true
+        default: 1111111111111111111111111111111111111111
+      signer_ref:
+        required: true
+        default: 2222222222222222222222222222222222222222
+env:
+  BROKER_REF: ${{ inputs.broker_ref || '1111111111111111111111111111111111111111' }}
+";
+
+#[test]
+fn workflow_pin_scan_ignores_unrelated_commit_literals() {
+    let source = format!(
+        "{PIN_FIXTURE}  unrelated_commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+         \x20 other_input:\n    default: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
+    );
+    assert_workflow_pins(
+        "fixture",
+        &source,
+        "1111111111111111111111111111111111111111",
+        "2222222222222222222222222222222222222222",
+    );
+}
+
+#[test]
+#[should_panic(expected = "stale pin")]
+fn workflow_pin_scan_rejects_a_stale_input_default() {
+    assert_workflow_pins(
+        "fixture",
+        &PIN_FIXTURE.replace(
+            "default: 2222222222222222222222222222222222222222",
+            "default: 3333333333333333333333333333333333333333",
+        ),
+        "1111111111111111111111111111111111111111",
+        "2222222222222222222222222222222222222222",
+    );
+}
+
+#[test]
+#[should_panic(expected = "stale pin")]
+fn workflow_pin_scan_rejects_a_stale_same_line_fallback() {
+    assert_workflow_pins(
+        "fixture",
+        &PIN_FIXTURE.replace(
+            "|| '1111111111111111111111111111111111111111'",
+            "|| '3333333333333333333333333333333333333333'",
+        ),
+        "1111111111111111111111111111111111111111",
+        "2222222222222222222222222222222222222222",
     );
 }

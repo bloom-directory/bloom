@@ -38,6 +38,7 @@ thiserror.workspace = true
 hex.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
+futures.workspace = true
 tracing.workspace = true
 alloy.workspace = true
 parking_lot.workspace = true

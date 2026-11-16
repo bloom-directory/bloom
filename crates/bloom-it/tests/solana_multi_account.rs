@@ -144,12 +144,12 @@ impl MultiAccountBroker {
 
     fn policy(&self, wallet_id: Token) -> SignedPolicySnapshot {
         let canonical = serde_json::to_vec(&CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: wallet_id.clone(),
             maximum_approval_lifetime_ms: 3_600_000,
             allowed_petal_packages: Vec::new(),
             allowed_destinations: Vec::new(),
             required_verifiers: Vec::new(),
-            clear_signing: None,
         })
         .unwrap();
         SignedPolicySnapshot {
@@ -688,10 +688,17 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
     let numbered_outbox = "wallets/alice/1/chains/solana-local/outbox";
     let numbered_confirm =
         VfsPath::parse(&format!("/{numbered_outbox}/pending/{numbered_id}/confirm")).unwrap();
-    let refused = daemon.vfs.write(&numbered_confirm, b"y\n").await;
+    let refused = daemon
+        .vfs
+        .write(&numbered_confirm, b"y\n")
+        .await
+        .expect_err("confirm must fail closed before owner approval")
+        .to_string();
     assert!(
-        refused.is_err(),
-        "confirm must fail closed before owner approval"
+        refused.contains(&format!(
+            "owner approval pending; read {numbered_outbox}/pending/{numbered_id}/approval_challenge.json"
+        )) && !refused.contains("http"),
+        "{refused}"
     );
     let challenge = read_json(
         &daemon,

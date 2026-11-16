@@ -13,7 +13,7 @@ use std::{
 use async_trait::async_trait;
 use bloom_broker_api::{
     CanonicalWalletPolicy, CeremonyKind, CeremonyState, CredentialPublic, CredentialState,
-    DerivationRef, Digest32, KeyPublic, KeyRequest, KeyRole, KeySpec, OperationId,
+    DerivationRef, Digest32, KeyPublic, KeyRef, KeyRequest, KeyRole, KeySpec, OperationId,
     OperationRequest, ProtocolError, ProtocolErrorCode, SignedPolicySnapshot, Token,
     WalletAccountsPublic, WalletPublic,
 };
@@ -191,6 +191,12 @@ pub trait WalletProjectionReader: Send + Sync {
     ) -> Result<WalletProjection, ProtocolError> {
         self.get_wallet(wallet_id).await
     }
+    /// Mark `wallet_id`'s cached projection superseded: the next read
+    /// observes Broker, and fails rather than serve the cache if Broker is
+    /// unavailable.
+    fn invalidate_wallet(&self, _wallet_id: &Token) -> Result<(), ProtocolError> {
+        Ok(())
+    }
     async fn begin_legacy_migration(
         &self,
         _operation_id: &OperationId,
@@ -274,6 +280,7 @@ impl FileProjectionStore {
     ) -> Result<ProjectionCache, ProtocolError> {
         let mut cache = self.load()?;
         cache.apply_live_refresh(observed, completed_migrations, terminal_migrations)?;
+        cache.superseded.clear();
         self.save_unlocked(&cache)?;
         Ok(cache)
     }
@@ -284,7 +291,19 @@ impl FileProjectionStore {
         _refresh_lock: &ProjectionRefreshLock,
     ) -> Result<ProjectionCache, ProtocolError> {
         let mut cache = self.load()?;
+        cache.superseded.remove(projection.wallet_id().as_str());
         cache.apply_wallet_refresh(projection)?;
+        self.save_unlocked(&cache)?;
+        Ok(cache)
+    }
+
+    fn mark_superseded(
+        &self,
+        wallet_id: &Token,
+        _refresh_lock: &ProjectionRefreshLock,
+    ) -> Result<ProjectionCache, ProtocolError> {
+        let mut cache = self.load()?;
+        cache.superseded.insert(wallet_id.as_str().to_owned());
         self.save_unlocked(&cache)?;
         Ok(cache)
     }
@@ -389,6 +408,36 @@ impl CachedWalletProjectionReader {
             .map(|key| serde_json::to_string(&key.key_ref))
             .collect::<Result<BTreeSet<_>, _>>()
             .map_err(|error| invalid_projection(format!("encode Broker key reference: {error}")))?;
+        let mut undescribed = BTreeSet::new();
+        for key_ref in &wallet.key_refs {
+            let encoded = serde_json::to_string(key_ref).map_err(|error| {
+                invalid_projection(format!("encode wallet key reference: {error}"))
+            })?;
+            if !described.contains(&encoded) {
+                undescribed.insert(encoded);
+            }
+        }
+        // A root-key wallet's Petal keys are derived from its root. Describe
+        // them in one request rather than one `key.get_public` each, which
+        // grows with every Petal session the wallet has run. Only derived
+        // keys the wallet lists, held by the root's own backend instance, are
+        // taken; anything else falls through to the per-key reads below.
+        if !undescribed.is_empty()
+            && let Some(root) = &wallet.root_key_ref
+        {
+            for key in broker.derived_keys(root.clone()).await? {
+                if !is_derived_from_backend_of(&key, root) {
+                    continue;
+                }
+                let encoded = serde_json::to_string(&key.key_ref).map_err(|error| {
+                    invalid_projection(format!("encode derived key reference: {error}"))
+                })?;
+                if undescribed.remove(&encoded) {
+                    described.insert(encoded);
+                    keys.push(key);
+                }
+            }
+        }
         for key_ref in &wallet.key_refs {
             let encoded = serde_json::to_string(key_ref).map_err(|error| {
                 invalid_projection(format!("encode wallet key reference: {error}"))
@@ -756,6 +805,13 @@ impl WalletProjectionReader for CachedWalletProjectionReader {
             .cache
             .lock()
             .map_err(|_| unavailable("Machine projection cache mutex poisoned"))?;
+        if cache.superseded.contains(wallet_id.as_str()) {
+            return Err(unavailable(format!(
+                "{}; wallet {} changed since its cached projection",
+                broker_error.message,
+                wallet_id.as_str()
+            )));
+        }
         match cache.wallets.get(wallet_id.as_str()) {
             Some(CachedWallet::Live(projection)) => Ok(projection.clone().stale()),
             Some(CachedWallet::Tombstone { .. }) => Err(invalid_projection(format!(
@@ -776,7 +832,11 @@ impl WalletProjectionReader for CachedWalletProjectionReader {
         &self,
         wallet_id: &Token,
     ) -> Result<WalletProjection, ProtocolError> {
-        self.refresh_wallet(wallet_id)
+        // An earlier observation may share this request's millisecond. Even
+        // timestamp-based refresh sharing must be disabled for authority.
+        self.clone()
+            .with_max_age(Duration::ZERO)
+            .refresh_wallet(wallet_id)
             .await?
             .ok_or_else(|| invalid_projection(format!("wallet {} not found", wallet_id.as_str())))
     }
@@ -795,6 +855,22 @@ impl WalletProjectionReader for CachedWalletProjectionReader {
             return Ok(projection);
         }
         self.get_wallet(wallet_id).await
+    }
+
+    fn invalidate_wallet(&self, wallet_id: &Token) -> Result<(), ProtocolError> {
+        self.wallet_refreshed_ms
+            .lock()
+            .map_err(|_| unavailable("Machine projection freshness mutex poisoned"))?
+            .remove(wallet_id.as_str());
+        let refresh_lock = self.store.acquire_refresh_lock()?;
+        let updated = self.store.mark_superseded(wallet_id, &refresh_lock)?;
+        *self
+            .cache
+            .lock()
+            .map_err(|_| unavailable("Machine projection cache mutex poisoned"))? = updated;
+        // A full refresh also counts as this wallet's observation.
+        self.last_live_refresh_ms.store(0, Ordering::SeqCst);
+        Ok(())
     }
 
     async fn begin_legacy_migration(
@@ -849,6 +925,11 @@ struct ProjectionCache {
     pending_legacy_migrations: BTreeMap<String, PendingLegacyMigration>,
     #[serde(default, alias = "reconciled_legacy_migrations")]
     completed_legacy_migrations: BTreeMap<String, String>,
+    /// Wallets whose cached projection is known to be superseded, such as by
+    /// a committed policy update. Saved so a restart cannot serve it as a
+    /// stale fallback before a live observation replaces it.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    superseded: BTreeSet<String>,
 }
 
 impl ProjectionCache {
@@ -858,6 +939,7 @@ impl ProjectionCache {
             wallets: BTreeMap::new(),
             pending_legacy_migrations: BTreeMap::new(),
             completed_legacy_migrations: BTreeMap::new(),
+            superseded: BTreeSet::new(),
         }
     }
 
@@ -1377,6 +1459,17 @@ fn unavailable(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::ServiceUnavailable, message)
 }
 
+/// Whether a `key.list_derived` result describes a derived key held by the
+/// same backend instance as the wallet's root. The exact root a child descends
+/// from is named in a backend-specific form, so it is not checked here; a key
+/// that fails this is read on its own with `key.get_public`.
+fn is_derived_from_backend_of(key: &KeyPublic, root: &KeyRef) -> bool {
+    key.role == KeyRole::Derived
+        && key.key_ref.derivation.is_some()
+        && key.key_ref.backend == root.backend
+        && key.key_ref.backend_instance == root.backend_instance
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -1397,6 +1490,15 @@ mod tests {
         policy: SignedPolicySnapshot,
     }
 
+    #[derive(Debug, serde::Deserialize, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct Schema1CredentialPublic {
+        credential_id: String,
+        wallet_id: String,
+        created_at_ms: String,
+        state: String,
+    }
+
     struct FakeBroker {
         available: Mutex<bool>,
         wallet_list_reads: AtomicU64,
@@ -1409,6 +1511,11 @@ mod tests {
         list_requests: std::sync::atomic::AtomicUsize,
         /// `wallet.get_public` calls, one per single-wallet refresh.
         get_requests: std::sync::atomic::AtomicUsize,
+        /// Keys `key.list_derived` reports for a wallet's root, by wallet.
+        derived: Mutex<BTreeMap<String, Vec<KeyPublic>>>,
+        /// `key.list_derived` and `key.get_public` calls.
+        derived_requests: std::sync::atomic::AtomicUsize,
+        key_requests: std::sync::atomic::AtomicUsize,
     }
 
     struct BlockingEmptyBroker {
@@ -1448,6 +1555,9 @@ mod tests {
                 accounts_errors: Mutex::new(BTreeMap::new()),
                 list_requests: 0.into(),
                 get_requests: 0.into(),
+                derived: Mutex::new(BTreeMap::new()),
+                derived_requests: 0.into(),
+                key_requests: 0.into(),
             }
         }
 
@@ -1582,10 +1692,148 @@ mod tests {
                             empty_wallet_accounts(wallet_id),
                         ))
                     }
+                    MachineBrokerRequest::KeyListDerived(KeyRequest { key_ref }) => {
+                        self.derived_requests.fetch_add(1, Ordering::SeqCst);
+                        let derived = self.derived.lock().unwrap();
+                        Ok(MachineBrokerResponse::KeyListDerived(
+                            wallets
+                                .iter()
+                                .find(|(_, value)| {
+                                    value.wallet.root_key_ref == Some(key_ref.clone())
+                                })
+                                .and_then(|(name, _)| derived.get(name).cloned())
+                                .unwrap_or_default(),
+                        ))
+                    }
+                    MachineBrokerRequest::KeyGetPublic(KeyRequest { key_ref }) => {
+                        self.key_requests.fetch_add(1, Ordering::SeqCst);
+                        self.derived
+                            .lock()
+                            .unwrap()
+                            .values()
+                            .flatten()
+                            .find(|key| key.key_ref == key_ref)
+                            .cloned()
+                            .map(MachineBrokerResponse::KeyGetPublic)
+                            .ok_or_else(|| invalid_projection("unknown fake key"))
+                    }
                     _ => Err(invalid_projection("unexpected fake Broker method")),
                 }
             })
         }
+    }
+
+    fn derived_key(index: u8) -> KeyPublic {
+        KeyPublic {
+            key_ref: KeyRef {
+                backend: token("local"),
+                backend_instance: token("primary"),
+                locator: format!("alice/petal-{index}"),
+                key_spec: KeySpec::Secp256k1,
+                public_key_fingerprint: Digest32::from_bytes([40 + index; 32]),
+                derivation: Some(DerivationRef::Bip32Secp256k1 {
+                    root_key_id: token("root"),
+                    path: format!("m/44'/60'/0'/18735/{index}"),
+                }),
+            },
+            role: KeyRole::Derived,
+            canonical_public_key: Base64UrlBytes::from_bytes(&[2; 33]),
+            addresses: Vec::new(),
+            supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+        }
+    }
+
+    #[tokio::test]
+    async fn derived_keys_are_described_in_one_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut wallet = fixture(1);
+        let derived = (0..5).map(derived_key).collect::<Vec<_>>();
+        // The wallet lists four of the five derived keys plus one key the
+        // root enumeration does not report.
+        let unlisted = derived_key(9);
+        wallet
+            .wallet
+            .key_refs
+            .extend(derived[..4].iter().map(|key| key.key_ref.clone()));
+        wallet.wallet.key_refs.push(unlisted.key_ref.clone());
+        let broker = Arc::new(FakeBroker::new(wallet));
+        broker
+            .derived
+            .lock()
+            .unwrap()
+            .insert("alice".into(), derived.clone());
+        broker
+            .derived
+            .lock()
+            .unwrap()
+            .insert("other".into(), vec![unlisted.clone()]);
+        let reader = CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(broker.clone())),
+            FileProjectionStore::new(directory.path().join("wallets.json")),
+        )
+        .unwrap();
+
+        let projection = reader.get_wallet_authority(&token("alice")).await.unwrap();
+
+        assert_eq!(broker.derived_requests.load(Ordering::SeqCst), 1);
+        // Only the key the root enumeration missed is read on its own.
+        assert_eq!(broker.key_requests.load(Ordering::SeqCst), 1);
+        let projected = projection
+            .keys
+            .iter()
+            .map(|key| key.key_ref.clone())
+            .collect::<Vec<_>>();
+        for key in derived[..4].iter().chain([&unlisted]) {
+            assert!(projected.contains(&key.key_ref));
+        }
+        // A derived key the wallet does not list is never projected.
+        assert!(!projected.contains(&derived[4].key_ref));
+    }
+
+    #[tokio::test]
+    async fn listed_keys_the_root_enumeration_cannot_vouch_for_are_read_one_by_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut wallet = fixture(1);
+        let child = derived_key(0);
+        // Listed by the wallet and returned by the root enumeration, but not
+        // a derived key of the root's backend instance.
+        let mut underived = derived_key(1);
+        underived.key_ref.derivation = None;
+        let mut foreign = derived_key(2);
+        foreign.key_ref.backend_instance = token("elsewhere");
+        let batch = vec![child.clone(), underived.clone(), foreign.clone()];
+        wallet
+            .wallet
+            .key_refs
+            .extend(batch.iter().map(|key| key.key_ref.clone()));
+        let broker = Arc::new(FakeBroker::new(wallet));
+        broker.derived.lock().unwrap().insert("alice".into(), batch);
+        let reader = CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(broker.clone())),
+            FileProjectionStore::new(directory.path().join("wallets.json")),
+        )
+        .unwrap();
+
+        reader.get_wallet_authority(&token("alice")).await.unwrap();
+
+        assert_eq!(broker.derived_requests.load(Ordering::SeqCst), 1);
+        // Only the true child is taken from the batch; the other two are
+        // described by their own exact `key.get_public` request.
+        assert_eq!(broker.key_requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn fully_described_wallets_skip_the_derived_key_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let broker = Arc::new(FakeBroker::new(fixture(1)));
+        let reader = CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(broker.clone())),
+            FileProjectionStore::new(directory.path().join("wallets.json")),
+        )
+        .unwrap();
+        reader.get_wallet_authority(&token("alice")).await.unwrap();
+        assert_eq!(broker.derived_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(broker.key_requests.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1899,6 +2147,79 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(durable.policy.version.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_policy_commit_can_outpace_display_cache_but_not_authority_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let broker = Arc::new(FakeBroker::new(fixture(1)));
+        let reader = CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(broker.clone())),
+            FileProjectionStore::new(directory.path().join("wallets.json")),
+        )
+        .unwrap()
+        .with_max_age(Duration::from_secs(60));
+        let wallet = token("alice");
+        let initial = reader.get_wallet(&wallet).await.unwrap();
+        assert_eq!(initial.policy.version.get(), 1);
+
+        broker
+            .wallets
+            .lock()
+            .unwrap()
+            .insert("alice".into(), fixture(2));
+        let cached = reader.get_wallet(&wallet).await.unwrap();
+        assert_eq!(cached.policy.version.get(), 1);
+        // Force the refresh-sharing condition without relying on the test
+        // completing within one wall-clock millisecond. Authority must bypass
+        // it even if the clock moved backwards after the cached observation.
+        reader
+            .wallet_refreshed_ms
+            .lock()
+            .unwrap()
+            .insert("alice".into(), u64::MAX);
+        let authoritative = reader.get_wallet_authority(&wallet).await.unwrap();
+        assert_eq!(authoritative.policy.version.get(), 2);
+        let refreshed = reader.get_wallet(&wallet).await.unwrap();
+        assert_eq!(refreshed.policy.version.get(), 2);
+    }
+
+    /// A failed refresh after a policy commit leaves the wallet marked. A
+    /// restarted Machine must not serve that cache while Broker is down.
+    #[tokio::test]
+    async fn a_superseded_wallet_stays_unserved_across_a_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileProjectionStore::new(directory.path().join("wallets.json"));
+        let broker = Arc::new(FakeBroker::new(fixture(1)));
+        let online = || {
+            CachedWalletProjectionReader::new(
+                Some(MachineBrokerClient::new(broker.clone())),
+                store.clone(),
+            )
+            .unwrap()
+        };
+        let wallet = token("alice");
+        let reader = online();
+        reader.get_wallet(&wallet).await.unwrap();
+        reader.invalidate_wallet(&wallet).unwrap();
+        drop(reader);
+
+        let restarted = CachedWalletProjectionReader::new(None, store.clone()).unwrap();
+        let error = restarted.get_wallet(&wallet).await.unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("changed since its cached projection"),
+            "{error:?}"
+        );
+
+        // A live observation replaces the cache and lifts the mark.
+        online().get_wallet(&wallet).await.unwrap();
+        let offline = CachedWalletProjectionReader::new(None, store).unwrap();
+        assert_eq!(
+            offline.get_wallet(&wallet).await.unwrap().freshness,
+            ProjectionFreshness::Stale
+        );
     }
 
     #[tokio::test]
@@ -2293,17 +2614,11 @@ mod tests {
 
     #[test]
     fn schema1_credentials_load_but_surface_projections_require_schema2_reader() {
-        // Serialize with the actual released API, not a current object with
-        // its version marker changed. The surrounding cache format is stable.
-        let old: schema1_broker_api::CredentialPublic = serde_json::from_value(serde_json::json!({
-            "credential_id": "CwsLCwsLCwsLCwsLCwsLCw",
-            "wallet_id": "alice",
-            "created_at_ms": "1",
-            "state": "ACTIVE"
-        }))
-        .unwrap();
-        let legacy_bytes = serde_json::to_vec(&old).unwrap();
-        let credential: CredentialPublic = serde_json::from_slice(&legacy_bytes).unwrap();
+        // Frozen output from Broker dd2add2b's released schema-1 API. Keep the
+        // reader local so a compatibility fixture cannot enter release pins.
+        let legacy_bytes = br#"{"credential_id":"CwsLCwsLCwsLCwsLCwsLCw","wallet_id":"alice","created_at_ms":"1","state":"ACTIVE"}"#;
+        serde_json::from_slice::<Schema1CredentialPublic>(legacy_bytes).unwrap();
+        let credential: CredentialPublic = serde_json::from_slice(legacy_bytes).unwrap();
         assert!(credential.surface.is_none());
         let mut fixture = migrated_fixture();
         fixture.credentials = vec![credential];
@@ -2337,8 +2652,7 @@ mod tests {
         )
         .unwrap();
         let updated = serde_json::to_vec(&projection.credentials[0]).unwrap();
-        let error =
-            serde_json::from_slice::<schema1_broker_api::CredentialPublic>(&updated).unwrap_err();
+        let error = serde_json::from_slice::<Schema1CredentialPublic>(&updated).unwrap_err();
         assert!(error.to_string().contains("unknown field `surface`"));
         cache
             .wallets
@@ -2450,12 +2764,12 @@ mod tests {
     fn migrated_fixture() -> ProjectionFixture {
         let mut fixture = fixture(1);
         let policy = CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: token("alice"),
             maximum_approval_lifetime_ms: 30 * 24 * 60 * 60 * 1_000,
             allowed_petal_packages: Vec::new(),
             allowed_destinations: Vec::new(),
             required_verifiers: Vec::new(),
-            clear_signing: None,
         };
         let policy_bytes = serde_jcs::to_vec(&policy).unwrap();
         let policy_digest = Digest32::from_bytes(Sha256::digest(&policy_bytes).into());

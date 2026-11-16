@@ -24,9 +24,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use bytes::Bytes;
 use embednfs::{
-    AccessMask, Attrs, CommitSupport, CreateKind, CreateRequest, CreateResult, DirEntry, DirPage,
-    FileSystem, FsError, FsResult, FsStats, ObjectType, OpenRequest, OpenSupport, ReadResult,
-    RequestContext, SetAttrs, Symlinks, Timestamp, WriteResult, WriteStability,
+    AccessMask, Attrs, CloseSupport, CommitSupport, CreateKind, CreateRequest, CreateResult,
+    DirEntry, DirPage, FileSystem, FsError, FsResult, FsStats, ObjectType, OpenRequest,
+    OpenSupport, ReadResult, RequestContext, SetAttrs, Symlinks, Timestamp, WriteResult,
+    WriteStability,
 };
 use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
@@ -42,6 +43,25 @@ use bloom_vfs::{Entry, EntryKind, Handler, HandlerError, Vfs, VfsPath, percent_d
 /// spec hint and is large enough for any plausible JSON/TOML/EIP-712
 /// body the daemon expects through the mount surface.
 pub(crate) const MAX_WRITE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+
+/// Largest payload a client hands us in one WRITE: the `wsize` the mount asks
+/// for (`build_mount_opts` in `lib.rs`), which this must track. A WRITE this
+/// long means the client filled its transfer buffer, so the payload probably
+/// continues in the next WRITE. NFS WRITE carries no EOF marker and the mount
+/// is `sync`, so this is the only signal that an offset-zero contiguous buffer
+/// is not yet the whole command. A client that mounts with a larger `wsize`
+/// loses nothing but the early error: its payload is dispatched at CLOSE.
+pub(crate) const MAX_WRITE_CHUNK_BYTES: usize = 64 * 1024;
+
+/// How long a failed command write stays on record so the client's close-time
+/// re-send of the same bytes is answered instead of dispatched again. Kept
+/// short, and consumed by the first repeat, so a deliberate retry of the same
+/// body still reaches the handler.
+pub(crate) const FAILED_WRITE_REPLAY_WINDOW: Duration = Duration::from_secs(1);
+
+/// Paths kept in the failed-write record. One entry per file being written;
+/// bounded so a client writing to many paths cannot grow it without end.
+pub(crate) const FAILED_WRITE_CAPACITY: usize = 64;
 
 /// TTL for the mount-side render cache that bridges GETATTR and the
 /// imminent READ. Long enough to cover the kernel's
@@ -202,7 +222,7 @@ fn map_err(e: HandlerError) -> FsError {
         HandlerError::NotFound(_) => FsError::NotFound,
         HandlerError::NotADir(_) => FsError::NotDirectory,
         HandlerError::NotAFile(_) => FsError::IsDirectory,
-        HandlerError::PermissionDenied => FsError::AccessDenied,
+        HandlerError::PermissionDenied | HandlerError::ApprovalPending(_) => FsError::AccessDenied,
         HandlerError::OperationNotPermitted => FsError::PermissionDenied,
         HandlerError::Invalid(_) => FsError::InvalidInput,
         HandlerError::Unsupported(_) => FsError::Unsupported,
@@ -515,9 +535,23 @@ struct DirectorySnapshot {
     change: u64,
 }
 
+/// Why a directory listing is being loaded into the mount cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectoryFill {
+    /// READDIR enumeration, which must keep one verifier across its pages.
+    Readdir,
+    /// GETATTR revalidating the directory's `change`.
+    Revalidation,
+}
+
 struct MountDirectoryEntry {
     entries: Option<Arc<[Entry]>>,
     change: u64,
+    /// `change` was issued by GETATTR before any listing and carried onto
+    /// the first READDIR. Clients may hold LOOKUP results (including
+    /// negative ones) validated against it that the listing has since
+    /// outdated, so the next revalidation replaces it once.
+    change_predates_listing: bool,
     created_at: Instant,
     last_used_at: Instant,
     last_validated_at: Instant,
@@ -614,6 +648,7 @@ impl MountDirectoryCache {
             MountDirectoryEntry {
                 entries: None,
                 change,
+                change_predates_listing: false,
                 created_at: now,
                 last_used_at: now,
                 last_validated_at: now,
@@ -647,6 +682,7 @@ impl MountDirectoryCache {
         path: VfsPath,
         entries: Arc<[Entry]>,
         generation: u64,
+        fill: DirectoryFill,
     ) -> Arc<DirectorySnapshot> {
         let now = Instant::now();
         let mut cache = self.inner.lock();
@@ -662,9 +698,20 @@ impl MountDirectoryCache {
         let unchanged = existing
             .and_then(|entry| entry.entries.as_deref())
             .is_some_and(|current| directory_entries_equal(current, &entries));
+        let metadata_only = existing.is_some_and(|entry| entry.entries.is_none());
         // A metadata-only entry has not exposed a listing yet, so the first
         // READDIR must fill it under the same verifier allocated by GETATTR.
-        let preserve_change = existing.is_some_and(|entry| entry.entries.is_none()) || unchanged;
+        // That token predates the listing, though: a client may have cached
+        // a LOOKUP against it (including "not found") that the listing now
+        // contradicts. Revalidation therefore never adopts it; it issues a
+        // fresh token, once, so such clients drop what they cached.
+        let carried_to_readdir = metadata_only && fill == DirectoryFill::Readdir;
+        let preserve_change = carried_to_readdir
+            || (unchanged
+                && !(fill == DirectoryFill::Revalidation
+                    && existing.is_some_and(|entry| entry.change_predates_listing)));
+        let change_predates_listing = carried_to_readdir
+            || (preserve_change && existing.is_some_and(|entry| entry.change_predates_listing));
         let change = existing
             .filter(|_| preserve_change)
             .map(|entry| entry.change)
@@ -683,6 +730,7 @@ impl MountDirectoryCache {
             MountDirectoryEntry {
                 entries: Some(entries),
                 change,
+                change_predates_listing,
                 created_at,
                 last_used_at: now,
                 last_validated_at: now,
@@ -777,6 +825,22 @@ pub struct BloomFs {
     /// check (`rsync`, `find -newer`) — but saner-looking than the
     /// epoch fallback used for entries with no known artifact time.
     mounted_at: SystemTime,
+    /// The last failed command write per path. A write that fails leaves the
+    /// client's page dirty, and some writers (`cat`) flush it again when the
+    /// file is closed; that re-send is a fresh WRITE, not a retransmission, so
+    /// the replay cache in the NFS layer does not cover it. Answering it from
+    /// here keeps one refused command from running twice.
+    failed_writes: Arc<Mutex<LruCache<VfsPath, FailedWrite>>>,
+}
+
+/// A command write that the handler refused, kept for
+/// [`FAILED_WRITE_REPLAY_WINDOW`].
+struct FailedWrite {
+    /// Hash of the exact bytes that failed. Only an identical body is a
+    /// re-send; different bytes are a different command.
+    payload: u64,
+    at: Instant,
+    error: FsError,
 }
 
 impl BloomFs {
@@ -789,7 +853,46 @@ impl BloomFs {
             directory_cache: Arc::new(MountDirectoryCache::new(DIRECTORY_CACHE_CAPACITY)),
             directory_in_flight: Arc::new(Mutex::new(HashMap::new())),
             mounted_at: SystemTime::now(),
+            failed_writes: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(FAILED_WRITE_CAPACITY).expect("capacity > 0"),
+            ))),
         }
+    }
+
+    /// Hash of a payload, for recognising a re-send of the same body.
+    fn payload_digest(payload: &[u8]) -> u64 {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        payload.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// If `payload` is the same body that just failed for `path`, return that
+    /// error without dispatching. Consumes the record, so only the first
+    /// repeat is answered this way.
+    fn replay_failed_write(&self, path: &VfsPath, payload: &[u8]) -> Option<FsError> {
+        let digest = Self::payload_digest(payload);
+        let mut failed = self.failed_writes.lock();
+        let fresh = failed.peek(path).is_some_and(|recorded| {
+            recorded.payload == digest && recorded.at.elapsed() < FAILED_WRITE_REPLAY_WINDOW
+        });
+        if !fresh {
+            // Any other body for this path supersedes the record.
+            failed.pop(path);
+            return None;
+        }
+        failed.pop(path).map(|recorded| recorded.error)
+    }
+
+    fn record_failed_write(&self, path: &VfsPath, payload: &[u8], error: FsError) {
+        self.failed_writes.lock().put(
+            path.clone(),
+            FailedWrite {
+                payload: Self::payload_digest(payload),
+                at: Instant::now(),
+                error,
+            },
+        );
     }
 
     /// Decompose a handle into the [`VfsPath`] it represents.
@@ -805,6 +908,11 @@ impl BloomFs {
         dir_path: &VfsPath,
         revalidate: bool,
     ) -> FsResult<Arc<DirectorySnapshot>> {
+        let fill = if revalidate {
+            DirectoryFill::Revalidation
+        } else {
+            DirectoryFill::Readdir
+        };
         if let Some(snapshot) = self.directory_cache.get(dir_path)
             && (!revalidate || !self.directory_cache.needs_revalidation(dir_path))
         {
@@ -838,6 +946,7 @@ impl BloomFs {
                             path.clone(),
                             Arc::from(entries),
                             generation,
+                            fill,
                         )),
                         Ok(Err(error)) => Err(map_err(error)),
                         Err(_) => {
@@ -1384,8 +1493,13 @@ impl FileSystem for BloomFs {
         // advertise UNSTABLE for every reply.
         //
         // Strategy:
-        // - Flush eagerly when the request is sync-stable and the buffer is
-        //   contiguous. For a narrowly-classified asynchronous command sink,
+        // - Flush eagerly when the request is sync-stable, the buffer is
+        //   contiguous, and this WRITE did not fill the client's transfer
+        //   buffer. A full-length WRITE means the payload probably continues,
+        //   and a contiguous prefix is indistinguishable from a whole body —
+        //   dispatching it would run a truncated command and then fail the
+        //   rest of it, so it waits for the short final chunk (or CLOSE).
+        //   For a narrowly-classified asynchronous command sink,
         //   accept a complete offset-zero write and dispatch it away from the
         //   NFS request path. Stability for these virtual files means Bloom
         //   accepted the command; completion is represented by the command's
@@ -1399,7 +1513,10 @@ impl FileSystem for BloomFs {
         // - UNSTABLE requested: buffer and reply UNSTABLE; a later
         //   COMMIT or read will trigger `flush_path`.
         let async_command = self.vfs.is_async_write_command(&path);
-        let (complete_payload, accepted) = {
+        // A WRITE that fills the transfer buffer is probably one chunk of a
+        // longer payload; hold it, whatever stability was asked for.
+        let may_continue = len >= MAX_WRITE_CHUNK_BYTES;
+        let (complete_payload, held, accepted) = {
             let mut map = self.write_buffers.lock();
             let buf = map.entry(path.clone()).or_insert_with(WriteBuffer::new);
             // FBIG check before mutating: fail fast so the client gets
@@ -1410,17 +1527,20 @@ impl FileSystem for BloomFs {
                 return Err(FsError::FileTooLarge);
             }
             buf.apply(offset, &data)?;
-            let payload = if buf.should_flush_after_write(requested)
-                || (offset == 0 && async_command && buf.is_complete())
+            let complete = buf.is_complete();
+            let payload = if !may_continue
+                && (buf.should_flush_after_write(requested)
+                    || (offset == 0 && async_command && complete))
             {
                 Some(map.remove(&path).expect("just observed").bytes)
             } else {
                 None
             };
-            (payload, len)
+            (payload, may_continue && complete, len)
         };
 
         if complete_payload.is_none()
+            && !held
             && matches!(
                 requested,
                 WriteStability::DataSync | WriteStability::FileSync
@@ -1430,11 +1550,14 @@ impl FileSystem for BloomFs {
             return Err(FsError::Unsupported);
         }
 
-        let actual_stability = if complete_payload.is_some() {
+        let actual_stability = if complete_payload.is_some() || held {
             // A normal write is persisted below before this result returns. An
             // asynchronous command is accepted for dispatch; its virtual file
             // never represents persisted content, and its outcome is projected
-            // separately by the command handler.
+            // separately by the command handler. A held chunk is answered at
+            // the stability asked for because embednfs rejects a downgrade;
+            // the payload it belongs to is dispatched by its final chunk, or
+            // by CLOSE if the client sends no shorter one.
             requested
         } else {
             // Still buffering: only safe to advertise UNSTABLE so the
@@ -1445,6 +1568,14 @@ impl FileSystem for BloomFs {
         if let Some(payload) = complete_payload {
             if mount_write_path_uses_wallet_signer(&path) {
                 return Err(FsError::PermissionDenied);
+            }
+            if let Some(error) = self.replay_failed_write(&path, &payload) {
+                debug!(
+                    path = %path.to_string_path(),
+                    bytes = payload.len(),
+                    "mount.adapter.write.replayed_failure"
+                );
+                return Err(error);
             }
             if async_command {
                 let vfs = self.vfs.clone();
@@ -1470,7 +1601,11 @@ impl FileSystem for BloomFs {
                         // Persisted new bytes — invalidate stale rendered views.
                         self.invalidate_after_write(&path);
                     }
-                    Err(error) => return Err(map_err(error)),
+                    Err(error) => {
+                        let error = map_err(error);
+                        self.record_failed_write(&path, &payload, error);
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -1568,6 +1703,14 @@ impl FileSystem for BloomFs {
         Some(self)
     }
 
+    fn close_support(&self) -> Option<&dyn CloseSupport<BloomHandle>> {
+        // A payload whose last chunk filled the client's transfer buffer is
+        // still held when the client stops writing — nothing shorter follows,
+        // and a `sync` mount sends no COMMIT. CLOSE is the end-of-payload
+        // signal NFS WRITE lacks.
+        Some(self)
+    }
+
     fn symlinks(&self) -> Option<&dyn Symlinks<BloomHandle>> {
         Some(self)
     }
@@ -1624,6 +1767,20 @@ impl Symlinks<BloomHandle> for BloomFs {
             EntryKind::Symlink => entry.link_target.ok_or(FsError::InvalidInput),
             _ => Err(FsError::InvalidInput),
         }
+    }
+}
+
+#[async_trait]
+impl CloseSupport<BloomHandle> for BloomFs {
+    async fn close(&self, _ctx: &RequestContext, handle: &BloomHandle) -> FsResult<()> {
+        let path = match handle {
+            BloomHandle::Root => return Ok(()),
+            BloomHandle::Path { path, .. } => path.clone(),
+        };
+        // Whole-file semantics, same as COMMIT: dispatch whatever complete
+        // payload is still held. An incomplete buffer is left for the idle
+        // reaper — a partial command must never run.
+        self.flush_path(&path).await
     }
 }
 
@@ -2570,6 +2727,105 @@ mod tests {
         assert_eq!(recorder.write_count(), 0);
     }
 
+    /// A `sync` mount sends one FILE_SYNC WRITE per `wsize` chunk, and NFS
+    /// WRITE carries no EOF marker. The first chunk is a contiguous prefix
+    /// from offset 0 — it must not be dispatched as a whole command, or the
+    /// handler runs on a body nobody wrote and the rest of it fails.
+    #[tokio::test]
+    async fn split_sync_payload_dispatches_once_with_the_whole_body() {
+        let recorder = RecordingHandler::new();
+        let vfs = Vfs::builder().mount("box", recorder.clone()).build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BloomHandle::Root, "box").await.unwrap();
+        let inbox = fs.lookup(&ctx, &dir, "inbox").await.unwrap();
+        let body = vec![b'j'; 100_000];
+
+        for offset in [0, MAX_WRITE_CHUNK_BYTES] {
+            let end = (offset + MAX_WRITE_CHUNK_BYTES).min(body.len());
+            let result = fs
+                .write(
+                    &ctx,
+                    &inbox,
+                    offset as u64,
+                    Bytes::copy_from_slice(&body[offset..end]),
+                    WriteStability::FileSync,
+                )
+                .await
+                .expect("every chunk of one payload is accepted");
+            assert_eq!(result.stability, WriteStability::FileSync);
+        }
+
+        assert_eq!(recorder.write_count(), 1);
+        assert_eq!(recorder.last_write().unwrap(), body);
+    }
+
+    /// The final chunk of a payload whose length is an exact multiple of the
+    /// transfer size is full-length too, so nothing shorter ever arrives to
+    /// release it. CLOSE is the end-of-payload signal that releases it.
+    #[tokio::test]
+    async fn chunk_aligned_sync_payload_dispatches_at_close() {
+        let recorder = RecordingHandler::new();
+        let vfs = Vfs::builder().mount("box", recorder.clone()).build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BloomHandle::Root, "box").await.unwrap();
+        let inbox = fs.lookup(&ctx, &dir, "inbox").await.unwrap();
+        let body = vec![b'j'; MAX_WRITE_CHUNK_BYTES];
+
+        fs.write(
+            &ctx,
+            &inbox,
+            0,
+            Bytes::copy_from_slice(&body),
+            WriteStability::FileSync,
+        )
+        .await
+        .unwrap();
+        assert_eq!(recorder.write_count(), 0, "held, not dispatched truncated");
+
+        fs.close_support()
+            .expect("BloomFs must advertise CLOSE")
+            .close(&ctx, &inbox)
+            .await
+            .unwrap();
+        assert_eq!(recorder.write_count(), 1);
+        assert_eq!(recorder.last_write().unwrap(), body);
+    }
+
+    /// A refused write leaves the client's page dirty and some writers flush
+    /// it again when the file is closed. That re-send must not run the
+    /// command a second time; the record is consumed by the first repeat, so
+    /// a deliberate retry still reaches the handler.
+    #[tokio::test]
+    async fn the_close_time_resend_of_a_refused_write_runs_once() {
+        let handler = ChallengeStagingHandler::new();
+        let vfs = Vfs::builder().mount("stage", handler.clone()).build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BloomHandle::Root, "stage").await.unwrap();
+        let challenge = fs.lookup(&ctx, &dir, "challenge").await.unwrap();
+        let body = b"{\"confirm\":true}";
+        let write = || {
+            fs.write(
+                &ctx,
+                &challenge,
+                0,
+                Bytes::copy_from_slice(body),
+                WriteStability::FileSync,
+            )
+        };
+
+        assert_eq!(write().await.unwrap_err(), FsError::AccessDenied);
+        assert_eq!(handler.staged_count(), 1);
+        // The re-send: same path, same bytes, answered from the record.
+        assert_eq!(write().await.unwrap_err(), FsError::AccessDenied);
+        assert_eq!(handler.staged_count(), 1, "one command, one invocation");
+        // The record is spent, so the next attempt is dispatched again.
+        assert_eq!(write().await.unwrap_err(), FsError::AccessDenied);
+        assert_eq!(handler.staged_count(), 2);
+    }
+
     /// Bug #4 acceptance: a write that would push the per-handle
     /// buffer past `MAX_WRITE_BUFFER_BYTES` must be rejected with
     /// `FileTooLarge` (NFS4ERR_FBIG) before any state mutation.
@@ -3198,6 +3454,60 @@ mod tests {
             "directory change must move after a new entry is added; \
              otherwise the kernel will keep serving the cached empty listing"
         );
+    }
+
+    /// A client caches a failed LOOKUP against the directory's `change`.
+    /// When that token was issued before the adapter had listed the
+    /// directory, the first listing must not adopt it: the entry may have
+    /// appeared in between, and a client polling faster than the idle TTL
+    /// would otherwise keep its negative entry until the snapshot's max
+    /// age (observed: `policy-updates/latest` missing for 30 s).
+    #[tokio::test(start_paused = true)]
+    async fn dir_change_moves_after_entry_appears_behind_metadata_only_token() {
+        let h = MutableDirHandler::new();
+        let vfs = Vfs::builder().mount("box", h.clone()).build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let box_dir = fs.lookup(&ctx, &BloomHandle::Root, "box").await.unwrap();
+        let pending = fs.lookup(&ctx, &box_dir, "pending").await.unwrap();
+        let before = fs.getattr(&ctx, &pending).await.unwrap().change;
+        assert!(fs.lookup(&ctx, &pending, "0001").await.is_err());
+        h.push("0001");
+        // Poll inside the idle TTL so the snapshot never expires.
+        tokio::time::advance(DIRECTORY_CACHE_REVALIDATE_INTERVAL + Duration::from_millis(1)).await;
+        let after = fs.getattr(&ctx, &pending).await.unwrap().change;
+        assert_ne!(
+            before, after,
+            "a change token issued before any listing must not survive the first listing"
+        );
+        fs.lookup(&ctx, &pending, "0001").await.unwrap();
+        tokio::time::advance(DIRECTORY_CACHE_REVALIDATE_INTERVAL + Duration::from_millis(1)).await;
+        assert_eq!(fs.getattr(&ctx, &pending).await.unwrap().change, after);
+    }
+
+    /// READDIR keeps the token GETATTR issued so one enumeration sees one
+    /// verifier, but the token predates the listing, so the next
+    /// revalidation replaces it once and then holds it stable.
+    #[tokio::test(start_paused = true)]
+    async fn readdir_filled_token_is_replaced_once_after_enumeration() {
+        let h = MutableDirHandler::new();
+        let vfs = Vfs::builder().mount("box", h.clone()).build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let box_dir = fs.lookup(&ctx, &BloomHandle::Root, "box").await.unwrap();
+        let pending = fs.lookup(&ctx, &box_dir, "pending").await.unwrap();
+        let issued = fs.getattr(&ctx, &pending).await.unwrap().change;
+        assert!(fs.lookup(&ctx, &pending, "0001").await.is_err());
+        h.push("0001");
+        fs.readdir(&ctx, &pending, 0, u32::MAX, false)
+            .await
+            .unwrap();
+        assert_eq!(fs.getattr(&ctx, &pending).await.unwrap().change, issued);
+        tokio::time::advance(DIRECTORY_CACHE_REVALIDATE_INTERVAL + Duration::from_millis(1)).await;
+        let replaced = fs.getattr(&ctx, &pending).await.unwrap().change;
+        assert_ne!(replaced, issued);
+        tokio::time::advance(DIRECTORY_CACHE_REVALIDATE_INTERVAL + Duration::from_millis(1)).await;
+        assert_eq!(fs.getattr(&ctx, &pending).await.unwrap().change, replaced);
     }
 
     /// Two empty directories at different paths must not share a

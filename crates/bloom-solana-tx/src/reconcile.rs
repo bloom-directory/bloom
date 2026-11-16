@@ -16,7 +16,7 @@ use sha2::Digest as _;
 use tokio::sync::oneshot;
 
 use crate::outbox::{OutboxError, SolanaOutbox};
-use crate::types::{RECEIPT_FILE, SolanaReceipt};
+use crate::types::{RECEIPT_FILE, SolanaReceipt, UNRESOLVED_FILE};
 
 /// Polls sent transfers and records their on-chain outcome.
 pub struct SolanaReconciler {
@@ -106,10 +106,9 @@ impl SolanaReconciler {
             .map_err(|e| OutboxError::Other(e.to_string()))?;
         let Some(Some(status)) = statuses.into_iter().next() else {
             // The failover path observed `null`. That is one endpoint's
-            // absence, not the cluster's: a lagging or non-archival peer can
-            // report `null` for a signature another endpoint finalized. Only
-            // proceed once the validity window has closed, and then ask
-            // every configured endpoint before writing anything terminal.
+            // absence: a lagging peer can miss a signature another endpoint
+            // finalized. Once the validity window has closed, ask every
+            // configured endpoint for an observation.
             let current_height = chain
                 .get_block_height()
                 .await
@@ -117,64 +116,28 @@ impl SolanaReconciler {
             if current_height <= entry.last_valid_block_height {
                 return Ok(None);
             }
-            let quorum = chain
+            let probes = chain
                 .probe_signature_status_all_endpoints(&entry.signature)
                 .await;
-            let mut finalized: Option<bloom_solana::SignatureStatus> = None;
-            let mut seen_unfinalized = false;
-            let mut absent = 0_usize;
-            let mut unavailable = 0_usize;
-            for probe in quorum {
-                match probe.status {
-                    Ok(None) => absent += 1,
-                    Ok(Some(status)) => {
-                        if status.confirmation_status.as_deref() == Some("finalized") {
-                            finalized = Some(status);
-                        } else {
-                            seen_unfinalized = true;
-                        }
-                    }
-                    Err(_) => unavailable += 1,
-                }
+            let observed: Vec<_> = probes
+                .into_iter()
+                .filter_map(|probe| probe.status.ok().flatten())
+                .collect();
+            if let Some(status) = observed
+                .iter()
+                .find(|s| s.confirmation_status.as_deref() == Some("finalized"))
+            {
+                return self.write_outcome_receipt(entry, status);
             }
-            if let Some(status) = finalized {
-                // Some endpoint observed the transfer the failover path
-                // missed. Reconcile from that observation.
-                return self.write_outcome_receipt(entry, &status);
-            }
-            if seen_unfinalized {
-                // Observed, but not yet finalized on any answering endpoint;
-                // a durable receipt stays terminal-only.
+            if !observed.is_empty() {
+                // Seen but not yet finalized; a receipt stays terminal-only.
                 return Ok(None);
             }
-            if unavailable > 0 {
-                // Absence cannot be proven while endpoints are missing.
-                // Keep the entry unreconciled rather than risk recording an
-                // executed transfer as failed.
-                return Err(OutboxError::Other(format!(
-                    "signature absence not proven: {unavailable} of {} endpoints unavailable",
-                    absent + unavailable,
-                )));
-            }
-            // Once the validity window has closed, a signature no configured
-            // endpoint reports — even from transaction history — cannot newly
-            // land. Record that terminal fact instead of leaving the outbox
-            // in `sent` forever.
-            let receipt = SolanaReceipt {
-                outcome: "failed".to_string(),
-                signature: entry.signature.clone(),
-                slot: None,
-                err: Some(serde_json::json!({
-                    "kind": "blockhash_expired_unseen",
-                    "last_valid_block_height": entry.last_valid_block_height,
-                    "observed_block_height": current_height,
-                    "endpoints_reporting_unseen": absent,
-                })),
-                confirmation_status: None,
-            };
-            let bytes = serde_json::to_vec_pretty(&receipt)?;
-            self.project_receipt(entry, &bytes)?;
-            return Ok(Some(receipt));
+            // No endpoint reports it, but RPC history can miss a landed
+            // transaction, so absence never becomes a failed receipt. The
+            // entry stays `sent`; tell the operator how to settle it.
+            self.write_unresolved_notice(entry, current_height)?;
+            return Ok(None);
         };
 
         // `processed` and `confirmed` are forkable observations. A durable
@@ -183,6 +146,39 @@ impl SolanaReconciler {
             return Ok(None);
         }
         self.write_outcome_receipt(entry, &status)
+    }
+
+    /// Publish `unresolved.md` once for a transfer no endpoint reports after
+    /// its blockhash expired.
+    fn write_unresolved_notice(
+        &self,
+        entry: &crate::types::SolanaSentEntry,
+        current_height: u64,
+    ) -> Result<(), OutboxError> {
+        let sent = self.outbox.read_in_state(
+            &entry.wallet,
+            &entry.chain,
+            &entry.id,
+            crate::outbox::SolanaOutboxState::Sent,
+        )?;
+        if sent.dir.join(UNRESOLVED_FILE).exists() {
+            return Ok(());
+        }
+        let text = format!(
+            "Unresolved: no configured RPC reports signature `{signature}`, and its \
+blockhash expired at block height {last_valid} (observed {current_height}).\n\n\
+This does not prove the transfer failed. RPC history can miss a landed \
+transaction, so Bloom will not mark it failed or restage it.\n\n\
+Look up `{signature}` in a block explorer or an archival RPC for this chain.\n\
+- If it landed, the payment is done: do not pay again. Bloom records the receipt \
+once a configured RPC reports it.\n\
+- If it did not land, it can no longer land. Stage a new transfer to pay again. \
+This entry stays in `sent` as a record.\n",
+            signature = entry.signature,
+            last_valid = entry.last_valid_block_height,
+        );
+        self.outbox
+            .write_sent_sibling(entry, UNRESOLVED_FILE, text.as_bytes())
     }
 
     /// Record a receipt from a finalized on-chain observation.

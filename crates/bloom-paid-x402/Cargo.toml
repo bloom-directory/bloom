@@ -16,6 +16,7 @@ x402-types = "2.0.0"
 tempfile.workspace = true
 
 [dev-dependencies]
+alloy-dyn-abi.workspace = true
 reqwest.workspace = true
 url.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

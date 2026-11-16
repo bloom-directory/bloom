@@ -1,0 +1,66 @@
+[
+  {
+    "preimage_hex": "1901d79297fcdf2ffcd4ae223d01edaa2ba214ff8f401d7c9300d995d17c82aa4040777b5978e5a5101240027e5357c7e489f6090589bacc6413c290516dfc336c47",
+    "hash_hex": "9a1e431de1fe475322c242fb1683d63f13a866cdcfdd2851ff7a627eb141e77f",
+    "witness": {
+      "action": {
+        "cancels": [
+          {
+            "a": 0,
+            "o": 42
+          }
+        ],
+        "type": "cancel"
+      },
+      "expires_after": null,
+      "kind": "hyperliquid_l1",
+      "network": "testnet",
+      "nonce": 123,
+      "schema": "bloom.message.review.v1",
+      "vault_address": null
+    }
+  },
+  {
+    "preimage_hex": "1901d79297fcdf2ffcd4ae223d01edaa2ba214ff8f401d7c9300d995d17c82aa4040612e407f106d1d21b9044b020af07d3748df825a94e0d32794bd085652265f34",
+    "hash_hex": "56cf19df90a2e50d9736bee0bef0e389b24da14e616b8be87ad9cb4f5c0118a8",
+    "witness": {
+      "action": {
+        "cancels": [
+          {
+            "a": 0,
+            "o": 42
+          }
+        ],
+        "f": true,
+        "type": "cancel"
+      },
+      "expires_after": null,
+      "kind": "hyperliquid_l1",
+      "network": "testnet",
+      "nonce": 124,
+      "schema": "bloom.message.review.v1",
+      "vault_address": null
+    }
+  },
+  {
+    "preimage_hex": "1901d79297fcdf2ffcd4ae223d01edaa2ba214ff8f401d7c9300d995d17c82aa404083e79768a6e5354434b6bf409d64d6775ca38691d17d2162092774a828eb5515",
+    "hash_hex": "7b7ee8cfb2b8f1d4baa8892d95c7e1b46afa4ee7f864170973f94e1b301c9eaf",
+    "witness": {
+      "action": {
+        "cancels": [
+          {
+            "asset": 0,
+            "cloid": "0x00112233445566778899aabbccddeeff"
+          }
+        ],
+        "type": "cancelByCloid"
+      },
+      "expires_after": null,
+      "kind": "hyperliquid_l1",
+      "network": "testnet",
+      "nonce": 125,
+      "schema": "bloom.message.review.v1",
+      "vault_address": null
+    }
+  }
+]

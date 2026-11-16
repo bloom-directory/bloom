@@ -154,10 +154,14 @@ temporary per-user systemd socket units for Broker and Signer; an active
 systemd user manager is required. Paths embedded in those units may contain
 only ASCII letters, digits, and `_./:@+-`.
 
-Linux also uses the reviewed `linux-chrony-nts` trusted-time profile. The host
-clock must already be synchronized through the production two-source NTS
-configuration; the developer harness does not replace it with unauthenticated
-NTP.
+On Linux the launcher writes the trusted-time source `linux-chrony-nts`. That
+is a legacy wire name kept for rollback compatibility; the runtime reads it as
+the `linux-system-clock` source described in the
+[Linux packaging README](./packaging/triad/linux/README.md): Bloom uses the
+ordinary host wall clock and guards it against backward steps. No Chrony, NTS
+or second time source is required. Keep the host clock synchronized as usual;
+a clock stepped backwards freezes Broker and Signer mutations until wall time
+catches up.
 
 The launcher writes public connection settings to
 `/tmp/bloom-triad-logs/triad.env`. Source that file only in the terminal meant
@@ -303,6 +307,11 @@ The examples use fixed paths. Before running another candidate, give it a
 distinct developer root, Machine home, socket, log directory, ready file,
 mountpoint, and ceremony port. Suffixing each path with a candidate name is
 sufficient for state isolation.
+
+For disposable authorization tests, `--retain-temporary-files` keeps the
+launcher's generated template and runtime directories for diagnosis. Shutdown
+still stops only that candidate's services and removes its ready file and
+Machine socket. The test runner uses this option without recursive cleanup.
 
 Each candidate also needs its own ceremony port so two complete development
 triads, including passkey ceremonies, can run side by side while the installed
@@ -465,12 +474,12 @@ exercise the behavior you changed.
 
 ## Preinstalled Petals
 
-Every Bloom home provisions Polymarket, Hyperliquid, Enso, Near Intents, and
-Tolly from the pinned release catalog. `bloom init` installs missing releases
-and updates older catalog releases; Machine startup also attempts provisioning
-in the background. Current verified installations are reused. Legacy
-`[petals] preinstalled` values are ignored, including empty lists, and are no
-longer written to new configs.
+Every Bloom home provisions Polymarket, Hyperliquid, Enso, Near Intents,
+Feedback, and Safe from the pinned release catalog. `bloom init` installs
+missing releases and updates older catalog releases; Machine startup also
+attempts provisioning in the background. Current verified installations are
+reused. Legacy `[petals] preinstalled` values are ignored, including empty
+lists, and are no longer written to new configs.
 
 The canonical list is `DEFAULT_PETALS` in
 [`crates/bloom/src/github_source.rs`](./crates/bloom/src/github_source.rs).
@@ -485,8 +494,12 @@ developer launcher does the same on every launch
 (`init triad-refresh-developer-provenance-catalog`), keeping developer-owned
 records such as locally enrolled Petals. A long-lived developer root therefore
 picks up new pinned releases on its next launch. An installation without
-source provenance (a manual local install of a default Petal) is never
-replaced: uninstall it first, then relaunch.
+source provenance (a local install of a default release archive) is reused
+when its package hash equals the pinned release's hash. If its hash is an
+explicit predecessor in the pinned catalog, provisioning upgrades it through
+the same verified download, signed activation and private-state carry-forward
+checks as a source-tracked installation. No uninstall is needed. Unknown
+package hashes and conflicting source identities are not overwritten.
 
 ## General local operation
 
@@ -529,6 +542,82 @@ The launcher's optional controls are:
 | `BLOOM_TRIAD_DEV_SOCKET_TIMEOUT_SECONDS` | Positive launcher socket timeout |
 | `BLOOM_TRIAD_DEV_CEREMONY_PORT` | Ceremony listener port when `--ceremony-port` is absent |
 | `BLOOM_TRIAD_DEV_REMOTE_UPSTREAM_PORT` | Hosted-relay loopback upstream port when `--remote-upstream-port` is absent |
+
+Every launch refreshes the developer provenance catalog before enrolling, and
+that refresh re-derives each Petal operation class's `fee_asset` from
+`FEE_BEARING_OPERATION_CLASSES` in `crates/bloom/src/triad_enrollment.rs`. A
+class enrolled before the table catalogued it is healed, with a `note:` on
+stderr. A heal is one-way, and no rollback undoes it: a build predating the
+table carries developer records over verbatim and never reads `fee_asset`, so
+the healed value is left untouched, and a build that has the table but not that
+row takes the keep-as-signed branch below. Only re-enrolling the Petal against
+the older build re-derives the record, so that is the way back.
+
+A **developer-published** class the record already carries any other value for
+is never overwritten, whether this build catalogues it differently or no longer
+catalogues it at all: one of the record and the table is stale, the refresh
+cannot tell which, and it will not re-sign on a guess. Records published by
+`bloom-release-pins` are the exception and are not protected this way — the
+refresh rebuilds them wholesale from this binary's own pins, so their fee
+assets follow the table silently, with no note and no warning. Editing a
+catalogued row therefore changes a release record without telling anyone, while
+the same change to a developer record is reported. It prints a `warning:`
+naming the route, the package hash, the value the record carries and the value
+this build derives, and carries on — so a stale record on one class does not
+stop a launch, and does not stop a legitimate heal on another. What it does
+mean is that Broker will judge that Petal's claims against the signed value,
+not against the table, so the warning is worth acting on rather than living
+with.
+
+Correcting a row in that table is therefore a breaking change for every
+developer root enrolled against the old value. The remedy is per-Petal:
+re-enrolling the Petal re-derives its records from the table, for the package
+hash on disk — so it clears a warning only while that hash is still the one the
+record names. The launcher runs this enrolment for the Hyperliquid package
+whenever `BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE` is set, immediately after the
+refresh, but it rebuilds the package first unless
+`BLOOM_TRIAD_DEV_BUILD_PETALS=0`: a Petal whose source has moved therefore gets
+a new hash, and the warned-about record survives. For any other Petal, or with
+that variable unset, run it yourself from the repository root, once per Petal
+the warning names:
+
+```sh
+cargo run -p bloom --no-default-features --features mount,triad-dev-harness -- \
+  init triad-enroll-developer-petal-provenance \
+  "$HOME/.bloom/triad-dev/config" \
+  "$HOME/Bloom/bloom-petal-hyperliquid"
+```
+
+`cargo run`, not a built path: worktrees are asked to set their own
+`CARGO_TARGET_DIR` above, so `target/debug/bloom` is stale or missing in exactly
+the setup these roots are built in. A build older than the table re-enrols the
+record with no fee asset at all, clearing the value the refresh declined to
+clear.
+
+Re-enrol only while the package on disk is still the one the warning names.
+Enrolment replaces records for the package hash it reads and leaves every other
+hash alone, so re-enrolling a Petal that has been rebuilt since enrols the new
+hash and leaves the warned-about record behind as a superseded one. Nothing
+clears that but a fresh root, as below — so for the "Petal has changed" cause,
+running this command moves the record out of reach of the very remedy it is
+offered for.
+
+The first path is the `config` directory under the `--developer-root` the
+launcher was given; the second is that Petal's built package directory, the
+same path the launcher takes from `BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE`. The
+warning prints both the command and the config directory it read, so it can be
+copied from there. A fresh root works too, and is the only route for a record
+the lineage marks `active: false`: the refresh will not overwrite it and
+enrolment refuses to reactivate a superseded package hash. There is
+deliberately no override — a single flag rewriting every disagreeing record at
+once would clear unrelated ones along with the intended one, and correcting a
+row has not yet happened.
+
+Adding a row is ordinarily safe: both enrollment sites derive from the same
+table, so a record written by either carries no value for a class the table did
+not know, and takes the healing path. A record that acquired a value some other
+way — an older binary, a hand edit — does disagree when its class is added with
+a different value, and is warned about the same way.
 
 The launcher also accepts `--ceremony-port PORT`. The selected port is the
 explicit flag, otherwise `BLOOM_TRIAD_DEV_CEREMONY_PORT` when set, otherwise

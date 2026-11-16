@@ -1,0 +1,39 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    ignore:
+      # Wasmtime 36 is an LTS line: take its patch and security releases,
+      # move to a new minor or major by hand.
+      - dependency-name: "wasmtime*"
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+      # Exact `=1.8.0` pin in bloom-paid-mpp; moves by hand.
+      - dependency-name: tempo-alloy
+    groups:
+      # Keep the runtime security updates independent of other Cargo bumps.
+      wasmtime:
+        patterns:
+          - "wasmtime"
+          - "wasmtime-wasi"
+      cargo-minor-and-patch:
+        exclude-patterns:
+          - "wasmtime"
+          - "wasmtime-wasi"
+        update-types:
+          - minor
+          - patch
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      github-actions-minor-and-patch:
+        update-types:
+          - minor
+          - patch

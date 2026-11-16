@@ -1944,6 +1944,7 @@ fn route_records_from_files(
             has_app_file = true;
             if rel.ends_with(".wasm") {
                 let pattern = route_pattern_from_rel(rel)?;
+                reject_host_reserved_pattern(&pattern)?;
                 routes.push(RouteRecord {
                     route_id: String::new(),
                     params: route_params(&pattern)?,
@@ -1951,6 +1952,8 @@ fn route_records_from_files(
                     pattern,
                     source_path: PathBuf::from(&file.path),
                 });
+            } else {
+                reject_host_reserved_pattern(rel)?;
             }
         }
     }
@@ -1981,6 +1984,18 @@ fn validate_single_petal_root(
                 "Petal package has extra petal root {root:?}; expected only petal/{expected}/"
             )));
         }
+    }
+    Ok(())
+}
+
+/// Reject a package path the host serves itself at the Petal's mount root.
+/// The router shadows such a name on every operation, so accepting it at
+/// install would land a route that can never be reached.
+fn reject_host_reserved_pattern(pattern: &str) -> Result<(), PetalError> {
+    if pattern == crate::router::LAST_ERROR {
+        return Err(PetalError::InvalidWasm(format!(
+            "{pattern} at the Petal root is served by Bloom; rename it"
+        )));
     }
     Ok(())
 }
@@ -4493,7 +4508,22 @@ pub(crate) mod route_fixtures {
     const WRITE_RESULT: u32 = 1408;
     const EMPTY_LIST_PTR: u32 = 2048;
     const ENTRY_NAME: &str = "alice";
+    pub(crate) const DENY_REASON: &str = "approval required";
     pub(crate) const LOOKUP_ENTRY_SIZE: u64 = 7;
+
+    /// What a fixture route's `write` export does. Everything but
+    /// [`FixtureWrite::Accepting`] also advertises `write-async`, so a test
+    /// that picks one of them is asserting Bloom waits for the route anyway.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum FixtureWrite {
+        /// Accepts every write.
+        Accepting,
+        /// Refuses every write with `denied(DENY_REASON)`.
+        Denied,
+        /// Traps inside the write handler: a host failure, not a refusal, so
+        /// the route never names a reason.
+        Trapping,
+    }
 
     /// Builds a directory (`$index`) route component whose `metadata`
     /// export reports `kind = dir`, `mode = 0o755`,
@@ -4513,8 +4543,7 @@ pub(crate) mod route_fixtures {
             package_import,
             false,
             true,
-            false,
-            false,
+            FixtureWrite::Accepting,
             false,
         )
     }
@@ -4532,8 +4561,7 @@ pub(crate) mod route_fixtures {
             package_import,
             true,
             true,
-            false,
-            false,
+            FixtureWrite::Accepting,
             false,
         )
     }
@@ -4546,8 +4574,7 @@ pub(crate) mod route_fixtures {
             None,
             false,
             false,
-            false,
-            false,
+            FixtureWrite::Accepting,
             false,
         )
     }
@@ -4560,16 +4587,14 @@ pub(crate) mod route_fixtures {
             None,
             false,
             false,
-            false,
-            false,
+            FixtureWrite::Accepting,
             true,
         )
     }
 
-    /// Builds a writable route which advertises asynchronous writes but
-    /// traps from its write handler. This exercises error propagation at the
-    /// VFS/router boundary without depending on a host capability failure.
-    pub(crate) fn async_failing_write_route_component() -> Vec<u8> {
+    /// Builds a writable file route whose `write` export behaves as `write`
+    /// says.
+    pub(crate) fn write_route_component(write: FixtureWrite) -> Vec<u8> {
         build_dynamic_dir_route_component(
             false,
             FixtureVfsImport::None,
@@ -4577,8 +4602,7 @@ pub(crate) mod route_fixtures {
             None,
             false,
             true,
-            true,
-            true,
+            write,
             true,
         )
     }
@@ -4591,8 +4615,7 @@ pub(crate) mod route_fixtures {
         package_import: Option<&str>,
         side_effecting_read: bool,
         include_list: bool,
-        write_async: bool,
-        trap_write: bool,
+        write: FixtureWrite,
         file_route: bool,
     ) -> Vec<u8> {
         // String table for the metadata cap names and the lookup entry name.
@@ -4604,6 +4627,8 @@ pub(crate) mod route_fixtures {
         }
         let name_ptr = STRINGS_BASE + strings.len() as u32;
         strings.extend_from_slice(ENTRY_NAME.as_bytes());
+        let reason_ptr = STRINGS_BASE + strings.len() as u32;
+        strings.extend_from_slice(DENY_REASON.as_bytes());
         let caps_array = (STRINGS_BASE + strings.len() as u32 + 3) & !3;
         let mut caps_array_bytes = Vec::new();
         for (ptr, len) in &cap_locs {
@@ -4619,7 +4644,7 @@ pub(crate) mod route_fixtures {
         meta[16] = 1; // cache-ttl-ms: some
         meta[24..32].copy_from_slice(&30_000u64.to_le_bytes());
         meta[32] = u8::from(side_effecting_read);
-        meta[33] = u8::from(write_async);
+        meta[33] = u8::from(write != FixtureWrite::Accepting);
         meta[60..64].copy_from_slice(&caps_array.to_le_bytes());
         meta[64..68].copy_from_slice(&(metadata_caps.len() as u32).to_le_bytes());
 
@@ -4636,7 +4661,13 @@ pub(crate) mod route_fixtures {
         // with empty ok lists, and result<_, route-error> ok.
         let mut empty_list = vec![0u8; 16];
         empty_list[4..8].copy_from_slice(&EMPTY_LIST_PTR.to_le_bytes());
-        let write = vec![0u8; 16];
+        let mut write_result = vec![0u8; 16];
+        if write == FixtureWrite::Denied {
+            write_result[0] = 1; // err
+            write_result[4] = 2; // route-error case "denied"
+            write_result[8..12].copy_from_slice(&reason_ptr.to_le_bytes());
+            write_result[12..16].copy_from_slice(&(DENY_REASON.len() as u32).to_le_bytes());
+        }
 
         let store_import = if import_store {
             r#"
@@ -4683,6 +4714,13 @@ pub(crate) mod route_fixtures {
         let package_import = package_import
             .map(|name| format!("  (import {name:?} (instance))\n"))
             .unwrap_or_default();
+        let core_write_func = if write == FixtureWrite::Trapping {
+            r#"(func $write (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
+      unreachable)"#
+        } else {
+            r#"(func $write (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
+      i32.const 1408)"#
+        };
         let core_list_func = if include_list {
             r#"(func $list (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
       i32.const 1280)"#
@@ -4698,13 +4736,6 @@ pub(crate) mod route_fixtures {
             r#"(alias core export $main-instance "list" (core func $core-list))"#
         } else {
             ""
-        };
-        let core_write_func = if trap_write {
-            r#"(func $write (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
-      unreachable)"#
-        } else {
-            r#"(func $write (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
-      i32.const 1408)"#
         };
         let component_list_export = if include_list {
             r#"(type $entry-list (list $entry-import))
@@ -4825,7 +4856,7 @@ pub(crate) mod route_fixtures {
             lookup_data = data_segment(LOOKUP_RESULT, &lookup),
             list_data = data_segment(LIST_RESULT, &empty_list),
             read_data = data_segment(READ_RESULT, &empty_list),
-            write_data = data_segment(WRITE_RESULT, &write),
+            write_data = data_segment(WRITE_RESULT, &write_result),
         );
         wat::parse_str(&wat).unwrap()
     }
@@ -4998,6 +5029,25 @@ name = "foo.bar"
 
         let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("too long for strict .petal.tar"));
+    }
+
+    /// `last_error.json` at a Petal's root is served by the host on every
+    /// operation, so a package route or file of that name could never be
+    /// reached. Refuse it at install rather than installing something dead.
+    #[test]
+    fn petal_scanner_rejects_a_host_served_root_name() {
+        for name in ["last_error.json.wasm", "last_error.json"] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_petal_package(tmp.path());
+            write_package_file(
+                tmp.path(),
+                &format!("petal/echo/{name}"),
+                route_component_no_imports(),
+            );
+
+            let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
+            assert!(err.to_string().contains("served by Bloom"), "{name}: {err}");
+        }
     }
 
     #[test]

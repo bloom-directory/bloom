@@ -1,0 +1,19 @@
+{
+  "name": "bloom-skill-evals",
+  "private": true,
+  "description": "Promptfoo evaluations of the Bloom agent skill in skills/bloom.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.22.0"
+  },
+  "scripts": {
+    "eval": "PROMPTFOO_DISABLE_TELEMETRY=1 promptfoo eval --no-cache --repeat 5 --config promptfooconfig.ts --output results/latest.json",
+    "eval:models": "BLOOM_EVAL_MODEL_SUITE=expanded PROMPTFOO_DISABLE_TELEMETRY=1 promptfoo eval --no-cache --repeat 5 --config promptfooconfig.ts --output results/latest-models.json",
+    "eval:claude": "BLOOM_EVAL_MODEL_SUITE=claude-revisions BLOOM_EVAL_LOCAL=claude PROMPTFOO_DISABLE_TELEMETRY=1 promptfoo eval --no-cache --repeat 5 --config promptfooconfig.ts --output results/latest-claude.json",
+    "check": "node providers/agent-cli.test.mjs && node assertions/onboarding-fixtures.cjs && PROMPTFOO_DISABLE_TELEMETRY=1 promptfoo validate config --config promptfooconfig.ts && BLOOM_EVAL_MODEL_SUITE=expanded PROMPTFOO_DISABLE_TELEMETRY=1 promptfoo validate config --config promptfooconfig.ts && BLOOM_EVAL_MODEL_SUITE=claude-revisions BLOOM_EVAL_LOCAL=claude PROMPTFOO_DISABLE_TELEMETRY=1 promptfoo validate config --config promptfooconfig.ts",
+    "view": "PROMPTFOO_DISABLE_TELEMETRY=1 promptfoo view --port 15500 --no"
+  },
+  "devDependencies": {
+    "promptfoo": "0.124.1"
+  }
+}

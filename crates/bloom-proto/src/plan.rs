@@ -200,16 +200,6 @@ pub struct StagedTx {
     /// on historical entries, which therefore remain unsupported/review-only.
     #[serde(default)]
     pub action_kind: TxActionKind,
-    /// The owner's explicit review choice, recorded when the transaction was
-    /// staged. `None` lets Broker decide under the wallet's policy: a clear
-    /// reading when a signed description covers the call, the existing
-    /// envelope review otherwise. `"opaque_exact"` is the owner asking to
-    /// approve bytes Bloom will not explain, which Broker still refuses
-    /// unless policy permits it. Absent on every row staged before clear
-    /// signing existed, and skipped when absent, so those rows keep their
-    /// exact bytes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub review_mode: Option<String>,
     /// Tx hash once broadcast.
     #[serde(default)]
     pub tx_hash: Option<String>,
@@ -247,6 +237,22 @@ pub struct StagedTx {
     /// historical `intent.json` entries resolve to the native EVM wallet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_origin: Option<ExecutionOrigin>,
+}
+
+/// Whether a central action id is safe to join as one path segment: exactly
+/// one normal component, not the `latest` sentinel, and free of separators,
+/// NUL and `..`.
+pub fn is_valid_action_id(id: &str) -> bool {
+    use std::path::{Component, Path};
+    let mut parts = Path::new(id).components();
+    matches!(
+        (parts.next(), parts.next()),
+        (Some(Component::Normal(_)), None)
+    ) && !(id == "latest"
+        || id.contains('/')
+        || id.contains('\\')
+        || id.contains('\0')
+        || id.contains(".."))
 }
 
 impl StagedTx {
@@ -447,10 +453,16 @@ impl PlanRender {
             "Chain:  {} (id {})\n",
             staged.chain, staged.chain_id
         ));
-        s.push_str(&format!(
-            "Value:  {} {} ({} wei)\n",
-            value_human, native_symbol, staged.value_wei
-        ));
+        if crate::chain::chain_has_native_asset(staged.chain_id) {
+            s.push_str(&format!(
+                "Value:  {} {} ({} wei)\n",
+                value_human, native_symbol, staged.value_wei
+            ));
+        } else {
+            // Tempo has no native token, so "0 ETH" would name an asset the
+            // chain does not have. Fees are paid in tokens.
+            s.push_str("Value:  none (this chain has no native token)\n");
+        }
         s.push_str(&format!("Nonce:  {}\n", staged.nonce));
         if let Some(gp) = staged.gas_price.as_deref() {
             s.push_str(&format!(
@@ -495,6 +507,14 @@ mod tests {
     use super::*;
     use crate::policy::{PolicyCheck, PolicyOutcome};
 
+    #[test]
+    fn action_id_must_be_one_normal_path_segment() {
+        for id in [".", "..", "", "a/b", "a/", "latest", "a\\b", "a\0b"] {
+            assert!(!is_valid_action_id(id), "{id:?} accepted");
+        }
+        assert!(is_valid_action_id("act-01"));
+    }
+
     fn base_eth_send() -> StagedTx {
         StagedTx {
             id: "tx_001".to_string(),
@@ -516,7 +536,6 @@ mod tests {
             expires_ms: 1_700_000_003_600,
             status: TxStatus::Pending,
             action_kind: TxActionKind::NativeTransfer,
-            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,
@@ -721,6 +740,19 @@ Write `y` to `confirm` to broadcast, `cancel` to discard, `override` to bypass s
             out.contains("Value:  0 ETH (not-a-number wei)"),
             "out: {out}"
         );
+    }
+
+    #[test]
+    fn render_names_no_native_value_on_tempo() {
+        let mut staged = base_eth_send();
+        staged.chain_id = crate::chain::TEMPO_MAINNET_CHAIN_ID;
+        staged.value_wei = "0".into();
+        let plan = PlanRender::render(&staged, "ETH", 18);
+        assert!(
+            plan.contains("Value:  none (this chain has no native token)"),
+            "{plan}"
+        );
+        assert!(!plan.contains("ETH"), "{plan}");
     }
 
     #[test]

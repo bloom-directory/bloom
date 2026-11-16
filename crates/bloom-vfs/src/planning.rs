@@ -97,12 +97,12 @@ mod tests {
             derivation: None,
         };
         let canonical = serde_jcs::to_vec(&CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: wallet_id.clone(),
             maximum_approval_lifetime_ms: 60_000,
             allowed_petal_packages: Vec::new(),
             allowed_destinations: destinations,
             required_verifiers: Vec::new(),
-            clear_signing: None,
         })
         .unwrap();
         WalletProjection {
