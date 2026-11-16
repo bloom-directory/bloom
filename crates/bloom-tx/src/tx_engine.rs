@@ -1020,29 +1020,8 @@ impl TxEngine {
                     let token_str = token.as_deref().unwrap_or("");
                     let (token_addr, sym_hint) = Self::resolve_token_address(token_str, chain_id)?;
                     let meta = self.token_meta(chain, token_addr, &sym_hint).await?;
-                    let parsed =
-                        parse_amount(amount).map_err(|e| TxEngineError::Amount(e.to_string()))?;
-                    // A native metric unit (wei/gwei/eth) on an ERC-20 amount is
-                    // ambiguous — it would be silently rescaled by token
-                    // decimals. Reject it and point at the unambiguous forms.
-                    // A bare integer (explicit_unit == false) is still accepted
-                    // as a human token amount.
-                    if parsed.explicit_unit && parsed.is_native() {
-                        return Err(TxEngineError::Amount(format!(
-                            "'{amount}' uses a native unit ('{}') for an ERC-20 token; write a human \
-                             amount like '10 {}' or raw base units like '10000000 base'",
-                            parsed.unit, meta.symbol
-                        )));
-                    }
-                    // `base` means the number is already in token base units —
-                    // do not rescale by decimals.
-                    let scale = if parsed.unit == "base" {
-                        0
-                    } else {
-                        meta.decimals
-                    };
-                    let amount = parse_units(&parsed.number, scale)
-                        .map_err(|e| TxEngineError::Amount(e.to_string()))?;
+                    let (amount, number) =
+                        token_amount_base_units(amount, meta.decimals, &meta.symbol)?;
                     let call = IERC20::transferCall {
                         to: to_addr,
                         amount,
@@ -1053,7 +1032,7 @@ impl TxEngine {
                         symbol: meta.symbol.clone(),
                         decimals: meta.decimals,
                         recipient: bloom_proto::checksum_address(&to_addr),
-                        amount: parsed.number.clone(),
+                        amount: number,
                         amount_base_units: Some(amount.to_string()),
                     };
                     Ok((
@@ -5807,6 +5786,39 @@ fn short_addr_label(a: &Address) -> String {
     } else {
         s
     }
+}
+
+/// The address of the one token Bloom knows by `symbol` on `chain_id`.
+pub fn known_token_address(chain_id: u64, symbol: &str) -> Option<Address> {
+    lookup_known_token(chain_id, &symbol.to_ascii_uppercase())?
+        .parse()
+        .ok()
+}
+
+/// Base units of an ERC-20 `amount` as an outbox body writes it, with the
+/// number as written. Staging and simulation share it, so the same body
+/// means the same transfer in both.
+pub fn token_amount_base_units(
+    amount: &str,
+    decimals: u8,
+    symbol: &str,
+) -> Result<(U256, String), TxEngineError> {
+    let parsed = parse_amount(amount).map_err(|e| TxEngineError::Amount(e.to_string()))?;
+    // A native metric unit (wei/gwei/eth) on an ERC-20 amount is ambiguous:
+    // it would be silently rescaled by token decimals. Reject it and point
+    // at the unambiguous forms. A bare number is a human token amount.
+    if parsed.explicit_unit && parsed.is_native() {
+        return Err(TxEngineError::Amount(format!(
+            "'{amount}' uses a native unit ('{}') for an ERC-20 token; write a human \
+             amount like '10 {symbol}' or raw base units like '10000000 base'",
+            parsed.unit
+        )));
+    }
+    // `base` means the number is already in token base units.
+    let scale = if parsed.unit == "base" { 0 } else { decimals };
+    let base =
+        parse_units(&parsed.number, scale).map_err(|e| TxEngineError::Amount(e.to_string()))?;
+    Ok((base, parsed.number))
 }
 
 /// Resolve an ERC-20 symbol to its address via the token list Broker also
