@@ -322,6 +322,23 @@ pub trait AccountPetalMount: Send + Sync {
     fn installed_package(&self, petal: &str) -> Option<String>;
 }
 
+/// Confirms a batch: wallet, account, ordered `chain:id` references and the
+/// confirmation text. Returns the batch status document.
+pub type BatchConfirm = Arc<
+    dyn Fn(
+            String,
+            u32,
+            Vec<String>,
+            String,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send>,
+        > + Send
+        + Sync,
+>;
+
+/// The last batch status document per wallet and account.
+type BatchResults = std::collections::HashMap<(String, u32), Vec<u8>>;
+
 #[derive(Clone)]
 pub struct WalletsHandler {
     pub chains: ChainRegistry,
@@ -362,6 +379,13 @@ pub struct WalletsHandler {
     /// host needs this handler, so there is exactly one of each and the
     /// session seam is attached once both exist.
     account_petals: Arc<parking_lot::RwLock<Option<Arc<dyn AccountPetalMount>>>>,
+    /// Sends several staged entries under one owner approval. Set by the
+    /// daemon once its batch service exists; `confirm-batch` is refused until
+    /// then.
+    batch_confirm: Arc<parking_lot::RwLock<Option<BatchConfirm>>>,
+    /// The last `confirm-batch` result per wallet and account, read back
+    /// from the same file.
+    batch_results: Arc<parking_lot::Mutex<BatchResults>>,
 }
 
 impl WalletsHandler {
@@ -388,10 +412,16 @@ impl WalletsHandler {
             solana: None,
             solana_reads: None,
             account_petals: Arc::new(parking_lot::RwLock::new(None)),
+            batch_confirm: Arc::new(parking_lot::RwLock::new(None)),
+            batch_results: Arc::new(parking_lot::Mutex::new(Default::default())),
         }
     }
 
     /// Attach the session seam that serves `wallets/<w>/<n>/sessions/`.
+    pub fn set_batch_confirm(&self, confirm: BatchConfirm) {
+        *self.batch_confirm.write() = Some(confirm);
+    }
+
     pub fn set_account_petals(&self, petals: Arc<dyn AccountPetalMount>) {
         *self.account_petals.write() = Some(petals);
     }
@@ -3030,7 +3060,13 @@ fn read_json<T: for<'de> serde::Deserialize<'de>>(
 /// Parse a state segment (`pending` / `sent` / `failed`) into an
 /// [`OutboxState`], rejecting anything else as NotFound.
 fn parse_state_seg(s: &str) -> Result<OutboxState, HandlerError> {
-    OutboxState::parse(s).ok_or_else(|| HandlerError::not_found(format!("outbox state '{}'", s)))
+    OutboxState::parse(s).ok_or_else(|| {
+        HandlerError::not_found(if s == "latest" {
+            "outbox/latest: nothing is staged here yet".to_owned()
+        } else {
+            format!("outbox state '{s}'")
+        })
+    })
 }
 
 fn solana_state(s: &str) -> Option<bloom_solana_tx::outbox::SolanaOutboxState> {
@@ -4247,6 +4283,10 @@ impl WalletsHandler {
             }
         };
         match rest {
+            // The root guide's `send.tx` and its bodies are EVM's.
+            [s] if s == "send.tx" => Err(HandlerError::invalid(
+                "a Solana outbox has no send.tx and takes its own body: read README.md here, write the body to new.tx, then y to latest/confirm",
+            )),
             // outbox/new.tx — stage a native transfer.
             [s] if s == "new.tx" => {
                 self.write_permit()?;
@@ -9093,6 +9133,14 @@ value = "0""#,
             "https://relay.test/ceremony/#cap=abc"
         );
         assert_eq!(waiting["expiry_ms"], 60_000);
+        // The plan carries the same link, so a caller that only got an error
+        // code from its write (a mount) finds it in one read.
+        let plan = f.handler.read(&vfs(format!("{dir}/plan.md"))).await;
+        let plan = String::from_utf8(plan.unwrap()).unwrap();
+        assert!(
+            plan.contains("https://relay.test/ceremony/#cap=abc"),
+            "{plan}"
+        );
         assert_eq!(
             waiting["retry_path"],
             format!("wallets/{w}/0/chains/anvil/outbox/pending/needs-approval/confirm")
@@ -10028,6 +10076,252 @@ value = "0""#,
         assert_eq!(new_tx.mode, 0o644);
     }
 
+    /// `confirm-batch` is written with the entries and read for the result,
+    /// so a mount reaches what `bloom wallet confirm-batch` does.
+    #[tokio::test]
+    async fn confirm_batch_is_written_with_entries_and_read_for_the_result() {
+        let f = make_handler_with_chain(true);
+        seed_pending(&f, "0001-first");
+        seed_pending(&f, "0002-second");
+        let path = vfs(format!("/{}/0/confirm-batch", f.wallet_name));
+        let account = vfs(format!("/{}/0", f.wallet_name));
+        let listed = f.handler.list(&account).await.unwrap();
+        assert!(listed.iter().any(|entry| entry.name == "confirm-batch"));
+        let help = String::from_utf8(f.handler.read(&path).await.unwrap()).unwrap();
+        assert!(help.contains("chain:id"), "{help}");
+
+        // Without the daemon's batch service the write is refused.
+        let unavailable = f.handler.write(&path, b"anvil:0001-first").await;
+        assert!(matches!(unavailable, Err(HandlerError::Unsupported(_))));
+
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let calls = seen.clone();
+        f.handler.set_batch_confirm(Arc::new(move |_wallet, _account, txs, _text| {
+            let first = calls.lock().is_empty();
+            calls.lock().push(txs);
+            Box::pin(async move {
+                Ok(if first {
+                    serde_json::json!({"status": "awaiting_ceremony", "ceremony_url": "http://localhost:1/c/x"})
+                } else {
+                    serde_json::json!({"status": "succeeded", "transactions": []})
+                })
+            })
+        }));
+
+        // The owner has to approve: the write is denied and the file holds the link.
+        let pending = f
+            .handler
+            .write(&path, b"anvil:0001-first anvil:0002-second\n")
+            .await;
+        assert!(
+            matches!(pending, Err(HandlerError::ApprovalPending(_))),
+            "{pending:?}"
+        );
+        let status = String::from_utf8(f.handler.read(&path).await.unwrap()).unwrap();
+        assert!(status.contains("http://localhost:1/c/x"), "{status}");
+        assert_eq!(
+            f.handler.lookup(&path).await.unwrap().size,
+            status.len() as u64
+        );
+        // Written again after approval, it sends; explicit references keep their order.
+        f.handler
+            .write(&path, b"anvil:0002-second anvil:0001-first")
+            .await
+            .unwrap();
+        let status = String::from_utf8(f.handler.read(&path).await.unwrap()).unwrap();
+        assert!(status.contains("succeeded"), "{status}");
+        assert_eq!(
+            *seen.lock(),
+            [
+                vec![
+                    "anvil:0001-first".to_owned(),
+                    "anvil:0002-second".to_owned()
+                ],
+                vec![
+                    "anvil:0002-second".to_owned(),
+                    "anvil:0001-first".to_owned()
+                ],
+            ]
+        );
+        // `y` repeats the batch the file last reported.
+        assert!(status.contains("anvil:0002-second"), "{status}");
+        f.handler.write(&path, b"y\n").await.unwrap();
+        let calls = seen.lock().clone();
+        assert_eq!(calls[2], calls[1]);
+        assert!(f.handler.write(&path, b"not-a-reference").await.is_err());
+    }
+
+    /// `latest/confirm` continues a batch: an entry the owner was asked for
+    /// as part of a batch is confirmed with that batch, not alone.
+    #[tokio::test]
+    async fn confirming_an_entry_of_an_awaited_batch_confirms_the_batch() {
+        let f = make_handler_with_chain(true);
+        seed_pending(&f, "0001-first");
+        seed_pending(&f, "0002-second");
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let calls = seen.clone();
+        f.handler
+            .set_batch_confirm(Arc::new(move |_wallet, _account, txs, _text| {
+                calls.lock().push(txs);
+                Box::pin(async move { Ok(serde_json::json!({"status": "awaiting_ceremony"})) })
+            }));
+        let batch = vfs(format!("/{}/0/confirm-batch", f.wallet_name));
+        assert!(f.handler.write(&batch, b"anvil:0001-first").await.is_err());
+        let confirm = |id: &str| {
+            vfs(format!(
+                "/{}/0/chains/anvil/outbox/pending/{id}/confirm",
+                f.wallet_name
+            ))
+        };
+        let again = f.handler.write(&confirm("0001-first"), b"y\n").await;
+        assert!(
+            matches!(again, Err(HandlerError::ApprovalPending(_))),
+            "{again:?}"
+        );
+        let batched = seen.lock().clone();
+        assert_eq!(batched, vec![vec!["anvil:0001-first".to_owned()]; 2]);
+        // An entry outside that batch is confirmed on its own.
+        let _ = f.handler.write(&confirm("0002-second"), b"y").await;
+        assert_eq!(seen.lock().len(), 2);
+    }
+
+    /// The plan of an entry asked for with others names them all, and a
+    /// control written to an entry that already left `pending` says where
+    /// it went.
+    #[tokio::test]
+    async fn a_batched_plan_names_its_batch_and_a_moved_entry_its_place() {
+        let f = make_handler_with_chain(true);
+        seed_pending(&f, "0001-first");
+        seed_pending(&f, "0002-second");
+        f.handler
+            .set_batch_confirm(Arc::new(move |_wallet, _account, _txs, _text| {
+                Box::pin(async move {
+                    Ok(serde_json::json!({"status": "awaiting_ceremony", "ceremony_url": "https://relay.test/c"}))
+                })
+            }));
+        let batch = vfs(format!("/{}/0/confirm-batch", f.wallet_name));
+        let _ = f
+            .handler
+            .write(&batch, b"anvil:0001-first anvil:0002-second")
+            .await;
+        let outbox = format!("/{}/0/chains/anvil/outbox", f.wallet_name);
+        let plan = f
+            .handler
+            .read(&vfs(format!("{outbox}/pending/0002-second/plan.md")))
+            .await
+            .unwrap();
+        let plan = String::from_utf8(plan).unwrap();
+        assert!(
+            plan.contains("one of 2 entries") && plan.contains("0001-first, 0002-second"),
+            "{plan}"
+        );
+        assert!(plan.contains("https://relay.test/c"), "{plan}");
+
+        let outbox_store = &f.handler.tx_engine.outbox;
+        let first = outbox_store
+            .read_in_state(&f.wallet_name, "anvil", "0001-first", OutboxState::Pending)
+            .unwrap();
+        outbox_store.transition(&first, OutboxState::Sent).unwrap();
+        let moved = f
+            .handler
+            .write(&vfs(format!("{outbox}/pending/0001-first/confirm")), b"y")
+            .await
+            .unwrap_err();
+        assert!(moved.to_string().contains("sent/0001-first/"), "{moved}");
+
+        // The batch is over once an entry left `pending`: its file says so,
+        // and the other entry is no longer confirmed as part of it.
+        let status = String::from_utf8(f.handler.read(&batch).await.unwrap()).unwrap();
+        assert!(status.contains("\"ended\""), "{status}");
+        let plan = f
+            .handler
+            .read(&vfs(format!("{outbox}/pending/0002-second/plan.md")))
+            .await
+            .unwrap();
+        assert!(
+            !String::from_utf8(plan)
+                .unwrap()
+                .contains("one of 2 entries")
+        );
+    }
+
+    /// Several bodies in one `send.tx` write are all checked before any is
+    /// staged, so a mistake in a later line leaves nothing to duplicate.
+    #[tokio::test]
+    async fn a_multi_body_send_with_a_bad_line_stages_nothing() {
+        let f = make_handler_with_chain(true);
+        let (projection, _evm0, _evm1) = two_account_projection(&f);
+        let mut handler = f.handler.clone();
+        handler.wallet_projections = Some(projection);
+        let to = "0x0000000000000000000000000000000000000002";
+        let body = format!(
+            "{{\"kind\":\"send\",\"to\":\"{to}\",\"value\":\"1 wei\"}}\n{{\"kind\":\"approve\",\"token\":\"{to}\",\"amount\":\"1\"}}\n"
+        );
+        let send = vfs(format!("/{}/0/chains/anvil/outbox/send.tx", f.wallet_name));
+        let error = handler.write(&send, body.as_bytes()).await.unwrap_err();
+        assert!(
+            error.to_string().contains("approve needs spender")
+                && error.to_string().contains("nothing was staged"),
+            "{error}"
+        );
+        let pending = handler
+            .tx_engine
+            .outbox
+            .list(&f.wallet_name, "anvil", OutboxState::Pending)
+            .unwrap();
+        assert!(pending.is_empty(), "{pending:?}");
+    }
+
+    /// A request usually names a chain by id; `chains/<id>` links to its name.
+    #[tokio::test]
+    async fn a_chain_is_reachable_by_its_numeric_id() {
+        let f = make_handler_with_chain(true);
+        let id = f.handler.chains.get("anvil").unwrap().spec().chain_id;
+        let path = vfs(format!("/{}/0/chains/{id}", f.wallet_name));
+        let entry = f.handler.lookup(&path).await.unwrap();
+        assert_eq!(entry.link_target.as_deref(), Some("anvil"));
+        let unknown = vfs(format!("/{}/0/chains/999999999", f.wallet_name));
+        assert!(f.handler.lookup(&unknown).await.is_err());
+    }
+
+    /// The outbox carries its own instructions, sized so a mount serves them.
+    #[tokio::test]
+    async fn outbox_readme_says_how_to_stage_and_confirm() {
+        let f = make_handler_with_chain(true);
+        let root = format!("/{}/0/chains/anvil/outbox", f.wallet_name);
+        let listed = f
+            .handler
+            .list(&VfsPath::parse(&root).unwrap())
+            .await
+            .unwrap();
+        let readme = listed
+            .iter()
+            .find(|entry| entry.name == "README.md")
+            .unwrap();
+        let path = VfsPath::parse(&format!("{root}/README.md")).unwrap();
+        let text = String::from_utf8(f.handler.read(&path).await.unwrap()).unwrap();
+        assert_eq!(readme.size, text.len() as u64);
+        assert_eq!(f.handler.lookup(&path).await.unwrap().size, readme.size);
+        // `send.tx` (stage and ask the owner in one write) sits beside `new.tx`.
+        assert!(listed.iter().any(|entry| entry.name == "send.tx"));
+        let send = VfsPath::parse(&format!("{root}/send.tx")).unwrap();
+        assert_eq!(f.handler.lookup(&send).await.unwrap().name, "send.tx");
+        for word in [
+            "`send.tx`",
+            "`new.tx`",
+            "`latest/`",
+            "`latest/plan.md`",
+            "`latest/confirm`",
+            "receipt.json",
+        ] {
+            assert!(text.contains(word), "{word} missing from {text}");
+        }
+        // A control written to the outbox itself says where it belongs.
+        let stray = VfsPath::parse(&format!("{root}/confirm")).unwrap();
+        let error = f.handler.write(&stray, b"y").await.unwrap_err();
+        assert!(error.to_string().contains("latest/confirm"), "{error}");
+    }
+
     #[tokio::test]
     async fn outbox_latest_is_advertised_and_resolves_the_pending_identity() {
         let f = make_handler_with_chain(true);
@@ -10079,9 +10373,11 @@ value = "0""#,
             .outbox
             .transition(&entry, OutboxState::Failed)
             .unwrap();
+        // The entry staged last was refused: `latest` follows it, so the
+        // path it was staged through still leads to its outcome.
         let listed = f.handler.list(&root).await.unwrap();
         let latest = listed.iter().find(|entry| entry.name == "latest").unwrap();
-        assert_eq!(latest.link_target.as_deref(), Some("pending/0002-newer"));
+        assert_eq!(latest.link_target.as_deref(), Some("failed/0003-newest"));
     }
 
     #[tokio::test]
@@ -10123,7 +10419,7 @@ value = "0""#,
         // A confirm renames the entry into `sent` after the listing saw it
         // (StateMismatch on read); a cancel removes one outright (NotFound).
         // Neither is a pending candidate any more, and neither may break the
-        // listing.
+        // listing. The sent entry was staged last, so `latest` follows it.
         std::fs::create_dir_all(outbox.join("sent")).unwrap();
         std::fs::rename(
             outbox.join("pending").join("0003-moved"),
@@ -10142,7 +10438,7 @@ value = "0""#,
             .into_iter()
             .find(|entry| entry.name == "latest")
             .expect("latest is advertised");
-        assert_eq!(latest.link_target.as_deref(), Some("pending/0001-pending"));
+        assert_eq!(latest.link_target.as_deref(), Some("sent/0003-moved"));
     }
 
     #[tokio::test]

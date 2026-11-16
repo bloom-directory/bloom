@@ -2292,6 +2292,7 @@ impl TxEngine {
         let mut already_attempted = Vec::with_capacity(targets.len());
         let batches = self.outbox.batch_index();
         let now = now_ms();
+        let mut sequences: HashMap<(String, String), Vec<StagedTx>> = HashMap::new();
         for target in &targets {
             let policy = &target.policy;
             let entry = self.outbox.read(wallet, &target.chain_name, &target.id)?;
@@ -2351,7 +2352,19 @@ impl TxEngine {
                     ));
                 }
                 if !override_warnings {
-                    self.simulate_or_reject(staged, &target.chain).await?;
+                    // An entry that follows another from the same sender on
+                    // the same chain runs on the state its predecessors leave
+                    // (a supply after its approval), so it is simulated after
+                    // them, not alone against today's state.
+                    let sender = (target.chain_name.clone(), staged.from.to_ascii_lowercase());
+                    let sequence = sequences.entry(sender).or_default();
+                    sequence.push(staged.clone());
+                    if sequence.len() == 1 {
+                        self.simulate_or_reject(staged, &target.chain).await?;
+                    } else {
+                        self.simulate_sequence_or_reject(sequence, &target.chain)
+                            .await?;
+                    }
                 }
             }
             let unsigned = self.build_unsigned_evm_tx(&entry.staged, &target.chain)?;
@@ -4168,13 +4181,8 @@ impl TxEngine {
         }
     }
 
-    /// `eth_call` the staged tx against current state; reject on revert. RPC
-    /// failures simulating are non-fatal (don't block broadcast on infra).
-    async fn simulate_or_reject(
-        &self,
-        staged: &StagedTx,
-        chain: &ChainClient,
-    ) -> Result<(), TxEngineError> {
+    /// The call a staged tx will make, for simulation.
+    fn simulation_request(staged: &StagedTx) -> Result<TransactionRequest, TxEngineError> {
         let from: Address = staged
             .from
             .parse()
@@ -4182,13 +4190,62 @@ impl TxEngine {
         let destination = staged.transaction_kind().map_err(TxEngineError::Address)?;
         let value = U256::from_str_radix(&staged.value_wei, 10).unwrap_or(U256::ZERO);
         let data = staged.data_hex.parse::<Bytes>().unwrap_or_default();
-        let req = TransactionRequest::default()
+        Ok(TransactionRequest::default()
             .from(from)
             .with_kind(destination)
             .nonce(staged.nonce)
             .with_gas_limit(staged.gas_limit)
             .value(value)
-            .input(data.into());
+            .input(data.into()))
+    }
+
+    /// Simulate the last tx of `sequence` after the ones before it; reject if
+    /// any of them reverts. A node that cannot simulate a sequence leaves the
+    /// old check in force: the tx is simulated alone and refused on revert.
+    async fn simulate_sequence_or_reject(
+        &self,
+        sequence: &[StagedTx],
+        chain: &ChainClient,
+    ) -> Result<(), TxEngineError> {
+        let Some(last) = sequence.last() else {
+            return Ok(());
+        };
+        let mut calls = Vec::with_capacity(sequence.len());
+        for staged in sequence {
+            // The simulated block assigns nonces itself.
+            let mut call = Self::simulation_request(staged)?;
+            call.nonce = None;
+            calls.push(call);
+        }
+        match chain.simulate_sequence(&calls).await {
+            Ok(outcomes) => match outcomes.iter().position(Result::is_err) {
+                None => Ok(()),
+                Some(index) => {
+                    let returndata = outcomes[index].as_ref().err().cloned().unwrap_or_default();
+                    Err(TxEngineError::SimulationReverted {
+                        reason: format!(
+                            "{} (entry {}, simulated after the entries before it)",
+                            crate::reconcile::decode_revert(&returndata),
+                            sequence[index].id
+                        ),
+                    })
+                }
+            },
+            Err(error) => {
+                debug!(id = %last.id, error = %error, "tx.simulate_sequence_unavailable");
+                self.simulate_or_reject(last, chain).await
+            }
+        }
+    }
+
+    /// `eth_call` the staged tx against current state; reject on revert. RPC
+    /// failures simulating are non-fatal (don't block broadcast on infra).
+    async fn simulate_or_reject(
+        &self,
+        staged: &StagedTx,
+        chain: &ChainClient,
+    ) -> Result<(), TxEngineError> {
+        let req = Self::simulation_request(staged)?;
         match chain.eth_call_capture_revert(req, None).await {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(returndata)) => Err(TxEngineError::SimulationReverted {
