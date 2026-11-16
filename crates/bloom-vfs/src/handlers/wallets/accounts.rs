@@ -107,7 +107,7 @@ pub(super) struct FamilyKey {
 /// `wallets/<wallet>/<n>/confirm-batch`: one owner approval for several
 /// staged entries. Written with the entries, read for the result.
 const CONFIRM_BATCH: &str = "confirm-batch";
-const CONFIRM_BATCH_HELP: &str = "write the staged entries to send under one approval, in order, as chain:id separated by spaces (ethereum:0001-abcde ethereum:0002-fghij), or chain:pending for every pending entry on that chain. Read this file for the result: the approval link, then each transaction hash.\n";
+const CONFIRM_BATCH_HELP: &str = "write the staged entries to send under one approval, in order, as chain:id separated by spaces (ethereum:0001-abcde ethereum:0002-fghij), or chain:pending for every pending entry on that chain; y repeats the last batch. Read this file for the result: the approval link, then each transaction hash.\n";
 
 /// `outbox/send.tx`: stage a body and ask the owner in one write.
 const SEND_TX: &str = "send.tx";
@@ -458,6 +458,22 @@ impl WalletsHandler {
         let body = std::str::from_utf8(data)
             .map_err(|_| HandlerError::invalid("non-utf8 confirm-batch content"))?;
         let mut refs = Vec::new();
+        if body.trim() == "y" {
+            // `y` repeats the batch this file last reported.
+            let last: serde_json::Value =
+                serde_json::from_slice(&self.batch_status(wallet, number)).unwrap_or_default();
+            let entries = last["entries"].as_array().cloned().unwrap_or_default();
+            let refs: Vec<String> = entries
+                .iter()
+                .filter_map(|entry| entry.as_str().map(str::to_owned))
+                .collect();
+            if refs.is_empty() {
+                return Err(HandlerError::invalid(format!(
+                    "no batch to repeat; {CONFIRM_BATCH_HELP}"
+                )));
+            }
+            return self.confirm_batch_entries(wallet, number, refs).await;
+        }
         for reference in body.split_whitespace() {
             match reference.split_once(':') {
                 Some((chain, "pending")) => {
@@ -493,11 +509,22 @@ impl WalletsHandler {
                 "no entries to confirm; {CONFIRM_BATCH_HELP}"
             )));
         }
+        self.confirm_batch_entries(wallet, number, refs).await
+    }
+
+    /// Confirm `refs` (`chain:id`, in order) under one approval and record
+    /// the outcome, with the entries, as what `confirm-batch` reads as.
+    async fn confirm_batch_entries(
+        &self,
+        wallet: &str,
+        number: u32,
+        refs: Vec<String>,
+    ) -> Result<(), HandlerError> {
         let confirm = self.batch_confirm.read().clone().ok_or_else(|| {
             HandlerError::Unsupported("batch confirmation is not available on this Bloom".into())
         })?;
-        let outcome = confirm(wallet.to_owned(), number, refs, "y".into()).await;
-        let (status, result) = match outcome {
+        let outcome = confirm(wallet.to_owned(), number, refs.clone(), "y".into()).await;
+        let (mut status, result) = match outcome {
             Ok(status) => {
                 let awaiting = status["status"] == "awaiting_ceremony";
                 let path = format!("wallets/{wallet}/{number}/{CONFIRM_BATCH}");
@@ -515,6 +542,9 @@ impl WalletsHandler {
                 Err(HandlerError::backend(error)),
             ),
         };
+        if let Some(fields) = status.as_object_mut() {
+            fields.insert("entries".into(), refs.into());
+        }
         let mut text = serde_json::to_vec_pretty(&status).map_err(err_be)?;
         text.push(b'\n');
         self.batch_results
@@ -1074,12 +1104,12 @@ impl WalletsHandler {
             .chain_id;
         let policy =
             crate::advisory_exact_evm_policy(&projection, chain, chain_id).map_err(err_be)?;
-        if let [control] = chain_rest {
-            if EVM_PENDING_CONTROLS.contains(&control.as_str()) {
-                return Err(HandlerError::invalid(format!(
-                    "`{control}` belongs to an entry: write `latest/{control}` or `pending/<id>/{control}`"
-                )));
-            }
+        if let [control] = chain_rest
+            && EVM_PENDING_CONTROLS.contains(&control.as_str())
+        {
+            return Err(HandlerError::invalid(format!(
+                "`{control}` belongs to an entry: write `latest/{control}` or `pending/<id>/{control}`"
+            )));
         }
         if chain_rest == [SEND_TX] {
             return self
@@ -1124,22 +1154,38 @@ impl WalletsHandler {
                 })
                 .collect())
         };
-        let before = pending(self)?;
-        self.write_outbox_from(
-            wallet,
-            chain,
-            from,
-            policy,
-            &["new.tx".to_owned()],
-            data,
-            number,
-        )
-        .await?;
-        // Confirm exactly the entry this write staged, never "the newest".
-        let staged: Vec<String> = pending(self)?
-            .into_iter()
-            .filter(|id| !before.contains(id))
-            .collect();
+        let text = std::str::from_utf8(data)
+            .map_err(|_| HandlerError::invalid("non-utf8 outbox content"))?;
+        let bodies = bloom_tx::intent_parser::bodies(text);
+        let mut before = pending(self)?;
+        let mut staged = Vec::new();
+        for body in &bodies {
+            self.write_outbox_from(
+                wallet,
+                chain,
+                from,
+                policy,
+                &["new.tx".to_owned()],
+                body.as_bytes(),
+                number,
+            )
+            .await?;
+            // Confirm exactly the entries this write staged, never "the
+            // newest".
+            let now = pending(self)?;
+            staged.extend(now.iter().filter(|id| !before.contains(id)).cloned());
+            before = now;
+        }
+        if bodies.len() > 1 {
+            // Several bodies go under one approval, in the order written.
+            if staged.len() != bodies.len() {
+                return Err(HandlerError::backend(
+                    "staged, but another entry was staged at the same moment; confirm yours by id through confirm-batch",
+                ));
+            }
+            let refs = staged.iter().map(|id| format!("{chain}:{id}")).collect();
+            return self.confirm_batch_entries(wallet, number, refs).await;
+        }
         let [id] = staged.as_slice() else {
             return Err(HandlerError::backend(
                 "staged, but another entry was staged at the same moment; confirm yours by id under pending/",
@@ -1380,6 +1426,26 @@ impl WalletsHandler {
                 let mut file = open_regular_outbox_artifact(&entry.dir, fname)?;
                 let mut bytes = Vec::new();
                 std::io::Read::read_to_end(&mut file, &mut bytes)?;
+                // A write can only fail with an error code on a mount, so the
+                // plan says where the owner approves once they were asked.
+                let mut link = None;
+                if let (true, Some(signing)) = (fname == "plan.md", evm_signing_state(&entry)) {
+                    let outbox = format!("wallets/{wallet}/{number}/chains/{chain}/outbox");
+                    let challenge = evm_approval_challenge(&entry, &signing, &outbox, &|petal| {
+                        self.installed_petal_package(petal)
+                    })?;
+                    let live = self.live_approval_challenge(wallet, challenge).await?;
+                    let live: serde_json::Value = serde_json::from_slice(&live).map_err(err_be)?;
+                    link = live["ceremony_url"].as_str().map(str::to_owned);
+                }
+                if let Some(link) = link {
+                    bytes.extend_from_slice(
+                        format!(
+                            "\n## Approval\n\nThe owner was asked: {link}\nWrite `y` to `confirm` again: it sends once they have approved.\n"
+                        )
+                        .as_bytes(),
+                    );
+                }
                 Ok(bytes)
             }
             _ => Err(HandlerError::NotAFile(rest.join("/"))),

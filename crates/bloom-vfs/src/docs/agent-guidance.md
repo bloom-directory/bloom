@@ -8,8 +8,6 @@ relative to this file's directory. Without a mount,
 - `next.md`: what is pending.
 - `wallets/<wallet>/<n>/holdings.json`: balances of account `<n>`; the first
   is `0`.
-- `wallets/<wallet>/<n>/confirm-batch`: several staged entries under one
-  approval, in order (an approve, then the call that spends it).
 - `docs/`: one short file per topic; the filenames are the index.
 
 Send, approve or call a contract through the account's outbox,
@@ -29,6 +27,9 @@ that entry, before and after it is sent: `latest/plan.md` is what will be
 signed, writing `y` to `latest/confirm` waits for the approval and sends, and
 then `latest/receipt.json` holds the result. `new.tx` takes the same body and
 only stages it; `cancel` written to `latest/confirm` discards an entry.
+
+Several bodies in one write, one per line, go under one approval, in order (an
+approve, then the call that spends it).
 
 ## Rules
 

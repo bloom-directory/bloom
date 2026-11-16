@@ -1521,9 +1521,15 @@ impl IpcServer {
                     }
                     .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
                     .and_then(|doc| doc["ceremony_url"].as_str().map(str::to_owned));
+                    // Several bodies went under one approval: the batch
+                    // file is what waits for it.
+                    let next = match challenge.strip_suffix("/confirm-batch") {
+                        Some(_) => format!("/{challenge}"),
+                        None => "latest/confirm".to_owned(),
+                    };
                     Err(match url {
                         Some(url) => WriteError::Approval(format!(
-                            "permission denied: owner approval required: {url} . Write y to latest/confirm: it waits for their approval, then sends."
+                            "permission denied: owner approval required: {url} . Write y to {next}: it waits for their approval, then sends."
                         )),
                         None => HandlerError::ApprovalPending(challenge).into(),
                     })
@@ -1577,7 +1583,7 @@ impl IpcServer {
                 || tokio::time::Instant::now() >= deadline
             {
                 return Err(WriteError::Approval(format!(
-                    "permission denied: owner approval required: {url} . Write confirm-batch again: it waits for their approval, then sends."
+                    "permission denied: owner approval required: {url} . Write y to confirm-batch: it waits for their approval, then sends."
                 )));
             }
             // Each attempt is an audited request, so poll less often than a

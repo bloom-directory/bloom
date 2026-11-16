@@ -16,8 +16,8 @@ signed, writing `y` to `latest/confirm` waits for the approval and sends, and
 then `latest/receipt.json` holds the result. `new.tx` takes the same body and
 only stages it; `cancel` written to `latest/confirm` discards an entry.
 
-Several staged entries can go under one approval: stage each through
-`new.tx`, write `<chain>:pending` (or their `chain:id` references in order) to
-`../../../confirm-batch` for the link, then write it again: it waits for the
-approval and sends. Reading that file gives the hashes. `pending/`, `sent/`
-and `failed/` hold every entry by id.
+Several bodies in one write, one per line, go under one approval, in order (an
+approve, then the call that spends it). Entries already staged go together by
+writing `<chain>:pending` (or their `chain:id` references in order) to
+`../../../confirm-batch`; reading that file gives the link, then the hashes.
+`pending/`, `sent/` and `failed/` hold every entry by id.

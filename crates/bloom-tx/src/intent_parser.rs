@@ -263,6 +263,22 @@ fn is_empty_or_zero_value(value: &str) -> bool {
     trimmed.is_empty() || trimmed == "0"
 }
 
+/// The bodies one write holds: one per line when more than one line opens a
+/// body (a `send` line or a single-line JSON object), else the whole input.
+pub fn bodies(input: &str) -> Vec<&str> {
+    let opens = |line: &&str| line.starts_with("send ") || line.starts_with("{\"");
+    let lines: Vec<&str> = input
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.len() > 1 && lines.iter().all(opens) {
+        lines
+    } else {
+        vec![input]
+    }
+}
+
 /// Parse a textual intent in any of the accepted forms.
 pub fn parse(input: &str) -> Result<RawIntent, ParseError> {
     let s = input.trim();
@@ -278,7 +294,7 @@ pub fn parse(input: &str) -> Result<RawIntent, ParseError> {
         .count();
     if bodies > 1 {
         return Err(ParseError::Invalid(format!(
-            "this write holds {bodies} bodies; write one body per transaction"
+            "this write holds {bodies} bodies; `send.tx` takes several, one per line, under one approval"
         )));
     }
     if s.starts_with('{') {
@@ -464,9 +480,11 @@ mod tests {
         let both = "send 0.25 ETH to 0x70997970C51812dc3A010C7d01b50e0d17dc79C8\n{\"kind\":\"send\",\"to\":\"0x70997970C51812dc3A010C7d01b50e0d17dc79C8\",\"value\":\"0.25 eth\"}";
         let error = parse(both).unwrap_err().to_string();
         assert!(error.contains("2 bodies"), "{error}");
+        assert_eq!(bodies(both).len(), 2);
         // A pretty-printed JSON body is still one body.
         let pretty = "{\n  \"kind\": \"send\",\n  \"to\": \"0x70997970C51812dc3A010C7d01b50e0d17dc79C8\",\n  \"value\": \"0.25 eth\"\n}";
         assert!(parse(pretty).is_ok());
+        assert_eq!(bodies(pretty), vec![pretty]);
     }
 
     #[test]

@@ -9123,6 +9123,14 @@ value = "0""#,
             "https://relay.test/ceremony/#cap=abc"
         );
         assert_eq!(waiting["expiry_ms"], 60_000);
+        // The plan carries the same link, so a caller that only got an error
+        // code from its write (a mount) finds it in one read.
+        let plan = f.handler.read(&vfs(format!("{dir}/plan.md"))).await;
+        let plan = String::from_utf8(plan.unwrap()).unwrap();
+        assert!(
+            plan.contains("https://relay.test/ceremony/#cap=abc"),
+            "{plan}"
+        );
         assert_eq!(
             waiting["retry_path"],
             format!("wallets/{w}/0/chains/anvil/outbox/pending/needs-approval/confirm")
@@ -10122,6 +10130,11 @@ value = "0""#,
                 ],
             ]
         );
+        // `y` repeats the batch the file last reported.
+        assert!(status.contains("anvil:0002-second"), "{status}");
+        f.handler.write(&path, b"y\n").await.unwrap();
+        let calls = seen.lock().clone();
+        assert_eq!(calls[2], calls[1]);
         assert!(f.handler.write(&path, b"not-a-reference").await.is_err());
     }
 
