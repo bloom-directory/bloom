@@ -2664,9 +2664,11 @@ field() {{
         }
     }
     assert!(!release_script("bloom-ceremonies").exists());
-    assert!(!fs::read_to_string(release_script("build-bundle.sh"))
-        .unwrap()
-        .contains("bloom-ceremonies"));
+    assert!(
+        !fs::read_to_string(release_script("build-bundle.sh"))
+            .unwrap()
+            .contains("bloom-ceremonies")
+    );
 }
 
 #[test]
@@ -2686,8 +2688,10 @@ fn linux_relay_provisioning_runs_as_part_of_a_standard_setup() {
 
     // A standard setup provisions the relay itself. The installer calls the
     // packaged helper rather than asking the user to run a retry command.
-    assert!(installer
-        .contains("systemctl start --no-block \"bloom-relay-provision@$login_uid.service\""));
+    assert!(
+        installer
+            .contains("systemctl start --no-block \"bloom-relay-provision@$login_uid.service\"")
+    );
     assert!(!installer.contains("localhost remains available. Retry: sudo"));
     assert!(!installer.contains("admin provision --login-uid $login_uid\" >&2"));
     // The helper is installed as a packaged binary and enabled as a path
