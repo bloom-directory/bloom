@@ -3498,23 +3498,28 @@ fn print_approval_pending(url: &str, expires_at_ms: u128, petal_next: Option<&st
 
 /// Print the mined result, waiting a few seconds for it, so the caller need
 /// not read `sent/<id>/receipt.json` separately. On a chain that has not mined
-/// the transaction by then, say where the receipt will appear.
+/// the transaction by then, say where the receipt will appear. A reverted
+/// transaction is an error, so confirm does not exit 0 for it.
 async fn print_receipt(
     endpoint: &ResolvedEndpoint,
     wallet: &str,
     account: u32,
     chain: &str,
     id: &str,
-) {
+) -> Result<()> {
     let path = format!("/wallets/{wallet}/{account}/chains/{chain}/outbox/sent/{id}/receipt.json");
     for _ in 0..20 {
         if let Ok(bytes) = ipc_read(endpoint, &path).await {
             println!("Receipt: {}", String::from_utf8_lossy(&bytes).trim_end());
-            return;
+            let reverted = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .is_ok_and(|receipt| receipt["outcome"] == "reverted");
+            anyhow::ensure!(!reverted, "the transaction was mined but reverted");
+            return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
     println!("Receipt: not mined yet; read {}", &path[1..]);
+    Ok(())
 }
 
 fn confirm_context_note(projection: &ConfirmProjection) -> Option<String> {
@@ -5247,8 +5252,7 @@ async fn wallet_confirm(
         {
             println!("Already broadcast: {tx_hash}");
             println!("Entry: wallets/{wallet}/{account}/chains/{chain}/outbox/sent/{id}");
-            print_receipt(client_endpoint, &wallet, account, &chain, &id).await;
-            Ok(())
+            print_receipt(client_endpoint, &wallet, account, &chain, &id).await
         }
         (Err((_, error)), Some(context)) => {
             if let Some(note) = confirm_context_note(context) {
@@ -5282,8 +5286,7 @@ async fn wallet_confirm(
             );
             println!("Broadcast: {tx_hash}");
             println!("Entry: wallets/{wallet}/{account}/chains/{chain}/outbox/sent/{id}");
-            print_receipt(client_endpoint, &wallet, account, &chain, &id).await;
-            Ok(())
+            print_receipt(client_endpoint, &wallet, account, &chain, &id).await
         }
         (Ok(_), None) => {
             if is_cancel {
