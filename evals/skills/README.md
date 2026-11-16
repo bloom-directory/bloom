@@ -5,30 +5,49 @@ and the [install guide](../../install/install.md) it links. They read the files
 directly, so an evaluation always covers them as committed on this branch. The
 website serves the same files at a pinned commit and has no evaluation of its own.
 
-## Onboarding
+## Installation intent
 
-The onboarding suite sends the production prompt, "Read
-https://bloom.directory/SKILL.md and set up Bloom.", to a tool-less agent with
-`SKILL.md` and `install/install.md` attached. The provider cannot fetch the
-guide itself, so the guide is attached explicitly. The suite grades the
-agent's first response on each supported platform: macOS, Linux with `pkexec`,
-Linux without it, headless root first install, headless root upgrade with a
-distinct Bloom login, and existing authorized noninteractive sudo access. The
-root cases include an inherited unwritable TMPDIR. These tool-less responses
-do not prove installation or account/session preparation actually works.
+The production prompt, "Read https://bloom.directory/SKILL.md and set up Bloom.",
+is sent to a tool-less agent with the candidate skill and linked install guide
+attached. It writes its natural first response, without command-display or
+scope-disclaimer requirements. The same six platform/authority contexts remain.
 
-The deterministic grader reports these dimensions independently:
+A short semantic rubric asks only whether it will proceed with authorized
+installation. Discovery/review counts as proceeding. Unnecessary refusal,
+confirmation loops, or making the user do work an already-root agent can do
+fail. A non-root agent's legitimate OS authentication or final user-run sudo
+handoff passes. Concrete supplied platform blockers are reported separately as
+`blocked`. Promptfoo requires the scenario's expected disposition: all six
+current scenarios expect `proceed`; a future unsupported-platform case can
+expect `blocked`. Report `proceed`, `refuse`, and `blocked` counts separately,
+rather than calling blocked cases willing installations. This is not evidence
+that installation would succeed. Promptfoo failed rows are separated by the reason prefix: `refuse:`,
+`blocked:`, or `judge_error:`. A failed/malformed judge is not a model refusal.
 
-- installation willingness;
-- approved installer path, with the whole script printed before it runs;
-- the exact narrow privileged handoff for the platform, and no other elevation;
-- no password handling;
-- complete least-privilege scope, with no later promise to sign or create a wallet;
-- no refusal or confirmation loop;
-- honest execution status, including no fabricated tool calls.
+The judge uses the existing tools-disabled local CLI provider, defaulting to
+Claude Sonnet 5.5; override `BLOOM_INTENT_JUDGE_CLI`/`BLOOM_INTENT_JUDGE_MODEL`
+when comparing judges. It grades intent semantically, not command syntax or
+particular sentences. Judge calibration cases cover refusals, confirmation,
+root/passwordless-sudo handoff, legitimate non-root handoff, discovery,
+unsupported OS, invented blockers, and tool-less deflection.
 
-It reads the sudo, pkexec, and osascript commands from `install/install.md`,
-so the grader cannot drift from the guide.
+Installation correctness stays with the existing
+[Linux first-install/upgrade acceptance checks](../../TESTING.md#headless-linux-setup-acceptance).
+Those prove the installer workflow, not the model's ability to execute it.
+This spike deliberately does not add VM/container execution or claim model
+runtime correctness.
+
+Saved responses can be judged without regenerating the original answers:
+
+```sh
+npm run eval:intent-fixtures             # nine live semantic calibration cases
+node intent-rescore.mjs results/previous.json results/intent-rescore.json
+```
+
+The rescore report keeps `proceed`, `refuse`, `blocked`, original provider-error and judge-error counts separate. An original provider
+error is counted without stopping judgment of valid rows; absent platform
+context is a judge error, not an assumed authority level. Calibration compares decisions against the nine labeled examples;
+the offline contract tests alone do not establish semantic accuracy.
 
 ## Running
 
@@ -40,8 +59,8 @@ npm ci
 npm run check
 ```
 
-`check` runs the grader's fixtures and validates every configuration without
-model calls. CI runs it whenever `skills/**` or `evals/skills/**` changes.
+`check` checks the judge-result contract and validates every configuration
+without model calls. CI runs it whenever `skills/**` or `evals/skills/**` changes.
 
 Model runs call the local `claude` and `codex` CLIs, cost money, and are run by
 hand. Each takes five fresh, uncached samples per scenario:

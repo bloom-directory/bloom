@@ -333,3 +333,10 @@ Once idle, allow one restart of the existing packaged Machine as a workaround, n
 Recheck audit health/startup completion; continue only if healthy, otherwise report the blocker and stop.
 An empty mount directory is not a successful mount. Wallet onboarding and
 transaction actions remain outside this setup scope even while Bloom is running.
+
+If you completed installation using root or root-equivalent access you already
+had (including passwordless sudo), tell the user they can continue, and that
+Bloom is safest when the agent runs as a non-root user without root-equivalent
+access. Link to the [OS and release boundary](https://docs.bloom.directory/wallet/security-model#os-and-release-boundary):
+root can replace binaries, service configuration, or protected state, outside
+Bloom's protections. This notice must not block continued use.
