@@ -443,6 +443,16 @@ impl CheckoutService {
         self.browser.return_control().await
     }
 
+    /// Hands back a checkout that released nothing: no approval, so no card
+    /// or saved details reached the page. The person stays signed in.
+    async fn return_unreleased(&self) -> Result<()> {
+        if self.browser.has_private_traveler_data() {
+            return self.return_control().await;
+        }
+        self.saved.lock().take();
+        self.browser.return_control_signed_in().await
+    }
+
     pub fn new(
         browser: Arc<Browser>,
         state: &Path,
@@ -709,12 +719,12 @@ impl CheckoutService {
                         Ok(())
                     })();
                     if let Err(error) = check {
-                        self.return_control().await?;
+                        self.return_unreleased().await?;
                         return Err(error);
                     }
                 }
                 if let Err(error) = self.store.insert(&status, kind, &agent_description) {
-                    let _ = self.return_control().await;
+                    let _ = self.return_unreleased().await;
                     return Err(error);
                 }
                 status.state = "preparing".into();
@@ -785,7 +795,7 @@ impl CheckoutService {
                     _ => {
                         status.state = "failed_before_release".into();
                         self.store.update(&status)?;
-                        self.return_control().await?;
+                        self.return_unreleased().await?;
                         Ok(serde_json::to_value(status)?)
                     }
                 }
@@ -808,7 +818,7 @@ impl CheckoutService {
                     .as_ref()
                     .is_some_and(|p| !p.approved && !p.submitted)
                 {
-                    if let Err(error) = self.return_control().await {
+                    if let Err(error) = self.return_unreleased().await {
                         self.mark_paused(&operation_id);
                         return Err(error);
                     }
@@ -840,7 +850,7 @@ impl CheckoutService {
                 status.state = "cancelled".into();
                 status.ceremony_url = None;
                 self.store.update(&status)?;
-                if let Err(error) = self.return_control().await {
+                if let Err(error) = self.return_unreleased().await {
                     self.mark_paused(&operation_id);
                     return Err(error);
                 }
@@ -2211,6 +2221,16 @@ mod tests {
             );
             service.private.lock().await.as_mut().unwrap().approved = false;
             service.mark_paused(&id);
+            // The person's sign-in survives: nothing was released.
+            let tab = service.private.lock().await.as_ref().unwrap().tab.clone();
+            let url = tab_url(&tab).await.unwrap();
+            tab.cdp
+                .evaluate(
+                    &tab.session,
+                    "document.cookie='signed=in; max-age=999'".into(),
+                )
+                .await
+                .unwrap();
             let result = service
                 .request(Request::Cancel {
                     operation_id: id.clone(),
@@ -2222,10 +2242,17 @@ mod tests {
             assert!(service.private.lock().await.is_none());
             service
                 .request(Request::Browse {
-                    request: BrowseRequest::Snapshot,
+                    request: BrowseRequest::Open { url },
                 })
                 .await
                 .unwrap();
+            let tab = service.browser.handoff().await.unwrap();
+            let cookie = tab
+                .cdp
+                .evaluate(&tab.session, "document.cookie".into())
+                .await
+                .unwrap();
+            assert_eq!(cookie, "signed=in", "{state}");
             server.abort();
         }
     }
