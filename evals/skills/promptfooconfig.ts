@@ -41,8 +41,8 @@ Platform context: {{platformContext}}.`;
 const currentPrompt = read('prompts/current.txt');
 const currentSkill = [
   readFileSync(resolve(skillDir, 'SKILL.md'), 'utf8').trim(),
-  // Setup and upgrade scenarios follow this reference; the provider has no tools.
-  readFileSync(resolve(skillDir, 'references/install.md'), 'utf8').trim(),
+  // Setup and upgrade scenarios follow the guide SKILL.md links; the provider has no tools.
+  readFileSync(resolve(evalDir, '../../install/install.md'), 'utf8').trim(),
 ].join('\n\n');
 
 // Evaluate the skill package as published: its filesystem entrypoint

@@ -1,9 +1,10 @@
 # Skill evaluations
 
-Promptfoo evaluations of the agent skill in [`skills/bloom`](../../skills/bloom/).
-They read the package files directly, so an evaluation always covers the skill
-as committed on this branch. The website serves the same files at a pinned
-commit and has no evaluation of its own. After this package changes land,
+Promptfoo evaluations of the agent skill in [`skills/bloom`](../../skills/bloom/)
+and the [install guide](../../install/install.md) it links. They read the files
+directly, so an evaluation always covers them as committed on this branch. The
+website serves the same files at a pinned commit and has no evaluation of its
+own. After these files change and land,
 advance the website's `scripts/sync-bloom-skill.ts` pin to the landed commit.
 The website currently publishes `/SKILL.md`; its `/SETUP.md` entrypoint/alias
 must also be verified when rolling out the production prompt.
@@ -11,7 +12,7 @@ must also be verified when rolling out the production prompt.
 ## Onboarding: pre-tool response v1
 
 The suite supplies the exact production setup/upgrade request, platform context,
-and published `SKILL.md` plus `references/install.md`. With tools unavailable,
+and published `SKILL.md` plus `install/install.md`. With tools unavailable,
 the agent writes its natural message immediately before its first tool call.
 There is no numbered output checklist, word limit, or request to print commands.
 The root-access notice must come from the retrieved guidance, not an eval hint.

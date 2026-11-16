@@ -1,6 +1,6 @@
 # Install Bloom
 
-For an explicit install, setup or upgrade request, read this reference in full.
+For an explicit install, setup or upgrade request, read this guide in full.
 Upgrade through the same signed path, preserving the existing enrollment.
 
 ## Setup and upgrade: reviewed download and privileged installation
@@ -93,9 +93,10 @@ an active manager, do not enable linger or restart it.
 ### Review before execution
 
 Work from `/tmp` on Linux or `/private/tmp` on macOS, never inside Bloom's mount.
-For local skills, copy bundled `scripts/setup.sh` (relative to the skill, not
-CWD) into the review directory instead of downloading. Website-loaded skills
-fetch production. Inspect that exact local copy before execution.
+Use the `setup.sh` that ships with this guide. If you read this guide from a
+local checkout, copy the `setup.sh` beside it into the review directory instead
+of downloading. Otherwise fetch production. Inspect that exact local copy before
+execution.
 
 Linux root: prepend initialization, then create/download as the account:
 

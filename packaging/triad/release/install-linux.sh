@@ -875,6 +875,35 @@ restore_linux_upgrade_units() {
   done
 }
 
+# A retained-custody uninstall removes the shared unit definitions. Stopping
+# those absent services is unnecessary and systemctl returns an error for it.
+# Do not hide failures for loaded services, or a missing unit that is still active.
+stop_linux_service_if_present() {
+  local unit="$1" load_state active_state
+  load_state="$(systemctl show "$unit" --property=LoadState --value)" || return
+  if [[ "$load_state" == not-found ]]; then
+    active_state="$(systemctl show "$unit" --property=ActiveState --value)" || return
+    if [[ "$active_state" == inactive ]]; then
+      return 0
+    fi
+  fi
+  systemctl stop "$unit"
+}
+
+# A same-release reinstall stops the login's running Triad before replacing
+# its binaries. After a retained-custody uninstall the Broker and Signer
+# units are gone, so their stops go through stop_linux_service_if_present.
+stop_linux_same_release_services() {
+  local install_root="$1" login_uid="$2"
+  linux_root_is_live "$install_root" || return 0
+  [[ -x "$install_root/usr/libexec/bloom/current/bloom-broker" ]] || return 0
+  systemctl stop "bloom-session@$login_uid.path" 2>/dev/null || true
+  systemctl stop "bloom-broker-ceremony@$login_uid.socket" 2>/dev/null || true
+  systemctl stop "bloom-broker-ceremony-ipv6@$login_uid.socket" 2>/dev/null || true
+  stop_linux_service_if_present "bloom-broker@$login_uid.service" || return
+  stop_linux_service_if_present "bloom-signer@$login_uid.service"
+}
+
 # Checked explicitly and aggregated across logins: rollback runs with
 # errexit suspended, where only the last command's status would otherwise
 # be reported, and restoring units under a still-running service is unsafe.
@@ -1579,14 +1608,8 @@ case "$action" in
         DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$login_uid/bus" \
         systemctl --user stop bloom-machine.service 2>/dev/null || true
     fi
-    if [[ "$fresh_install" == false && "$release_upgrade" == false && "$root" == "/" ]] && \
-      [[ -x "$root/usr/libexec/bloom/current/bloom-broker" ]]
-    then
-      systemctl stop "bloom-session@$login_uid.path" 2>/dev/null || true
-      systemctl stop "bloom-broker-ceremony@$login_uid.socket" 2>/dev/null || true
-      systemctl stop "bloom-broker-ceremony-ipv6@$login_uid.socket" 2>/dev/null || true
-      systemctl stop "bloom-broker@$login_uid.service"
-      systemctl stop "bloom-signer@$login_uid.service"
+    if [[ "$fresh_install" == false && "$release_upgrade" == false ]]; then
+      stop_linux_same_release_services "$root" "$login_uid"
     fi
 
     binary_root="$root/usr/libexec/bloom/current"

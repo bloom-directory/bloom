@@ -6,9 +6,9 @@ const grade = require('./onboarding.cjs');
 
 // Execute the actual documentation blocks as separate, stateless shell calls.
 // Only account switching/download/service commands are stubbed; env -i is real.
-const skillDir = resolve(__dirname, '../../../skills/bloom');
-const install = readFileSync(join(skillDir, 'references/install.md'), 'utf8');
-const setup = readFileSync(join(skillDir, 'scripts/setup.sh'), 'utf8');
+const installDir = resolve(__dirname, '../../../install');
+const install = readFileSync(join(installDir, 'install.md'), 'utf8');
+const setup = readFileSync(join(installDir, 'setup.sh'), 'utf8');
 const blocks = [...install.matchAll(/```sh\n([\s\S]*?)```/g)].map(m => m[1].trim());
 const review = blocks.find(s => s.includes('review_dir="$(as_bloom mktemp'));
 const stage = blocks.find(s => s.includes('as_bloom sh "$review_dir/setup.sh"'));
