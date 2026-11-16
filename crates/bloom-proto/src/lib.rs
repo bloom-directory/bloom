@@ -43,7 +43,9 @@ pub use intent::{
     GasStrategy, INTENT_HASH_DOMAIN, RawIntent, RawIntentBody, ShellIntent, TxIntent, ValueOrToken,
     intent_hash_of,
 };
-pub use plan::{NftAction, NftRef, PlanRender, StagedTx, TokenRef, TxActionKind, TxStatus};
+pub use plan::{
+    NftAction, NftRef, PlanRender, StagedTx, TokenRef, TxActionKind, TxStatus, is_valid_action_id,
+};
 pub use policy::{
     AgentAutonomyMode, ApprovalPolicy, ApprovalStepUpPolicy, AuthorizationSubject,
     AuthorizationSurface, AutonomyDecision, BudgetSnapshot, LimitsPolicy, Policy, PolicyCheck,
