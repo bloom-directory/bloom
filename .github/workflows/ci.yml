@@ -141,8 +141,8 @@ jobs:
     # builder-order classes fee-bearing. Plain `cargo test` rather than nextest
     # on purpose: several of them serialize a fixture rebuild through a
     # process-local Mutex, which a process-per-test runner would not honour.
-    # Deliberately not a count: the first one here said three, and every commit
-    # that adds a test to that module falsifies whatever number replaces it.
+    # Deliberately not a count: any number here is falsified by the next commit
+    # that adds a test to that module.
     # `cargo build --all-features` elsewhere does not set `cfg(test)`, so it
     # does not cover them either. Scoped to `bloom` to keep this cheap.
     name: dev-harness tests

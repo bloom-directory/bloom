@@ -391,10 +391,8 @@ fn refresh_developer_provenance_catalog(
     let mut notes = Vec::new();
     let mut warnings = Vec::new();
     for record in &mut developer_records {
-        // `if let`, not a `matches!` guard over a second `match`: the two read
-        // the same subject, so the fallback arm the guard made unreachable
-        // could only ever have reported a blank route. Binding once means
-        // widening this later is a compile error rather than a blank field.
+        // Bound once, so that admitting another subject kind here is a
+        // compile error rather than a record reported with a blank route.
         if let ProvenanceSubject::Petal {
             package_hash,
             route,
@@ -488,14 +486,12 @@ fn refresh_developer_provenance_catalog(
             shell_quoted(config_dir),
         ));
     }
-    // Settling the catalog is fallible from here down, and every `?` in it
-    // used to drop what the walk found -- the same swallowing the no-write
-    // path below is written to avoid, one branch over, and reachable whenever
-    // an interrupted run has left a `.json.new` behind. Wrapped rather than
-    // given context at each `?` so that a fallible call added in here later
-    // cannot quietly reintroduce it. The lines ride out on the error instead
-    // of being printed from inside the refresh, which would put them beyond
-    // the tests' reach.
+    // Settling the catalog is fallible from here down, and a bare `?` in it
+    // would drop what the walk found -- reachable whenever an interrupted run
+    // has left a `.json.new` behind. One wrapper rather than context at each
+    // `?`, so a fallible call added in here later is covered too. The lines
+    // ride out on the error rather than being printed from inside the refresh,
+    // which would put them beyond the tests' reach.
     //
     // The warnings ride out; the notes do not, and `warnings` therefore stays
     // separate until the settle has succeeded. A `note:` asserts a change was
@@ -2192,10 +2188,9 @@ mod tests {
 
     /// A record with no lineage at all stays governed. The launcher's
     /// `jq`-injected authority fixture is exactly that, and its hand-written
-    /// `fee_asset` literal has to keep being re-derived. The walk no longer
-    /// reads lineage at all, so this is a regression guard against a future
-    /// filter reintroducing one and silently dropping this record out of
-    /// scope, which nothing else here would notice.
+    /// `fee_asset` literal has to keep being re-derived. The walk reads no
+    /// lineage, so this guards against a filter on it dropping this record out
+    /// of scope silently, which nothing else here would notice.
     #[cfg(feature = "triad-dev-harness")]
     #[test]
     fn developer_catalog_refresh_governs_a_record_with_no_lineage() {

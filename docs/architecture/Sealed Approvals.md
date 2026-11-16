@@ -503,8 +503,7 @@ before a claim is authorized. Only core perpetual limit legs are bounded at all;
 trigger orders, asset ids at or above 10,000 and non-`Alo` sells are refused
 rather than bounded.
 
-What the owner sees of the market is weaker than the fee binding, in the
-opposite direction to what this section used to say. The
+What the owner sees of the market is weaker than the fee binding. The
 `Market ID (identity unverified)` label is replaced whenever the id parses as a
 `u32`, whether or not Broker can name that market: an id outside the bundled
 mainnet list renders as `Market <id> (not in this Bloom release's market list)`,
