@@ -588,15 +588,9 @@ impl SimulateHandler {
                     ));
                 }
                 let chain_id = client.spec().chain_id;
-                let contract = match token.trim().parse::<Address>() {
-                    Ok(contract) => contract,
-                    Err(_) => bloom_tx::tx_engine::known_token_address(chain_id, token)
-                        .ok_or_else(|| {
-                            HandlerError::invalid(format!(
-                                "unknown token '{token}' on chain id {chain_id}: pass its 0x address"
-                            ))
-                        })?,
-                };
+                let (contract, _) =
+                    bloom_tx::tx_engine::TxEngine::resolve_token_address(token, chain_id)
+                        .map_err(|e| HandlerError::invalid(e.to_string()))?;
                 let decimals = client
                     .erc20_decimals(contract)
                     .await

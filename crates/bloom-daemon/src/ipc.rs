@@ -4728,8 +4728,7 @@ summary = "Demo app used by IPC tests."
             vec![],
         );
         let context = IpcOperationContext::detached();
-        let write =
-            json!({"path": "/wallets/w/0/confirm-batch", "bytes_b64": B64.encode("base:pending")});
+        let write = json!({"path": "/wallets/w/0/confirm-batch", "bytes_b64": B64.encode("base:tx-1 base:tx-2")});
         let started = std::time::Instant::now();
         let Err(WriteError::Approval(message)) = server.do_write(&write, &context).await else {
             panic!("the first write must report the approval link");
@@ -4739,6 +4738,49 @@ summary = "Demo app used by IPC tests."
         // Still waiting on this write; approved by the next attempt.
         assert!(server.do_write(&write, &context).await.is_ok());
         assert!(started.elapsed() >= owner_wait::BATCH_APPROVAL_POLL);
+    }
+
+    /// An outbox whose `send.tx` stages `tx-9` and asks the owner.
+    struct SendFile;
+
+    #[async_trait::async_trait]
+    impl Handler for SendFile {
+        async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+            Ok(Entry::writable_file(
+                path.segments().last().map_or("w", String::as_str),
+            ))
+        }
+
+        async fn read(&self, _path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            Ok(br#"{"ceremony_url":"http://localhost:1/c/s"}"#.to_vec())
+        }
+
+        async fn write(&self, _path: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+            Err(HandlerError::ApprovalPending(
+                "wallets/w/0/chains/base/outbox/pending/tx-9/approval_challenge.json".into(),
+            ))
+        }
+    }
+
+    /// `send.tx` answers with the link and the entry to confirm by id:
+    /// `latest` may be someone else's entry by the time the caller writes.
+    #[tokio::test]
+    async fn send_tx_names_the_entry_it_staged() {
+        let server = IpcServer::new(
+            Vfs::builder().mount("wallets", Arc::new(SendFile)).build(),
+            "0",
+            vec![],
+        );
+        let write = json!({"path": "/wallets/w/0/chains/base/outbox/send.tx", "bytes_b64": B64.encode("send 1 ETH to 0x01")});
+        let context = IpcOperationContext::detached();
+        let Err(WriteError::Approval(message)) = server.do_write(&write, &context).await else {
+            panic!("send.tx must report the approval link");
+        };
+        assert!(
+            message.contains("http://localhost:1/c/s")
+                && message.contains("Write y to pending/tx-9/confirm"),
+            "{message}"
+        );
     }
 
     /// A sent entry whose receipt is recorded only on the fourth read.

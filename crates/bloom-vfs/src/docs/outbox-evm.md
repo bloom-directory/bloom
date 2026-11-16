@@ -18,6 +18,6 @@ only stages it; `cancel` written to `latest/confirm` discards an entry.
 
 Several bodies in one write, one per line, go under one approval, in order (an
 approve, then the call that spends it). Entries already staged go together by
-writing `<chain>:pending` (or their `chain:id` references in order) to
-`../../../confirm-batch`; reading that file gives the link, then the hashes.
+writing their `chain:id` references, in order, to `../../../confirm-batch`;
+reading that file gives the link, then the hashes.
 `pending/`, `sent/` and `failed/` hold every entry by id.

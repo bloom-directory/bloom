@@ -1322,9 +1322,13 @@ impl FileSystem for BloomFs {
         })?;
         let parent_path = Self::path_of(parent);
         let child = parent_path.join(&decoded);
-        let e = bloom_vfs::owner_wait::lookup(&self.vfs, &child)
-            .await
-            .map_err(map_err)?;
+        // A receipt that is due is waited for, which holds a request slot:
+        // past [`OWNER_WAITERS`] such waits the lookup answers at once.
+        let e = match self.owner_waiters.clone().try_acquire_owned() {
+            Ok(_permit) => bloom_vfs::owner_wait::lookup(&self.vfs, &child).await,
+            Err(_) => self.vfs.lookup(&child).await,
+        }
+        .map_err(map_err)?;
         Ok(BloomHandle::Path {
             entry: e,
             path: child,

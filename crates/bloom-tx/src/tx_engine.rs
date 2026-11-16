@@ -883,8 +883,9 @@ impl TxEngine {
     }
 
     /// Resolve an ERC-20 token symbol or 0x address into a concrete
-    /// contract address on the given chain.
-    fn resolve_token_address(
+    /// contract address on the given chain. Staging and simulation share
+    /// it, so a token named in a body is the same contract in both.
+    pub fn resolve_token_address(
         token: &str,
         chain_id: u64,
     ) -> Result<(Address, String), TxEngineError> {
@@ -5786,13 +5787,6 @@ fn short_addr_label(a: &Address) -> String {
     } else {
         s
     }
-}
-
-/// The address of the one token Bloom knows by `symbol` on `chain_id`.
-pub fn known_token_address(chain_id: u64, symbol: &str) -> Option<Address> {
-    lookup_known_token(chain_id, &symbol.to_ascii_uppercase())?
-        .parse()
-        .ok()
 }
 
 /// Base units of an ERC-20 `amount` as an outbox body writes it, with the

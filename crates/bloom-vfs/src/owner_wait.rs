@@ -93,10 +93,19 @@ pub async fn write(
                         format!(" for {} staged transactions, sent in order", entries.len())
                     })
                     .unwrap_or_default();
+                // Name the entry: `latest` is whatever was staged last,
+                // which another writer may have changed since.
+                let id = url
+                    .as_ref()
+                    .and_then(|doc| doc["entries"].as_array()?.last()?.as_str())
+                    .and_then(|entry| entry.split_once(':'))
+                    .map(|(_, id)| id.to_owned())
+                    .or_else(|| challenge.rsplit('/').nth(1).map(str::to_owned))
+                    .unwrap_or_default();
                 let url = url.and_then(|doc| doc["ceremony_url"].as_str().map(str::to_owned));
                 Err(match url {
                     Some(url) => WriteError::Approval(format!(
-                        "permission denied: owner approval required{staged}: {url} . Write y to latest/confirm: it waits for their approval, then sends."
+                        "permission denied: owner approval required{staged}: {url} . Write y to pending/{id}/confirm: it waits for their approval, then sends."
                     )),
                     None => HandlerError::ApprovalPending(challenge).into(),
                 })
