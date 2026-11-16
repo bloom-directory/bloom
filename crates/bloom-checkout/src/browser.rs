@@ -61,7 +61,6 @@ impl Browser {
         self.private_traveler_used.load(Ordering::SeqCst)
     }
 
-
     pub fn needs_restart(&self) -> bool {
         self.unusable.load(Ordering::SeqCst) || self.cdp.exited()
     }
