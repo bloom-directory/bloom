@@ -230,6 +230,31 @@ mod tests {
     use super::*;
     use crate::handler::EntryKind;
 
+    /// The body forms the guide and the outbox doc list are one list, and
+    /// every form in it parses, so neither drifts from the parser.
+    #[test]
+    fn the_listed_send_tx_forms_match_and_parse() {
+        let forms = |doc: &str| -> String {
+            let (_, after) = doc
+                .split_once("Write a body to `send.tx`")
+                .expect("lists forms");
+            let (_, block) = after.split_once("```text\n").expect("a text block");
+            block.split_once("```").expect("closed").0.to_owned()
+        };
+        let guide = forms(include_str!("../docs/agent-guidance.md"));
+        assert_eq!(guide, forms(include_str!("../docs/outbox-evm.md")));
+        let to = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
+        for line in guide.lines() {
+            // A JSON form is followed by a note on its units.
+            let body = match line.rfind('}') {
+                Some(end) => &line[..=end],
+                None => line,
+            };
+            bloom_tx::intent_parser::parse(&body.replace("0x...", to))
+                .unwrap_or_else(|error| panic!("{line}: {error}"));
+        }
+    }
+
     #[tokio::test]
     async fn root_lists_embedded_and_dynamic_docs() {
         let h = DocsHandler::new();

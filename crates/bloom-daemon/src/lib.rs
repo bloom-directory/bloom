@@ -3481,8 +3481,11 @@ impl ipc::BatchConfirmationService for CanonicalBatchConfirmation {
         request: ipc::BatchConfirmIpcRequest,
     ) -> ipc::BatchConfirmFuture<'a> {
         Box::pin(async move {
-            if !(1..=32).contains(&request.txs.len()) {
-                return Err("transaction batch must contain 1 to 32 children".into());
+            let max = bloom_tx::tx_engine::MAX_BATCH_CHILDREN;
+            if !(1..=max).contains(&request.txs.len()) {
+                return Err(format!(
+                    "transaction batch must contain 1 to {max} children"
+                ));
             }
             if request.account >= (1_u32 << 31) {
                 return Err("account must be between 0 and 2147483647".into());

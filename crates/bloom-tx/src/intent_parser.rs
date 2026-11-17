@@ -277,7 +277,8 @@ fn is_empty_or_zero_value(value: &str) -> bool {
 }
 
 /// The bodies one write holds: one per line when more than one line opens a
-/// body (a `send` line or a single-line JSON object), else the whole input.
+/// body (a `send` line or a single-line JSON object), each object when the
+/// input is several JSON objects (pretty-printed, say), else the whole input.
 pub fn bodies(input: &str) -> Vec<&str> {
     let lines: Vec<&str> = input
         .lines()
@@ -286,7 +287,18 @@ pub fn bodies(input: &str) -> Vec<&str> {
         .collect();
     let opens = |line: &&str| line.starts_with("send ") || line.starts_with('{');
     if lines.len() > 1 && lines.iter().all(opens) {
-        lines
+        return lines;
+    }
+    let mut objects = Vec::new();
+    let mut stream = serde_json::Deserializer::from_str(input).into_iter::<serde::de::IgnoredAny>();
+    let mut start = 0;
+    while let Some(Ok(_)) = stream.next() {
+        let end = stream.byte_offset();
+        objects.push(input[start..end].trim());
+        start = end;
+    }
+    if objects.len() > 1 && input[start..].trim().is_empty() {
+        objects
     } else {
         vec![input]
     }
@@ -498,6 +510,9 @@ mod tests {
         // A space after the brace, as `jq -c`-style tools may write it.
         let spaced = "{ \"kind\": \"send\", \"to\": \"0x70997970C51812dc3A010C7d01b50e0d17dc79C8\", \"value\": \"1 eth\" }";
         assert_eq!(bodies(&format!("{spaced}\n{spaced}")).len(), 2);
+        // Two pretty-printed bodies are two bodies, not a parse error.
+        let two = format!("{pretty}\n{pretty}\n");
+        assert_eq!(bodies(&two), vec![pretty, pretty]);
     }
 
     #[test]

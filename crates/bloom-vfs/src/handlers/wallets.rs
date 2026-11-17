@@ -10256,6 +10256,12 @@ value = "0""#,
             }));
         let batch = vfs(format!("/{}/0/confirm-batch", f.wallet_name));
         assert!(f.handler.write(&batch, b"anvil:0001-first").await.is_err());
+        // A Machine restart while the owner approves: the batch is read back
+        // from disk, so the entry still continues it.
+        f.handler.batch_results.lock().clear();
+        let status = String::from_utf8(f.handler.read(&batch).await.unwrap()).unwrap();
+        assert!(status.contains("awaiting_ceremony"), "{status}");
+        f.handler.batch_results.lock().clear();
         let confirm = |id: &str| {
             vfs(format!(
                 "/{}/0/chains/anvil/outbox/pending/{id}/confirm",
