@@ -60,6 +60,13 @@ signed handoff, versions, services, VFS, and audit readiness; upgrade also
 checks identity metadata and a Machine-home marker. No wallet operations run.
 Evidence stays in `/var/tmp/bloom-headless-test.*`; do not publish raw logs.
 Full readiness needs NFS support, not a container that rejects mounts.
+
+The release workflow runs these checks on a fresh Ubuntu VM after publication,
+requiring the staged tag to match the release. Its second run proves a same-release
+reinstall, not a version upgrade. Older-to-newer upgrade acceptance remains a
+separate disposable-host check. This is a post-publication smoke check, not a
+pre-publication candidate gate; it uses the checkout's guide and setup script,
+not the separately hosted website copies.
 Run [skill checks and model evals](evals/skills/README.md) separately.
 
 ## Triad and Solana ladders

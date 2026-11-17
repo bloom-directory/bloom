@@ -72,6 +72,10 @@ cat "$evidence/staging.txt"
 stage=$(sed -n 's/^BLOOM_STAGE=//p' "$evidence/staging.txt")
 tag=$(sed -n 's/^BLOOM_RELEASE_TAG=//p' "$evidence/staging.txt")
 [[ -n $stage && -n $tag ]]
+if [[ -n ${BLOOM_EXPECTED_RELEASE_TAG:-} && $tag != "$BLOOM_EXPECTED_RELEASE_TAG" ]]; then
+  echo "FAIL: staged $tag; expected $BLOOM_EXPECTED_RELEASE_TAG" >&2
+  exit 1
+fi
 grep -qx "BLOOM_LOGIN_UID=$uid" "$evidence/staging.txt"
 grep -qx "BLOOM_LOGIN_USER=$user" "$evidence/staging.txt"
 

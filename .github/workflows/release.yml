@@ -624,3 +624,28 @@ jobs:
               --notes-file "$notes" \
               dist/*
           fi
+
+  headless-setup:
+    name: Published Linux headless setup
+    needs: [prepare, publish]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.prepare.outputs.release_sha }}
+          persist-credentials: false
+      - name: Install host prerequisites
+        run: sudo apt-get update && sudo apt-get install -y nfs-common openssh-client python3
+      # A hosted runner is a fresh systemd VM, not a model execution sandbox.
+      # setup.sh discovers published latest; never count an older release as green.
+      - name: Check fresh install and same-release reinstall
+        env:
+          EXPECTED_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: |
+          sudo env BLOOM_DISPOSABLE_INSTALL_TEST=1 BLOOM_EXPECTED_RELEASE_TAG="$EXPECTED_TAG" \
+            bash tests/packaging/linux-headless-setup.sh first-install
+          sudo env BLOOM_DISPOSABLE_INSTALL_TEST=1 BLOOM_EXPECTED_RELEASE_TAG="$EXPECTED_TAG" \
+            bash tests/packaging/linux-headless-setup.sh upgrade

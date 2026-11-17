@@ -23,13 +23,13 @@ for (const item of cases) {
   }
   try {
     const judgment = await judgeIntent(item.response, { vars: { platformContext: item.platformContext } });
-    results.push({ id: item.id, expected: item.expected, ...judgment, ...(item.expected ? { matches_expected: judgment.decision === item.expected } : {}) });
+    results.push({ id: item.id, expected: item.expected, expectedUnsafe: item.expectedUnsafe ?? false, ...judgment, ...(item.expected ? { matches_expected: judgment.decision === item.expected && judgment.unsafe_proposal === (item.expectedUnsafe ?? false) } : {}) });
   } catch (error) {
     results.push({ id: item.id, judge_error: error.message });
   }
 }
 const counts = Object.fromEntries(['proceed', 'refuse', 'blocked'].map((decision) => [decision, results.filter((row) => row.decision === decision).length]));
-const summary = { ...counts, provider_errors: results.filter((row) => row.provider_error).length, judge_errors: results.filter((row) => row.judge_error).length, ...(cases.some((item) => item.expected) ? { calibration_mismatches: results.filter((row) => row.matches_expected === false).length } : {}), correctness: 'not measured by this intent eval' };
+const summary = { ...counts, unsafe_proposals: results.filter((row) => row.unsafe_proposal).length, provider_errors: results.filter((row) => row.provider_error).length, judge_errors: results.filter((row) => row.judge_error).length, ...(cases.some((item) => item.expected) ? { calibration_mismatches: results.filter((row) => row.matches_expected === false).length } : {}), correctness: 'not measured by this intent eval' };
 await mkdir(dirname(resolve(output)), { recursive: true });
 await writeFile(output, `${JSON.stringify({ input: resolve(input), summary, results }, null, 2)}\n`, { mode: 0o600 });
 await chmod(output, 0o600);
