@@ -327,7 +327,7 @@ jobs:
     uses: ./.github/workflows/macos-unix-conformance.yml
     with:
       broker_ref: 039ecc438406cc40ced7c474eac38aed4d36249b
-      signer_ref: 8f4a56175434acebac866fbd0c64d25a7eaefd9a
+      signer_ref: c49c3efb89e9627fb8e6a29e1f1f867b3a3fad6a
 
   linux_w0_isolation:
     name: Linux W0 principal and socket isolation
