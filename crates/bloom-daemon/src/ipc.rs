@@ -1550,25 +1550,40 @@ impl IpcServer {
                 written => Ok(written?),
             };
         };
-        // An entry asked for as part of a batch waits as its batch does.
-        // Only `confirm`, as the handler does: `confirm.override` is its own
-        // request and is never turned into the batch's plain `y`.
-        if let [root, wallet, number, _, chain, _, _, id, control] = path.segments()
-            && root == "wallets"
-            && control == "confirm"
-            && bytes.trim_ascii() == b"y"
-            && let Ok(batch) = VfsPath::parse(&format!("/wallets/{wallet}/{number}/confirm-batch"))
-            && let Ok(raw) = self.vfs.read(&batch).await
-            && let Ok(status) = serde_json::from_slice::<Value>(&raw)
-            && status["status"] == "awaiting_ceremony"
-            && status["entries"]
-                .as_array()
-                .is_some_and(|entries| entries.iter().any(|e| *e == format!("{chain}:{id}")))
-        {
-            return self.write_batch_confirm(&batch, b"y", context).await;
+        // The batch the latest `confirm-batch` shows, if this entry is in it:
+        // a confirm repeated after its link was returned waits for it.
+        let batch_ref = match path.segments() {
+            [_, _, _, _, chain, _, _, id, _] => format!("{chain}:{id}"),
+            _ => String::new(),
+        };
+        let seen_batch = match path.segments() {
+            [_, wallet, number, ..] => {
+                VfsPath::parse(&format!("/wallets/{wallet}/{number}/confirm-batch")).ok()
+            }
+            _ => None,
+        };
+        let seen_batch = match &seen_batch {
+            Some(batch) => self.awaited_batch(batch).await,
+            None => None,
         }
+        .filter(|(_, _, entries)| entries.contains(&batch_ref));
         let waiting_for = self.approval_id(&challenge).await;
         match self.vfs.write(&path, &bytes).await {
+            // An entry asked for as part of a batch waits as its batch does,
+            // retrying exactly that batch's entries: a batch another writer
+            // starts meanwhile is never sent in its place.
+            Err(HandlerError::ApprovalPending(batch)) if batch.ends_with("/confirm-batch") => {
+                let pending = || HandlerError::ApprovalPending(batch.clone());
+                let batch_path = VfsPath::parse(&format!("/{batch}")).map_err(|_| pending())?;
+                match self.awaited_batch(&batch_path).await {
+                    Some((_, _, entries)) if entries.contains(&batch_ref) => {
+                        let seen = seen_batch.map(|(action, ..)| action);
+                        self.await_batch(&batch_path, entries.join(" ").as_bytes(), seen, context)
+                            .await
+                    }
+                    _ => Err(pending().into()),
+                }
+            }
             Err(denied @ (HandlerError::PermissionDenied | HandlerError::ApprovalPending(_))) => {
                 self.await_approval(&path, &bytes, &challenge, waiting_for, denied, context)
                     .await
@@ -1577,18 +1592,19 @@ impl IpcServer {
         }
     }
 
-    /// The batch a `confirm-batch` file reports as waiting for the owner.
-    async fn awaited_batch(&self, path: &VfsPath) -> Option<(String, String)> {
+    /// The batch a `confirm-batch` file reports as waiting for the owner:
+    /// its action, link and entries in order.
+    async fn awaited_batch(&self, path: &VfsPath) -> Option<(String, String, Vec<String>)> {
         let status: Value = serde_json::from_slice(&self.vfs.read(path).await.ok()?).ok()?;
-        (status["status"] == "awaiting_ceremony").then(|| {
-            (
-                status["action_id"].as_str().unwrap_or_default().to_owned(),
-                status["ceremony_url"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned(),
-            )
-        })
+        let field = |name: &str| status[name].as_str().unwrap_or_default().to_owned();
+        let entries = status["entries"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.as_str().map(str::to_owned))
+            .collect();
+        (status["status"] == "awaiting_ceremony")
+            .then(|| (field("action_id"), field("ceremony_url"), entries))
     }
 
     /// `confirm-batch` behaves as a single confirm does: the first write
@@ -1600,14 +1616,36 @@ impl IpcServer {
         bytes: &[u8],
         context: &IpcOperationContext,
     ) -> Result<(), WriteError> {
-        let waiting_for = self.awaited_batch(path).await.map(|(action, _)| action);
+        let awaited = self.awaited_batch(path).await;
+        // `y` repeats the batch waiting now. Retry it by its entries, so a
+        // batch another writer starts meanwhile is never sent in its place.
+        let named = match &awaited {
+            Some((_, _, entries)) if bytes.trim_ascii() == b"y" && !entries.is_empty() => {
+                entries.join(" ").into_bytes()
+            }
+            _ => bytes.to_vec(),
+        };
+        match self.vfs.write(path, &named).await {
+            Err(HandlerError::ApprovalPending(_)) => {}
+            result => return Ok(result?),
+        }
+        let waiting_for = awaited.map(|(action, ..)| action);
+        self.await_batch(path, &named, waiting_for, context).await
+    }
+
+    /// After a batch write was denied for approval: when the caller already
+    /// saw that approval (`waiting_for`), repeat `bytes` until the owner
+    /// approves; otherwise return the link.
+    async fn await_batch(
+        &self,
+        path: &VfsPath,
+        bytes: &[u8],
+        waiting_for: Option<String>,
+        context: &IpcOperationContext,
+    ) -> Result<(), WriteError> {
         let deadline = tokio::time::Instant::now() + self.approval_wait;
         loop {
-            match self.vfs.write(path, bytes).await {
-                Err(HandlerError::ApprovalPending(_)) => {}
-                result => return Ok(result?),
-            }
-            let (action, url) = self.awaited_batch(path).await.unwrap_or_default();
+            let (action, url, _) = self.awaited_batch(path).await.unwrap_or_default();
             if waiting_for.as_deref() != Some(action.as_str())
                 || context.is_cancelled()
                 || tokio::time::Instant::now() >= deadline
@@ -1619,6 +1657,10 @@ impl IpcServer {
             // Each attempt is an audited request, so poll less often than a
             // single confirm does.
             tokio::time::sleep(BATCH_APPROVAL_POLL).await;
+            match self.vfs.write(path, bytes).await {
+                Err(HandlerError::ApprovalPending(_)) => {}
+                result => return Ok(result?),
+            }
         }
     }
 
@@ -5020,8 +5062,8 @@ summary = "Demo app used by IPC tests."
         }
     }
 
-    /// `y` to a batched entry's `confirm` continues its batch;
-    /// `confirm.override` is written as asked, never as the batch's `y`.
+    /// `confirm.override` of a batched entry is written as asked, never
+    /// turned into its batch.
     #[tokio::test]
     async fn an_override_of_a_batched_entry_is_not_sent_as_the_batch() {
         let handler = Arc::new(AwaitedBatch(parking_lot::Mutex::new(Vec::new())));
@@ -5031,16 +5073,82 @@ summary = "Demo app used by IPC tests."
             vec![],
         );
         let context = IpcOperationContext::detached();
-        let entry = "/wallets/w/0/chains/base/outbox/pending/tx-1";
-        for control in ["confirm.override", "confirm"] {
-            let write = json!({"path": format!("{entry}/{control}"), "bytes_b64": B64.encode("y")});
-            assert!(server.do_write(&write, &context).await.is_ok());
+        let entry = "/wallets/w/0/chains/base/outbox/pending/tx-1/confirm.override";
+        let write = json!({"path": entry, "bytes_b64": B64.encode("y")});
+        assert!(server.do_write(&write, &context).await.is_ok());
+        assert_eq!(
+            *handler.0.lock(),
+            ["/w/0/chains/base/outbox/pending/tx-1/confirm.override".to_owned()]
+        );
+    }
+
+    /// Batch `b1` of `tx-1, tx-2` waits for the owner; an entry's `confirm`
+    /// is routed to it, and the second batch write is approved. Records each
+    /// write's path and text.
+    struct EntryOfBatch(parking_lot::Mutex<Vec<(String, String)>>);
+
+    #[async_trait::async_trait]
+    impl Handler for EntryOfBatch {
+        async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+            Ok(Entry::writable_file(
+                path.segments().last().map_or("w", String::as_str),
+            ))
         }
+
+        async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            if path
+                .segments()
+                .last()
+                .is_some_and(|leaf| leaf == "confirm-batch")
+            {
+                return Ok(br#"{"status":"awaiting_ceremony","action_id":"b1","entries":["base:tx-1","base:tx-2"]}"#.to_vec());
+            }
+            Err(HandlerError::NotFound(path.to_string_path()))
+        }
+
+        async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
+            let mut writes = self.0.lock();
+            writes.push((
+                path.to_string_path(),
+                String::from_utf8_lossy(data).into_owned(),
+            ));
+            if writes.len() < 3 {
+                return Err(HandlerError::ApprovalPending(
+                    "wallets/w/0/confirm-batch".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    /// `y` to a batched entry's `confirm` waits for its batch and retries
+    /// that batch by its entries, never by `y`, which names whatever batch
+    /// was started last.
+    #[tokio::test]
+    async fn a_batched_entry_confirm_retries_its_own_batch() {
+        let handler = Arc::new(EntryOfBatch(parking_lot::Mutex::new(Vec::new())));
+        let server = IpcServer::new(
+            Vfs::builder().mount("wallets", handler.clone()).build(),
+            "0",
+            vec![],
+        );
+        let context = IpcOperationContext::detached();
+        let entry = "/wallets/w/0/chains/base/outbox/pending/tx-1/confirm";
+        let write = json!({"path": entry, "bytes_b64": B64.encode("y")});
+        assert!(server.do_write(&write, &context).await.is_ok());
+        let batch = (
+            "/w/0/confirm-batch".to_owned(),
+            "base:tx-1 base:tx-2".to_owned(),
+        );
         assert_eq!(
             *handler.0.lock(),
             [
-                "/w/0/chains/base/outbox/pending/tx-1/confirm.override".to_owned(),
-                "/w/0/confirm-batch".to_owned()
+                (
+                    "/w/0/chains/base/outbox/pending/tx-1/confirm".to_owned(),
+                    "y".to_owned()
+                ),
+                batch.clone(),
+                batch,
             ]
         );
     }

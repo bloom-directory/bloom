@@ -430,6 +430,8 @@ const TRIAD_SIGNING_STATE_FILE: &str = crate::outbox::SIGNING_STATE_FILE;
 const TRIAD_BATCH_STATE_DIR: &str = crate::outbox::BATCH_SIGNING_STATE_DIR;
 const TRIAD_BATCH_STATE_FILE: &str = crate::outbox::SIGNING_STATE_FILE;
 const TRIAD_EXACT_APPROVAL_TTL_MS: u64 = 10 * 60 * 1_000;
+/// The most transactions one owner approval can cover.
+pub const MAX_BATCH_CHILDREN: usize = 32;
 
 #[derive(Clone)]
 struct TriadSigningService {
@@ -2245,10 +2247,10 @@ impl TxEngine {
         override_warnings: bool,
     ) -> Result<ConfirmBatchResult, TxEngineError> {
         self.assert_write_permit(permit)?;
-        if !(1..=32).contains(&targets.len()) {
-            return Err(TxEngineError::ApprovalConstruction(
-                "transaction batch must contain 1 to 32 children".into(),
-            ));
+        if !(1..=MAX_BATCH_CHILDREN).contains(&targets.len()) {
+            return Err(TxEngineError::ApprovalConstruction(format!(
+                "transaction batch must contain 1 to {MAX_BATCH_CHILDREN} children"
+            )));
         }
         let mut unique = HashSet::with_capacity(targets.len());
         let ordered_refs = targets
