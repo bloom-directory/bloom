@@ -3729,7 +3729,10 @@ async fn run(cli: Cli) -> Result<()> {
 
     if cli.version {
         let client_protocol = IpcProtocolRange::supported();
-        println!("bloom {}", env!("CARGO_PKG_VERSION"));
+        // Build every line before writing: the daemon round trip must not sit
+        // between writes, or a reader that closes early (`| head -1`) turns
+        // the next write into a broken-pipe panic.
+        let mut out = format!("bloom {}\n", env!("CARGO_PKG_VERSION"));
         match IpcClient::new(&client_endpoint.socket)
             .call_with_protocol("version", serde_json::Value::Null)
             .await
@@ -3739,25 +3742,32 @@ async fn run(cli: Cli) -> Result<()> {
                     .result
                     .as_str()
                     .context("daemon version response is not a string")?;
-                println!("bloom-daemon {daemon_version}");
-                println!(
-                    "bloom-ipc {} (compatible; cli {}, daemon {})",
+                out.push_str(&format!(
+                    "bloom-daemon {daemon_version}\n\
+                     bloom-ipc {} (compatible; cli {}, daemon {})\n",
                     reply.negotiated_protocol, client_protocol, reply.daemon_protocol
-                );
+                ));
             }
             Err(IpcClientError::Transport(_)) => {
-                println!("bloom-daemon unavailable");
-                println!("bloom-ipc {client_protocol} (not negotiated)");
+                out.push_str(&format!(
+                    "bloom-daemon unavailable\nbloom-ipc {client_protocol} (not negotiated)\n"
+                ));
             }
             Err(IpcClientError::Incompatible { client, daemon }) => {
-                println!("bloom-daemon incompatible");
-                println!("bloom-ipc incompatible (cli {client}, daemon {daemon})");
+                out.push_str(&format!(
+                    "bloom-daemon incompatible\n\
+                     bloom-ipc incompatible (cli {client}, daemon {daemon})\n"
+                ));
             }
             Err(error) => {
-                println!("bloom-daemon incompatible");
-                println!("bloom-ipc {client_protocol} (not negotiated: {error})");
+                out.push_str(&format!(
+                    "bloom-daemon incompatible\n\
+                     bloom-ipc {client_protocol} (not negotiated: {error})\n"
+                ));
             }
         }
+        write_ignoring_closed_reader(std::io::stdout().lock(), &out)
+            .context("write version to stdout")?;
         return Ok(());
     }
 
@@ -6794,5 +6804,61 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("unix:/restricted/bloom.sock"), "{message}");
         assert!(message.contains("bloom serve"), "{message}");
+    }
+}
+
+/// Writes CLI output, treating a reader that has already closed the pipe
+/// (`bloom --version | head -1`) as a normal end of output rather than an
+/// error.
+fn write_ignoring_closed_reader(mut out: impl std::io::Write, text: &str) -> std::io::Result<()> {
+    match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        result => result,
+    }
+}
+
+#[cfg(test)]
+mod closed_reader_tests {
+    use super::write_ignoring_closed_reader;
+    use std::io::{self, Write};
+
+    struct ClosedReader;
+
+    impl Write for ClosedReader {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct Failing;
+
+    impl Write for Failing {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::PermissionDenied.into())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_closed_reader_ends_output_quietly() {
+        write_ignoring_closed_reader(ClosedReader, "bloom 0.5.1\n").unwrap();
+    }
+
+    #[test]
+    fn other_write_errors_still_surface() {
+        let error = write_ignoring_closed_reader(Failing, "bloom 0.5.1\n").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn output_is_written_whole() {
+        let mut buffer = Vec::new();
+        write_ignoring_closed_reader(&mut buffer, "a\nb\n").unwrap();
+        assert_eq!(buffer, b"a\nb\n");
     }
 }

@@ -1,0 +1,15 @@
+{
+  "name": "bloom",
+  "description": "Bloom's agent skill for Claude Code.",
+  "owner": {
+    "name": "Bloom Directory",
+    "url": "https://bloom.directory"
+  },
+  "plugins": [
+    {
+      "name": "bloom",
+      "source": "./skills/bloom",
+      "description": "Use Bloom, the programmable financial harness for AI agents: balances, payments, trades, and wallets on EVM chains and Solana."
+    }
+  ]
+}
