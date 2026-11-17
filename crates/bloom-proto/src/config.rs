@@ -292,6 +292,16 @@ const POLYGON_RPC_URLS: [&str; 3] = [
     "https://tenderly.rpc.polygon.community",
 ];
 
+/// Down since November 2026 (HTTP 530, Cloudflare 1033).
+const RETIRED_ARC_RPC_URL: &str = "https://rpc.arc-scan.org";
+
+/// Arc's own endpoint, then dRPC's. Both listed in Arc's docs and checked
+/// to answer `eth_chainId` with 5042 on 2026-11-13.
+const ARC_RPC_URLS: [&str; 2] = [
+    "https://rpc.mainnet.arc.io",
+    "https://rpc.drpc.mainnet.arc.io",
+];
+
 fn default_chains() -> BTreeMap<String, ChainSpec> {
     let mut chains = BTreeMap::new();
     for spec in [
@@ -401,7 +411,7 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
             "HyperEVM",
             "HYPE",
         ),
-        evm_chain("arc", 5_042, &["https://rpc.arc-scan.org"], "Arc", "USDC"),
+        evm_chain("arc", 5_042, &ARC_RPC_URLS, "Arc", "USDC"),
     ] {
         chains.insert(spec.name.clone(), spec);
     }
@@ -411,15 +421,15 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
 /// Repair configs containing the exact retired default and add missing fallback
 /// providers. Preserve custom entries and their relative order; custom-only
 /// lists and explicit `rpc_endpoints` remain operator-controlled.
-fn replace_retired_polygon_urls(urls: &mut Vec<String>) {
-    let Some(i) = urls.iter().position(|u| u == RETIRED_POLYGON_RPC_URL) else {
+fn replace_retired_urls(urls: &mut Vec<String>, retired: &str, defaults: &[&str]) {
+    let Some(i) = urls.iter().position(|u| u == retired) else {
         return;
     };
-    if !urls.iter().any(|u| u == POLYGON_RPC_URLS[0]) {
-        urls[i] = POLYGON_RPC_URLS[0].to_string();
+    if !urls.iter().any(|u| u == defaults[0]) {
+        urls[i] = defaults[0].to_string();
     }
-    urls.retain(|u| u != RETIRED_POLYGON_RPC_URL);
-    for url in POLYGON_RPC_URLS {
+    urls.retain(|u| u != retired);
+    for url in defaults {
         if !urls.iter().any(|u| u == url) {
             urls.push(url.to_string());
         }
@@ -518,8 +528,16 @@ impl Config {
         }
         for spec in self.chains.values_mut() {
             spec.infer_op_stack();
-            if spec.chain_id == 137 {
-                replace_retired_polygon_urls(&mut spec.rpc_urls);
+            match spec.chain_id {
+                137 => replace_retired_urls(
+                    &mut spec.rpc_urls,
+                    RETIRED_POLYGON_RPC_URL,
+                    &POLYGON_RPC_URLS,
+                ),
+                5_042 => {
+                    replace_retired_urls(&mut spec.rpc_urls, RETIRED_ARC_RPC_URL, &ARC_RPC_URLS)
+                }
+                _ => {}
             }
         }
     }
@@ -781,7 +799,7 @@ mod tests {
         assert_eq!(hyperliquid.chain_id, 999);
         let arc = cfg.chains.get("arc").expect("Arc entry");
         assert_eq!(arc.chain_id, 5_042);
-        assert_eq!(arc.rpc_urls, vec!["https://rpc.arc-scan.org"]);
+        assert_eq!(arc.rpc_urls, ARC_RPC_URLS);
         assert_eq!(arc.display_name.as_deref(), Some("Arc"));
         assert_eq!(arc.native_symbol, "USDC");
         assert_eq!(arc.native_decimals, 18);
@@ -1257,6 +1275,23 @@ allow_broadcast = false
             "https://polygon-mainnet.g.alchemy.com/v2/KEY",
         ];
         assert_eq!(migrated_polygon_urls(&custom), custom);
+    }
+
+    #[test]
+    fn migration_replaces_retired_arc_default_only() {
+        let migrated = |urls: &[&str]| {
+            let mut cfg = Config::local_default();
+            cfg.chains.get_mut("arc").unwrap().rpc_urls =
+                urls.iter().map(|u| (*u).to_string()).collect();
+            cfg.migrate();
+            cfg.chains["arc"].rpc_urls.clone()
+        };
+        assert_eq!(migrated(&[RETIRED_ARC_RPC_URL]), ARC_RPC_URLS);
+        let custom = [
+            "https://arc.example/rpc",
+            "https://rpc.arc-scan.org/?key=abc",
+        ];
+        assert_eq!(migrated(&custom), custom);
     }
 
     #[test]
