@@ -2275,7 +2275,7 @@ dependencies = [
 
 [[package]]
 name = "bloom"
-version = "0.4.2"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "anyhow",
@@ -2310,7 +2310,7 @@ dependencies = [
  "predicates",
  "qrcode",
  "rand 0.8.6",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "serde",
  "serde_jcs",
  "serde_json",
@@ -2332,7 +2332,7 @@ dependencies = [
  "bloom-rpc-wire",
  "ed25519-dalek",
  "hex",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "serde",
  "serde_jcs",
  "serde_json",
@@ -2343,7 +2343,7 @@ dependencies = [
 [[package]]
 name = "bloom-broker-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=0a9a8dae12e86237cb9d6ba63a2456d7c0871cf9#0a9a8dae12e86237cb9d6ba63a2456d7c0871cf9"
+source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=94c422210e0ec374d461d500ff849e16d40cf30b#94c422210e0ec374d461d500ff849e16d40cf30b"
 dependencies = [
  "bech32",
  "bloom-rpc-wire",
@@ -2358,7 +2358,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-daemon"
-version = "0.4.2"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "anyhow",
@@ -2366,6 +2366,7 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "bloom-broker-api",
+ "bloom-daemon",
  "bloom-ens",
  "bloom-etherscan",
  "bloom-evm",
@@ -2390,7 +2391,7 @@ dependencies = [
  "hex",
  "parking_lot",
  "reqwest 0.12.28",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "serde",
  "serde_jcs",
  "serde_json",
@@ -2406,7 +2407,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-ens"
-version = "0.4.2"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "bloom-evm",
@@ -2421,7 +2422,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-etherscan"
-version = "0.4.2"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "async-trait",
@@ -2439,7 +2440,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-evm"
-version = "0.4.2"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "bloom-proto",
@@ -2457,7 +2458,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-it"
-version = "0.4.2"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "alloy-signer-local 2.0.5",
@@ -2493,7 +2494,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-machine"
-version = "0.4.2"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "bloom-broker-api",
@@ -2510,7 +2511,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-machine-client"
-version = "0.4.2"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "bloom-audit-checkpoint",
@@ -2534,7 +2535,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-mcp"
-version = "0.4.2"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2552,7 +2553,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-mempool"
-version = "0.4.2"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "alloy-signer-local 2.0.5",
@@ -2574,7 +2575,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-mount"
-version = "0.4.2"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "bloom-vfs",
@@ -2583,7 +2584,7 @@ dependencies = [
  "futures",
  "lru 0.18.2",
  "parking_lot",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -2591,7 +2592,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-paid-http"
-version = "0.4.2"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2606,7 +2607,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-paid-mpp"
-version = "0.4.2"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "async-trait",
@@ -2623,7 +2624,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-paid-x402"
-version = "0.4.2"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "alloy-dyn-abi",
@@ -2650,7 +2651,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-petals"
-version = "0.4.2"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2685,7 +2686,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-prices"
-version = "0.4.2"
+version = "0.5.1"
 dependencies = [
  "parking_lot",
  "reqwest 0.12.28",
@@ -2698,7 +2699,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-proto"
-version = "0.4.2"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "blake3",
@@ -2720,7 +2721,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-revert"
-version = "0.4.2"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "alloy-dyn-abi",
@@ -2742,7 +2743,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-rpc"
-version = "0.4.2"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "bloom-proto",
@@ -2759,7 +2760,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-rpc-common"
-version = "0.4.2"
+version = "0.5.1"
 dependencies = [
  "parking_lot",
  "serde",
@@ -2797,7 +2798,7 @@ version = "0.1.3"
 source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=48b83c54c1787b4aff2456bd3adbe18856902e45#48b83c54c1787b4aff2456bd3adbe18856902e45"
 dependencies = [
  "libc",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "tracing",
  "tracing-subscriber 0.3.23",
 ]
@@ -2805,7 +2806,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=68d8ecaec34a7cae99f754972b5a781a8e17e542#68d8ecaec34a7cae99f754972b5a781a8e17e542"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=7b8e848e0657075e94ef0cffb86b5844bc07a1c7#7b8e848e0657075e94ef0cffb86b5844bc07a1c7"
 dependencies = [
  "bloom-rpc-wire",
  "ed25519-dalek",
@@ -2820,7 +2821,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-derive"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=68d8ecaec34a7cae99f754972b5a781a8e17e542#68d8ecaec34a7cae99f754972b5a781a8e17e542"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=7b8e848e0657075e94ef0cffb86b5844bc07a1c7#7b8e848e0657075e94ef0cffb86b5844bc07a1c7"
 dependencies = [
  "bip39",
  "ed25519-dalek",
@@ -2836,7 +2837,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-solana"
-version = "0.4.2"
+version = "0.5.1"
 dependencies = [
  "bloom-proto",
  "bloom-rpc-common",
@@ -2851,7 +2852,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-solana-tx"
-version = "0.4.2"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2880,7 +2881,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-tools"
-version = "0.4.2"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "alloy-dyn-abi",
@@ -2902,7 +2903,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "rand 0.10.2",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "serde",
  "serde_jcs",
  "serde_json",
@@ -2922,7 +2923,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-tx"
-version = "0.4.2"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "alloy-signer-local 2.0.5",
@@ -2954,7 +2955,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-update"
-version = "0.4.2"
+version = "0.5.1"
 dependencies = [
  "parking_lot",
  "reqwest 0.12.28",
@@ -2969,7 +2970,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-vfs"
-version = "0.4.2"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "async-trait",
@@ -3004,7 +3005,7 @@ dependencies = [
  "qrcode",
  "rand 0.8.6",
  "reqwest 0.12.28",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "serde",
  "serde_jcs",
  "serde_json",
@@ -3019,7 +3020,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-watch"
-version = "0.4.2"
+version = "0.5.1"
 dependencies = [
  "alloy 2.0.5",
  "anyhow",
@@ -3172,7 +3173,7 @@ dependencies = [
  "cap-primitives",
  "cap-std",
  "io-lifetimes",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3183,7 +3184,7 @@ checksum = "150941cefd3df4de2fea24604ba4949371576f62e527410298333f7d431a1bc6"
 dependencies = [
  "cap-primitives",
  "cap-std",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "smallvec",
 ]
 
@@ -3199,9 +3200,9 @@ dependencies = [
  "io-lifetimes",
  "ipnet",
  "maybe-owned",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "rustix-linux-procfs",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
  "winx",
 ]
 
@@ -3224,7 +3225,7 @@ dependencies = [
  "cap-primitives",
  "io-extras",
  "io-lifetimes",
- "rustix 1.1.4",
+ "rustix 1.1.6",
 ]
 
 [[package]]
@@ -3237,7 +3238,7 @@ dependencies = [
  "cap-primitives",
  "iana-time-zone",
  "once_cell",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "winx",
 ]
 
@@ -4411,7 +4412,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4526,8 +4527,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ce92ff622d6dadf7349484f42c93271a0d49b7cc4d466a936405bacbe10aa78"
 dependencies = [
  "cfg-if",
- "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "rustix 1.1.6",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4682,8 +4683,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94e7099f6313ecacbe1256e8ff9d617b75d1bcb16a6fddef94866d225a01a14a"
 dependencies = [
  "io-lifetimes",
- "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "rustix 1.1.6",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5593,7 +5594,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2285ddfe3054097ef4b2fe909ef8c3bcd1ea52a8f0d274416caebeef39f04a65"
 dependencies = [
  "io-lifetimes",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5940,7 +5941,7 @@ version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ad38eb12aea514a0466ea40a80fd8cc83637065948eb4a426e4aa46261175227"
 dependencies = [
- "rustix 1.1.4",
+ "rustix 1.1.6",
 ]
 
 [[package]]
@@ -6979,7 +6980,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7965,20 +7966,20 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "rustix"
-version = "1.1.4"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags",
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7988,7 +7989,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2fc84bf7e9aa16c4f2c758f27412dc9841341e16aa682d9c7ac308fe3ee12056"
 dependencies = [
  "once_cell",
- "rustix 1.1.4",
+ "rustix 1.1.6",
 ]
 
 [[package]]
@@ -8046,7 +8047,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -9069,7 +9070,7 @@ dependencies = [
  "fd-lock",
  "io-lifetimes",
  "rustix 0.38.44",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
  "winx",
 ]
 
@@ -9105,8 +9106,8 @@ dependencies = [
  "fastrand",
  "getrandom 0.3.4",
  "once_cell",
- "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "rustix 1.1.6",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -10130,7 +10131,7 @@ dependencies = [
  "postcard",
  "pulley-interpreter",
  "rayon",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "semver 1.0.28",
  "serde",
  "serde_derive",
@@ -10245,7 +10246,7 @@ dependencies = [
  "cc",
  "cfg-if",
  "libc",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "wasmtime-internal-asm-macros",
  "wasmtime-internal-versioned-export-macros",
  "windows-sys 0.60.2",
@@ -10361,7 +10362,7 @@ dependencies = [
  "futures",
  "io-extras",
  "io-lifetimes",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "rustix-linux-procfs",
  "system-interface",
  "thiserror 2.0.18",
@@ -10938,7 +10939,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f3fd376f71958b862e7afb20cfe5a22830e1963462f3a17f49d82a6c1d1f42d"
 dependencies = [
  "bitflags",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -11176,12 +11177,12 @@ dependencies = [
 
 [[package]]
 name = "xattr"
-version = "1.6.1"
+version = "1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
+checksum = "963d6fab92d5504b971dc8bd90ca743c2575e590bc8071ea5bc571598667ae08"
 dependencies = [
  "libc",
- "rustix 1.1.4",
+ "rustix 1.1.6",
 ]
 
 [[package]]

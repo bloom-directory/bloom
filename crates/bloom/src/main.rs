@@ -1407,7 +1407,8 @@ fn machine_error_from_handler(error: &bloom_vfs::HandlerError, message: String) 
     let kind = match error {
         bloom_vfs::HandlerError::NotFound(_) => MachineErrorKind::NotFound,
         bloom_vfs::HandlerError::PermissionDenied
-        | bloom_vfs::HandlerError::OperationNotPermitted => MachineErrorKind::PermissionDenied,
+        | bloom_vfs::HandlerError::OperationNotPermitted
+        | bloom_vfs::HandlerError::ApprovalPending(_) => MachineErrorKind::PermissionDenied,
         bloom_vfs::HandlerError::Invalid(_)
         | bloom_vfs::HandlerError::NotADir(_)
         | bloom_vfs::HandlerError::NotAFile(_)
@@ -1783,6 +1784,7 @@ async fn execute_machine_command(
         }
         MachineCommand::WalletOutboxCancel {
             wallet,
+            account,
             chain,
             id,
             text,
@@ -1790,6 +1792,7 @@ async fn execute_machine_command(
             execute_wallet_outbox_action(
                 &daemon.vfs,
                 &wallet,
+                account,
                 &chain,
                 &id,
                 "cancel",
@@ -1801,6 +1804,7 @@ async fn execute_machine_command(
         }
         MachineCommand::WalletOutboxReplace {
             wallet,
+            account,
             chain,
             id,
             intent,
@@ -1808,6 +1812,7 @@ async fn execute_machine_command(
             execute_wallet_outbox_action(
                 &daemon.vfs,
                 &wallet,
+                account,
                 &chain,
                 &id,
                 "replace",
@@ -1876,11 +1881,19 @@ async fn execute_machine_command(
 async fn execute_wallet_outbox_action(
     vfs: &bloom_vfs::Vfs,
     wallet: &str,
+    account: u32,
     chain: &str,
     id: &str,
     action: &str,
     body: &[u8],
 ) -> Result<()> {
+    if account >= (1_u32 << 31) {
+        return Err(machine_error(
+            MachineErrorKind::InvalidParams,
+            "account must be between 0 and 2147483647",
+        )
+        .into());
+    }
     for (label, value) in [("wallet", wallet), ("chain", chain), ("id", id)] {
         if value.is_empty()
             || value == "."
@@ -1897,7 +1910,7 @@ async fn execute_wallet_outbox_action(
         }
     }
     let path = bloom_vfs::VfsPath::parse(&format!(
-        "/wallets/{wallet}/0/chains/{chain}/outbox/pending/{id}/{action}"
+        "/wallets/{wallet}/{account}/chains/{chain}/outbox/pending/{id}/{action}"
     ))?;
     bloom_vfs::Handler::write(vfs, &path, body).await?;
     Ok(())
@@ -2945,6 +2958,9 @@ enum WalletCmd {
     Stage {
         wallet: String,
         chain: String,
+        /// Account index used for staging and the atomic action-ID lookup.
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=2_147_483_647))]
+        account: u32,
         /// Intent body (JSON, TOML, or shell-style). If omitted, read
         /// from stdin.
         #[arg(long)]
@@ -2961,6 +2977,9 @@ enum WalletCmd {
         wallet: String,
         chain: String,
         id: String,
+        /// Account used when staging; use the same value on every retry.
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=2_147_483_647))]
+        account: u32,
         /// Confirmation text (default "y"; "override" bypasses soft
         /// policy warnings).
         #[arg(long, default_value = "y")]
@@ -2972,6 +2991,9 @@ enum WalletCmd {
         wallet: String,
         chain: String,
         id: String,
+        /// Account used when staging.
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=2_147_483_647))]
+        account: u32,
         /// Confirmation text. Must be non-empty.
         #[arg(long, default_value = "y")]
         text: String,
@@ -2982,6 +3004,9 @@ enum WalletCmd {
         wallet: String,
         chain: String,
         id: String,
+        /// Account used when staging.
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=2_147_483_647))]
+        account: u32,
         /// Exactly `{"max_fee_per_gas":"<wei>","max_priority_fee_per_gas":"<wei>"}`;
         /// any other body is refused. If omitted, read stdin.
         #[arg(long)]
@@ -2992,6 +3017,9 @@ enum WalletCmd {
     /// Each TX is `chain:id`, for example `base:0001-abc`.
     ConfirmBatch {
         wallet: String,
+        /// Account used when staging every transaction in this batch.
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=2_147_483_647))]
+        account: u32,
         /// Staged tx references in the exact order to broadcast.
         txs: Vec<String>,
         /// Confirmation text for each tx.
@@ -3346,8 +3374,15 @@ fn print_vfs_stat_json(path: &str, entry: &serde_json::Value) -> Result<()> {
 }
 
 enum ConfirmProjection {
-    Ceremony { url: String, expires_at_ms: u128 },
-    Broadcast { tx_hash: String },
+    Ceremony {
+        url: String,
+        expires_at_ms: u128,
+        /// A Petal-staged entry's retry step; its raw confirm never sends.
+        petal_next: Option<String>,
+    },
+    Broadcast {
+        tx_hash: String,
+    },
 }
 
 fn unix_now_ms() -> u128 {
@@ -3363,13 +3398,15 @@ fn unix_now_ms() -> u128 {
 async fn confirm_projection(
     endpoint: &ResolvedEndpoint,
     wallet: &str,
+    account: u32,
     chain: &str,
     id: &str,
 ) -> Option<ConfirmProjection> {
     // The public approval challenge carries the live ceremony link; the
     // entry's private signing state (`ceremony.json`) is not mounted.
-    let challenge_path =
-        format!("/wallets/{wallet}/0/chains/{chain}/outbox/pending/{id}/approval_challenge.json");
+    let challenge_path = format!(
+        "/wallets/{wallet}/{account}/chains/{chain}/outbox/pending/{id}/approval_challenge.json"
+    );
     if let Ok(bytes) = ipc_read(endpoint, &challenge_path).await {
         let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
         let url = value
@@ -3388,13 +3425,21 @@ async fn confirm_projection(
             && !url.trim().is_empty()
             && expires_at_ms.is_some_and(|expires| expires > unix_now_ms())
         {
+            let petal_next = value
+                .get("staged_by")
+                .is_some_and(serde_json::Value::is_string)
+                .then(|| value.get("next").and_then(serde_json::Value::as_str))
+                .flatten()
+                .map(str::to_string);
             return Some(ConfirmProjection::Ceremony {
                 url,
                 expires_at_ms: expires_at_ms.unwrap_or(0),
+                petal_next,
             });
         }
     }
-    let sent_path = format!("/wallets/{wallet}/0/chains/{chain}/outbox/sent/{id}/intent.json");
+    let sent_path =
+        format!("/wallets/{wallet}/{account}/chains/{chain}/outbox/sent/{id}/intent.json");
     if let Ok(bytes) = ipc_read(endpoint, &sent_path).await {
         let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
         if let Some(tx_hash) = value.get("tx_hash").and_then(serde_json::Value::as_str)
@@ -3429,6 +3474,15 @@ async fn try_ipc_coded(
             };
             Err((code, map_ipc_client_error(endpoint, error)))
         }
+    }
+}
+
+fn print_approval_pending(url: &str, expires_at_ms: u128, petal_next: Option<&str>) {
+    let remaining = expires_at_ms.saturating_sub(unix_now_ms()) / 1000;
+    println!("Approval required: open {url}");
+    match petal_next {
+        Some(next) => println!("Ceremony expires in {remaining}s. {next}"),
+        None => println!("Ceremony expires in {remaining}s; re-run this confirm after approving."),
     }
 }
 
@@ -3626,7 +3680,10 @@ async fn run(cli: Cli) -> Result<()> {
 
     if cli.version {
         let client_protocol = IpcProtocolRange::supported();
-        println!("bloom {}", env!("CARGO_PKG_VERSION"));
+        // Build every line before writing: the daemon round trip must not sit
+        // between writes, or a reader that closes early (`| head -1`) turns
+        // the next write into a broken-pipe panic.
+        let mut out = format!("bloom {}\n", env!("CARGO_PKG_VERSION"));
         match IpcClient::new(&client_endpoint.socket)
             .call_with_protocol("version", serde_json::Value::Null)
             .await
@@ -3636,25 +3693,32 @@ async fn run(cli: Cli) -> Result<()> {
                     .result
                     .as_str()
                     .context("daemon version response is not a string")?;
-                println!("bloom-daemon {daemon_version}");
-                println!(
-                    "bloom-ipc {} (compatible; cli {}, daemon {})",
+                out.push_str(&format!(
+                    "bloom-daemon {daemon_version}\n\
+                     bloom-ipc {} (compatible; cli {}, daemon {})\n",
                     reply.negotiated_protocol, client_protocol, reply.daemon_protocol
-                );
+                ));
             }
             Err(IpcClientError::Transport(_)) => {
-                println!("bloom-daemon unavailable");
-                println!("bloom-ipc {client_protocol} (not negotiated)");
+                out.push_str(&format!(
+                    "bloom-daemon unavailable\nbloom-ipc {client_protocol} (not negotiated)\n"
+                ));
             }
             Err(IpcClientError::Incompatible { client, daemon }) => {
-                println!("bloom-daemon incompatible");
-                println!("bloom-ipc incompatible (cli {client}, daemon {daemon})");
+                out.push_str(&format!(
+                    "bloom-daemon incompatible\n\
+                     bloom-ipc incompatible (cli {client}, daemon {daemon})\n"
+                ));
             }
             Err(error) => {
-                println!("bloom-daemon incompatible");
-                println!("bloom-ipc {client_protocol} (not negotiated: {error})");
+                out.push_str(&format!(
+                    "bloom-daemon incompatible\n\
+                     bloom-ipc {client_protocol} (not negotiated: {error})\n"
+                ));
             }
         }
+        write_ignoring_closed_reader(std::io::stdout().lock(), &out)
+            .context("write version to stdout")?;
         return Ok(());
     }
 
@@ -4132,6 +4196,7 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Wallet(WalletCmd::Stage {
             wallet,
             chain,
+            account,
             intent,
         }) => {
             let body = match intent {
@@ -4142,7 +4207,7 @@ async fn run(cli: Cli) -> Result<()> {
                     buf
                 }
             };
-            let path = format!("/wallets/{wallet}/0/chains/{chain}/outbox/new.tx");
+            let path = format!("/wallets/{wallet}/{account}/chains/{chain}/outbox/new.tx");
             let client = IpcClient::new(&client_endpoint.socket);
             let projection = try_ipc(
                 &client,
@@ -4151,7 +4216,7 @@ async fn run(cli: Cli) -> Result<()> {
                 serde_json::json!({
                     "path": path,
                     "bytes_b64": B64.encode(body.as_bytes()),
-                    "projection_path": format!("/wallets/{wallet}/0/chains/{chain}/outbox/latest"),
+                    "projection_path": format!("/wallets/{wallet}/{account}/chains/{chain}/outbox/latest"),
                 }),
             )
             .await
@@ -4171,9 +4236,11 @@ async fn run(cli: Cli) -> Result<()> {
             wallet,
             chain,
             id,
+            account,
             text,
         }) => {
-            let path = format!("/wallets/{wallet}/0/chains/{chain}/outbox/pending/{id}/confirm");
+            let path =
+                format!("/wallets/{wallet}/{account}/chains/{chain}/outbox/pending/{id}/confirm");
             let is_cancel = text.trim().eq_ignore_ascii_case("cancel");
             let body = text.into_bytes();
             let client = IpcClient::new(&client_endpoint.socket);
@@ -4193,17 +4260,18 @@ async fn run(cli: Cli) -> Result<()> {
             // "not found". Only those two expected outcomes are translated
             // into the durable entry's truth; every other failure surfaces,
             // with the entry's projection offered as context only.
-            let projection = confirm_projection(&client_endpoint, &wallet, &chain, &id).await;
+            let projection =
+                confirm_projection(&client_endpoint, &wallet, account, &chain, &id).await;
             match (outcome, &projection) {
-                (Err((code, _)), Some(ConfirmProjection::Ceremony { url, expires_at_ms }))
-                    if code == IPC_ERR_PERMISSION_DENIED =>
-                {
-                    let remaining = expires_at_ms.saturating_sub(unix_now_ms());
-                    println!("Approval required: open {url}");
-                    println!(
-                        "Ceremony expires in {}s; re-run this confirm after approving.",
-                        remaining / 1000
-                    );
+                (
+                    Err((code, _)),
+                    Some(ConfirmProjection::Ceremony {
+                        url,
+                        expires_at_ms,
+                        petal_next,
+                    }),
+                ) if code == IPC_ERR_PERMISSION_DENIED => {
+                    print_approval_pending(url, *expires_at_ms, petal_next.as_deref());
                     // Nothing is signed or broadcast yet, so exit 0 would tell
                     // a script the transaction went out.
                     EXIT_CODE_OVERRIDE
@@ -4214,7 +4282,7 @@ async fn run(cli: Cli) -> Result<()> {
                     if code == IPC_ERR_NOT_FOUND && !is_cancel =>
                 {
                     println!("Already broadcast: {tx_hash}");
-                    println!("Entry: wallets/{wallet}/0/chains/{chain}/outbox/sent/{id}");
+                    println!("Entry: wallets/{wallet}/{account}/chains/{chain}/outbox/sent/{id}");
                     Ok(())
                 }
                 (Err((_, error)), Some(context)) => {
@@ -4230,13 +4298,15 @@ async fn run(cli: Cli) -> Result<()> {
                     "ipc wallet confirm via {}",
                     client_endpoint.display
                 ))),
-                (Ok(_), Some(ConfirmProjection::Ceremony { url, expires_at_ms })) => {
-                    let remaining = expires_at_ms.saturating_sub(unix_now_ms());
-                    println!("Approval required: open {url}");
-                    println!(
-                        "Ceremony expires in {}s; re-run this confirm after approving.",
-                        remaining / 1000
-                    );
+                (
+                    Ok(_),
+                    Some(ConfirmProjection::Ceremony {
+                        url,
+                        expires_at_ms,
+                        petal_next,
+                    }),
+                ) => {
+                    print_approval_pending(url, *expires_at_ms, petal_next.as_deref());
                     EXIT_CODE_OVERRIDE
                         .store(EXIT_APPROVAL_PENDING, std::sync::atomic::Ordering::SeqCst);
                     Ok(())
@@ -4247,7 +4317,7 @@ async fn run(cli: Cli) -> Result<()> {
                         "entry already broadcast; use wallet cancel for an on-chain replacement"
                     );
                     println!("Broadcast: {tx_hash}");
-                    println!("Entry: wallets/{wallet}/0/chains/{chain}/outbox/sent/{id}");
+                    println!("Entry: wallets/{wallet}/{account}/chains/{chain}/outbox/sent/{id}");
                     Ok(())
                 }
                 (Ok(_), None) => {
@@ -4255,7 +4325,7 @@ async fn run(cli: Cli) -> Result<()> {
                         println!("Discarded entry {id}.");
                     } else {
                         println!(
-                            "Confirmed; no broadcast result recorded yet. Inspect wallets/{wallet}/0/chains/{chain}/outbox/"
+                            "Confirmed; no broadcast result recorded yet. Inspect wallets/{wallet}/{account}/chains/{chain}/outbox/"
                         );
                         // An accepted cancel is done; an unrecorded broadcast
                         // is not, and a script must be able to tell.
@@ -4268,6 +4338,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Wallet(WalletCmd::Cancel {
             wallet,
+            account,
             chain,
             id,
             text,
@@ -4276,6 +4347,7 @@ async fn run(cli: Cli) -> Result<()> {
                 &client_endpoint,
                 MachineCommand::WalletOutboxCancel {
                     wallet,
+                    account,
                     chain,
                     id,
                     text,
@@ -4285,6 +4357,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Wallet(WalletCmd::Replace {
             wallet,
+            account,
             chain,
             id,
             intent,
@@ -4301,6 +4374,7 @@ async fn run(cli: Cli) -> Result<()> {
                 &client_endpoint,
                 MachineCommand::WalletOutboxReplace {
                     wallet,
+                    account,
                     chain,
                     id,
                     intent: body,
@@ -4308,14 +4382,24 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
         }
-        Cmd::Wallet(WalletCmd::ConfirmBatch { wallet, txs, text }) => {
+        Cmd::Wallet(WalletCmd::ConfirmBatch {
+            wallet,
+            account,
+            txs,
+            text,
+        }) => {
             if txs.is_empty() {
                 bail!("confirm-batch needs at least one tx ref like base:0001-abc");
             }
             for tx in &txs {
                 let _ = parse_batch_tx_ref(tx)?;
             }
-            let request = bloom_daemon::ipc::BatchConfirmIpcRequest { wallet, txs, text };
+            let request = bloom_daemon::ipc::BatchConfirmIpcRequest {
+                wallet,
+                account,
+                txs,
+                text,
+            };
             let client = IpcClient::new(&client_endpoint.socket);
             let result = try_ipc(
                 &client,
@@ -5441,12 +5525,13 @@ mod tests {
             .mount("wallets", handler.clone())
             .build();
 
-        execute_wallet_outbox_action(&vfs, "alice", "base", "tx-1", "cancel", b"approve")
+        execute_wallet_outbox_action(&vfs, "alice", 7, "base", "tx-1", "cancel", b"approve")
             .await
             .unwrap();
         execute_wallet_outbox_action(
             &vfs,
             "alice",
+            7,
             "base",
             "tx-1",
             "replace",
@@ -5459,11 +5544,11 @@ mod tests {
             *handler.0.lock().unwrap(),
             vec![
                 (
-                    "/alice/0/chains/base/outbox/pending/tx-1/cancel".into(),
+                    "/alice/7/chains/base/outbox/pending/tx-1/cancel".into(),
                     b"approve".to_vec(),
                 ),
                 (
-                    "/alice/0/chains/base/outbox/pending/tx-1/replace".into(),
+                    "/alice/7/chains/base/outbox/pending/tx-1/replace".into(),
                     b"replacement intent".to_vec(),
                 ),
             ]
@@ -5473,6 +5558,24 @@ mod tests {
     #[tokio::test]
     async fn daemon_owned_wallet_outbox_actions_reject_path_shaping_params() {
         let vfs = bloom_vfs::Vfs::new();
+        let error = execute_wallet_outbox_action(
+            &vfs,
+            "alice",
+            1_u32 << 31,
+            "base",
+            "tx-1",
+            "cancel",
+            b"approve",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<bloom_daemon::ipc::MachineError>()
+                .unwrap()
+                .kind,
+            bloom_daemon::ipc::MachineErrorKind::InvalidParams,
+        );
         for invalid in ["bad/segment", "bad\\segment", "bad\0segment"] {
             for (wallet, chain, id) in [
                 (invalid, "base", "tx-1"),
@@ -5480,7 +5583,7 @@ mod tests {
                 ("alice", "base", invalid),
             ] {
                 let error =
-                    execute_wallet_outbox_action(&vfs, wallet, chain, id, "cancel", b"approve")
+                    execute_wallet_outbox_action(&vfs, wallet, 0, chain, id, "cancel", b"approve")
                         .await
                         .unwrap_err();
                 let error = error
@@ -6452,5 +6555,61 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("unix:/restricted/bloom.sock"), "{message}");
         assert!(message.contains("bloom serve"), "{message}");
+    }
+}
+
+/// Writes CLI output, treating a reader that has already closed the pipe
+/// (`bloom --version | head -1`) as a normal end of output rather than an
+/// error.
+fn write_ignoring_closed_reader(mut out: impl std::io::Write, text: &str) -> std::io::Result<()> {
+    match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        result => result,
+    }
+}
+
+#[cfg(test)]
+mod closed_reader_tests {
+    use super::write_ignoring_closed_reader;
+    use std::io::{self, Write};
+
+    struct ClosedReader;
+
+    impl Write for ClosedReader {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct Failing;
+
+    impl Write for Failing {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::PermissionDenied.into())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_closed_reader_ends_output_quietly() {
+        write_ignoring_closed_reader(ClosedReader, "bloom 0.5.1\n").unwrap();
+    }
+
+    #[test]
+    fn other_write_errors_still_surface() {
+        let error = write_ignoring_closed_reader(Failing, "bloom 0.5.1\n").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn output_is_written_whole() {
+        let mut buffer = Vec::new();
+        write_ignoring_closed_reader(&mut buffer, "a\nb\n").unwrap();
+        assert_eq!(buffer, b"a\nb\n");
     }
 }

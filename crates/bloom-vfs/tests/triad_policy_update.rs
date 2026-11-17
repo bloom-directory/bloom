@@ -1150,3 +1150,70 @@ async fn petal_eligibility_recovers_lost_prepare_and_commits_after_restart() {
         1
     );
 }
+
+fn prepare_count(fixture: &BrokerFixture) -> usize {
+    fixture
+        .requests
+        .lock()
+        .iter()
+        .filter(|r| matches!(r, MachineBrokerRequest::PolicyValidateUpdate(_)))
+        .count()
+}
+
+#[tokio::test]
+async fn expired_petal_policy_approval_is_replaced_on_retry() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(false);
+    let hash = Digest32::from_bytes([7; 32]);
+    let handler = eligibility_handler(temp.path(), fixture.clone());
+    let PetalEligibility::AwaitingPolicyApproval(first) = handler
+        .ensure_petal_eligibility("alice", &hash)
+        .await
+        .unwrap()
+    else {
+        panic!("owner approval must be required");
+    };
+
+    // Broker's status sweep retired the unsigned ceremony at its expiry.
+    *fixture.ceremony_state_override.lock() = Some(CeremonyState::Expired);
+    let PetalEligibility::AwaitingPolicyApproval(replacement) = handler
+        .ensure_petal_eligibility("alice", &hash)
+        .await
+        .unwrap()
+    else {
+        panic!("an expired approval must be replaced");
+    };
+    assert_ne!(replacement.operation_id, first.operation_id);
+    assert!(replacement.prepare.is_some());
+    assert_eq!(prepare_count(&fixture), 2);
+    let updates = temp
+        .path()
+        .join("machine-policy-projections/alice/policy-updates");
+    assert!(
+        updates
+            .join("failed")
+            .join(first.operation_id.as_str())
+            .exists()
+    );
+
+    // The replacement is usable: once approved, the retry commits it.
+    *fixture.ceremony_state_override.lock() = None;
+    fixture.complete.store(true, Ordering::SeqCst);
+    let PetalEligibility::Allowed(snapshot) = handler
+        .ensure_petal_eligibility("alice", &hash)
+        .await
+        .unwrap()
+    else {
+        panic!("the approved replacement must commit");
+    };
+    assert_eq!(
+        snapshot.canonical_policy.decode(),
+        serde_jcs::to_vec(&policy_with_package(&policy(60_000), &hash)).unwrap()
+    );
+    assert!(
+        updates
+            .join("confirmed")
+            .join(replacement.operation_id.as_str())
+            .exists()
+    );
+}
