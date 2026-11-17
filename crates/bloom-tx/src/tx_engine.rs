@@ -3231,7 +3231,17 @@ impl TxEngine {
                 returned_hash: Some(returned),
             })
         } else {
-            let returned = chain.send_raw(signed.raw.clone()).await?;
+            let returned = match chain.send_raw(signed.raw.clone()).await {
+                Ok(returned) => returned,
+                // The node may have taken the transaction and lost only its
+                // answer. When the chain knows these exact bytes' hash, the
+                // send happened: report it as sent, not as an unknown error
+                // the caller has to investigate.
+                Err(error) => match chain_knows_tx(chain, signed.hash).await {
+                    Ok(true) => signed.hash,
+                    _ => return Err(error.into()),
+                },
+            };
             if returned != signed.hash {
                 return Err(TxEngineError::BroadcastHashMismatch {
                     expected: format!("{:#x}", signed.hash),
@@ -11600,6 +11610,74 @@ mod tests {
             }
             other => panic!("expected StateMismatch, got {other:?}"),
         }
+    }
+
+    /// The node takes a send but its answer is lost. When the chain knows the
+    /// signed hash, the confirm reports the entry sent instead of an error
+    /// the caller has to investigate (bench task erc20-transfer-recovery).
+    #[tokio::test]
+    async fn a_send_whose_answer_is_lost_but_that_landed_is_sent() {
+        let receipt = serde_json::json!({
+            "transactionHash": format!("{:#x}", alloy::primitives::B256::repeat_byte(7)),
+            "transactionIndex": "0x0",
+            "blockHash": format!("{:#x}", alloy::primitives::B256::repeat_byte(9)),
+            "blockNumber": "0x5",
+            "from": TEST_SIGNER_ADDRESS,
+            "to": "0x0000000000000000000000000000000000000002",
+            "cumulativeGasUsed": "0x5208",
+            "gasUsed": "0x5208",
+            "contractAddress": null,
+            "logs": [],
+            "logsBloom": format!("0x{}", "00".repeat(256)),
+            "status": "0x1",
+            "effectiveGasPrice": "0x1",
+            "type": "0x2"
+        });
+        let lost = r#"error:{"code":-32000,"message":"upstream response lost; submission status unknown"}"#;
+        let url = spawn_queued_rpc(HashMap::from([
+            (
+                "eth_chainId".to_string(),
+                vec!["\"0x7a69\"".to_string(); 20],
+            ),
+            ("eth_call".into(), vec!["\"0x\"".into(); 20]),
+            ("eth_getTransactionCount".into(), vec!["\"0x0\"".into(); 20]),
+            ("eth_sendRawTransaction".into(), vec![lost.into()]),
+            ("eth_getTransactionByHash".into(), vec!["null".into(); 20]),
+            (
+                "eth_getTransactionReceipt".into(),
+                vec![receipt.to_string(); 20],
+            ),
+        ]))
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let (engine, fixture, _) = triad_batch_fixture(outbox.clone(), false, false);
+        let permit = permit_for(&directory);
+        let chain = stage_chain(&url);
+        let policy = Policy::default();
+        let mut staged = fake_staged_1559("lost-answer");
+        staged.created_ms = now_ms();
+        outbox.write_pending(&staged, "p").unwrap();
+        let confirm = || {
+            engine.confirm(
+                &permit,
+                "alice",
+                "anvil",
+                "lost-answer",
+                &chain,
+                &policy,
+                policy.override_sentinel(),
+            )
+        };
+        assert!(matches!(
+            confirm().await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        fixture.active.store(true, Ordering::SeqCst);
+        let sent = confirm().await.unwrap();
+        assert!(sent.tx_hash.is_some());
+        let entry = outbox.read("alice", "anvil", "lost-answer").unwrap();
+        assert_eq!(entry.state, OutboxState::Sent);
     }
 
     /// A confirm interrupted after its broadcast marker recovers through

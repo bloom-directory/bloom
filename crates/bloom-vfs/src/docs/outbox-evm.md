@@ -14,7 +14,8 @@ That stages it and asks the owner; their approval link is in the error, or
 on a mount in `latest/plan.md`. `latest/` is that entry, before and after it
 is sent: `latest/plan.md` is what will be signed, writing `y` to
 `latest/confirm` waits for the approval, sends, and answers with the receipt
-of each entry it sent (on a mount, read `latest/receipt.json`). `new.tx` takes the same body and only
+of each entry it sent and the account's balances on that chain (on a mount,
+read `latest/receipt.json`). `new.tx` takes the same body and only
 stages it; `cancel` written to `latest/confirm` discards an entry.
 
 Several bodies in one write, one per line, go under one approval, in order (an

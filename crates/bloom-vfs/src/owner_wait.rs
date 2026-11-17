@@ -223,7 +223,32 @@ async fn sent_report(vfs: &Vfs, path: &VfsPath, entries: &[String]) -> Option<St
             }
         });
     }
+    // What the account holds now on that chain, so the caller need not check
+    // a swap's or supply's result with separate balance reads.
+    let chain = entries.first().and_then(|entry| entry.split_once(':'))?.0;
+    if let Some(balances) = balances(vfs, root, wallet, number, chain).await {
+        lines.push(format!("{chain} balances now: {balances}"));
+    }
     Some(lines.join("\n"))
+}
+
+/// The account's balances on `chain` from its `holdings.json`, as one line.
+async fn balances(
+    vfs: &Vfs,
+    root: &str,
+    wallet: &str,
+    number: &str,
+    chain: &str,
+) -> Option<String> {
+    let path = VfsPath::parse(&format!("/{root}/{wallet}/{number}/holdings.json")).ok()?;
+    let holdings: Value = serde_json::from_slice(&vfs.read(&path).await.ok()?).ok()?;
+    let held: Vec<&str> = holdings["holdings"]
+        .as_array()?
+        .iter()
+        .filter(|holding| holding["chain"] == chain)
+        .filter_map(|holding| holding["display"].as_str())
+        .collect();
+    (!held.is_empty()).then(|| held.join(", "))
 }
 
 /// The batch a `confirm-batch` file reports as waiting for the owner:
@@ -567,6 +592,7 @@ mod tests {
                     br#"{"outcome":"success","tx_hash":"0xaa","block_number":7,"revert_reason":null}"#.to_vec()
                 }
                 "/w/0/chains/base/outbox/sent/tx-2/tx_hash" => b"0xbb\n".to_vec(),
+                "/w/0/holdings.json" => br#"{"holdings":[{"chain":"base","display":"1.5 ETH"},{"chain":"arc","display":"9 USDC"},{"chain":"base","display":"20 USDC"}]}"#.to_vec(),
                 other => return Err(HandlerError::not_found(other)),
             })
         }
@@ -587,7 +613,8 @@ mod tests {
             sent.ok().flatten().as_deref(),
             Some(
                 "tx-1: {\"outcome\":\"success\",\"tx_hash\":\"0xaa\",\"block_number\":7,\"revert_reason\":null}\n\
-                 tx-2: broadcast tx 0xbb; receipt not recorded yet: wallets/w/0/chains/base/outbox/sent/tx-2/receipt.json"
+                 tx-2: broadcast tx 0xbb; receipt not recorded yet: wallets/w/0/chains/base/outbox/sent/tx-2/receipt.json\n\
+                 base balances now: 1.5 ETH, 20 USDC"
             )
         );
         let cancelled = write(&vfs, &path, b"cancel", wait, &|| false, true).await;
