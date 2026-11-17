@@ -4898,7 +4898,7 @@ summary = "Demo app used by IPC tests."
         );
         let write = json!({"path": "/wallets/w/0/chains/base/outbox/send.tx", "bytes_b64": B64.encode("send 1 ETH to 0x01")});
         let context = IpcOperationContext::detached();
-        let Err(WriteError::Approval(message)) = server.do_write(&write, &context).await else {
+        let Ok(Some(message)) = server.do_write(&write, &context).await else {
             panic!("send.tx must report the approval link");
         };
         assert!(

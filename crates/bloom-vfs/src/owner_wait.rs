@@ -116,7 +116,22 @@ pub async fn write(
                     .map(|(_, id)| id.to_owned())
                     .or_else(|| challenge.rsplit('/').nth(1).map(str::to_owned))
                     .unwrap_or_default();
+                let entries: Vec<String> = url
+                    .as_ref()
+                    .and_then(|doc| doc["entries"].as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| entry.as_str().map(str::to_owned))
+                    .collect();
                 let url = url.and_then(|doc| doc["ceremony_url"].as_str().map(str::to_owned));
+                // Staging is not a failure: answer with what will be signed,
+                // so the caller need not read each plan before confirming.
+                if report && let Some(url) = &url {
+                    let plans = staged_plans(vfs, path, &entries).await;
+                    return Ok(Some(format!(
+                        "{plans}Staged; owner approval{staged}: {url} . Write y to pending/{id}/confirm: it waits for their approval, then sends."
+                    )));
+                }
                 Err(match url {
                     Some(url) => WriteError::Approval(format!(
                         "permission denied: owner approval required{staged}: {url} . Write y to pending/{id}/confirm: it waits for their approval, then sends."
@@ -186,6 +201,27 @@ pub async fn write(
         return Ok(None);
     }
     Ok(sent_report(vfs, path, &sending).await)
+}
+
+/// Each staged `chain:id` entry's `plan.md`, up to its confirm instructions.
+async fn staged_plans(vfs: &Vfs, path: &VfsPath, entries: &[String]) -> String {
+    let [root, wallet, number, ..] = path.segments() else {
+        return String::new();
+    };
+    let mut plans = String::new();
+    for (chain, id) in entries.iter().filter_map(|entry| entry.split_once(':')) {
+        let plan = format!("/{root}/{wallet}/{number}/chains/{chain}/outbox/pending/{id}/plan.md");
+        let Some(plan) = VfsPath::parse(&plan).ok() else {
+            continue;
+        };
+        if let Ok(raw) = vfs.read(&plan).await {
+            let text = String::from_utf8_lossy(&raw);
+            let shown = text.split("\n## Confirm").next().unwrap_or_default();
+            plans.push_str(shown.trim_end());
+            plans.push_str("\n\n");
+        }
+    }
+    plans
 }
 
 /// One line per `chain:id` entry: its receipt, or where it is when it has
@@ -621,6 +657,52 @@ mod tests {
         assert_eq!(cancelled.ok().flatten(), None);
         let mounted = write(&vfs, &path, b"y", wait, &|| false, false).await;
         assert_eq!(mounted.ok().flatten(), None);
+    }
+
+    /// `send.tx` stages one entry and asks the owner.
+    struct Staging;
+
+    #[async_trait::async_trait]
+    impl Handler for Staging {
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            Ok(Entry::file(p.segments().last().unwrap()))
+        }
+        async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            Ok(match p.to_string_path().as_str() {
+                "/w/0/chains/base/outbox/pending/tx-1/approval_challenge.json" => {
+                    br#"{"ceremony_url":"http://localhost/c/1","entries":["base:tx-1"]}"#.to_vec()
+                }
+                "/w/0/chains/base/outbox/pending/tx-1/plan.md" => {
+                    b"# Staged tx tx-1\n\nTo: 0xabc\n\n## Confirm\nWrite y\n".to_vec()
+                }
+                other => return Err(HandlerError::not_found(other)),
+            })
+        }
+        async fn write(&self, _p: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+            Err(HandlerError::ApprovalPending(
+                "wallets/w/0/chains/base/outbox/pending/tx-1/approval_challenge.json".into(),
+            ))
+        }
+    }
+
+    /// Staging answers with the plan and the link instead of an error, so the
+    /// caller confirms next without reading the plan; a mount still gets the
+    /// refusal it reports.
+    #[tokio::test]
+    async fn staging_answers_with_the_plan_and_the_link() {
+        let vfs = Vfs::builder().mount("wallets", Arc::new(Staging)).build();
+        let path = VfsPath::parse("/wallets/w/0/chains/base/outbox/send.tx").unwrap();
+        let wait = Duration::from_secs(50);
+        let staged = write(&vfs, &path, b"send 1 ETH to 0xabc", wait, &|| false, true).await;
+        assert_eq!(
+            staged.ok().flatten().as_deref(),
+            Some(
+                "# Staged tx tx-1\n\nTo: 0xabc\n\nStaged; owner approval: http://localhost/c/1 . \
+                 Write y to pending/tx-1/confirm: it waits for their approval, then sends."
+            )
+        );
+        let mounted = write(&vfs, &path, b"send 1 ETH to 0xabc", wait, &|| false, false).await;
+        assert!(matches!(mounted, Err(WriteError::Approval(_))));
     }
 
     /// The first policy write answers with the link at once; the repeat
