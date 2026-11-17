@@ -5486,8 +5486,42 @@ async fn render_next_actions_with_timeout(
     md.into_bytes()
 }
 
+/// The account's nonzero balances, as ` (now: 1.5 ETH on base, ...)`, or
+/// nothing when `holdings.json` cannot be read in time.
+async fn held_now(tree: &dyn Handler, wallet: &str, account: &str, limit: Duration) -> String {
+    let Ok(path) = VfsPath::parse(&format!("/{wallet}/{account}/holdings.json")) else {
+        return String::new();
+    };
+    let read = tokio::time::timeout(limit.min(Duration::from_secs(3)), tree.read(&path)).await;
+    let Some(holdings) = read
+        .ok()
+        .and_then(Result::ok)
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    else {
+        return String::new();
+    };
+    let held: Vec<String> = holdings["holdings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|h| h["raw"].as_str() != Some("0"))
+        .filter_map(|h| {
+            Some(format!(
+                "{} on {}",
+                h["display"].as_str()?,
+                h["chain"].as_str()?
+            ))
+        })
+        .collect();
+    if held.is_empty() {
+        String::new()
+    } else {
+        format!(" (now: {})", held.join(", "))
+    }
+}
+
 /// Where each account's balances and outboxes are, so a reader of `next.md`
-/// has real paths without listing the tree first.
+/// has real paths and balances without listing the tree first.
 async fn render_wallet_paths(
     wallet_tree: &dyn Handler,
     wallet_ids: &[String],
@@ -5526,8 +5560,9 @@ async fn render_wallet_paths(
             if chains.is_empty() {
                 continue;
             }
+            let held = held_now(wallet_tree, wallet, account, live_timeout).await;
             lines.push_str(&format!(
-                "- `{wallet}` account `{account}`: balances `wallets/{wallet}/{account}/holdings.json`; outbox `wallets/{wallet}/{account}/chains/<chain>/outbox/` on {}\n",
+                "- `{wallet}` account `{account}`: balances `wallets/{wallet}/{account}/holdings.json`{held}; outbox `wallets/{wallet}/{account}/chains/<chain>/outbox/` on {}\n",
                 chains.join(", ")
             ));
         }
@@ -6475,6 +6510,26 @@ mod tests {
         let text = render_wallet_paths(&tree, &["alice".to_owned()], Duration::from_secs(1)).await;
         assert!(text.contains("`alice` account `0`"), "{text}");
         assert!(text.contains("and 2 more; list `wallets/alice/`"), "{text}");
+    }
+
+    /// An account's line carries its nonzero balances, so a reader need not
+    /// open holdings.json before acting.
+    #[tokio::test]
+    async fn next_md_shows_what_each_account_holds() {
+        let tree = WalletTreeFixture {
+            dirs: [("alice", vec!["0"]), ("alice/0/chains", vec!["base"])].into(),
+            files: [(
+                "alice/0/holdings.json",
+                r#"{"holdings":[{"chain":"base","raw":"15","display":"1.5 ETH"},{"chain":"base","raw":"0","display":"0 USDC"}]}"#,
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let text = render_wallet_paths(&tree, &["alice".to_owned()], Duration::from_secs(1)).await;
+        assert!(
+            text.contains("holdings.json` (now: 1.5 ETH on base);"),
+            "{text}"
+        );
     }
 
     fn alice_tree() -> WalletTreeFixture {
