@@ -42,7 +42,7 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT INT TERM
-bash "$repo_root/scripts/triad-dev-launch.sh" --services-only --retain-temporary-files \
+bash "$repo_root/scripts/triad-dev-launch.sh" --services-only --no-checkout --retain-temporary-files \
   --developer-root "$run_root" --machine-socket "$run_root/m.sock" \
   --log-dir "$run_root/logs" --ready-file "$run_root/ready" \
   --ceremony-port "$(free_port)" --remote-upstream-port "$(free_port)" \
