@@ -438,11 +438,7 @@ impl WalletsHandler {
     /// What `confirm-batch` reads as: the last batch's status, or how to
     /// write one.
     fn batch_status(&self, wallet: &str, number: u32) -> Vec<u8> {
-        let stored = self
-            .batch_results
-            .lock()
-            .get(&(wallet.to_owned(), number))
-            .and_then(|batches| batches.last().cloned());
+        let stored = self.batches(wallet, number).last().cloned();
         match stored {
             Some(stored) => self.batch_view(wallet, stored),
             None => CONFIRM_BATCH_HELP.as_bytes().to_vec(),
@@ -489,12 +485,7 @@ impl WalletsHandler {
         number: u32,
         entry: &str,
     ) -> Option<(Vec<String>, serde_json::Value)> {
-        let batches = self
-            .batch_results
-            .lock()
-            .get(&(wallet.to_owned(), number))
-            .cloned()
-            .unwrap_or_default();
+        let batches = self.batches(wallet, number);
         batches.into_iter().rev().find_map(|stored| {
             let status: serde_json::Value =
                 serde_json::from_slice(&self.batch_view(wallet, stored)).ok()?;
@@ -592,6 +583,8 @@ impl WalletsHandler {
         text.push(b'\n');
         // This result replaces its batch's earlier one and becomes the
         // latest; of the rest, only batches still waiting are kept.
+        // Loads a record saved before a restart, if there is one.
+        self.batches(wallet, number);
         let mut results = self.batch_results.lock();
         let batches = results.entry((wallet.to_owned(), number)).or_default();
         batches.retain(|stored| {
@@ -599,7 +592,59 @@ impl WalletsHandler {
             stored["status"] == "awaiting_ceremony" && stored["entries"] != status["entries"]
         });
         batches.push(text);
+        // Kept on disk too: after a Machine restart, a batch the owner is
+        // still approving must continue, not open a second approval. Saved
+        // under the lock, so concurrent batches save in order.
+        if let Some(file) = self.batches_file(wallet, number) {
+            let saved: Vec<serde_json::Value> = batches
+                .iter()
+                .filter_map(|stored| serde_json::from_slice(stored).ok())
+                .collect();
+            if let Err(error) = serde_json::to_vec(&saved)
+                .map_err(err_be)
+                .and_then(|bytes| write_atomic_file(&file, &bytes))
+            {
+                tracing::warn!(%wallet, number, %error, "confirm_batch.record_unsaved");
+            }
+        }
+        drop(results);
         result
+    }
+
+    /// Where an account's `confirm-batch` record is kept, beside its outbox.
+    fn batches_file(&self, wallet: &str, number: u32) -> Option<std::path::PathBuf> {
+        let dir = self
+            .tx_engine
+            .outbox
+            .wallet_chain_dir(wallet, CONFIRM_BATCH)
+            .ok()?;
+        Some(dir.with_file_name(format!(".{CONFIRM_BATCH}-{number}.json")))
+    }
+
+    /// An account's `confirm-batch` results, oldest first, loaded from disk
+    /// the first time after a restart.
+    fn batches(&self, wallet: &str, number: u32) -> Vec<Vec<u8>> {
+        let key = (wallet.to_owned(), number);
+        if let Some(batches) = self.batch_results.lock().get(&key) {
+            return batches.clone();
+        }
+        let loaded: Vec<Vec<u8>> = self
+            .batches_file(wallet, number)
+            .and_then(|file| std::fs::read(file).ok())
+            .and_then(|raw| serde_json::from_slice::<Vec<serde_json::Value>>(&raw).ok())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|status| {
+                let mut text = serde_json::to_vec_pretty(status).ok()?;
+                text.push(b'\n');
+                Some(text)
+            })
+            .collect();
+        self.batch_results
+            .lock()
+            .entry(key)
+            .or_insert(loaded)
+            .clone()
     }
 
     /// The key one of the [`ACCOUNT_KEY_FILES`] presents, or `None` when the
