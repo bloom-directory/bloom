@@ -84,8 +84,8 @@ pub(crate) const RENDER_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a repeated confirm on a mount waits for the owner. Shorter than
 /// the 50 s `bloom vfs` waits: the write holds an NFS request slot meanwhile.
 pub(crate) const OWNER_WAIT: Duration = Duration::from_secs(30);
-/// How many writes may wait for the owner at once, of the connection's 64
-/// request slots.
+/// How many writes may wait for the owner at once, and apart from them how
+/// many lookups may wait for a receipt, of the connection's 64 request slots.
 pub(crate) const OWNER_WAITERS: usize = 8;
 
 /// Directory snapshots bridge the GETATTR used to compute NFS's cookie
@@ -841,6 +841,9 @@ pub struct BloomFs {
     failed_writes: Arc<Mutex<LruCache<VfsPath, FailedWrite>>>,
     /// Bounds how many writes wait for the owner at once.
     owner_waiters: Arc<tokio::sync::Semaphore>,
+    /// Bounds how many lookups wait for a due receipt at once, apart from
+    /// the owner waits so a burst of lookups never refuses a confirm.
+    receipt_waiters: Arc<tokio::sync::Semaphore>,
 }
 
 /// A command write that the handler refused, kept for
@@ -867,6 +870,7 @@ impl BloomFs {
                 NonZeroUsize::new(FAILED_WRITE_CAPACITY).expect("capacity > 0"),
             ))),
             owner_waiters: Arc::new(tokio::sync::Semaphore::new(OWNER_WAITERS)),
+            receipt_waiters: Arc::new(tokio::sync::Semaphore::new(OWNER_WAITERS)),
         }
     }
 
@@ -1333,7 +1337,7 @@ impl FileSystem for BloomFs {
             Err(absent)
                 if bloom_vfs::owner_wait::receipt_is_due(&self.vfs, &child, &absent).await =>
             {
-                match self.owner_waiters.clone().try_acquire_owned() {
+                match self.receipt_waiters.clone().try_acquire_owned() {
                     Ok(_permit) => {
                         bloom_vfs::owner_wait::await_receipt(&self.vfs, &child, absent).await
                     }
@@ -2473,6 +2477,42 @@ mod tests {
             .await;
         assert_eq!(refused.unwrap_err(), FsError::AccessDenied);
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// A sent entry whose transaction is not mined: no receipt yet.
+    struct Unmined;
+
+    #[async_trait]
+    impl Handler for Unmined {
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            match p.segments().last().unwrap().as_str() {
+                "receipt.json" => Err(HandlerError::NotFound(p.to_string_path())),
+                leaf => Ok(Entry::writable_file(leaf)),
+            }
+        }
+    }
+
+    /// Owner waits and receipt waits have separate slots: with every owner
+    /// slot taken, a due receipt is still waited for.
+    #[tokio::test(start_paused = true)]
+    async fn a_receipt_wait_takes_no_owner_slot() {
+        let fs = BloomFs::new(Vfs::builder().mount("wallets", Arc::new(Unmined)).build());
+        let _held = fs
+            .owner_waiters
+            .clone()
+            .try_acquire_many_owned(OWNER_WAITERS as u32)
+            .unwrap();
+        let parent = BloomHandle::Path {
+            entry: Entry::dir("tx-1"),
+            path: VfsPath::parse("/wallets/w/0/chains/base/outbox/sent/tx-1").unwrap(),
+        };
+        let started = Instant::now();
+        let absent = fs.lookup(&fake_ctx(), &parent, "receipt.json").await;
+        assert_eq!(absent.unwrap_err(), FsError::NotFound);
+        assert!(
+            started.elapsed()
+                >= bloom_vfs::owner_wait::APPROVAL_POLL * bloom_vfs::owner_wait::RECEIPT_POLLS
+        );
     }
 
     #[test]

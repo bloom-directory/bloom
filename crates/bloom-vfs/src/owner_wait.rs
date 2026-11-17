@@ -52,11 +52,28 @@ fn confirm_challenge_path(path: &VfsPath) -> Option<VfsPath> {
     }
 }
 
+/// A write [`write`] may wait for the owner on.
+enum Waiting<'a> {
+    /// A wallet's `policy.json`, named by its wallet.
+    Policy(&'a str),
+    Batch,
+    /// A pending entry's confirm, with its approval challenge.
+    Confirm(VfsPath),
+}
+
+fn waiting(path: &VfsPath) -> Option<Waiting<'_>> {
+    match path.segments() {
+        [root, wallet, leaf] if root == "wallets" && leaf == "policy.json" => {
+            Some(Waiting::Policy(wallet))
+        }
+        [root, _, _, leaf] if root == "wallets" && leaf == "confirm-batch" => Some(Waiting::Batch),
+        _ => confirm_challenge_path(path).map(Waiting::Confirm),
+    }
+}
+
 /// Whether a write to `path` is one [`write`] may wait for the owner on.
 pub fn may_wait(path: &VfsPath) -> bool {
-    matches!(path.segments(), [root, _, leaf] if root == "wallets" && leaf == "policy.json")
-        || matches!(path.segments(), [root, _, _, leaf] if root == "wallets" && leaf == "confirm-batch")
-        || confirm_challenge_path(path).is_some()
+    waiting(path).is_some()
 }
 
 /// Write `bytes` to `path`, waiting for the owner where a repeat of the
@@ -68,17 +85,17 @@ pub async fn write(
     wait: Duration,
     cancelled: Cancelled<'_>,
 ) -> Result<(), WriteError> {
-    if let [root, wallet, leaf] = path.segments()
-        && root == "wallets"
-        && leaf == "policy.json"
-    {
-        return write_policy(vfs, wallet, path, bytes, wait, cancelled).await;
-    }
-    if matches!(path.segments(), [root, _, _, leaf] if root == "wallets" && leaf == "confirm-batch")
-    {
-        return write_batch_confirm(vfs, path, bytes, wait, cancelled).await;
-    }
-    let Some(challenge) = confirm_challenge_path(path) else {
+    let challenge = match waiting(path) {
+        Some(Waiting::Policy(wallet)) => {
+            return write_policy(vfs, wallet, path, bytes, wait, cancelled).await;
+        }
+        Some(Waiting::Batch) => {
+            return write_batch_confirm(vfs, path, bytes, wait, cancelled).await;
+        }
+        Some(Waiting::Confirm(challenge)) => Some(challenge),
+        None => None,
+    };
+    let Some(challenge) = challenge else {
         return match vfs.write(path, bytes).await {
             // `outbox/send.tx` stages and asks the owner in one write:
             // answer as a first confirm does, with the link.
