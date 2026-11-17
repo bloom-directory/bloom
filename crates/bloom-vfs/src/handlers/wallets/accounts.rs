@@ -1255,16 +1255,32 @@ impl WalletsHandler {
                 bodies.len()
             )));
         }
-        for body in bodies.iter().filter(|_| bodies.len() > 1) {
-            bloom_tx::intent_parser::parse(body)
-                .map_err(|e| HandlerError::invalid(format!("{e}; nothing was staged")))?;
+        for (n, body) in bodies.iter().enumerate().filter(|_| bodies.len() > 1) {
+            bloom_tx::intent_parser::parse(body).map_err(|e| {
+                HandlerError::invalid(format!(
+                    "line {} of {}: {e}; nothing was staged",
+                    n + 1,
+                    bodies.len()
+                ))
+            })?;
         }
-        for body in &bodies {
+        for (n, body) in bodies.iter().enumerate() {
             match self.stage_from(wallet, chain, from, policy, body).await {
                 Ok(id) => staged.push(id),
                 // A body the chain or policy refused: discard the ones
-                // before it, which were only ever meant to go together.
+                // before it, which were only ever meant to go together. The
+                // error names the line, so the fix is made to that one.
                 Err(error) => {
+                    let line = format!("line {} of {}: ", n + 1, bodies.len());
+                    let error = match error {
+                        HandlerError::Invalid(m) if bodies.len() > 1 => {
+                            HandlerError::invalid(format!("{line}{m}"))
+                        }
+                        HandlerError::Backend(m) if bodies.len() > 1 => {
+                            HandlerError::backend(format!("{line}{m}"))
+                        }
+                        error => error,
+                    };
                     return Err(self
                         .discard_staged(wallet, chain, from, policy, &staged, number, error)
                         .await);
@@ -1318,7 +1334,15 @@ impl WalletsHandler {
             }
         }
         if left.is_empty() {
-            return error;
+            return match error {
+                HandlerError::Invalid(m) if !staged.is_empty() => {
+                    HandlerError::invalid(format!("{m}; nothing was staged"))
+                }
+                HandlerError::Backend(m) if !staged.is_empty() => {
+                    HandlerError::backend(format!("{m}; nothing was staged"))
+                }
+                error => error,
+            };
         }
         HandlerError::backend(format!(
             "{error}; still staged, cancel before retrying: {}",

@@ -10543,6 +10543,35 @@ value = "0""#,
         assert!(pending.is_empty(), "{pending:?}");
     }
 
+    /// A line refused while staging is named, and the lines staged before it
+    /// are discarded, so the fix is made to that line and the write repeated.
+    #[tokio::test]
+    async fn a_batch_line_refused_while_staging_is_named() {
+        let f = make_handler_with_chain(true);
+        let (projection, _evm0, _evm1) = two_account_projection(&f);
+        let mut handler = f.handler.clone();
+        handler.wallet_projections = Some(projection);
+        let to = "0x0000000000000000000000000000000000000002";
+        let body = format!(
+            "{{\"kind\":\"send\",\"to\":\"{to}\",\"value\":\"1 wei\"}}\n{{\"kind\":\"raw\",\"to\":\"{to}\",\"data\":\"0xabc\",\"value\":\"0\"}}\n"
+        );
+        let send = vfs(format!("/{}/0/chains/anvil/outbox/send.tx", f.wallet_name));
+        let error = handler.write(&send, body.as_bytes()).await.unwrap_err();
+        let error = error.to_string();
+        assert!(
+            error.contains("line 2 of 2: ")
+                && error.contains("two digits per byte")
+                && error.ends_with("nothing was staged"),
+            "{error}"
+        );
+        let pending = handler
+            .tx_engine
+            .outbox
+            .list(&f.wallet_name, "anvil", OutboxState::Pending)
+            .unwrap();
+        assert!(pending.is_empty(), "{pending:?}");
+    }
+
     /// `send.tx` is refused before staging when any body names another
     /// account, or when there are more bodies than one approval covers.
     #[tokio::test]
