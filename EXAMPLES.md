@@ -153,7 +153,7 @@ cat <<'JSON' > /bloom/simulate/new
 }
 JSON
 
-cat /bloom/simulate/latest/result.json
+cat /bloom/simulate/latest/simulation.json
 cat /bloom/simulate/latest/plan.md
 ```
 

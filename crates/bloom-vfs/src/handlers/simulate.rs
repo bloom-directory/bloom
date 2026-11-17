@@ -1271,6 +1271,15 @@ mod tests {
             .expect("read last");
         let id = String::from_utf8(last_bytes).unwrap().trim().to_string();
         assert!(id.starts_with("sim-"), "id was {:?}", id);
+        // `latest` links to it, and the listing shows the link.
+        let latest = h.lookup(&VfsPath::parse("/latest").unwrap()).await.unwrap();
+        assert_eq!(latest.link_target.as_deref(), Some(id.as_str()));
+        let listed = h.list(&VfsPath::parse("/").unwrap()).await.unwrap();
+        assert!(
+            listed
+                .iter()
+                .any(|e| e.name == "latest" && e.link_target.as_deref() == Some(id.as_str()))
+        );
 
         // 3. simulation.json should be success=true with gas_used > 0.
         let sim_path = VfsPath::parse(&format!("/{}/simulation.json", id)).unwrap();
