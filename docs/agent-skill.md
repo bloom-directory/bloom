@@ -26,7 +26,8 @@ exact commit. Advance its revision after the Bloom PR lands, using the landed
 commit rather than the PR head. Its build publishes `SKILL.md`, and serves
 `install/install.md` and `install/setup.sh` at the paths the skill and guide
 link: `/references/install.md` and `/scripts/setup.sh` (`/setup.sh` remains a
-copy for existing links). Do not edit generated website copies.
+copy for existing links). Do not edit generated website copies. Verify the
+published files match the pinned commit after deployment.
 
 ## skills.sh
 
@@ -94,13 +95,3 @@ Release workflow bumps it with `Cargo.toml`. After tagging `vX.Y.Z`:
    Connect command must still work against an upgraded Bloom. v0.4.2 is the
    first skill release, so it gets a fresh-install check instead; upgrade
    tests start at v0.5.0.
-
-## Headless Linux rollout
-
-Ship the updated guidance with the signed release, then repin/deploy the website
-at the landed commit. Its sync must fetch the guide and script from `install/`,
-not the retired paths under `skills/bloom/`. Check published `SKILL.md`,
-`/references/install.md`, `/scripts/setup.sh`, legacy `/setup.sh`, and `SETUP.md`
-if served. Publish the skill from the release tag as above; use the
-[Linux acceptance check](../TESTING.md#headless-linux-setup-acceptance).
-Publication remains pending until those separately hosted files are verified.

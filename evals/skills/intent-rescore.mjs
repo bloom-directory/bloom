@@ -10,6 +10,7 @@ const source = JSON.parse(await readFile(input, 'utf8'));
 const cases = Array.isArray(source) ? source : source.results?.results.map((row, index) => ({
   id: `${row.provider?.label ?? 'model'}:${row.vars?.platform ?? index}:${index}`,
   platformContext: row.vars?.platformContext,
+  expected: row.vars?.expected,
   response: row.response?.output,
   provider_error: row.response?.error ?? (typeof row.response?.output === 'string' ? undefined : row.error),
 }));
