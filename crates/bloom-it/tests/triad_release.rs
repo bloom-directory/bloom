@@ -739,9 +739,8 @@ fn triad_developer_launcher_supports_vfs_only_mode() {
     let launcher = fs::read_to_string(workspace().join("scripts/triad-dev-launch.sh")).unwrap();
 
     assert!(
-        launcher.contains(
-            "required_paths=(\"$developer_root\" \"$machine_socket\" \"$log_dir\" \"$ready_file\")"
-        ),
+        launcher.contains("[ -n \"$developer_root\" ] || die \"--developer-root is required\"")
+            && !launcher.contains("[ -n \"$mount_dir\" ] || die"),
         "the developer launcher must not require --mount"
     );
     assert!(
@@ -932,6 +931,8 @@ fn triad_developer_launcher_selects_ceremony_port_without_sibling_checkouts() {
             root.join("logs").to_str().unwrap(),
             "--ready-file",
             root.join("ready").to_str().unwrap(),
+            // Otherwise a host Chromium would make the launcher build Checkout.
+            "--no-checkout",
         ]);
         for arg in extra {
             command.arg(arg);
