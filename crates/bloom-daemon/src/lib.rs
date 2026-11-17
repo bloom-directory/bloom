@@ -5505,13 +5505,18 @@ async fn render_wallet_paths(
         )
     };
     let mut lines = String::new();
+    let more = |hidden: usize, what: &str| match hidden {
+        0 => String::new(),
+        n => format!("- and {n} more; list `{what}`\n"),
+    };
     for wallet in wallet_ids.iter().take(SHOWN) {
-        let accounts = names(format!("/{wallet}")).await.unwrap_or_default();
-        for account in accounts
-            .iter()
+        let accounts: Vec<String> = names(format!("/{wallet}"))
+            .await
+            .unwrap_or_default()
+            .into_iter()
             .filter(|name| name.parse::<u32>().is_ok())
-            .take(SHOWN)
-        {
+            .collect();
+        for account in accounts.iter().take(SHOWN) {
             let chains = names(format!("/{wallet}/{account}/chains"))
                 .await
                 .unwrap_or_default();
@@ -5523,7 +5528,12 @@ async fn render_wallet_paths(
                 chains.join(", ")
             ));
         }
+        lines.push_str(&more(
+            accounts.len().saturating_sub(SHOWN),
+            &format!("wallets/{wallet}/"),
+        ));
     }
+    lines.push_str(&more(wallet_ids.len().saturating_sub(SHOWN), "wallets/"));
     if lines.is_empty() {
         String::new()
     } else {
@@ -6443,6 +6453,25 @@ mod tests {
                 .map(|body| body.as_bytes().to_vec())
                 .ok_or_else(|| HandlerError::not_found(key))
         }
+    }
+
+    /// The path list is capped, and says so instead of hiding the rest.
+    #[tokio::test]
+    async fn next_md_names_the_accounts_it_leaves_out() {
+        let tree = WalletTreeFixture {
+            dirs: [
+                (
+                    "alice",
+                    vec!["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"],
+                ),
+                ("alice/0/chains", vec!["base"]),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let text = render_wallet_paths(&tree, &["alice".to_owned()], Duration::from_secs(1)).await;
+        assert!(text.contains("`alice` account `0`"), "{text}");
+        assert!(text.contains("and 2 more; list `wallets/alice/`"), "{text}");
     }
 
     fn alice_tree() -> WalletTreeFixture {

@@ -18,8 +18,8 @@ Infer what Bloom state settles; ask only for what it cannot:
 
 `wallets/<wallet>/accounts.json` lists the wallet's accounts; each entry's
 `number` is its derivation index, and `wallets/<wallet>/<n>/` is that account.
-Never select an account by list position or address alias. Stage through the
-numbered path (`wallets/<wallet>/<n>/chains/<chain>/outbox/new.tx`, using `0`
+Never select an account by list position or address alias. Send through the
+numbered path (`wallets/<wallet>/<n>/chains/<chain>/outbox/send.tx`, using `0`
 explicitly for the first account); it fixes the sender to that account's key.
 Keep every follow-up, including Petal routes and outbox confirmations, in the
 same account.
