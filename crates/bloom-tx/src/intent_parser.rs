@@ -284,7 +284,7 @@ pub fn bodies(input: &str) -> Vec<&str> {
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .collect();
-    let opens = |line: &&str| line.starts_with("send ") || line.starts_with("{\"");
+    let opens = |line: &&str| line.starts_with("send ") || line.starts_with('{');
     if lines.len() > 1 && lines.iter().all(opens) {
         lines
     } else {
@@ -495,6 +495,9 @@ mod tests {
         let pretty = "{\n  \"kind\": \"send\",\n  \"to\": \"0x70997970C51812dc3A010C7d01b50e0d17dc79C8\",\n  \"value\": \"0.25 eth\"\n}";
         assert!(parse(pretty).is_ok());
         assert_eq!(bodies(pretty), vec![pretty]);
+        // A space after the brace, as `jq -c`-style tools may write it.
+        let spaced = "{ \"kind\": \"send\", \"to\": \"0x70997970C51812dc3A010C7d01b50e0d17dc79C8\", \"value\": \"1 eth\" }";
+        assert_eq!(bodies(&format!("{spaced}\n{spaced}")).len(), 2);
     }
 
     #[test]

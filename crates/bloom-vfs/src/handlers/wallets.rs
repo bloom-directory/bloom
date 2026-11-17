@@ -2751,11 +2751,21 @@ fn approval_pending(outbox: &str, id: &str) -> HandlerError {
 /// monotonically increasing allocation counter, so within one millisecond the
 /// greater id is the later staging. Newest first, deterministically.
 fn newest_pending_target(mut pending: Vec<(u128, String)>) -> Option<String> {
-    pending.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    pending.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| outbox_id_order(&b.1).cmp(&outbox_id_order(&a.1)))
+    });
     pending
         .into_iter()
         .next()
         .map(|(_, id)| format!("pending/{id}"))
+}
+
+/// Allocation order of an outbox id. The counter before the `-` is padded to
+/// four digits only, so past 9,999 it must be compared as a number.
+fn outbox_id_order(id: &str) -> (u64, &str) {
+    let counter = id.split('-').next().and_then(|n| n.parse().ok());
+    (counter.unwrap_or(0), id)
 }
 
 /// Outbox failures, keeping "it is not there" apart from "it broke".
@@ -8127,6 +8137,29 @@ value = "0""#,
                 .await
                 .is_err()
         );
+
+        // Once the entry is sent, `latest` follows it to the receipt.
+        let engine = handler.solana_engine("solana-devnet").unwrap();
+        let outbox = engine.outbox();
+        let sent = bloom_solana_tx::outbox::SolanaOutboxState::Sent;
+        let pending = outbox
+            .read_in_state(
+                "alice",
+                "solana-devnet",
+                "0001-00001",
+                bloom_solana_tx::outbox::SolanaOutboxState::Pending,
+            )
+            .unwrap();
+        outbox.transition(&pending, sent).unwrap();
+        assert_eq!(
+            handler
+                .lookup(&VfsPath::parse("/alice/0/chains/solana-devnet/outbox/latest").unwrap())
+                .await
+                .unwrap()
+                .link_target
+                .as_deref(),
+            Some("sent/0001-00001")
+        );
     }
 
     // Account chain listings must enumerate both the EVM registry and native
@@ -10437,6 +10470,16 @@ value = "0""#,
         let listed = f.handler.list(&root).await.unwrap();
         let latest = listed.iter().find(|entry| entry.name == "latest").unwrap();
         assert_eq!(latest.link_target.as_deref(), Some("failed/0003-newest"));
+    }
+
+    #[test]
+    fn outbox_ids_order_by_their_counter_past_four_digits() {
+        assert!(outbox_id_order("10000-00001") > outbox_id_order("9999-99999"));
+        assert!(outbox_id_order("0002-00001") > outbox_id_order("0001-99999"));
+        assert_eq!(
+            newest_pending_target(vec![(5, "9999-00001".into()), (5, "10000-00001".into())]),
+            Some("pending/10000-00001".into())
+        );
     }
 
     #[tokio::test]
