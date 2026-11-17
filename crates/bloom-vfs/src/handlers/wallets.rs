@@ -2853,7 +2853,7 @@ fn validate_policy_action_id(id: &str) -> Result<(), HandlerError> {
 fn tx_open_err(e: TxEngineError) -> HandlerError {
     match e {
         TxEngineError::ApprovalRequired(_) => HandlerError::PermissionDenied,
-        TxEngineError::PolicyDenied => HandlerError::OperationNotPermitted,
+        TxEngineError::PolicyDenied(_) => HandlerError::OperationNotPermitted,
         TxEngineError::DependencyNotSatisfied { .. }
         | TxEngineError::SimulationReverted { .. }
         | TxEngineError::NonceGap { .. }
@@ -4002,6 +4002,12 @@ impl WalletsHandler {
             .get(1)
             .and_then(|segment| parse_account_segment(segment))
         {
+            // Policy is set per wallet; say where instead of a bare denial.
+            if segs.len() == 3 && segs[2] == "policy.json" {
+                return Err(HandlerError::invalid(format!(
+                    "policy belongs to the wallet, not an account: write `wallets/{wallet}/policy.json`"
+                )));
+            }
             return self.write_account(wallet, number, &segs[2..], data).await;
         }
         if segs.get(1).map(String::as_str) == Some("passkeys") {
@@ -7526,6 +7532,21 @@ value = "0""#,
             handler.read(&path).await.unwrap(),
             bytes,
             "staging must not remove signed policy authority"
+        );
+    }
+
+    /// A policy written at an account's path names the wallet's path instead
+    /// of a bare denial, which reads as a refusal of the change itself.
+    #[tokio::test]
+    async fn a_policy_written_to_an_account_names_the_wallet_path() {
+        let f = make_handler();
+        let path = VfsPath::parse(&format!("/{}/0/policy.json", f.wallet_name)).unwrap();
+        let error = f.handler.write(&path, b"{}").await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("write `wallets/{}/policy.json`", f.wallet_name)),
+            "{error}"
         );
     }
 

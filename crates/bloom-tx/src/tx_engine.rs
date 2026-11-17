@@ -136,8 +136,10 @@ pub enum TxEngineError {
     Data(String),
     #[error("invalid EIP-1559 fee override: {0}")]
     InvalidFeeOverride(String),
-    #[error("policy denied")]
-    PolicyDenied,
+    /// The checks that refused it, so the caller can tell a wrong address
+    /// from a payee the policy does not allow.
+    #[error("policy denied: {0}")]
+    PolicyDenied(String),
     #[error("broadcast approval required {0}")]
     ApprovalRequired(ApprovalRequirement),
     #[error("approval service unavailable: {0}")]
@@ -1575,7 +1577,10 @@ impl TxEngine {
                 advice = %mev_report.advice,
                 "tx.policy_denied"
             );
-            return Err(TxEngineError::PolicyDenied);
+            return Err(TxEngineError::PolicyDenied(format!(
+                "mev.fail_on_high_risk: {}",
+                mev_report.advice
+            )));
         }
 
         // Open a pinned read session for the balance + code reads so the
@@ -2174,7 +2179,9 @@ impl TxEngine {
                 reason = "hard",
                 "tx.policy_denied"
             );
-            return Err(TxEngineError::PolicyDenied);
+            return Err(TxEngineError::PolicyDenied(policy_engine::denial(
+                &staged.policy_checks,
+            )));
         }
         let warn = policy_engine::has_warning(&staged.policy_checks);
         if warn && !override_warnings {
@@ -2185,7 +2192,9 @@ impl TxEngine {
                 reason = "warn_no_override",
                 "tx.policy_denied"
             );
-            return Err(TxEngineError::PolicyDenied);
+            return Err(TxEngineError::PolicyDenied(policy_engine::denial(
+                &staged.policy_checks,
+            )));
         }
 
         if !override_warnings {
@@ -2333,11 +2342,12 @@ impl TxEngine {
                 if let Some(dep_id) = staged.depends_on.as_deref() {
                     self.ensure_dependency_satisfied(wallet, &target.chain_name, dep_id)?;
                 }
-                if policy_engine::has_hard_violation(&staged.policy_checks) {
-                    return Err(TxEngineError::PolicyDenied);
-                }
-                if policy_engine::has_warning(&staged.policy_checks) && !override_warnings {
-                    return Err(TxEngineError::PolicyDenied);
+                if policy_engine::has_hard_violation(&staged.policy_checks)
+                    || policy_engine::has_warning(&staged.policy_checks) && !override_warnings
+                {
+                    return Err(TxEngineError::PolicyDenied(policy_engine::denial(
+                        &staged.policy_checks,
+                    )));
                 }
                 if policy.private.enabled
                     && !matches!(
@@ -2631,7 +2641,9 @@ impl TxEngine {
                 reason = "hard",
                 "tx.policy_denied"
             );
-            return Err(TxEngineError::PolicyDenied);
+            return Err(TxEngineError::PolicyDenied(policy_engine::denial(
+                &staged.policy_checks,
+            )));
         }
         let warn = policy_engine::has_warning(&staged.policy_checks);
         if warn && !override_warnings {
@@ -2642,7 +2654,9 @@ impl TxEngine {
                 reason = "warn_no_override",
                 "tx.policy_denied"
             );
-            return Err(TxEngineError::PolicyDenied);
+            return Err(TxEngineError::PolicyDenied(policy_engine::denial(
+                &staged.policy_checks,
+            )));
         }
 
         // Pre-broadcast simulation first (no side effects): eth_call against
@@ -12296,9 +12310,10 @@ mod tests {
         let r = engine
             .confirm(&permit, "alice", "anvil", "0001-test", &chain, &policy, "y")
             .await;
-        assert!(
-            matches!(r, Err(TxEngineError::PolicyDenied)),
-            "expected PolicyDenied, got {r:?}"
+        // The refusal names the check, so the caller can tell what to fix.
+        assert_eq!(
+            r.unwrap_err().to_string(),
+            "policy denied: caps.max_value_eth: value exceeds max"
         );
 
         // The outbox entry must have been moved to the `failed` state.
@@ -12323,7 +12338,7 @@ mod tests {
                 &permit, "alice", "anvil", &staged.id, &chain, &policy, false,
             )
             .await;
-        assert!(matches!(result, Err(TxEngineError::PolicyDenied)));
+        assert!(matches!(result, Err(TxEngineError::PolicyDenied(_))));
         let entry = engine.outbox.read("alice", "anvil", &staged.id).unwrap();
         assert_eq!(entry.state, OutboxState::Failed);
         assert_eq!(entry.staged.status, TxStatus::Failed);
