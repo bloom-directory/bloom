@@ -2856,7 +2856,11 @@ fn tx_open_err(e: TxEngineError) -> HandlerError {
         TxEngineError::PolicyDenied => HandlerError::OperationNotPermitted,
         TxEngineError::DependencyNotSatisfied { .. }
         | TxEngineError::SimulationReverted { .. }
-        | TxEngineError::NonceGap { .. } => HandlerError::invalid(e.to_string()),
+        | TxEngineError::NonceGap { .. }
+        // What the body said, not a Bloom failure.
+        | TxEngineError::Address(_)
+        | TxEngineError::Amount(_)
+        | TxEngineError::Data(_) => HandlerError::invalid(e.to_string()),
         other => err_be(other),
     }
 }

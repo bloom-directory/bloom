@@ -131,6 +131,9 @@ pub enum TxEngineError {
     Address(String),
     #[error("amount: {0}")]
     Amount(String),
+    /// A body's `data` is not hex calldata.
+    #[error("invalid data: {0}; give the calldata as 0x-prefixed hex, two digits per byte")]
+    Data(String),
     #[error("invalid EIP-1559 fee override: {0}")]
     InvalidFeeOverride(String),
     #[error("policy denied")]
@@ -5569,7 +5572,7 @@ fn decode_data(s: &str) -> Result<Bytes, TxEngineError> {
         return Ok(Bytes::new());
     }
     let s = s.strip_prefix("0x").unwrap_or(s);
-    let v = hex::decode(s).map_err(|e| TxEngineError::Amount(format!("data: {e}")))?;
+    let v = hex::decode(s).map_err(|e| TxEngineError::Data(e.to_string()))?;
     Ok(Bytes::from(v))
 }
 
@@ -11610,6 +11613,15 @@ mod tests {
             }
             other => panic!("expected StateMismatch, got {other:?}"),
         }
+    }
+
+    /// Calldata with an odd digit says it is the data that is wrong, not an
+    /// amount (an agent retyping calldata by hand hit this in the bench).
+    #[test]
+    fn odd_calldata_is_named_as_data() {
+        let error = decode_data("0xabc").unwrap_err().to_string();
+        assert!(error.starts_with("invalid data: "), "{error}");
+        assert_eq!(decode_data("0xabcd").unwrap().len(), 2);
     }
 
     /// The node takes a send but its answer is lost. When the chain knows the
