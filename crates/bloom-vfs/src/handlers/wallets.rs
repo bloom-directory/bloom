@@ -2290,8 +2290,54 @@ impl WalletsHandler {
         data: &[u8],
     ) -> Result<(), HandlerError> {
         let _lock = self.lock_wallet_policy_update(wallet)?;
-        self.write_wallet_policy_update_locked(wallet, data, None)
+        let merged = self.with_added_destinations(wallet, data).await?;
+        self.write_wallet_policy_update_locked(wallet, merged.as_deref().unwrap_or(data), None)
             .await
+    }
+
+    /// `{"add_destinations":[{"chain":..,"destination":..}]}` proposes the
+    /// current policy plus those destinations, so adding a payee needs no
+    /// read and edit of the whole policy. Anything else is a full policy and
+    /// is left as written. The same write repeated proposes the same bytes
+    /// while the policy is unchanged, as the approval wait requires.
+    async fn with_added_destinations(
+        &self,
+        wallet: &str,
+        data: &[u8],
+    ) -> Result<Option<Vec<u8>>, HandlerError> {
+        let Ok(serde_json::Value::Object(body)) = serde_json::from_slice(data) else {
+            return Ok(None);
+        };
+        let Some(added) = body.get("add_destinations").filter(|_| body.len() == 1) else {
+            return Ok(None);
+        };
+        let added = added.as_array().ok_or_else(|| {
+            HandlerError::invalid(
+                r#"add_destinations takes a list: [{"chain":"ethereum","destination":"0x..."}]"#,
+            )
+        })?;
+        let mut policy: serde_json::Value =
+            serde_json::from_slice(&self.read_triad_wallet_policy(wallet).await?)
+                .map_err(|error| HandlerError::backend(format!("parse policy: {error}")))?;
+        let destinations = policy["allowed_destinations"]
+            .as_array_mut()
+            .ok_or_else(|| HandlerError::backend("policy has no allowed_destinations"))?;
+        // An address is the same destination in any letter case.
+        let key = |d: &serde_json::Value| {
+            let field = |name: &str| d[name].as_str().map(str::to_ascii_lowercase);
+            (field("chain"), field("destination"))
+        };
+        for destination in added {
+            if !destinations
+                .iter()
+                .any(|held| key(held) == key(destination))
+            {
+                destinations.push(destination.clone());
+            }
+        }
+        serde_json::to_vec(&policy)
+            .map(Some)
+            .map_err(|error| HandlerError::backend(error.to_string()))
     }
 
     async fn write_wallet_policy_update_locked(
@@ -7476,6 +7522,95 @@ value = "0""#,
             handler.read(&path).await.unwrap(),
             bytes,
             "staging must not remove signed policy authority"
+        );
+    }
+
+    /// `add_destinations` proposes the current policy plus the new payees,
+    /// once each, whatever their letter case.
+    #[tokio::test]
+    async fn adding_a_destination_proposes_the_current_policy_plus_it() {
+        struct PolicyBroker {
+            baseline: SignedPolicySnapshot,
+            prepared: Mutex<Option<bloom_broker_api::PolicyUpdateRequest>>,
+        }
+        impl bloom_broker_api::MachineBrokerService for PolicyBroker {
+            fn dispatch<'a>(
+                &'a self,
+                request: MachineBrokerRequest,
+            ) -> bloom_broker_api::ServiceFuture<'a, MachineBrokerResponse> {
+                Box::pin(async move {
+                    match request {
+                        MachineBrokerRequest::PolicyRead(_) => {
+                            Ok(MachineBrokerResponse::PolicyRead(self.baseline.clone()))
+                        }
+                        MachineBrokerRequest::PolicyValidateUpdate(request) => {
+                            *self.prepared.lock().unwrap() = Some(request.clone());
+                            Ok(MachineBrokerResponse::PolicyValidateUpdate(
+                                bloom_broker_api::PolicyUpdatePrepareResponse {
+                                    operation_id: request.operation_id,
+                                    ceremony_kind: bloom_broker_api::CeremonyKind::PolicyUpdate,
+                                    ceremony_url: "https://example.invalid/add".into(),
+                                    ceremony_expires_at_ms: DecimalU64::new(u64::MAX),
+                                    review_manifest_digest: digest(90),
+                                },
+                            ))
+                        }
+                        other => panic!("unexpected policy request: {other:?}"),
+                    }
+                })
+            }
+        }
+        let f = make_handler();
+        let mut current: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../bloom-machine-client/tests/fixtures/legacy-policy-removal.json"
+        ))
+        .unwrap();
+        let mut current = current["current"].take();
+        current["wallet_id"] = serde_json::json!(f.wallet_name);
+        let held = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
+        current["allowed_destinations"] =
+            serde_json::json!([{"chain": "ethereum", "destination": held}]);
+        let current: CanonicalWalletPolicy = serde_json::from_value(current).unwrap();
+        let bytes = serde_jcs::to_vec(&current).unwrap();
+        let mut projection = static_projection_value(f.wallet_addr);
+        projection.policy.canonical_policy = Base64UrlBytes::from_bytes(&bytes);
+        projection.policy.policy_digest = Digest32::from_bytes(sha2::Sha256::digest(&bytes).into());
+        let broker = Arc::new(PolicyBroker {
+            baseline: projection.policy.clone(),
+            prepared: Mutex::new(None),
+        });
+        let home = bloom_proto::HomeDir::at(f._tmp.path());
+        let handler = f
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(broker.clone())))
+            .with_projection_reader(Arc::new(StaticProjection(projection)))
+            .with_home_write_permit(Arc::new(HomeWritePermit::acquire(&home).unwrap()));
+        let path = VfsPath::parse(&format!("/{}/policy.json", f.wallet_name)).unwrap();
+        let new = "0x54179eb54D8d25B633c825149AB37ac23ab0F101";
+        let body = serde_json::json!({"add_destinations": [
+            {"chain": "ethereum", "destination": new},
+            {"chain": "ethereum", "destination": held.to_ascii_lowercase()},
+        ]});
+        assert!(matches!(
+            handler.write(&path, body.to_string().as_bytes()).await,
+            Err(HandlerError::PermissionDenied)
+        ));
+        let prepared = broker.prepared.lock().unwrap().clone().unwrap();
+        let mut expected = current.clone();
+        let mut value = serde_json::to_value(&expected).unwrap();
+        value["allowed_destinations"] = serde_json::json!([
+            {"chain": "ethereum", "destination": held},
+            {"chain": "ethereum", "destination": new},
+        ]);
+        expected = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            prepared.proposed_canonical_policy.decode(),
+            serde_jcs::to_vec(&expected).unwrap()
+        );
+        let refused = handler.write(&path, br#"{"add_destinations":"0x1"}"#).await;
+        assert!(
+            refused.unwrap_err().to_string().contains("takes a list"),
+            "a wrong shape names the right one"
         );
     }
 
