@@ -2641,6 +2641,24 @@ fn wallet_confirm_reports_the_pending_ceremony_url() {
         .stdout(predicate::str::contains(
             "Next: bloom wallet confirm alice base 0001-cafe --account 7 (waits",
         ));
+    // A non-default text is repeated, quoted, so the retry still overrides.
+    bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "confirm",
+            "alice",
+            "base",
+            "0001-cafe",
+            "--account",
+            "7",
+            "--text",
+            "it's override",
+        ])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains(
+            r"Next: bloom wallet confirm alice base 0001-cafe --account 7 --text 'it'\''s override' (waits",
+        ));
 
     stop_ipc_server(server, server_thread);
 }

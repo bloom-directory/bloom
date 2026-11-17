@@ -336,8 +336,9 @@ pub type BatchConfirm = Arc<
         + Sync,
 >;
 
-/// The last batch status document per wallet and account.
-type BatchResults = std::collections::HashMap<(String, u32), Vec<u8>>;
+/// Batch status documents per wallet and account, oldest first: every batch
+/// still waiting for the owner, then the latest, which `confirm-batch` shows.
+type BatchResults = std::collections::HashMap<(String, u32), Vec<Vec<u8>>>;
 
 #[derive(Clone)]
 pub struct WalletsHandler {
@@ -383,8 +384,9 @@ pub struct WalletsHandler {
     /// daemon once its batch service exists; `confirm-batch` is refused until
     /// then.
     batch_confirm: Arc<parking_lot::RwLock<Option<BatchConfirm>>>,
-    /// The last `confirm-batch` result per wallet and account, read back
-    /// from the same file.
+    /// `confirm-batch` results per wallet and account: the last is read back
+    /// from the same file, and each batch waiting for the owner is kept so
+    /// its entries' confirms continue it.
     batch_results: Arc<parking_lot::Mutex<BatchResults>>,
 }
 
@@ -10270,6 +10272,17 @@ value = "0""#,
         // An entry outside that batch is confirmed on its own.
         let _ = f.handler.write(&confirm("0002-second"), b"y").await;
         assert_eq!(seen.lock().len(), 2);
+        // A second batch started while the first waits does not take its
+        // place: each entry still continues its own batch.
+        seed_pending(&f, "0003-third");
+        assert!(f.handler.write(&batch, b"anvil:0003-third").await.is_err());
+        let _ = f.handler.write(&confirm("0001-first"), b"y").await;
+        let _ = f.handler.write(&confirm("0003-third"), b"y").await;
+        let one = |id: &str| vec![format!("anvil:{id}")];
+        assert_eq!(
+            seen.lock()[2..],
+            [one("0003-third"), one("0001-first"), one("0003-third")]
+        );
     }
 
     /// The plan of an entry asked for with others names them all, and a
@@ -10356,6 +10369,40 @@ value = "0""#,
                 && error.to_string().contains("nothing was staged"),
             "{error}"
         );
+        let pending = handler
+            .tx_engine
+            .outbox
+            .list(&f.wallet_name, "anvil", OutboxState::Pending)
+            .unwrap();
+        assert!(pending.is_empty(), "{pending:?}");
+    }
+
+    /// `send.tx` is refused before staging when any body names another
+    /// account, or when there are more bodies than one approval covers.
+    #[tokio::test]
+    async fn send_tx_refuses_another_account_and_oversized_batches_before_staging() {
+        let f = make_handler_with_chain(true);
+        let (projection, _evm0, _evm1) = two_account_projection(&f);
+        let mut handler = f.handler.clone();
+        handler.wallet_projections = Some(projection);
+        let send = vfs(format!("/{}/1/chains/anvil/outbox/send.tx", f.wallet_name));
+        let to = "0x0000000000000000000000000000000000000002";
+        let line = format!("{{\"kind\":\"send\",\"to\":\"{to}\",\"value\":\"1 wei\"}}");
+        let other = format!(
+            "{{\"kind\":\"send\",\"to\":\"{to}\",\"value\":\"1 wei\",\"account_fingerprint\":\"{}\"}}",
+            "10".repeat(32)
+        );
+        for (body, refusal) in [
+            (format!("{line}\n{other}\n"), "intent names account"),
+            (format!("{line}\n").repeat(33), "at most 32"),
+        ] {
+            let error = handler.write(&send, body.as_bytes()).await.unwrap_err();
+            assert!(
+                error.to_string().contains(refusal)
+                    && error.to_string().contains("nothing was staged"),
+                "{error}"
+            );
+        }
         let pending = handler
             .tx_engine
             .outbox
@@ -10470,6 +10517,28 @@ value = "0""#,
         let listed = f.handler.list(&root).await.unwrap();
         let latest = listed.iter().find(|entry| entry.name == "latest").unwrap();
         assert_eq!(latest.link_target.as_deref(), Some("failed/0003-newest"));
+
+        // The id counter restarts with the Machine: an old entry with a
+        // greater id is not newer than one staged since.
+        let latest = || async {
+            let listed = f.handler.list(&root).await.unwrap();
+            let latest = listed.into_iter().find(|entry| entry.name == "latest");
+            latest.unwrap().link_target.unwrap()
+        };
+        seed_pending_with_created_ms(&f, "0042-before-restart", 1_000);
+        let outbox = &f.handler.tx_engine.outbox;
+        let old = outbox
+            .read_in_state(
+                &f.wallet_name,
+                "anvil",
+                "0042-before-restart",
+                OutboxState::Pending,
+            )
+            .unwrap();
+        outbox.transition(&old, OutboxState::Sent).unwrap();
+        assert_eq!(latest().await, "failed/0003-newest");
+        seed_pending_with_created_ms(&f, "0001-after-restart", 20_000);
+        assert_eq!(latest().await, "pending/0001-after-restart");
     }
 
     #[test]

@@ -120,25 +120,40 @@ pub async fn write(
             written => Ok(written?),
         };
     };
-    // An entry asked for as part of a batch waits as its batch does.
-    // Only `confirm`, as the handler does: `confirm.override` is its own
-    // request and is never turned into the batch's plain `y`.
-    if let [root, wallet, number, _, chain, _, _, id, control] = path.segments()
-        && root == "wallets"
-        && control == "confirm"
-        && bytes.trim_ascii() == b"y"
-        && let Ok(batch) = VfsPath::parse(&format!("/wallets/{wallet}/{number}/confirm-batch"))
-        && let Ok(raw) = vfs.read(&batch).await
-        && let Ok(status) = serde_json::from_slice::<Value>(&raw)
-        && status["status"] == "awaiting_ceremony"
-        && status["entries"]
-            .as_array()
-            .is_some_and(|entries| entries.iter().any(|e| *e == format!("{chain}:{id}")))
-    {
-        return write_batch_confirm(vfs, &batch, b"y", wait, cancelled).await;
+    // The batch the latest `confirm-batch` shows, if this entry is in it:
+    // a confirm repeated after its link was returned waits for it.
+    let batch_ref = match path.segments() {
+        [_, _, _, _, chain, _, _, id, _] => format!("{chain}:{id}"),
+        _ => String::new(),
+    };
+    let seen_batch = match path.segments() {
+        [_, wallet, number, ..] => {
+            VfsPath::parse(&format!("/wallets/{wallet}/{number}/confirm-batch")).ok()
+        }
+        _ => None,
+    };
+    let seen_batch = match &seen_batch {
+        Some(batch) => awaited_batch(vfs, batch).await,
+        None => None,
     }
+    .filter(|(_, _, entries)| entries.contains(&batch_ref));
     let waiting_for = approval_id(vfs, &challenge).await;
     match vfs.write(path, bytes).await {
+        // An entry asked for as part of a batch waits as its batch does,
+        // retrying exactly that batch's entries: a batch another writer
+        // starts meanwhile is never sent in its place.
+        Err(HandlerError::ApprovalPending(batch)) if batch.ends_with("/confirm-batch") => {
+            let pending = || HandlerError::ApprovalPending(batch.clone());
+            let batch_path = VfsPath::parse(&format!("/{batch}")).map_err(|_| pending())?;
+            match awaited_batch(vfs, &batch_path).await {
+                Some((_, _, entries)) if entries.contains(&batch_ref) => {
+                    let seen = seen_batch.map(|(action, ..)| action);
+                    let named = entries.join(" ");
+                    await_batch(vfs, &batch_path, named.as_bytes(), seen, wait, cancelled).await
+                }
+                _ => Err(pending().into()),
+            }
+        }
         Err(denied @ (HandlerError::PermissionDenied | HandlerError::ApprovalPending(_))) => {
             await_approval(
                 vfs,
@@ -156,18 +171,19 @@ pub async fn write(
     }
 }
 
-/// The batch a `confirm-batch` file reports as waiting for the owner.
-async fn awaited_batch(vfs: &Vfs, path: &VfsPath) -> Option<(String, String)> {
+/// The batch a `confirm-batch` file reports as waiting for the owner:
+/// its action, link and entries in order.
+async fn awaited_batch(vfs: &Vfs, path: &VfsPath) -> Option<(String, String, Vec<String>)> {
     let status: Value = serde_json::from_slice(&vfs.read(path).await.ok()?).ok()?;
-    (status["status"] == "awaiting_ceremony").then(|| {
-        (
-            status["action_id"].as_str().unwrap_or_default().to_owned(),
-            status["ceremony_url"]
-                .as_str()
-                .unwrap_or_default()
-                .to_owned(),
-        )
-    })
+    let field = |name: &str| status[name].as_str().unwrap_or_default().to_owned();
+    let entries = status["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.as_str().map(str::to_owned))
+        .collect();
+    (status["status"] == "awaiting_ceremony")
+        .then(|| (field("action_id"), field("ceremony_url"), entries))
 }
 
 /// `confirm-batch` behaves as a single confirm does: the first write
@@ -180,14 +196,37 @@ async fn write_batch_confirm(
     wait: Duration,
     cancelled: Cancelled<'_>,
 ) -> Result<(), WriteError> {
-    let waiting_for = awaited_batch(vfs, path).await.map(|(action, _)| action);
+    let awaited = awaited_batch(vfs, path).await;
+    // `y` repeats the batch waiting now. Retry it by its entries, so a
+    // batch another writer starts meanwhile is never sent in its place.
+    let named = match &awaited {
+        Some((_, _, entries)) if bytes.trim_ascii() == b"y" && !entries.is_empty() => {
+            entries.join(" ").into_bytes()
+        }
+        _ => bytes.to_vec(),
+    };
+    match vfs.write(path, &named).await {
+        Err(HandlerError::ApprovalPending(_)) => {}
+        result => return Ok(result?),
+    }
+    let waiting_for = awaited.map(|(action, ..)| action);
+    await_batch(vfs, path, &named, waiting_for, wait, cancelled).await
+}
+
+/// After a batch write was denied for approval: when the caller already
+/// saw that approval (`waiting_for`), repeat `bytes` until the owner
+/// approves; otherwise return the link.
+async fn await_batch(
+    vfs: &Vfs,
+    path: &VfsPath,
+    bytes: &[u8],
+    waiting_for: Option<String>,
+    wait: Duration,
+    cancelled: Cancelled<'_>,
+) -> Result<(), WriteError> {
     let deadline = tokio::time::Instant::now() + wait;
     loop {
-        match vfs.write(path, bytes).await {
-            Err(HandlerError::ApprovalPending(_)) => {}
-            result => return Ok(result?),
-        }
-        let (action, url) = awaited_batch(vfs, path).await.unwrap_or_default();
+        let (action, url, _) = awaited_batch(vfs, path).await.unwrap_or_default();
         if waiting_for.as_deref() != Some(action.as_str())
             || cancelled()
             || tokio::time::Instant::now() >= deadline
@@ -199,6 +238,10 @@ async fn write_batch_confirm(
         // Each attempt is an audited request, so poll less often than a
         // single confirm does.
         tokio::time::sleep(BATCH_APPROVAL_POLL).await;
+        match vfs.write(path, bytes).await {
+            Err(HandlerError::ApprovalPending(_)) => {}
+            result => return Ok(result?),
+        }
     }
 }
 

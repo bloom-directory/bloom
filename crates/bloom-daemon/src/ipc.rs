@@ -4768,8 +4768,8 @@ summary = "Demo app used by IPC tests."
         }
     }
 
-    /// `y` to a batched entry's `confirm` continues its batch;
-    /// `confirm.override` is written as asked, never as the batch's `y`.
+    /// `confirm.override` of a batched entry is written as asked, never
+    /// turned into its batch.
     #[tokio::test]
     async fn an_override_of_a_batched_entry_is_not_sent_as_the_batch() {
         let handler = Arc::new(AwaitedBatch(parking_lot::Mutex::new(Vec::new())));
@@ -4779,16 +4779,82 @@ summary = "Demo app used by IPC tests."
             vec![],
         );
         let context = IpcOperationContext::detached();
-        let entry = "/wallets/w/0/chains/base/outbox/pending/tx-1";
-        for control in ["confirm.override", "confirm"] {
-            let write = json!({"path": format!("{entry}/{control}"), "bytes_b64": B64.encode("y")});
-            assert!(server.do_write(&write, &context).await.is_ok());
+        let entry = "/wallets/w/0/chains/base/outbox/pending/tx-1/confirm.override";
+        let write = json!({"path": entry, "bytes_b64": B64.encode("y")});
+        assert!(server.do_write(&write, &context).await.is_ok());
+        assert_eq!(
+            *handler.0.lock(),
+            ["/w/0/chains/base/outbox/pending/tx-1/confirm.override".to_owned()]
+        );
+    }
+
+    /// Batch `b1` of `tx-1, tx-2` waits for the owner; an entry's `confirm`
+    /// is routed to it, and the second batch write is approved. Records each
+    /// write's path and text.
+    struct EntryOfBatch(parking_lot::Mutex<Vec<(String, String)>>);
+
+    #[async_trait::async_trait]
+    impl Handler for EntryOfBatch {
+        async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+            Ok(Entry::writable_file(
+                path.segments().last().map_or("w", String::as_str),
+            ))
         }
+
+        async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            if path
+                .segments()
+                .last()
+                .is_some_and(|leaf| leaf == "confirm-batch")
+            {
+                return Ok(br#"{"status":"awaiting_ceremony","action_id":"b1","entries":["base:tx-1","base:tx-2"]}"#.to_vec());
+            }
+            Err(HandlerError::NotFound(path.to_string_path()))
+        }
+
+        async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
+            let mut writes = self.0.lock();
+            writes.push((
+                path.to_string_path(),
+                String::from_utf8_lossy(data).into_owned(),
+            ));
+            if writes.len() < 3 {
+                return Err(HandlerError::ApprovalPending(
+                    "wallets/w/0/confirm-batch".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    /// `y` to a batched entry's `confirm` waits for its batch and retries
+    /// that batch by its entries, never by `y`, which names whatever batch
+    /// was started last.
+    #[tokio::test]
+    async fn a_batched_entry_confirm_retries_its_own_batch() {
+        let handler = Arc::new(EntryOfBatch(parking_lot::Mutex::new(Vec::new())));
+        let server = IpcServer::new(
+            Vfs::builder().mount("wallets", handler.clone()).build(),
+            "0",
+            vec![],
+        );
+        let context = IpcOperationContext::detached();
+        let entry = "/wallets/w/0/chains/base/outbox/pending/tx-1/confirm";
+        let write = json!({"path": entry, "bytes_b64": B64.encode("y")});
+        assert!(server.do_write(&write, &context).await.is_ok());
+        let batch = (
+            "/w/0/confirm-batch".to_owned(),
+            "base:tx-1 base:tx-2".to_owned(),
+        );
         assert_eq!(
             *handler.0.lock(),
             [
-                "/w/0/chains/base/outbox/pending/tx-1/confirm.override".to_owned(),
-                "/w/0/confirm-batch".to_owned()
+                (
+                    "/w/0/chains/base/outbox/pending/tx-1/confirm".to_owned(),
+                    "y".to_owned()
+                ),
+                batch.clone(),
+                batch,
             ]
         );
     }

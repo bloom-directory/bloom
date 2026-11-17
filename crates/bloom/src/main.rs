@@ -3509,20 +3509,24 @@ async fn print_receipt(
 ) -> Result<()> {
     let path = format!("/wallets/{wallet}/{account}/chains/{chain}/outbox/sent/{id}/receipt.json");
     // The Machine's read already waits for a receipt that is due, so bound
-    // the two waits together by the clock, not by a count of reads.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // the two waits together by the clock, not by a count of reads; a read
+    // still running at the deadline is abandoned.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        if let Ok(bytes) = ipc_read(endpoint, &path).await {
+        if let Ok(Ok(bytes)) = tokio::time::timeout_at(deadline, ipc_read(endpoint, &path)).await {
             println!("Receipt: {}", String::from_utf8_lossy(&bytes).trim_end());
             let reverted = serde_json::from_slice::<serde_json::Value>(&bytes)
                 .is_ok_and(|receipt| receipt["outcome"] == "reverted");
             anyhow::ensure!(!reverted, "the transaction was mined but reverted");
             return Ok(());
         }
-        if std::time::Instant::now() >= deadline {
+        if tokio::time::Instant::now() >= deadline {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        tokio::time::sleep_until(
+            deadline.min(tokio::time::Instant::now() + std::time::Duration::from_millis(250)),
+        )
+        .await;
     }
     println!("Receipt: not mined yet; read {}", &path[1..]);
     Ok(())
@@ -5215,8 +5219,14 @@ async fn wallet_confirm(
 ) -> Result<()> {
     let path = format!("/wallets/{wallet}/{account}/chains/{chain}/outbox/pending/{id}/confirm");
     let is_cancel = text.trim().eq_ignore_ascii_case("cancel");
+    // The retry repeats the text: a bare `y` would refuse warnings the
+    // owner was asked to override.
+    let text_flag = match text.as_str() {
+        "y" => String::new(),
+        _ => format!(" --text '{}'", text.replace('\'', r"'\''")),
+    };
     let retry = format!(
-        "bloom wallet confirm {wallet} {chain} {id}{}",
+        "bloom wallet confirm {wallet} {chain} {id}{}{text_flag}",
         account_flag(account)
     );
     let body = text.into_bytes();
