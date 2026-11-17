@@ -552,6 +552,8 @@ impl SimulateHandler {
                 names.join(", ")
             )));
         };
+        // A numeric id works here as it does in an outbox path.
+        let preferred = self.chains.named_by_id(&preferred).unwrap_or(preferred);
         self.chains.get(&preferred).ok_or_else(|| {
             HandlerError::not_found(format!(
                 "chain '{}' not registered (have: {:?})",
@@ -1144,6 +1146,30 @@ mod tests {
         let r = ChainRegistry::new();
         r.add(client);
         r
+    }
+
+    /// A body may name its chain by numeric id, as an outbox path may.
+    #[test]
+    fn a_chain_named_by_id_is_found() {
+        let r = registry_for("http://127.0.0.1:1");
+        let mut other = ChainSpec::anvil_default();
+        other.name = "other".into();
+        other.chain_id = 7;
+        r.add(ChainClient::new(other).unwrap());
+        let h = SimulateHandler::new(r, Arc::new(AddressBook::default()));
+        let to = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
+        let intent = |chain: &str| {
+            bloom_tx::intent_parser::parse(&format!(
+                r#"{{"kind":"send","to":"{to}","value":"1 eth","chain":"{chain}"}}"#
+            ))
+            .unwrap()
+        };
+        assert_eq!(h.pick_client(&intent("7")).unwrap().spec().name, "other");
+        assert_eq!(
+            h.pick_client(&intent("other")).unwrap().spec().name,
+            "other"
+        );
+        assert!(h.pick_client(&intent("8")).is_err());
     }
 
     #[tokio::test]
