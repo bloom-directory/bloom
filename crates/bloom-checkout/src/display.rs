@@ -38,13 +38,16 @@ impl Display {
     /// Starts Xvfb with an authority file and its own `/tmp` in `dir`, which
     /// must be private.
     pub fn start(xvfb: &Path, dir: &Path) -> Result<Self> {
-        let authority = dir.join("Xauthority");
-        write_authority(&authority)?;
         let tmp = dir.join("display-tmp");
         // Xvfb clears a stopped earlier display's stale lock and socket itself.
         if !tmp.is_dir() {
             std::fs::DirBuilder::new().mode(0o700).create(&tmp)?;
         }
+        // Inside the namespace `tmp` is `/tmp`, so Xvfb reads the authority
+        // there; a path under `dir` would vanish when `dir` is itself under
+        // `/tmp`, and Xvfb would then accept clients without the cookie.
+        let authority = tmp.join("Xauthority");
+        write_authority(&authority)?;
         let sockets = tmp.join(".X11-unix");
         // Leave room for "/X<number>" inside sockaddr_un's 108 bytes.
         if sockets.as_os_str().len() > 96 {
@@ -60,8 +63,7 @@ impl Display {
         let mut command = Command::new(xvfb);
         command
             .args(["-displayfd", "3", "-nolisten", "tcp", "-nolisten", "local"])
-            .arg("-auth")
-            .arg(&authority)
+            .args(["-auth", "/tmp/Xauthority"])
             .args(["-screen", "0", "1280x900x24"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
