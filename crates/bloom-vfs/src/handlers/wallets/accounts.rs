@@ -1671,7 +1671,7 @@ impl WalletsHandler {
                 done.push((id, state));
             }
         }
-        done.sort_by(|a, b| b.0.cmp(&a.0));
+        done.sort_by(|a, b| outbox_id_order(&b.0).cmp(&outbox_id_order(&a.0)));
         let newest_done = done.into_iter().find_map(|(id, state)| {
             let entry = self
                 .tx_engine
@@ -1683,7 +1683,9 @@ impl WalletsHandler {
         });
         Ok(match (newest_pending, newest_done) {
             (Some(pending), Some(done)) => {
-                let id = |target: &str| target.split_once('/').map(|(_, id)| id.to_owned());
+                fn id(target: &str) -> (u64, &str) {
+                    outbox_id_order(target.rsplit('/').next().unwrap_or(target))
+                }
                 Some(if id(&done) > id(&pending) {
                     done
                 } else {
@@ -2133,7 +2135,9 @@ impl WalletsHandler {
     /// The Solana twin of `evm_latest_target`: fenced before the newest
     /// entry is chosen, fail-closed on unreadable candidates, skipping an
     /// entry that left `pending` mid-listing, `Ok(None)` when nothing is
-    /// visible.
+    /// visible. It follows the entry staged last into `sent`/`failed` too.
+    /// Solana ids are random, so staging time orders them and every finished
+    /// entry is read.
     fn solana_latest_target(
         &self,
         wallet: &str,
@@ -2173,7 +2177,32 @@ impl WalletsHandler {
             }
             pending.push((entry.staged.created_ms, id));
         }
-        Ok(newest_pending_target(pending))
+        let mut done: Option<(u128, String)> = None;
+        for state in [
+            bloom_solana_tx::outbox::SolanaOutboxState::Sent,
+            bloom_solana_tx::outbox::SolanaOutboxState::Failed,
+        ] {
+            for id in engine
+                .outbox()
+                .list(wallet, chain, state)
+                .map_err(solana_outbox_err)?
+            {
+                let Ok(entry) = engine.outbox().read_in_state(wallet, chain, &id, state) else {
+                    continue;
+                };
+                let staged_ms = entry.staged.created_ms;
+                if solana_entry_belongs(&entry.staged, &Self::solana_sender(family))
+                    && done.as_ref().is_none_or(|(ms, _)| staged_ms > *ms)
+                {
+                    done = Some((staged_ms, format!("{}/{id}", state.dirname())));
+                }
+            }
+        }
+        let newest_pending = pending.iter().map(|(ms, _)| *ms).max();
+        Ok(match done {
+            Some((ms, target)) if newest_pending.is_none_or(|pending| ms > pending) => Some(target),
+            _ => newest_pending_target(pending),
+        })
     }
 }
 
