@@ -320,12 +320,15 @@ impl ToolSpec {
             },
             VfsMethod::Write => {
                 let written = payload_len(arguments);
+                // A confirm that sent answers with its receipts.
+                let sent = result.get("sent").and_then(Value::as_str);
+                let text = match sent {
+                    Some(sent) => format!("wrote {written} byte(s) to {path}\n{sent}"),
+                    None => format!("wrote {written} byte(s) to {path}"),
+                };
                 ok_result(
-                    vec![json!({
-                        "type": "text",
-                        "text": format!("wrote {written} byte(s) to {path}"),
-                    })],
-                    json!({ "path": path, "bytes_written": written }),
+                    vec![json!({"type": "text", "text": text})],
+                    json!({ "path": path, "bytes_written": written, "sent": sent }),
                 )
             }
             VfsMethod::WriteWithLookup => {

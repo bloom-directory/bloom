@@ -1056,8 +1056,8 @@ impl BloomFs {
         } else {
             Duration::ZERO
         };
-        match bloom_vfs::owner_wait::write(&self.vfs, path, bytes, wait, &|| false).await {
-            Ok(()) => Ok(()),
+        match bloom_vfs::owner_wait::write(&self.vfs, path, bytes, wait, &|| false, false).await {
+            Ok(_) => Ok(()),
             Err(WriteError::Handler(error)) => Err(map_err(error)),
             // The link is in the entry's `plan.md`; a mount returns a code.
             Err(WriteError::Approval(_)) => Err(FsError::AccessDenied),

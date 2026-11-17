@@ -61,22 +61,29 @@ pub fn may_wait(path: &VfsPath) -> bool {
 
 /// Write `bytes` to `path`, waiting for the owner where a repeat of the
 /// same request is the caller's next step. `wait` bounds that wait.
+///
+/// With `report`, a confirm that sends answers with one line per entry it
+/// sent, from the receipts, so the caller need not list `sent/` or read them
+/// afterwards. A mount cannot return text, so it passes `false`.
 pub async fn write(
     vfs: &Vfs,
     path: &VfsPath,
     bytes: &[u8],
     wait: Duration,
     cancelled: Cancelled<'_>,
-) -> Result<(), WriteError> {
+    report: bool,
+) -> Result<Option<String>, WriteError> {
     if let [root, wallet, leaf] = path.segments()
         && root == "wallets"
         && leaf == "policy.json"
     {
-        return write_policy(vfs, wallet, path, bytes, wait, cancelled).await;
+        write_policy(vfs, wallet, path, bytes, wait, cancelled).await?;
+        return Ok(None);
     }
     if matches!(path.segments(), [root, _, _, leaf] if root == "wallets" && leaf == "confirm-batch")
     {
-        return write_batch_confirm(vfs, path, bytes, wait, cancelled).await;
+        write_batch_confirm(vfs, path, bytes, wait, cancelled).await?;
+        return Ok(None);
     }
     let Some(challenge) = confirm_challenge_path(path) else {
         return match vfs.write(path, bytes).await {
@@ -117,7 +124,7 @@ pub async fn write(
                     None => HandlerError::ApprovalPending(challenge).into(),
                 })
             }
-            written => Ok(written?),
+            written => Ok(written.map(|()| None)?),
         };
     };
     // The batch the latest `confirm-batch` shows, if this entry is in it:
@@ -137,8 +144,13 @@ pub async fn write(
         None => None,
     }
     .filter(|(_, _, entries)| entries.contains(&batch_ref));
+    // A batch's entries are sent together, so the answer covers them all.
+    let sending = match &seen_batch {
+        Some((_, _, entries)) => entries.clone(),
+        None => vec![batch_ref.clone()],
+    };
     let waiting_for = approval_id(vfs, &challenge).await;
-    match vfs.write(path, bytes).await {
+    let written: Result<(), WriteError> = match vfs.write(path, bytes).await {
         // An entry asked for as part of a batch waits as its batch does,
         // retrying exactly that batch's entries: a batch another writer
         // starts meanwhile is never sent in its place.
@@ -168,7 +180,50 @@ pub async fn write(
             .await
         }
         result => Ok(result?),
+    };
+    written?;
+    if !report || !matches!(bytes.trim_ascii(), b"y" | b"override") {
+        return Ok(None);
     }
+    Ok(sent_report(vfs, path, &sending).await)
+}
+
+/// One line per `chain:id` entry: its receipt, or where it is when it has
+/// none. The receipt is shown whole, since its fields differ by chain.
+async fn sent_report(vfs: &Vfs, path: &VfsPath, entries: &[String]) -> Option<String> {
+    let [root, wallet, number, ..] = path.segments() else {
+        return None;
+    };
+    let mut lines = Vec::new();
+    for entry in entries {
+        let (chain, id) = entry.split_once(':')?;
+        let sent = format!("{root}/{wallet}/{number}/chains/{chain}/outbox/sent/{id}");
+        let receipt = VfsPath::parse(&format!("/{sent}/receipt.json")).ok()?;
+        let raw = match vfs.read(&receipt).await {
+            Err(error) if receipt_is_due(vfs, &receipt, &error).await => {
+                match await_receipt(vfs, &receipt, error).await {
+                    Ok(_) => vfs.read(&receipt).await.ok(),
+                    Err(_) => None,
+                }
+            }
+            read => read.ok(),
+        };
+        let receipt: Option<Value> = raw.and_then(|raw| serde_json::from_slice(&raw).ok());
+        lines.push(match receipt {
+            Some(receipt) => format!("{id}: {receipt}"),
+            None => {
+                let hash = VfsPath::parse(&format!("/{sent}/tx_hash")).ok()?;
+                match vfs.read(&hash).await {
+                    Ok(hash) => format!(
+                        "{id}: broadcast tx {}; receipt not recorded yet: {sent}/receipt.json",
+                        String::from_utf8_lossy(&hash).trim()
+                    ),
+                    Err(_) => format!("{id}: not in sent/; read its entry for the outcome"),
+                }
+            }
+        });
+    }
+    Some(lines.join("\n"))
 }
 
 /// The batch a `confirm-batch` file reports as waiting for the owner:
@@ -489,6 +544,58 @@ mod tests {
         }
     }
 
+    /// Batch `tx-1, tx-2` awaiting the owner, approved: `tx-1` has its
+    /// receipt, `tx-2` was broadcast but is not mined yet.
+    struct SentBatch;
+
+    #[async_trait::async_trait]
+    impl Handler for SentBatch {
+        // `tx_hash` is not looked up, so the answer does not wait 5 s for
+        // `tx-2`'s receipt.
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            match p.segments().last().unwrap().as_str() {
+                "tx_hash" => Err(HandlerError::not_found(p.to_string_path())),
+                leaf => Ok(Entry::file(leaf)),
+            }
+        }
+        async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            Ok(match p.to_string_path().as_str() {
+                "/w/0/confirm-batch" => {
+                    br#"{"status":"awaiting_ceremony","action_id":"b1","entries":["base:tx-1","base:tx-2"]}"#.to_vec()
+                }
+                "/w/0/chains/base/outbox/sent/tx-1/receipt.json" => {
+                    br#"{"outcome":"success","tx_hash":"0xaa","block_number":7,"revert_reason":null}"#.to_vec()
+                }
+                "/w/0/chains/base/outbox/sent/tx-2/tx_hash" => b"0xbb\n".to_vec(),
+                other => return Err(HandlerError::not_found(other)),
+            })
+        }
+        async fn write(&self, _p: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+            Ok(())
+        }
+    }
+
+    /// A confirm that sends answers with every entry of its batch, so the
+    /// caller need not list `sent/` or read the receipts; `cancel` does not.
+    #[tokio::test]
+    async fn a_confirm_answers_with_what_it_sent() {
+        let vfs = Vfs::builder().mount("wallets", Arc::new(SentBatch)).build();
+        let path = VfsPath::parse("/wallets/w/0/chains/base/outbox/pending/tx-2/confirm").unwrap();
+        let wait = Duration::from_secs(50);
+        let sent = write(&vfs, &path, b"y\n", wait, &|| false, true).await;
+        assert_eq!(
+            sent.ok().flatten().as_deref(),
+            Some(
+                "tx-1: {\"outcome\":\"success\",\"tx_hash\":\"0xaa\",\"block_number\":7,\"revert_reason\":null}\n\
+                 tx-2: broadcast tx 0xbb; receipt not recorded yet: wallets/w/0/chains/base/outbox/sent/tx-2/receipt.json"
+            )
+        );
+        let cancelled = write(&vfs, &path, b"cancel", wait, &|| false, true).await;
+        assert_eq!(cancelled.ok().flatten(), None);
+        let mounted = write(&vfs, &path, b"y", wait, &|| false, false).await;
+        assert_eq!(mounted.ok().flatten(), None);
+    }
+
     /// The first policy write answers with the link at once; the repeat
     /// waits for the owner and installs the policy. MCP callers get this
     /// too, not only `bloom vfs write`.
@@ -500,7 +607,8 @@ mod tests {
         let wait = Duration::from_secs(50);
 
         let started = tokio::time::Instant::now();
-        let Err(WriteError::Approval(first)) = write(&vfs, &path, b"{}", wait, &|| false).await
+        let Err(WriteError::Approval(first)) =
+            write(&vfs, &path, b"{}", wait, &|| false, true).await
         else {
             panic!("the first write is refused with the link");
         };
@@ -512,7 +620,11 @@ mod tests {
             tokio::time::sleep(APPROVAL_POLL).await;
             owner.approved.store(true, Ordering::SeqCst);
         });
-        assert!(write(&vfs, &path, b"{}", wait, &|| false).await.is_ok());
+        assert!(
+            write(&vfs, &path, b"{}", wait, &|| false, true)
+                .await
+                .is_ok()
+        );
         assert!(started.elapsed() >= APPROVAL_POLL);
         assert_eq!(wallet.installed.load(Ordering::SeqCst), 1);
     }

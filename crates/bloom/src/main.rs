@@ -4004,9 +4004,13 @@ async fn run(cli: Cli) -> Result<()> {
                 return write_policy(&client_endpoint, wallet, params).await;
             }
             let client = IpcClient::new(&client_endpoint.socket);
-            try_ipc(&client, &client_endpoint, "write", params)
+            let written = try_ipc(&client, &client_endpoint, "write", params)
                 .await
                 .with_context(|| format!("ipc write via {}", client_endpoint.display))?;
+            // A confirm that sent answers with its receipts.
+            if let Some(sent) = written.get("sent").and_then(serde_json::Value::as_str) {
+                println!("{sent}");
+            }
             debug!(endpoint = %client_endpoint.display, "cli.vfs.write.via_ipc");
             Ok(())
         }

@@ -1150,7 +1150,8 @@ impl IpcServer {
                 Err(e) => map_handler_err(id, e),
             },
             "write" => match self.do_write(&req.params, &context).await {
-                Ok(()) => Response::ok(id, Value::Null),
+                Ok(None) => Response::ok(id, Value::Null),
+                Ok(Some(sent)) => Response::ok(id, json!({ "sent": sent })),
                 Err(WriteError::Handler(e)) => map_handler_err(id, e),
                 Err(WriteError::Approval(message)) => Response::err(id, -32007, message),
             },
@@ -1432,7 +1433,7 @@ impl IpcServer {
         &self,
         params: &Value,
         context: &IpcOperationContext,
-    ) -> Result<(), WriteError> {
+    ) -> Result<Option<String>, WriteError> {
         match self.write_direct(params, context).await {
             Err(WriteError::Handler(error)) => match self.relinked(params, &error, false).await {
                 Some(real) => self.write_direct(&real, context).await,
@@ -1446,15 +1447,20 @@ impl IpcServer {
         &self,
         params: &Value,
         context: &IpcOperationContext,
-    ) -> Result<(), WriteError> {
+    ) -> Result<Option<String>, WriteError> {
         let path = parse_path(params)?;
         if write_path_uses_wallet_signer(&path) && !is_fee_repair_write(&path, params) {
             return Err(HandlerError::PermissionDenied.into());
         }
         let bytes = parse_write_bytes(params)?;
-        owner_wait::write(&self.vfs, &path, &bytes, self.approval_wait, &|| {
-            context.is_cancelled()
-        })
+        owner_wait::write(
+            &self.vfs,
+            &path,
+            &bytes,
+            self.approval_wait,
+            &|| context.is_cancelled(),
+            true,
+        )
         .await
     }
 
