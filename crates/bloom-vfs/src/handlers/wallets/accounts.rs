@@ -1094,14 +1094,23 @@ impl WalletsHandler {
         let family = Self::evm_family(&view, chain)?;
         let from = Self::evm_address(family)?;
         // A body fingerprint that names a different account is an error,
-        // symmetric with the Solana outbox: the path fixes the sender.
-        if chain_rest == ["new.tx"]
-            && let Ok(body) = serde_json::from_slice::<serde_json::Value>(data)
-            && let Some(named) = body.get("account_fingerprint").and_then(|v| v.as_str())
-            && !family
-                .fingerprint
-                .to_ascii_lowercase()
-                .starts_with(&named.to_ascii_lowercase())
+        // symmetric with the Solana outbox: the path fixes the sender. Every
+        // body of a `send.tx` batch is checked.
+        if let [leaf] = chain_rest
+            && (leaf == "new.tx" || leaf == SEND_TX)
+            && let Some(named) = std::str::from_utf8(data).ok().and_then(|text| {
+                bloom_tx::intent_parser::bodies(text)
+                    .into_iter()
+                    .find_map(|body| {
+                        let body: serde_json::Value = serde_json::from_str(body).ok()?;
+                        let named = body.get("account_fingerprint")?.as_str()?;
+                        (!family
+                            .fingerprint
+                            .to_ascii_lowercase()
+                            .starts_with(&named.to_ascii_lowercase()))
+                        .then(|| named.to_owned())
+                    })
+            })
         {
             return Err(HandlerError::invalid(format!(
                 "intent names account {named}, but this path stages from {}",
@@ -1131,9 +1140,11 @@ impl WalletsHandler {
             crate::advisory_exact_evm_policy(&projection, chain, chain_id).map_err(err_be)?;
         // An entry that already left `pending` (its batch was sent, say) is
         // reported where it now is, so the caller reads the result instead
-        // of guessing what a bare "not found" means.
+        // of guessing what a bare "not found" means. `latest/confirm` reaches
+        // `sent/<id>/confirm` once its entry was sent: that is answered the
+        // same way, not as a "permission denied" that reads as an approval.
         if let [state, id, control] = chain_rest
-            && state == "pending"
+            && matches!(state.as_str(), "pending" | "sent" | "failed")
             && EVM_PENDING_CONTROLS.contains(&control.as_str())
             && let Some(now) = ["sent", "failed"].into_iter().find(|now| {
                 self.evm_outbox_entry(wallet, family, chain, now, id)
@@ -1141,7 +1152,7 @@ impl WalletsHandler {
             })
         {
             return Err(HandlerError::not_found(format!(
-                "pending/{id}: it is no longer pending; its result is in `{now}/{id}/`"
+                "{id} is no longer pending; its result is in `{now}/{id}/`"
             )));
         }
         // An entry asked for as part of a batch is confirmed with its batch:
@@ -1476,7 +1487,17 @@ impl WalletsHandler {
                         && let Ok(live) = self.live_approval_challenge(wallet, challenge).await
                         && let Ok(live) = serde_json::from_slice::<serde_json::Value>(&live)
                     {
-                        link = live["ceremony_url"].as_str().map(str::to_owned);
+                        // Only a plain `confirm` is sent by writing `y` to it
+                        // again; a Petal, `confirm.override` or fee repair
+                        // says its own next step.
+                        let plain = live["retry_path"]
+                            .as_str()
+                            .is_some_and(|path| path.ends_with("/confirm"));
+                        let next =
+                            (!plain).then(|| live["next"].as_str().unwrap_or_default().to_owned());
+                        link = live["ceremony_url"]
+                            .as_str()
+                            .map(|url| (url.to_owned(), next));
                     }
                 }
                 // An entry asked for with others is sent with them.
@@ -1502,12 +1523,18 @@ impl WalletsHandler {
                         )
                         .as_bytes(),
                     );
-                } else if let Some(link) = link {
+                } else if let Some((link, next)) = link {
+                    let next = match next {
+                        Some(next) => {
+                            format!("{next} Its fields are in `approval_challenge.json`.")
+                        }
+                        None => {
+                            "Write `y` to `confirm` again: it sends once they have approved.".into()
+                        }
+                    };
                     bytes.extend_from_slice(
-                        format!(
-                            "\n## Approval\n\nThe owner was asked: {link}\nWrite `y` to `confirm` again: it sends once they have approved.\n"
-                        )
-                        .as_bytes(),
+                        format!("\n## Approval\n\nThe owner was asked: {link}\n{next}\n")
+                            .as_bytes(),
                     );
                 }
                 Ok(bytes)
@@ -1655,11 +1682,12 @@ impl WalletsHandler {
             }
             pending.push((entry.staged.created_ms, id));
         }
+        let pending_ms = pending.iter().map(|(ms, _)| *ms).max();
         let newest_pending = newest_pending_target(pending);
         // Once the entry staged last is sent or refused, `latest` follows it,
         // so the path a caller staged and confirmed through still leads to
-        // the receipt. Ids are allocated in increasing order, so the greatest
-        // id that belongs to this account is the newest.
+        // the receipt. Ids restart at 1 with the daemon, so the newest is
+        // the one staged last, as for pending entries.
         let mut done = Vec::new();
         for state in [OutboxState::Sent, OutboxState::Failed] {
             for id in self
@@ -1668,31 +1696,28 @@ impl WalletsHandler {
                 .list(wallet, chain, state)
                 .map_err(err_be)?
             {
-                done.push((id, state));
+                if let Ok(entry) = self
+                    .tx_engine
+                    .outbox
+                    .read_in_state(wallet, chain, &id, state)
+                    && Self::evm_entry_belongs(family, &entry.staged.from)
+                {
+                    done.push((entry.staged.created_ms, format!("{}/{id}", state.dirname())));
+                }
             }
         }
-        done.sort_by(|a, b| outbox_id_order(&b.0).cmp(&outbox_id_order(&a.0)));
-        let newest_done = done.into_iter().find_map(|(id, state)| {
-            let entry = self
-                .tx_engine
-                .outbox
-                .read_in_state(wallet, chain, &id, state);
-            entry
-                .is_ok_and(|entry| Self::evm_entry_belongs(family, &entry.staged.from))
-                .then(|| format!("{}/{id}", state.dirname()))
-        });
-        Ok(match (newest_pending, newest_done) {
-            (Some(pending), Some(done)) => {
-                fn id(target: &str) -> (u64, &str) {
-                    outbox_id_order(target.rsplit('/').next().unwrap_or(target))
-                }
-                Some(if id(&done) > id(&pending) {
-                    done
-                } else {
-                    pending
-                })
+        fn order((ms, target): &(u128, String)) -> (u128, (u64, &str)) {
+            (
+                *ms,
+                outbox_id_order(target.rsplit('/').next().unwrap_or(target)),
+            )
+        }
+        let newest_done = done.into_iter().max_by(|a, b| order(a).cmp(&order(b)));
+        Ok(match (pending_ms.zip(newest_pending), newest_done) {
+            (Some((pending_ms, pending)), Some((done_ms, done))) => {
+                Some(if done_ms > pending_ms { done } else { pending })
             }
-            (pending, done) => pending.or(done),
+            (pending, done) => pending.or(done).map(|(_, target)| target),
         })
     }
 
@@ -2786,7 +2811,7 @@ fn approval_next_step(
         S::Prepared | S::AwaitingCeremony => (
             "awaiting_ceremony",
             if direct {
-                "Show ceremony_url to the owner. Write retry_body to retry_path right away, without waiting for their reply: it waits for their approval and sends. It starts no new ceremony. Stop when ceremony_expires_at_ms passes and tell the owner.".into()
+                "Show ceremony_url to the owner. Write retry_body to retry_path right away, without waiting for their reply: it waits for their approval and sends. It starts no new ceremony. Stop when expiry_ms passes and tell the owner.".into()
             } else {
                 format!("Give ceremony_url to the owner. As soon as they approve, {retry}. Retrying earlier is safe: it starts no new ceremony and returns permission denied again.")
             },

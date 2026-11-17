@@ -199,12 +199,23 @@ async fn write_batch_confirm(
 ) -> Result<(), WriteError> {
     let waiting_for = awaited_batch(vfs, path).await.map(|(action, _)| action);
     let deadline = tokio::time::Instant::now() + wait;
+    let mut written = vfs.write(path, bytes).await;
     loop {
-        match vfs.write(path, bytes).await {
+        match written {
             Err(HandlerError::ApprovalPending(_)) => {}
             result => return Ok(result?),
         }
         let (action, url) = awaited_batch(vfs, path).await.unwrap_or_default();
+        // A batch whose approval was declined or expired is asked for again
+        // by the next `y`: say so, or the new link reads as the same request.
+        if waiting_for
+            .as_deref()
+            .is_some_and(|before| before != action && !action.is_empty())
+        {
+            return Err(WriteError::Approval(format!(
+                "permission denied: the owner did not approve the earlier request (declined, expired, or replaced by another batch). A new approval was asked for: {url} . Check with the owner before writing y to confirm-batch again."
+            )));
+        }
         if waiting_for.as_deref() != Some(action.as_str())
             || cancelled()
             || tokio::time::Instant::now() >= deadline
@@ -216,6 +227,14 @@ async fn write_batch_confirm(
         // Each attempt is an audited request, so poll less often than a
         // single confirm does.
         tokio::time::sleep(BATCH_APPROVAL_POLL).await;
+        // `y` repeats whichever batch the file reports. If another write
+        // replaced this one meanwhile, report that batch instead of confirming it.
+        written = match awaited_batch(vfs, path).await {
+            Some((action, _)) if waiting_for.as_deref() != Some(action.as_str()) => {
+                Err(HandlerError::ApprovalPending(String::new()))
+            }
+            _ => vfs.write(path, bytes).await,
+        };
     }
 }
 
@@ -373,7 +392,22 @@ async fn write_policy(
         .map(|update| update["action_id"].clone());
     let denied = match vfs.write(path, bytes).await {
         Err(denied @ (HandlerError::PermissionDenied | HandlerError::ApprovalPending(_))) => denied,
-        written => return Ok(written?),
+        written => {
+            written?;
+            // A write that finds the awaited update declined or expired
+            // retires it to `failed/` and succeeds without installing it.
+            if let Some(action) = waiting_before.as_ref().and_then(Value::as_str)
+                && let Ok(failed) = VfsPath::parse(&format!(
+                    "/wallets/{wallet}/policy-updates/failed/{action}/status.json"
+                ))
+                && vfs.read(&failed).await.is_ok()
+            {
+                return Err(WriteError::Approval(
+                    "permission denied: policy not changed: the owner declined or the approval expired. Write the policy again to ask them again.".into(),
+                ));
+            }
+            return Ok(());
+        }
     };
     let asked = update().await;
     // The owner approved between the write and this read.
@@ -431,6 +465,7 @@ mod tests {
     struct PolicyUpdate {
         writes: AtomicUsize,
         approved: std::sync::atomic::AtomicBool,
+        declined: std::sync::atomic::AtomicBool,
         installed: AtomicUsize,
     }
 
@@ -440,7 +475,12 @@ mod tests {
             Ok(Entry::file(p.segments().last().unwrap()))
         }
         async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
-            if self.writes.load(Ordering::SeqCst) == 0 {
+            // `latest` still reads as waiting: the decline is only seen by
+            // the next write, as when the owner declines just before it.
+            let retired = p.to_string_path().contains("/failed/");
+            if self.writes.load(Ordering::SeqCst) == 0
+                || (retired && !self.declined.load(Ordering::SeqCst))
+            {
                 return Err(HandlerError::not_found(p.to_string_path()));
             }
             let status = if self.approved.load(Ordering::SeqCst) {
@@ -455,6 +495,10 @@ mod tests {
         }
         async fn write(&self, _p: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
             self.writes.fetch_add(1, Ordering::SeqCst);
+            // A declined update is retired and the write succeeds.
+            if self.declined.load(Ordering::SeqCst) {
+                return Ok(());
+            }
             if !self.approved.load(Ordering::SeqCst) {
                 return Err(HandlerError::PermissionDenied);
             }
@@ -489,5 +533,23 @@ mod tests {
         assert!(write(&vfs, &path, b"{}", wait, &|| false).await.is_ok());
         assert!(started.elapsed() >= APPROVAL_POLL);
         assert_eq!(wallet.installed.load(Ordering::SeqCst), 1);
+    }
+
+    /// A repeat that finds the update declined is not reported as installed.
+    #[tokio::test]
+    async fn a_declined_policy_write_is_not_reported_as_installed() {
+        let wallet = Arc::new(PolicyUpdate::default());
+        let vfs = Vfs::builder().mount("wallets", wallet.clone()).build();
+        let path = VfsPath::parse("/wallets/alice/policy.json").unwrap();
+        let wait = Duration::from_secs(50);
+        assert!(write(&vfs, &path, b"{}", wait, &|| false).await.is_err());
+
+        wallet.declined.store(true, Ordering::SeqCst);
+        let Err(WriteError::Approval(declined)) = write(&vfs, &path, b"{}", wait, &|| false).await
+        else {
+            panic!("a declined update is refused");
+        };
+        assert!(declined.contains("policy not changed"), "{declined}");
+        assert_eq!(wallet.installed.load(Ordering::SeqCst), 0);
     }
 }

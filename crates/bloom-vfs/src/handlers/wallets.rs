@@ -5862,6 +5862,29 @@ mod tests {
             mismatch.to_string().contains("intent names account"),
             "{mismatch:?}"
         );
+        // `send.tx` checks every body of a batch, not only the first.
+        let body = |fingerprint: Option<String>| {
+            let mut body = serde_json::json!({
+                "to": "0x0000000000000000000000000000000000000002",
+                "value": "0",
+            });
+            if let Some(fingerprint) = fingerprint {
+                body["account_fingerprint"] = fingerprint.into();
+            }
+            serde_json::to_string(&body).unwrap()
+        };
+        let mismatch = handler
+            .write(
+                &vfs(format!("/{w}/1/chains/anvil/outbox/send.tx")),
+                format!("{}\n{}", body(None), body(Some("10".repeat(32)))).as_bytes(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            mismatch.to_string().contains("intent names account"),
+            "{mismatch:?}"
+        );
+        assert!(handler.list(&pending(1)).await.unwrap().is_empty());
         let controls: Vec<String> = handler
             .list(&vfs(format!(
                 "/{w}/0/chains/anvil/outbox/pending/from-account-zero"
@@ -10470,6 +10493,35 @@ value = "0""#,
         let listed = f.handler.list(&root).await.unwrap();
         let latest = listed.iter().find(|entry| entry.name == "latest").unwrap();
         assert_eq!(latest.link_target.as_deref(), Some("failed/0003-newest"));
+
+        // Ids restart at 1 with the daemon: an entry staged after a restart
+        // has a lower id than the refused one, and still owns `latest`.
+        seed_pending_with_created_ms(&f, "0001-restarted", 12_000);
+        let listed = f.handler.list(&root).await.unwrap();
+        let latest = listed.iter().find(|entry| entry.name == "latest").unwrap();
+        assert_eq!(
+            latest.link_target.as_deref(),
+            Some("pending/0001-restarted")
+        );
+        let entry = f
+            .handler
+            .tx_engine
+            .outbox
+            .read_in_state(
+                &f.wallet_name,
+                "anvil",
+                "0001-restarted",
+                OutboxState::Pending,
+            )
+            .unwrap();
+        f.handler
+            .tx_engine
+            .outbox
+            .transition(&entry, OutboxState::Sent)
+            .unwrap();
+        let listed = f.handler.list(&root).await.unwrap();
+        let latest = listed.iter().find(|entry| entry.name == "latest").unwrap();
+        assert_eq!(latest.link_target.as_deref(), Some("sent/0001-restarted"));
     }
 
     #[test]
@@ -11164,7 +11216,9 @@ value = "0""#,
             .outbox
             .transition(&entry, OutboxState::Sent)
             .unwrap();
-        // Path that points at sent — must be permission denied (no route).
+        // Path that points at sent (`latest/confirm` after a send): no
+        // rebroadcast, and the answer says where the result is rather than
+        // a "permission denied" that reads as an approval to ask for.
         let p = VfsPath::parse(&format!(
             "/{}/0/chains/anvil/outbox/sent/0001-test/confirm",
             f.wallet_name
@@ -11172,7 +11226,7 @@ value = "0""#,
         .unwrap();
         let r = f.handler.write(&p, b"y").await;
         assert!(
-            matches!(r, Err(HandlerError::PermissionDenied)),
+            matches!(&r, Err(HandlerError::NotFound(why)) if why.contains("sent/0001-test/")),
             "got: {r:?}"
         );
         // Path under pending/<id> still resolves but the engine rejects

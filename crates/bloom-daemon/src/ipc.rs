@@ -1138,14 +1138,14 @@ impl IpcServer {
                         -32010,
                         "path is not an inert resource; use vfs_read deliberately",
                     ),
-                    Ok(_) => match self.do_read(&req.params, &context).await {
+                    Ok(_) => match self.do_read(&req.params, &context, true).await {
                         Ok(value) => Response::ok(id, value),
                         Err(error) => map_handler_err(id, error),
                     },
                     Err(error) => map_handler_err(id, error),
                 }
             }
-            "read" => match self.do_read(&req.params, &context).await {
+            "read" => match self.do_read(&req.params, &context, false).await {
                 Ok(v) => Response::ok(id, v),
                 Err(e) => map_handler_err(id, e),
             },
@@ -1349,10 +1349,13 @@ impl IpcServer {
         Ok(entry)
     }
 
+    /// Read `params`. An `inert` read refuses a side-effecting route behind
+    /// a link, as `read_inert` refuses one named directly.
     async fn do_read(
         &self,
         params: &Value,
         context: &IpcOperationContext,
+        inert: bool,
     ) -> Result<Value, HandlerError> {
         let error = match self.read_direct(params, context).await {
             Err(error) => error,
@@ -1361,6 +1364,14 @@ impl IpcServer {
         // The receipt may be asked for through `latest`, so the wait applies
         // to the real path.
         let (params, error) = match self.relinked(params, &error, true).await {
+            Some(real)
+                if inert
+                    && parse_path(&real).is_ok_and(|p| self.vfs.is_read_side_effecting(&p)) =>
+            {
+                return Err(HandlerError::invalid(
+                    "path is not an inert resource; use vfs_read deliberately",
+                ));
+            }
             Some(real) => match self.read_direct(&real, context).await {
                 Err(error) => (real, error),
                 read => return read,
@@ -4614,6 +4625,10 @@ summary = "Demo app used by IPC tests."
             }
         }
 
+        fn is_read_side_effecting(&self, path: &VfsPath) -> bool {
+            path.to_string_path() == "/pending/x1/plan.md"
+        }
+
         async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
             match path.to_string_path().as_str() {
                 "/pending/x1" => Ok(vec![Entry::file("plan.md")]),
@@ -4647,16 +4662,21 @@ summary = "Demo app used by IPC tests."
         let context = IpcOperationContext::detached();
 
         let read = server
-            .do_read(&json!({"path": "/box/latest/plan.md"}), &context)
+            .do_read(&json!({"path": "/box/latest/plan.md"}), &context, false)
             .await
             .unwrap();
         assert_eq!(read["bytes_b64"], B64.encode("the plan"));
         // A path may cross two links.
         let twice = server
-            .do_read(&json!({"path": "/box/first/plan.md"}), &context)
+            .do_read(&json!({"path": "/box/first/plan.md"}), &context, false)
             .await
             .unwrap();
         assert_eq!(twice["bytes_b64"], B64.encode("the plan"));
+        // An inert read does not reach a side-effecting route through a link.
+        let inert = server
+            .do_read(&json!({"path": "/box/latest/plan.md"}), &context, true)
+            .await;
+        assert!(matches!(inert, Err(HandlerError::Invalid(_))), "{inert:?}");
         let listed = server
             .do_list(&json!({"path": "/box/latest"}))
             .await
@@ -4682,7 +4702,7 @@ summary = "Demo app used by IPC tests."
         // A path that is simply absent still fails as before.
         assert!(
             server
-                .do_read(&json!({"path": "/box/latest/nope"}), &context)
+                .do_read(&json!({"path": "/box/latest/nope"}), &context, false)
                 .await
                 .is_err()
         );
@@ -4871,18 +4891,18 @@ summary = "Demo app used by IPC tests."
         );
         let context = IpcOperationContext::detached();
         let receipt = json!({"path": "/w/outbox/sent/x1/receipt.json"});
-        let read = server.do_read(&receipt, &context).await.unwrap();
+        let read = server.do_read(&receipt, &context, false).await.unwrap();
         assert_eq!(read["bytes_b64"], B64.encode("{}"));
 
         // The same wait applies when the entry is reached through a link.
         handler.0.store(0, std::sync::atomic::Ordering::SeqCst);
         let linked = json!({"path": "/w/outbox/latest/receipt.json"});
-        let read = server.do_read(&linked, &context).await.unwrap();
+        let read = server.do_read(&linked, &context, false).await.unwrap();
         assert_eq!(read["bytes_b64"], B64.encode("{}"));
 
         let started = std::time::Instant::now();
         let unknown = json!({"path": "/w/outbox/sent/nope/receipt.json"});
-        assert!(server.do_read(&unknown, &context).await.is_err());
+        assert!(server.do_read(&unknown, &context, false).await.is_err());
         assert!(
             started.elapsed() < APPROVAL_POLL,
             "an unknown entry must not wait"
