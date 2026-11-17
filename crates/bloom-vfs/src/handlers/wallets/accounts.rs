@@ -1213,6 +1213,29 @@ impl WalletsHandler {
         {
             return self.confirm_batch_entries(wallet, number, refs).await;
         }
+        // `cancel` discards the whole batch: an entry left behind would hold
+        // its nonce and block whatever is staged next.
+        if let [state, id, control] = chain_rest
+            && state == "pending"
+            && control == "confirm"
+            && data.trim_ascii().eq_ignore_ascii_case(b"cancel")
+            && let Some((refs, _)) =
+                self.awaited_batch_with(wallet, number, &format!("{chain}:{id}"))
+        {
+            for (entry_chain, entry) in refs.iter().filter_map(|r| r.split_once(':')) {
+                let cancel = ["pending".to_owned(), entry.to_owned(), "confirm".to_owned()];
+                let still_pending = self
+                    .tx_engine
+                    .outbox
+                    .read_in_state(wallet, entry_chain, entry, OutboxState::Pending)
+                    .is_ok();
+                if entry_chain == chain && still_pending {
+                    self.write_outbox_from(wallet, chain, from, &policy, &cancel, b"cancel", number)
+                        .await?;
+                }
+            }
+            return Ok(());
+        }
         if let [control] = chain_rest
             && EVM_PENDING_CONTROLS.contains(&control.as_str())
         {
@@ -1289,9 +1312,17 @@ impl WalletsHandler {
         }
         if let [id] = staged.as_slice() {
             let confirm = ["pending".to_owned(), id.clone(), "confirm".to_owned()];
-            return self
+            // One that failed (not one waiting for the owner) is discarded,
+            // so a corrected retry is not blocked behind its nonce.
+            return match self
                 .write_outbox_from(wallet, chain, from, policy, &confirm, b"y", number)
-                .await;
+                .await
+            {
+                Err(error @ (HandlerError::Invalid(_) | HandlerError::Backend(_))) => Err(self
+                    .discard_staged(wallet, chain, from, policy, &staged, number, error)
+                    .await),
+                result => result,
+            };
         }
         // Several bodies go under one approval, in the order written. A
         // batch that failed (not one waiting for the owner) is discarded too.
@@ -1319,6 +1350,7 @@ impl WalletsHandler {
         error: HandlerError,
     ) -> HandlerError {
         let mut left = Vec::new();
+        let mut all_discarded = true;
         for id in staged {
             let cancel = ["pending".to_owned(), id.clone(), "confirm".to_owned()];
             let discarded = self
@@ -1329,16 +1361,18 @@ impl WalletsHandler {
                 .outbox
                 .read_in_state(wallet, chain, id, OutboxState::Pending)
                 .is_ok();
+            all_discarded &= discarded.is_ok();
             if discarded.is_err() && pending {
                 left.push(format!("pending/{id}"));
             }
         }
         if left.is_empty() {
+            let discarded = all_discarded && !staged.is_empty();
             return match error {
-                HandlerError::Invalid(m) if !staged.is_empty() => {
+                HandlerError::Invalid(m) if discarded => {
                     HandlerError::invalid(format!("{m}; nothing was staged"))
                 }
-                HandlerError::Backend(m) if !staged.is_empty() => {
+                HandlerError::Backend(m) if discarded => {
                     HandlerError::backend(format!("{m}; nothing was staged"))
                 }
                 error => error,

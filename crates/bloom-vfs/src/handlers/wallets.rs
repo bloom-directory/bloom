@@ -10451,6 +10451,37 @@ value = "0""#,
         );
     }
 
+    /// `cancel` written to one entry of an awaited batch discards the whole
+    /// batch, so no entry is left holding a nonce; others stay pending.
+    #[tokio::test]
+    async fn cancelling_an_entry_of_an_awaited_batch_cancels_the_batch() {
+        let f = cancel_fixture();
+        for id in ["0001-first", "0002-second", "0003-other"] {
+            seed_pending(&f, id);
+        }
+        f.handler
+            .set_batch_confirm(Arc::new(move |_wallet, _account, _txs, _text| {
+                Box::pin(async move { Ok(serde_json::json!({"status": "awaiting_ceremony"})) })
+            }));
+        let batch = vfs(format!("/{}/0/confirm-batch", f.wallet_name));
+        let _ = f
+            .handler
+            .write(&batch, b"anvil:0001-first anvil:0002-second")
+            .await;
+        let confirm = vfs(format!(
+            "/{}/0/chains/anvil/outbox/pending/0002-second/confirm",
+            f.wallet_name
+        ));
+        f.handler.write(&confirm, b"cancel\n").await.unwrap();
+        let pending = f
+            .handler
+            .tx_engine
+            .outbox
+            .list(&f.wallet_name, "anvil", OutboxState::Pending)
+            .unwrap();
+        assert_eq!(pending, ["0001-test", "0003-other"]);
+    }
+
     /// The plan of an entry asked for with others names them all, and a
     /// control written to an entry that already left `pending` says where
     /// it went.

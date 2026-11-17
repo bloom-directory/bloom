@@ -33,7 +33,8 @@ their approval link (on a mount the write is refused; both are in
 of each entry it sent and the account's balances on that chain, each with
 what it changed by (on a mount,
 read `latest/receipt.json`). `new.tx` takes the same body and only
-stages it; `cancel` written to `latest/confirm` discards an entry.
+stages it; `cancel` written to `latest/confirm` discards an entry, with the rest of
+its batch.
 
 Several bodies in one write, one per line, go under one approval, in order (an
 approve, then the call that spends it).
