@@ -108,10 +108,11 @@ jobs:
           broker_sha="$(sed -n -E 's/^broker_commit = "([0-9a-f]{40})"$/\1/p' <<<"$matrix")"
           signer_sha="$(sed -n -E 's/^signer_commit = "([0-9a-f]{40})"$/\1/p' <<<"$matrix")"
           skill_version="$(git show "$release_sha:skills/bloom/SKILL.md" |
-            sed -n -E 's/^  version: "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p')"
+            sed -n -E 's/^  version: "?([0-9]+\.[0-9]+\.[0-9]+)"?$/\1/p')"
+          plugin_version="$(git show "$release_sha:skills/bloom/.claude-plugin/plugin.json" | jq -r .version)"
           if [[ "$workspace_version" != "$version" || "$machine_version" != "$version" ||
-            "$skill_version" != "$version" ]]; then
-            echo "::error::$tag must match the workspace, triad matrix, and skill versions"
+            "$skill_version" != "$version" || "$plugin_version" != "$version" ]]; then
+            echo "::error::$tag must match the workspace, triad matrix, skill, and plugin versions"
             exit 1
           fi
           [[ -n "$broker_sha" && -n "$signer_sha" ]] || {
@@ -624,3 +625,28 @@ jobs:
               --notes-file "$notes" \
               dist/*
           fi
+
+  headless-setup:
+    name: Published Linux headless setup
+    needs: [prepare, publish]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.prepare.outputs.release_sha }}
+          persist-credentials: false
+      - name: Install host prerequisites
+        run: sudo apt-get update && sudo apt-get install -y nfs-common openssh-client python3
+      # A hosted runner is a fresh systemd VM, not a model execution sandbox.
+      # setup.sh discovers published latest; never count an older release as green.
+      - name: Check fresh install and same-release reinstall
+        env:
+          EXPECTED_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: |
+          sudo env BLOOM_DISPOSABLE_INSTALL_TEST=1 BLOOM_EXPECTED_RELEASE_TAG="$EXPECTED_TAG" \
+            bash tests/packaging/linux-headless-setup.sh first-install
+          sudo env BLOOM_DISPOSABLE_INSTALL_TEST=1 BLOOM_EXPECTED_RELEASE_TAG="$EXPECTED_TAG" \
+            bash tests/packaging/linux-headless-setup.sh upgrade
