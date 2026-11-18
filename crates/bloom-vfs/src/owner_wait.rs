@@ -143,6 +143,11 @@ pub async fn write(
                     None => HandlerError::ApprovalPending(challenge).into(),
                 })
             }
+            // `new.tx` only stages: answer with what will be signed and the
+            // next step, or the caller searches `latest/` for a link.
+            Ok(()) if report && path.segments().last().is_some_and(|leaf| leaf == "new.tx") => {
+                Ok(staged_reply(vfs, path).await)
+            }
             written => Ok(written.map(|()| None)?),
         };
     };
@@ -213,6 +218,22 @@ pub async fn write(
     // was read on, even when its batch spans chains.
     let chain = batch_ref.split_once(':').map_or("", |(chain, _)| chain);
     Ok(sent_report(vfs, path, &sending, chain, before.unwrap_or_default()).await)
+}
+
+/// The reply to a `new.tx` write: the entry it staged, up to its confirm
+/// instructions, and how to ask the owner.
+async fn staged_reply(vfs: &Vfs, path: &VfsPath) -> Option<String> {
+    let [root, wallet, number, _, chain, ..] = path.segments() else {
+        return None;
+    };
+    let latest = format!("/{root}/{wallet}/{number}/chains/{chain}/outbox/latest/plan.md");
+    let raw = vfs.read(&VfsPath::parse(&latest).ok()?).await.ok()?;
+    let text = String::from_utf8_lossy(&raw);
+    let id = text.lines().next()?.strip_prefix("# Staged tx ")?.trim();
+    let plans = staged_plans(vfs, path, &[format!("{chain}:{id}")]).await;
+    Some(format!(
+        "{plans}Staged, not yet asked. Write y to pending/{id}/confirm: it answers with the owner's approval link."
+    ))
 }
 
 /// Each staged `chain:id` entry's `plan.md`, up to its confirm instructions.
@@ -798,6 +819,44 @@ mod tests {
         );
         let mounted = write(&vfs, &path, b"send 1 ETH to 0xabc", wait, &|| false, false).await;
         assert!(matches!(mounted, Err(WriteError::Approval(_))));
+    }
+
+    /// `new.tx` stages without asking; it answers with the plan and the
+    /// next step, so the caller does not search `latest/` for a link.
+    #[tokio::test]
+    async fn staging_only_answers_with_the_plan_and_the_next_step() {
+        struct Staged;
+        #[async_trait::async_trait]
+        impl Handler for Staged {
+            async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+                Ok(Entry::file(p.segments().last().unwrap()))
+            }
+            async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+                match p.to_string_path().as_str() {
+                    "/w/0/chains/base/outbox/latest/plan.md"
+                    | "/w/0/chains/base/outbox/pending/tx-1/plan.md" => {
+                        Ok(b"# Staged tx tx-1\n\nTo: 0xabc\n\n## Confirm\nWrite y\n".to_vec())
+                    }
+                    other => Err(HandlerError::not_found(other)),
+                }
+            }
+            async fn write(&self, _p: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+                Ok(())
+            }
+        }
+        let vfs = Vfs::builder().mount("wallets", Arc::new(Staged)).build();
+        let path = VfsPath::parse("/wallets/w/0/chains/base/outbox/new.tx").unwrap();
+        let wait = Duration::from_secs(50);
+        let staged = write(&vfs, &path, b"send 1 ETH to 0xabc", wait, &|| false, true).await;
+        assert_eq!(
+            staged.ok().flatten().as_deref(),
+            Some(
+                "# Staged tx tx-1\n\nTo: 0xabc\n\nStaged, not yet asked. Write y to \
+                 pending/tx-1/confirm: it answers with the owner's approval link."
+            )
+        );
+        let mounted = write(&vfs, &path, b"send 1 ETH to 0xabc", wait, &|| false, false).await;
+        assert!(matches!(mounted, Ok(None)));
     }
 
     /// The first policy write answers with the link at once; the repeat
