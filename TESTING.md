@@ -43,6 +43,32 @@ recorded compatibility revisions, including the Linux release build and both
 macOS conformance workflows with explicit Broker and Signer refs. Local checks
 do not replace required review or CI on the published candidate.
 
+## Headless Linux setup acceptance
+
+On a disposable Linux/systemd host with OpenSSH, Python 3, and NFS client
+support, run these as root from the candidate checkout:
+
+```sh
+BLOOM_DISPOSABLE_INSTALL_TEST=1 bash tests/packaging/linux-headless-setup.sh first-install
+BLOOM_DISPOSABLE_INSTALL_TEST=1 bash tests/packaging/linux-headless-setup.sh upgrade
+```
+
+The first mode creates a dedicated login; the second reuses a verified
+enrollment and reports whether the version changed or it was a reinstall.
+Both exercise the [install guide](install/install.md), root-private TMPDIR,
+signed handoff, versions, services, VFS, and audit readiness; upgrade also
+checks identity metadata and a Machine-home marker. No wallet operations run.
+Evidence stays in `/var/tmp/bloom-headless-test.*`; do not publish raw logs.
+Full readiness needs NFS support, not a container that rejects mounts.
+
+The release workflow runs these checks on a fresh Ubuntu VM after publication,
+requiring the staged tag to match the release. Its second run proves a same-release
+reinstall, not a version upgrade. Older-to-newer upgrade acceptance remains a
+separate disposable-host check. This is a post-publication smoke check, not a
+pre-publication candidate gate; it uses the checkout's guide and setup script,
+not the separately hosted website copies.
+Run [skill checks and model evals](evals/skills/README.md) separately.
+
 ## Triad and Solana ladders
 
 Select the checks for the changed behavior using the map below. Test an
