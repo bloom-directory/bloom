@@ -5,6 +5,9 @@ on:
     paths: &skill_paths
       - ".github/workflows/skill-evals.yml"
       - ".claude-plugin/**"
+      - ".agents/plugins/**"
+      - "plugin.json"
+      - "gemini-extension.json"
       - "skills/**"
       - "install/**"
       - "evals/skills/**"
@@ -44,10 +47,13 @@ jobs:
         working-directory: .
         run: |
           jq -er '.plugins[].source' .claude-plugin/marketplace.json | xargs -I{} test -f {}/.claude-plugin/plugin.json
-          jq -e '.name and .version' skills/bloom/.claude-plugin/plugin.json
-          # Installed plugins update only when this version changes, so it
-          # moves with the skill's version.
+          jq -er '.plugins[].source.path' .agents/plugins/marketplace.json | xargs -I{} test -f {}/plugin.json
+          # Installed plugins update only when this version changes, so every
+          # manifest's version moves with the skill's version.
           skill="$(sed -n -E 's/^  version: "?([0-9]+\.[0-9]+\.[0-9]+)"?$/\1/p' skills/bloom/SKILL.md)"
-          plugin="$(jq -r .version skills/bloom/.claude-plugin/plugin.json)"
-          [ -n "$skill" ] && [ "$skill" = "$plugin" ] ||
-            { echo "::error::plugin.json version $plugin differs from SKILL.md version $skill"; exit 1; }
+          for f in skills/bloom/.claude-plugin/plugin.json plugin.json gemini-extension.json; do
+            jq -e '.name and .version' "$f" > /dev/null
+            plugin="$(jq -r .version "$f")"
+            [ -n "$skill" ] && [ "$skill" = "$plugin" ] ||
+              { echo "::error::$f version $plugin differs from SKILL.md version $skill"; exit 1; }
+          done
