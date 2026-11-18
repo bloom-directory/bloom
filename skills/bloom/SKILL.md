@@ -5,7 +5,7 @@ homepage: https://bloom.directory
 license: MIT
 allowed-tools: Bash(bloom vfs ls:*) Bash(bloom vfs cat:*) Read
 metadata:
-  version: 0.5.0
+  version: 0.5.1
 ---
 
 # Bloom
@@ -39,9 +39,9 @@ If the user gave a mount path, read from that path instead.
   `bloom vfs ls|cat`.
 - It fails: report the error. If the user asked to install Bloom, read the
   install guide at <https://bloom.directory/references/install.md> in full first;
-  installing needs the user's administrator approval in their operating
-  system's own dialog. Otherwise do not install, restart, or launch another
-  Bloom; a remote or sandboxed agent uses its existing connection.
+  an authorized agent may use administrative access it already has, or the
+  operating system asks the user for administrator approval. Otherwise do not
+  install, restart, or launch another Bloom; a remote or sandboxed agent uses its existing connection.
 
 ## Rules
 
