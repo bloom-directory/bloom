@@ -4645,7 +4645,12 @@ impl WalletsHandler {
                 Some(&self.address_book),
             )
             .await
-            .map_err(err_be)?;
+            // A body the engine refused is the caller's to fix (`invalid`);
+            // a policy denial keeps its message naming the rule.
+            .map_err(|error| match error {
+                TxEngineError::PolicyDenied(_) => err_be(error),
+                other => tx_open_err(other),
+            })?;
         tracing::info!(wallet, chain, id = %staged.id, "outbox.staged");
         Ok(staged.id)
     }
@@ -8382,11 +8387,15 @@ value = "0""#,
     }
 
     fn seed_pending_with_created_ms(f: &Fixture, id: &str, created_ms: u128) {
+        seed_pending_on(f, "anvil", 31337, id, created_ms);
+    }
+
+    fn seed_pending_on(f: &Fixture, chain: &str, chain_id: u64, id: &str, created_ms: u128) {
         let staged = bloom_proto::StagedTx {
             id: id.into(),
             wallet: f.wallet_name.clone(),
-            chain: "anvil".into(),
-            chain_id: 31337,
+            chain: chain.into(),
+            chain_id,
             from: bloom_proto::checksum_address(&f.wallet_addr),
             to: Some("0x0000000000000000000000000000000000000002".into()),
             value_wei: "0".into(),
@@ -10481,6 +10490,57 @@ value = "0""#,
             .list(&f.wallet_name, "anvil", OutboxState::Pending)
             .unwrap();
         assert_eq!(pending, ["0001-test", "0003-other"]);
+    }
+
+    /// A batch spanning two chains is cancelled on both: an entry left on
+    /// the other chain would hold its nonce.
+    #[tokio::test]
+    async fn cancelling_a_batch_cancels_its_entries_on_every_chain() {
+        let f = cancel_fixture();
+        f.handler.chains.add(
+            bloom_evm::ChainClient::new(bloom_proto::ChainSpec {
+                name: "base".into(),
+                chain_id: 8453,
+                rpc_urls: vec!["http://127.0.0.1:1".into()],
+                rpc_endpoints: Vec::new(),
+                etherscan_api_url: None,
+                display_name: None,
+                native_symbol: "ETH".into(),
+                native_decimals: 18,
+                legacy_tx: false,
+                op_stack: false,
+            })
+            .unwrap(),
+        );
+        seed_pending(&f, "0002-anvil");
+        seed_pending_on(&f, "base", 8453, "0003-base", 0);
+        f.handler
+            .set_batch_confirm(Arc::new(move |_wallet, _account, _txs, _text| {
+                Box::pin(async move { Ok(serde_json::json!({"status": "awaiting_ceremony"})) })
+            }));
+        let batch = vfs(format!("/{}/0/confirm-batch", f.wallet_name));
+        let _ = f
+            .handler
+            .write(&batch, b"anvil:0002-anvil base:0003-base")
+            .await;
+        let confirm = vfs(format!(
+            "/{}/0/chains/anvil/outbox/pending/0002-anvil/confirm",
+            f.wallet_name
+        ));
+        f.handler.write(&confirm, b"cancel").await.unwrap();
+        let outbox = &f.handler.tx_engine.outbox;
+        assert_eq!(
+            outbox
+                .list(&f.wallet_name, "anvil", OutboxState::Pending)
+                .unwrap(),
+            ["0001-test"]
+        );
+        assert!(
+            outbox
+                .list(&f.wallet_name, "base", OutboxState::Pending)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// The plan of an entry asked for with others names them all, and a

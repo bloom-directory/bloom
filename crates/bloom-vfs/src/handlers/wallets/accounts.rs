@@ -1222,19 +1222,51 @@ impl WalletsHandler {
             && let Some((refs, _)) =
                 self.awaited_batch_with(wallet, number, &format!("{chain}:{id}"))
         {
+            // A batch may span chains: each entry is cancelled at its own
+            // outbox, under that chain's policy.
+            let mut left = Vec::new();
             for (entry_chain, entry) in refs.iter().filter_map(|r| r.split_once(':')) {
                 let cancel = ["pending".to_owned(), entry.to_owned(), "confirm".to_owned()];
+                let Some(client) = self.chains.get(entry_chain) else {
+                    left.push(format!("{entry_chain}:{entry}"));
+                    continue;
+                };
                 let still_pending = self
                     .tx_engine
                     .outbox
                     .read_in_state(wallet, entry_chain, entry, OutboxState::Pending)
                     .is_ok();
-                if entry_chain == chain && still_pending {
-                    self.write_outbox_from(
-                        wallet, chain, from, &policy, &cancel, b"cancel", number,
-                    )
-                    .await?;
+                if !still_pending {
+                    continue;
                 }
+                let other;
+                let policy = if entry_chain == chain {
+                    &policy
+                } else {
+                    other = crate::advisory_exact_evm_policy(
+                        &projection,
+                        entry_chain,
+                        client.spec().chain_id,
+                    )
+                    .map_err(err_be)?;
+                    &other
+                };
+                self.write_outbox_from(
+                    wallet,
+                    entry_chain,
+                    from,
+                    policy,
+                    &cancel,
+                    b"cancel",
+                    number,
+                )
+                .await?;
+            }
+            if !left.is_empty() {
+                return Err(HandlerError::invalid(format!(
+                    "the rest of this batch was cancelled; {} are not on an EVM chain here: cancel each at its own outbox",
+                    left.join(", ")
+                )));
             }
             return Ok(());
         }

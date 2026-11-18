@@ -49,7 +49,7 @@ approve, then the call that spends it).
 - Give the human the complete approval link, unchanged, and say in a
   sentence what you asked for. Then confirm again in the same turn: that
   write waits for them, so there is nothing to stop and wait for.
-- A refusal (`Operation not permitted`, a policy `deny`) is final. Do not
+- A refusal (`Operation not permitted`, or an error saying `policy denied`) is final. Do not
   change policy, switch accounts or try another interface to get around it.
   Propose a policy change only when the owner asks for that change; to add
   a payee, write `{"add_destinations":[{"chain":"<chain>","destination":"0x..."}]}`

@@ -209,7 +209,10 @@ pub async fn write(
     if !reports {
         return Ok(None);
     }
-    Ok(sent_report(vfs, path, &sending, before.unwrap_or_default()).await)
+    // Balances are shown for the confirmed entry's chain, the one `before`
+    // was read on, even when its batch spans chains.
+    let chain = batch_ref.split_once(':').map_or("", |(chain, _)| chain);
+    Ok(sent_report(vfs, path, &sending, chain, before.unwrap_or_default()).await)
 }
 
 /// Each staged `chain:id` entry's `plan.md`, up to its confirm instructions.
@@ -239,6 +242,7 @@ async fn sent_report(
     vfs: &Vfs,
     path: &VfsPath,
     entries: &[String],
+    chain: &str,
     before: Vec<Value>,
 ) -> Option<String> {
     let [root, wallet, number, ..] = path.segments() else {
@@ -276,11 +280,17 @@ async fn sent_report(
     // What the account holds now on that chain, and how each balance
     // changed, so the caller need not check a swap's or supply's result
     // with separate balance reads, nor mistake a balance for what it got.
-    let chain = entries.first().and_then(|entry| entry.split_once(':'))?.0;
     if let Some(after) = holdings(vfs, path, chain).await {
         let changed = changes(&before, &after);
+        // "(change)" only when a delta is shown, so a bare list is never
+        // read as amounts that moved.
+        let label = if changed.contains(" (") {
+            " (change)"
+        } else {
+            ""
+        };
         if !changed.is_empty() {
-            lines.push(format!("{chain} balances now (change): {changed}"));
+            lines.push(format!("{chain} balances now{label}: {changed}"));
         }
     }
     Some(lines.join("\n"))
@@ -709,7 +719,7 @@ mod tests {
             Some(
                 "tx-1: {\"outcome\":\"success\",\"tx_hash\":\"0xaa\",\"block_number\":7,\"revert_reason\":null}\n\
                  tx-2: broadcast tx 0xbb; receipt not recorded yet: wallets/w/0/chains/base/outbox/sent/tx-2/receipt.json\n\
-                 base balances now (change): 1.5 ETH, 20 USDC"
+                 base balances now: 1.5 ETH, 20 USDC"
             )
         );
         let cancelled = write(&vfs, &path, b"cancel", wait, &|| false, true).await;

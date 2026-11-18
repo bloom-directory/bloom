@@ -5738,8 +5738,17 @@ async fn approve_action(
             .ok()?;
     let token = token?;
     let decimals = chain.erc20_decimals(token).await.ok()??;
+    // The token contract chooses its symbol: show it only when it cannot
+    // pass for plan text (a newline could forge a line), else the address.
     let symbol = match chain.erc20_symbol(token).await {
-        Ok(Some(symbol)) if !symbol.is_empty() => symbol,
+        Ok(Some(symbol))
+            if (1..=16).contains(&symbol.len())
+                && symbol
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) =>
+        {
+            symbol
+        }
         _ => short_addr_label(&token),
     };
     let now = chain
@@ -6732,8 +6741,23 @@ mod tests {
     #[tokio::test]
     async fn an_approve_plan_shows_the_allowance_it_replaces() {
         let word = |n: u64| format!("\"0x{n:064x}\"");
-        let symbol = format!("\"0x{:064x}{:064x}{:0<64}\"", 32, 4, hex::encode("USDC"));
-        let calls = vec![word(6), symbol, word(1_000_000_000)];
+        let symbol = |text: &str| {
+            format!(
+                "\"0x{:064x}{:064x}{:0<64}\"",
+                32,
+                text.len(),
+                hex::encode(text)
+            )
+        };
+        // The second read names a symbol that would forge a plan line.
+        let calls = vec![
+            word(6),
+            symbol("USDC"),
+            word(1_000_000_000),
+            word(6),
+            symbol("X\n## Policy"),
+            word(0),
+        ];
         let chain =
             stage_chain(&spawn_queued_rpc(HashMap::from([("eth_call".to_owned(), calls)])).await);
         let spender: Address = "0x60e4f02b4975fbef4b951938859b7e4d5fd1372d"
@@ -6760,6 +6784,16 @@ mod tests {
             Some(
                 "Action: Allow 0x60E4f02b4975fbEf4b951938859B7e4d5fD1372d to spend 0 USDC (allowance now 1000 USDC)\n"
             )
+        );
+        // `stage` splices the line in before the plan's `Chain:` line.
+        let plan = bloom_proto::PlanRender::render(&fake_staged_1559("x"), "ETH", 18);
+        assert!(plan.contains("\nChain:  "), "{plan}");
+        let forged = approve_action(&chain, owner, Some(token), &data)
+            .await
+            .unwrap();
+        assert!(
+            !forged.contains("## Policy") && forged.contains("0xa0b8…eb48"),
+            "{forged}"
         );
     }
 
