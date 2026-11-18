@@ -820,6 +820,9 @@ pub struct IpcServer {
 /// It stays under the 60 s request timeout common MCP clients default to.
 const APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(50);
 const APPROVAL_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+const BATCH_APPROVAL_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+/// A receipt read waits this many polls (5 s) for the transaction to be mined.
+const RECEIPT_POLLS: u32 = 10;
 
 enum WriteError {
     Handler(HandlerError),
@@ -878,6 +881,12 @@ impl IpcServer {
             shutdown: Arc::new(Notify::new()),
             approval_wait: APPROVAL_WAIT,
         }
+    }
+
+    /// How long a repeated confirm waits for the owner's approval.
+    pub fn with_approval_wait(mut self, wait: std::time::Duration) -> Self {
+        self.approval_wait = wait;
+        self
     }
 
     /// Enable `petals.*` IPC methods. Without this the methods return
@@ -1295,7 +1304,81 @@ impl IpcServer {
         }
     }
 
+    /// The parameters with `path` rewritten through the symlink it crosses,
+    /// when `error` is how a handler reports a path it does not serve.
+    ///
+    /// A kernel mount follows `outbox/latest` itself; this gives IPC and MCP
+    /// callers the same paths. The operation is repeated in full on the real
+    /// path, so every check sees the path that is acted on. `leaf` also
+    /// follows a link that is the last segment.
+    async fn relinked(&self, params: &Value, error: &HandlerError, leaf: bool) -> Option<Value> {
+        if !matches!(
+            error,
+            HandlerError::NotFound(_)
+                | HandlerError::NotADir(_)
+                | HandlerError::NotAFile(_)
+                | HandlerError::PermissionDenied
+                // A write under a linked name (`chains/1`) is refused as
+                // invalid rather than absent.
+                | HandlerError::Invalid(_)
+        ) {
+            return None;
+        }
+        // A path may cross more than one link (`chains/1/outbox/latest/...`).
+        let mut segments = parse_path(params).ok()?.segments().to_vec();
+        let mut followed = false;
+        for _hop in 0..4 {
+            let last = if leaf {
+                segments.len()
+            } else {
+                segments.len().saturating_sub(1)
+            };
+            let mut next = None;
+            for end in 1..=last {
+                let prefix = VfsPath::parse(&format!("/{}", segments[..end].join("/"))).ok()?;
+                let Ok(entry) = self.vfs.lookup(&prefix).await else {
+                    break;
+                };
+                let Some(target) = entry.link_target else {
+                    continue;
+                };
+                // Targets are relative to the link's directory and stay inside it.
+                if target.starts_with('/') || target.split('/').any(|part| part == "..") {
+                    return None;
+                }
+                let mut real = segments[..end - 1].to_vec();
+                real.extend(target.split('/').map(str::to_owned));
+                real.extend_from_slice(&segments[end..]);
+                next = Some(real);
+                break;
+            }
+            match next {
+                Some(real) => {
+                    segments = real;
+                    followed = true;
+                }
+                None => break,
+            }
+        }
+        if !followed {
+            return None;
+        }
+        let mut params = params.clone();
+        params["path"] = Value::String(format!("/{}", segments.join("/")));
+        Some(params)
+    }
+
     async fn do_lookup(&self, params: &Value) -> Result<Value, HandlerError> {
+        match self.lookup_direct(params).await {
+            Err(error) => match self.relinked(params, &error, false).await {
+                Some(real) => self.lookup_direct(&real).await,
+                None => Err(error),
+            },
+            found => found,
+        }
+    }
+
+    async fn lookup_direct(&self, params: &Value) -> Result<Value, HandlerError> {
         let path = parse_path(params)?;
         let e = self.vfs.lookup(&path).await?;
         let mut entry = entry_to_json(&e);
@@ -1313,6 +1396,76 @@ impl IpcServer {
     }
 
     async fn do_read(
+        &self,
+        params: &Value,
+        context: &IpcOperationContext,
+    ) -> Result<Value, HandlerError> {
+        let error = match self.read_direct(params, context).await {
+            Err(error) => error,
+            read => return read,
+        };
+        // The receipt may be asked for through `latest`, so the wait applies
+        // to the real path.
+        let (params, error) = match self.relinked(params, &error, true).await {
+            Some(real) => match self.read_direct(&real, context).await {
+                Err(error) => (real, error),
+                read => return read,
+            },
+            None => (params.clone(), error),
+        };
+        if self.receipt_is_due(&params, &error).await {
+            return self.read_receipt_when_mined(&params, context, error).await;
+        }
+        Err(error)
+    }
+
+    /// Whether `params` names the receipt of an outbox entry that was
+    /// broadcast (it has a `tx_hash`) but has no receipt recorded yet.
+    async fn receipt_is_due(&self, params: &Value, error: &HandlerError) -> bool {
+        let Ok(path) = parse_path(params) else {
+            return false;
+        };
+        let segments = path.segments();
+        let [.., outbox, sent, _, leaf] = segments else {
+            return false;
+        };
+        if !matches!(error, HandlerError::NotFound(_))
+            || outbox != "outbox"
+            || sent != "sent"
+            || leaf != "receipt.json"
+        {
+            return false;
+        }
+        let sibling = format!("/{}/tx_hash", segments[..segments.len() - 1].join("/"));
+        match VfsPath::parse(&sibling) {
+            Ok(tx_hash) => self.vfs.lookup(&tx_hash).await.is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// A receipt is recorded once the transaction is mined, moments after the
+    /// confirm that sent it returns. Wait for it briefly, so a caller that
+    /// confirms and reads the receipt in one command gets it.
+    async fn read_receipt_when_mined(
+        &self,
+        params: &Value,
+        context: &IpcOperationContext,
+        absent: HandlerError,
+    ) -> Result<Value, HandlerError> {
+        for _ in 0..RECEIPT_POLLS {
+            if context.is_cancelled() {
+                break;
+            }
+            tokio::time::sleep(APPROVAL_POLL).await;
+            match self.read_direct(params, context).await {
+                Err(HandlerError::NotFound(_)) => continue,
+                read => return read,
+            }
+        }
+        Err(absent)
+    }
+
+    async fn read_direct(
         &self,
         params: &Value,
         context: &IpcOperationContext,
@@ -1341,16 +1494,105 @@ impl IpcServer {
         params: &Value,
         context: &IpcOperationContext,
     ) -> Result<(), WriteError> {
+        match self.write_direct(params, context).await {
+            Err(WriteError::Handler(error)) => match self.relinked(params, &error, false).await {
+                Some(real) => self.write_direct(&real, context).await,
+                None => Err(error.into()),
+            },
+            written => written,
+        }
+    }
+
+    async fn write_direct(
+        &self,
+        params: &Value,
+        context: &IpcOperationContext,
+    ) -> Result<(), WriteError> {
         let path = parse_path(params)?;
         if write_path_uses_wallet_signer(&path) && !is_fee_repair_write(&path, params) {
             return Err(HandlerError::PermissionDenied.into());
         }
         let bytes = parse_write_bytes(params)?;
+        if matches!(path.segments(), [root, _, _, leaf] if root == "wallets" && leaf == "confirm-batch")
+        {
+            return self.write_batch_confirm(&path, &bytes, context).await;
+        }
         let Some(challenge) = confirm_challenge_path(&path) else {
-            return Ok(self.vfs.write(&path, &bytes).await?);
+            return match self.vfs.write(&path, &bytes).await {
+                // `outbox/send.tx` stages and asks the owner in one write:
+                // answer as a first confirm does, with the link.
+                Err(HandlerError::ApprovalPending(challenge))
+                    if path.segments().last().is_some_and(|leaf| leaf == "send.tx") =>
+                {
+                    let url = match VfsPath::parse(&format!("/{challenge}")) {
+                        Ok(challenge) => self.vfs.read(&challenge).await.ok(),
+                        Err(_) => None,
+                    }
+                    .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok());
+                    // Several bodies were staged: say so, or the caller
+                    // checks each entry before asking the owner.
+                    let staged = url
+                        .as_ref()
+                        .and_then(|doc| doc["entries"].as_array())
+                        .filter(|entries| entries.len() > 1)
+                        .map(|entries| {
+                            format!(" for {} staged transactions, sent in order", entries.len())
+                        })
+                        .unwrap_or_default();
+                    // Name the entry: `latest` is whatever was staged last,
+                    // which another writer may have changed since.
+                    let id = url
+                        .as_ref()
+                        .and_then(|doc| doc["entries"].as_array()?.last()?.as_str())
+                        .and_then(|entry| entry.split_once(':'))
+                        .map(|(_, id)| id.to_owned())
+                        .or_else(|| challenge.rsplit('/').nth(1).map(str::to_owned))
+                        .unwrap_or_default();
+                    let url = url.and_then(|doc| doc["ceremony_url"].as_str().map(str::to_owned));
+                    Err(match url {
+                        Some(url) => WriteError::Approval(format!(
+                            "permission denied: owner approval required{staged}: {url} . Write y to pending/{id}/confirm: it waits for their approval, then sends."
+                        )),
+                        None => HandlerError::ApprovalPending(challenge).into(),
+                    })
+                }
+                written => Ok(written?),
+            };
         };
+        // The batch the latest `confirm-batch` shows, if this entry is in it:
+        // a confirm repeated after its link was returned waits for it.
+        let batch_ref = match path.segments() {
+            [_, _, _, _, chain, _, _, id, _] => format!("{chain}:{id}"),
+            _ => String::new(),
+        };
+        let seen_batch = match path.segments() {
+            [_, wallet, number, ..] => {
+                VfsPath::parse(&format!("/wallets/{wallet}/{number}/confirm-batch")).ok()
+            }
+            _ => None,
+        };
+        let seen_batch = match &seen_batch {
+            Some(batch) => self.awaited_batch(batch).await,
+            None => None,
+        }
+        .filter(|(_, _, entries)| entries.contains(&batch_ref));
         let waiting_for = self.approval_id(&challenge).await;
         match self.vfs.write(&path, &bytes).await {
+            // An entry asked for as part of a batch waits as its batch does,
+            // retrying exactly that batch's entries: a batch another writer
+            // starts meanwhile is never sent in its place.
+            Err(HandlerError::ApprovalPending(batch)) if batch.ends_with("/confirm-batch") => {
+                let pending = || HandlerError::ApprovalPending(batch.clone());
+                let batch_path = VfsPath::parse(&format!("/{batch}")).map_err(|_| pending())?;
+                match self.awaited_batch(&batch_path).await {
+                    Some((_, _, entries)) if entries.contains(&batch_ref) => {
+                        let seen = seen_batch.map(|(action, ..)| action);
+                        self.await_batch(&batch_path, entries.join(" ").as_bytes(), seen, context)
+                            .await
+                    }
+                    _ => Err(pending().into()),
+                }
+            }
             Err(denied @ (HandlerError::PermissionDenied | HandlerError::ApprovalPending(_))) => {
                 self.await_approval(&path, &bytes, &challenge, waiting_for, denied, context)
                     .await
@@ -1373,6 +1615,78 @@ impl IpcServer {
         match self.vfs.write(path, bytes).await {
             Err(_) if self.sent_elsewhere(path).await => Ok(()),
             result => Ok(result?),
+        }
+    }
+
+    /// The batch a `confirm-batch` file reports as waiting for the owner:
+    /// its action, link and entries in order.
+    async fn awaited_batch(&self, path: &VfsPath) -> Option<(String, String, Vec<String>)> {
+        let status: Value = serde_json::from_slice(&self.vfs.read(path).await.ok()?).ok()?;
+        let field = |name: &str| status[name].as_str().unwrap_or_default().to_owned();
+        let entries = status["entries"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.as_str().map(str::to_owned))
+            .collect();
+        (status["status"] == "awaiting_ceremony")
+            .then(|| (field("action_id"), field("ceremony_url"), entries))
+    }
+
+    /// `confirm-batch` behaves as a single confirm does: the first write
+    /// returns the owner's link at once, and a repeat for the same batch
+    /// waits for their approval, then sends.
+    async fn write_batch_confirm(
+        &self,
+        path: &VfsPath,
+        bytes: &[u8],
+        context: &IpcOperationContext,
+    ) -> Result<(), WriteError> {
+        let awaited = self.awaited_batch(path).await;
+        // `y` repeats the batch waiting now. Retry it by its entries, so a
+        // batch another writer starts meanwhile is never sent in its place.
+        let named = match &awaited {
+            Some((_, _, entries)) if bytes.trim_ascii() == b"y" && !entries.is_empty() => {
+                entries.join(" ").into_bytes()
+            }
+            _ => bytes.to_vec(),
+        };
+        match self.vfs.write(path, &named).await {
+            Err(HandlerError::ApprovalPending(_)) => {}
+            result => return Ok(result?),
+        }
+        let waiting_for = awaited.map(|(action, ..)| action);
+        self.await_batch(path, &named, waiting_for, context).await
+    }
+
+    /// After a batch write was denied for approval: when the caller already
+    /// saw that approval (`waiting_for`), repeat `bytes` until the owner
+    /// approves; otherwise return the link.
+    async fn await_batch(
+        &self,
+        path: &VfsPath,
+        bytes: &[u8],
+        waiting_for: Option<String>,
+        context: &IpcOperationContext,
+    ) -> Result<(), WriteError> {
+        let deadline = tokio::time::Instant::now() + self.approval_wait;
+        loop {
+            let (action, url, _) = self.awaited_batch(path).await.unwrap_or_default();
+            if waiting_for.as_deref() != Some(action.as_str())
+                || context.is_cancelled()
+                || tokio::time::Instant::now() >= deadline
+            {
+                return Err(WriteError::Approval(format!(
+                    "permission denied: owner approval required: {url} . Write y to confirm-batch: it waits for their approval, then sends."
+                )));
+            }
+            // Each attempt is an audited request, so poll less often than a
+            // single confirm does.
+            tokio::time::sleep(BATCH_APPROVAL_POLL).await;
+            match self.vfs.write(path, bytes).await {
+                Err(HandlerError::ApprovalPending(_)) => {}
+                result => return Ok(result?),
+            }
         }
     }
 
@@ -1474,14 +1788,15 @@ impl IpcServer {
                 }
             }
             if new_approval || context.is_cancelled() || tokio::time::Instant::now() >= deadline {
+                // Short on purpose: naming the challenge file here sent
+                // agents off to read it before retrying.
                 let link = if url.is_empty() {
-                    format!("in {challenge_file}")
+                    format!("the link in {challenge_file}")
                 } else {
-                    format!("{url} (also in {challenge_file})")
+                    url.to_owned()
                 };
                 return Err(WriteError::Approval(format!(
-                    "permission denied: owner approval required. Give the human the ceremony link {link}, then write confirm to {} again; it waits for the approval and sends.",
-                    path.to_string_path()
+                    "permission denied: owner approval required: {link} . Write confirm again: it waits for their approval, then sends."
                 )));
             }
             first = false;
@@ -1512,6 +1827,16 @@ impl IpcServer {
     }
 
     async fn do_list(&self, params: &Value) -> Result<Value, HandlerError> {
+        match self.list_direct(params).await {
+            Err(error) => match self.relinked(params, &error, true).await {
+                Some(real) => self.list_direct(&real).await,
+                None => Err(error),
+            },
+            listed => listed,
+        }
+    }
+
+    async fn list_direct(&self, params: &Value) -> Result<Value, HandlerError> {
         let path = parse_path(params)?;
         let entries = self.vfs.list(&path).await?;
         Ok(json!(entries.iter().map(entry_to_json).collect::<Vec<_>>()))
@@ -2894,9 +3219,8 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         assert_eq!(error.code, -32007);
         for needle in [
-            "give the human the ceremony link http://localhost:28735/c/abc",
-            "/wallets/w/0/chains/base/outbox/pending/tx-1/approval_challenge.json",
-            "write confirm to /wallets/w/0/chains/base/outbox/pending/tx-1/confirm again",
+            "owner approval required: http://localhost:28735/c/abc ",
+            "write confirm again: it waits for their approval",
         ] {
             assert!(
                 error
@@ -4651,6 +4975,372 @@ summary = "Demo app used by IPC tests."
             .await
             .unwrap();
         handle.await.unwrap();
+    }
+
+    /// A box with `latest -> pending/x1`, as the wallet outbox has.
+    struct LinkedEntry(tokio::sync::Mutex<Vec<String>>);
+
+    #[async_trait::async_trait]
+    impl Handler for LinkedEntry {
+        async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+            let segments: Vec<&str> = path.segments().iter().map(String::as_str).collect();
+            match segments.as_slice() {
+                [] => Ok(Entry::dir("box")),
+                ["latest"] => Ok(Entry::symlink("latest", "pending/x1")),
+                ["first"] => Ok(Entry::symlink("first", "latest")),
+                ["pending"] | ["pending", "x1"] => Ok(Entry::dir(segments[segments.len() - 1])),
+                ["pending", "x1", "plan.md"] => Ok(Entry::file("plan.md")),
+                ["pending", "x1", "confirm"] => Ok(Entry::writable_file("confirm")),
+                _ => Err(HandlerError::NotFound(path.to_string_path())),
+            }
+        }
+
+        async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            match path.to_string_path().as_str() {
+                "/pending/x1/plan.md" => Ok(b"the plan".to_vec()),
+                other => Err(HandlerError::NotAFile(other.to_owned())),
+            }
+        }
+
+        async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            match path.to_string_path().as_str() {
+                "/pending/x1" => Ok(vec![Entry::file("plan.md")]),
+                other => Err(HandlerError::NotFound(other.to_owned())),
+            }
+        }
+
+        async fn write(&self, path: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+            match path.to_string_path().as_str() {
+                "/pending/x1/confirm" => {
+                    self.0.lock().await.push(path.to_string_path());
+                    Ok(())
+                }
+                "/latest/new.tx" => Err(HandlerError::invalid("unknown name")),
+                "/pending/x1/new.tx" => Ok(()),
+                _ => Err(HandlerError::PermissionDenied),
+            }
+        }
+    }
+
+    /// A kernel mount follows `outbox/latest`; IPC and MCP callers get the
+    /// same paths, and the link itself still reads as a link.
+    #[tokio::test]
+    async fn paths_through_a_symlink_reach_what_it_points_at() {
+        let handler = Arc::new(LinkedEntry(tokio::sync::Mutex::new(Vec::new())));
+        let server = IpcServer::new(
+            Vfs::builder().mount("box", handler.clone()).build(),
+            "0",
+            vec![],
+        );
+        let context = IpcOperationContext::detached();
+
+        let read = server
+            .do_read(&json!({"path": "/box/latest/plan.md"}), &context)
+            .await
+            .unwrap();
+        assert_eq!(read["bytes_b64"], B64.encode("the plan"));
+        // A path may cross two links.
+        let twice = server
+            .do_read(&json!({"path": "/box/first/plan.md"}), &context)
+            .await
+            .unwrap();
+        assert_eq!(twice["bytes_b64"], B64.encode("the plan"));
+        let listed = server
+            .do_list(&json!({"path": "/box/latest"}))
+            .await
+            .unwrap();
+        assert_eq!(listed[0]["name"], "plan.md");
+        let inside = server
+            .do_lookup(&json!({"path": "/box/latest/plan.md"}))
+            .await
+            .unwrap();
+        assert_eq!(inside["kind"], "file");
+        let write = json!({"path": "/box/latest/confirm", "bytes_b64": B64.encode("y")});
+        assert!(server.do_write(&write, &context).await.is_ok());
+        assert_eq!(*handler.0.lock().await, ["/pending/x1/confirm"]);
+        // A handler may refuse a linked name as invalid rather than absent.
+        let staged = json!({"path": "/box/latest/new.tx", "bytes_b64": ""});
+        assert!(server.do_write(&staged, &context).await.is_ok());
+
+        let link = server
+            .do_lookup(&json!({"path": "/box/latest"}))
+            .await
+            .unwrap();
+        assert_eq!(link["kind"], "symlink");
+        // A path that is simply absent still fails as before.
+        assert!(
+            server
+                .do_read(&json!({"path": "/box/latest/nope"}), &context)
+                .await
+                .is_err()
+        );
+        let denied = json!({"path": "/box/pending/x1/other", "bytes_b64": ""});
+        assert!(server.do_write(&denied, &context).await.is_err());
+    }
+
+    /// A `confirm-batch` file whose batch is approved after two writes.
+    struct BatchFile(std::sync::atomic::AtomicU32);
+
+    #[async_trait::async_trait]
+    impl Handler for BatchFile {
+        async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+            Ok(Entry::writable_file(
+                path.segments().last().map_or("w", String::as_str),
+            ))
+        }
+
+        async fn read(&self, _path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            Ok(match self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                0 => b"usage".to_vec(),
+                1 | 2 => br#"{"status":"awaiting_ceremony","action_id":"b1","ceremony_url":"http://localhost:1/c/b"}"#.to_vec(),
+                _ => br#"{"status":"succeeded"}"#.to_vec(),
+            })
+        }
+
+        async fn write(&self, _path: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+            match self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 | 1 => Err(HandlerError::ApprovalPending("w/0/confirm-batch".into())),
+                _ => Ok(()),
+            }
+        }
+    }
+
+    /// The first batch write returns the owner's link at once; the repeat
+    /// waits for their approval, as a repeated confirm does.
+    #[tokio::test]
+    async fn a_repeated_batch_confirm_waits_for_the_owner() {
+        let handler = Arc::new(BatchFile(std::sync::atomic::AtomicU32::new(0)));
+        let server = IpcServer::new(
+            Vfs::builder().mount("wallets", handler.clone()).build(),
+            "0",
+            vec![],
+        );
+        let context = IpcOperationContext::detached();
+        let write = json!({"path": "/wallets/w/0/confirm-batch", "bytes_b64": B64.encode("base:tx-1 base:tx-2")});
+        let started = std::time::Instant::now();
+        let Err(WriteError::Approval(message)) = server.do_write(&write, &context).await else {
+            panic!("the first write must report the approval link");
+        };
+        assert!(message.contains("http://localhost:1/c/b"), "{message}");
+        assert!(started.elapsed() < BATCH_APPROVAL_POLL);
+        // Still waiting on this write; approved by the next attempt.
+        assert!(server.do_write(&write, &context).await.is_ok());
+        assert!(started.elapsed() >= BATCH_APPROVAL_POLL);
+    }
+
+    /// A batch of `tx-1` waiting for the owner; records the paths written.
+    struct AwaitedBatch(parking_lot::Mutex<Vec<String>>);
+
+    #[async_trait::async_trait]
+    impl Handler for AwaitedBatch {
+        async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+            Ok(Entry::writable_file(
+                path.segments().last().map_or("w", String::as_str),
+            ))
+        }
+
+        async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            if path
+                .segments()
+                .last()
+                .is_some_and(|leaf| leaf == "confirm-batch")
+            {
+                return Ok(br#"{"status":"awaiting_ceremony","entries":["base:tx-1"]}"#.to_vec());
+            }
+            Err(HandlerError::NotFound(path.to_string_path()))
+        }
+
+        async fn write(&self, path: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+            self.0.lock().push(path.to_string_path());
+            Ok(())
+        }
+    }
+
+    /// `confirm.override` of a batched entry is written as asked, never
+    /// turned into its batch.
+    #[tokio::test]
+    async fn an_override_of_a_batched_entry_is_not_sent_as_the_batch() {
+        let handler = Arc::new(AwaitedBatch(parking_lot::Mutex::new(Vec::new())));
+        let server = IpcServer::new(
+            Vfs::builder().mount("wallets", handler.clone()).build(),
+            "0",
+            vec![],
+        );
+        let context = IpcOperationContext::detached();
+        let entry = "/wallets/w/0/chains/base/outbox/pending/tx-1/confirm.override";
+        let write = json!({"path": entry, "bytes_b64": B64.encode("y")});
+        assert!(server.do_write(&write, &context).await.is_ok());
+        assert_eq!(
+            *handler.0.lock(),
+            ["/w/0/chains/base/outbox/pending/tx-1/confirm.override".to_owned()]
+        );
+    }
+
+    /// Batch `b1` of `tx-1, tx-2` waits for the owner; an entry's `confirm`
+    /// is routed to it, and the second batch write is approved. Records each
+    /// write's path and text.
+    struct EntryOfBatch(parking_lot::Mutex<Vec<(String, String)>>);
+
+    #[async_trait::async_trait]
+    impl Handler for EntryOfBatch {
+        async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+            Ok(Entry::writable_file(
+                path.segments().last().map_or("w", String::as_str),
+            ))
+        }
+
+        async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            if path
+                .segments()
+                .last()
+                .is_some_and(|leaf| leaf == "confirm-batch")
+            {
+                return Ok(br#"{"status":"awaiting_ceremony","action_id":"b1","entries":["base:tx-1","base:tx-2"]}"#.to_vec());
+            }
+            Err(HandlerError::NotFound(path.to_string_path()))
+        }
+
+        async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
+            let mut writes = self.0.lock();
+            writes.push((
+                path.to_string_path(),
+                String::from_utf8_lossy(data).into_owned(),
+            ));
+            if writes.len() < 3 {
+                return Err(HandlerError::ApprovalPending(
+                    "wallets/w/0/confirm-batch".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    /// `y` to a batched entry's `confirm` waits for its batch and retries
+    /// that batch by its entries, never by `y`, which names whatever batch
+    /// was started last.
+    #[tokio::test]
+    async fn a_batched_entry_confirm_retries_its_own_batch() {
+        let handler = Arc::new(EntryOfBatch(parking_lot::Mutex::new(Vec::new())));
+        let server = IpcServer::new(
+            Vfs::builder().mount("wallets", handler.clone()).build(),
+            "0",
+            vec![],
+        );
+        let context = IpcOperationContext::detached();
+        let entry = "/wallets/w/0/chains/base/outbox/pending/tx-1/confirm";
+        let write = json!({"path": entry, "bytes_b64": B64.encode("y")});
+        assert!(server.do_write(&write, &context).await.is_ok());
+        let batch = (
+            "/w/0/confirm-batch".to_owned(),
+            "base:tx-1 base:tx-2".to_owned(),
+        );
+        assert_eq!(
+            *handler.0.lock(),
+            [
+                (
+                    "/w/0/chains/base/outbox/pending/tx-1/confirm".to_owned(),
+                    "y".to_owned()
+                ),
+                batch.clone(),
+                batch,
+            ]
+        );
+    }
+
+    /// An outbox whose `send.tx` stages `tx-9` and asks the owner.
+    struct SendFile;
+
+    #[async_trait::async_trait]
+    impl Handler for SendFile {
+        async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+            Ok(Entry::writable_file(
+                path.segments().last().map_or("w", String::as_str),
+            ))
+        }
+
+        async fn read(&self, _path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            Ok(br#"{"ceremony_url":"http://localhost:1/c/s"}"#.to_vec())
+        }
+
+        async fn write(&self, _path: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+            Err(HandlerError::ApprovalPending(
+                "wallets/w/0/chains/base/outbox/pending/tx-9/approval_challenge.json".into(),
+            ))
+        }
+    }
+
+    /// `send.tx` answers with the link and the entry to confirm by id:
+    /// `latest` may be someone else's entry by the time the caller writes.
+    #[tokio::test]
+    async fn send_tx_names_the_entry_it_staged() {
+        let server = IpcServer::new(
+            Vfs::builder().mount("wallets", Arc::new(SendFile)).build(),
+            "0",
+            vec![],
+        );
+        let write = json!({"path": "/wallets/w/0/chains/base/outbox/send.tx", "bytes_b64": B64.encode("send 1 ETH to 0x01")});
+        let context = IpcOperationContext::detached();
+        let Err(WriteError::Approval(message)) = server.do_write(&write, &context).await else {
+            panic!("send.tx must report the approval link");
+        };
+        assert!(
+            message.contains("http://localhost:1/c/s")
+                && message.contains("Write y to pending/tx-9/confirm"),
+            "{message}"
+        );
+    }
+
+    /// A sent entry whose receipt is recorded only on the fourth read.
+    struct LateReceipt(std::sync::atomic::AtomicU32);
+
+    #[async_trait::async_trait]
+    impl Handler for LateReceipt {
+        async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+            match path.to_string_path().as_str() {
+                "/outbox/sent/x1/tx_hash" => Ok(Entry::file("tx_hash")),
+                "/outbox/latest" => Ok(Entry::symlink("latest", "sent/x1")),
+                "/outbox" => Ok(Entry::dir("outbox")),
+                other => Err(HandlerError::NotFound(other.to_owned())),
+            }
+        }
+
+        async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            let reads = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match path.to_string_path().as_str() {
+                "/outbox/sent/x1/receipt.json" if reads >= 3 => Ok(b"{}".to_vec()),
+                other => Err(HandlerError::NotFound(other.to_owned())),
+            }
+        }
+    }
+
+    /// Confirm-then-read-the-receipt in one command must not miss a receipt
+    /// that is recorded a moment after the send. Only a broadcast entry waits.
+    #[tokio::test]
+    async fn a_receipt_read_waits_for_a_broadcast_entry_to_be_mined() {
+        let handler = Arc::new(LateReceipt(std::sync::atomic::AtomicU32::new(0)));
+        let server = IpcServer::new(
+            Vfs::builder().mount("w", handler.clone()).build(),
+            "0",
+            vec![],
+        );
+        let context = IpcOperationContext::detached();
+        let receipt = json!({"path": "/w/outbox/sent/x1/receipt.json"});
+        let read = server.do_read(&receipt, &context).await.unwrap();
+        assert_eq!(read["bytes_b64"], B64.encode("{}"));
+
+        // The same wait applies when the entry is reached through a link.
+        handler.0.store(0, std::sync::atomic::Ordering::SeqCst);
+        let linked = json!({"path": "/w/outbox/latest/receipt.json"});
+        let read = server.do_read(&linked, &context).await.unwrap();
+        assert_eq!(read["bytes_b64"], B64.encode("{}"));
+
+        let started = std::time::Instant::now();
+        let unknown = json!({"path": "/w/outbox/sent/nope/receipt.json"});
+        assert!(server.do_read(&unknown, &context).await.is_err());
+        assert!(
+            started.elapsed() < APPROVAL_POLL,
+            "an unknown entry must not wait"
+        );
     }
 
     #[tokio::test]
