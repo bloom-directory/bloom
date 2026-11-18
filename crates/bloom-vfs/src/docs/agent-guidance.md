@@ -21,9 +21,12 @@ one of these forms:
 send 0.25 ETH to 0x...
 {"kind":"send","to":"0x...","token":"USDC","amount":"10"}              human units
 {"kind":"approve","token":"0x...","spender":"0x...","amount":"1000000"}  raw units; "0" revokes
-{"kind":"raw","to":"0x...","data":"0x...","value":"0"}                  any contract call
-{"kind":"call","contract":"0x...","method":"transfer(address,uint256)","args":["0x...","1"]}
+{"kind":"call","contract":"0x...","method":"supply(address,uint256,address,uint16)","args":["0x...","1000000","0x...",0]}
+{"kind":"raw","to":"0x...","data":"0x...","value":"0"}                  calldata you built
 ```
+
+`call` encodes the arguments for you (a struct is a JSON array); `value`
+is in wei.
 
 That stages it, asks the owner, and answers with what will be signed and
 their approval link (on a mount the write is refused; both are in
