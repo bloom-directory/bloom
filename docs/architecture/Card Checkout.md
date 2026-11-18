@@ -12,11 +12,12 @@ the approval page, or the human's private view of the browser.
 - **Machine** exposes `cards/` and `checkout/` in VFS. It forwards closed
   requests to Broker (cards) and to `bloom-checkout` (shopping), and re-parses
   every response into a closed public type before it reaches VFS.
-- **`bloom-checkout`** is its own principal. It owns a headless Chromium over a
-  CDP pipe, using Chromium's normal browser identity. With `--xvfb` on Linux
-  the Chromium is headed on Checkout's own Xvfb display, which runs in a
-  private user and mount namespace so its socket never enters the host's
-  `/tmp`; without that namespace Checkout runs headless, never on a host display.
+- **`bloom-checkout`** is its own principal. It owns a Chromium over a CDP pipe,
+  using Chromium's normal browser identity. With `--xvfb` on Linux the
+  Chromium is headed on Checkout's own Xvfb display, because some shops refuse
+  headless browsers. That display runs in a private user and mount namespace,
+  so its socket never enters the host's `/tmp`. Without that namespace, and on
+  macOS, Checkout runs headless, never on a host display.
   It accepts Machine requests only from the Machine UID, reads checkout facts,
   fills a released card and clicks the pay button. Its operation store is a
   private SQLite file.
