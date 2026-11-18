@@ -634,6 +634,46 @@ impl ChainClient {
         }
     }
 
+    /// Simulate `calls` in order, each on the state the earlier ones leave
+    /// (`eth_simulateV1`), so a call that depends on an earlier one (a supply
+    /// after its approval) is judged as it will run. One outcome per call,
+    /// as [`Self::eth_call_capture_revert`] gives. `Err` when the node cannot
+    /// simulate a sequence.
+    pub async fn simulate_sequence(
+        &self,
+        calls: &[TransactionRequest],
+    ) -> Result<Vec<Result<Bytes, Bytes>>, ChainError> {
+        let payload = serde_json::json!({ "blockStateCalls": [{ "calls": calls }] });
+        let res: serde_json::Value = self
+            .primary
+            .client()
+            .request("eth_simulateV1", (payload, "latest"))
+            .await
+            .map_err(|e| ChainError::Rpc(e.to_string()))?;
+        let outcomes = res[0]["calls"]
+            .as_array()
+            .filter(|outcomes| outcomes.len() == calls.len())
+            .ok_or_else(|| ChainError::Decode("eth_simulateV1: unexpected result shape".into()))?;
+        let bytes = |value: &serde_json::Value| {
+            value
+                .as_str()
+                .and_then(|hex| hex.parse::<Bytes>().ok())
+                .unwrap_or_default()
+        };
+        Ok(outcomes
+            .iter()
+            .map(|outcome| {
+                if outcome["status"] == "0x1" {
+                    Ok(bytes(&outcome["returnData"]))
+                } else if outcome["error"]["data"].is_string() {
+                    Err(bytes(&outcome["error"]["data"]))
+                } else {
+                    Err(bytes(&outcome["returnData"]))
+                }
+            })
+            .collect())
+    }
+
     pub async fn gas_price(&self) -> Result<u128, ChainError> {
         Ok(self.primary.get_gas_price().await?)
     }
@@ -2103,6 +2143,28 @@ mod mock_rpc_tests {
         let v = c.debug_trace_call(req, None).await.unwrap();
         assert_eq!(v["type"], "CALL");
         assert_eq!(v["gasUsed"], "0x1");
+    }
+
+    // -- simulate_sequence -------------------------------------------------
+
+    #[tokio::test]
+    async fn simulate_sequence_reports_each_call_in_order() {
+        let mut r = responses();
+        r.insert(
+            "eth_simulateV1".into(),
+            vec![MockResponse::Ok(
+                r#"[{"calls":[{"status":"0x1","returnData":"0x01"},{"status":"0x0","returnData":"0x","error":{"code":3,"message":"execution reverted","data":"0xdead"}}]}]"#
+                    .into(),
+            )],
+        );
+        let url = spawn_mock(r).await;
+        let c = client_at(&url);
+        let calls = [TransactionRequest::default(), TransactionRequest::default()];
+        let out = c.simulate_sequence(&calls).await.unwrap();
+        assert_eq!(out[0].as_ref().unwrap().as_ref(), &[0x01]);
+        assert_eq!(out[1].as_ref().unwrap_err().as_ref(), &[0xde, 0xad]);
+        // A node without the method, or a result of the wrong length, is an error.
+        assert!(c.simulate_sequence(&calls[..1]).await.is_err());
     }
 
     // -- eth_call_capture_revert ------------------------------------------
