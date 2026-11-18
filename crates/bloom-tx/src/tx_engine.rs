@@ -131,6 +131,9 @@ pub enum TxEngineError {
     Address(String),
     #[error("amount: {0}")]
     Amount(String),
+    /// A `call` body whose arguments do not fit its method.
+    #[error("{0}")]
+    Call(String),
     /// A body's `data` is not hex calldata.
     #[error("invalid data: {0}; give the calldata as 0x-prefixed hex, two digits per byte")]
     Data(String),
@@ -1101,7 +1104,7 @@ impl TxEngine {
                     parse_eth(value).map_err(|e| TxEngineError::Amount(e.to_string()))?
                 };
                 let data = bloom_tools::encode_call(method, &serde_json::json!(args))
-                    .map_err(|e| TxEngineError::Amount(format!("encode_call: {e}")))?;
+                    .map_err(|e| TxEngineError::Call(format!("call {method}: {e}")))?;
                 Ok((Some(contract_addr), v, data, None, None))
             }
             RawIntentBody::Approve {

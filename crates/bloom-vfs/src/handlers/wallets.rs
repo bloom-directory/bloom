@@ -2860,6 +2860,7 @@ fn tx_open_err(e: TxEngineError) -> HandlerError {
         // What the body said, not a Bloom failure.
         | TxEngineError::Address(_)
         | TxEngineError::Amount(_)
+        | TxEngineError::Call(_)
         | TxEngineError::Data(_) => HandlerError::invalid(e.to_string()),
         other => err_be(other),
     }

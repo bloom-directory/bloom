@@ -1230,8 +1230,10 @@ impl WalletsHandler {
                     .read_in_state(wallet, entry_chain, entry, OutboxState::Pending)
                     .is_ok();
                 if entry_chain == chain && still_pending {
-                    self.write_outbox_from(wallet, chain, from, &policy, &cancel, b"cancel", number)
-                        .await?;
+                    self.write_outbox_from(
+                        wallet, chain, from, &policy, &cancel, b"cancel", number,
+                    )
+                    .await?;
                 }
             }
             return Ok(());

@@ -314,7 +314,10 @@ fn changes(before: &[Value], after: &[Value]) -> String {
         let d = I256::from_raw(now).wrapping_sub(I256::from_raw(was));
         (!d.is_zero()).then(|| {
             let sign = if d.is_negative() { "-" } else { "+" };
-            format!(" ({sign}{})", bloom_proto::format_units(d.unsigned_abs(), decimals))
+            format!(
+                " ({sign}{})",
+                bloom_proto::format_units(d.unsigned_abs(), decimals)
+            )
         })
     };
     let decimals = |h: &Value| h["decimals"].as_u64().unwrap_or(0) as u8;
@@ -719,16 +722,26 @@ mod tests {
     /// is not mistaken for the whole balance; one spent to zero still shows.
     #[test]
     fn balances_show_what_the_confirm_changed() {
-        let h = |symbol: &str, decimals: u8, raw: &str, display: &str| {
-            serde_json::json!({"asset": symbol, "symbol": symbol, "decimals": decimals, "raw": raw, "display": display})
-        };
-        let before = [h("ETH", 18, "2000000000000000000", "2 ETH"), h("USDC", 6, "50000000000", "50000 USDC"), h("WETH", 18, "1", "0.000000000000000001 WETH")];
-        let after = [h("ETH", 18, "1500000000000000000", "1.5 ETH"), h("USDC", 6, "51144033300", "51144.0333 USDC"), h("WETH", 18, "1", "0.000000000000000001 WETH"), h("DAI", 18, "1000000000000000000", "1 DAI")];
+        let h = |symbol: &str, decimals: u8, raw: &str, display: &str| serde_json::json!({"asset": symbol, "symbol": symbol, "decimals": decimals, "raw": raw, "display": display});
+        let before = [
+            h("ETH", 18, "2000000000000000000", "2 ETH"),
+            h("USDC", 6, "50000000000", "50000 USDC"),
+            h("WETH", 18, "1", "0.000000000000000001 WETH"),
+        ];
+        let after = [
+            h("ETH", 18, "1500000000000000000", "1.5 ETH"),
+            h("USDC", 6, "51144033300", "51144.0333 USDC"),
+            h("WETH", 18, "1", "0.000000000000000001 WETH"),
+            h("DAI", 18, "1000000000000000000", "1 DAI"),
+        ];
         assert_eq!(
             changes(&before, &after),
             "1.5 ETH (-0.5), 51144.0333 USDC (+1144.0333), 0.000000000000000001 WETH, 1 DAI (+1)"
         );
-        assert_eq!(changes(&after[..2], &after[..1]), "1.5 ETH, 0 USDC (-51144.0333)");
+        assert_eq!(
+            changes(&after[..2], &after[..1]),
+            "1.5 ETH, 0 USDC (-51144.0333)"
+        );
     }
 
     /// `send.tx` stages one entry and asks the owner.
