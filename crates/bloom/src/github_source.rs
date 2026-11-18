@@ -3162,7 +3162,7 @@ mod tests {
         );
         assert_eq!(
             results[0].outcome,
-            crate::petal_provisioning::ProvisioningOutcome::Installed
+            crate::petal_provisioning::ProvisioningOutcome::Updated
         );
         assert_eq!(installed_owner(&daemon).as_deref(), Some(new_hash));
         assert_eq!(
