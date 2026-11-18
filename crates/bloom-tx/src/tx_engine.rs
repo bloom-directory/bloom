@@ -2100,8 +2100,11 @@ impl TxEngine {
         );
         staged.policy_checks.extend(staged_policy_extras);
 
-        let plan =
+        let mut plan =
             bloom_proto::PlanRender::render(&staged, &spec.native_symbol, spec.native_decimals);
+        if let Some(action) = approve_action(chain, from, to, &data_hex).await {
+            plan = plan.replacen("\nChain:  ", &format!("\n{action}Chain:  "), 1);
+        }
         self.outbox.write_pending(&staged, &plan)?;
         if let Some(body) = conflict_body {
             self.outbox
@@ -5721,6 +5724,40 @@ fn parse_approve_amount(s: &str) -> Result<U256, String> {
     U256::from_str_radix(t, 10).map_err(|e| format!("invalid uint256 '{s}': {e}"))
 }
 
+/// An ERC-20 approve's plan line: the allowance it sets beside the one it
+/// replaces, so neither needs reading from the chain. Best effort: `None`
+/// when the token cannot be read.
+async fn approve_action(
+    chain: &ChainClient,
+    owner: Address,
+    token: Option<Address>,
+    data_hex: &str,
+) -> Option<String> {
+    let call =
+        IERC20::approveCall::abi_decode(&hex::decode(data_hex.trim_start_matches("0x")).ok()?)
+            .ok()?;
+    let token = token?;
+    let decimals = chain.erc20_decimals(token).await.ok()??;
+    let symbol = match chain.erc20_symbol(token).await {
+        Ok(Some(symbol)) if !symbol.is_empty() => symbol,
+        _ => short_addr_label(&token),
+    };
+    let now = chain
+        .erc20_allowance(token, owner, call.spender)
+        .await
+        .ok()??;
+    let shown = |amount: U256| match amount {
+        U256::MAX => format!("unlimited {symbol}"),
+        amount => format!("{} {symbol}", bloom_proto::format_units(amount, decimals)),
+    };
+    Some(format!(
+        "Action: Allow {} to spend {} (allowance now {})\n",
+        bloom_proto::checksum_address(&call.spender),
+        shown(call.amount),
+        shown(now)
+    ))
+}
+
 /// Pull the `spender` argument out of an `approve(address,uint256)`
 /// calldata blob. Returns `None` if the buffer doesn't decode as an
 /// approve call — the caller treats that as "no spender hint" and
@@ -6687,6 +6724,47 @@ mod tests {
                 symbol: "TKN".into(),
                 decimals: 6,
             })
+        );
+    }
+
+    /// An approve's plan shows the allowance it replaces, so a revoke needs
+    /// no read of the chain before or after.
+    #[tokio::test]
+    async fn an_approve_plan_shows_the_allowance_it_replaces() {
+        let word = |n: u64| format!("\"0x{n:064x}\"");
+        let symbol = format!(
+            "\"0x{:064x}{:064x}{}\"",
+            32,
+            4,
+            format!("{:0<64}", hex::encode("USDC"))
+        );
+        let calls = vec![word(6), symbol, word(1_000_000_000)];
+        let chain =
+            stage_chain(&spawn_queued_rpc(HashMap::from([("eth_call".to_owned(), calls)])).await);
+        let spender: Address = "0x60e4f02b4975fbef4b951938859b7e4d5fd1372d"
+            .parse()
+            .unwrap();
+        let data = format!(
+            "0x{}",
+            hex::encode(
+                IERC20::approveCall {
+                    spender,
+                    amount: U256::ZERO
+                }
+                .abi_encode()
+            )
+        );
+        let token: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+            .parse()
+            .unwrap();
+        let owner: Address = TEST_SIGNER_ADDRESS.parse().unwrap();
+        assert_eq!(
+            approve_action(&chain, owner, Some(token), &data)
+                .await
+                .as_deref(),
+            Some(
+                "Action: Allow 0x60E4f02b4975fbEf4b951938859B7e4d5fD1372d to spend 0 USDC (allowance now 1000 USDC)\n"
+            )
         );
     }
 

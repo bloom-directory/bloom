@@ -5339,11 +5339,33 @@ async fn write_policy(
     params: serde_json::Value,
 ) -> Result<()> {
     let client = IpcClient::new(&endpoint.socket);
+    // Say what changed, so the caller need not read the policy back.
+    let added: Vec<String> = params["bytes_b64"]
+        .as_str()
+        .and_then(|body| B64.decode(body).ok())
+        .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+        .and_then(|body| body["add_destinations"].as_array().cloned())
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            Some(format!(
+                "{} on {}",
+                entry["destination"].as_str()?,
+                entry["chain"].as_str()?
+            ))
+        })
+        .collect();
     // The Machine answers a first write with the link and makes a repeat
     // wait for the owner; this only words the answer for a terminal.
     let (code, error) = match try_ipc_coded(&client, endpoint, "write", params).await {
         Ok(_) => {
-            println!("Policy updated.");
+            match added.is_empty() {
+                true => println!("Policy updated."),
+                false => println!(
+                    "Policy updated: sends to {} are now allowed.",
+                    added.join(", ")
+                ),
+            }
             return Ok(());
         }
         Err(denied) => denied,
