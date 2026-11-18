@@ -12,8 +12,10 @@ the approval page, or the human's private view of the browser.
 - **Machine** exposes `cards/` and `checkout/` in VFS. It forwards closed
   requests to Broker (cards) and to `bloom-checkout` (shopping), and re-parses
   every response into a closed public type before it reaches VFS.
-- **`bloom-checkout`** is its own principal. It owns a headless Chromium over a
-  CDP pipe, using Chromium's normal browser identity.
+- **`bloom-checkout`** is its own principal. It owns a Chromium over a CDP pipe,
+  using Chromium's normal browser identity. With `--xvfb` on Linux the
+  Chromium is headed on Checkout's own Xvfb display, because some shops refuse
+  headless browsers; otherwise, and on macOS, it runs headless.
   It accepts Machine requests only from the Machine UID, reads checkout facts,
   fills a released card and clicks the pay button. Its operation store is a
   private SQLite file.
@@ -151,10 +153,15 @@ access without that browser's existing origin-scoped session key. It is not reac
 Takeover is for login, verification, saved-traveler entry or an unsupported
 field. On handback, checkout discards the whole browsing context,
 including the login and any booking session, and resumes shopping in a fresh
-blank tab, as card and site-payment completion do. Machine's clicks are not
+blank tab, as card and site-payment completion do. The one exception is
+"Close and stay signed in", which only the person can choose: pages close but
+cookies and storage stay, so Machine can read signed-in pages (name,
+addresses, orders) and later take-overs start signed in. It is refused after
+saved traveler values were filled. Machine's clicks are not
 an authorization boundary: page text cannot tell a harmless "Continue" from a
-control that charges a shop-saved payment method, so no session the person
-authenticated is ever handed to Machine. Takeover buys nothing and releases
+control that charges a shop-saved payment method, so Machine's `click`,
+`type` and `select` are refused on every merchant page, including a kept
+sign-in. Takeover buys nothing and releases
 no card; saved-card and site payment need their separate approval for the
 exact merchant/total.
 
