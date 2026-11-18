@@ -26,9 +26,6 @@ pub(crate) const POLICY_LOCK_GRACE_MS: u64 = 30_000;
 /// before Broker reports it retired.
 const EXPIRED_CEREMONY_GRACE_MS: u64 = 30_000;
 
-/// The Petals setup offers, and the only ones a setup proposes or waits for.
-const SETUP_PETALS: &[&str] = bloom_proto::config::SETUP_PETALS;
-
 /// Name shown in the setup menu and in messages.
 pub(crate) fn petal_label(name: &str) -> &str {
     match name {
@@ -373,36 +370,22 @@ pub(crate) fn earlier_releases(
 }
 
 /// What a request asks of a wallet's policy, from `setup`: each chosen,
-/// installed Petal's package and destinations. A chosen Petal that is not
-/// installed is named, not proposed. Only the Petals setup offers count.
+/// installed Petal's package and destinations, as Machine's first Petal
+/// proposal resolves them ([`bloom_daemon::chosen_petals`]), with each one's
+/// earlier releases.
 fn default_policy_request(daemon: &Daemon, setup: &WalletSetup) -> Result<DefaultPolicyRequest> {
-    let mut request = DefaultPolicyRequest::default();
-    for name in setup.petals.keys() {
-        // Setup never offers these, so a config naming one, as only a hand
-        // edit or a Petal since dropped from the catalog can, allows nothing
-        // more; no release installs it, so waiting for it would never end.
-        if !SETUP_PETALS.contains(&name.as_str()) {
-            tracing::warn!(petal = %name, "default_policy.petal_not_in_setup_ignored");
-            continue;
-        }
-        let Some(hash) = daemon
-            .petals
-            .store()
-            .resolve_petal_owner(name)
-            .with_context(|| format!("resolve installed Petal {name}"))?
-        else {
-            request.not_installed.push(name.clone());
-            continue;
-        };
-        request.earlier.push(earlier_releases(daemon, name, &hash));
-        request.packages.push(
-            bloom_broker_api::Digest32::new(hash)
-                .with_context(|| format!("installed Petal {name} has an invalid package hash"))?,
-        );
+    let chosen = bloom_daemon::chosen_petals(daemon.petals.store(), setup)?;
+    let mut request = DefaultPolicyRequest {
+        destinations: chosen.destinations,
+        not_installed: chosen.not_installed,
+        ..DefaultPolicyRequest::default()
+    };
+    for petal in chosen.installed {
         request
-            .destinations
-            .extend(bloom_daemon::default_policy_destinations(name));
-        request.petals.push(name.clone());
+            .earlier
+            .push(earlier_releases(daemon, &petal.name, &petal.hash));
+        request.packages.push(petal.package);
+        request.petals.push(petal.name);
     }
     Ok(request)
 }
@@ -1041,6 +1024,7 @@ pub(crate) fn ceremony_expiry_from_output(output: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bloom_proto::config::SETUP_PETALS;
 
     fn chosen_setup(names: &[&str]) -> WalletSetup {
         let mut setup = WalletSetup::default();

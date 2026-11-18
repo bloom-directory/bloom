@@ -3981,18 +3981,42 @@ fn eligibility_host_error(wallet: &str, error: bloom_vfs::HandlerError) -> HostE
     HostError::Denied(error.to_string())
 }
 
-/// What a wallet's first Petal proposal also allows, from its setup: each
-/// chosen Petal that is installed, and its destinations. A chosen Petal that
-/// is not installed is listed in `not_installed`, so the proposal waits for
-/// it rather than leave it out of the policy for good. Only the Petals setup
-/// offers ([`bloom_proto::config::SETUP_PETALS`]) count. One whose owner
-/// record cannot be read, or holds an invalid package hash, fails the whole
-/// setup, so the proposal stops.
-fn default_policy_setup(
+/// A wallet's setup resolved against the Petals installed now: what its
+/// default policy allows. Machine's first Petal proposal and `bloom wallet
+/// default-policy` both read a setup through [`chosen_petals`], so which
+/// Petals count, and what each allows, is decided in one place.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ChosenPetals {
+    /// Each chosen, installed Petal.
+    pub installed: Vec<ChosenPetal>,
+    /// The destinations every installed Petal's transactions need.
+    pub destinations: Vec<bloom_broker_api::PolicyDestination>,
+    /// Chosen Petals with no installed package, so not proposed: one may
+    /// still be installing after Machine started, or have failed to.
+    pub not_installed: Vec<String>,
+}
+
+/// A chosen Petal and the package installed for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChosenPetal {
+    pub name: String,
+    /// The installed package's hash, as the Petal store names it.
+    pub hash: String,
+    pub package: bloom_broker_api::Digest32,
+}
+
+/// Resolve a wallet's setup against `store`: each chosen Petal that is
+/// installed, with its package, and the destinations it needs. A chosen
+/// Petal that is not installed is listed in `not_installed`, so a proposal
+/// waits for it rather than leave it out of the policy for good. Only the
+/// Petals setup offers ([`bloom_proto::config::SETUP_PETALS`]) count. One
+/// whose owner record cannot be read, or holds an invalid package hash,
+/// fails the whole setup, so nothing is proposed.
+pub fn chosen_petals(
     store: &PetalStore,
     chosen: &bloom_proto::config::WalletSetup,
-) -> Result<bloom_vfs::handlers::DefaultPolicySetup, bloom_vfs::HandlerError> {
-    let mut setup = bloom_vfs::handlers::DefaultPolicySetup::default();
+) -> Result<ChosenPetals, HandlerError> {
+    let mut petals = ChosenPetals::default();
     for name in chosen.petals.keys() {
         // Setup never offers these, so a config naming one, as only a hand
         // edit or a Petal since dropped from the catalog can, allows nothing
@@ -4003,21 +4027,45 @@ fn default_policy_setup(
         }
         let installed = store.resolve_petal_owner(name).map_err(|error| {
             warn!(petal = %name, %error, "petal.default_policy_owner_unreadable");
-            bloom_vfs::HandlerError::backend(format!("read the installed {name} Petal: {error}"))
+            HandlerError::backend(format!("read the installed {name} Petal: {error}"))
         })?;
         let Some(hash) = installed else {
-            setup.not_installed.push(name.clone());
+            petals.not_installed.push(name.clone());
             continue;
         };
-        let package = bloom_broker_api::Digest32::new(hash).map_err(|error| {
-            bloom_vfs::HandlerError::backend(format!(
+        let package = bloom_broker_api::Digest32::new(hash.clone()).map_err(|error| {
+            HandlerError::backend(format!(
                 "the installed {name} Petal has an invalid package hash: {error}"
             ))
         })?;
-        setup.packages.push(package);
-        setup.destinations.extend(default_policy_destinations(name));
+        petals
+            .destinations
+            .extend(default_policy_destinations(name));
+        petals.installed.push(ChosenPetal {
+            name: name.clone(),
+            hash,
+            package,
+        });
     }
-    Ok(setup)
+    Ok(petals)
+}
+
+/// What a wallet's first Petal proposal also allows, from its setup: the
+/// packages and destinations [`chosen_petals`] resolves.
+fn default_policy_setup(
+    store: &PetalStore,
+    chosen: &bloom_proto::config::WalletSetup,
+) -> Result<bloom_vfs::handlers::DefaultPolicySetup, HandlerError> {
+    let chosen = chosen_petals(store, chosen)?;
+    Ok(bloom_vfs::handlers::DefaultPolicySetup {
+        packages: chosen
+            .installed
+            .into_iter()
+            .map(|petal| petal.package)
+            .collect(),
+        destinations: chosen.destinations,
+        not_installed: chosen.not_installed,
+    })
 }
 
 /// [`default_policy_setup`] for `wallet`, from the config on disk now, not a
@@ -6447,6 +6495,28 @@ mod tests {
         let setup = default_policy_setup(&store, &chosen).unwrap();
         assert!(setup.not_installed.is_empty());
         assert_eq!(setup.packages.len(), 2);
+        // `bloom wallet default-policy` reads the same resolution, with each
+        // Petal's name and store hash, to find its earlier releases.
+        let chosen_now = chosen_petals(&store, &chosen).unwrap();
+        assert_eq!(
+            chosen_now
+                .installed
+                .iter()
+                .map(|petal| (petal.name.as_str(), petal.hash.clone()))
+                .collect::<Vec<_>>(),
+            [
+                ("hyperliquid", "ab".repeat(32)),
+                ("polymarket", "cd".repeat(32))
+            ]
+        );
+        assert_eq!(
+            chosen_now
+                .installed
+                .into_iter()
+                .map(|petal| petal.package)
+                .collect::<Vec<_>>(),
+            setup.packages
+        );
         assert_eq!(
             setup.destinations,
             default_policy_destinations("polymarket")
