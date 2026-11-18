@@ -13,14 +13,13 @@ send 0.25 ETH to 0x...
 `call` encodes the arguments for you (a struct is a JSON array); `value`
 is in wei.
 
-That stages it, asks the owner, and answers with what will be signed and
-their approval link (on a mount the write is refused; both are in
-`latest/plan.md`). `latest/` is that entry, before and after it is sent:
-`latest/plan.md` is what will be signed, writing `y` to
-`latest/confirm` waits for the approval, sends, and answers with the receipt
-of each entry it sent and the account's balances on that chain, each with
-what it changed by (on a mount,
-read `latest/receipt.json`). `new.tx` takes the same body and only
+That stages it, asks the owner, waits for their approval, sends, and
+answers with what was signed, the approval link, the receipt of each entry
+and the account's balances on that chain, each with what it changed by (on
+a mount the write is refused; read `latest/plan.md` for the link, write `y`
+to `latest/confirm`, then read `latest/receipt.json`). If the answer says it
+was not sent yet, write `y` to `latest/confirm`: it waits again, then sends.
+`new.tx` takes the same body and only
 stages it; `cancel` written to `latest/confirm` discards an entry, with the rest of
 its batch.
 

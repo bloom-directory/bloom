@@ -130,11 +130,24 @@ pub async fn write(
                 let url = url.and_then(|doc| doc["ceremony_url"].as_str().map(str::to_owned));
                 // Staging is not a failure: answer with what will be signed,
                 // so the caller need not read each plan before confirming.
+                // Experiment: wait for the owner here and send, so staging,
+                // approval and sending take one write.
                 if report && let Some(url) = &url {
                     let plans = staged_plans(vfs, path, &entries).await;
-                    return Ok(Some(format!(
-                        "{plans}Staged; owner approval{staged}: {url} . Write y to pending/{id}/confirm: it waits for their approval, then sends."
-                    )));
+                    let segments = path.segments();
+                    let outbox = segments[..segments.len() - 1].join("/");
+                    let asked = format!("{plans}Owner approval{staged}: {url}\n");
+                    let Ok(confirm) = VfsPath::parse(&format!("/{outbox}/pending/{id}/confirm")) else {
+                        return Ok(Some(asked));
+                    };
+                    let sent = Box::pin(write(vfs, &confirm, b"y", wait, cancelled, true)).await;
+                    return Ok(Some(match sent {
+                        Ok(report) => format!("{asked}{}", report.unwrap_or_default()),
+                        Err(WriteError::Approval(message)) => format!("{asked}Not sent: {message}"),
+                        Err(WriteError::Handler(error)) => format!(
+                            "{asked}Not sent: {error}. Write y to pending/{id}/confirm to retry the wait, or cancel."
+                        ),
+                    }));
                 }
                 Err(match url {
                     Some(url) => WriteError::Approval(format!(
