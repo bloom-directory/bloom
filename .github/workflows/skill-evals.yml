@@ -4,7 +4,9 @@ on:
   pull_request:
     paths: &skill_paths
       - ".github/workflows/skill-evals.yml"
+      - ".claude-plugin/**"
       - "skills/**"
+      - "install/**"
       - "evals/skills/**"
   push:
     branches:
@@ -38,3 +40,14 @@ jobs:
       # Grader fixtures and config validation only; no model calls.
       - name: Check onboarding grader and configs
         run: npm run check
+      - name: Check plugin manifests
+        working-directory: .
+        run: |
+          jq -er '.plugins[].source' .claude-plugin/marketplace.json | xargs -I{} test -f {}/.claude-plugin/plugin.json
+          jq -e '.name and .version' skills/bloom/.claude-plugin/plugin.json
+          # Installed plugins update only when this version changes, so it
+          # moves with the skill's version.
+          skill="$(sed -n -E 's/^  version: "?([0-9]+\.[0-9]+\.[0-9]+)"?$/\1/p' skills/bloom/SKILL.md)"
+          plugin="$(jq -r .version skills/bloom/.claude-plugin/plugin.json)"
+          [ -n "$skill" ] && [ "$skill" = "$plugin" ] ||
+            { echo "::error::plugin.json version $plugin differs from SKILL.md version $skill"; exit 1; }

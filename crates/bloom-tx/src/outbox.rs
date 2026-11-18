@@ -277,7 +277,7 @@ pub enum OutboxError {
         (Some(hash), _) => format!("it may have been broadcast as {hash}"),
         (None, SigningEvidence::Entry) => "a signing request may have been sent, but no transaction hash is recorded".to_owned(),
         (None, SigningEvidence::Cancel) => "a cancellation of it may have been signed, but no transaction hash is recorded; reconcile it by running `bloom wallet cancel` for it again".to_owned(),
-        (None, SigningEvidence::Batch { ordered_refs }) => format!("a batch signing request covering it may have been sent; reconcile that batch with `bloom wallet confirm-batch {wallet} {}`, listing its refs in exactly this order", ordered_refs.join(" ")),
+        (None, SigningEvidence::Batch { ordered_refs }) => format!("a batch signing request covering it may have been sent; reconcile that batch with `bloom wallet confirm-batch` for wallet '{wallet}' and its staging account, listing its refs in exactly this order: {}", ordered_refs.join(" ")),
         (None, SigningEvidence::UnreadableBatch) => format!("a batch signing record under outbox/{BATCH_SIGNING_STATE_DIR} could not be read, so Bloom cannot prove this entry was never signed"),
     })]
     PossiblySigned {
@@ -461,7 +461,9 @@ impl Outbox {
         root: impl Into<PathBuf>,
         projection: Arc<dyn CentralOutboxProjection>,
     ) -> Result<Self, OutboxError> {
-        Self::new_inner(root, Some(projection))
+        let outbox = Self::new_inner(root, Some(projection))?;
+        outbox.reconcile_terminal_actions()?;
+        Ok(outbox)
     }
 
     fn new_inner(
@@ -481,6 +483,84 @@ impl Outbox {
                 projection,
             }),
         })
+    }
+
+    /// Repair wallet-first transitions interrupted before the central projection.
+    /// Run before serving requests; this only updates projections, never transactions.
+    fn reconcile_terminal_actions(&self) -> Result<(), OutboxError> {
+        for wallet in fs::read_dir(&self.inner.root)? {
+            let wallet = wallet?;
+            if !wallet.file_type()?.is_dir()
+                || wallet.file_name().to_string_lossy().starts_with('.')
+            {
+                continue;
+            }
+            for chain in fs::read_dir(wallet.path())? {
+                let chain = chain?;
+                if !chain.file_type()?.is_dir() {
+                    continue;
+                }
+                for state in [OutboxState::Sent, OutboxState::Failed] {
+                    let entries = match fs::read_dir(chain.path().join(state.dirname())) {
+                        Ok(entries) => entries,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(e) => return Err(e.into()),
+                    };
+                    for entry in entries {
+                        let entry = entry?;
+                        if !entry.file_type()?.is_dir() {
+                            continue;
+                        }
+                        // An unreadable record is left unrepaired, as the sweep does,
+                        // rather than keeping the whole wallet daemon from starting.
+                        let path = entry.path().join("intent.json");
+                        let staged =
+                            fs::read(&path)
+                                .map_err(|error| error.to_string())
+                                .and_then(|bytes| {
+                                    serde_json::from_slice::<StagedTx>(&bytes)
+                                        .map_err(|error| error.to_string())
+                                });
+                        match staged {
+                            Ok(staged) => self.reconcile_terminal_action(&OutboxEntry {
+                                state,
+                                staged,
+                                dir: entry.path(),
+                            })?,
+                            Err(error) => tracing::warn!(
+                                path = %path.display(), %error, "outbox.reconcile_entry_unreadable"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn reconcile_terminal_action(&self, entry: &OutboxEntry) -> Result<(), OutboxError> {
+        let Some(action_id) = &entry.staged.action_id else {
+            return Ok(());
+        };
+        if entry.state == OutboxState::Pending {
+            return Ok(());
+        }
+        // A damaged id must not name a central path; skip it like an
+        // unreadable intent.
+        if !bloom_proto::is_valid_action_id(action_id) {
+            tracing::warn!(id = %entry.staged.id, %action_id, "outbox.reconcile_action_id_invalid");
+            return Ok(());
+        }
+        // The central transition also repairs status.json when its rename
+        // already completed. Never infer a new action from the wallet id.
+        self.transition_central_action(action_id, OutboxState::Pending, entry.state)?;
+        if entry.state == OutboxState::Sent
+            && let Err(error) = crate::tx_engine::repair_central_evm_result(self, entry)
+        {
+            // As at send time, the sent row stays the record.
+            tracing::warn!(id = %entry.staged.id, %action_id, %error, "tx.central_result_unwritten");
+        }
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {
@@ -1009,6 +1089,7 @@ impl Outbox {
         new_state: OutboxState,
     ) -> Result<PathBuf, OutboxError> {
         if entry.state == new_state {
+            self.reconcile_terminal_action(entry)?;
             return Ok(entry.dir.clone());
         }
         let target_parent = self.state_dir(&entry.staged.wallet, &entry.staged.chain, new_state)?;
@@ -2325,7 +2406,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("`bloom wallet confirm-batch alice anvil:second anvil:first`"),
+                .contains("wallet 'alice' and its staging account, listing its refs in exactly this order: anvil:second anvil:first"),
             "{error}"
         );
     }
@@ -2714,6 +2795,7 @@ mod tests {
         transitions: Mutex<Vec<(String, String, String)>>, // (id, from, to)
         fail_transition: Mutex<Option<String>>,
         action_files: Mutex<Vec<(String, String, String)>>,
+        file_data: Mutex<std::collections::HashMap<String, Vec<u8>>>,
     }
 
     impl MockProjection {
@@ -2724,6 +2806,7 @@ mod tests {
                 transitions: Mutex::new(vec![]),
                 fail_transition: Mutex::new(None),
                 action_files: Mutex::new(vec![]),
+                file_data: Mutex::new(Default::default()),
             }
         }
     }
@@ -2774,8 +2857,12 @@ mod tests {
             action_id: &str,
             state: &str,
             file: &str,
-            _data: &[u8],
+            data: &[u8],
         ) -> Result<(), String> {
+            self.file_data
+                .lock()
+                .unwrap()
+                .insert(format!("{action_id}/{state}/{file}"), data.to_vec());
             self.action_files.lock().unwrap().push((
                 action_id.to_string(),
                 state.to_string(),
@@ -2786,12 +2873,244 @@ mod tests {
 
         fn read_action_file(
             &self,
-            _action_id: &str,
-            _state: &str,
-            _file: &str,
+            action_id: &str,
+            state: &str,
+            file: &str,
         ) -> Result<Vec<u8>, String> {
-            Err("not found".into())
+            self.file_data
+                .lock()
+                .unwrap()
+                .get(&format!("{action_id}/{state}/{file}"))
+                .cloned()
+                .ok_or_else(|| "not found".into())
         }
+    }
+
+    #[test]
+    fn terminal_wallet_crash_is_repaired_on_retry_and_restart() {
+        for state in [OutboxState::Sent, OutboxState::Failed] {
+            let dir = tempfile::tempdir().unwrap();
+            let projection = Arc::new(MockProjection::new());
+            let outbox = Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
+            let staged = fake_staged("crash");
+            outbox.write_pending(&staged, "plan").unwrap();
+            let pending = outbox.read("alice", "anvil", &staged.id).unwrap();
+            let action_id = pending.staged.action_id.clone().unwrap();
+            // Persist exactly the crash window: wallet rename completed, central
+            // transition never called. The intent still has its pending status.
+            let parent = outbox.state_dir("alice", "anvil", state).unwrap();
+            outbox.create_dir_durable(&parent).unwrap();
+            fs::rename(&pending.dir, parent.join(&staged.id)).unwrap();
+            sync_dir(&parent).unwrap();
+            sync_dir(pending.dir.parent().unwrap()).unwrap();
+            drop(outbox);
+            let reopened = Outbox::new(dir.path()).unwrap();
+            let terminal = reopened.read("alice", "anvil", &staged.id).unwrap();
+            let bytes = fs::read(terminal.dir.join("intent.json")).unwrap();
+            drop(reopened);
+            let reopened = Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
+            assert_eq!(
+                *projection.transitions.lock().unwrap(),
+                vec![(action_id.clone(), "pending".into(), state.dirname().into())]
+            );
+            reopened.transition(&terminal, state).unwrap();
+            assert_eq!(projection.transitions.lock().unwrap().len(), 2);
+            assert_eq!(fs::read(terminal.dir.join("intent.json")).unwrap(), bytes);
+            // Projection errors remain visible and leave the durable wallet alone.
+            *projection.fail_transition.lock().unwrap() = Some("unavailable".into());
+            assert!(reopened.transition(&terminal, state).is_err());
+            assert!(Outbox::new_with_projection(dir.path(), projection.clone()).is_err());
+            assert_eq!(fs::read(terminal.dir.join("intent.json")).unwrap(), bytes);
+        }
+    }
+
+    /// Persist a sent row whose `kind` broadcast produced `hash`.
+    fn sent_after_broadcast(
+        outbox: &Outbox,
+        id: &str,
+        kind: BroadcastAttemptKind,
+        hash: &str,
+    ) -> OutboxEntry {
+        let mut staged = fake_staged(id);
+        staged.gas_price = Some("1".into());
+        outbox.write_pending(&staged, "plan").unwrap();
+        let mut entry = outbox.read("alice", "anvil", &staged.id).unwrap();
+        let attempt = BroadcastAttempt {
+            schema: "bloom.broadcast_attempted.v1".into(),
+            tx_hash: hash.into(),
+            raw_tx_blake3: String::new(),
+            raw_tx_path: kind.raw_name().into(),
+            from: staged.from.clone(),
+            to: staged.to.clone(),
+            nonce: 0,
+            chain_id: staged.chain_id,
+            created_ms: 1,
+            transport: BroadcastTransport::PublicRpc,
+            private_provider: None,
+        };
+        outbox
+            .write_broadcast_attempt(&entry, kind, &attempt)
+            .unwrap();
+        entry.staged.status = TxStatus::Sent;
+        entry.staged.tx_hash = Some(hash.into());
+        outbox
+            .write_artefact(
+                &entry.dir,
+                "intent.json",
+                &serde_json::to_vec(&entry.staged).unwrap(),
+            )
+            .unwrap();
+        outbox.transition(&entry, OutboxState::Sent).unwrap();
+        outbox.read("alice", "anvil", id).unwrap()
+    }
+
+    fn central_json(projection: &MockProjection, action_id: &str, file: &str) -> serde_json::Value {
+        serde_json::from_slice(
+            &projection
+                .read_action_file(action_id, "sent", file)
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// A crash after the wallet move loses the central result; restart rebuilds
+    /// it from the recorded hash and attempt, once.
+    #[test]
+    fn restart_rebuilds_a_lost_central_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let projection = Arc::new(MockProjection::new());
+        let outbox = Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
+        let hash = format!("0x{}", "ab".repeat(32));
+        let entry = sent_after_broadcast(&outbox, "lost", BroadcastAttemptKind::Confirm, &hash);
+        let action_id = entry.staged.action_id.clone().unwrap();
+        drop(outbox);
+
+        let written = || projection.action_files.lock().unwrap().len();
+        Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
+        assert_eq!(written(), 2);
+        let read = |file| central_json(&projection, &action_id, file);
+        assert_eq!(read("result.json")["tx_hash"], hash);
+        assert_eq!(read("result.json")["action_kind"], "evm_confirm");
+        assert_eq!(read("status.json")["outcome"], "sent");
+        Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
+        assert_eq!(written(), 2, "a complete result is not rewritten");
+    }
+
+    /// A crash after a fee replacement updates the wallet row but before the
+    /// central result leaves the original hash centrally; restart replaces it.
+    #[test]
+    fn restart_replaces_a_stale_central_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let projection = Arc::new(MockProjection::new());
+        let outbox = Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
+        let original = format!("0x{}", "11".repeat(32));
+        let replacement = format!("0x{}", "22".repeat(32));
+        let entry = sent_after_broadcast(
+            &outbox,
+            "bumped",
+            BroadcastAttemptKind::Replacement,
+            &replacement,
+        );
+        let action_id = entry.staged.action_id.clone().unwrap();
+        for file in ["result.json", "status.json"] {
+            projection
+                .write_action_file(
+                    &action_id,
+                    "sent",
+                    file,
+                    &serde_json::to_vec(&serde_json::json!({ "tx_hash": original })).unwrap(),
+                )
+                .unwrap();
+        }
+        drop(outbox);
+
+        Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
+        let read = |file| central_json(&projection, &action_id, file);
+        assert_eq!(read("result.json")["tx_hash"], replacement);
+        assert_eq!(read("result.json")["action_kind"], "evm_replace");
+        assert_eq!(read("status.json")["tx_hash"], replacement);
+    }
+
+    /// A terminal intent whose persisted action id could escape the central
+    /// outbox is skipped without any central call; valid entries still repair.
+    #[test]
+    fn reconciliation_skips_invalid_action_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let projection = Arc::new(MockProjection::new());
+        let outbox = Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
+        let hash = format!("0x{}", "ab".repeat(32));
+        let valid = sent_after_broadcast(&outbox, "valid", BroadcastAttemptKind::Confirm, &hash);
+        let valid_id = valid.staged.action_id.clone().unwrap();
+        for (id, action_id) in [("empty", ""), ("dot", "."), ("escape", "../outside")] {
+            let mut entry = sent_after_broadcast(&outbox, id, BroadcastAttemptKind::Confirm, &hash);
+            entry.staged.action_id = Some(action_id.into());
+            outbox
+                .write_artefact(
+                    &entry.dir,
+                    "intent.json",
+                    &serde_json::to_vec(&entry.staged).unwrap(),
+                )
+                .unwrap();
+        }
+        drop(outbox);
+        projection.transitions.lock().unwrap().clear();
+        projection.action_files.lock().unwrap().clear();
+        projection.file_data.lock().unwrap().clear();
+
+        Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
+        let transitions = projection.transitions.lock().unwrap().clone();
+        assert_eq!(
+            transitions,
+            vec![(valid_id.clone(), "pending".into(), "sent".into())]
+        );
+        let files = projection.action_files.lock().unwrap().clone();
+        assert!(files.iter().all(|(action_id, _, _)| *action_id == valid_id));
+        assert_eq!(
+            central_json(&projection, &valid_id, "result.json")["tx_hash"],
+            hash
+        );
+    }
+
+    /// A missing or malformed terminal intent is skipped, untouched, and does
+    /// not keep the daemon from starting or block repair of other entries.
+    #[test]
+    fn reconciliation_skips_unreadable_terminal_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let projection = Arc::new(MockProjection::new());
+        let outbox = Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
+        let staged = fake_staged("crash");
+        outbox.write_pending(&staged, "plan").unwrap();
+        let pending = outbox.read("alice", "anvil", &staged.id).unwrap();
+        let sent = outbox
+            .state_dir("alice", "anvil", OutboxState::Sent)
+            .unwrap();
+        outbox.create_dir_durable(&sent).unwrap();
+        fs::rename(&pending.dir, sent.join(&staged.id)).unwrap();
+        fs::create_dir(sent.join("missing")).unwrap();
+        fs::create_dir(sent.join("corrupt")).unwrap();
+        fs::write(sent.join("corrupt/intent.json"), "{").unwrap();
+        drop(outbox);
+        Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
+        assert_eq!(projection.transitions.lock().unwrap().len(), 1);
+        assert_eq!(fs::read(sent.join("corrupt/intent.json")).unwrap(), b"{");
+        assert!(!sent.join("missing/intent.json").exists());
+    }
+
+    #[test]
+    fn reconciliation_leaves_pending_and_legacy_entries_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(dir.path()).unwrap();
+        let staged = fake_staged("legacy");
+        outbox.write_pending(&staged, "plan").unwrap();
+        let entry = outbox.read("alice", "anvil", &staged.id).unwrap();
+        outbox.transition(&entry, OutboxState::Sent).unwrap();
+        let projection = Arc::new(MockProjection::new());
+        let reopened = Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
+        reopened
+            .write_pending(&fake_staged("pending"), "plan")
+            .unwrap();
+        reopened.reconcile_terminal_actions().unwrap();
+        assert!(projection.transitions.lock().unwrap().is_empty());
     }
 
     #[test]
