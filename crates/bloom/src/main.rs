@@ -1807,6 +1807,17 @@ async fn execute_machine_command(
                 default_policy::DefaultPolicyMode::of_command(observe_only),
             )
             .await?;
+            // A waiting command's polls are logged as reads, but the one that
+            // settles its ceremony, by committing an approved change or
+            // finding it ended, is a transition worth an info line.
+            if observe_only && let Some(state) = default_policy::settled_state(&status) {
+                info!(
+                    event = "machine.workflow_transition",
+                    workflow = "default_policy",
+                    operation_id = "",
+                    state
+                );
+            }
             format!("{}\n", serde_json::to_string(&status)?)
         }
         MachineCommand::WalletOutboxCancel {
@@ -2926,6 +2937,11 @@ enum WalletCmd {
         /// Use a browser on the Bloom host instead of the default surface.
         #[arg(long)]
         local: bool,
+        /// Print the ceremony link and exit, without waiting for the wallet
+        /// and its default policy. For `main`, run `bloom wallet
+        /// default-policy main` once the wallet exists.
+        #[arg(long)]
+        no_wait: bool,
     },
     /// Start a Broker-hosted BIP-39 mnemonic import ceremony. The recovery
     /// phrase is entered only in the browser and never crosses Machine.
@@ -2938,6 +2954,11 @@ enum WalletCmd {
         /// Use the canonical localhost ceremony surface.
         #[arg(long)]
         local: bool,
+        /// Print the ceremony link and exit, without waiting for the wallet
+        /// and its default policy. For `main`, run `bloom wallet
+        /// default-policy main` once the wallet exists.
+        #[arg(long)]
+        no_wait: bool,
     },
     /// Approve the default policy for a wallet: one policy ceremony that allows
     /// the Petals chosen during setup. `new` and `import` run it for `main`.
@@ -3872,13 +3893,28 @@ async fn run(cli: Cli) -> Result<()> {
                     )?;
                 } else {
                     default_policy::accept_setup_suggestions(d.config.setup.main_mut());
+                    println!(
+                        "{}",
+                        default_policy::chosen_without_asking(d.config.setup.main())
+                    );
                 }
                 d.config.setup.complete = true;
                 // Only `[setup]` is written: the rest of the owner's config,
-                // comments included, stays as they wrote it.
-                d.config
-                    .save_setup(&d.home.config_path())
-                    .context("save setup choices")?;
+                // comments included, stays as they wrote it. A config Bloom
+                // cannot write, such as one the owner made read-only, does
+                // not stop the Petals installing: without the choices saved,
+                // no default policy is proposed, and the owner is told what
+                // to add.
+                let config_path = d.home.config_path();
+                if let Err(error) = d.config.save_setup(&config_path) {
+                    let setup = d.config.setup_toml().unwrap_or_default();
+                    eprintln!(
+                        "warning: could not save setup's choices to {}: {error}\n\
+                         Bloom still installs its Petals, but proposes no default policy until \
+                         the config has:\n\n{setup}",
+                        config_path.display()
+                    );
+                }
             }
             let preinstalled = github_source::ensure_preinstalled_petals(&home, &d)
                 .context("provision canonical pre-installed Petals")?;
@@ -4071,12 +4107,17 @@ async fn run(cli: Cli) -> Result<()> {
             .await?;
             Ok(())
         }
-        Cmd::Wallet(WalletCmd::New { name, local }) => {
+        Cmd::Wallet(WalletCmd::New {
+            name,
+            local,
+            no_wait,
+        }) => {
             default_policy::create_wallet_then_default_policy(
                 &client_endpoint,
                 name,
                 MachineCustodyKind::New,
                 local,
+                no_wait,
             )
             .await
         }
@@ -4084,12 +4125,14 @@ async fn run(cli: Cli) -> Result<()> {
             name,
             raw_private_key,
             local,
+            no_wait,
         }) => {
             default_policy::create_wallet_then_default_policy(
                 &client_endpoint,
                 name,
                 wallet_import_kind(raw_private_key),
                 local,
+                no_wait,
             )
             .await
         }
@@ -5774,6 +5817,12 @@ mod tests {
             new.cmd,
             Some(Cmd::Wallet(WalletCmd::New { local: true, .. }))
         ));
+        assert!(matches!(
+            Cli::try_parse_from(["bloom", "wallet", "new", "main", "--no-wait"])
+                .unwrap()
+                .cmd,
+            Some(Cmd::Wallet(WalletCmd::New { no_wait: true, .. }))
+        ));
         let import = Cli::try_parse_from(["bloom", "wallet", "import", "main", "--local"]).unwrap();
         assert!(matches!(
             import.cmd,
@@ -5830,6 +5879,7 @@ mod tests {
                 name,
                 raw_private_key: false,
                 local: false,
+                no_wait: false,
             })) if name == "recovered"
         ));
         assert_eq!(
@@ -5859,6 +5909,7 @@ mod tests {
                 name,
                 raw_private_key: true,
                 local: false,
+                no_wait: false,
             })) if name == "legacy-local"
         ));
         assert_eq!(
@@ -6509,6 +6560,7 @@ mod tests {
                 name,
                 raw_private_key: false,
                 local: false,
+                no_wait: false,
             })) if name == "wallet"
         ));
 

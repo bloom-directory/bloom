@@ -588,6 +588,47 @@ mod tests {
         }
     }
 
+    /// Enso's catalog entry names the Petal, not its router. The router runs
+    /// whatever calldata it is given, so a listed router would let the
+    /// agent's own raw call, or an approval naming it, through on every chain.
+    #[test]
+    fn only_enso_may_call_its_router() {
+        let destinations = bloom_proto::petal_destinations::for_petal("enso");
+        assert!(
+            destinations
+                .iter()
+                .all(|destination| destination.destination == "petal:enso"),
+            "{destinations:?}"
+        );
+        let listed: Vec<&str> = destinations
+            .iter()
+            .filter(|destination| destination.chain == "base")
+            .map(|destination| destination.destination)
+            .collect();
+        assert_eq!(listed, ["petal:enso"]);
+        let policy = policy_allowing(&listed);
+        const ROUTER: &str = "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf";
+        assert!(!has_hard_violation(&evaluate(
+            &policy,
+            "base",
+            U256::ZERO,
+            18,
+            staged_by(Some("petal:enso"), ROUTER),
+        )));
+        for origin in [Some("petal:polymarket"), None] {
+            assert!(
+                has_hard_violation(&evaluate(
+                    &policy,
+                    "base",
+                    U256::ZERO,
+                    18,
+                    staged_by(origin, ROUTER),
+                )),
+                "{origin:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_petal_entry_covers_only_the_petal_it_names_exactly() {
         // Another Petal whose name differs only in case is a different Petal,

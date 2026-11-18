@@ -1,4 +1,5 @@
-//! Fixed contracts each canonical Petal stages EVM transactions to.
+//! What each canonical Petal's EVM transactions need the wallet policy to
+//! allow.
 //!
 //! Machine refuses an outbox transaction whose `to` address is not in the
 //! wallet policy's `allowed_destinations`, and an empty list refuses every
@@ -7,12 +8,13 @@
 //! in Bloom's source, never in config or in anything a Petal supplies at
 //! runtime, and the owner still approves the policy ceremony that adds them.
 //!
-//! Destinations that change per transaction cannot be listed here: an ERC-20
-//! approval's token contract, a NEAR Intents deposit address, or the deposit
-//! wallet Polymarket funds. Nor can a token contract a Petal calls: Machine
-//! takes a contract call's `to` as its recipient, so listing a token would let
-//! any staged call to it, from any Petal or the agent, transfer or approve
-//! that token to anyone. Such Petals get a `petal:<name>` entry instead.
+//! No contract address is listed. Machine takes a contract call's `to` as its
+//! recipient, so listing a token contract or a router would let any staged
+//! call to it, from any Petal or the agent, transfer, approve or forward funds
+//! to anyone. Destinations that change per transaction, such as an approval's
+//! token or a NEAR Intents deposit address, cannot be listed either. Each
+//! Petal instead gets a `petal:<name>` entry on the chains it uses, which
+//! Machine matches only against what that Petal staged.
 
 /// A wallet policy destination: a Bloom chain name and an address on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,77 +35,72 @@ pub fn for_petal(name: &str) -> &'static [PetalPolicyDestination] {
     }
 }
 
-/// Enso Router V2 on every chain Enso's shipped route rules allow, by Bloom
-/// chain name. Machine refuses an outbox transaction whose destination is not
-/// in the wallet policy, so a chain missing here cannot swap even though Enso
-/// plans the route.
+/// Enso swaps through its Router V2, which runs whatever command sequence a
+/// transaction's calldata gives it, so it can forward the value or tokens it
+/// receives anywhere. Listing the router's address would let any call to it
+/// pass, including the agent's own raw call or an approval naming it as
+/// spender. `petal:enso` instead trusts only what this Petal stages, as with
+/// Polymarket and NEAR Intents: the router call, and the exact approval of a
+/// route's input token, which varies per route. Every transaction is still an
+/// approval the owner signs.
 ///
-/// Each address is Enso's published deployment for that chain
-/// (https://docs.enso.build/pages/build/reference/deployments) and was checked
-/// with `eth_getCode`: identical bytecode wherever the address repeats, and a
-/// distinct deployment on Linea and on Robinhood Chain and Tempo. Adding a
-/// chain means checking its router the same way, and a chain Enso's rules stop
-/// allowing comes out: Enso v0.1.7 dropped Arc, so its router is not listed.
-///
-/// Enso's approvals go to the input token, which varies per route, so a swap
-/// from an ERC-20 still needs that token allowed separately.
+/// The chains are the ones Enso's shipped route rules allow, by Bloom chain
+/// name; Machine refuses an outbox transaction on a chain missing here, so
+/// such a chain cannot swap even though Enso plans the route. A chain Enso's
+/// rules stop allowing comes out: Enso v0.1.7 dropped Arc, so it is not listed.
 pub const ENSO_POLICY_DESTINATIONS: &[PetalPolicyDestination] = &[
     PetalPolicyDestination {
         chain: "arbitrum",
-        destination: ENSO_ROUTER_V2,
+        destination: ENSO_STAGED,
     },
     PetalPolicyDestination {
         chain: "avalanche",
-        destination: ENSO_ROUTER_V2,
+        destination: ENSO_STAGED,
     },
     PetalPolicyDestination {
         chain: "base",
-        destination: ENSO_ROUTER_V2,
+        destination: ENSO_STAGED,
     },
     PetalPolicyDestination {
         chain: "bsc",
-        destination: ENSO_ROUTER_V2,
+        destination: ENSO_STAGED,
     },
     PetalPolicyDestination {
         chain: "ethereum",
-        destination: ENSO_ROUTER_V2,
+        destination: ENSO_STAGED,
     },
     PetalPolicyDestination {
         chain: "gnosis",
-        destination: ENSO_ROUTER_V2,
+        destination: ENSO_STAGED,
     },
     PetalPolicyDestination {
         chain: "hyperliquid",
-        destination: ENSO_ROUTER_V2,
+        destination: ENSO_STAGED,
     },
     PetalPolicyDestination {
         chain: "optimism",
-        destination: ENSO_ROUTER_V2,
+        destination: ENSO_STAGED,
     },
     PetalPolicyDestination {
         chain: "polygon",
-        destination: ENSO_ROUTER_V2,
+        destination: ENSO_STAGED,
     },
     PetalPolicyDestination {
         chain: "linea",
-        destination: ENSO_ROUTER_V2_LINEA,
+        destination: ENSO_STAGED,
     },
     PetalPolicyDestination {
         chain: "robinhood",
-        destination: ENSO_ROUTER_V2_ROBINHOOD_TEMPO,
+        destination: ENSO_STAGED,
     },
     PetalPolicyDestination {
         chain: "tempo",
-        destination: ENSO_ROUTER_V2_ROBINHOOD_TEMPO,
+        destination: ENSO_STAGED,
     },
 ];
 
-/// Enso Router V2 on every covered chain except Linea, Robinhood Chain and Tempo.
-const ENSO_ROUTER_V2: &str = "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf";
-/// Enso's separate Linea deployment.
-const ENSO_ROUTER_V2_LINEA: &str = "0xa146d46823f3f594b785200102be5385cafce9b5";
-/// Enso's deployment shared by Robinhood Chain and Tempo.
-const ENSO_ROUTER_V2_ROBINHOOD_TEMPO: &str = "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7";
+/// What Enso stages, as Machine records it on an outbox entry.
+const ENSO_STAGED: &str = "petal:enso";
 
 /// NEAR Intents deposits go to a fresh address for every quote, signed by the
 /// 1Click API, so no fixed address can be listed. `petal:near-intents` instead

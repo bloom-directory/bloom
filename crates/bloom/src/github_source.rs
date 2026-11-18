@@ -3175,6 +3175,12 @@ mod tests {
         );
         let meta = daemon.petals.store().load_meta(new_hash).unwrap();
         assert_eq!(meta.replaced.as_deref(), Some(old_hash));
+        // A policy approved for the replaced release is recognised as one
+        // Bloom updated, not one the owner removed the Petal from.
+        assert!(
+            crate::default_policy::earlier_releases(&daemon, "near-intents", new_hash)
+                .contains(&bloom_broker_api::Digest32::new(old_hash.to_owned()).unwrap())
+        );
         assert_eq!(
             meta.source.as_ref().unwrap().resolved_commit,
             NEAR_NEW_COMMIT

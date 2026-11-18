@@ -106,6 +106,22 @@ pub(crate) fn accept_setup_suggestions(setup: &mut WalletSetup) {
     }
 }
 
+/// What `bloom init` chose without a terminal to ask on, and where to change
+/// it before the wallet is created.
+pub(crate) fn chosen_without_asking(setup: &WalletSetup) -> String {
+    let chosen: Vec<String> = setup.petals.keys().cloned().collect();
+    let allows = if chosen.is_empty() {
+        "no Petals".to_owned()
+    } else {
+        petal_labels(&chosen)
+    };
+    format!(
+        "setup: without a terminal to ask on, {DEFAULT_POLICY_WALLET}'s default policy will \
+         allow {allows}. To change that before creating {DEFAULT_POLICY_WALLET}, edit \
+         [setup.wallets.{DEFAULT_POLICY_WALLET}.petals] in config.toml."
+    )
+}
+
 fn ask_yes_no(
     input: &mut impl BufRead,
     output: &mut impl Write,
@@ -201,9 +217,24 @@ pub(crate) enum DefaultPolicyStatus {
         missing: Vec<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         not_installed: Vec<String>,
+        /// Chosen Petals the policy allows an earlier release of, which
+        /// Bloom has since updated: the owner removed nothing.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        updated: Vec<String>,
     },
     /// Another command is changing the wallet's policy right now.
     Busy,
+}
+
+/// How an observed wait ended, for Machine's log: `None` while the
+/// ceremony still waits for the owner or the status needs no transition.
+pub(crate) fn settled_state(status: &DefaultPolicyStatus) -> Option<&'static str> {
+    match status {
+        DefaultPolicyStatus::Applied { .. } => Some("applied"),
+        DefaultPolicyStatus::ProposalEnded => Some("ended"),
+        DefaultPolicyStatus::ChangedSinceCreation { .. } => Some("changed_since_creation"),
+        _ => None,
+    }
 }
 
 /// What a default-policy request does with the wallet's setup.
@@ -237,6 +268,9 @@ pub(crate) struct DefaultPolicyRequest {
     /// Chosen, installed Petals, in step with `packages`.
     pub(crate) petals: Vec<String>,
     pub(crate) packages: Vec<bloom_broker_api::Digest32>,
+    /// Each installed Petal's earlier releases, in step with `petals`: what a
+    /// policy approved before Bloom updated it may still name.
+    pub(crate) earlier: Vec<Vec<bloom_broker_api::Digest32>>,
     pub(crate) destinations: Vec<bloom_broker_api::PolicyDestination>,
     /// Chosen Petals not installed yet, so not proposed: one may still be
     /// installing after Machine started, or have failed to.
@@ -258,21 +292,84 @@ impl DefaultPolicyRequest {
     }
 
     /// The chosen, installed Petals `current` does not allow: its package,
-    /// or any of the destinations its transactions need, is missing.
-    fn missing(&self, current: &bloom_broker_api::SignedPolicySnapshot) -> Result<Vec<String>> {
+    /// or any of the destinations its transactions need, is missing. Those it
+    /// allows an earlier release of, with every destination, are returned
+    /// apart as updated: Bloom changed their package, not the owner.
+    fn missing(&self, current: &bloom_broker_api::SignedPolicySnapshot) -> Result<Missing> {
         let policy = decode_policy(current)?;
-        let mut missing = Vec::new();
-        for (name, package) in self.petals.iter().zip(&self.packages) {
-            if !policy.allowed_petal_packages.contains(package)
-                || bloom_daemon::default_policy_destinations(name)
+        let mut missing = Missing::default();
+        let earlier = self
+            .earlier
+            .iter()
+            .map(Vec::as_slice)
+            .chain(std::iter::repeat(&[][..]));
+        for ((name, package), earlier) in self.petals.iter().zip(&self.packages).zip(earlier) {
+            let destinations_allowed = bloom_daemon::default_policy_destinations(name)
+                .iter()
+                .all(|destination| policy.allowed_destinations.contains(destination));
+            if destinations_allowed && policy.allowed_petal_packages.contains(package) {
+                continue;
+            }
+            if destinations_allowed
+                && earlier
                     .iter()
-                    .any(|destination| !policy.allowed_destinations.contains(destination))
+                    .any(|release| policy.allowed_petal_packages.contains(release))
             {
-                missing.push(name.clone());
+                missing.updated.push(name.clone());
+            } else {
+                missing.missing.push(name.clone());
             }
         }
         Ok(missing)
     }
+}
+
+/// What a changed policy lacks of the setup.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Missing {
+    /// Petals the policy allows no release of.
+    missing: Vec<String>,
+    /// Petals the policy allows an earlier release of.
+    updated: Vec<String>,
+}
+
+/// The earlier releases of the Petal installed as `hash`: the packages it
+/// replaced, as far back as the store remembers, and the predecessors
+/// Bloom's catalog names for it.
+pub(crate) fn earlier_releases(
+    daemon: &Daemon,
+    name: &str,
+    hash: &str,
+) -> Vec<bloom_broker_api::Digest32> {
+    let mut earlier = Vec::new();
+    let mut next = daemon
+        .petals
+        .store()
+        .load_meta(hash)
+        .ok()
+        .and_then(|meta| meta.replaced);
+    // Bounded, in case a damaged store links releases in a loop.
+    for _ in 0..64 {
+        let Some(replaced) = next.take() else { break };
+        if let Ok(digest) = bloom_broker_api::Digest32::new(replaced.clone()) {
+            earlier.push(digest);
+        }
+        next = daemon
+            .petals
+            .store()
+            .load_meta(&replaced)
+            .ok()
+            .and_then(|meta| meta.replaced);
+    }
+    if let Some(entry) = crate::github_source::preinstalled_petal(name) {
+        earlier.extend(
+            entry
+                .predecessor_package_hashes
+                .iter()
+                .filter_map(|hash| bloom_broker_api::Digest32::new((*hash).to_owned()).ok()),
+        );
+    }
+    earlier
 }
 
 /// What a request asks of a wallet's policy, from `setup`: each chosen,
@@ -297,6 +394,7 @@ fn default_policy_request(daemon: &Daemon, setup: &WalletSetup) -> Result<Defaul
             request.not_installed.push(name.clone());
             continue;
         };
+        request.earlier.push(earlier_releases(daemon, name, &hash));
         request.packages.push(
             bloom_broker_api::Digest32::new(hash)
                 .with_context(|| format!("installed Petal {name} has an invalid package hash"))?,
@@ -394,9 +492,11 @@ fn settled_status(
                 not_installed: request.not_installed,
             }
         } else {
+            let Missing { missing, updated } = request.missing(&current)?;
             DefaultPolicyStatus::ChangedSinceCreation {
-                missing: request.missing(&current)?,
+                missing,
                 not_installed: request.not_installed,
+                updated,
             }
         },
     )
@@ -413,9 +513,11 @@ fn proposal_status(
             petals: request.petals,
         },
         bloom_machine_client::PetalEligibility::ChangedSinceCreation(current) => {
+            let Missing { missing, updated } = request.missing(&current)?;
             DefaultPolicyStatus::ChangedSinceCreation {
-                missing: request.missing(&current)?,
+                missing,
                 not_installed: Vec::new(),
+                updated,
             }
         }
         bloom_machine_client::PetalEligibility::AwaitingPolicyApproval(pending) => {
@@ -590,18 +692,23 @@ impl DefaultPolicyWait {
         self.announced.is_some()
     }
 
-    /// Whether the announced policy ceremony has expired. Checked after a
-    /// status read so an idle owner is not handed a replacement ceremony.
+    /// Whether the announced policy ceremony has expired, with the same
+    /// grace as any other ceremony: an approval the owner gave just before
+    /// expiry may still be verifying, and Broker, not this clock, decides
+    /// whether it commits. Checked after a status read so an idle owner is
+    /// not handed a replacement ceremony.
     pub(crate) fn ceremony_expired(&self, now_ms: u64) -> bool {
-        self.announced.is_some() && now_ms >= self.deadline_ms
+        self.announced.is_some()
+            && now_ms >= self.deadline_ms.saturating_add(EXPIRED_CEREMONY_GRACE_MS)
     }
 
     pub(crate) fn report_expired(&self, output: &mut impl Write) -> Result<()> {
         writeln!(
             output,
-            "default_policy: the approval for {} ended without your approval, as it expired or was refused, so nothing changed; run `{}` for a new one",
+            "default_policy: the approval for {} ended without your approval, as it expired or was refused, so nothing changed; run `{}` for a new one. It allows every Petal chosen during setup; to allow fewer, remove the others from [setup.wallets.{}.petals] in config.toml first",
             self.wallet,
-            self.resume()
+            self.resume(),
+            self.wallet
         )?;
         Ok(())
     }
@@ -705,7 +812,16 @@ impl DefaultPolicyWait {
             DefaultPolicyStatus::ChangedSinceCreation {
                 missing,
                 not_installed,
+                updated,
             } => {
+                if !updated.is_empty() {
+                    writeln!(
+                        output,
+                        "default_policy: {wallet}'s policy allows an earlier release of {}, which Bloom has since updated; the next use asks you to approve the new release. To allow it now, {}",
+                        petal_labels(updated),
+                        policy_update_steps(&wallet)
+                    )?;
+                }
                 if !missing.is_empty() {
                     writeln!(
                         output,
@@ -825,12 +941,15 @@ impl DefaultPolicyWait {
 }
 
 /// Run a wallet creation or import command. For the default-policy wallet,
-/// then wait for the wallet and walk the owner through its default policy.
+/// then wait for the wallet and walk the owner through its default policy,
+/// unless `no_wait` asks to return with the ceremony link, as a caller that
+/// sees output only once the command exits needs.
 pub(crate) async fn create_wallet_then_default_policy(
     endpoint: &crate::ResolvedEndpoint,
     name: String,
     kind: bloom_daemon::ipc::MachineCustodyKind,
     local: bool,
+    no_wait: bool,
 ) -> Result<()> {
     let output = crate::machine_command(
         endpoint,
@@ -843,6 +962,12 @@ pub(crate) async fn create_wallet_then_default_policy(
     .await?;
     crate::print_machine_command_output(&output)?;
     if output.exit_code != 0 || name != DEFAULT_POLICY_WALLET {
+        return Ok(());
+    }
+    if no_wait {
+        println!(
+            "default_policy: once {name} exists, run `bloom wallet default-policy {name}` to approve the Petals chosen during setup"
+        );
         return Ok(());
     }
     // Without a parseable expiry, wait as long as a wallet ceremony can last.
@@ -1059,6 +1184,7 @@ mod tests {
         let request = DefaultPolicyRequest {
             petals: vec!["polymarket".into()],
             packages: vec![package.clone()],
+            earlier: Vec::new(),
             destinations: destinations.clone(),
             not_installed: Vec::new(),
         };
@@ -1073,15 +1199,76 @@ mod tests {
         assert!(!request.allowed_by(&snapshot(&policy, 2)).unwrap());
         assert_eq!(
             request.missing(&snapshot(&policy, 2)).unwrap(),
-            ["polymarket"]
+            Missing {
+                missing: vec!["polymarket".into()],
+                updated: Vec::new(),
+            }
         );
         policy.allowed_destinations = destinations;
         assert!(request.allowed_by(&snapshot(&policy, 2)).unwrap());
-        assert!(request.missing(&snapshot(&policy, 2)).unwrap().is_empty());
+        assert_eq!(
+            request.missing(&snapshot(&policy, 2)).unwrap(),
+            Missing::default()
+        );
     }
 
-    /// With a chosen Petal not installed, a setup the owner just chose is not
-    /// proposed even before Machine asks Broker.
+    /// A policy that allows the release Bloom has since replaced is not one
+    /// the owner removed the Petal from: it is reported as updated.
+    #[test]
+    fn a_policy_allowing_an_earlier_release_reports_the_petal_updated() {
+        let installed = bloom_broker_api::Digest32::from_bytes([2; 32]);
+        let earlier = bloom_broker_api::Digest32::from_bytes([1; 32]);
+        let destinations = bloom_daemon::default_policy_destinations("polymarket");
+        let request = DefaultPolicyRequest {
+            petals: vec!["polymarket".into()],
+            packages: vec![installed],
+            earlier: vec![vec![earlier.clone()]],
+            destinations: destinations.clone(),
+            not_installed: Vec::new(),
+        };
+        let mut policy = bloom_broker_api::CanonicalWalletPolicy {
+            wallet_id: bloom_broker_api::Token::new("main").unwrap(),
+            maximum_approval_lifetime_ms: 60_000,
+            allowed_petal_packages: vec![earlier],
+            allowed_destinations: destinations,
+            required_verifiers: Vec::new(),
+            clear_signing: None,
+        };
+        assert_eq!(
+            request.missing(&snapshot(&policy, 2)).unwrap(),
+            Missing {
+                missing: Vec::new(),
+                updated: vec!["polymarket".into()],
+            }
+        );
+        // Without its destinations, the owner did take something away.
+        policy.allowed_destinations.clear();
+        assert_eq!(
+            request.missing(&snapshot(&policy, 2)).unwrap(),
+            Missing {
+                missing: vec!["polymarket".into()],
+                updated: Vec::new(),
+            }
+        );
+
+        let mut wait = DefaultPolicyWait::new("main", 1_000);
+        let (_, output) = observe(
+            &mut wait,
+            &DefaultPolicyStatus::ChangedSinceCreation {
+                missing: Vec::new(),
+                not_installed: Vec::new(),
+                updated: vec!["polymarket".into()],
+            },
+            10,
+        );
+        assert!(
+            output
+                .contains("allows an earlier release of Polymarket, which Bloom has since updated"),
+            "{output}"
+        );
+        assert!(!output.contains("has changed since"), "{output}");
+    }
+
     /// A wallet without chosen Petals has no default policy, before
     /// anything is read from Broker.
     #[tokio::test]
@@ -1130,6 +1317,7 @@ mod tests {
         let request = |missing: bool| DefaultPolicyRequest {
             petals: vec!["enso".into()],
             packages: vec![package.clone()],
+            earlier: Vec::new(),
             destinations: bloom_daemon::default_policy_destinations("enso"),
             not_installed: if missing {
                 vec!["hyperliquid".into()]
@@ -1176,6 +1364,7 @@ mod tests {
                     .iter()
                     .map(|name| (*name).to_owned())
                     .collect(),
+                updated: Vec::new(),
             };
         for mode in [Resume, Observe] {
             // Allowed with every chosen Petal installed: applied, whatever
@@ -1234,6 +1423,7 @@ mod tests {
         let request = DefaultPolicyRequest {
             petals: vec!["enso".into()],
             packages: vec![bloom_broker_api::Digest32::from_bytes([2; 32])],
+            earlier: Vec::new(),
             destinations: Vec::new(),
             not_installed: Vec::new(),
         };
@@ -1264,6 +1454,7 @@ mod tests {
             DefaultPolicyStatus::ChangedSinceCreation {
                 missing: vec!["enso".into()],
                 not_installed: Vec::new(),
+                updated: Vec::new(),
             }
         );
         assert!(matches!(
@@ -1337,8 +1528,19 @@ mod tests {
         assert!(output.contains("main allows Polymarket"), "{output}");
     }
 
-    /// Once announced, a ceremony that ended unapproved ends the wait without
-    /// a new link, and an expired one is never announced.
+    /// An announced ceremony is not called expired until the grace any
+    /// ceremony gets has passed, so an approval verifying at expiry is not
+    /// reported as ended and then committed.
+    #[test]
+    fn an_announced_ceremony_gets_the_grace_at_expiry() {
+        let mut wait = DefaultPolicyWait::new("main", 1_000);
+        let (_, first) = observe(&mut wait, &awaiting("op", 5_000, true), 10);
+        assert!(first.contains("default_policy_url"), "{first}");
+        assert!(!wait.ceremony_expired(5_000));
+        assert!(!wait.ceremony_expired(5_000 + EXPIRED_CEREMONY_GRACE_MS - 1));
+        assert!(wait.ceremony_expired(5_000 + EXPIRED_CEREMONY_GRACE_MS));
+    }
+
     /// Once a ceremony is announced, later statuses for it are not printed
     /// again, even if a chosen Petal changed meanwhile and Machine no longer
     /// counts it as exactly the default policy.
@@ -1467,6 +1669,7 @@ mod tests {
             &DefaultPolicyStatus::ChangedSinceCreation {
                 missing: vec!["enso".into()],
                 not_installed: Vec::new(),
+                updated: Vec::new(),
             },
             10,
         );
@@ -1549,6 +1752,16 @@ mod tests {
 
     #[test]
     fn the_mode_follows_the_command() {
+        // Only an observed wait that settles is logged as a transition.
+        assert_eq!(
+            settled_state(&DefaultPolicyStatus::Applied { petals: Vec::new() }),
+            Some("applied")
+        );
+        assert_eq!(
+            settled_state(&DefaultPolicyStatus::ProposalEnded),
+            Some("ended")
+        );
+        assert_eq!(settled_state(&DefaultPolicyStatus::Busy), None);
         assert_eq!(
             DefaultPolicyMode::of_command(false),
             DefaultPolicyMode::Resume

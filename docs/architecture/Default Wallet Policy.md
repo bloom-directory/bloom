@@ -29,7 +29,9 @@ bloom wallet new main  (or bloom wallet import main)
                        that allows all of them, printed once
 ```
 
-Without a terminal, `bloom init` chooses every Petal setup offers. A home
+Without a terminal, `bloom init` chooses every Petal setup offers and says
+which, so the owner can change `[setup.wallets.main.petals]` before creating
+`main`. A home
 created before setup existed, or a packaged install that never runs
 `bloom init`, has no choices, and nothing is proposed for it.
 
@@ -42,12 +44,17 @@ created before setup existed, or a packaged install that never runs
 2. **One approval, for the whole setup.** The default policy is proposed only
    once every chosen Petal is installed. While one is missing, Machine
    proposes nothing and names it, so the owner never approves part of the
-   setup and then needs a second ceremony.
+   setup and then needs a second ceremony. An owner who wants fewer Petals
+   removes the others from `[setup.wallets.main.petals]`; a refused or
+   expired approval says so, and the next proposal carries only what is left.
 3. **Only while the wallet has the policy creation installed.** That policy
    is at Broker version 1 (`CREATION_POLICY_VERSION`). Once the owner
    commits any change, Bloom never proposes the setup again, so nothing the
    owner removed comes back. `bloom wallet default-policy` then reports what
-   the policy lacks and how to add it.
+   the policy lacks and how to add it. A Petal whose earlier release the
+   policy allows, because Bloom updated it since, is reported as updated
+   rather than as removed; its next use asks the owner to approve the new
+   release.
 4. **A Petal's first use carries the setup.** While the wallet still has its
    creation policy, a Petal's own policy proposal also allows the Petals
    chosen at setup, so whichever comes first, the owner approves one policy.
@@ -56,8 +63,7 @@ created before setup existed, or a packaged install that never runs
    without that Petal, and once approved, the policy would no longer be the
    creation one, so the missing Petal would never be proposed. The setup is
    read only for that first proposal: a use the policy already allows reads
-   nothing of it. Machine passes
-   that error to the Petal as a backend error, not a denial, so the Petal
+   nothing of it. Machine passes that error to the Petal as a backend error, not a denial, so the Petal
    shows the agent its text, and logs it.
 5. **Only setup's Petals.** Only the Petals setup offers
    (`bloom_proto::config::SETUP_PETALS`) are proposed or waited for. A config
@@ -82,8 +88,14 @@ that setup finished, so declining every Petal stays a valid, remembered
 choice. Each chosen Petal is a table
 (`[setup.wallets.main.petals.polymarket]`) so later per-Petal choices fit
 without changing the layout. `bloom init` writes only `[setup]`, appended to
-the config in one atomic replace, so the rest of the owner's config, comments
-included, stays as they wrote it.
+the config in one atomic replace, so the rest of the owner's config stays as
+they wrote it: comments (those just above `[setup]` too), a byte-order mark,
+CRLF line endings, and keys a later release wrote under `[setup]`. A
+hard-linked config, one owned by another user or group, or one in a directory
+that cannot take a sibling file is written in place instead, so those stay
+too. A config the owner made read-only is never replaced: `bloom init` warns,
+prints the `[setup]` to add by hand, and still installs the Petals, and no
+default policy is proposed until the choices are saved.
 
 ### The request
 
@@ -91,12 +103,13 @@ For a wallet, Machine reads its setup from the config on disk, not the copy
 loaded at startup, and resolves each chosen Petal's installed package from the
 Petal store. The request is every installed chosen Petal's package plus the
 destinations its transactions need, from Bloom's own table
-(`bloom_proto::petal_destinations`), never from config. Polymarket and NEAR
-Intents are allowed through Petal-scoped entries (`petal:polymarket`,
-`petal:near-intents`): the policy engine lets a transaction through to a
-destination the Petal chose only when the Petal that staged it is the one the
-entry names. Listing their token contracts instead would let any Petal, or
-the agent, move those tokens anywhere with a raw call.
+(`bloom_proto::petal_destinations`), never from config. Polymarket, Enso and
+NEAR Intents are allowed through Petal-scoped entries (`petal:polymarket`,
+`petal:enso`, `petal:near-intents`) on the chains they use: the policy engine
+lets a transaction through to a destination the Petal chose only when the
+Petal that staged it is exactly the one the entry names. Listing their token
+contracts or Enso's router instead would let any Petal, or the agent, move
+funds anywhere with a raw call.
 
 ### Proposing and waiting
 
@@ -107,7 +120,10 @@ wallet exists or its ceremony expires. Broker refusals that may clear up
 deadline. Machine reconciles any change already proposed first, so one the
 owner approved commits and one still waiting is reported with its link, then
 proposes the default policy through the wallet's existing policy operation.
-The command prints the ceremony link once.
+The command prints the ceremony link once. `--no-wait` returns
+straight after printing the wallet ceremony link, for a caller that sees output
+only when the command exits; `bloom wallet default-policy main` then proposes
+the default policy once the wallet exists.
 
 A waiting change is described as the default policy only when it is the
 current policy with nothing added but the default policy (`adds_only`). Any
@@ -121,7 +137,8 @@ Broker owns a ceremony's expiry: it retires an expired one when Machine next
 reads its status, and Machine never judges expiry by its own clock. Once a
 waiting command has announced a ceremony, it asks Machine only to settle and
 report (`observe_only`). If that ceremony ends without approval, the command
-stops and says so, rather than handing an owner who left the link a new one
+stops and says so, after the same 30-second grace past expiry any ceremony
+gets, since an approval given just before expiry may still be verifying, rather than handing an owner who left the link a new one
 every few minutes. `bloom wallet default-policy main` picks up where a
 stopped command left off.
 

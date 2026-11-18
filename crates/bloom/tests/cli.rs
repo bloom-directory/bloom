@@ -1032,6 +1032,57 @@ fn init_keeps_an_existing_hand_edited_config() {
     assert!(config.setup.complete);
 }
 
+/// A config the owner keeps read-only, here symlinked into a read-only
+/// directory as a managed dotfiles setup would, is left alone: `bloom init`
+/// says what to add, says what it chose without a terminal, and still goes on
+/// to install the Petals.
+#[cfg(unix)]
+#[test]
+fn init_with_a_read_only_config_still_installs_the_petals() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let home = fresh_home();
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    home_dir.ensure().unwrap();
+    let managed = home.path().join("managed");
+    std::fs::create_dir_all(&managed).unwrap();
+    let real = managed.join("config.toml");
+    bloom_proto::Config::local_default().save(&real).unwrap();
+    let original = std::fs::read_to_string(&real).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o444)).unwrap();
+    std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o555)).unwrap();
+    std::os::unix::fs::symlink(&real, home_dir.config_path()).unwrap();
+    let output = bloom_cmd(home.path())
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("https_proxy", "http://127.0.0.1:1")
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .arg("init")
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("main's default policy will allow"),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains("could not save setup's choices"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("[setup.wallets.main.petals.polymarket]"),
+        "{stderr}"
+    );
+    // Provisioning, offline here, is still attempted.
+    assert!(
+        stderr.contains("provision canonical pre-installed Petals"),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), original);
+}
+
 /// Choices recorded before setup finished, as by a run that stopped
 /// part-way, are kept when `bloom init` runs setup again: a declined Petal
 /// stays declined.

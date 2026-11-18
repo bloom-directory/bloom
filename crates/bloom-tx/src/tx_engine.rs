@@ -7495,14 +7495,18 @@ mod tests {
             "{:?}",
             staged.policy_checks
         );
+        // The same transfer from another Petal, or from the agent, stages
+        // with the destination refused, not with some unrelated error.
         for origin in [None, Some(petal("petal:near-intents"))] {
-            let staged = stage(origin.clone()).await;
+            let staged = stage(origin.clone()).await.unwrap();
             assert!(
-                match &staged {
-                    Ok(staged) => crate::policy_engine::has_hard_violation(&staged.policy_checks),
-                    Err(_) => true,
-                },
-                "{origin:?}: {staged:?}"
+                crate::policy_engine::has_hard_violation(&staged.policy_checks)
+                    && staged
+                        .policy_checks
+                        .iter()
+                        .any(|check| check.message.contains("not on allowlist")),
+                "{origin:?}: {:?}",
+                staged.policy_checks
             );
         }
     }
