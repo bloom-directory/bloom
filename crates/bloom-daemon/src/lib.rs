@@ -2906,6 +2906,9 @@ impl PetalHost for DaemonPetalHost {
                 &outbox_id,
                 Some(requirement),
             ),
+            Err(bloom_tx::TxEngineError::PolicyDenied) => Err(HostError::Backend(
+                petal_policy_denial(&service.tx_engine, &wallet, &chain_name, &outbox_id),
+            )),
             Err(error) => Err(HostError::Backend(format!("confirm EVM outbox: {error}"))),
         }
     }
@@ -3328,6 +3331,38 @@ fn petal_outbox_outcome(
         plan_md,
         approval_required,
     })
+}
+
+/// The refusal a Petal reports when policy denies a confirm, naming each
+/// check that denied it. `policy denied` alone does not say whether the
+/// recipient, the contract or an unacknowledged warning was the cause, so the
+/// agent reading it has nothing to act on. The checks are the ones recorded
+/// at staging, read back from the entry the engine just refused.
+fn petal_policy_denial(tx_engine: &TxEngine, wallet: &str, chain: &str, outbox_id: &str) -> String {
+    use bloom_proto::policy::PolicyOutcome;
+
+    let mut refusal = String::from("confirm EVM outbox: policy denied");
+    let Ok(entry) = tx_engine.outbox.read(wallet, chain, outbox_id) else {
+        return refusal;
+    };
+    let checks = &entry.staged.policy_checks;
+    // A hard deny refuses on its own; without one, the refusal came from
+    // warnings the Petal did not acknowledge.
+    let blocking = if checks.iter().any(|c| c.outcome == PolicyOutcome::Deny) {
+        PolicyOutcome::Deny
+    } else {
+        PolicyOutcome::Warn
+    };
+    let causes: Vec<String> = checks
+        .iter()
+        .filter(|c| c.outcome == blocking)
+        .map(|c| format!("{}: {}", c.rule, c.message))
+        .collect();
+    if !causes.is_empty() {
+        refusal.push_str(": ");
+        refusal.push_str(&causes.join("; "));
+    }
+    refusal
 }
 
 fn petal_http_transport_error(
@@ -10539,7 +10574,12 @@ allowed = ["bloom:vfs.read"]
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("policy"), "{error}");
+        // The refusal names the check that denied it, so the agent reading it
+        // knows the destination is the cause, not only that policy refused.
+        assert_eq!(
+            error.to_string(),
+            "backend: confirm EVM outbox: policy denied: destinations.allow: not on allowlist"
+        );
         let entry = daemon
             .tx_engine
             .outbox
@@ -10548,6 +10588,44 @@ allowed = ["bloom:vfs.read"]
         assert_eq!(entry.state, bloom_tx::outbox::OutboxState::Failed);
         let checks = std::fs::read_to_string(entry.dir.join("policy_check.json")).unwrap();
         assert!(checks.contains("\"deny\""), "{checks}");
+        assert!(broker.sign_calls.lock().is_empty());
+
+        // With no deny, an unacknowledged warning is what refuses, and the
+        // refusal names it the same way. The entry stays pending for a retry
+        // that acknowledges it.
+        let mut warned = staged;
+        warned.id = "warned-outbox".into();
+        warned.policy_checks = vec![bloom_proto::policy::PolicyCheck::soft(
+            "caps.require_confirm_above_usd",
+            bloom_proto::policy::PolicyOutcome::Warn,
+            "usd 12.00 > soft 10.00",
+        )];
+        daemon
+            .tx_engine
+            .outbox
+            .write_pending(&warned, "# warned fixture")
+            .unwrap();
+        let error = host
+            .evm_tx_confirm(
+                "w".into(),
+                "ethereum".into(),
+                warned.id.clone(),
+                false,
+                Some(account_route_context("w", Some(0), None)),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "backend: confirm EVM outbox: policy denied: \
+             caps.require_confirm_above_usd: usd 12.00 > soft 10.00"
+        );
+        let entry = daemon
+            .tx_engine
+            .outbox
+            .read("w", "ethereum", &warned.id)
+            .unwrap();
+        assert_eq!(entry.state, bloom_tx::outbox::OutboxState::Pending);
         assert!(broker.sign_calls.lock().is_empty());
     }
 

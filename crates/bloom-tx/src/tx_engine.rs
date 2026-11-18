@@ -11632,6 +11632,13 @@ mod tests {
         // Naming the token by symbol borrows nothing either.
         assert!(lookup_known_token(1, "USDC").is_some());
         assert!(lookup_known_token(31337, "USDC").is_none());
+        // The miss tells the caller what works there: the token's address.
+        let miss = TxEngine::resolve_token_address("USDC", 31337).unwrap_err();
+        assert_eq!(
+            miss.to_string(),
+            "token: unknown token 'USDC' on chain id 31337: pass its 0x address \
+             (tokens/known.json lists the tokens Bloom knows by symbol)"
+        );
         let unknown: Address = "0x1111111111111111111111111111111111111111"
             .parse()
             .unwrap();
