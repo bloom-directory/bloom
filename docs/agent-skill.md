@@ -73,6 +73,32 @@ merged change that passes its scan is published; a held or failed version
 keeps the previous one live. The Propose Release workflow sets the plugin's
 `version` with the skill's.
 
+## Codex, Gemini CLI, Antigravity and other Agent Plugins clients
+
+The repository root is also a plugin. Root `plugin.json` follows the
+[Agent Plugins](https://agent-plugins.org) format, whose clients load
+`skills/bloom/`. `gemini-extension.json` does the same for Gemini CLI, and
+`.agents/plugins/marketplace.json` lists the root plugin for Codex, which
+otherwise reads the Claude Code marketplace and then finds no skill in
+`skills/bloom/`. The Propose Release workflow sets both manifests' `version`
+with the skill's.
+
+```sh
+codex plugin marketplace add bloom-directory/bloom && codex plugin add bloom@bloom
+gemini extensions install https://github.com/bloom-directory/bloom
+agy plugin install https://github.com/bloom-directory/bloom
+```
+
+Check the root after changing these files:
+
+```sh
+agy plugin validate .
+gemini extensions validate .
+```
+
+The Gemini CLI gallery lists the repository from its `gemini-cli-extension`
+topic and `gemini-extension.json`.
+
 ## ClawHub
 
 Publish this folder from the release tag, without `.claude-plugin/`: ClawHub
