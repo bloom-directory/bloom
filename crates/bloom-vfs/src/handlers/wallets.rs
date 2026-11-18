@@ -189,9 +189,44 @@ impl TriadPolicyUpdateProjection {
         Ok(bytes)
     }
 
+    /// View a pending policy change. `required`, `destinations` and
+    /// `lifetime` are what the caller asked to be allowed; a change that does
+    /// not carry all of them is somebody else's, and must never be presented
+    /// as the caller's own. A change with the packages but not their
+    /// destinations would leave those Petals' outbox transactions denied after
+    /// it commits.
     fn pending_view(
         &self,
-        package_hash: &bloom_broker_api::Digest32,
+        required: &[bloom_broker_api::Digest32],
+        destinations: &[bloom_broker_api::PolicyDestination],
+        lifetime: Option<u64>,
+    ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
+        self.pending_view_where(|proposed| includes(proposed, required, destinations, lifetime))
+    }
+
+    /// View a pending policy change as [`Self::pending_view`] does, but as
+    /// the caller's own only when it is `current` with nothing but the
+    /// request added: see [`adds_only`]. `also` names what it may add besides
+    /// the request.
+    fn pending_view_only(
+        &self,
+        current: &bloom_broker_api::CanonicalWalletPolicy,
+        required: &[bloom_broker_api::Digest32],
+        also: &PolicyExtras,
+        destinations: &[bloom_broker_api::PolicyDestination],
+        lifetime: Option<u64>,
+    ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
+        self.pending_view_where(|proposed| {
+            includes(proposed, required, destinations, lifetime)
+                && adds_only(current, proposed, required, also, destinations, lifetime)
+        })
+    }
+
+    /// View a pending policy change, which is the caller's own when
+    /// `is_requested` holds for the policy it proposes.
+    fn pending_view_where(
+        &self,
+        is_requested: impl FnOnce(&bloom_broker_api::CanonicalWalletPolicy) -> bool,
     ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
         let proposed: bloom_broker_api::CanonicalWalletPolicy =
             serde_json::from_slice(&self.retained_policy_bytes()?).map_err(err_be)?;
@@ -228,9 +263,7 @@ impl TriadPolicyUpdateProjection {
                     challenge_path: format!(
                         "/wallets/{wallet}/policy-updates/pending/{operation}/{APPROVAL_CHALLENGE_FILE}"
                     ),
-                    includes_requested_package: proposed
-                        .allowed_petal_packages
-                        .contains(package_hash),
+                    includes_requested: is_requested(&proposed),
                 },
             ),
         )
@@ -321,6 +354,250 @@ pub trait AccountPetalMount: Send + Sync {
     /// The installed package hash of the Petal named `petal`, if any.
     fn installed_package(&self, petal: &str) -> Option<String>;
 }
+/// What a default-policy request does once the wallet's policy has changed
+/// since wallet creation. A named type rather than a `bool`, so another flag
+/// passed in the same position does not compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterPolicyChange {
+    /// Report what the policy lacks and propose nothing.
+    Report,
+    /// Propose it: the owner has just chosen it.
+    Propose,
+}
+
+/// When a policy change already waiting for the owner counts as the
+/// caller's own request.
+#[derive(Debug, Clone, Copy)]
+enum WaitingMatch<'a> {
+    /// It carries everything asked for, so its one ceremony covers the
+    /// request, whatever else it changes: a Petal's own use waits on it.
+    Includes,
+    /// It is the current policy with only the request added, and perhaps
+    /// packages from `also`: a default policy is described to the owner as
+    /// what it allows, so a change carrying anything more is not one.
+    Only { also: &'a PolicyExtras },
+}
+
+/// What a waiting default policy may add besides the request: what it
+/// proposed for chosen Petals that are no longer installed, their packages as
+/// Machine last saw them installed or as the catalog pins them, and their
+/// destinations. Allowed, never required.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PolicyExtras {
+    pub packages: Vec<bloom_broker_api::Digest32>,
+    pub destinations: Vec<bloom_broker_api::PolicyDestination>,
+}
+
+/// What a wallet's first Petal policy proposal also allows: the Petals chosen
+/// during setup and the fixed contracts they transact with, and the
+/// persona's approval lifetime. All are empty for wallets without a setup.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DefaultPolicySetup {
+    pub packages: Vec<bloom_broker_api::Digest32>,
+    pub destinations: Vec<bloom_broker_api::PolicyDestination>,
+    /// Set on the first proposal; never required of a later one, so a Petal's
+    /// own use does not open a ceremony just for it.
+    pub maximum_approval_lifetime_ms: Option<u64>,
+    /// Chosen Petals with no installed package. While any is missing, a
+    /// Petal's use proposes nothing on the policy wallet creation installed,
+    /// so the owner never approves part of the setup: the first change
+    /// committed ends the setup's own proposals.
+    pub not_installed: Vec<String>,
+}
+
+/// What a persona switch replaces a wallet's policy with: exactly these
+/// packages and destinations, and this maximum approval lifetime. The
+/// policy's required verifiers and clear-signing setting stay as they are,
+/// since setup never chooses them, except the legacy clear-signing rules a
+/// Broker built with bloom-broker#103 refuses ([`BROKER_REFUSES_LEGACY_CLEAR_SIGNING`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PolicyReplacement {
+    pub packages: Vec<bloom_broker_api::Digest32>,
+    pub destinations: Vec<bloom_broker_api::PolicyDestination>,
+    pub maximum_approval_lifetime_ms: u64,
+}
+
+/// What became of a policy proposal Machine made, from its retained
+/// projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposalOutcome {
+    /// It still waits for the owner.
+    Pending,
+    /// The owner approved it and it committed. A later change may have
+    /// replaced it since.
+    Committed,
+    /// It was cancelled, refused, expired or failed, so it never committed.
+    Ended,
+}
+
+/// A wallet's policy once its retained proposals are reconciled, read
+/// without proposing anything.
+#[derive(Debug, Clone)]
+pub enum ReconciledPolicy {
+    /// A change still waits for the owner, viewed against the request, with
+    /// the policy it proposes.
+    Awaiting {
+        pending: Box<bloom_machine_client::PendingPolicyUpdate>,
+        proposed: Box<bloom_broker_api::CanonicalWalletPolicy>,
+    },
+    /// No change waits: the verified current policy, including any change
+    /// the owner approved meanwhile.
+    Current(bloom_broker_api::SignedPolicySnapshot),
+}
+
+/// Whether `proposed` carries every package and destination asked for, and
+/// the approval `lifetime` when one is asked for.
+fn includes(
+    proposed: &bloom_broker_api::CanonicalWalletPolicy,
+    required: &[bloom_broker_api::Digest32],
+    destinations: &[bloom_broker_api::PolicyDestination],
+    lifetime: Option<u64>,
+) -> bool {
+    required
+        .iter()
+        .all(|package| proposed.allowed_petal_packages.contains(package))
+        && destinations
+            .iter()
+            .all(|destination| proposed.allowed_destinations.contains(destination))
+        && lifetime.is_none_or(|lifetime| proposed.maximum_approval_lifetime_ms == lifetime)
+}
+
+/// Whether `proposed` is `current` with nothing but a default-policy request
+/// added: it keeps everything `current` allows, adds only packages from
+/// `required` or `also` and destinations from `destinations` or `also`, sets the
+/// approval lifetime only to `lifetime`, and changes nothing else. A change
+/// that also carries anything more, such as an agent's proposal of the
+/// default policy plus a destination of its own, is somebody else's, so it is
+/// never presented to the owner as the default policy.
+fn adds_only(
+    current: &bloom_broker_api::CanonicalWalletPolicy,
+    proposed: &bloom_broker_api::CanonicalWalletPolicy,
+    required: &[bloom_broker_api::Digest32],
+    also: &PolicyExtras,
+    destinations: &[bloom_broker_api::PolicyDestination],
+    lifetime: Option<u64>,
+) -> bool {
+    let packages_only = current
+        .allowed_petal_packages
+        .iter()
+        .all(|package| proposed.allowed_petal_packages.contains(package))
+        && proposed.allowed_petal_packages.iter().all(|package| {
+            current.allowed_petal_packages.contains(package)
+                || required.contains(package)
+                || also.packages.contains(package)
+        });
+    let destinations_only = current
+        .allowed_destinations
+        .iter()
+        .all(|destination| proposed.allowed_destinations.contains(destination))
+        && proposed.allowed_destinations.iter().all(|destination| {
+            current.allowed_destinations.contains(destination)
+                || destinations.contains(destination)
+                || also.destinations.contains(destination)
+        });
+    packages_only
+        && destinations_only
+        && proposed.maximum_approval_lifetime_ms
+            == lifetime.unwrap_or(current.maximum_approval_lifetime_ms)
+        && proposed.wallet_id == current.wallet_id
+        && proposed.required_verifiers == current.required_verifiers
+        && proposed.clear_signing == current.clear_signing
+}
+
+/// The version of the restrictive policy wallet creation installs. Every
+/// committed change increments it, so only a policy at this version is still
+/// the one creation installed. An empty package list is not the same fact:
+/// the owner may have removed every Petal on purpose.
+pub const CREATION_POLICY_VERSION: u64 = 1;
+
+/// Whether the Broker this Machine is built for refuses a policy that keeps
+/// the legacy clear-signing rules: bloom-broker#103 and later, which speak
+/// Machine–Broker 1.8, decode transfers themselves and refuse to sign under
+/// a policy that still carries those rules until a replacement removes them.
+pub const BROKER_REFUSES_LEGACY_CLEAR_SIGNING: bool = bloom_broker_api::BROKER_API_MINOR_MIN >= 8;
+
+/// The verifier through which a policy requires the legacy clear-signing
+/// rules.
+const LEGACY_CLEAR_SIGNING_VERIFIER: &str = "evm-clear-signing-v1";
+
+/// Whether `policy` carries the legacy clear-signing rules: a
+/// `clear_signing` setting, or a required `evm-clear-signing-v1` verifier.
+pub fn has_legacy_clear_signing(policy: &bloom_broker_api::CanonicalWalletPolicy) -> bool {
+    policy.clear_signing.is_some()
+        || policy
+            .required_verifiers
+            .iter()
+            .any(|required| required.verifier_id.as_str() == LEGACY_CLEAR_SIGNING_VERIFIER)
+}
+
+impl PolicyReplacement {
+    /// Whether `policy` already allows exactly this, in any order.
+    fn matches(&self, policy: &bloom_broker_api::CanonicalWalletPolicy) -> bool {
+        self.matches_for(policy, BROKER_REFUSES_LEGACY_CLEAR_SIGNING)
+    }
+
+    fn matches_for(
+        &self,
+        policy: &bloom_broker_api::CanonicalWalletPolicy,
+        drop_legacy_clear_signing: bool,
+    ) -> bool {
+        fn same<T: PartialEq>(left: &[T], right: &[T]) -> bool {
+            left.iter().all(|item| right.contains(item))
+                && right.iter().all(|item| left.contains(item))
+        }
+        same(&policy.allowed_petal_packages, &self.packages)
+            && same(&policy.allowed_destinations, &self.destinations)
+            && policy.maximum_approval_lifetime_ms == self.maximum_approval_lifetime_ms
+            && !(drop_legacy_clear_signing && has_legacy_clear_signing(policy))
+    }
+
+    /// `current` with its setup-chosen parts replaced, each entry once.
+    fn applied_to(
+        &self,
+        current: &bloom_broker_api::CanonicalWalletPolicy,
+    ) -> bloom_broker_api::CanonicalWalletPolicy {
+        self.applied_to_for(current, BROKER_REFUSES_LEGACY_CLEAR_SIGNING)
+    }
+
+    fn applied_to_for(
+        &self,
+        current: &bloom_broker_api::CanonicalWalletPolicy,
+        drop_legacy_clear_signing: bool,
+    ) -> bloom_broker_api::CanonicalWalletPolicy {
+        let mut proposed = current.clone();
+        proposed.allowed_petal_packages.clear();
+        proposed.allowed_destinations.clear();
+        proposed.maximum_approval_lifetime_ms = self.maximum_approval_lifetime_ms;
+        if drop_legacy_clear_signing {
+            proposed.clear_signing = None;
+            proposed
+                .required_verifiers
+                .retain(|required| required.verifier_id.as_str() != LEGACY_CLEAR_SIGNING_VERIFIER);
+        }
+        bloom_machine_client::policy_with_destinations(
+            &bloom_machine_client::policy_with_packages(&proposed, &self.packages),
+            &self.destinations,
+        )
+    }
+}
+
+/// Where a wallet's policy stands once its retained proposals are reconciled.
+enum PolicyBaseline {
+    /// A proposal still waits for the owner.
+    Awaiting(TriadPolicyUpdateProjection),
+    /// No proposal waits: the verified current policy.
+    Current(
+        bloom_broker_api::SignedPolicySnapshot,
+        bloom_broker_api::CanonicalWalletPolicy,
+    ),
+}
+
+/// Reads a wallet's [`DefaultPolicySetup`]. A failure, such as an unreadable
+/// Petal owner record, stops the first proposal rather than letting it leave
+/// a chosen Petal out: once that proposal commits, later ones add only the
+/// requested package, so nothing would put the missing Petal back.
+pub type DefaultPolicyPackages =
+    Arc<dyn Fn(&str) -> Result<DefaultPolicySetup, HandlerError> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct WalletsHandler {
@@ -362,6 +639,8 @@ pub struct WalletsHandler {
     /// host needs this handler, so there is exactly one of each and the
     /// session seam is attached once both exist.
     account_petals: Arc<parking_lot::RwLock<Option<Arc<dyn AccountPetalMount>>>>,
+    /// Setup choices proposed together with a wallet's first Petal package.
+    default_policy_packages: Option<DefaultPolicyPackages>,
 }
 
 impl WalletsHandler {
@@ -388,7 +667,13 @@ impl WalletsHandler {
             solana: None,
             solana_reads: None,
             account_petals: Arc::new(parking_lot::RwLock::new(None)),
+            default_policy_packages: None,
         }
+    }
+
+    pub fn with_default_policy_packages(mut self, packages: DefaultPolicyPackages) -> Self {
+        self.default_policy_packages = Some(packages);
+        self
     }
 
     /// Attach the session seam that serves `wallets/<w>/<n>/sessions/`.
@@ -1931,12 +2216,347 @@ impl WalletsHandler {
         wallet: &str,
         package_hash: &bloom_broker_api::Digest32,
     ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
-        use bloom_machine_client::{PetalEligibility, policy_with_package};
-        use sha2::Digest as _;
+        // A wallet's first proposal also allows the Petals chosen during setup,
+        // so the owner approves one policy rather than one per Petal. "First"
+        // is the Broker policy version, not the package list: once the owner
+        // has committed any change, later proposals add only the requested
+        // package, so a Petal the owner removed is never proposed again behind
+        // another.
+        let setup = match &self.default_policy_packages {
+            Some(defaults) => defaults(wallet),
+            None => Ok(DefaultPolicySetup::default()),
+        };
+        self.ensure_policy_allows(
+            wallet,
+            std::slice::from_ref(package_hash),
+            std::slice::from_ref(package_hash),
+            &[],
+            None,
+            setup.as_ref(),
+            AfterPolicyChange::Propose,
+            WaitingMatch::Includes,
+        )
+        .await
+    }
+
+    /// Drive a wallet's default policy: propose every package and destination
+    /// together through the existing policy operation. `Allowed` means the
+    /// policy allows all of them. Once any change has been committed, nothing
+    /// is proposed unless `after_change` is [`AfterPolicyChange::Propose`]
+    /// because the owner has just chosen these again, so a Petal or destination
+    /// the owner removed is reported as `ChangedSinceCreation` instead of being
+    /// proposed again. A persona's destinations or approval `lifetime` may
+    /// be proposed without any package.
+    pub async fn ensure_petal_packages_allowed(
+        &self,
+        wallet: &str,
+        packages: &[bloom_broker_api::Digest32],
+        destinations: &[bloom_broker_api::PolicyDestination],
+        lifetime: Option<u64>,
+        after_change: AfterPolicyChange,
+    ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
+        if packages.is_empty() && destinations.is_empty() && lifetime.is_none() {
+            return Err(HandlerError::invalid(
+                "no packages, destinations or lifetime to allow",
+            ));
+        }
+        self.ensure_policy_allows(
+            wallet,
+            packages,
+            packages,
+            destinations,
+            lifetime,
+            Ok(&DefaultPolicySetup::default()),
+            after_change,
+            WaitingMatch::Only {
+                also: &PolicyExtras::default(),
+            },
+        )
+        .await
+    }
+
+    /// Replace what setup chose in a wallet's policy, after the owner switched
+    /// its persona: propose exactly `replacement`'s packages, destinations and
+    /// lifetime, whatever the policy's version, removing anything else setup
+    /// could have chosen. `Allowed` means the policy already matches it. With
+    /// `may_propose` false, as once a switch's own proposal was refused or
+    /// expired, nothing new is proposed, and a policy that does not match is
+    /// returned as `ChangedSinceCreation`.
+    pub async fn ensure_policy_replaced(
+        &self,
+        wallet: &str,
+        replacement: &PolicyReplacement,
+        may_propose: bool,
+    ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
+        self.write_permit()?;
+        let _lock = self.lock_wallet_policy_update(wallet)?;
+        let (current, policy) = match self.reconcile_policy_updates_locked(wallet).await? {
+            PolicyBaseline::Awaiting(projection) => {
+                return projection.pending_view_where(|proposed| replacement.matches(proposed));
+            }
+            PolicyBaseline::Current(current, policy) => (current, policy),
+        };
+        if replacement.matches(&policy) {
+            return Ok(bloom_machine_client::PetalEligibility::Allowed(current));
+        }
+        if !may_propose {
+            return Ok(bloom_machine_client::PetalEligibility::ChangedSinceCreation(current));
+        }
+        self.propose_policy_locked(wallet, &replacement.applied_to(&policy), &current)
+            .await
+            .map_err(|error| match error {
+                HandlerError::Backend(message) => {
+                    HandlerError::Backend(format!("{POLICY_PROPOSAL_FAILED}: {message}"))
+                }
+                other => other,
+            })?
+            .pending_view_where(|proposed| replacement.matches(proposed))
+    }
+
+    /// Reconcile `wallet`'s retained policy proposals, committing one the
+    /// owner approved, and report the change still waiting for the owner, or
+    /// else the current policy. The waiting change is the request's own only
+    /// when it is the current policy with nothing added but `required`,
+    /// `destinations`, `lifetime` and what `also` names: what it proposed for
+    /// chosen Petals no longer installed. Unlike
+    /// [`Self::ensure_petal_packages_allowed`], this never proposes anything,
+    /// whatever the policy's version.
+    pub async fn reconciled_policy(
+        &self,
+        wallet: &str,
+        required: &[bloom_broker_api::Digest32],
+        also: &PolicyExtras,
+        destinations: &[bloom_broker_api::PolicyDestination],
+        lifetime: Option<u64>,
+    ) -> Result<ReconciledPolicy, HandlerError> {
+        self.write_permit()?;
+        let _lock = self.lock_wallet_policy_update(wallet)?;
+        match self.reconcile_policy_updates_locked(wallet).await? {
+            PolicyBaseline::Awaiting(projection) => {
+                let proposed =
+                    serde_json::from_slice(&projection.retained_policy_bytes()?).map_err(err_be)?;
+                // Whether the waiting change is the request's own is judged
+                // against the current policy, so a failed read is reported,
+                // never guessed.
+                let (_, current) = self.current_policy_locked(wallet).await?;
+                match projection.pending_view_only(
+                    &current,
+                    required,
+                    also,
+                    destinations,
+                    lifetime,
+                )? {
+                    bloom_machine_client::PetalEligibility::AwaitingPolicyApproval(pending) => {
+                        Ok(ReconciledPolicy::Awaiting {
+                            pending: Box::new(pending),
+                            proposed: Box::new(proposed),
+                        })
+                    }
+                    _ => Err(HandlerError::backend(
+                        "a pending policy change was not viewed as pending",
+                    )),
+                }
+            }
+            PolicyBaseline::Current(current, _) => Ok(ReconciledPolicy::Current(current)),
+        }
+    }
+
+    /// Read and verify `wallet`'s current policy from Broker.
+    pub async fn current_policy(
+        &self,
+        wallet: &str,
+    ) -> Result<bloom_broker_api::SignedPolicySnapshot, HandlerError> {
+        let _lock = self.lock_wallet_policy_update(wallet)?;
+        Ok(self.current_policy_locked(wallet).await?.0)
+    }
+
+    /// Cancel a policy proposal Machine made, such as an earlier persona
+    /// switch, so it can no longer commit, and say what became of it. A
+    /// proposal the owner approved before the cancel reached Broker commits
+    /// instead, and is reported as [`ProposalOutcome::Committed`], so the
+    /// caller can apply what it proposed. A proposal that is no longer
+    /// pending needs no cancel; its outcome is reported as it stands.
+    pub async fn cancel_policy_proposal(
+        &self,
+        wallet: &str,
+        operation_id: &str,
+    ) -> Result<ProposalOutcome, HandlerError> {
+        self.write_permit()?;
+        validate_policy_action_id(operation_id)?;
+        let _lock = self.lock_wallet_policy_update(wallet)?;
+        let dir = self.policy_update_action_dir(wallet, "pending", operation_id);
+        if !dir.is_dir() {
+            return Ok(self.proposal_outcome_unchecked(wallet, operation_id));
+        }
+        let projection: TriadPolicyUpdateProjection = read_json(dir.join(APPROVAL_CHALLENGE_FILE))?;
+        let cancelled = self
+            .broker()?
+            .cancel_ceremony(projection.operation_id)
+            .await;
+        // Let the retained proposal settle either way: a cancelled one leaves
+        // `pending`, and one the owner approved just now commits, because
+        // Broker refuses to cancel a ceremony past the owner's approval.
+        self.reconcile_policy_updates_locked(wallet).await?;
+        match cancelled {
+            _ if !dir.is_dir() => Ok(self.proposal_outcome_unchecked(wallet, operation_id)),
+            Ok(_) => Ok(ProposalOutcome::Ended),
+            Err(error) => Err(HandlerError::backend(format!(
+                "cancel the earlier policy proposal for wallet {wallet}: {error}"
+            ))),
+        }
+    }
+
+    /// What became of a policy proposal Machine made for `wallet`, after
+    /// reconciling the wallet's retained proposals, so one the owner approved
+    /// meanwhile reads as committed.
+    pub async fn policy_proposal_outcome(
+        &self,
+        wallet: &str,
+        operation_id: &str,
+    ) -> Result<ProposalOutcome, HandlerError> {
+        self.write_permit()?;
+        validate_policy_action_id(operation_id)?;
+        let _lock = self.lock_wallet_policy_update(wallet)?;
+        self.reconcile_policy_updates_locked(wallet).await?;
+        Ok(self.proposal_outcome_unchecked(wallet, operation_id))
+    }
+
+    /// Read a proposal's outcome from where its projection is retained. The
+    /// caller validated `operation_id` and reconciled.
+    fn proposal_outcome_unchecked(&self, wallet: &str, operation_id: &str) -> ProposalOutcome {
+        if self
+            .policy_update_action_dir(wallet, "pending", operation_id)
+            .is_dir()
+        {
+            ProposalOutcome::Pending
+        } else if self
+            .policy_update_action_dir(wallet, "confirmed", operation_id)
+            .is_dir()
+        {
+            ProposalOutcome::Committed
+        } else {
+            ProposalOutcome::Ended
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn ensure_policy_allows(
+        &self,
+        wallet: &str,
+        required: &[bloom_broker_api::Digest32],
+        additions: &[bloom_broker_api::Digest32],
+        destinations: &[bloom_broker_api::PolicyDestination],
+        // Required of the policy, and proposed with the rest.
+        lifetime: Option<u64>,
+        // Added only while the policy is still the one wallet creation
+        // installed, so one ceremony makes every chosen Petal usable instead
+        // of gating each one. If it could not be read, nothing is proposed
+        // while that is the case.
+        first_proposal: Result<&DefaultPolicySetup, &HandlerError>,
+        // Whether to propose the request once the policy is no longer the one
+        // wallet creation installed.
+        after_change: AfterPolicyChange,
+        // When a change already waiting for the owner is this request.
+        waiting: WaitingMatch<'_>,
+    ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
+        use bloom_machine_client::{
+            PetalEligibility, policy_with_destinations, policy_with_packages,
+        };
 
         self.write_permit()?;
         let _lock = self.lock_wallet_policy_update(wallet)?;
-        let broker = self.broker()?;
+        let allows = |policy: &bloom_broker_api::CanonicalWalletPolicy| {
+            required
+                .iter()
+                .all(|package| policy.allowed_petal_packages.contains(package))
+                && destinations
+                    .iter()
+                    .all(|destination| policy.allowed_destinations.contains(destination))
+                && lifetime.is_none_or(|lifetime| policy.maximum_approval_lifetime_ms == lifetime)
+        };
+        let (current, policy) = match self.reconcile_policy_updates_locked(wallet).await? {
+            PolicyBaseline::Awaiting(projection) => {
+                // Broker keeps one live ceremony per wallet, so while the
+                // waiting change's ceremony is open, any approval this request
+                // needs would be refused: point at that ceremony. Otherwise,
+                // as while the owner's approval is being verified, the
+                // committed policy is still the wallet's, and a request it
+                // already allows proceeds. If it cannot be read, the waiting
+                // change is reported as before.
+                let verifying =
+                    projection.ceremony_state != bloom_broker_api::CeremonyState::AwaitingUser;
+                let current = match waiting {
+                    // Whether the waiting change is this request's own is
+                    // judged against the current policy, so a failed read is
+                    // reported, never guessed.
+                    WaitingMatch::Only { .. } => Some(self.current_policy_locked(wallet).await?),
+                    WaitingMatch::Includes if verifying => {
+                        self.current_policy_locked(wallet).await.ok()
+                    }
+                    WaitingMatch::Includes => None,
+                };
+                if verifying
+                    && let Some((current, policy)) = &current
+                    && allows(policy)
+                {
+                    return Ok(PetalEligibility::Allowed(current.clone()));
+                }
+                return match (waiting, &current) {
+                    (WaitingMatch::Only { also }, Some((_, policy))) => {
+                        projection.pending_view_only(policy, required, also, destinations, lifetime)
+                    }
+                    _ => projection.pending_view(required, destinations, lifetime),
+                };
+            }
+            PolicyBaseline::Current(current, policy) => (current, policy),
+        };
+        if allows(&policy) {
+            return Ok(PetalEligibility::Allowed(current));
+        }
+        let creation_policy = current.version.get() == CREATION_POLICY_VERSION;
+        if !creation_policy && after_change == AfterPolicyChange::Report {
+            return Ok(PetalEligibility::ChangedSinceCreation(current));
+        }
+        let mut additions = additions.to_vec();
+        // Kept apart from `destinations`, which stays what the caller asked
+        // for so a pending change is judged against the request alone.
+        let mut proposed_destinations = destinations.to_vec();
+        let mut proposed_lifetime = lifetime;
+        if creation_policy {
+            let first_proposal = first_proposal.map_err(|error| {
+                HandlerError::backend(format!(
+                    "the Petals chosen during setup could not be read, so no policy was proposed for wallet {wallet}: {error}"
+                ))
+            })?;
+            // The first committed change ends setup's proposals, so one made
+            // while a chosen Petal is missing would leave that Petal out for
+            // good: wait for it, as the default policy itself does.
+            if !first_proposal.not_installed.is_empty() {
+                return Err(default_policy_waiting(&first_proposal.not_installed));
+            }
+            additions.extend_from_slice(&first_proposal.packages);
+            proposed_destinations.extend_from_slice(&first_proposal.destinations);
+            proposed_lifetime = proposed_lifetime.or(first_proposal.maximum_approval_lifetime_ms);
+        }
+        let mut proposed = policy_with_destinations(
+            &policy_with_packages(&policy, &additions),
+            &proposed_destinations,
+        );
+        if let Some(lifetime) = proposed_lifetime {
+            proposed.maximum_approval_lifetime_ms = lifetime;
+        }
+        self.propose_policy_locked(wallet, &proposed, &current)
+            .await?
+            .pending_view(required, destinations, lifetime)
+    }
+
+    /// Reconcile a wallet's retained policy proposals, then read and verify
+    /// its current policy. The caller holds the wallet's policy lock.
+    async fn reconcile_policy_updates_locked(
+        &self,
+        wallet: &str,
+    ) -> Result<PolicyBaseline, HandlerError> {
+        self.broker()?;
         // Reconcile retained proposals before choosing a baseline. In particular,
         // unrelated pending consent must never be overwritten or silently rebased.
         for operation_id in self.policy_update_action_ids(wallet, "pending") {
@@ -1945,18 +2565,47 @@ impl WalletsHandler {
                 .join(APPROVAL_CHALLENGE_FILE);
             let projection: TriadPolicyUpdateProjection = read_json(&path)?;
             let proposed_bytes = projection.retained_policy_bytes()?;
-            match self
+            // Broker owns a ceremony's expiry: it retires an expired one when
+            // asked its status, and resuming then moves it out of `pending`.
+            let resumed = self
                 .resume_wallet_policy_update(wallet, &operation_id, &proposed_bytes)
-                .await
-            {
+                .await;
+            match resumed {
                 Ok(()) => continue,
                 Err(HandlerError::PermissionDenied) => {
-                    let projection: TriadPolicyUpdateProjection = read_json(&path)?;
-                    return projection.pending_view(package_hash);
+                    return Ok(PolicyBaseline::Awaiting(read_json(&path)?));
+                }
+                // A cancelled, expired, or failed ceremony has left `pending`;
+                // propose again from the current policy.
+                Err(_)
+                    if !self
+                        .policy_update_action_dir(wallet, "pending", &operation_id)
+                        .is_dir() =>
+                {
+                    continue;
                 }
                 Err(error) => return Err(error),
             }
         }
+        let (current, policy) = self.current_policy_locked(wallet).await?;
+        Ok(PolicyBaseline::Current(current, policy))
+    }
+
+    /// Read and verify `wallet`'s current policy from Broker. The caller
+    /// holds the wallet's policy lock.
+    async fn current_policy_locked(
+        &self,
+        wallet: &str,
+    ) -> Result<
+        (
+            bloom_broker_api::SignedPolicySnapshot,
+            bloom_broker_api::CanonicalWalletPolicy,
+        ),
+        HandlerError,
+    > {
+        use sha2::Digest as _;
+
+        let broker = self.broker()?;
         let wallet_id = bloom_broker_api::Token::new(wallet.to_owned())
             .map_err(|error| HandlerError::invalid(error.to_string()))?;
         let current = broker
@@ -1976,13 +2625,21 @@ impl WalletsHandler {
                 "Broker eligibility policy has invalid wallet, digest, or canonical bytes",
             ));
         }
-        if policy.allowed_petal_packages.contains(package_hash) {
-            return Ok(PetalEligibility::Allowed(current));
-        }
-        let proposed = policy_with_package(&policy, package_hash);
-        let proposed_bytes = serde_jcs::to_vec(&proposed).map_err(err_be)?;
+        Ok((current, policy))
+    }
+
+    /// Propose `proposed` against `current` and return the pending change it
+    /// opened, which waits for the owner. The caller holds the wallet's
+    /// policy lock.
+    async fn propose_policy_locked(
+        &self,
+        wallet: &str,
+        proposed: &bloom_broker_api::CanonicalWalletPolicy,
+        current: &bloom_broker_api::SignedPolicySnapshot,
+    ) -> Result<TriadPolicyUpdateProjection, HandlerError> {
+        let proposed_bytes = serde_jcs::to_vec(proposed).map_err(err_be)?;
         match self
-            .write_wallet_policy_update_locked(wallet, &proposed_bytes, Some(&current))
+            .write_wallet_policy_update_locked(wallet, &proposed_bytes, Some(current))
             .await
         {
             Err(HandlerError::PermissionDenied) => {
@@ -1991,11 +2648,10 @@ impl WalletsHandler {
                         .ok_or_else(|| {
                             HandlerError::backend("prepared policy operation was not persisted")
                         })?;
-                let projection: TriadPolicyUpdateProjection = read_json(
+                read_json(
                     self.policy_update_action_dir(wallet, "pending", &operation_id)
                         .join(APPROVAL_CHALLENGE_FILE),
-                )?;
-                projection.pending_view(package_hash)
+                )
             }
             Err(error) => Err(error),
             Ok(()) => Err(HandlerError::backend(
@@ -2012,16 +2668,31 @@ impl WalletsHandler {
     ) -> Result<(), HandlerError> {
         match self.ensure_petal_eligibility(wallet, package_hash).await? {
             bloom_machine_client::PetalEligibility::Allowed(_) => Ok(()),
+            // Not produced here: this request is proposed at any version.
+            bloom_machine_client::PetalEligibility::ChangedSinceCreation(_) => Err(
+                HandlerError::backend("wallet policy does not allow this Petal package"),
+            ),
             bloom_machine_client::PetalEligibility::AwaitingPolicyApproval(pending) => {
-                Err(HandlerError::backend(format!(
-                    "POLICY_APPROVAL_REQUIRED: complete the owner ceremony at {} then retry this operation; status: {}",
-                    pending
-                        .prepare
-                        .as_ref()
-                        .map(|prepare| prepare.ceremony_url.as_str())
-                        .unwrap_or(&pending.status_path),
-                    pending.status_path,
-                )))
+                let ceremony = pending
+                    .prepare
+                    .as_ref()
+                    .map(|prepare| prepare.ceremony_url.as_str())
+                    .unwrap_or(&pending.status_path);
+                Err(HandlerError::backend(if pending.includes_requested {
+                    format!(
+                        "POLICY_APPROVAL_REQUIRED: complete the owner ceremony at {ceremony} then retry this operation; status: {}",
+                        pending.status_path,
+                    )
+                } else {
+                    // Somebody else's change, such as a persona switch, which
+                    // may even remove this Petal: approving it does not allow
+                    // this operation, but Broker opens one ceremony per wallet
+                    // at a time, so it must finish first.
+                    format!(
+                        "POLICY_APPROVAL_REQUIRED: another policy change for wallet {wallet} is waiting for the owner at {ceremony}; it does not allow this operation, but Broker opens one ceremony per wallet at a time, so the owner must approve or refuse it first, then retry this operation; status: {}",
+                        pending.status_path,
+                    )
+                }))
             }
         }
     }
@@ -2094,7 +2765,7 @@ impl WalletsHandler {
             .truncate(false)
             .open(directory.join(".coordinator.lock"))?;
         fs2::FileExt::try_lock_exclusive(&file).map_err(|error| {
-            HandlerError::backend(format!("wallet policy coordination busy; retry: {error}"))
+            HandlerError::backend(format!("{POLICY_COORDINATION_BUSY}; retry: {error}"))
         })?;
         Ok(file)
     }
@@ -2762,6 +3433,57 @@ fn validate_policy_action_id(id: &str) -> Result<(), HandlerError> {
     Ok(())
 }
 
+/// Start of the error a policy writer gets while another command holds the
+/// wallet's policy lock. Waiting commands poll again instead of failing.
+pub const POLICY_COORDINATION_BUSY: &str = "wallet policy coordination busy";
+
+/// Prefix of the error a Petal's use gets while the wallet still has the
+/// policy creation installed and a Petal chosen during setup is not installed:
+/// no policy is proposed until it is, so the owner approves the whole setup
+/// at once.
+pub const DEFAULT_POLICY_WAITING: &str = "DEFAULT_POLICY_WAITING";
+
+/// The error a Petal's use gets while the wallet still has the policy wallet
+/// creation installed and the Petals its setup chose named in
+/// `not_installed` are missing. It is read by agents through the Petal, so
+/// it avoids the words a Petal reads as a refusal, a missing route or a bad
+/// request ("denied", "permission", "invalid", "not found"). It names only
+/// setup's own Petals, never the wallet, whose name the owner chose and
+/// could contain one of them.
+pub fn default_policy_waiting(not_installed: &[String]) -> HandlerError {
+    let names = not_installed.join(", ");
+    let (verb, them, stays) = if not_installed.len() == 1 {
+        ("is", "it", "it stays")
+    } else {
+        ("are", "them", "one stays")
+    };
+    HandlerError::backend(format!(
+        "{DEFAULT_POLICY_WAITING}: this wallet's setup chose {names}, which {verb} not installed yet. Its first policy change allows every chosen Petal at once, so nothing was proposed. Retry once `docs/petals.md` lists {them}; Bloom installs its catalog Petals as it starts. If {stays} missing, tell the owner to restart Bloom, or to run `bloom wallet persona <wallet> <persona>` and leave {them} out"
+    ))
+}
+
+/// The message of a [`default_policy_waiting`] error, which a Petal must show
+/// as it is rather than as a refusal.
+pub fn default_policy_waiting_message(error: &HandlerError) -> Option<&str> {
+    match error {
+        HandlerError::Backend(message) if message.starts_with(DEFAULT_POLICY_WAITING) => {
+            Some(message)
+        }
+        _ => None,
+    }
+}
+
+/// Whether `error` says another command holds the wallet's policy lock, so
+/// the same operation succeeds once it finishes.
+pub fn is_policy_coordination_busy(error: &HandlerError) -> bool {
+    matches!(error, HandlerError::Backend(message) if message.starts_with(POLICY_COORDINATION_BUSY))
+}
+
+/// Marks a failure of the proposal a persona switch makes, as opposed to a
+/// failure reconciling or reading the policy around it, so Machine can tell
+/// Broker's refusal of that proposal apart. Followed by `: ` and the failure.
+pub const POLICY_PROPOSAL_FAILED: &str = "POLICY_PROPOSAL_FAILED";
+
 fn tx_open_err(e: TxEngineError) -> HandlerError {
     match e {
         TxEngineError::ApprovalRequired(_) => HandlerError::PermissionDenied,
@@ -2974,7 +3696,7 @@ fn record_confirm_error(
         (
             "policy_approval_required",
             format!(
-                "The wallet policy does not yet allow the Petal that staged this transaction. Give the owner the ceremony link in error (pending updates are under wallets/{wallet}/policy-updates/pending/); once they approve, write confirm again."
+                "The wallet policy does not yet allow the Petal that staged this transaction, or another policy change must finish first. Give the owner the ceremony link in error (pending updates are under wallets/{wallet}/policy-updates/pending/); once they have approved or refused it, write confirm again."
             ),
         )
     } else {
@@ -4697,6 +5419,149 @@ impl WalletsHandler {
 }
 #[cfg(test)]
 mod tests {
+    /// A waiting change is a default-policy request's own only when it is the
+    /// current policy with nothing but the request, and `also`, added: every
+    /// other difference, in any field, makes it somebody else's.
+    #[test]
+    fn only_the_request_added_to_the_current_policy_is_its_own() {
+        use super::{PolicyExtras, adds_only};
+        use bloom_broker_api::{CanonicalWalletPolicy, Digest32, PolicyDestination, Token};
+
+        let destination = |address: &str| PolicyDestination {
+            chain: Token::new("ethereum").unwrap(),
+            destination: address.into(),
+        };
+        let kept = Digest32::from_bytes([1; 32]);
+        let asked = Digest32::from_bytes([2; 32]);
+        let also_package = Digest32::from_bytes([3; 32]);
+        let current = CanonicalWalletPolicy {
+            wallet_id: Token::new("main").unwrap(),
+            maximum_approval_lifetime_ms: 60_000,
+            allowed_petal_packages: vec![kept.clone()],
+            allowed_destinations: vec![destination("0x01")],
+            required_verifiers: Vec::new(),
+            clear_signing: None,
+        };
+        let also = PolicyExtras {
+            packages: vec![also_package.clone()],
+            destinations: vec![destination("0x03")],
+        };
+        let asked_destinations = [destination("0x02")];
+        let own = |proposed: &CanonicalWalletPolicy, lifetime: Option<u64>| {
+            adds_only(
+                &current,
+                proposed,
+                std::slice::from_ref(&asked),
+                &also,
+                &asked_destinations,
+                lifetime,
+            )
+        };
+        let mut request = current.clone();
+        request
+            .allowed_petal_packages
+            .extend([asked.clone(), also_package.clone()]);
+        request
+            .allowed_destinations
+            .extend([destination("0x02"), destination("0x03")]);
+        assert!(own(&request, None));
+        assert!(own(&current, None), "adding nothing is still the request");
+
+        let mut more = request.clone();
+        more.allowed_petal_packages
+            .push(Digest32::from_bytes([9; 32]));
+        assert!(!own(&more, None), "another package");
+        let mut more = request.clone();
+        more.allowed_destinations.push(destination("0xdead"));
+        assert!(!own(&more, None), "another destination");
+        let mut removed = request.clone();
+        removed
+            .allowed_petal_packages
+            .retain(|package| package != &kept);
+        assert!(!own(&removed, None), "a package removed");
+        let mut removed = request.clone();
+        removed.allowed_destinations.remove(0);
+        assert!(!own(&removed, None), "a destination removed");
+
+        let mut longer = request.clone();
+        longer.maximum_approval_lifetime_ms = u64::MAX;
+        assert!(!own(&longer, None), "a lifetime nobody asked for");
+        assert!(own(&longer, Some(u64::MAX)), "the lifetime asked for");
+        assert!(
+            !own(&request, Some(u64::MAX)),
+            "the lifetime asked for, missing"
+        );
+
+        let mut other = request.clone();
+        other.wallet_id = Token::new("other").unwrap();
+        assert!(!own(&other, None), "another wallet");
+        let mut other = request.clone();
+        other
+            .required_verifiers
+            .push(bloom_broker_api::RequiredVerifier {
+                verifier_id: Token::new("human").unwrap(),
+                verifier_digest: Digest32::from_bytes([4; 32]),
+            });
+        assert!(!own(&other, None), "a verifier");
+        let mut other = request.clone();
+        other.clear_signing = Some(bloom_broker_api::LegacyClearSigningPolicy {
+            catalog_id: Token::new("bloom").unwrap(),
+            trusted_keys: Vec::new(),
+            signature_threshold: 1,
+            maximum_observation_age_ms: 60_000,
+            opaque_exact_allowed: false,
+            unlimited_allowance_allowed: false,
+            verifier: bloom_broker_api::RequiredVerifier {
+                verifier_id: Token::new("clear-signing").unwrap(),
+                verifier_digest: Digest32::from_bytes([5; 32]),
+            },
+        });
+        assert!(!own(&other, None), "clear-signing rules");
+    }
+
+    /// A replacement keeps the policy's clear-signing rules for a Broker that
+    /// accepts them, and drops the legacy ones for a Broker built with
+    /// bloom-broker#103, which refuses to sign under them; a policy that still
+    /// carries them then does not match.
+    #[test]
+    fn a_replacement_drops_legacy_clear_signing_only_where_broker_refuses_it() {
+        let verifier = |id: &str| bloom_broker_api::RequiredVerifier {
+            verifier_id: bloom_broker_api::Token::new(id).unwrap(),
+            verifier_digest: bloom_broker_api::Digest32::from_bytes([4; 32]),
+        };
+        let current = bloom_broker_api::CanonicalWalletPolicy {
+            wallet_id: bloom_broker_api::Token::new("alice").unwrap(),
+            allowed_petal_packages: Vec::new(),
+            allowed_destinations: Vec::new(),
+            maximum_approval_lifetime_ms: 60_000,
+            required_verifiers: vec![verifier("human"), verifier(LEGACY_CLEAR_SIGNING_VERIFIER)],
+            clear_signing: Some(bloom_broker_api::LegacyClearSigningPolicy {
+                catalog_id: bloom_broker_api::Token::new("bloom").unwrap(),
+                trusted_keys: Vec::new(),
+                signature_threshold: 1,
+                maximum_observation_age_ms: 60_000,
+                opaque_exact_allowed: false,
+                unlimited_allowance_allowed: false,
+                verifier: verifier(LEGACY_CLEAR_SIGNING_VERIFIER),
+            }),
+        };
+        let replacement = PolicyReplacement {
+            maximum_approval_lifetime_ms: 60_000,
+            ..PolicyReplacement::default()
+        };
+
+        let kept = replacement.applied_to_for(&current, false);
+        assert_eq!(kept.clear_signing, current.clear_signing);
+        assert_eq!(kept.required_verifiers, current.required_verifiers);
+        assert!(replacement.matches_for(&current, false));
+
+        let dropped = replacement.applied_to_for(&current, true);
+        assert_eq!(dropped.clear_signing, None);
+        assert_eq!(dropped.required_verifiers, vec![verifier("human")]);
+        assert!(!replacement.matches_for(&current, true));
+        assert!(replacement.matches_for(&dropped, true));
+    }
+
     use super::*;
     use alloy::primitives::Address;
     use bloom_broker_api::{

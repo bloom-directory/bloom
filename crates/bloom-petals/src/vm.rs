@@ -54,7 +54,7 @@ use crate::meta::Capability;
 use crate::policy::{NetPolicy, StoreNamespacePolicy};
 use crate::private_store::PrivateStore;
 
-fn open_selected_private_store(
+pub(crate) fn open_selected_private_store(
     root: PathBuf,
     account: Option<&(String, u32)>,
     policy: Option<&StoreNamespacePolicy>,
