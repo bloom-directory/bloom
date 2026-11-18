@@ -153,19 +153,35 @@ active status includes a public `view_url` pointing to `/view`; it grants no
 access without that browser's existing origin-scoped session key. It is not reachable from another device.
 
 Takeover is for login, verification, saved-traveler entry or an unsupported
-field. On handback, checkout discards the whole browsing context,
-including the login and any booking session, and resumes shopping in a fresh
-blank tab, as card and site-payment completion do. The one exception is
-"Close and stay signed in", which only the person can choose: pages close but
-cookies and storage stay, so Machine can read signed-in pages (name,
-addresses, orders) and later take-overs start signed in. It is refused after
-saved traveler values were filled. Machine's clicks are not
-an authorization boundary: page text cannot tell a harmless "Continue" from a
-control that charges a shop-saved payment method, so Machine's `click`,
-`type` and `select` are refused on every merchant page, including a kept
-sign-in. Takeover buys nothing and releases
-no card; saved-card and site payment need their separate approval for the
-exact merchant/total.
+field. Takeover buys nothing and releases no card; saved-card and site
+payment need their separate approval for the exact merchant/total.
+
+## Agent browsing and sign-ins
+
+Machine may `click`, `type` and `select` on merchant pages, so the agent
+fills signup forms, chooses plans and options and builds the basket itself.
+Every session refuses three things: a control with payment wording, a card
+field and a password field. The person handles those in a take-over or an
+approved payment.
+
+A take-over that sees password or code fields done closes by itself and keeps
+the browsing context: cookies, storage and the signed-in page. The person can
+also choose "Close and stay signed in". Either way Machine then reads and acts
+on signed-in pages, which show the person's name, addresses and orders; the
+private view says so before the person chooses. A payment cancelled before
+approval also keeps the sign-in. Every other handback, and every handback
+after saved traveler values were filled, discards the context and resumes in
+a blank tab, as card and site-payment completion do.
+
+This accepts a known risk. Page text cannot tell a harmless "Continue" from a
+control that charges a shop-saved payment method, so the payment-wording guard
+is a heuristic, not an authorization boundary. In a signed-in session a
+mislabelled control could place an order with the shop's own saved method,
+without Bloom's approval. The trade was made because refusing every agent
+interaction left the person doing every click. Bloom's saved cards stay
+behind approval in every case. A take-over's own uncertain outcome does not
+block later payments at the shop; an uncertain card or site payment still
+does.
 
 Checkout's Chromium reaches the network only through an in-process proxy
 that resolves each host itself and connects to the checked address. Every
