@@ -987,7 +987,23 @@ impl Outbox {
                 {
                     continue;
                 }
-                let staged: StagedTx = serde_json::from_slice(&fs::read(&intent_path)?)?;
+                // A concurrent pending → sent rename can move the entry after
+                // the exists() check; the other state's walk counts it.
+                let bytes = match fs::read(&intent_path) {
+                    Ok(bytes) => bytes,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                let staged: StagedTx = match serde_json::from_slice(&bytes) {
+                    Ok(staged) => staged,
+                    // sent/ is long-lived history: one unreadable row must not
+                    // block every auto-nonce stage, as walk_all_sent skips it.
+                    Err(error) if state == OutboxState::Sent => {
+                        tracing::warn!(%error, path = %intent_path.display(), "outbox.reserved_nonce.skip_malformed_sent");
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
                 if staged.from.parse::<alloy::primitives::Address>().ok() == Some(addr) {
                     max_nonce = Some(max_nonce.map_or(staged.nonce, |m| m.max(staged.nonce)));
                 }
@@ -2017,6 +2033,34 @@ mod tests {
             ob.highest_reserved_nonce("alice", "anvil", from).unwrap(),
             None
         );
+    }
+
+    /// One unreadable unmined sent/ row must not block every auto-nonce stage.
+    #[test]
+    fn highest_reserved_nonce_skips_an_unreadable_sent_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::new(dir.path()).unwrap();
+        let from: alloy::primitives::Address = "0x0000000000000000000000000000000000000001"
+            .parse()
+            .unwrap();
+        let mut ok = fake_staged("0001-ok");
+        ok.nonce = 3;
+        ob.write_pending(&ok, "# plan").unwrap();
+        let broken = ob.state_dir("alice", "anvil", OutboxState::Sent).unwrap();
+        let broken = broken.join("0002-broken");
+        fs::create_dir_all(&broken).unwrap();
+        fs::write(broken.join("intent.json"), b"{not json").unwrap();
+        assert_eq!(
+            ob.highest_reserved_nonce("alice", "anvil", from).unwrap(),
+            Some(3)
+        );
+
+        // An unreadable pending entry may hold a live nonce, so it still fails.
+        let pending = ob
+            .state_dir("alice", "anvil", OutboxState::Pending)
+            .unwrap();
+        fs::write(pending.join("0001-ok").join("intent.json"), b"{not json").unwrap();
+        assert!(ob.highest_reserved_nonce("alice", "anvil", from).is_err());
     }
 
     #[test]
