@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use std::time::{Duration, Instant};
 
-use tokio::net::TcpListener;
+use tokio::net::TcpSocket;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -30,6 +30,8 @@ use crate::{MountConfig, MountError, MountHandle, build_mount_args, build_mount_
 const MOUNT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const UMOUNT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const FSTAB_UMOUNT_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+/// A lazy unmount of a dead NFS mount took about 6 s in a container test.
+const STALE_DETACH_TIMEOUT: Duration = Duration::from_secs(30);
 
 type CommandAttempt = (String, Vec<String>);
 
@@ -475,8 +477,12 @@ async fn serve_nfs_config(
     // OS-assigned port immediately so we can wire it into the mount
     // command — `mount.nfs4 port=N` needs the real number. Binding before
     // touching a stale mount also proves no live Machine owns its port.
-    let listener = match TcpListener::bind(cfg.nfs_listen).await {
-        Ok(listener) => listener,
+    // The socket listens only after the detach: a listening socket would let
+    // the dead mount's NFS client reconnect into its backlog, and the lazy
+    // unmount's teardown would then wait on replies nobody sends. A bound,
+    // non-listening socket answers those reconnects with RST.
+    let socket = match bind_nfs_socket(cfg.nfs_listen) {
+        Ok(socket) => socket,
         Err(error) if stale.is_some() && error.kind() == std::io::ErrorKind::AddrInUse => {
             return Err(MountError::Mount(format!(
                 "another Machine is serving the Bloom mount at {} on {}",
@@ -486,7 +492,7 @@ async fn serve_nfs_config(
         }
         Err(error) => return Err(error.into()),
     };
-    let local = listener.local_addr()?;
+    let local = socket.local_addr()?;
     if let Some(mounted) = stale {
         if !stale_mount_is_unserved(&mounted, local.port()) {
             let served_by = mounted
@@ -501,18 +507,9 @@ async fn serve_nfs_config(
                 cfg.mount_path.display()
             )));
         }
-        tokio::task::spawn_blocking(move || {
-            run_command_attempts(
-                stale_detach_attempts(&probe, from_fstab),
-                if from_fstab {
-                    FSTAB_UMOUNT_COMMAND_TIMEOUT
-                } else {
-                    UMOUNT_COMMAND_TIMEOUT
-                },
-            )
-        })
-        .await
-        .map_err(|e| MountError::Mount(format!("stale mount detach join: {e}")))??;
+        tokio::task::spawn_blocking(move || detach_stale_mount(&probe, from_fstab))
+            .await
+            .map_err(|e| MountError::Mount(format!("stale mount detach join: {e}")))??;
         warn!(mount_path = %cfg.mount_path.display(), port = local.port(), "mount.stale_detached");
     }
     if !cfg.mount_path.exists() {
@@ -527,6 +524,7 @@ async fn serve_nfs_config(
             cfg.mount_path.display()
         )));
     }
+    let listener = socket.listen(1024)?;
     info!(addr = %local, mount_path = %cfg.mount_path.display(), "mount.nfs_listening");
 
     let fs = BloomFs::new(vfs);
@@ -591,6 +589,39 @@ async fn serve_nfs_config(
     ))
 }
 
+/// Bind the NFS address without listening, with the same address reuse as
+/// `TcpListener::bind`, so a live listener still fails with `AddrInUse`.
+fn bind_nfs_socket(addr: SocketAddr) -> std::io::Result<TcpSocket> {
+    let socket = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    #[cfg(unix)]
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    Ok(socket)
+}
+
+/// Lazily detach a dead Bloom mount. Superblock teardown can outlast
+/// `umount -l` itself, and a timeout can fire after the detach took effect,
+/// so a failure counts only while the mount is still in the table.
+fn detach_stale_mount(probe: &Path, from_fstab: bool) -> Result<(), MountError> {
+    let Err(error) = run_command_attempts(
+        stale_detach_attempts(probe, from_fstab),
+        STALE_DETACH_TIMEOUT,
+    ) else {
+        return Ok(());
+    };
+    match mounted_filesystem(probe)? {
+        Some(_) => Err(error),
+        None => {
+            warn!(%error, mount_path = %probe.display(), "mount.stale_detach_failed_but_detached");
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Tests for the `server.rs` lifecycle helpers and `NfsMountHandle`.
@@ -620,6 +651,23 @@ mod tests {
     }
     fn ephemeral_addr() -> SocketAddr {
         "127.0.0.1:0".parse().expect("static loopback")
+    }
+
+    /// bloom#258: before the stale mount is detached, the bound port must
+    /// refuse the dead mount's reconnects (RST) instead of queueing them, and
+    /// a live Machine's listener must still make the bind fail.
+    #[tokio::test]
+    async fn the_nfs_port_refuses_connections_until_it_listens() {
+        let socket = bind_nfs_socket(ephemeral_addr()).unwrap();
+        let addr = socket.local_addr().unwrap();
+        let refused = tokio::net::TcpStream::connect(addr).await.unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::ConnectionRefused);
+
+        let listener = socket.listen(16).unwrap();
+        tokio::net::TcpStream::connect(addr).await.unwrap();
+        let in_use = bind_nfs_socket(addr).unwrap_err();
+        assert_eq!(in_use.kind(), std::io::ErrorKind::AddrInUse);
+        drop(listener);
     }
     fn unique_nonexistent_path() -> PathBuf {
         // Use a per-pid/per-time path so concurrent tests don't collide.
