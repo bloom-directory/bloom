@@ -2853,7 +2853,7 @@ fn validate_policy_action_id(id: &str) -> Result<(), HandlerError> {
 fn tx_open_err(e: TxEngineError) -> HandlerError {
     match e {
         TxEngineError::ApprovalRequired(_) => HandlerError::PermissionDenied,
-        TxEngineError::PolicyDenied(_) => HandlerError::OperationNotPermitted,
+        TxEngineError::PolicyDenied(_) => HandlerError::Refused(e.to_string()),
         TxEngineError::DependencyNotSatisfied { .. }
         | TxEngineError::SimulationReverted { .. }
         | TxEngineError::NonceGap { .. }
@@ -4645,12 +4645,7 @@ impl WalletsHandler {
                 Some(&self.address_book),
             )
             .await
-            // A body the engine refused is the caller's to fix (`invalid`);
-            // a policy denial keeps its message naming the rule.
-            .map_err(|error| match error {
-                TxEngineError::PolicyDenied(_) => err_be(error),
-                other => tx_open_err(other),
-            })?;
+            .map_err(tx_open_err)?;
         tracing::info!(wallet, chain, id = %staged.id, "outbox.staged");
         Ok(staged.id)
     }
@@ -4848,6 +4843,20 @@ mod tests {
     };
     use bloom_machine_client::{ProjectionFreshness, ProjectionVerification};
     use bloom_proto::AddressBook;
+
+    /// A policy denial reads as `operation not permitted` and names its rule,
+    /// whether it refuses the stage or the confirm.
+    #[test]
+    fn a_policy_denial_is_refused_with_its_rule() {
+        let refused = tx_open_err(TxEngineError::PolicyDenied(
+            "allowlists.recipients: 0xdead is not on the allowlist".into(),
+        ));
+        assert!(matches!(refused, HandlerError::Refused(_)), "{refused:?}");
+        assert_eq!(
+            refused.to_string(),
+            "operation not permitted: policy denied: allowlists.recipients: 0xdead is not on the allowlist"
+        );
+    }
     use bloom_tx::outbox::Outbox;
     use bloom_tx::tx_engine::TxEngine;
     use std::sync::Mutex;

@@ -1674,6 +1674,9 @@ impl TxEngine {
                 }
             }
         }
+        // A tx staged behind none of this sender's pending entries runs on
+        // today's state, so a failed gas estimate can be judged now.
+        let mut runs_alone = intent.nonce.is_none();
         let nonce = match intent.nonce {
             Some(n) => n,
             None => {
@@ -1681,6 +1684,7 @@ impl TxEngine {
                 let pending_high = self
                     .outbox
                     .highest_pending_nonce(wallet, &spec.name, from)?;
+                runs_alone = pending_high.is_none();
                 // If there are staged-but-unconfirmed txs, use the slot
                 // after the highest pending nonce. After broadcast they
                 // move to sent/ and the chain RPC returns the updated
@@ -1736,6 +1740,17 @@ impl TxEngine {
                 buffered.max(21_000)
             }
             Err(e) => {
+                // A lone tx whose estimate failed because it reverts is
+                // refused here, before the owner is asked to approve it.
+                if runs_alone
+                    && !matches!(intent.body, RawIntentBody::Deploy { .. })
+                    && let Ok(Err(returndata)) =
+                        chain.eth_call_capture_revert(req.clone(), None).await
+                {
+                    return Err(TxEngineError::SimulationReverted {
+                        reason: crate::reconcile::decode_revert(&returndata),
+                    });
+                }
                 // Use the hint from the external estimator (e.g. Enso) when
                 // available, applying the same 25% buffer. Fall back to 500k
                 // only if no hint was provided.
@@ -7978,6 +7993,71 @@ mod tests {
             .await
             .expect_err("a creation must not be staged on a blind default");
         assert!(error.to_string().contains("cannot estimate gas"), "{error}");
+    }
+
+    /// A tx that reverts against today's state is refused when it is staged,
+    /// with the reason, not after the owner approved it. Behind a pending
+    /// entry it may rely on (a spend after its approval), it is staged.
+    #[tokio::test]
+    async fn a_lone_reverting_tx_is_refused_at_staging() {
+        let stf = format!("0x08c379a0{:064x}{:064x}{:0<64}", 32, 3, hex::encode("STF"));
+        // Each stage reads a fresh node: its answers are queued, not replayed.
+        let node = || async {
+            let mut responses = stage_rpc_responses(false);
+            responses.remove("eth_estimateGas");
+            responses.insert(
+                "eth_call".into(),
+                vec![format!(
+                    r#"error:{{"code":3,"message":"execution reverted","data":"{stf}"}}"#
+                )],
+            );
+            stage_chain(&spawn_queued_rpc(responses).await)
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let engine = TxEngine::new(
+            Outbox::new(directory.path().join("outbox")).unwrap(),
+            60_000,
+        );
+        let permit = permit_for(&directory);
+        let from: Address = TEST_SIGNER_ADDRESS.parse().unwrap();
+        let body = r#"{"kind":"raw","to":"0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45","data":"0x1234","value":"0"}"#;
+        let stage = |chain: ChainClient| {
+            let (engine, permit) = (&engine, &permit);
+            async move {
+                engine
+                    .stage(
+                        permit,
+                        "alice",
+                        from,
+                        crate::intent_parser::parse(body).unwrap(),
+                        &chain,
+                        &Policy::default(),
+                        None,
+                    )
+                    .await
+            }
+        };
+        let error = stage(node().await)
+            .await
+            .expect_err("a reverting tx is not staged");
+        assert!(
+            matches!(&error, TxEngineError::SimulationReverted { reason } if reason.contains("STF")),
+            "{error}"
+        );
+        assert!(
+            engine
+                .outbox
+                .list("alice", "anvil", OutboxState::Pending)
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut earlier = fake_staged_1559("approve");
+        earlier.from = bloom_proto::checksum_address(&from);
+        engine.outbox.write_pending(&earlier, "p").unwrap();
+        stage(node().await)
+            .await
+            .expect("behind a pending entry it is staged");
     }
 
     #[tokio::test]

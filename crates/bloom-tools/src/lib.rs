@@ -169,7 +169,8 @@ mod tests {
 
     #[test]
     fn encode_call_takes_a_struct_as_an_array() {
-        // Uniswap SwapRouter02 exactInputSingle: selector 0x04e45aaf.
+        // Uniswap SwapRouter02 exactInputSingle, checked word for word
+        // against `cast calldata` for the same arguments.
         let calldata = encode_call(
             "exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))",
             &serde_json::json!([[
@@ -177,14 +178,25 @@ mod tests {
                 "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
                 500,
                 "0xa0066F3b71eFa96D0Dc37cE59ccD60bA50b2d7Bc",
-                "500000000000000000",
-                "1132000000",
+                "1000000000000000000",
+                "2265159854",
                 0
             ]]),
         )
         .unwrap();
-        assert_eq!(&calldata[..10], "0x04e45aaf");
-        assert_eq!(calldata.len(), 2 + 8 + 7 * 64);
+        assert_eq!(
+            calldata,
+            concat!(
+                "0x04e45aaf",
+                "000000000000000000000000c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+                "000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                "00000000000000000000000000000000000000000000000000000000000001f4",
+                "000000000000000000000000a0066f3b71efa96d0dc37ce59ccd60ba50b2d7bc",
+                "0000000000000000000000000000000000000000000000000de0b6b3a7640000",
+                "00000000000000000000000000000000000000000000000000000000870398ae",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+        );
     }
 
     #[test]
