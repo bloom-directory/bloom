@@ -5502,7 +5502,12 @@ async fn held_now(
             .as_array()?
             .iter()
             .filter(|h| h["raw"].as_str() != Some("0"))
-            .filter_map(|h| Some((h["chain"].as_str()?.to_owned(), h["display"].as_str()?.to_owned())))
+            .filter_map(|h| {
+                Some((
+                    h["chain"].as_str()?.to_owned(),
+                    h["display"].as_str()?.to_owned(),
+                ))
+            })
             .collect(),
     )
 }

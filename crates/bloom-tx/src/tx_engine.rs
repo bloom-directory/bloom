@@ -6732,12 +6732,7 @@ mod tests {
     #[tokio::test]
     async fn an_approve_plan_shows_the_allowance_it_replaces() {
         let word = |n: u64| format!("\"0x{n:064x}\"");
-        let symbol = format!(
-            "\"0x{:064x}{:064x}{}\"",
-            32,
-            4,
-            format!("{:0<64}", hex::encode("USDC"))
-        );
+        let symbol = format!("\"0x{:064x}{:064x}{:0<64}\"", 32, 4, hex::encode("USDC"));
         let calls = vec![word(6), symbol, word(1_000_000_000)];
         let chain =
             stage_chain(&spawn_queued_rpc(HashMap::from([("eth_call".to_owned(), calls)])).await);
