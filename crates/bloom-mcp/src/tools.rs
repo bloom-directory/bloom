@@ -320,16 +320,21 @@ impl ToolSpec {
             },
             VfsMethod::Write => {
                 let written = payload_len(arguments);
-                // A confirm that sent answers with its receipts.
+                // A confirm that sent answers with its receipts; a send.tx
+                // that staged answers with its approval, and sent nothing.
                 let sent = result.get("sent").and_then(Value::as_str);
-                let text = match sent {
-                    Some(sent) => format!("wrote {written} byte(s) to {path}\n{sent}"),
+                let pending = result.get("approval_pending");
+                let report = sent.or_else(|| pending?.get("text")?.as_str());
+                let text = match report {
+                    Some(report) => format!("wrote {written} byte(s) to {path}\n{report}"),
                     None => format!("wrote {written} byte(s) to {path}"),
                 };
-                ok_result(
-                    vec![json!({"type": "text", "text": text})],
-                    json!({ "path": path, "bytes_written": written, "sent": sent }),
-                )
+                let mut structured =
+                    json!({ "path": path, "bytes_written": written, "sent": sent });
+                if let Some(pending) = pending {
+                    structured["approval_pending"] = pending.clone();
+                }
+                ok_result(vec![json!({"type": "text", "text": text})], structured)
             }
             VfsMethod::WriteWithLookup => {
                 let written = payload_len(arguments);

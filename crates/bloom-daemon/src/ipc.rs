@@ -54,7 +54,9 @@ use std::time::UNIX_EPOCH;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use bloom_petals::{PetalError, PetalRunner};
-use bloom_vfs::owner_wait::{self, APPROVAL_POLL, APPROVAL_WAIT, RECEIPT_POLLS, WriteError};
+use bloom_vfs::owner_wait::{
+    self, APPROVAL_POLL, APPROVAL_WAIT, RECEIPT_POLLS, WriteError, Written,
+};
 use bloom_vfs::{Entry, EntryKind, Handler, HandlerError, Vfs, VfsPath};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1150,8 +1152,20 @@ impl IpcServer {
                 Err(e) => map_handler_err(id, e),
             },
             "write" => match self.do_write(&req.params, &context).await {
-                Ok(None) => Response::ok(id, Value::Null),
-                Ok(Some(sent)) => Response::ok(id, json!({ "sent": sent })),
+                Ok(Written::Done) => Response::ok(id, Value::Null),
+                Ok(Written::Sent(sent)) => Response::ok(id, json!({ "sent": sent })),
+                Ok(Written::ApprovalPending {
+                    id: entry,
+                    ceremony_url,
+                    text,
+                }) => Response::ok(
+                    id,
+                    json!({ "approval_pending": {
+                        "id": entry,
+                        "ceremony_url": ceremony_url,
+                        "text": text,
+                    } }),
+                ),
                 Err(WriteError::Handler(e)) => map_handler_err(id, e),
                 Err(WriteError::Approval(message)) => Response::err(id, -32007, message),
             },
@@ -1433,7 +1447,7 @@ impl IpcServer {
         &self,
         params: &Value,
         context: &IpcOperationContext,
-    ) -> Result<Option<String>, WriteError> {
+    ) -> Result<Written, WriteError> {
         match self.write_direct(params, context).await {
             Err(WriteError::Handler(error)) => match self.relinked(params, &error, false).await {
                 Some(real) => self.write_direct(&real, context).await,
@@ -1447,7 +1461,7 @@ impl IpcServer {
         &self,
         params: &Value,
         context: &IpcOperationContext,
-    ) -> Result<Option<String>, WriteError> {
+    ) -> Result<Written, WriteError> {
         let path = parse_path(params)?;
         if write_path_uses_wallet_signer(&path) && !is_fee_repair_write(&path, params) {
             return Err(HandlerError::PermissionDenied.into());
@@ -4898,14 +4912,32 @@ summary = "Demo app used by IPC tests."
         );
         let write = json!({"path": "/wallets/w/0/chains/base/outbox/send.tx", "bytes_b64": B64.encode("send 1 ETH to 0x01")});
         let context = IpcOperationContext::detached();
-        let Ok(Some(message)) = server.do_write(&write, &context).await else {
+        let Ok(Written::ApprovalPending {
+            id,
+            ceremony_url,
+            text,
+        }) = server.do_write(&write, &context).await
+        else {
             panic!("send.tx must report the approval link");
         };
-        assert!(
-            message.contains("http://localhost:1/c/s")
-                && message.contains("Write y to pending/tx-9/confirm"),
-            "{message}"
+        assert_eq!(
+            (id.as_str(), ceremony_url.as_str()),
+            ("tx-9", "http://localhost:1/c/s")
         );
+        assert!(text.contains("Write y to pending/tx-9/confirm"), "{text}");
+        // Nothing was signed: the answer is never under `sent`.
+        let answer = server
+            .dispatch(Request {
+                jsonrpc: "2.0".into(),
+                id: json!(1),
+                method: "write".into(),
+                params: write,
+            })
+            .await
+            .result
+            .expect("staging is not an error");
+        assert!(answer.get("sent").is_none(), "{answer}");
+        assert_eq!(answer["approval_pending"]["id"], "tx-9", "{answer}");
     }
 
     /// A sent entry whose receipt is recorded only on the fourth read.

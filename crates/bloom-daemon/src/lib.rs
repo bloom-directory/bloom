@@ -5546,6 +5546,10 @@ async fn render_wallet_paths(
         0 => String::new(),
         n => format!("- and {n} more; list `{what}`\n"),
     };
+    // Rows first, then every account's balances at once: each read is
+    // capped, so one slow chain costs the whole render that cap, not a
+    // multiple of it.
+    let mut rows = Vec::new();
     for wallet in wallet_ids.iter().take(SHOWN) {
         let accounts: Vec<String> = names(format!("/{wallet}"))
             .await
@@ -5557,19 +5561,33 @@ async fn render_wallet_paths(
             let chains = names(format!("/{wallet}/{account}/chains"))
                 .await
                 .unwrap_or_default();
-            if chains.is_empty() {
-                continue;
+            if !chains.is_empty() {
+                rows.push((wallet, account.clone(), Some(chains)));
             }
-            let held = held_now(wallet_tree, wallet, account, live_timeout).await;
-            lines.push_str(&format!(
-                "- `{wallet}` account `{account}`: balances `wallets/{wallet}/{account}/holdings.json`{held}; outbox `wallets/{wallet}/{account}/chains/<chain>/outbox/` on {}\n",
-                chains.join(", ")
-            ));
         }
-        lines.push_str(&more(
+        let hidden = more(
             accounts.len().saturating_sub(SHOWN),
             &format!("wallets/{wallet}/"),
-        ));
+        );
+        if !hidden.is_empty() {
+            rows.push((wallet, hidden, None));
+        }
+    }
+    let held = futures::future::join_all(rows.iter().map(|(wallet, account, chains)| async move {
+        match chains {
+            Some(_) => held_now(wallet_tree, wallet, account, live_timeout).await,
+            None => String::new(),
+        }
+    }))
+    .await;
+    for ((wallet, account, chains), held) in rows.iter().zip(held) {
+        match chains {
+            Some(chains) => lines.push_str(&format!(
+                "- `{wallet}` account `{account}`: balances `wallets/{wallet}/{account}/holdings.json`{held}; outbox `wallets/{wallet}/{account}/chains/<chain>/outbox/` on {}\n",
+                chains.join(", ")
+            )),
+            None => lines.push_str(account),
+        }
     }
     lines.push_str(&more(wallet_ids.len().saturating_sub(SHOWN), "wallets/"));
     if lines.is_empty() {
@@ -6464,6 +6482,8 @@ mod tests {
         dirs: std::collections::HashMap<&'static str, Vec<&'static str>>,
         files: std::collections::HashMap<&'static str, &'static str>,
         broken: Option<&'static str>,
+        /// How long each file read takes, like a slow chain RPC.
+        read_delay: Duration,
     }
 
     #[async_trait::async_trait]
@@ -6485,6 +6505,7 @@ mod tests {
         }
 
         async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            tokio::time::sleep(self.read_delay).await;
             let key = path.segments().join("/");
             self.files
                 .get(key.as_str())
@@ -6532,6 +6553,33 @@ mod tests {
         );
     }
 
+    /// AGENTS.md ends with this render, so slow chains must not add up:
+    /// every account's balances are read at once.
+    #[tokio::test]
+    async fn next_md_reads_every_accounts_balances_at_once() {
+        let tree = WalletTreeFixture {
+            dirs: [
+                ("alice", vec!["0", "1", "2", "3"]),
+                ("alice/0/chains", vec!["base"]),
+                ("alice/1/chains", vec!["base"]),
+                ("alice/2/chains", vec!["base"]),
+                ("alice/3/chains", vec!["base"]),
+            ]
+            .into(),
+            read_delay: Duration::from_millis(600),
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let text = render_wallet_paths(&tree, &["alice".to_owned()], Duration::from_secs(10)).await;
+        assert!(text.contains("`alice` account `3`"), "{text}");
+        // One read at a time would take 2.4 s.
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
     fn alice_tree() -> WalletTreeFixture {
         WalletTreeFixture {
             dirs: [
@@ -6573,7 +6621,7 @@ mod tests {
                 ),
             ]
             .into(),
-            broken: None,
+            ..Default::default()
         }
     }
 

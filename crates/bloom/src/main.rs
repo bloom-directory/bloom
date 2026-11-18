@@ -4021,6 +4021,13 @@ async fn run(cli: Cli) -> Result<()> {
             if let Some(sent) = written.get("sent").and_then(serde_json::Value::as_str) {
                 println!("{sent}");
             }
+            // A send.tx that staged and waits for the owner sent nothing:
+            // exit as `wallet confirm` does for the same state.
+            if let Some(text) = written["approval_pending"]["text"].as_str() {
+                println!("{text}");
+                EXIT_CODE_OVERRIDE
+                    .store(EXIT_APPROVAL_PENDING, std::sync::atomic::Ordering::SeqCst);
+            }
             debug!(endpoint = %client_endpoint.display, "cli.vfs.write.via_ipc");
             Ok(())
         }
