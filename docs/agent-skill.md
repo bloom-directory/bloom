@@ -80,8 +80,10 @@ without `.claude-plugin/` (ClawHub refuses a folder with a plugin manifest as a
 skill). It uses the `CLAWHUB_TOKEN` secret in the `production-release`
 environment, an API token of a `@bloom-directory` member. It skips a version
 already on ClawHub, so it is safe to retry. It also moves the keyword tags
-(`crypto`, `wallet`, ...) to the new version; Hermes's catalog files skills by
-them.
+(`crypto`, `wallet`, ...) to the new version. ClawHub cannot remove a tag.
+Hermes files a ClawHub skill by its first tag in alphabetical order that names a
+category, so `crypto` puts Bloom under Blockchain. For skills it lists from
+GitHub, Hermes uses the category in the root `skills.sh.json`: Finance.
 
 The listing is <https://clawhub.ai/bloom-directory/skills/bloom>, owned by the
 `@bloom-directory` publisher. Slugs are per owner, and another publisher also
