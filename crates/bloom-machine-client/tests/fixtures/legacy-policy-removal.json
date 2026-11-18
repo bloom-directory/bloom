@@ -65,6 +65,7 @@
     "removed_petal_packages": [],
     "added_destinations": [],
     "removed_destinations": [],
+    "respelled_destinations": [],
     "added_required_verifiers": [],
     "removed_required_verifiers": [
       {

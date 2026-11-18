@@ -19,7 +19,6 @@ pub use projection::{
 };
 
 use std::{
-    collections::BTreeSet,
     future::Future,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
@@ -3040,37 +3039,12 @@ fn jcs_digest<T: Serialize>(value: &T) -> Result<Digest32, ProtocolError> {
     ))
 }
 
-const CLAIMED_POLICY_AUTHORITY_DIFF_DOMAIN: &[u8] = b"bloom-policy-authority-diff/v1";
-
-#[derive(Serialize)]
-struct ClaimedPolicyAuthorityDiff {
-    maximum_approval_lifetime_ms_before: DecimalU64,
-    maximum_approval_lifetime_ms_after: DecimalU64,
-    added_petal_packages: Vec<Digest32>,
-    removed_petal_packages: Vec<Digest32>,
-    added_destinations: Vec<ClaimedPolicyAuthorityDestination>,
-    removed_destinations: Vec<ClaimedPolicyAuthorityDestination>,
-    added_required_verifiers: Vec<ClaimedPolicyAuthorityVerifier>,
-    removed_required_verifiers: Vec<ClaimedPolicyAuthorityVerifier>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    removed_legacy_clear_signing: Option<bloom_broker_api::LegacyClearSigningPolicy>,
-}
-
-#[derive(Clone, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-struct ClaimedPolicyAuthorityDestination {
-    chain: Token,
-    destination: String,
-}
-
-#[derive(Clone, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-struct ClaimedPolicyAuthorityVerifier {
-    verifier_id: Token,
-    verifier_digest: Digest32,
-}
-
 /// Computes Machine's claimed authority-diff digest for policy-update
-/// preflight. Broker independently recomputes the canonical review delta and
-/// rejects any mismatch; this helper confers no policy or review authority.
+/// preflight. Broker recomputes the canonical review delta and rejects any
+/// mismatch; this helper confers no policy or review authority. Both sides
+/// derive the diff with `bloom_broker_api::canonical_policy_authority_diff`,
+/// which compares destinations by decoded identity, so a pin that moves the
+/// diff moves Machine's claim with it.
 pub fn claimed_policy_authority_diff_digest(
     current: &bloom_broker_api::CanonicalWalletPolicy,
     proposed: &bloom_broker_api::CanonicalWalletPolicy,
@@ -3081,71 +3055,7 @@ pub fn claimed_policy_authority_diff_digest(
             "Legacy clear_signing policy may only be retained unchanged or removed",
         ));
     }
-    fn set_diff<T: Ord + Clone>(
-        before: impl IntoIterator<Item = T>,
-        after: impl IntoIterator<Item = T>,
-    ) -> (Vec<T>, Vec<T>) {
-        let before = before.into_iter().collect::<BTreeSet<_>>();
-        let after = after.into_iter().collect::<BTreeSet<_>>();
-        (
-            after.difference(&before).cloned().collect(),
-            before.difference(&after).cloned().collect(),
-        )
-    }
-
-    let (added_petal_packages, removed_petal_packages) = set_diff(
-        current.allowed_petal_packages.iter().cloned(),
-        proposed.allowed_petal_packages.iter().cloned(),
-    );
-    let (added_destinations, removed_destinations) = set_diff(
-        current
-            .allowed_destinations
-            .iter()
-            .map(|value| ClaimedPolicyAuthorityDestination {
-                chain: value.chain.clone(),
-                destination: value.destination.clone(),
-            }),
-        proposed
-            .allowed_destinations
-            .iter()
-            .map(|value| ClaimedPolicyAuthorityDestination {
-                chain: value.chain.clone(),
-                destination: value.destination.clone(),
-            }),
-    );
-    let (added_required_verifiers, removed_required_verifiers) = set_diff(
-        current
-            .required_verifiers
-            .iter()
-            .map(|value| ClaimedPolicyAuthorityVerifier {
-                verifier_id: value.verifier_id.clone(),
-                verifier_digest: value.verifier_digest.clone(),
-            }),
-        proposed
-            .required_verifiers
-            .iter()
-            .map(|value| ClaimedPolicyAuthorityVerifier {
-                verifier_id: value.verifier_id.clone(),
-                verifier_digest: value.verifier_digest.clone(),
-            }),
-    );
-    let claimed = ClaimedPolicyAuthorityDiff {
-        maximum_approval_lifetime_ms_before: DecimalU64::new(current.maximum_approval_lifetime_ms),
-        maximum_approval_lifetime_ms_after: DecimalU64::new(proposed.maximum_approval_lifetime_ms),
-        added_petal_packages,
-        removed_petal_packages,
-        added_destinations,
-        removed_destinations,
-        added_required_verifiers,
-        removed_required_verifiers,
-        removed_legacy_clear_signing: (current.clear_signing != proposed.clear_signing)
-            .then(|| current.clear_signing.clone())
-            .flatten(),
-    };
-    let mut hasher = Sha256::new();
-    hasher.update(CLAIMED_POLICY_AUTHORITY_DIFF_DOMAIN);
-    hasher.update(serde_jcs::to_vec(&claimed).map_err(canonical_error)?);
-    Ok(Digest32::from_bytes(hasher.finalize().into()))
+    bloom_broker_api::canonical_policy_authority_diff(current, proposed).digest()
 }
 
 fn canonical_error(error: serde_json::Error) -> ProtocolError {
@@ -3674,21 +3584,24 @@ mod tests {
         );
     }
 
+    /// The vector `bloom-broker-api` pins for v2. A pin that changes the diff
+    /// without changing both sides fails here and in the Broker.
     #[test]
-    fn claimed_policy_authority_diff_digest_matches_reviewed_v1_vector() {
+    fn claimed_policy_authority_diff_digest_matches_reviewed_v2_vector() {
+        let destination = |chain: &str, destination: &str| bloom_broker_api::PolicyDestination {
+            chain: Token::new(chain).unwrap(),
+            destination: destination.into(),
+        };
         let current = bloom_broker_api::CanonicalWalletPolicy {
             clear_signing: None,
             wallet_id: Token::new("wallet").unwrap(),
             maximum_approval_lifetime_ms: 10,
-            allowed_petal_packages: vec![
-                Digest32::from_bytes([2; 32]),
-                Digest32::from_bytes([1; 32]),
-                Digest32::from_bytes([2; 32]),
+            allowed_petal_packages: vec![Digest32::from_bytes([1; 32])],
+            allowed_destinations: vec![
+                destination("base", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
+                destination("base", "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
+                destination("ethereum", "old"),
             ],
-            allowed_destinations: vec![bloom_broker_api::PolicyDestination {
-                chain: Token::new("ethereum").unwrap(),
-                destination: "old".into(),
-            }],
             required_verifiers: vec![bloom_broker_api::RequiredVerifier {
                 verifier_id: Token::new("human").unwrap(),
                 verifier_digest: Digest32::from_bytes([3; 32]),
@@ -3698,23 +3611,55 @@ mod tests {
             clear_signing: None,
             wallet_id: Token::new("wallet").unwrap(),
             maximum_approval_lifetime_ms: 20,
-            allowed_petal_packages: vec![
-                Digest32::from_bytes([4; 32]),
-                Digest32::from_bytes([2; 32]),
-                Digest32::from_bytes([4; 32]),
+            allowed_petal_packages: vec![Digest32::from_bytes([4; 32])],
+            allowed_destinations: vec![
+                destination("base", "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
+                destination("ethereum", "new"),
             ],
-            allowed_destinations: vec![bloom_broker_api::PolicyDestination {
-                chain: Token::new("ethereum").unwrap(),
-                destination: "new".into(),
-            }],
             required_verifiers: Vec::new(),
         };
         assert_eq!(
             claimed_policy_authority_diff_digest(&current, &proposed)
                 .unwrap()
                 .as_str(),
-            "3cb245d0d885a2802566aca5c7af7caed5a069d4d205ec484538a1e4f67b9e42"
+            "44f12ff959f3988f53c160d105d1bbb7e6395ee739fe49be59dd9f2da3d717e6"
         );
+    }
+
+    /// pm#88: re-spelling an allowed account, or dropping one of its two
+    /// spellings, is not an authority change, so Machine's claim matches the
+    /// diff Broker shows the owner rather than an add and a remove.
+    #[test]
+    fn claimed_policy_authority_diff_treats_a_respelling_as_no_authority_change() {
+        let policy = |destinations: &[&str]| bloom_broker_api::CanonicalWalletPolicy {
+            clear_signing: None,
+            wallet_id: Token::new("wallet").unwrap(),
+            maximum_approval_lifetime_ms: 10,
+            allowed_petal_packages: Vec::new(),
+            allowed_destinations: destinations
+                .iter()
+                .map(|destination| bloom_broker_api::PolicyDestination {
+                    chain: Token::new("base").unwrap(),
+                    destination: (*destination).into(),
+                })
+                .collect(),
+            required_verifiers: Vec::new(),
+        };
+        let checksummed = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+        let lowercase = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+        for (current, proposed) in [
+            (policy(&[checksummed]), policy(&[lowercase])),
+            (policy(&[checksummed, lowercase]), policy(&[lowercase])),
+        ] {
+            let diff = bloom_broker_api::canonical_policy_authority_diff(&current, &proposed);
+            assert!(diff.added_destinations.is_empty());
+            assert!(diff.removed_destinations.is_empty());
+            assert_eq!(diff.respelled_destinations.len(), 1);
+            assert_eq!(
+                claimed_policy_authority_diff_digest(&current, &proposed).unwrap(),
+                diff.digest().unwrap()
+            );
+        }
     }
 
     #[test]
@@ -3730,7 +3675,7 @@ mod tests {
             claimed_policy_authority_diff_digest(&current, &proposed)
                 .unwrap()
                 .as_str(),
-            "65f348e08a8ded736ad13843456a1afbaacf16bf5518147b1d7d900f703e7401"
+            "8cc51489b9ac2667c953f4c31d9e2b1ae19ac8e3e0596014919a114d6fe970a3"
         );
         let mut restored = proposed.clone();
         restored.clear_signing = current.clear_signing.clone();

@@ -297,6 +297,8 @@ pub fn evaluate(
     out
 }
 
+/// EVM only: see the comment in `check_lists` before matching any other
+/// address family case-insensitively.
 fn address_lc(a: Option<Address>) -> Option<String> {
     a.map(|x| format!("{x:#x}").to_ascii_lowercase())
 }
@@ -408,6 +410,14 @@ fn check_lists(
             return;
         }
     };
+    // Lowercasing both sides compares decoded identity only because `addr`
+    // is a parsed EVM `Address`, whose hex spelling's case is EIP-55's
+    // checksum. It is not a rule for addresses in general: base58 case is
+    // data, so lowercasing a Solana entry names a different account, and a
+    // bech32 prefix is part of the account. If this ever takes another
+    // family, for example to put Solana outbox transfers through the same
+    // gate, compare `bloom_broker_api::address::comparable(chain, entry)`
+    // per chain instead, as Broker matches claims (bloom-broker#80, pm#88).
     let target_lc = format!("{target:#x}").to_ascii_lowercase();
     let hit = list
         .iter()
