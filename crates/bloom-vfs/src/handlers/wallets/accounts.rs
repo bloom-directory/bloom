@@ -2323,6 +2323,20 @@ fn evm_approval_challenge(
             object.remove("retry_body");
         }
     }
+    // IPC and the mount refuse writes to `pending/<id>/cancel`, so the only
+    // retry that reaches this approval is the command that started it.
+    if control == "cancel" {
+        let account = outbox.split('/').nth(2).unwrap_or("0");
+        let command = format!(
+            "bloom wallet cancel {} {} {} --account {account}",
+            staged.wallet, staged.chain, staged.id
+        );
+        if let Some(object) = challenge.as_object_mut() {
+            object.remove("retry_path");
+            object.remove("retry_body");
+            object.insert("retry_command".into(), command.into());
+        }
+    }
     Ok(challenge)
 }
 
@@ -2337,15 +2351,18 @@ fn reconcile_approval_challenge(
     live: Option<&bloom_broker_api::ApprovalPublicStatus>,
 ) {
     let petal = challenge["staged_by"].as_str().map(str::to_owned);
-    let retry = match &petal {
-        Some(petal) => format!(
+    let command = challenge["retry_command"].as_str().map(str::to_owned);
+    let retry = match (&petal, &command) {
+        (Some(petal), _) => format!(
             "retry {}",
             crate::handlers::outbox::through_staging_petal(petal)
         ),
-        None => "write retry_body to retry_path".into(),
+        (None, Some(command)) => format!("run `{command}` again"),
+        (None, None) => "write retry_body to retry_path".into(),
     };
+    let direct = petal.is_none() && command.is_none();
     let (state, mut next) = match live {
-        Some(status) => approval_next_step(status.state, &retry, petal.is_none()),
+        Some(status) => approval_next_step(status.state, &retry, direct),
         None => (
             "unknown",
             format!(
@@ -2396,7 +2413,7 @@ fn approval_next_step(
             if direct {
                 "Give ceremony_url to the owner, then write retry_body to retry_path. Through bloom vfs write or MCP it waits for their approval and sends; on a mount it is denied until they approve, so write it again after. Neither starts a new ceremony.".into()
             } else {
-                format!("Give ceremony_url to the owner. As soon as they approve, {retry}. Retrying earlier is safe: it starts no new ceremony and returns permission denied again.")
+                format!("Give ceremony_url to the owner. As soon as they approve, {retry}. Retrying earlier is safe: it starts no new ceremony and reports the approval as still pending.")
             },
         ),
         S::Active => (
@@ -2499,11 +2516,16 @@ mod tests {
         let signing = evm_signing_state(&entry).expect("waiting cancel is projected");
         let root = "wallets/main/0/chains/base/outbox";
         let challenge = evm_approval_challenge(&entry, &signing, root, &|_| None).unwrap();
+        // IPC and the mount refuse cancel writes, so no write is advertised.
+        assert!(challenge.get("retry_path").is_none(), "{challenge}");
+        assert!(challenge.get("retry_body").is_none(), "{challenge}");
         assert_eq!(
-            challenge["retry_path"],
-            format!("{root}/pending/0005-72611/cancel")
+            challenge["retry_command"],
+            format!(
+                "bloom wallet cancel {} {} 0005-72611 --account 0",
+                entry.staged.wallet, entry.staged.chain
+            )
         );
-        assert_eq!(challenge["retry_body"], "y");
         assert_eq!(
             challenge["plan_path"],
             format!("{root}/sent/0005-72611/plan.md")

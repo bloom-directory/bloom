@@ -9092,10 +9092,15 @@ value = "0""#,
             challenge["ceremony_url"],
             "https://relay.test/ceremony/#cap=cancel"
         );
-        assert_eq!(
-            challenge["retry_path"],
-            format!("wallets/{w}/0/chains/anvil/outbox/pending/sent-cancel/cancel")
+        assert!(challenge.get("retry_path").is_none(), "{challenge}");
+        let next = challenge["next"].as_str().unwrap();
+        assert!(
+            next.contains(&format!(
+                "run `bloom wallet cancel {w} anvil sent-cancel --account 0` again"
+            )),
+            "{next}"
         );
+        assert!(!next.contains("retry_path"), "{next}");
         assert_eq!(challenge["value_wei"], "0");
     }
 
