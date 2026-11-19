@@ -229,6 +229,10 @@ jobs:
         with:
           name: nextest-archive
           path: target
+      # Ubuntu's AppArmor default denies the unprivileged user namespace that
+      # Checkout's private display runs in; allow it so the display test runs.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Run library unit tests from archive
         run: cargo nextest run --archive-file target/nextest-archive.tar.zst -E 'kind(lib) or (package(bloom) and kind(bin))' --no-fail-fast
 
