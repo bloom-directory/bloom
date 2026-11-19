@@ -22,6 +22,10 @@
 
   <key>EnvironmentVariables</key>
   <dict>
+    <key>BLOOM_CHECKOUT_INTAKE_SOCKET</key>
+    <string>@BLOOM_CHECKOUT_INTAKE@</string>
+    <key>BLOOM_CHECKOUT_UID</key>
+    <string>@BLOOM_CHECKOUT_UID@</string>
     <key>BLOOM_BROKER_IDENTITY</key>
     <string>@BLOOM_BROKER_IDENTITY@</string>
     <key>BLOOM_BROKER_CONFIG</key>

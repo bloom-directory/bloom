@@ -26,6 +26,10 @@ const TOPICS: &[(&str, &str)] = &[
         include_str!("../docs/topics/paid-http-requests.md"),
     ),
     (
+        "pay-with-a-saved-card.md",
+        include_str!("../docs/topics/pay-with-a-saved-card.md"),
+    ),
+    (
         "policy-change.md",
         include_str!("../docs/topics/policy-change.md"),
     ),

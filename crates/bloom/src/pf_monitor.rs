@@ -138,6 +138,17 @@ pub fn run_once() -> Result<()> {
             |target| command_output("/bin/launchctl", &["print", target]),
             |target| command_output("/bin/launchctl", &["kill", "SIGTERM", target]).map(|_| ()),
         )?;
+        if enrollment.get("checkout_uid").is_some() {
+            crate::macos_runtime::prepare_checkout(
+                Path::new("/private/var/run/bloom"),
+                login_uid,
+                required_u32(&enrollment, "broker_uid")?,
+                required_u32(&enrollment, "checkout_uid")?,
+                required_u32(&enrollment, "machine_checkout_gid")?,
+                required_u32(&enrollment, "broker_checkout_gid")?,
+            )
+            .context("prepare macOS checkout runtime")?;
+        }
         let status = Status {
             schema: STATUS_SCHEMA,
             login_uid,
@@ -192,10 +203,26 @@ fn restart_services_for_live_session(login_uid: u32, revoke_gid: u32) -> Result<
         );
     }
 
-    for service in ["signer", "broker"] {
+    let checkout_installed = PathBuf::from(format!(
+        "/Library/LaunchDaemons/com.bloom.checkout.{login_uid}.plist"
+    ))
+    .exists();
+    for service in ["signer", "broker", "checkout"] {
+        if service == "checkout" && !checkout_installed {
+            continue;
+        }
         let target = format!("system/com.bloom.{service}.{login_uid}");
-        let state = command_output("/bin/launchctl", &["print", &target])
-            .with_context(|| format!("inspect loaded {service} job for login {login_uid}"))?;
+        let state = match command_output("/bin/launchctl", &["print", &target]) {
+            Ok(state) => state,
+            // Checkout is optional and may be unloaded during an upgrade.
+            // Do not prevent lifecycle checks for the remaining logins.
+            Err(_) if service == "checkout" => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("inspect loaded {service} job for login {login_uid}")
+                });
+            }
+        };
         if !state.lines().any(|line| line.trim() == "state = running") {
             command_output("/bin/launchctl", &["kickstart", &target])
                 .with_context(|| format!("restart {service} for live login {login_uid}"))?;

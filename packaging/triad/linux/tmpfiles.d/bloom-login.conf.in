@@ -1,4 +1,8 @@
 # Parents are traversable but contain no readable data.
+d /run/bloom/@LOGIN_UID@/checkout 0711 bloom-checkout-@LOGIN_UID@ bloom-checkout-@LOGIN_UID@ -
+d /run/bloom/@LOGIN_UID@/checkout/rpc 0710 bloom-checkout-@LOGIN_UID@ bloom-machine-checkout-@LOGIN_UID@ -
+d /run/bloom/@LOGIN_UID@/broker/checkout 0710 bloom-broker-@LOGIN_UID@ bloom-broker-checkout-@LOGIN_UID@ -
+d /var/lib/bloom/@LOGIN_UID@/checkout 0700 bloom-checkout-@LOGIN_UID@ bloom-checkout-@LOGIN_UID@ -
 d /run/bloom/@LOGIN_UID@ 0711 root root -
 d /run/bloom/@LOGIN_UID@/broker 0711 bloom-broker-@LOGIN_UID@ bloom-broker-@LOGIN_UID@ -
 d /run/bloom/@LOGIN_UID@/broker/rpc 0710 bloom-broker-@LOGIN_UID@ bloom-machine-broker-@LOGIN_UID@ -
