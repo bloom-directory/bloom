@@ -1,7 +1,7 @@
 {
   "name": "bloom-skill-evals",
   "private": true,
-  "description": "Promptfoo evaluations of the Bloom agent skill in skills/bloom.",
+  "description": "Promptfoo evaluations of the Bloom agent skill in plugins/bloom/skills/bloom.",
   "type": "module",
   "engines": {
     "node": ">=22.22.0"

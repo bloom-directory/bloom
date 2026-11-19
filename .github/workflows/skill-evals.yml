@@ -6,9 +6,7 @@ on:
       - ".github/workflows/skill-evals.yml"
       - ".claude-plugin/**"
       - ".agents/plugins/**"
-      - "plugin.json"
-      - "gemini-extension.json"
-      - "skills/**"
+      - "plugins/**"
       - "install/**"
       - "evals/skills/**"
   push:
@@ -50,8 +48,8 @@ jobs:
           jq -er '.plugins[].source.path' .agents/plugins/marketplace.json | xargs -I{} test -f {}/plugin.json
           # Installed plugins update only when this version changes, so every
           # manifest's version moves with the skill's version.
-          skill="$(sed -n -E 's/^  version: "?([0-9]+\.[0-9]+\.[0-9]+)"?$/\1/p' skills/bloom/SKILL.md)"
-          for f in skills/bloom/.claude-plugin/plugin.json plugin.json gemini-extension.json; do
+          skill="$(sed -n -E 's/^  version: "?([0-9]+\.[0-9]+\.[0-9]+)"?$/\1/p' plugins/bloom/skills/bloom/SKILL.md)"
+          for f in plugins/bloom/.claude-plugin/plugin.json plugins/bloom/plugin.json; do
             jq -e '.name and .version' "$f" > /dev/null
             plugin="$(jq -r .version "$f")"
             [ -n "$skill" ] && [ "$skill" = "$plugin" ] ||
