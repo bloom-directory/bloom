@@ -11330,9 +11330,8 @@ value = "0""#,
         assert!(matches!(r, Err(HandlerError::Invalid(_))), "got: {r:?}");
     }
 
-    /// A broadcast entry is in `sent/` but is still cancelled through
-    /// `pending/<id>/`, as the cancel challenge's `retry_path` says; the
-    /// sender fence still hides another account's entry. Replace is refused,
+    /// A broadcast entry is in `sent/` but its cancel control is still
+    /// `pending/<id>/cancel`; the sender fence still hides another account's entry. Replace is refused,
     /// because its approval is not projected for a sent entry.
     #[tokio::test]
     async fn cancel_reaches_a_sent_entry_of_the_same_sender() {
