@@ -59,6 +59,24 @@ pub fn may_wait(path: &VfsPath) -> bool {
         || confirm_challenge_path(path).is_some()
 }
 
+/// What a successful [`write`] reports to a caller that can show text.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Written {
+    /// Nothing to report.
+    Done,
+    /// A confirm sent: one line per entry, from the receipts.
+    Sent(String),
+    /// `new.tx` staged without asking the owner: what will be signed and
+    /// the next step. Nothing is signed or sent.
+    Staged(String),
+    /// `send.tx` staged and is waiting for the owner. Nothing is signed.
+    ApprovalPending {
+        id: String,
+        ceremony_url: String,
+        text: String,
+    },
+}
+
 /// Write `bytes` to `path`, waiting for the owner where a repeat of the
 /// same request is the caller's next step. `wait` bounds that wait.
 ///
@@ -72,18 +90,18 @@ pub async fn write(
     wait: Duration,
     cancelled: Cancelled<'_>,
     report: bool,
-) -> Result<Option<String>, WriteError> {
+) -> Result<Written, WriteError> {
     if let [root, wallet, leaf] = path.segments()
         && root == "wallets"
         && leaf == "policy.json"
     {
         write_policy(vfs, wallet, path, bytes, wait, cancelled).await?;
-        return Ok(None);
+        return Ok(Written::Done);
     }
     if matches!(path.segments(), [root, _, _, leaf] if root == "wallets" && leaf == "confirm-batch")
     {
         write_batch_confirm(vfs, path, bytes, wait, cancelled).await?;
-        return Ok(None);
+        return Ok(Written::Done);
     }
     let Some(challenge) = confirm_challenge_path(path) else {
         return match vfs.write(path, bytes).await {
@@ -130,11 +148,16 @@ pub async fn write(
                 let url = url.and_then(|doc| doc["ceremony_url"].as_str().map(str::to_owned));
                 // Staging is not a failure: answer with what will be signed,
                 // so the caller need not read each plan before confirming.
+                // Nothing is sent, so it is never reported as `Sent`.
                 if report && let Some(url) = &url {
                     let plans = staged_plans(vfs, path, &entries).await;
-                    return Ok(Some(format!(
-                        "{plans}Staged; owner approval{staged}: {url} . Write y to pending/{id}/confirm: it waits for their approval, then sends."
-                    )));
+                    return Ok(Written::ApprovalPending {
+                        text: format!(
+                            "{plans}Staged; owner approval{staged}: {url} . Write y to pending/{id}/confirm: it waits for their approval, then sends."
+                        ),
+                        id,
+                        ceremony_url: url.clone(),
+                    });
                 }
                 Err(match url {
                     Some(url) => WriteError::Approval(format!(
@@ -146,9 +169,11 @@ pub async fn write(
             // `new.tx` only stages: answer with what will be signed and the
             // next step, or the caller searches `latest/` for a link.
             Ok(()) if report && path.segments().last().is_some_and(|leaf| leaf == "new.tx") => {
-                Ok(staged_reply(vfs, path).await)
+                Ok(staged_reply(vfs, path)
+                    .await
+                    .map_or(Written::Done, Written::Staged))
             }
-            written => Ok(written.map(|()| None)?),
+            written => Ok(written.map(|()| Written::Done)?),
         };
     };
     // The batch the latest `confirm-batch` shows, if this entry is in it:
@@ -212,12 +237,16 @@ pub async fn write(
     };
     written?;
     if !reports {
-        return Ok(None);
+        return Ok(Written::Done);
     }
     // Balances are shown for the confirmed entry's chain, the one `before`
     // was read on, even when its batch spans chains.
     let chain = batch_ref.split_once(':').map_or("", |(chain, _)| chain);
-    Ok(sent_report(vfs, path, &sending, chain, before.unwrap_or_default()).await)
+    Ok(
+        sent_report(vfs, path, &sending, chain, before.unwrap_or_default())
+            .await
+            .map_or(Written::Done, Written::Sent),
+    )
 }
 
 /// The reply to a `new.tx` write: the entry it staged, up to its confirm
@@ -736,17 +765,18 @@ mod tests {
         let wait = Duration::from_secs(50);
         let sent = write(&vfs, &path, b"y\n", wait, &|| false, true).await;
         assert_eq!(
-            sent.ok().flatten().as_deref(),
-            Some(
+            sent.ok(),
+            Some(Written::Sent(
                 "tx-1: {\"outcome\":\"success\",\"tx_hash\":\"0xaa\",\"block_number\":7,\"revert_reason\":null}\n\
                  tx-2: broadcast tx 0xbb; receipt not recorded yet: wallets/w/0/chains/base/outbox/sent/tx-2/receipt.json\n\
                  base balances now: 1.5 ETH, 20 USDC"
-            )
+                    .into()
+            ))
         );
         let cancelled = write(&vfs, &path, b"cancel", wait, &|| false, true).await;
-        assert_eq!(cancelled.ok().flatten(), None);
+        assert_eq!(cancelled.ok(), Some(Written::Done));
         let mounted = write(&vfs, &path, b"y", wait, &|| false, false).await;
-        assert_eq!(mounted.ok().flatten(), None);
+        assert_eq!(mounted.ok(), Some(Written::Done));
     }
 
     /// A balance is shown with what the confirm changed, so a swap's output
@@ -810,12 +840,16 @@ mod tests {
         let path = VfsPath::parse("/wallets/w/0/chains/base/outbox/send.tx").unwrap();
         let wait = Duration::from_secs(50);
         let staged = write(&vfs, &path, b"send 1 ETH to 0xabc", wait, &|| false, true).await;
+        // Nothing is signed: never reported as sent.
         assert_eq!(
-            staged.ok().flatten().as_deref(),
-            Some(
-                "# Staged tx tx-1\n\nTo: 0xabc\n\nStaged; owner approval: http://localhost/c/1 . \
+            staged.ok(),
+            Some(Written::ApprovalPending {
+                id: "tx-1".into(),
+                ceremony_url: "http://localhost/c/1".into(),
+                text: "# Staged tx tx-1\n\nTo: 0xabc\n\nStaged; owner approval: http://localhost/c/1 . \
                  Write y to pending/tx-1/confirm: it waits for their approval, then sends."
-            )
+                    .into(),
+            })
         );
         let mounted = write(&vfs, &path, b"send 1 ETH to 0xabc", wait, &|| false, false).await;
         assert!(matches!(mounted, Err(WriteError::Approval(_))));
@@ -849,14 +883,15 @@ mod tests {
         let wait = Duration::from_secs(50);
         let staged = write(&vfs, &path, b"send 1 ETH to 0xabc", wait, &|| false, true).await;
         assert_eq!(
-            staged.ok().flatten().as_deref(),
-            Some(
+            staged.ok(),
+            Some(Written::Staged(
                 "# Staged tx tx-1\n\nTo: 0xabc\n\nStaged, not yet asked. Write y to \
                  pending/tx-1/confirm: it answers with the owner's approval link."
-            )
+                    .into()
+            ))
         );
         let mounted = write(&vfs, &path, b"send 1 ETH to 0xabc", wait, &|| false, false).await;
-        assert!(matches!(mounted, Ok(None)));
+        assert_eq!(mounted.ok(), Some(Written::Done));
     }
 
     /// The first policy write answers with the link at once; the repeat

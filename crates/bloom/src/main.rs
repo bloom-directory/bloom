@@ -4018,9 +4018,20 @@ async fn run(cli: Cli) -> Result<()> {
             let written = try_ipc(&client, &client_endpoint, "write", params)
                 .await
                 .with_context(|| format!("ipc write via {}", client_endpoint.display))?;
-            // A confirm that sent answers with its receipts.
-            if let Some(sent) = written.get("sent").and_then(serde_json::Value::as_str) {
-                println!("{sent}");
+            // A confirm that sent answers with its receipts; a new.tx
+            // write, with what it staged.
+            if let Some(report) = ["sent", "staged"]
+                .into_iter()
+                .find_map(|key| written.get(key).and_then(serde_json::Value::as_str))
+            {
+                println!("{report}");
+            }
+            // A send.tx that staged and waits for the owner sent nothing:
+            // exit as `wallet confirm` does for the same state.
+            if let Some(text) = written["approval_pending"]["text"].as_str() {
+                println!("{text}");
+                EXIT_CODE_OVERRIDE
+                    .store(EXIT_APPROVAL_PENDING, std::sync::atomic::Ordering::SeqCst);
             }
             debug!(endpoint = %client_endpoint.display, "cli.vfs.write.via_ipc");
             Ok(())

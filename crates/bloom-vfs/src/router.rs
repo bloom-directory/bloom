@@ -125,6 +125,16 @@ impl Vfs {
         Self::builder().build()
     }
 
+    /// The guide's size is known only while it is static; once it ends with
+    /// `next.md` it is reported unsized, like the other rendered root files.
+    fn agent_guidance_entry(&self, name: &str) -> Entry {
+        let mut entry = Entry::file(name);
+        if !self.root_dynamic.contains_key("next.md") {
+            entry.size = AGENT_GUIDANCE.len() as u64;
+        }
+        entry
+    }
+
     pub fn builder() -> VfsBuilder {
         VfsBuilder::default()
     }
@@ -460,9 +470,7 @@ impl Handler for Vfs {
             return Err(HandlerError::NotFound(path.to_string_path()));
         }
         if let Some(name) = root_agent_guidance_entry(path) {
-            let mut entry = Entry::file(name);
-            entry.size = AGENT_GUIDANCE.len() as u64;
-            return Ok(entry);
+            return Ok(self.agent_guidance_entry(name));
         }
         if let Some(name) = root_dynamic_entry(path, &self.root_dynamic) {
             return Ok(Entry::file(name));
@@ -587,9 +595,7 @@ impl Handler for Vfs {
         if path.is_root() {
             let mut out = Vec::new();
             for name in AGENT_GUIDANCE_FILES {
-                let mut entry = Entry::file(name);
-                entry.size = AGENT_GUIDANCE.len() as u64;
-                out.push(entry);
+                out.push(self.agent_guidance_entry(name));
             }
             for name in self.handlers.keys() {
                 out.push(Entry::dir(name));

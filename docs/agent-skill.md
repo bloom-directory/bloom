@@ -26,7 +26,8 @@ exact commit. Advance its revision after the Bloom PR lands, using the landed
 commit rather than the PR head. Its build publishes `SKILL.md`, and serves
 `install/install.md` and `install/setup.sh` at the paths the skill and guide
 link: `/references/install.md` and `/scripts/setup.sh` (`/setup.sh` remains a
-copy for existing links). Do not edit generated website copies.
+copy for existing links). Do not edit generated website copies. Verify the
+published files match the pinned commit after deployment.
 
 ## skills.sh
 

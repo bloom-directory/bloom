@@ -57,3 +57,5 @@ approve, then the call that spends it).
 - An error does not show whether the operation happened. Read the result
   before retrying. Never stage a payment again while one is pending or its
   outcome is unknown.
+- Report a failed or partly completed request as a failure, and say which
+  steps did not complete.

@@ -1328,15 +1328,12 @@ impl WalletsHandler {
                 // before it, which were only ever meant to go together. The
                 // error names the line, so the fix is made to that one.
                 Err(error) => {
-                    let line = format!("line {} of {}: ", n + 1, bodies.len());
-                    let error = match error {
-                        HandlerError::Invalid(m) if bodies.len() > 1 => {
-                            HandlerError::invalid(format!("{line}{m}"))
-                        }
-                        HandlerError::Backend(m) if bodies.len() > 1 => {
-                            HandlerError::backend(format!("{line}{m}"))
-                        }
-                        error => error,
+                    let error = if bodies.len() > 1 {
+                        reworded(error, |m| {
+                            format!("line {} of {}: {m}", n + 1, bodies.len())
+                        })
+                    } else {
+                        error
                     };
                     return Err(self
                         .discard_staged(wallet, chain, from, policy, &staged, number, error)
@@ -1402,14 +1399,10 @@ impl WalletsHandler {
         }
         if left.is_empty() {
             let discarded = all_discarded && !staged.is_empty();
-            return match error {
-                HandlerError::Invalid(m) if discarded => {
-                    HandlerError::invalid(format!("{m}; nothing was staged"))
-                }
-                HandlerError::Backend(m) if discarded => {
-                    HandlerError::backend(format!("{m}; nothing was staged"))
-                }
-                error => error,
+            return if discarded {
+                reworded(error, |m| format!("{m}; nothing was staged"))
+            } else {
+                error
             };
         }
         HandlerError::backend(format!(
@@ -3033,9 +3026,37 @@ impl WalletsHandler {
     }
 }
 
+/// `error` with its message rewritten, keeping its kind; kinds without a
+/// free-text message pass through unchanged.
+fn reworded(error: HandlerError, f: impl Fn(&str) -> String) -> HandlerError {
+    match error {
+        HandlerError::Invalid(m) => HandlerError::Invalid(f(&m)),
+        HandlerError::Backend(m) => HandlerError::Backend(f(&m)),
+        HandlerError::Refused(m) => HandlerError::Refused(f(&m)),
+        error => error,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A batch line the policy refused keeps its kind (`Operation not
+    /// permitted`) and still names its line and that nothing was staged.
+    #[test]
+    fn a_policy_refusal_in_a_batch_names_its_line() {
+        let refused = HandlerError::Refused("policy denied: allowlists.recipients: 0xdead".into());
+        let refused = reworded(refused, |m| format!("line 2 of 2: {m}"));
+        let refused = reworded(refused, |m| format!("{m}; nothing was staged"));
+        assert_eq!(
+            refused.to_string(),
+            "operation not permitted: line 2 of 2: policy denied: allowlists.recipients: 0xdead; nothing was staged"
+        );
+        assert!(matches!(
+            reworded(HandlerError::OperationNotPermitted, |m| m.to_owned()),
+            HandlerError::OperationNotPermitted
+        ));
+    }
 
     #[test]
     fn fee_repair_challenge_binds_the_retry_body_and_unchanged_call() {
