@@ -3514,9 +3514,6 @@ async fn confirm_projection(
     None
 }
 
-/// How long a repeated policy write waits for the owner. Matches the
-/// daemon's confirm wait, which stays under common 60 s tool timeouts.
-const POLICY_APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(50);
 const IPC_ERR_NOT_FOUND: i32 = -32004;
 const IPC_ERR_PERMISSION_DENIED: i32 = -32007;
 
@@ -4108,9 +4105,20 @@ async fn run(cli: Cli) -> Result<()> {
                 return write_policy(&client_endpoint, wallet, params).await;
             }
             let client = IpcClient::new(&client_endpoint.socket);
-            try_ipc(&client, &client_endpoint, "write", params)
+            let written = try_ipc(&client, &client_endpoint, "write", params)
                 .await
                 .with_context(|| format!("ipc write via {}", client_endpoint.display))?;
+            // A confirm that sent answers with its receipts.
+            if let Some(sent) = written.get("sent").and_then(serde_json::Value::as_str) {
+                println!("{sent}");
+            }
+            // A send.tx that staged and waits for the owner sent nothing:
+            // exit as `wallet confirm` does for the same state.
+            if let Some(text) = written["approval_pending"]["text"].as_str() {
+                println!("{text}");
+                EXIT_CODE_OVERRIDE
+                    .store(EXIT_APPROVAL_PENDING, std::sync::atomic::Ordering::SeqCst);
+            }
             debug!(endpoint = %client_endpoint.display, "cli.vfs.write.via_ipc");
             Ok(())
         }
@@ -5447,76 +5455,32 @@ async fn policy_update(endpoint: &ResolvedEndpoint, wallet: &str) -> Option<serd
     serde_json::from_slice(&ipc_read(endpoint, &path).await.ok()?).ok()
 }
 
-/// Write a wallet policy. A policy change needs the owner's approval, and the
-/// write alone reports that as a bare "permission denied". Print the ceremony
-/// link instead. A repeat of the same write waits for the owner, like a
-/// repeated confirm, and installs the policy only if they approved.
+/// Write a wallet policy. A policy change needs the owner's approval: print
+/// the ceremony link the Machine answers with. A repeat of the same write
+/// waits there for the owner and installs the policy only if they approved.
 async fn write_policy(
     endpoint: &ResolvedEndpoint,
     wallet: &str,
     params: serde_json::Value,
 ) -> Result<()> {
-    const WAITING: &str = "awaiting_custody";
     let client = IpcClient::new(&endpoint.socket);
-    let context = || format!("ipc write via {}", endpoint.display);
-    let waiting_before = policy_update(endpoint, wallet)
-        .await
-        .filter(|update| update["status"] == WAITING)
-        .map(|update| update["action_id"].clone());
-    let (code, error) = match try_ipc_coded(&client, endpoint, "write", params.clone()).await {
+    // The Machine answers a first write with the link and makes a repeat
+    // wait for the owner; this only words the answer for a terminal.
+    let (code, error) = match try_ipc_coded(&client, endpoint, "write", params).await {
         Ok(_) => {
             println!("Policy updated.");
             return Ok(());
         }
         Err(denied) => denied,
     };
-    let update = policy_update(endpoint, wallet)
-        .await
-        .filter(|_| code == IPC_ERR_PERMISSION_DENIED);
-    // The owner approved between the write and this read.
-    if update
-        .as_ref()
-        .is_some_and(|update| update["status"] == "ready_to_commit")
-    {
-        try_ipc(&client, endpoint, "write", params)
-            .await
-            .with_context(context)?;
-        println!("Policy updated.");
-        return Ok(());
-    }
-    let Some(update) = update.filter(|update| update["status"] == WAITING) else {
-        return Err(anyhow::Error::new(error).context(context()));
+    let update = policy_update(endpoint, wallet).await.filter(|update| {
+        code == IPC_ERR_PERMISSION_DENIED && update["status"] == "awaiting_custody"
+    });
+    let Some(update) = update else {
+        return Err(
+            anyhow::Error::new(error).context(format!("ipc write via {}", endpoint.display))
+        );
     };
-    if waiting_before.as_ref() == Some(&update["action_id"]) {
-        let deadline = tokio::time::Instant::now() + POLICY_APPROVAL_WAIT;
-        while tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            let Some(now) = policy_update(endpoint, wallet).await else {
-                continue;
-            };
-            anyhow::ensure!(
-                now["action_id"] == update["action_id"],
-                "another policy update replaced this one; read wallets/{wallet}/policy-updates/latest/status.json"
-            );
-            match now["status"].as_str() {
-                // prepare_pending: Broker has not opened the ceremony yet.
-                Some(WAITING | "prepare_pending") => continue,
-                Some("confirmed") => {}
-                // Approved: the same bytes written again install the policy.
-                Some("ready_to_commit") => {
-                    try_ipc(&client, endpoint, "write", params)
-                        .await
-                        .with_context(context)?;
-                }
-                status => bail!(
-                    "policy not changed: the update is {} (declined, expired, or the policy changed meanwhile); see wallets/{wallet}/policy-updates/latest/status.json",
-                    status.unwrap_or("in an unknown state")
-                ),
-            }
-            println!("Policy updated.");
-            return Ok(());
-        }
-    }
     let url = update["ceremony_url"].as_str().unwrap_or_default();
     let remaining = u128::from(update["expiry_ms"].as_u64().unwrap_or_default())
         .saturating_sub(unix_now_ms())

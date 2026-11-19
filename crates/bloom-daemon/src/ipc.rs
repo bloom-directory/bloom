@@ -54,6 +54,9 @@ use std::time::UNIX_EPOCH;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use bloom_petals::{PetalError, PetalRunner};
+use bloom_vfs::owner_wait::{
+    self, APPROVAL_POLL, APPROVAL_WAIT, RECEIPT_POLLS, WriteError, Written,
+};
 use bloom_vfs::{Entry, EntryKind, Handler, HandlerError, Vfs, VfsPath};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -904,44 +907,6 @@ pub struct IpcServer {
     approval_wait: std::time::Duration,
 }
 
-/// How long an IPC confirm waits for the owner's approval before it returns.
-/// It stays under the 60 s request timeout common MCP clients default to.
-const APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(50);
-const APPROVAL_POLL: std::time::Duration = std::time::Duration::from_millis(500);
-const BATCH_APPROVAL_POLL: std::time::Duration = std::time::Duration::from_secs(2);
-/// A receipt read waits this many polls (5 s) for the transaction to be mined.
-const RECEIPT_POLLS: u32 = 10;
-
-enum WriteError {
-    Handler(HandlerError),
-    /// The owner's approval did not arrive; the message says what to do.
-    Approval(String),
-}
-
-impl From<HandlerError> for WriteError {
-    fn from(error: HandlerError) -> Self {
-        WriteError::Handler(error)
-    }
-}
-
-/// The approval challenge beside a pending outbox `confirm` sink.
-fn confirm_challenge_path(path: &VfsPath) -> Option<VfsPath> {
-    match path.segments() {
-        [root, _, _, chains, _, outbox, pending, _, control]
-            if root == "wallets"
-                && chains == "chains"
-                && outbox == "outbox"
-                && pending == "pending"
-                && matches!(control.as_str(), "confirm" | "confirm.override") =>
-        {
-            let mut segments = path.segments().to_vec();
-            segments.pop();
-            VfsPath::parse(&format!("/{}/approval_challenge.json", segments.join("/"))).ok()
-        }
-        _ => None,
-    }
-}
-
 impl IpcServer {
     pub fn new(vfs: Vfs, version: impl Into<String>, chains: Vec<String>) -> Self {
         Self {
@@ -1291,7 +1256,20 @@ impl IpcServer {
                 Err(e) => map_handler_err(id, e),
             },
             "write" => match self.do_write(&req.params, &context).await {
-                Ok(()) => Response::ok(id, Value::Null),
+                Ok(Written::Done) => Response::ok(id, Value::Null),
+                Ok(Written::Sent(sent)) => Response::ok(id, json!({ "sent": sent })),
+                Ok(Written::ApprovalPending {
+                    id: entry,
+                    ceremony_url,
+                    text,
+                }) => Response::ok(
+                    id,
+                    json!({ "approval_pending": {
+                        "id": entry,
+                        "ceremony_url": ceremony_url,
+                        "text": text,
+                    } }),
+                ),
                 Err(WriteError::Handler(e)) => map_handler_err(id, e),
                 Err(WriteError::Approval(message)) => Response::err(id, -32007, message),
             },
@@ -1517,23 +1495,8 @@ impl IpcServer {
     /// Whether `params` names the receipt of an outbox entry that was
     /// broadcast (it has a `tx_hash`) but has no receipt recorded yet.
     async fn receipt_is_due(&self, params: &Value, error: &HandlerError) -> bool {
-        let Ok(path) = parse_path(params) else {
-            return false;
-        };
-        let segments = path.segments();
-        let [.., outbox, sent, _, leaf] = segments else {
-            return false;
-        };
-        if !matches!(error, HandlerError::NotFound(_))
-            || outbox != "outbox"
-            || sent != "sent"
-            || leaf != "receipt.json"
-        {
-            return false;
-        }
-        let sibling = format!("/{}/tx_hash", segments[..segments.len() - 1].join("/"));
-        match VfsPath::parse(&sibling) {
-            Ok(tx_hash) => self.vfs.lookup(&tx_hash).await.is_ok(),
+        match parse_path(params) {
+            Ok(path) => owner_wait::receipt_is_due(&self.vfs, &path, error).await,
             Err(_) => false,
         }
     }
@@ -1588,7 +1551,7 @@ impl IpcServer {
         &self,
         params: &Value,
         context: &IpcOperationContext,
-    ) -> Result<(), WriteError> {
+    ) -> Result<Written, WriteError> {
         match self.write_direct(params, context).await {
             Err(WriteError::Handler(error)) => match self.relinked(params, &error, false).await {
                 Some(real) => self.write_direct(&real, context).await,
@@ -1602,258 +1565,21 @@ impl IpcServer {
         &self,
         params: &Value,
         context: &IpcOperationContext,
-    ) -> Result<(), WriteError> {
+    ) -> Result<Written, WriteError> {
         let path = parse_path(params)?;
         if write_path_uses_wallet_signer(&path) && !is_fee_repair_write(&path, params) {
             return Err(HandlerError::PermissionDenied.into());
         }
         let bytes = parse_write_bytes(params)?;
-        if matches!(path.segments(), [root, _, _, leaf] if root == "wallets" && leaf == "confirm-batch")
-        {
-            return self.write_batch_confirm(&path, &bytes, context).await;
-        }
-        let Some(challenge) = confirm_challenge_path(&path) else {
-            return match self.vfs.write(&path, &bytes).await {
-                // `outbox/send.tx` stages and asks the owner in one write:
-                // answer as a first confirm does, with the link.
-                Err(HandlerError::ApprovalPending(challenge))
-                    if path.segments().last().is_some_and(|leaf| leaf == "send.tx") =>
-                {
-                    let url = match VfsPath::parse(&format!("/{challenge}")) {
-                        Ok(challenge) => self.vfs.read(&challenge).await.ok(),
-                        Err(_) => None,
-                    }
-                    .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok());
-                    // Several bodies were staged: say so, or the caller
-                    // checks each entry before asking the owner.
-                    let staged = url
-                        .as_ref()
-                        .and_then(|doc| doc["entries"].as_array())
-                        .filter(|entries| entries.len() > 1)
-                        .map(|entries| {
-                            format!(" for {} staged transactions, sent in order", entries.len())
-                        })
-                        .unwrap_or_default();
-                    // Name the entry: `latest` is whatever was staged last,
-                    // which another writer may have changed since.
-                    let id = url
-                        .as_ref()
-                        .and_then(|doc| doc["entries"].as_array()?.last()?.as_str())
-                        .and_then(|entry| entry.split_once(':'))
-                        .map(|(_, id)| id.to_owned())
-                        .or_else(|| challenge.rsplit('/').nth(1).map(str::to_owned))
-                        .unwrap_or_default();
-                    let url = url.and_then(|doc| doc["ceremony_url"].as_str().map(str::to_owned));
-                    Err(match url {
-                        Some(url) => WriteError::Approval(format!(
-                            "permission denied: owner approval required{staged}: {url} . Write y to pending/{id}/confirm: it waits for their approval, then sends."
-                        )),
-                        None => HandlerError::ApprovalPending(challenge).into(),
-                    })
-                }
-                written => Ok(written?),
-            };
-        };
-        // The batch the latest `confirm-batch` shows, if this entry is in it:
-        // a confirm repeated after its link was returned waits for it.
-        let batch_ref = match path.segments() {
-            [_, _, _, _, chain, _, _, id, _] => format!("{chain}:{id}"),
-            _ => String::new(),
-        };
-        let seen_batch = match path.segments() {
-            [_, wallet, number, ..] => {
-                VfsPath::parse(&format!("/wallets/{wallet}/{number}/confirm-batch")).ok()
-            }
-            _ => None,
-        };
-        let seen_batch = match &seen_batch {
-            Some(batch) => self.awaited_batch(batch).await,
-            None => None,
-        }
-        .filter(|(_, _, entries)| entries.contains(&batch_ref));
-        let waiting_for = self.approval_id(&challenge).await;
-        match self.vfs.write(&path, &bytes).await {
-            // An entry asked for as part of a batch waits as its batch does,
-            // retrying exactly that batch's entries: a batch another writer
-            // starts meanwhile is never sent in its place.
-            Err(HandlerError::ApprovalPending(batch)) if batch.ends_with("/confirm-batch") => {
-                let pending = || HandlerError::ApprovalPending(batch.clone());
-                let batch_path = VfsPath::parse(&format!("/{batch}")).map_err(|_| pending())?;
-                match self.awaited_batch(&batch_path).await {
-                    Some((_, _, entries)) if entries.contains(&batch_ref) => {
-                        let seen = seen_batch.map(|(action, ..)| action);
-                        self.await_batch(&batch_path, entries.join(" ").as_bytes(), seen, context)
-                            .await
-                    }
-                    _ => Err(pending().into()),
-                }
-            }
-            Err(denied @ (HandlerError::PermissionDenied | HandlerError::ApprovalPending(_))) => {
-                self.await_approval(&path, &bytes, &challenge, waiting_for, denied, context)
-                    .await
-            }
-            result => Ok(result?),
-        }
-    }
-
-    /// The batch a `confirm-batch` file reports as waiting for the owner:
-    /// its action, link and entries in order.
-    async fn awaited_batch(&self, path: &VfsPath) -> Option<(String, String, Vec<String>)> {
-        let status: Value = serde_json::from_slice(&self.vfs.read(path).await.ok()?).ok()?;
-        let field = |name: &str| status[name].as_str().unwrap_or_default().to_owned();
-        let entries = status["entries"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| entry.as_str().map(str::to_owned))
-            .collect();
-        (status["status"] == "awaiting_ceremony")
-            .then(|| (field("action_id"), field("ceremony_url"), entries))
-    }
-
-    /// `confirm-batch` behaves as a single confirm does: the first write
-    /// returns the owner's link at once, and a repeat for the same batch
-    /// waits for their approval, then sends.
-    async fn write_batch_confirm(
-        &self,
-        path: &VfsPath,
-        bytes: &[u8],
-        context: &IpcOperationContext,
-    ) -> Result<(), WriteError> {
-        let awaited = self.awaited_batch(path).await;
-        // `y` repeats the batch waiting now. Retry it by its entries, so a
-        // batch another writer starts meanwhile is never sent in its place.
-        let named = match &awaited {
-            Some((_, _, entries)) if bytes.trim_ascii() == b"y" && !entries.is_empty() => {
-                entries.join(" ").into_bytes()
-            }
-            _ => bytes.to_vec(),
-        };
-        match self.vfs.write(path, &named).await {
-            Err(HandlerError::ApprovalPending(_)) => {}
-            result => return Ok(result?),
-        }
-        let waiting_for = awaited.map(|(action, ..)| action);
-        self.await_batch(path, &named, waiting_for, context).await
-    }
-
-    /// After a batch write was denied for approval: when the caller already
-    /// saw that approval (`waiting_for`), repeat `bytes` until the owner
-    /// approves; otherwise return the link.
-    async fn await_batch(
-        &self,
-        path: &VfsPath,
-        bytes: &[u8],
-        waiting_for: Option<String>,
-        context: &IpcOperationContext,
-    ) -> Result<(), WriteError> {
-        let deadline = tokio::time::Instant::now() + self.approval_wait;
-        loop {
-            let (action, url, _) = self.awaited_batch(path).await.unwrap_or_default();
-            if waiting_for.as_deref() != Some(action.as_str())
-                || context.is_cancelled()
-                || tokio::time::Instant::now() >= deadline
-            {
-                return Err(WriteError::Approval(format!(
-                    "permission denied: owner approval required: {url} . Write y to confirm-batch: it waits for their approval, then sends."
-                )));
-            }
-            // Each attempt is an audited request, so poll less often than a
-            // single confirm does.
-            tokio::time::sleep(BATCH_APPROVAL_POLL).await;
-            match self.vfs.write(path, bytes).await {
-                Err(HandlerError::ApprovalPending(_)) => {}
-                result => return Ok(result?),
-            }
-        }
-    }
-
-    async fn approval_id(&self, challenge_path: &VfsPath) -> Option<String> {
-        let raw = self.vfs.read(challenge_path).await.ok()?;
-        let challenge: Value = serde_json::from_slice(&raw).ok()?;
-        challenge["approval_id"].as_str().map(str::to_owned)
-    }
-
-    /// A confirm denied for owner approval returns the ceremony link at once
-    /// when the approval is new to the caller. A confirm made after the
-    /// caller already saw that approval waits, outside every VFS lock, for
-    /// Broker to report it active, then repeats the same write. That retry is
-    /// the ordinary confirm path: it re-verifies the approval with Broker and
-    /// signs at most once under the entry's dispatch marker. Waiting never
-    /// starts a ceremony or restages anything.
-    async fn await_approval(
-        &self,
-        path: &VfsPath,
-        bytes: &[u8],
-        challenge_path: &VfsPath,
-        waiting_for: Option<String>,
-        denied: HandlerError,
-        context: &IpcOperationContext,
-    ) -> Result<(), WriteError> {
-        let deadline = tokio::time::Instant::now() + self.approval_wait;
-        let challenge_file = challenge_path.to_string_path();
-        let mut retried_active = false;
-        let mut first = true;
-        loop {
-            let Ok(raw) = self.vfs.read(challenge_path).await else {
-                // A denial with no challenge is not an approval wait. A
-                // challenge that disappears mid-wait means the entry left
-                // `pending/` (sent, cancelled, expired): report where it went.
-                if first {
-                    return Err(denied.into());
-                }
-                return Ok(self.vfs.write(path, bytes).await?);
-            };
-            let challenge: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
-            let url = challenge["ceremony_url"].as_str().unwrap_or_default();
-            let new_approval = challenge["approval_id"].as_str() != waiting_for.as_deref();
-            // A Petal rechecks its conditions when it confirms, so its entries
-            // are retried through it, never by rewriting this raw confirm.
-            if challenge["staged_by"].is_string() {
-                let next = challenge["next"].as_str().unwrap_or_default();
-                let link = if url.is_empty() {
-                    String::new()
-                } else {
-                    format!(" Ceremony link: {url}.")
-                };
-                return Err(WriteError::Approval(format!(
-                    "permission denied: owner approval required.{link} {next} Details: {challenge_file}"
-                )));
-            }
-            match challenge["state"].as_str().unwrap_or("unknown") {
-                "active" if retried_active => return Err(HandlerError::PermissionDenied.into()),
-                "active" => {
-                    retried_active = true;
-                    match self.vfs.write(path, bytes).await {
-                        Err(HandlerError::PermissionDenied | HandlerError::ApprovalPending(_)) => {
-                            continue;
-                        }
-                        result => return Ok(result?),
-                    }
-                }
-                "awaiting_ceremony" | "unknown" => retried_active = false,
-                state => {
-                    let next = challenge["next"].as_str().unwrap_or_default();
-                    return Err(WriteError::Approval(format!(
-                        "permission denied: owner approval {state}. {next} Details: {challenge_file}"
-                    )));
-                }
-            }
-            if new_approval || context.is_cancelled() || tokio::time::Instant::now() >= deadline {
-                // Short on purpose: naming the challenge file here sent
-                // agents off to read it before retrying.
-                let link = if url.is_empty() {
-                    format!("the link in {challenge_file}")
-                } else {
-                    url.to_owned()
-                };
-                return Err(WriteError::Approval(format!(
-                    "permission denied: owner approval required: {link} . Write confirm again: it waits for their approval, then sends."
-                )));
-            }
-            first = false;
-            tokio::time::sleep(APPROVAL_POLL).await;
-        }
+        owner_wait::write(
+            &self.vfs,
+            &path,
+            &bytes,
+            self.approval_wait,
+            &|| context.is_cancelled(),
+            true,
+        )
+        .await
     }
 
     /// Serialize a VFS mutation with lookup of the identity projection it
@@ -5412,10 +5138,10 @@ summary = "Demo app used by IPC tests."
             panic!("the first write must report the approval link");
         };
         assert!(message.contains("http://localhost:1/c/b"), "{message}");
-        assert!(started.elapsed() < BATCH_APPROVAL_POLL);
+        assert!(started.elapsed() < owner_wait::BATCH_APPROVAL_POLL);
         // Still waiting on this write; approved by the next attempt.
         assert!(server.do_write(&write, &context).await.is_ok());
-        assert!(started.elapsed() >= BATCH_APPROVAL_POLL);
+        assert!(started.elapsed() >= owner_wait::BATCH_APPROVAL_POLL);
     }
 
     /// A batch of `tx-1` waiting for the owner; records the paths written.
@@ -5570,14 +5296,32 @@ summary = "Demo app used by IPC tests."
         );
         let write = json!({"path": "/wallets/w/0/chains/base/outbox/send.tx", "bytes_b64": B64.encode("send 1 ETH to 0x01")});
         let context = IpcOperationContext::detached();
-        let Err(WriteError::Approval(message)) = server.do_write(&write, &context).await else {
+        let Ok(Written::ApprovalPending {
+            id,
+            ceremony_url,
+            text,
+        }) = server.do_write(&write, &context).await
+        else {
             panic!("send.tx must report the approval link");
         };
-        assert!(
-            message.contains("http://localhost:1/c/s")
-                && message.contains("Write y to pending/tx-9/confirm"),
-            "{message}"
+        assert_eq!(
+            (id.as_str(), ceremony_url.as_str()),
+            ("tx-9", "http://localhost:1/c/s")
         );
+        assert!(text.contains("Write y to pending/tx-9/confirm"), "{text}");
+        // Nothing was signed: the answer is never under `sent`.
+        let answer = server
+            .dispatch(Request {
+                jsonrpc: "2.0".into(),
+                id: json!(1),
+                method: "write".into(),
+                params: write,
+            })
+            .await
+            .result
+            .expect("staging is not an error");
+        assert!(answer.get("sent").is_none(), "{answer}");
+        assert_eq!(answer["approval_pending"]["id"], "tx-9", "{answer}");
     }
 
     /// A sent entry whose receipt is recorded only on the fourth read.

@@ -718,25 +718,6 @@ impl WalletsHandler {
 
     /// The configured EVM chain whose chain id is `id`, unless a chain is
     /// already named that.
-    fn chain_named_by_id(&self, id: &str) -> Option<String> {
-        let id: u64 = id.parse().ok()?;
-        let names = self.chains.list_names();
-        if names
-            .iter()
-            .any(|name| name.parse::<u64>().is_ok_and(|n| n == id))
-        {
-            return None;
-        }
-        // A fork and the network it copies share an id: name neither.
-        let mut named = names.into_iter().filter(|name| {
-            self.chains
-                .get(name)
-                .is_some_and(|c| c.spec().chain_id == id)
-        });
-        let only = named.next()?;
-        named.next().is_none().then_some(only)
-    }
-
     fn chain_name_entries(&self, view: &AccountView) -> Vec<Entry> {
         self.chain_names(view)
             .into_iter()
@@ -974,8 +955,8 @@ impl WalletsHandler {
             [dir] if dir == "chains" => Ok(Entry::dir("chains")),
             // A chain is also reachable by its numeric id (`chains/1`), as a
             // link to its name: requests usually give the id.
-            [dir, id] if dir == "chains" && self.chain_named_by_id(id).is_some() => Ok(
-                Entry::symlink(id, &self.chain_named_by_id(id).unwrap_or_default()),
+            [dir, id] if dir == "chains" && self.chains.named_by_id(id).is_some() => Ok(
+                Entry::symlink(id, &self.chains.named_by_id(id).unwrap_or_default()),
             ),
             [dir, chain, chain_rest @ ..] if dir == "chains" => {
                 if self.is_solana_chain(chain) {
@@ -2065,6 +2046,7 @@ impl WalletsHandler {
             [] => Ok(Entry::dir("outbox")),
             [leaf] if leaf == OUTBOX_README => Ok(outbox_readme_entry(SOLANA_OUTBOX_README)),
             [leaf] if leaf == "new.tx" => Ok(Entry::writable_file("new.tx")),
+            [leaf] if leaf == SEND_TX => Ok(Entry::writable_file(SEND_TX)),
             [leaf] if leaf == "latest" => {
                 let target = self
                     .solana_latest_target(wallet, family, chain)?
@@ -2153,6 +2135,7 @@ impl WalletsHandler {
                 let mut entries = vec![
                     outbox_readme_entry(SOLANA_OUTBOX_README),
                     Entry::writable_file("new.tx"),
+                    Entry::writable_file(SEND_TX),
                     Entry::dir("pending"),
                     Entry::dir("sent"),
                     Entry::dir("failed"),
@@ -2899,7 +2882,7 @@ fn approval_next_step(
         S::Prepared | S::AwaitingCeremony => (
             "awaiting_ceremony",
             if direct {
-                "Show ceremony_url to the owner. Through bloom vfs write or MCP, write retry_body to retry_path right away, without waiting for their reply: it waits for their approval and sends. On a mount, write retry_body to retry_path after they approve; earlier it is denied. Neither starts a new ceremony. Stop when ceremony_expires_at_ms passes and tell the owner.".into()
+                "Show ceremony_url to the owner. Write retry_body to retry_path right away, without waiting for their reply: it waits for their approval and sends. It starts no new ceremony. Stop when ceremony_expires_at_ms passes and tell the owner.".into()
             } else {
                 format!("Give ceremony_url to the owner. As soon as they approve, {retry}. Retrying earlier is safe: it starts no new ceremony and returns permission denied again.")
             },

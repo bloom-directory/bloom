@@ -131,6 +131,9 @@ pub enum TxEngineError {
     Address(String),
     #[error("amount: {0}")]
     Amount(String),
+    /// A body's `data` is not hex calldata.
+    #[error("invalid data: {0}; give the calldata as 0x-prefixed hex, two digits per byte")]
+    Data(String),
     #[error("invalid EIP-1559 fee override: {0}")]
     InvalidFeeOverride(String),
     #[error("policy denied")]
@@ -884,9 +887,56 @@ impl TxEngine {
         }
     }
 
+    /// The native value a `send` body moves on `spec`'s chain, or `None` when
+    /// it names an ERC-20 token. Staging and simulation share it, so one
+    /// body is the same transaction in both.
+    pub fn native_send_value(
+        spec: &ChainSpec,
+        value: &str,
+        token: &Option<String>,
+        amount: &str,
+    ) -> Result<Option<U256>, TxEngineError> {
+        // The chain's own native symbol (POL, BNB, AVAX, ...) is a
+        // native send, not an ERC-20 lookup.
+        if token
+            .as_deref()
+            .is_some_and(|t| t.trim().eq_ignore_ascii_case(&spec.native_symbol))
+        {
+            if !matches!(value.trim(), "" | "0") {
+                return Err(TxEngineError::Amount(
+                    "native sends take one amount; value and amount were both set".into(),
+                ));
+            }
+            return parse_units(amount.trim(), spec.native_decimals)
+                .map(Some)
+                .map_err(|e| TxEngineError::Amount(e.to_string()));
+        }
+        // "eth"/"ether" name an asset. On a chain whose native token is
+        // something else, sending it would move a different asset.
+        if token.is_none() && !spec.native_symbol.eq_ignore_ascii_case("ETH") {
+            let unit = parse_amount(value).map(|p| p.unit).unwrap_or_default();
+            if unit == "eth" || unit == "ether" {
+                return Err(TxEngineError::Amount(format!(
+                    "{} pays in {}, not ETH; write the amount in {}",
+                    spec.name, spec.native_symbol, spec.native_symbol
+                )));
+            }
+        }
+        let Some(v) = Self::resolve_native_value(value, token)? else {
+            return Ok(None);
+        };
+        if !amount.trim().is_empty() {
+            return Err(TxEngineError::Amount(
+                "native sends must use value; amount is only for token sends".into(),
+            ));
+        }
+        Ok(Some(v))
+    }
+
     /// Resolve an ERC-20 token symbol or 0x address into a concrete
-    /// contract address on the given chain.
-    fn resolve_token_address(
+    /// contract address on the given chain. Staging and simulation share
+    /// it, so a token named in a body is the same contract in both.
+    pub fn resolve_token_address(
         token: &str,
         chain_id: u64,
     ) -> Result<(Address, String), TxEngineError> {
@@ -971,40 +1021,7 @@ impl TxEngine {
                 data,
             } => {
                 let to_addr = self.resolve_recipient_async(to, address_book).await?;
-                let spec = chain.spec();
-                // The chain's own native symbol (POL, BNB, AVAX, ...) is a
-                // native send, not an ERC-20 lookup.
-                if token
-                    .as_deref()
-                    .is_some_and(|t| t.trim().eq_ignore_ascii_case(&spec.native_symbol))
-                {
-                    if !matches!(value.trim(), "" | "0") {
-                        return Err(TxEngineError::Amount(
-                            "native sends take one amount; value and amount were both set".into(),
-                        ));
-                    }
-                    let v = parse_units(amount.trim(), spec.native_decimals)
-                        .map_err(|e| TxEngineError::Amount(e.to_string()))?;
-                    let data = data.clone().unwrap_or_else(|| "0x".into());
-                    return Ok((Some(to_addr), v, data, None, None));
-                }
-                // "eth"/"ether" name an asset. On a chain whose native token is
-                // something else, sending it would move a different asset.
-                if token.is_none() && !spec.native_symbol.eq_ignore_ascii_case("ETH") {
-                    let unit = parse_amount(value).map(|p| p.unit).unwrap_or_default();
-                    if unit == "eth" || unit == "ether" {
-                        return Err(TxEngineError::Amount(format!(
-                            "{} pays in {}, not ETH; write the amount in {}",
-                            spec.name, spec.native_symbol, spec.native_symbol
-                        )));
-                    }
-                }
-                if let Some(v) = Self::resolve_native_value(value, token)? {
-                    if !amount.trim().is_empty() {
-                        return Err(TxEngineError::Amount(
-                            "native sends must use value; amount is only for token sends".into(),
-                        ));
-                    }
+                if let Some(v) = Self::native_send_value(chain.spec(), value, token, amount)? {
                     let data = data.clone().unwrap_or_else(|| "0x".into());
                     Ok((Some(to_addr), v, data, None, None))
                 } else {
@@ -1022,29 +1039,8 @@ impl TxEngine {
                     let token_str = token.as_deref().unwrap_or("");
                     let (token_addr, sym_hint) = Self::resolve_token_address(token_str, chain_id)?;
                     let meta = self.token_meta(chain, token_addr, &sym_hint).await?;
-                    let parsed =
-                        parse_amount(amount).map_err(|e| TxEngineError::Amount(e.to_string()))?;
-                    // A native metric unit (wei/gwei/eth) on an ERC-20 amount is
-                    // ambiguous — it would be silently rescaled by token
-                    // decimals. Reject it and point at the unambiguous forms.
-                    // A bare integer (explicit_unit == false) is still accepted
-                    // as a human token amount.
-                    if parsed.explicit_unit && parsed.is_native() {
-                        return Err(TxEngineError::Amount(format!(
-                            "'{amount}' uses a native unit ('{}') for an ERC-20 token; write a human \
-                             amount like '10 {}' or raw base units like '10000000 base'",
-                            parsed.unit, meta.symbol
-                        )));
-                    }
-                    // `base` means the number is already in token base units —
-                    // do not rescale by decimals.
-                    let scale = if parsed.unit == "base" {
-                        0
-                    } else {
-                        meta.decimals
-                    };
-                    let amount = parse_units(&parsed.number, scale)
-                        .map_err(|e| TxEngineError::Amount(e.to_string()))?;
+                    let (amount, number) =
+                        token_amount_base_units(amount, meta.decimals, &meta.symbol)?;
                     let call = IERC20::transferCall {
                         to: to_addr,
                         amount,
@@ -1055,7 +1051,7 @@ impl TxEngine {
                         symbol: meta.symbol.clone(),
                         decimals: meta.decimals,
                         recipient: bloom_proto::checksum_address(&to_addr),
-                        amount: parsed.number.clone(),
+                        amount: number,
                         amount_base_units: Some(amount.to_string()),
                     };
                     Ok((
@@ -3246,7 +3242,17 @@ impl TxEngine {
                 returned_hash: Some(returned),
             })
         } else {
-            let returned = chain.send_raw(signed.raw.clone()).await?;
+            let returned = match chain.send_raw(signed.raw.clone()).await {
+                Ok(returned) => returned,
+                // The node may have taken the transaction and lost only its
+                // answer. When the chain knows these exact bytes' hash, the
+                // send happened: report it as sent, not as an unknown error
+                // the caller has to investigate.
+                Err(error) => match chain_knows_tx(chain, signed.hash).await {
+                    Ok(true) => signed.hash,
+                    _ => return Err(error.into()),
+                },
+            };
             if returned != signed.hash {
                 return Err(TxEngineError::BroadcastHashMismatch {
                     expected: format!("{:#x}", signed.hash),
@@ -5574,7 +5580,7 @@ fn decode_data(s: &str) -> Result<Bytes, TxEngineError> {
         return Ok(Bytes::new());
     }
     let s = s.strip_prefix("0x").unwrap_or(s);
-    let v = hex::decode(s).map_err(|e| TxEngineError::Amount(format!("data: {e}")))?;
+    let v = hex::decode(s).map_err(|e| TxEngineError::Data(e.to_string()))?;
     Ok(Bytes::from(v))
 }
 
@@ -5817,6 +5823,32 @@ fn short_addr_label(a: &Address) -> String {
     } else {
         s
     }
+}
+
+/// Base units of an ERC-20 `amount` as an outbox body writes it, with the
+/// number as written. Staging and simulation share it, so the same body
+/// means the same transfer in both.
+pub fn token_amount_base_units(
+    amount: &str,
+    decimals: u8,
+    symbol: &str,
+) -> Result<(U256, String), TxEngineError> {
+    let parsed = parse_amount(amount).map_err(|e| TxEngineError::Amount(e.to_string()))?;
+    // A native metric unit (wei/gwei/eth) on an ERC-20 amount is ambiguous:
+    // it would be silently rescaled by token decimals. Reject it and point
+    // at the unambiguous forms. A bare number is a human token amount.
+    if parsed.explicit_unit && parsed.is_native() {
+        return Err(TxEngineError::Amount(format!(
+            "'{amount}' uses a native unit ('{}') for an ERC-20 token; write a human \
+             amount like '10 {symbol}' or raw base units like '10000000 base'",
+            parsed.unit
+        )));
+    }
+    // `base` means the number is already in token base units.
+    let scale = if parsed.unit == "base" { 0 } else { decimals };
+    let base =
+        parse_units(&parsed.number, scale).map_err(|e| TxEngineError::Amount(e.to_string()))?;
+    Ok((base, parsed.number))
 }
 
 /// Resolve an ERC-20 symbol to its address via the token list Broker also
@@ -11674,6 +11706,83 @@ mod tests {
             }
             other => panic!("expected StateMismatch, got {other:?}"),
         }
+    }
+
+    /// Calldata with an odd digit says it is the data that is wrong, not an
+    /// amount (an agent retyping calldata by hand hit this in the bench).
+    #[test]
+    fn odd_calldata_is_named_as_data() {
+        let error = decode_data("0xabc").unwrap_err().to_string();
+        assert!(error.starts_with("invalid data: "), "{error}");
+        assert_eq!(decode_data("0xabcd").unwrap().len(), 2);
+    }
+
+    /// The node takes a send but its answer is lost. When the chain knows the
+    /// signed hash, the confirm reports the entry sent instead of an error
+    /// the caller has to investigate (bench task erc20-transfer-recovery).
+    #[tokio::test]
+    async fn a_send_whose_answer_is_lost_but_that_landed_is_sent() {
+        let receipt = serde_json::json!({
+            "transactionHash": format!("{:#x}", alloy::primitives::B256::repeat_byte(7)),
+            "transactionIndex": "0x0",
+            "blockHash": format!("{:#x}", alloy::primitives::B256::repeat_byte(9)),
+            "blockNumber": "0x5",
+            "from": TEST_SIGNER_ADDRESS,
+            "to": "0x0000000000000000000000000000000000000002",
+            "cumulativeGasUsed": "0x5208",
+            "gasUsed": "0x5208",
+            "contractAddress": null,
+            "logs": [],
+            "logsBloom": format!("0x{}", "00".repeat(256)),
+            "status": "0x1",
+            "effectiveGasPrice": "0x1",
+            "type": "0x2"
+        });
+        let lost = r#"error:{"code":-32000,"message":"upstream response lost; submission status unknown"}"#;
+        let url = spawn_queued_rpc(HashMap::from([
+            (
+                "eth_chainId".to_string(),
+                vec!["\"0x7a69\"".to_string(); 20],
+            ),
+            ("eth_call".into(), vec!["\"0x\"".into(); 20]),
+            ("eth_getTransactionCount".into(), vec!["\"0x0\"".into(); 20]),
+            ("eth_sendRawTransaction".into(), vec![lost.into()]),
+            ("eth_getTransactionByHash".into(), vec!["null".into(); 20]),
+            (
+                "eth_getTransactionReceipt".into(),
+                vec![receipt.to_string(); 20],
+            ),
+        ]))
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let (engine, fixture, _) = triad_batch_fixture(outbox.clone(), false, false);
+        let permit = permit_for(&directory);
+        let chain = stage_chain(&url);
+        let policy = Policy::default();
+        let mut staged = fake_staged_1559("lost-answer");
+        staged.created_ms = now_ms();
+        outbox.write_pending(&staged, "p").unwrap();
+        let confirm = || {
+            engine.confirm(
+                &permit,
+                "alice",
+                "anvil",
+                "lost-answer",
+                &chain,
+                &policy,
+                policy.override_sentinel(),
+            )
+        };
+        assert!(matches!(
+            confirm().await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        fixture.active.store(true, Ordering::SeqCst);
+        let sent = confirm().await.unwrap();
+        assert!(sent.tx_hash.is_some());
+        let entry = outbox.read("alice", "anvil", "lost-answer").unwrap();
+        assert_eq!(entry.state, OutboxState::Sent);
     }
 
     /// A confirm interrupted after its broadcast marker recovers through
