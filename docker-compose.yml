@@ -1,0 +1,609 @@
+# =============================================================================
+# Bloom triad container stack -- DEVELOPMENT / SANDBOX ONLY. LINUX ONLY.
+# =============================================================================
+#
+# This stack mints its own throwaway signing identity into Docker named volumes
+# and runs the full triad against it. It is a development sandbox, not a
+# deployment: the keys live in `docker volume` storage, `docker compose down -v`
+# destroys them irreversibly, and nothing here is a substitute for the reviewed
+# packaging under packaging/triad/. Do not put value behind it.
+#
+# Trust direction is one-way and enforced by Unix-socket reachability plus
+# peer-uid authentication, not by network ACLs:
+#
+#     machine --(broker.sock)--> broker --(signer.sock)--> signer
+#                                   \                        /
+#                                    `--(session.sock)--> session sentinel
+#
+# The Machine can never reach the Signer, because the Signer's RPC socket volume
+# is mounted only into the Signer and the Broker. Adding that volume to the
+# `machine` service would collapse the whole custody boundary; do not.
+#
+# Sibling checkout layout, the same one scripts/triad-dev-launch.sh assumes:
+#
+#     bloom-directory/
+#       bloom/          <- this repo (Machine + session sentinel), context "."
+#       bloom-broker/   <- context "../bloom-broker"
+#       bloom-signer/   <- context "../bloom-signer"
+#
+# Quick start (details and prerequisites: README.md, "Container stack"):
+#
+#     cp .env.example .env
+#     docker compose build signer broker machine
+#     docker compose --profile bootstrap run --rm bootstrap
+#     docker compose up -d
+#     ls ~/bloom
+#
+# READ THE MOUNT SECTION IN README.md BEFORE STARTING `machine`. The mount path
+# needs CAP_SYS_ADMIN, an unconfined AppArmor profile, host NFS client support,
+# and a *shared* host mount at the `/bloom` bind source.
+
+name: bloom-triad
+
+# ---------------------------------------------------------------------------
+# Networks
+# ---------------------------------------------------------------------------
+networks:
+  # Session sentinel, Broker and Signer speak only over Unix domain sockets, and
+  # the Broker's ceremony origin listener is bound to literal loopback. They are
+  # attached to this network purely so Compose has somewhere to put them;
+  # `internal: true` means Docker installs no NAT/gateway rule, so none of them
+  # can reach the internet or the host even if a future code path tried to.
+  #
+  # `network_mode: none` would be marginally tighter (no interface at all), but
+  # Compose forbids combining `network_mode` with any other service networking
+  # key, and it makes attaching a debugger harder.
+  bloom-isolated:
+    internal: true
+
+  # Only the Machine gets egress. It needs it: JSON-RPC to chain endpoints,
+  # price feeds, ENS, and the GitHub update check all originate here.
+  bloom-egress: {}
+
+# ---------------------------------------------------------------------------
+# Volumes
+#
+# Four kinds, and the distinction matters:
+#
+#   *-config  Per-service enrollment material, written once by `bootstrap` and
+#             mounted READ-ONLY into exactly the one service that needs it.
+#             Each service gets only the files it is entitled to: the Machine
+#             never sees a signing seed, the Signer never sees the Broker's.
+#   *-rpc /
+#   *-control Unix socket directories. Shared between exactly the two services
+#             on either end of one edge. These are the trust boundary.
+#   *-db      Durable service state (SQLite stores, journals, audit checkpoint
+#             chains) signed by the enrolled identity.
+#   triad-tools
+#             One non-secret helper binary; see the `broker` entrypoint.
+#
+# CUSTODY WARNING. Unlike a production install, the signing seeds ARE in named
+# volumes here -- that is what makes the stack self-contained, and it is exactly
+# why it is dev-only. `docker compose down -v` deletes every one of them and the
+# developer identity is gone for good; the Broker and Signer databases signed by
+# it become unreadable. Use plain `docker compose down` to stop the stack.
+#
+# Ownership note (easy to get wrong): a named volume inherits the image's
+# uid/gid/mode at the mount point *while it is still empty*. `bootstrap` runs
+# first and leaves every volume non-empty with the ownership the services
+# require, which is what makes that copy-up a no-op afterwards.
+# ---------------------------------------------------------------------------
+volumes:
+  # --- per-service enrollment material (read-only at every service) ---
+  signer-config: {}
+  broker-config: {}
+  machine-config: {}
+  session-config: {}
+
+  # --- RPC socket volumes (the trust boundary) ---
+  signer-rpc: {} # signer.sock   -- mounted by: signer, broker
+  broker-rpc: {} # broker.sock   -- mounted by: broker, machine
+  session-rpc: {} # session.sock -- mounted by: session, signer, broker
+
+  # --- control socket volumes (operator surfaces, deliberately not shared) ---
+  signer-control: {}
+  broker-control: {}
+
+  # --- durable state ---
+  signer-db: {} # /var/db/bloom/signer  + audit-checkpoints
+  broker-db: {} # /var/db/bloom/broker  + journal/authority/ceremony/checkpoints
+  machine-home: {} # BLOOM_HOME
+
+  # --- non-secret operational helper ---
+  triad-tools: {}
+
+# ---------------------------------------------------------------------------
+# Anchors
+# ---------------------------------------------------------------------------
+x-service-user: &service-user "${BLOOM_SERVICE_UID:-10001}:${BLOOM_SERVICE_GID:-10001}"
+
+# Every authority service: no capabilities, no privilege escalation, no egress.
+x-authority-hardening: &authority-hardening
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+  networks: [bloom-isolated]
+  restart: unless-stopped
+
+services:
+  # =========================================================================
+  # bootstrap -- one-shot, profile-gated. Mints the developer enrollment.
+  #
+  #     docker compose --profile bootstrap run --rm bootstrap
+  #     docker compose --profile bootstrap run --rm bootstrap status
+  #
+  # Rerunning it is safe and is the supported way to re-pin the configs after
+  # rebuilding the images: it re-conforms paths, ownership and the release
+  # digest but NEVER rotates the developer identity, because the Broker and
+  # Signer databases are signed by it. Destroying the identity is a separate,
+  # explicitly confirmed operation:
+  #
+  #     docker compose --profile bootstrap run --rm \
+  #       -e BLOOM_TRIAD_RESET_CONFIRM=destroy-developer-custody bootstrap reset
+  # =========================================================================
+  bootstrap:
+    profiles: [bootstrap]
+    build:
+      # Repo root: the packaging templates the bootstrap reuses live there.
+      context: .
+      dockerfile: deploy/triad/Dockerfile.bootstrap
+      # BuildKit named contexts. The bootstrap does not rebuild the triad; it
+      # copies the exact binaries out of the three service images and hashes
+      # those bytes, so the release digest it pins into broker.json/signer.json
+      # is provably the digest of what actually runs. Build those three images
+      # first -- `docker compose build signer broker machine`.
+      additional_contexts:
+        bloom-machine-image: docker-image://bloom:${BLOOM_IMAGE_TAG:-local}
+        bloom-broker-image: docker-image://bloom-broker:${BLOOM_IMAGE_TAG:-local}
+        bloom-signer-image: docker-image://bloom-signer:${BLOOM_IMAGE_TAG:-local}
+    image: bloom-triad-bootstrap:${BLOOM_IMAGE_TAG:-local}
+
+    # Root on purpose. The Broker and Signer verify their edge manifest,
+    # authority-edge history and provenance catalog are owned by uid 0 -- that
+    # is their production trust path and this stack does not weaken it -- so
+    # something has to be able to install root-owned files. The one step that
+    # must not be root (`init triad-render-developer-enrollment` refuses it)
+    # is dropped to the service uid with setpriv inside the script.
+    user: "0:0"
+
+    environment:
+      BLOOM_SERVICE_UID: ${BLOOM_SERVICE_UID:-10001}
+      BLOOM_SERVICE_GID: ${BLOOM_SERVICE_GID:-10001}
+
+    # Seed material is generated into this tmpfs and never touches a disk-backed
+    # layer. The installer signing seed and the revoke identity are discarded
+    # with it: no service in this stack is entitled to them.
+    tmpfs:
+      - /state/enrollment:mode=0700,uid=0,gid=0
+
+    volumes:
+      - type: volume
+        source: signer-config
+        target: /state/config/signer
+      - type: volume
+        source: broker-config
+        target: /state/config/broker
+      - type: volume
+        source: machine-config
+        target: /state/config/machine
+      - type: volume
+        source: session-config
+        target: /state/config/session
+      - type: volume
+        source: signer-rpc
+        target: /state/run/signer-rpc
+      - type: volume
+        source: signer-control
+        target: /state/run/signer-control
+      - type: volume
+        source: broker-rpc
+        target: /state/run/broker-rpc
+      - type: volume
+        source: broker-control
+        target: /state/run/broker-control
+      - type: volume
+        source: session-rpc
+        target: /state/run/session-rpc
+      - type: volume
+        source: signer-db
+        target: /state/db/signer
+      - type: volume
+        source: broker-db
+        target: /state/db/broker
+      - type: volume
+        source: machine-home
+        target: /state/machine-home
+      - type: volume
+        source: triad-tools
+        target: /state/tools
+
+    # No network at all: it generates keys and writes files.
+    network_mode: "none"
+    restart: "no"
+
+  # =========================================================================
+  # session -- the login-session sentinel.
+  #
+  # Not optional and not decorative: bloom-broker and bloom-signer each block
+  # at startup on `connect_authenticated_session(...)` and exit if it fails, so
+  # the triad does not come up without this. It holds no custody -- it proves
+  # liveness of an authenticated login session and nothing else.
+  #
+  # It is also the one service that uses the developer trust path rather than
+  # the production one, because `bloom serve session-sentinel` otherwise looks
+  # for a macOS enrollment record. See the long comment in
+  # deploy/triad/bootstrap.sh; the practical consequence is that its copy of
+  # the edge manifest is service-owned instead of root-owned. That file holds
+  # public keys only.
+  # =========================================================================
+  session:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: bloom:${BLOOM_IMAGE_TAG:-local}
+    command: ["serve", "session-sentinel"]
+    user: *service-user
+
+    environment:
+      # The sentinel derives everything from these two. config_root is
+      # <root>/config and the socket directory is <runtime>/session, and it
+      # requires the runtime to be inside the root -- hence both point at the
+      # same directory.
+      BLOOM_TRIAD_DEVELOPER_ROOT: /var/lib/bloom-session
+      BLOOM_TRIAD_DEVELOPER_RUNTIME: /var/lib/bloom-session
+      RUST_LOG: ${BLOOM_SESSION_LOG:-info}
+
+    volumes:
+      - type: volume
+        source: session-config
+        target: /var/lib/bloom-session
+        read_only: true
+      # Nested inside the read-only volume above, and writable: this is where
+      # the sentinel binds session.sock. Compose mounts by increasing path
+      # depth, so the parent lands first.
+      - type: volume
+        source: session-rpc
+        target: /var/lib/bloom-session/session
+
+    <<: *authority-hardening
+
+    # Honest scope: proves the listener is bound. It does not prove the sentinel
+    # will complete an authenticated handshake -- doing that would require
+    # speaking the framed protocol as a pinned peer, which no shell can do.
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /var/lib/bloom-session/session/session.sock"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  # =========================================================================
+  # Signer -- innermost. Holds key material. Reachable only by the Broker.
+  # =========================================================================
+  signer:
+    build:
+      context: ../bloom-signer
+      dockerfile: Dockerfile
+      # SIGNER_UID/GID must equal `signer.effective_uid` in the edge manifest,
+      # because the Signer authenticates its peer by effective uid. The
+      # bootstrap renders that manifest from its own uid, so all three services
+      # and the bootstrap share one id -- see BLOOM_SERVICE_UID in .env.example.
+      args:
+        SIGNER_UID: ${BLOOM_SERVICE_UID:-10001}
+        SIGNER_GID: ${BLOOM_SERVICE_GID:-10001}
+    image: bloom-signer:${BLOOM_IMAGE_TAG:-local}
+    user: *service-user
+
+    # No `command:`. The image's ENTRYPOINT is the whole invocation: bloom-signer
+    # takes no subcommands and no flags other than a bare `--version`. Every knob
+    # is an env var or a field in signer.json. Do not invent flags here.
+
+    depends_on:
+      session:
+        condition: service_healthy
+
+    environment:
+      # Socket paths have no compiled-in default and are required at startup.
+      BLOOM_SIGNER_SOCKET: /run/bloom-signer-rpc/signer.sock
+      # Control socket -> its own volume, mounted nowhere else. It carries
+      # revocation control RPCs, which are an operator surface, not a Broker
+      # surface, so it must not ride along in the volume the Broker sees.
+      BLOOM_SIGNER_CONTROL_SOCKET: /run/bloom-signer-control/signer-control.sock
+      BLOOM_SESSION_SOCKET: /run/bloom-session/session.sock
+
+      BLOOM_SIGNER_IDENTITY: /etc/bloom/signer-identity.json
+      BLOOM_EDGE_MANIFEST: /etc/bloom/edge-manifest.json
+      BLOOM_SIGNER_CONFIG: /etc/bloom/signer.json
+      BLOOM_AUTHORITY_EDGE_HISTORY: /etc/bloom/authority-edge-history.json
+      BLOOM_SIGNER_AUDIT_CHECKPOINT_DIR: /var/db/bloom/signer/audit-checkpoints
+      # Raising this past info can surface request shapes and key identifiers.
+      # It does not print seeds, but treat the output as sensitive anyway.
+      RUST_LOG: ${BLOOM_SIGNER_LOG:-info}
+
+    volumes:
+      # Read-only, and holding only what the Signer is entitled to:
+      # signer.json (its seeds), signer-identity.json, plus the root-owned
+      # edge manifest and authority-edge history it verifies as trust anchors.
+      - type: volume
+        source: signer-config
+        target: /etc/bloom
+        read_only: true
+      - type: volume
+        source: signer-rpc
+        target: /run/bloom-signer-rpc
+      - type: volume
+        source: signer-control
+        target: /run/bloom-signer-control
+      - type: volume
+        source: session-rpc
+        target: /run/bloom-session
+      - type: volume
+        source: signer-db
+        target: /var/db/bloom/signer
+
+    <<: *authority-hardening
+
+    # As with the sentinel: this proves both listeners are bound, which rules
+    # out the half-initialised window. It does NOT prove the Signer answers RPC.
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "test -S /run/bloom-signer-rpc/signer.sock && test -S /run/bloom-signer-control/signer-control.sock",
+        ]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  # =========================================================================
+  # Broker -- mediates. Talks to the Signer, is talked to by the Machine.
+  # =========================================================================
+  broker:
+    build:
+      context: ../bloom-broker
+      dockerfile: Dockerfile
+      args:
+        BLOOM_UID: ${BLOOM_SERVICE_UID:-10001}
+        BLOOM_GID: ${BLOOM_SERVICE_GID:-10001}
+      # If the workspace's bloom-directory git dependencies are private, the
+      # Dockerfile accepts an optional `git_credentials` build secret. Left
+      # unwired because a missing file would break the default public build;
+      # see README.md.
+    image: bloom-broker:${BLOOM_IMAGE_TAG:-local}
+    user: *service-user
+
+    # The Broker acquires its ceremony origin listener through systemd socket
+    # activation and has, by design, no path-binding fallback -- a Broker
+    # outside its launch manager fails closed rather than creating a weaker
+    # endpoint. scripts/triad-dev-launch.sh satisfies that with a real systemd
+    # user socket unit. There is no systemd here, so this shim performs the
+    # identical handoff (bind, place on fd 3, publish LISTEN_PID/LISTEN_FDS/
+    # LISTEN_FDNAMES) and then execs the real binary, which keeps PID 1 and
+    # receives signals directly. It is a plain static C binary delivered in a
+    # read-only volume; it handles no secrets. See
+    # deploy/triad/ceremony-activate.c.
+    entrypoint:
+      - /opt/bloom-tools/bloom-ceremony-activate
+      - 127.0.0.1:18734
+      - broker-ceremony
+      - /usr/local/bin/bloom-broker
+
+    depends_on:
+      session:
+        condition: service_healthy
+      signer:
+        condition: service_healthy
+
+    environment:
+      BLOOM_BROKER_SOCKET: /run/bloom-broker-rpc/broker.sock
+      # Operator surface; kept out of the volume the Machine sees, for the same
+      # reason as the Signer's.
+      BLOOM_BROKER_CONTROL_SOCKET: /run/bloom-broker-control/broker-control.sock
+      BLOOM_SESSION_SOCKET: /run/bloom-session/session.sock
+      BLOOM_BROKER_CEREMONY_ACTIVATION_NAME: broker-ceremony
+
+      BLOOM_BROKER_IDENTITY: /etc/bloom/broker-identity.json
+      BLOOM_EDGE_MANIFEST: /etc/bloom/edge-manifest.json
+      BLOOM_BROKER_CONFIG: /etc/bloom/broker.json
+      BLOOM_AUTHORITY_EDGE_HISTORY: /etc/bloom/authority-edge-history.json
+      BLOOM_BROKER_AUDIT_CHECKPOINT_DIR: /var/db/bloom/broker/audit-checkpoints
+      RUST_LOG: ${BLOOM_BROKER_LOG:-info}
+
+      # NOTE: the Broker finds the Signer through `signer_socket_path` in
+      # broker.json, NOT through an env var. The bootstrap sets that field to
+      # /run/bloom-signer-rpc/signer.sock, which is why the Signer's socket
+      # volume is mounted at the *same* path in both containers.
+
+    volumes:
+      - type: volume
+        source: broker-config
+        target: /etc/bloom
+        read_only: true
+      - type: volume
+        source: broker-rpc
+        target: /run/bloom-broker-rpc
+      - type: volume
+        source: broker-control
+        target: /run/bloom-broker-control
+      # The Signer's socket directory. This mount, and only this mount, is what
+      # gives the Broker a path to the Signer.
+      - type: volume
+        source: signer-rpc
+        target: /run/bloom-signer-rpc
+      - type: volume
+        source: session-rpc
+        target: /run/bloom-session
+      - type: volume
+        source: broker-db
+        target: /var/db/bloom/broker
+      - type: volume
+        source: triad-tools
+        target: /opt/bloom-tools
+        read_only: true
+
+    <<: *authority-hardening
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "test -S /run/bloom-broker-rpc/broker.sock && test -S /run/bloom-broker-control/broker-control.sock",
+        ]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  # =========================================================================
+  # Machine -- outermost. The only service with egress, and the only one that
+  # needs elevated privileges. Everything unusual about this service is a
+  # consequence of one line: `bloom serve --mount /bloom`.
+  # =========================================================================
+  machine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: bloom:${BLOOM_IMAGE_TAG:-local}
+
+    # Same uid as the authority services, and not negotiable: the Broker
+    # authenticates this peer against `machine.effective_uid` in the edge
+    # manifest, which the bootstrap rendered from its own uid.
+    user: *service-user
+
+    # Verified against `bloom serve --help`:
+    #   --mount [<PATH>]  Mount the VFS for the lifetime of the daemon.
+    #                     With no PATH, defaults to /bloom on Linux.
+    # PATH is passed explicitly so this file does not depend on that default.
+    command: ["serve", "--mount", "/bloom"]
+
+    depends_on:
+      broker:
+        condition: service_healthy
+
+    environment:
+      BLOOM_HOME: /var/lib/bloom
+      BLOOM_BROKER_SOCKET: /run/bloom-broker-rpc/broker.sock
+      BLOOM_MACHINE_IDENTITY: /etc/bloom/machine-identity.json
+      BLOOM_EDGE_MANIFEST: /etc/bloom/edge-manifest.json
+      BLOOM_PROVENANCE_CATALOG: /etc/bloom/provenance-catalog.json
+      BLOOM_AUTHORITY_EDGE_HISTORY: /etc/bloom/authority-edge-history.json
+      BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR: /var/lib/bloom/audit-checkpoints/machine
+      RUST_LOG: ${BLOOM_MACHINE_LOG:-info}
+
+    volumes:
+      # Note what is absent: no signer.json, no broker.json, no signing seed of
+      # any kind. The Machine gets an identity and three trust anchors.
+      - type: volume
+        source: machine-config
+        target: /etc/bloom
+        read_only: true
+      - type: volume
+        source: machine-home
+        target: /var/lib/bloom
+      - type: volume
+        source: broker-rpc
+        target: /run/bloom-broker-rpc
+
+      # ---------------------------------------------------------------------
+      # THE MOUNT PROJECTION. LINUX ONLY. READ README.md.
+      #
+      # `bloom serve --mount /bloom` starts an embedded NFSv4.1 server bound to
+      # loopback inside this container, then execs `mount.nfs4` to mount it at
+      # /bloom. That mount is created inside the container's mount namespace.
+      # `rshared` propagation is what pushes it back out to the host directory
+      # below, so the host actually sees the wallet tree.
+      #
+      # Preconditions, all of which fail loudly rather than silently if unmet:
+      #
+      #   1. Linux host. Mount propagation does not exist on Docker Desktop for
+      #      macOS or Windows -- the daemon runs in its own VM, and `rshared`
+      #      would at best project into that VM, never to your desktop. On those
+      #      platforms use `bloom vfs` instead of a mount.
+      #   2. The host source directory must itself be on a *shared* mount, or
+      #      the daemon rejects the rshared bind with
+      #      "path is mounted on / but it is not a shared mount".
+      #      Check:  findmnt -no PROPAGATION -T "${HOME}/bloom"
+      #      Fix:    sudo mount --make-shared /     (see README.md to scope it)
+      #   3. The host kernel needs NFS client support (`sudo modprobe nfs`); the
+      #      container shares the host kernel and cannot supply it.
+      #
+      # The mount helper itself is in the image: the runtime stage installs
+      # nfs-common, which provides the setuid-root mount.nfs4. That setuid bit
+      # is how an unprivileged uid 10001 gets to call mount(2) here, and it is
+      # why `no-new-privileges` is NOT set on this service (it is set on all
+      # three authority services).
+      # ---------------------------------------------------------------------
+      - type: bind
+        source: ${BLOOM_HOST_DIR:-${HOME}/bloom}
+        target: /bloom
+        bind:
+          propagation: rshared
+          create_host_path: true
+
+    networks: [bloom-egress]
+
+    # -----------------------------------------------------------------------
+    # PRIVILEGE. This service is deliberately the only one that gets any.
+    #
+    # CAP_SYS_ADMIN is required for mount(2). It is also, bluntly, close to
+    # root-equivalent on the host: combined with the rshared bind it is enough
+    # to affect host mount state. This is the price of projecting the mount out
+    # of the container, and it is why the Broker, Signer and sentinel are
+    # separate services with cap_drop: [ALL] -- a compromise of the Machine must
+    # not reach key material.
+    #
+    # apparmor:unconfined is required on AppArmor hosts (Ubuntu, Debian with
+    # apparmor enabled): the docker-default profile denies mount unconditionally,
+    # so CAP_SYS_ADMIN alone is not sufficient there. Docker's default seccomp
+    # profile already permits mount/umount2 once CAP_SYS_ADMIN is present, so no
+    # seccomp override is needed.
+    #
+    # If your host is SELinux-enforcing rather than AppArmor, drop the apparmor
+    # line (it is a no-op or an error there) and expect to need an SELinux
+    # policy adjustment instead.
+    #
+    # `privileged: true` is the blunt fallback if the pair below is not enough
+    # on your host. It grants strictly more than this needs -- all capabilities,
+    # unmasked /proc and /sys, all devices. Prefer the narrow form; reach for
+    # privileged only to confirm a diagnosis, then narrow it again.
+    # -----------------------------------------------------------------------
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    # privileged: true
+
+    # -----------------------------------------------------------------------
+    # NFS PORT: deliberately NOT published.
+    #
+    # The embedded server defaults to `nfs_listen_addr = "127.0.0.1:12049"` and
+    # the client that consumes it is the mount call in this same container, so
+    # the traffic never leaves the loopback interface. Publishing it would
+    # expose an unauthenticated NFS export of the wallet tree to anything that
+    # can reach the port -- there is no NFS-level auth in front of it.
+    #
+    # Only if you are debugging the export from the host, and only bound to
+    # loopback, uncomment:
+    #   ports:
+    #     - "127.0.0.1:12049:12049/tcp"
+    # -----------------------------------------------------------------------
+
+    # `bloom status` is a real subcommand that round-trips over the daemon's IPC
+    # socket, so unlike the socket-existence probes above this one genuinely
+    # exercises the service. It does not assert that /bloom is mounted -- the
+    # runtime image has no `mountpoint` binary -- so a healthy Machine with a
+    # failed mount is possible. Check `docker compose logs machine` for the
+    # mount result, or just `ls` the host directory.
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/bloom", "status", "-q"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+    # The mount is torn down on shutdown; give the daemon room to unmount before
+    # SIGKILL, otherwise the host can be left with a stale NFS mount at /bloom.
+    stop_grace_period: 30s
+
+    restart: unless-stopped
