@@ -174,7 +174,11 @@ state. Their installed package documentation defines their mounted routes.
   recipient and amount, and reconstructs the calldata through the typed send
   path. Machine's staged plan then names the token, amount and recipient, and
   Machine checks the wallet's allowed destinations against the decoded
-  recipient rather than the token contract. Broker's approval ceremony decodes
+  recipient rather than the token contract. A Petal-scoped entry
+  (`petal:<name>`, see [Default Wallet Policy](./Default%20Wallet%20Policy.md))
+  passes that check for a transfer the named Petal staged, which is how a
+  recipient chosen per transaction, such as a deposit address, is allowed.
+  Broker's approval ceremony decodes
   the same bytes independently and is unchanged: without clear signing it shows
   a call to the token contract.
   Other calldata remains a generic contract call — including a transfer-shaped

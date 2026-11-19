@@ -931,14 +931,22 @@ mod tests {
 
         assert_eq!(agents, expected);
         assert_eq!(claude, expected);
-        let text = std::str::from_utf8(&agents).expect("guidance is utf-8");
+        // The root guide is short; the rest is one file per topic in `docs/`.
+        // These assertions hold for the guide and its topics together.
+        let mut text = String::from_utf8(agents).expect("guidance is utf-8");
+        let topics = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/docs/topics");
+        for entry in std::fs::read_dir(topics).expect("topic docs exist") {
+            text += &std::fs::read_to_string(entry.unwrap().path()).unwrap();
+        }
         assert!(
-            text.contains("cat docs/README.md"),
-            "guidance should use mounted filesystem examples"
+            text.contains("`docs/`"),
+            "guidance should point at the docs directory"
         );
+        // The published skill reads this file through `bloom vfs cat` before
+        // any mount, so the guide also names the CLI path for a transaction.
         assert!(
-            !text.contains("bloom vfs"),
-            "guidance should not mention the bloom vfs CLI"
+            text.contains("outbox/") && text.contains("`new.tx`") && text.contains("`confirm`"),
+            "guidance should name the outbox files a transaction goes through"
         );
         // Documentation assertion (plan:
         // docs/plans/2026-07-21-async-vfs-passkey-registration.md): agent

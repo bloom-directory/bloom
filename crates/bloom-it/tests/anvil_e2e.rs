@@ -437,3 +437,129 @@ async fn anvil_confirm_refuses_nonce_gap() -> Result<()> {
     drop(anvil);
     Ok(())
 }
+
+/// One write to `outbox/send.tx` stages the body and asks the owner; after
+/// the approval, confirming the entry `latest` names sends it and `latest` follows the
+/// entry into `sent/`.
+#[tokio::test(flavor = "multi_thread")]
+async fn anvil_send_tx_stages_asks_and_latest_confirm_sends() -> Result<()> {
+    let anvil = spawn_anvil().await?;
+    let rpc_url = anvil.rpc_url();
+    let tmp = tempfile::tempdir()?;
+    let home_root = tmp.path().to_path_buf();
+    write_config(&home_root, &rpc_url)?;
+    let home = HomeDir::at(&home_root);
+    let permit = Arc::new(HomeWritePermit::acquire(&home)?);
+    let test_signer: alloy_signer_local::PrivateKeySigner = TEST_WALLET_PRIVATE_KEY.parse()?;
+    let (broker, fixture) = exact_signing_broker(TEST_WALLET_PRIVATE_KEY)?;
+    let daemon = Daemon::from_home_with_permit_and_broker(
+        home,
+        permit,
+        broker,
+        exact_signing_catalog(&["transaction.confirm"]),
+    )
+    .map_err(|e| anyhow!("daemon: {e}"))?;
+    fund_via_cast(&rpc_url, &format!("{:#x}", test_signer.address()), 10).await?;
+    sleep(Duration::from_millis(250)).await;
+
+    let outbox = "/wallets/alice/0/chains/anvil/outbox";
+    let path = |leaf: &str| VfsPath::parse(&format!("{outbox}/{leaf}")).unwrap();
+    let asked = daemon
+        .vfs
+        .write(
+            &path("send.tx"),
+            b"send 1 ETH to 0x70997970C51812dc3A010C7d01b50e0d17dc79C8\n",
+        )
+        .await
+        .expect_err("the owner has not approved yet");
+    assert!(
+        asked.to_string().contains("owner approval pending"),
+        "{asked}"
+    );
+    let pending = daemon
+        .vfs
+        .list(&path("pending"))
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    assert_eq!(pending.len(), 1, "one write stages one entry");
+    let id = pending[0].name.clone();
+    let latest = |daemon: &Daemon| {
+        let vfs = daemon.vfs.clone();
+        let outbox = path("");
+        async move {
+            vfs.list(&outbox)
+                .await
+                .ok()?
+                .into_iter()
+                .find(|entry| entry.name == "latest")?
+                .link_target
+        }
+    };
+    assert_eq!(latest(&daemon).await, Some(format!("pending/{id}")));
+
+    fixture.activate();
+    daemon
+        .vfs
+        // IPC and the kernel follow the `latest` link; the bare tree here does not.
+        .write(&path(&format!("pending/{id}/confirm")), b"y\n")
+        .await
+        .map_err(|e| anyhow!("confirm after approval: {e}"))?;
+    assert_eq!(latest(&daemon).await, Some(format!("sent/{id}")));
+    let intent: serde_json::Value = serde_json::from_slice(
+        &daemon
+            .vfs
+            .read(&path(&format!("sent/{id}/intent.json")))
+            .await
+            .map_err(|e| anyhow!("read sent intent.json: {e}"))?,
+    )?;
+    assert_eq!(intent["status"], "sent", "{intent}");
+    drop(anvil);
+    Ok(())
+}
+
+/// A `send.tx` batch whose confirmation fails (here: no batch service) leaves
+/// nothing staged, so a retry does not stage a second set beside the first.
+#[tokio::test(flavor = "multi_thread")]
+async fn anvil_send_tx_batch_that_fails_to_confirm_is_discarded() -> Result<()> {
+    let anvil = spawn_anvil().await?;
+    let rpc_url = anvil.rpc_url();
+    let tmp = tempfile::tempdir()?;
+    let home_root = tmp.path().to_path_buf();
+    write_config(&home_root, &rpc_url)?;
+    let home = HomeDir::at(&home_root);
+    let permit = Arc::new(HomeWritePermit::acquire(&home)?);
+    let test_signer: alloy_signer_local::PrivateKeySigner = TEST_WALLET_PRIVATE_KEY.parse()?;
+    let (broker, _fixture) = exact_signing_broker(TEST_WALLET_PRIVATE_KEY)?;
+    let daemon = Daemon::from_home_with_permit_and_broker(
+        home,
+        permit,
+        broker,
+        exact_signing_catalog(&["transaction.confirm"]),
+    )
+    .map_err(|e| anyhow!("daemon: {e}"))?;
+    fund_via_cast(&rpc_url, &format!("{:#x}", test_signer.address()), 10).await?;
+    sleep(Duration::from_millis(250)).await;
+
+    let outbox = "/wallets/alice/0/chains/anvil/outbox";
+    let path = |leaf: &str| VfsPath::parse(&format!("{outbox}/{leaf}")).unwrap();
+    let send = "send 1 ETH to 0x70997970C51812dc3A010C7d01b50e0d17dc79C8\n";
+    let refused = daemon
+        .vfs
+        .write(&path("send.tx"), send.repeat(2).as_bytes())
+        .await
+        .expect_err("this daemon has no batch service");
+    assert!(
+        refused
+            .to_string()
+            .contains("batch confirmation is not available"),
+        "{refused}"
+    );
+    let pending = daemon
+        .vfs
+        .list(&path("pending"))
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    assert!(pending.is_empty(), "staged entries were left: {pending:?}");
+    drop(anvil);
+    Ok(())
+}

@@ -7,7 +7,7 @@ set -eu
 # release for the current platform. It never elevates privilege, never handles
 # a password, and never starts a Bloom service. After staging it prints the
 # captured values for one narrow, reviewed privileged handoff (pkexec/osascript,
-# or user-run sudo as a Linux fallback).
+# existing administrative access, or user-run sudo as a Linux fallback).
 #
 # Supported production targets and their signed release artifacts:
 #
@@ -207,7 +207,11 @@ stage_triad() {
       ;;
   esac
 
-  tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/bloom-triad-setup.XXXXXX")
+  # An administrator may have switched to the Bloom login while retaining a
+  # private TMPDIR. Fall back to the shared temporary root as this same user.
+  if ! tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/bloom-triad-setup.XXXXXX" 2>/dev/null); then
+    tmp_dir=$(mktemp -d /tmp/bloom-triad-setup.XXXXXX)
+  fi
   staged_new="$install_stage.new.$$"
   allowed_signers="$tmp_dir/allowed_signers"
   public_key="$tmp_dir/bloom-release-v1.pub"
@@ -326,6 +330,10 @@ main() {
   trap cleanup EXIT HUP INT TERM
 
   resolve_triad_target
+  if [ "$os" = Linux ] && [ "$login_uid" = 0 ]; then
+    printf '%s\n' "Stage Bloom as the verified non-root Bloom login user; see install.md." >&2
+    exit 1
+  fi
   require_triad_environment
   resolve_latest_release
   stage_triad

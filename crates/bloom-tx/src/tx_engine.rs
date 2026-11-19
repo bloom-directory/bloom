@@ -430,6 +430,8 @@ const TRIAD_SIGNING_STATE_FILE: &str = crate::outbox::SIGNING_STATE_FILE;
 const TRIAD_BATCH_STATE_DIR: &str = crate::outbox::BATCH_SIGNING_STATE_DIR;
 const TRIAD_BATCH_STATE_FILE: &str = crate::outbox::SIGNING_STATE_FILE;
 const TRIAD_EXACT_APPROVAL_TTL_MS: u64 = 10 * 60 * 1_000;
+/// The most transactions one owner approval can cover.
+pub const MAX_BATCH_CHILDREN: usize = 32;
 
 #[derive(Clone)]
 struct TriadSigningService {
@@ -1815,7 +1817,15 @@ impl TxEngine {
         // the destination has bytecode we still flag it as a contract
         // call; the heuristic mirrors the spec's "code length > 0 OR data
         // is non-empty" rule.
-        let mut policy_ctx = policy_engine::AddressContext::default();
+        let mut policy_ctx = policy_engine::AddressContext {
+            // A Petal's own destinations are only trusted when the policy names
+            // it; the engine merely reports which Petal staged this.
+            staged_by_petal: execution_origin
+                .as_ref()
+                .map(|origin| origin.petal_id.clone())
+                .filter(|petal| !petal.is_empty()),
+            ..Default::default()
+        };
         // Synthetic policy checks contributed by NFT-aware code paths
         // (e.g. operator-wide approvals) — appended after the rules engine
         // has produced its own checks so they all show up in plan.md.
@@ -2269,10 +2279,10 @@ impl TxEngine {
         override_warnings: bool,
     ) -> Result<ConfirmBatchResult, TxEngineError> {
         self.assert_write_permit(permit)?;
-        if !(1..=32).contains(&targets.len()) {
-            return Err(TxEngineError::ApprovalConstruction(
-                "transaction batch must contain 1 to 32 children".into(),
-            ));
+        if !(1..=MAX_BATCH_CHILDREN).contains(&targets.len()) {
+            return Err(TxEngineError::ApprovalConstruction(format!(
+                "transaction batch must contain 1 to {MAX_BATCH_CHILDREN} children"
+            )));
         }
         let mut unique = HashSet::with_capacity(targets.len());
         let ordered_refs = targets
@@ -2316,6 +2326,7 @@ impl TxEngine {
         let mut already_attempted = Vec::with_capacity(targets.len());
         let batches = self.outbox.batch_index();
         let now = now_ms();
+        let mut sequences: HashMap<(String, String), Vec<StagedTx>> = HashMap::new();
         for target in &targets {
             let policy = &target.policy;
             let entry = self.outbox.read(wallet, &target.chain_name, &target.id)?;
@@ -2375,7 +2386,19 @@ impl TxEngine {
                     ));
                 }
                 if !override_warnings {
-                    self.simulate_or_reject(staged, &target.chain).await?;
+                    // An entry that follows another from the same sender on
+                    // the same chain runs on the state its predecessors leave
+                    // (a supply after its approval), so it is simulated after
+                    // them, not alone against today's state.
+                    let sender = (target.chain_name.clone(), staged.from.to_ascii_lowercase());
+                    let sequence = sequences.entry(sender).or_default();
+                    sequence.push(staged.clone());
+                    if sequence.len() == 1 {
+                        self.simulate_or_reject(staged, &target.chain).await?;
+                    } else {
+                        self.simulate_sequence_or_reject(sequence, &target.chain)
+                            .await?;
+                    }
                 }
             }
             let unsigned = self.build_unsigned_evm_tx(&entry.staged, &target.chain)?;
@@ -4192,13 +4215,8 @@ impl TxEngine {
         }
     }
 
-    /// `eth_call` the staged tx against current state; reject on revert. RPC
-    /// failures simulating are non-fatal (don't block broadcast on infra).
-    async fn simulate_or_reject(
-        &self,
-        staged: &StagedTx,
-        chain: &ChainClient,
-    ) -> Result<(), TxEngineError> {
+    /// The call a staged tx will make, for simulation.
+    fn simulation_request(staged: &StagedTx) -> Result<TransactionRequest, TxEngineError> {
         let from: Address = staged
             .from
             .parse()
@@ -4206,13 +4224,62 @@ impl TxEngine {
         let destination = staged.transaction_kind().map_err(TxEngineError::Address)?;
         let value = U256::from_str_radix(&staged.value_wei, 10).unwrap_or(U256::ZERO);
         let data = staged.data_hex.parse::<Bytes>().unwrap_or_default();
-        let req = TransactionRequest::default()
+        Ok(TransactionRequest::default()
             .from(from)
             .with_kind(destination)
             .nonce(staged.nonce)
             .with_gas_limit(staged.gas_limit)
             .value(value)
-            .input(data.into());
+            .input(data.into()))
+    }
+
+    /// Simulate the last tx of `sequence` after the ones before it; reject if
+    /// any of them reverts. A node that cannot simulate a sequence cannot
+    /// judge a tx that runs on what the earlier ones leave (alone, a spend
+    /// reverts for want of its approval), so it is not simulated, as a tx
+    /// whose `eth_call` could not be made is not.
+    async fn simulate_sequence_or_reject(
+        &self,
+        sequence: &[StagedTx],
+        chain: &ChainClient,
+    ) -> Result<(), TxEngineError> {
+        let mut calls = Vec::with_capacity(sequence.len());
+        for staged in sequence {
+            // The simulated block assigns nonces itself.
+            let mut call = Self::simulation_request(staged)?;
+            call.nonce = None;
+            calls.push(call);
+        }
+        let outcomes = match chain.simulate_sequence(&calls).await {
+            Ok(outcomes) => outcomes,
+            Err(error) => {
+                debug!(error = %error, "tx.simulate_sequence_unavailable");
+                return Ok(());
+            }
+        };
+        match outcomes.iter().position(Result::is_err) {
+            None => Ok(()),
+            Some(index) => {
+                let returndata = outcomes[index].as_ref().err().cloned().unwrap_or_default();
+                Err(TxEngineError::SimulationReverted {
+                    reason: format!(
+                        "{} (entry {}, simulated after the entries before it)",
+                        crate::reconcile::decode_revert(&returndata),
+                        sequence[index].id
+                    ),
+                })
+            }
+        }
+    }
+
+    /// `eth_call` the staged tx against current state; reject on revert. RPC
+    /// failures simulating are non-fatal (don't block broadcast on infra).
+    async fn simulate_or_reject(
+        &self,
+        staged: &StagedTx,
+        chain: &ChainClient,
+    ) -> Result<(), TxEngineError> {
+        let req = Self::simulation_request(staged)?;
         match chain.eth_call_capture_revert(req, None).await {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(returndata)) => Err(TxEngineError::SimulationReverted {
@@ -6650,6 +6717,35 @@ mod tests {
         );
     }
 
+    /// An approve-then-spend batch on a node without `eth_simulateV1`: the
+    /// spend reverts when called alone, which says nothing about the batch.
+    #[tokio::test]
+    async fn a_node_without_sequence_simulation_does_not_refuse_a_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TxEngine::new(Outbox::new(dir.path().join("outbox")).unwrap(), 60_000);
+        let revert = r#"error:{"code":3,"message":"execution reverted","data":"0x"}"#;
+        let sequence = [fake_staged_1559("approve"), fake_staged_1559("spend")];
+
+        let without = HashMap::from([("eth_call".to_owned(), vec![revert.to_owned()])]);
+        let chain = stage_chain(&spawn_queued_rpc(without).await);
+        engine
+            .simulate_sequence_or_reject(&sequence, &chain)
+            .await
+            .expect("an unjudged batch is not refused");
+
+        // A node that has it still refuses the entry that reverts in order.
+        let with = HashMap::from([(
+            "eth_simulateV1".to_owned(),
+            vec![r#"[{"calls":[{"status":"0x1","returnData":"0x"},{"status":"0x0","returnData":"0x"}]}]"#.to_owned()],
+        )]);
+        let chain = stage_chain(&spawn_queued_rpc(with).await);
+        let refused = engine.simulate_sequence_or_reject(&sequence, &chain).await;
+        assert!(
+            matches!(&refused, Err(TxEngineError::SimulationReverted { reason }) if reason.contains("entry spend")),
+            "{refused:?}"
+        );
+    }
+
     fn fake_staged_1559(id: &str) -> StagedTx {
         StagedTx {
             id: id.into(),
@@ -7805,6 +7901,203 @@ mod tests {
             outcomes(&staged, "tokens.deny").is_empty(),
             "a local Anvil must not borrow mainnet's registry"
         );
+    }
+
+    /// A wallet policy's `petal:<name>` entry lets the transaction that
+    /// Petal stages go to a destination it chose. The engine reports which
+    /// Petal staged it; a hand-staged transaction, or one another Petal
+    /// staged, is still matched against the listed addresses.
+    #[tokio::test]
+    async fn a_petal_entry_covers_only_what_that_petal_staged() {
+        let mut policy = Policy::default();
+        policy
+            .allowlists
+            .recipients
+            .insert("petal:polymarket".into());
+        let stage = |origin: Option<ExecutionOrigin>| {
+            let policy = policy.clone();
+            async move {
+                let url = spawn_stage_rpc(false).await;
+                let oracle = RecordingOracle {
+                    calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                    usd_micro: 1_250_000,
+                    age_ms: 0,
+                    max_age_ms: 60_000,
+                };
+                let (engine, _dir, permit, chain) = stage_fixture(&url, oracle);
+                let intent = RawIntent {
+                    body: RawIntentBody::Send {
+                        to: "0x2222222222222222222222222222222222222222".into(),
+                        value: "0.001 eth".into(),
+                        token: None,
+                        amount: String::new(),
+                        data: None,
+                    },
+                    chain: Some("anvil".into()),
+                    gas: bloom_proto::intent::GasStrategy::Auto,
+                    nonce: None,
+                    gas_limit_hint: None,
+                    usd_value_hint: None,
+                };
+                engine
+                    .stage_with_execution_origin(
+                        &permit,
+                        "alice",
+                        "0x3333333333333333333333333333333333333333"
+                            .parse()
+                            .unwrap(),
+                        intent,
+                        &chain,
+                        &policy,
+                        None,
+                        origin,
+                    )
+                    .await
+            }
+        };
+        let petal = |id: &str| ExecutionOrigin {
+            petal_id: id.into(),
+            ..ExecutionOrigin::default()
+        };
+        let staged = stage(Some(petal("petal:polymarket"))).await.unwrap();
+        assert!(
+            !crate::policy_engine::has_hard_violation(&staged.policy_checks),
+            "{:?}",
+            staged.policy_checks
+        );
+        assert!(
+            staged.policy_checks.iter().any(|check| check
+                .message
+                .contains("destination chosen by petal:polymarket")),
+            "{:?}",
+            staged.policy_checks
+        );
+        // The same transfer from another Petal, or from the agent, stages
+        // with the destination refused, not with some unrelated error.
+        for origin in [None, Some(petal("petal:near-intents"))] {
+            let staged = stage(origin.clone()).await.unwrap();
+            assert!(
+                crate::policy_engine::has_hard_violation(&staged.policy_checks)
+                    && staged
+                        .policy_checks
+                        .iter()
+                        .any(|check| check.message.contains("not on allowlist")),
+                "{origin:?}: {:?}",
+                staged.policy_checks
+            );
+        }
+    }
+
+    /// A Petal's typed ERC-20 transfer is checked against its recipient, and a
+    /// venue may choose that per transaction (a per-quote deposit address), so
+    /// no owner can list it ahead of time. The wallet's `petal:<name>` entry
+    /// is what lets it through: it covers the typed transfer that Petal
+    /// staged, and nothing another Petal or the agent staged. Listing the
+    /// token contract, which passed while the call was still generic, no
+    /// longer does.
+    #[tokio::test]
+    async fn a_petal_entry_covers_the_typed_transfer_that_petal_staged() {
+        use bloom_proto::policy::PolicyOutcome;
+        const DEPOSIT: &str = "0x2222222222222222222222222222222222222222";
+        let usdc: Address = bloom_broker_api::token_by_symbol(1, "USDC")
+            .expect("mainnet USDC is curated")
+            .address
+            .parse()
+            .unwrap();
+        let stage = |entries: Vec<String>, origin: Option<ExecutionOrigin>| async move {
+            let mut policy = Policy::default();
+            policy.allowlists.recipients.extend(entries);
+            let url = spawn_mainnet_stage_rpc().await;
+            let oracle = RecordingOracle {
+                calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                usd_micro: 1_250_000,
+                age_ms: 0,
+                max_age_ms: 60_000,
+            };
+            let (engine, _dir, permit, chain) =
+                stage_fixture_on(oracle, stage_chain_on(&url, "ethereum", 1));
+            engine.token_cache.write().insert(
+                (1, usdc),
+                TokenMeta {
+                    address: usdc,
+                    symbol: "USDC".into(),
+                    decimals: 6,
+                },
+            );
+            // The body Machine builds for a Petal call it classified.
+            let intent = RawIntent {
+                body: RawIntentBody::Send {
+                    to: DEPOSIT.into(),
+                    value: "0".into(),
+                    token: Some(format!("{usdc:#x}")),
+                    amount: "1250000 base".into(),
+                    data: None,
+                },
+                chain: Some("ethereum".into()),
+                gas: bloom_proto::intent::GasStrategy::Auto,
+                nonce: None,
+                gas_limit_hint: None,
+                usd_value_hint: None,
+            };
+            let staged = engine
+                .stage_with_execution_origin(
+                    &permit,
+                    "alice",
+                    "0x3333333333333333333333333333333333333333"
+                        .parse()
+                        .unwrap(),
+                    intent,
+                    &chain,
+                    &policy,
+                    None,
+                    origin,
+                )
+                .await
+                .unwrap();
+            assert_eq!(staged.action_kind, TxActionKind::Erc20Transfer);
+            assert_eq!(staged.token.as_ref().unwrap().recipient, DEPOSIT);
+            staged
+                .policy_checks
+                .iter()
+                .filter(|check| check.rule == "allowlists.recipients")
+                .map(|check| (check.outcome, check.message.clone()))
+                .collect::<Vec<_>>()
+        };
+        let petal = |id: &str| ExecutionOrigin {
+            petal_id: id.into(),
+            ..ExecutionOrigin::default()
+        };
+        let refused = vec![(PolicyOutcome::Deny, format!("{DEPOSIT} not on allowlist"))];
+
+        // The Petal's own entry passes a recipient the policy never listed.
+        assert_eq!(
+            stage(
+                vec!["petal:near-intents".into()],
+                Some(petal("petal:near-intents"))
+            )
+            .await,
+            vec![(
+                PolicyOutcome::Pass,
+                "destination chosen by petal:near-intents, which wallet policy allows".to_owned()
+            )]
+        );
+        // The token contract is not the destination of a typed transfer.
+        assert_eq!(
+            stage(
+                vec![format!("{usdc:#x}")],
+                Some(petal("petal:near-intents"))
+            )
+            .await,
+            refused
+        );
+        // The entry covers only its own Petal.
+        for origin in [None, Some(petal("petal:enso"))] {
+            assert_eq!(
+                stage(vec!["petal:near-intents".into()], origin.clone()).await,
+                refused,
+                "{origin:?}"
+            );
+        }
     }
 
     #[tokio::test]
