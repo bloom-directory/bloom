@@ -122,6 +122,72 @@ pub const BACKGROUND_EFFECT_AUDIT_MATRIX: &[(&str, &str)] = &[
     ),
 ];
 
+/// Development builds only: `BLOOM_DEV_PETAL_ENDPOINTS="api.example.com=http://127.0.0.1:18080,..."`
+/// sends a Petal's HTTPS request for that host to a local stand-in server, with the venue's
+/// host in the `Host` header. Network policy and the audit log still see the venue's own URL.
+/// Benchmarks use it to run Petals against simulated venues; release builds ignore it.
+#[cfg(feature = "triad-dev-harness")]
+fn dev_petal_endpoint(url: &str) -> Option<(String, String)> {
+    static MAP: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+    let map = MAP.get_or_init(|| {
+        parse_dev_petal_endpoints(&std::env::var("BLOOM_DEV_PETAL_ENDPOINTS").unwrap_or_default())
+    });
+    rewrite_dev_petal_endpoint(map, url)
+}
+
+#[cfg(not(feature = "triad-dev-harness"))]
+fn dev_petal_endpoint(_url: &str) -> Option<(String, String)> {
+    None
+}
+
+#[cfg(any(test, feature = "triad-dev-harness"))]
+fn parse_dev_petal_endpoints(value: &str) -> Vec<(String, String)> {
+    value
+        .split(',')
+        .filter_map(|pair| pair.trim().split_once('='))
+        .filter(|(_, origin)| origin.starts_with("http://127.0.0.1:"))
+        .map(|(host, origin)| {
+            (
+                host.trim().to_ascii_lowercase(),
+                origin.trim_end_matches('/').to_string(),
+            )
+        })
+        .collect()
+}
+
+#[cfg(any(test, feature = "triad-dev-harness"))]
+fn rewrite_dev_petal_endpoint(map: &[(String, String)], url: &str) -> Option<(String, String)> {
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let (_, origin) = map.iter().find(|(name, _)| *name == host)?;
+    let query = parsed.query().map(|q| format!("?{q}")).unwrap_or_default();
+    Some((format!("{origin}{}{query}", parsed.path()), host))
+}
+
+#[cfg(test)]
+mod dev_petal_endpoint_tests {
+    use super::*;
+
+    #[test]
+    fn a_mapped_venue_goes_to_its_local_stand_in_with_its_own_host() {
+        let map = parse_dev_petal_endpoints(
+            "api.hyperliquid.xyz=http://127.0.0.1:18080/, evil.example=https://attacker.example",
+        );
+        assert_eq!(map.len(), 1, "only loopback http origins are accepted");
+        assert_eq!(
+            rewrite_dev_petal_endpoint(&map, "https://API.hyperliquid.xyz/info?x=1"),
+            Some((
+                "http://127.0.0.1:18080/info?x=1".into(),
+                "api.hyperliquid.xyz".into()
+            ))
+        );
+        assert_eq!(
+            rewrite_dev_petal_endpoint(&map, "https://clob.polymarket.com/book"),
+            None
+        );
+    }
+}
+
 const PETAL_HTTP_MAX_REDIRECTS: usize = 5;
 
 /// Concrete adapter that bridges the Machine-owned central outbox and
@@ -1819,7 +1885,14 @@ impl PetalHost for DaemonPetalHost {
                 let err = HostError::Invalid(format!("http method: {e}"));
                 self.audited_http_error(&correlation_id, &method, &url, "error", None, None, err)
             })?;
-            let mut builder = self.http.request(reqwest_method, &url);
+            let mut builder = match dev_petal_endpoint(&url) {
+                // Policy and audit above saw the venue's own URL; only the socket differs.
+                Some((local, host)) => self
+                    .http
+                    .request(reqwest_method, local)
+                    .header(reqwest::header::HOST, host),
+                None => self.http.request(reqwest_method, &url),
+            };
             for (name, value) in &headers {
                 builder = builder.header(name.as_str(), value.as_str());
             }
