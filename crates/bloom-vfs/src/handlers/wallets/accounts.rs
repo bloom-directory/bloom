@@ -104,6 +104,23 @@ pub(super) struct FamilyKey {
     derived: Option<DerivedAccountPublic>,
 }
 
+/// `wallets/<wallet>/<n>/confirm-batch`: one owner approval for several
+/// staged entries. Written with the entries, read for the result.
+const CONFIRM_BATCH: &str = "confirm-batch";
+const CONFIRM_BATCH_HELP: &str = "write the staged entries to send under one approval, in order, as chain:id separated by spaces (ethereum:0001-abcde ethereum:0002-fghij); y repeats the batch while it waits for approval. Read this file for the result: the approval link, then each transaction hash.\n";
+
+/// `outbox/send.tx`: stage a body and ask the owner in one write.
+const SEND_TX: &str = "send.tx";
+
+/// The outbox explains itself where it is used, so the root guide need not.
+const OUTBOX_README: &str = "README.md";
+const EVM_OUTBOX_README: &str = include_str!("../../docs/outbox-evm.md");
+const SOLANA_OUTBOX_README: &str = include_str!("../../docs/outbox-solana.md");
+
+fn outbox_readme_entry(text: &str) -> Entry {
+    Entry::file(OUTBOX_README).with_size(text.len() as u64)
+}
+
 impl FamilyKey {
     /// The display address the outbox fence compares staged senders
     /// against (EVM, case-insensitively).
@@ -414,7 +431,220 @@ impl WalletsHandler {
         );
         entries.push(Entry::dir("chains"));
         entries.push(Entry::dir("sessions"));
+        entries.push(Entry::writable_file(CONFIRM_BATCH));
         entries
+    }
+
+    /// What `confirm-batch` reads as: the last batch's status, or how to
+    /// write one.
+    fn batch_status(&self, wallet: &str, number: u32) -> Vec<u8> {
+        let stored = self.batches(wallet, number).last().cloned();
+        match stored {
+            Some(stored) => self.batch_view(wallet, stored),
+            None => CONFIRM_BATCH_HELP.as_bytes().to_vec(),
+        }
+    }
+
+    /// A recorded batch status as it reads now.
+    fn batch_view(&self, wallet: &str, stored: Vec<u8>) -> Vec<u8> {
+        // A batch waits for the owner only while every entry is still
+        // pending. Once one was cancelled or sent on its own, the rest are
+        // confirmed singly again, so a later `y` asks for no more than it names.
+        let Ok(mut status) = serde_json::from_slice::<serde_json::Value>(&stored) else {
+            return stored;
+        };
+        let pending = |entry: &serde_json::Value| {
+            let named = entry.as_str().and_then(|r| r.split_once(':'));
+            named.is_some_and(|(chain, id)| {
+                self.tx_engine
+                    .outbox
+                    .read_in_state(wallet, chain, id, OutboxState::Pending)
+                    .is_ok()
+            })
+        };
+        if status["status"] != "awaiting_ceremony"
+            || status["entries"]
+                .as_array()
+                .is_some_and(|entries| entries.iter().all(pending))
+        {
+            return stored;
+        }
+        status["status"] = "ended".into();
+        status["note"] = "an entry of this batch is no longer pending; confirm the others on their own or write a new batch".into();
+        let mut text = serde_json::to_vec_pretty(&status).unwrap_or(stored);
+        text.push(b'\n');
+        text
+    }
+
+    /// The batch waiting for the owner that `entry` (`chain:id`) is part of,
+    /// with its status, newest first: a batch started since does not
+    /// replace it.
+    fn awaited_batch_with(
+        &self,
+        wallet: &str,
+        number: u32,
+        entry: &str,
+    ) -> Option<(Vec<String>, serde_json::Value)> {
+        let batches = self.batches(wallet, number);
+        batches.into_iter().rev().find_map(|stored| {
+            let status: serde_json::Value =
+                serde_json::from_slice(&self.batch_view(wallet, stored)).ok()?;
+            let refs: Vec<String> = status["entries"]
+                .as_array()?
+                .iter()
+                .filter_map(|e| e.as_str().map(str::to_owned))
+                .collect();
+            (status["status"] == "awaiting_ceremony" && refs.iter().any(|r| r == entry))
+                .then_some((refs, status))
+        })
+    }
+
+    /// `confirm-batch`: send several staged entries under one owner
+    /// approval, in the order written.
+    async fn write_confirm_batch(
+        &self,
+        wallet: &str,
+        number: u32,
+        data: &[u8],
+    ) -> Result<(), HandlerError> {
+        let body = std::str::from_utf8(data)
+            .map_err(|_| HandlerError::invalid("non-utf8 confirm-batch content"))?;
+        let mut refs = Vec::new();
+        if body.trim() == "y" {
+            // `y` repeats the batch this file last reported.
+            let last: serde_json::Value =
+                serde_json::from_slice(&self.batch_status(wallet, number)).unwrap_or_default();
+            let entries = last["entries"].as_array().cloned().unwrap_or_default();
+            let refs: Vec<String> = entries
+                .iter()
+                .filter_map(|entry| entry.as_str().map(str::to_owned))
+                .collect();
+            // Only a batch still waiting for the owner is repeated: one that
+            // was sent, failed or lost an entry is not asked for again.
+            if refs.is_empty() || last["status"] != "awaiting_ceremony" {
+                return Err(HandlerError::invalid(format!(
+                    "no batch is waiting to repeat; {CONFIRM_BATCH_HELP}"
+                )));
+            }
+            return self.confirm_batch_entries(wallet, number, refs).await;
+        }
+        for reference in body.split_whitespace() {
+            match reference.split_once(':') {
+                Some(_) => refs.push(reference.to_owned()),
+                None => {
+                    return Err(HandlerError::invalid(format!(
+                        "'{reference}' is not chain:id; {CONFIRM_BATCH_HELP}"
+                    )));
+                }
+            }
+        }
+        if refs.is_empty() {
+            return Err(HandlerError::invalid(format!(
+                "no entries to confirm; {CONFIRM_BATCH_HELP}"
+            )));
+        }
+        self.confirm_batch_entries(wallet, number, refs).await
+    }
+
+    /// Confirm `refs` (`chain:id`, in order) under one approval and record
+    /// the outcome, with the entries, as what `confirm-batch` reads as.
+    async fn confirm_batch_entries(
+        &self,
+        wallet: &str,
+        number: u32,
+        refs: Vec<String>,
+    ) -> Result<(), HandlerError> {
+        let confirm = self.batch_confirm.read().clone().ok_or_else(|| {
+            HandlerError::Unsupported("batch confirmation is not available on this Bloom".into())
+        })?;
+        let outcome = confirm(wallet.to_owned(), number, refs.clone(), "y".into()).await;
+        let (mut status, result) = match outcome {
+            Ok(status) => {
+                let awaiting = status["status"] == "awaiting_ceremony";
+                let path = format!("wallets/{wallet}/{number}/{CONFIRM_BATCH}");
+                (
+                    status,
+                    if awaiting {
+                        Err(HandlerError::ApprovalPending(path))
+                    } else {
+                        Ok(())
+                    },
+                )
+            }
+            Err(error) => (
+                serde_json::json!({"status": "failed", "error": error}),
+                Err(HandlerError::backend(error)),
+            ),
+        };
+        if let Some(fields) = status.as_object_mut() {
+            fields.insert("entries".into(), refs.into());
+        }
+        let mut text = serde_json::to_vec_pretty(&status).map_err(err_be)?;
+        text.push(b'\n');
+        // This result replaces its batch's earlier one and becomes the
+        // latest; of the rest, only batches still waiting are kept.
+        // Loads a record saved before a restart, if there is one.
+        self.batches(wallet, number);
+        let mut results = self.batch_results.lock();
+        let batches = results.entry((wallet.to_owned(), number)).or_default();
+        batches.retain(|stored| {
+            let stored: serde_json::Value = serde_json::from_slice(stored).unwrap_or_default();
+            stored["status"] == "awaiting_ceremony" && stored["entries"] != status["entries"]
+        });
+        batches.push(text);
+        // Kept on disk too: after a Machine restart, a batch the owner is
+        // still approving must continue, not open a second approval. Saved
+        // under the lock, so concurrent batches save in order.
+        if let Some(file) = self.batches_file(wallet, number) {
+            let saved: Vec<serde_json::Value> = batches
+                .iter()
+                .filter_map(|stored| serde_json::from_slice(stored).ok())
+                .collect();
+            if let Err(error) = serde_json::to_vec(&saved)
+                .map_err(err_be)
+                .and_then(|bytes| write_atomic_file(&file, &bytes))
+            {
+                tracing::warn!(%wallet, number, %error, "confirm_batch.record_unsaved");
+            }
+        }
+        drop(results);
+        result
+    }
+
+    /// Where an account's `confirm-batch` record is kept, beside its outbox.
+    fn batches_file(&self, wallet: &str, number: u32) -> Option<std::path::PathBuf> {
+        let dir = self
+            .tx_engine
+            .outbox
+            .wallet_chain_dir(wallet, CONFIRM_BATCH)
+            .ok()?;
+        Some(dir.with_file_name(format!(".{CONFIRM_BATCH}-{number}.json")))
+    }
+
+    /// An account's `confirm-batch` results, oldest first, loaded from disk
+    /// the first time after a restart.
+    fn batches(&self, wallet: &str, number: u32) -> Vec<Vec<u8>> {
+        let key = (wallet.to_owned(), number);
+        if let Some(batches) = self.batch_results.lock().get(&key) {
+            return batches.clone();
+        }
+        let loaded: Vec<Vec<u8>> = self
+            .batches_file(wallet, number)
+            .and_then(|file| std::fs::read(file).ok())
+            .and_then(|raw| serde_json::from_slice::<Vec<serde_json::Value>>(&raw).ok())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|status| {
+                let mut text = serde_json::to_vec_pretty(status).ok()?;
+                text.push(b'\n');
+                Some(text)
+            })
+            .collect();
+        self.batch_results
+            .lock()
+            .entry(key)
+            .or_insert(loaded)
+            .clone()
     }
 
     /// The key one of the [`ACCOUNT_KEY_FILES`] presents, or `None` when the
@@ -484,6 +714,27 @@ impl WalletsHandler {
             return Ok(Vec::new());
         };
         petals.sessions(&Self::account_context(wallet, view))
+    }
+
+    /// The configured EVM chain whose chain id is `id`, unless a chain is
+    /// already named that.
+    fn chain_named_by_id(&self, id: &str) -> Option<String> {
+        let id: u64 = id.parse().ok()?;
+        let names = self.chains.list_names();
+        if names
+            .iter()
+            .any(|name| name.parse::<u64>().is_ok_and(|n| n == id))
+        {
+            return None;
+        }
+        // A fork and the network it copies share an id: name neither.
+        let mut named = names.into_iter().filter(|name| {
+            self.chains
+                .get(name)
+                .is_some_and(|c| c.spec().chain_id == id)
+        });
+        let only = named.next()?;
+        named.next().is_none().then_some(only)
     }
 
     fn chain_name_entries(&self, view: &AccountView) -> Vec<Entry> {
@@ -718,7 +969,14 @@ impl WalletsHandler {
             {
                 Ok(Entry::file(leaf))
             }
+            [leaf] if leaf == CONFIRM_BATCH => Ok(Entry::writable_file(CONFIRM_BATCH)
+                .with_size(self.batch_status(wallet, number).len() as u64)),
             [dir] if dir == "chains" => Ok(Entry::dir("chains")),
+            // A chain is also reachable by its numeric id (`chains/1`), as a
+            // link to its name: requests usually give the id.
+            [dir, id] if dir == "chains" && self.chain_named_by_id(id).is_some() => Ok(
+                Entry::symlink(id, &self.chain_named_by_id(id).unwrap_or_default()),
+            ),
             [dir, chain, chain_rest @ ..] if dir == "chains" => {
                 if self.is_solana_chain(chain) {
                     let (family, _) = Self::solana_family(&view, chain)?;
@@ -752,6 +1010,7 @@ impl WalletsHandler {
         match rest {
             [leaf] if leaf == "account.json" => self.account_json(wallet, &view),
             [leaf] if leaf == "holdings.json" => self.holdings_json(&view).await,
+            [leaf] if leaf == CONFIRM_BATCH => Ok(self.batch_status(wallet, number)),
             [leaf] if ACCOUNT_KEY_FILES.contains(&leaf.as_str()) => {
                 Self::read_account_key_file(&view, leaf)
             }
@@ -853,6 +1112,11 @@ impl WalletsHandler {
         } else {
             self.account_view(wallet, number).await?
         };
+        if let [leaf] = rest
+            && leaf == CONFIRM_BATCH
+        {
+            return self.write_confirm_batch(wallet, number, data).await;
+        }
         if let [dir, mount, slot, leaf] = rest
             && dir == "sessions"
             && leaf == "stop"
@@ -902,19 +1166,24 @@ impl WalletsHandler {
         let family = Self::evm_family(&view, chain)?;
         let from = Self::evm_address(family)?;
         // A body fingerprint that names a different account is an error,
-        // symmetric with the Solana outbox: the path fixes the sender.
-        if chain_rest == ["new.tx"]
-            && let Ok(body) = serde_json::from_slice::<serde_json::Value>(data)
-            && let Some(named) = body.get("account_fingerprint").and_then(|v| v.as_str())
-            && !family
-                .fingerprint
-                .to_ascii_lowercase()
-                .starts_with(&named.to_ascii_lowercase())
-        {
-            return Err(HandlerError::invalid(format!(
-                "intent names account {named}, but this path stages from {}",
-                family.fingerprint
-            )));
+        // symmetric with the Solana outbox: the path fixes the sender. Every
+        // body of a `send.tx` batch is checked before any is staged.
+        if chain_rest == ["new.tx"] || chain_rest == [SEND_TX] {
+            let text = String::from_utf8_lossy(data);
+            for body in bloom_tx::intent_parser::bodies(&text) {
+                if let Ok(body) = serde_json::from_str::<serde_json::Value>(body)
+                    && let Some(named) = body.get("account_fingerprint").and_then(|v| v.as_str())
+                    && !family
+                        .fingerprint
+                        .to_ascii_lowercase()
+                        .starts_with(&named.to_ascii_lowercase())
+                {
+                    return Err(HandlerError::invalid(format!(
+                        "intent names account {named}, but this path stages from {}; nothing was staged",
+                        family.fingerprint
+                    )));
+                }
+            }
         }
         let projection = if unsigned_stage {
             self.wallet_projection_navigation(wallet).await?
@@ -937,8 +1206,143 @@ impl WalletsHandler {
             .chain_id;
         let policy =
             crate::advisory_exact_evm_policy(&projection, chain, chain_id).map_err(err_be)?;
+        // An entry that already left `pending` (its batch was sent, say) is
+        // reported where it now is, so the caller reads the result instead
+        // of guessing what a bare "not found" means.
+        if let [state, id, control] = chain_rest
+            && state == "pending"
+            && EVM_PENDING_CONTROLS.contains(&control.as_str())
+            && let Some(now) = ["sent", "failed"].into_iter().find(|now| {
+                self.evm_outbox_entry(wallet, family, chain, now, id)
+                    .is_ok()
+            })
+        {
+            return Err(HandlerError::not_found(format!(
+                "pending/{id}: it is no longer pending; its result is in `{now}/{id}/`"
+            )));
+        }
+        // An entry asked for as part of a batch is confirmed with its batch:
+        // `latest/confirm` continues whatever `send.tx` started.
+        if let [state, id, control] = chain_rest
+            && state == "pending"
+            && control == "confirm"
+            && data.trim_ascii() == b"y"
+            && let Some((refs, _)) =
+                self.awaited_batch_with(wallet, number, &format!("{chain}:{id}"))
+        {
+            return self.confirm_batch_entries(wallet, number, refs).await;
+        }
+        if let [control] = chain_rest
+            && EVM_PENDING_CONTROLS.contains(&control.as_str())
+        {
+            return Err(HandlerError::invalid(format!(
+                "`{control}` belongs to an entry: write `latest/{control}` or `pending/<id>/{control}`"
+            )));
+        }
+        if chain_rest == [SEND_TX] {
+            return self
+                .stage_and_confirm(wallet, chain, from, &policy, data, number)
+                .await;
+        }
         self.write_outbox_from(wallet, chain, from, &policy, chain_rest, data, number)
             .await
+    }
+
+    /// `outbox/send.tx`: stage the body and confirm it in the same write, as
+    /// `bloom wallet stage --confirm` does. The owner is asked at once (the
+    /// write is denied with the entry's challenge), or the entry is sent when
+    /// no approval is needed.
+    async fn stage_and_confirm(
+        &self,
+        wallet: &str,
+        chain: &str,
+        from: alloy::primitives::Address,
+        policy: &Policy,
+        data: &[u8],
+        number: u32,
+    ) -> Result<(), HandlerError> {
+        let text = std::str::from_utf8(data)
+            .map_err(|_| HandlerError::invalid("non-utf8 outbox content"))?;
+        let bodies = bloom_tx::intent_parser::bodies(text);
+        let mut staged: Vec<String> = Vec::new();
+        // Every body is checked before any is staged, so a mistake in a
+        // later line leaves nothing behind for a retry to duplicate.
+        let max = bloom_tx::tx_engine::MAX_BATCH_CHILDREN;
+        if bodies.len() > max {
+            return Err(HandlerError::invalid(format!(
+                "{} transactions, but one approval covers at most {max}; nothing was staged",
+                bodies.len()
+            )));
+        }
+        for body in bodies.iter().filter(|_| bodies.len() > 1) {
+            bloom_tx::intent_parser::parse(body)
+                .map_err(|e| HandlerError::invalid(format!("{e}; nothing was staged")))?;
+        }
+        for body in &bodies {
+            match self.stage_from(wallet, chain, from, policy, body).await {
+                Ok(id) => staged.push(id),
+                // A body the chain or policy refused: discard the ones
+                // before it, which were only ever meant to go together.
+                Err(error) => {
+                    return Err(self
+                        .discard_staged(wallet, chain, from, policy, &staged, number, error)
+                        .await);
+                }
+            }
+        }
+        if let [id] = staged.as_slice() {
+            let confirm = ["pending".to_owned(), id.clone(), "confirm".to_owned()];
+            return self
+                .write_outbox_from(wallet, chain, from, policy, &confirm, b"y", number)
+                .await;
+        }
+        // Several bodies go under one approval, in the order written. A
+        // batch that failed (not one waiting for the owner) is discarded too.
+        let refs = staged.iter().map(|id| format!("{chain}:{id}")).collect();
+        match self.confirm_batch_entries(wallet, number, refs).await {
+            Err(error) if !matches!(error, HandlerError::ApprovalPending(_)) => Err(self
+                .discard_staged(wallet, chain, from, policy, &staged, number, error)
+                .await),
+            result => result,
+        }
+    }
+
+    /// Discard the still-pending, provably unsigned entries of a `send.tx`
+    /// that failed with `error`, and name any left behind. An entry that may
+    /// have been signed is refused by the discard and stays put.
+    #[allow(clippy::too_many_arguments)]
+    async fn discard_staged(
+        &self,
+        wallet: &str,
+        chain: &str,
+        from: alloy::primitives::Address,
+        policy: &Policy,
+        staged: &[String],
+        number: u32,
+        error: HandlerError,
+    ) -> HandlerError {
+        let mut left = Vec::new();
+        for id in staged {
+            let cancel = ["pending".to_owned(), id.clone(), "confirm".to_owned()];
+            let discarded = self
+                .write_outbox_from(wallet, chain, from, policy, &cancel, b"cancel", number)
+                .await;
+            let pending = self
+                .tx_engine
+                .outbox
+                .read_in_state(wallet, chain, id, OutboxState::Pending)
+                .is_ok();
+            if discarded.is_err() && pending {
+                left.push(format!("pending/{id}"));
+            }
+        }
+        if left.is_empty() {
+            return error;
+        }
+        HandlerError::backend(format!(
+            "{error}; still staged, cancel before retrying: {}",
+            left.join(", ")
+        ))
     }
 
     pub(super) fn solana_sender(family: &FamilyKey) -> SolanaSender<'_> {
@@ -1103,7 +1507,9 @@ impl WalletsHandler {
     ) -> Result<Entry, HandlerError> {
         match rest {
             [] => Ok(Entry::dir("outbox")),
+            [leaf] if leaf == OUTBOX_README => Ok(outbox_readme_entry(EVM_OUTBOX_README)),
             [leaf] if leaf == "new.tx" => Ok(Entry::writable_file("new.tx")),
+            [leaf] if leaf == SEND_TX => Ok(Entry::writable_file(SEND_TX)),
             [leaf] if leaf == "latest" => {
                 let target = self
                     .evm_latest_target(wallet, family, chain)?
@@ -1151,6 +1557,7 @@ impl WalletsHandler {
         rest: &[String],
     ) -> Result<Vec<u8>, HandlerError> {
         match rest {
+            [leaf] if leaf == OUTBOX_README => Ok(EVM_OUTBOX_README.as_bytes().to_vec()),
             [state, id, fname] => {
                 let entry = self.evm_outbox_entry(wallet, family, chain, state, id)?;
                 if fname == APPROVAL_CHALLENGE {
@@ -1168,6 +1575,51 @@ impl WalletsHandler {
                 let mut file = open_regular_outbox_artifact(&entry.dir, fname)?;
                 let mut bytes = Vec::new();
                 std::io::Read::read_to_end(&mut file, &mut bytes)?;
+                // A write can only fail with an error code on a mount, so the
+                // plan says where the owner approves once they were asked.
+                let mut link = None;
+                if let (true, Some(signing)) = (fname == "plan.md", evm_signing_state(&entry)) {
+                    let outbox = format!("wallets/{wallet}/{number}/chains/{chain}/outbox");
+                    // Best effort: the plan stays readable when the
+                    // approval's state cannot be fetched.
+                    let challenge = evm_approval_challenge(&entry, &signing, &outbox, &|petal| {
+                        self.installed_petal_package(petal)
+                    });
+                    if let Ok(challenge) = challenge
+                        && let Ok(live) = self.live_approval_challenge(wallet, challenge).await
+                        && let Ok(live) = serde_json::from_slice::<serde_json::Value>(&live)
+                    {
+                        link = live["ceremony_url"].as_str().map(str::to_owned);
+                    }
+                }
+                // An entry asked for with others is sent with them.
+                if state == "pending"
+                    && let Some((refs, status)) =
+                        self.awaited_batch_with(wallet, number, &format!("{chain}:{id}"))
+                    && refs.len() > 1
+                    && fname == "plan.md"
+                {
+                    let ids: Vec<&str> = refs
+                        .iter()
+                        .map(|r| r.split_once(':').map_or(r.as_str(), |(_, id)| id))
+                        .collect();
+                    bytes.extend_from_slice(
+                        format!(
+                            "\n## Approval\n\nThis is one of {} entries the owner was asked to approve together, sent in this order: {}. Each has its own `pending/<id>/plan.md`.\nLink: {}\nWrite `y` to `confirm`: it sends them all once the owner has approved.\n",
+                            ids.len(),
+                            ids.join(", "),
+                            status["ceremony_url"].as_str().unwrap_or_default(),
+                        )
+                        .as_bytes(),
+                    );
+                } else if let Some(link) = link {
+                    bytes.extend_from_slice(
+                        format!(
+                            "\n## Approval\n\nThe owner was asked: {link}\nWrite `y` to `confirm` again: it sends once they have approved.\n"
+                        )
+                        .as_bytes(),
+                    );
+                }
                 Ok(bytes)
             }
             _ => Err(HandlerError::NotAFile(rest.join("/"))),
@@ -1184,7 +1636,9 @@ impl WalletsHandler {
         match rest {
             [] => {
                 let mut entries = vec![
+                    outbox_readme_entry(EVM_OUTBOX_README),
                     Entry::writable_file("new.tx"),
+                    Entry::writable_file(SEND_TX),
                     Entry::dir("pending"),
                     Entry::dir("sent"),
                     Entry::dir("failed"),
@@ -1311,7 +1765,50 @@ impl WalletsHandler {
             }
             pending.push((entry.staged.created_ms, id));
         }
-        Ok(newest_pending_target(pending))
+        // Once the entry staged last is sent or refused, `latest` follows it,
+        // so the path a caller staged and confirmed through still leads to
+        // the receipt. Entries are ordered by staging time: the id counter
+        // restarts with the Machine, so an id alone does not say which is newer.
+        let mut done: Option<(u128, String)> = None;
+        for state in [OutboxState::Sent, OutboxState::Failed] {
+            for id in self
+                .tx_engine
+                .outbox
+                .list(wallet, chain, state)
+                .map_err(err_be)?
+            {
+                let Ok(entry) = self
+                    .tx_engine
+                    .outbox
+                    .read_in_state(wallet, chain, &id, state)
+                else {
+                    continue;
+                };
+                let staged_ms = entry.staged.created_ms;
+                let newer = |(ms, target): &(u128, String)| {
+                    let current = target.rsplit('/').next().unwrap_or(target);
+                    (staged_ms, outbox_id_order(&id)) > (*ms, outbox_id_order(current))
+                };
+                if Self::evm_entry_belongs(family, &entry.staged.from)
+                    && done.as_ref().is_none_or(newer)
+                {
+                    done = Some((staged_ms, format!("{}/{id}", state.dirname())));
+                }
+            }
+        }
+        let newest_pending = pending
+            .iter()
+            .map(|(ms, id)| (*ms, outbox_id_order(id)))
+            .max();
+        let newer_done = done.as_ref().is_some_and(|(ms, target)| {
+            let id = target.rsplit('/').next().unwrap_or(target);
+            newest_pending.is_none_or(|pending| (*ms, outbox_id_order(id)) > pending)
+        });
+        Ok(if newer_done {
+            done.map(|(_, target)| target)
+        } else {
+            newest_pending_target(pending)
+        })
     }
 
     /// The outbox entries `family` staged on `chain` in `state`, as
@@ -1566,6 +2063,7 @@ impl WalletsHandler {
         })?;
         match rest {
             [] => Ok(Entry::dir("outbox")),
+            [leaf] if leaf == OUTBOX_README => Ok(outbox_readme_entry(SOLANA_OUTBOX_README)),
             [leaf] if leaf == "new.tx" => Ok(Entry::writable_file("new.tx")),
             [leaf] if leaf == "latest" => {
                 let target = self
@@ -1617,6 +2115,7 @@ impl WalletsHandler {
         rest: &[String],
     ) -> Result<Vec<u8>, HandlerError> {
         match rest {
+            [leaf] if leaf == OUTBOX_README => Ok(SOLANA_OUTBOX_README.as_bytes().to_vec()),
             [state, id, fname] => {
                 if !is_public_solana_outbox_artifact(fname) {
                     return Err(HandlerError::not_found(fname));
@@ -1652,6 +2151,7 @@ impl WalletsHandler {
         match rest {
             [] => {
                 let mut entries = vec![
+                    outbox_readme_entry(SOLANA_OUTBOX_README),
                     Entry::writable_file("new.tx"),
                     Entry::dir("pending"),
                     Entry::dir("sent"),
@@ -1750,7 +2250,9 @@ impl WalletsHandler {
     /// The Solana twin of `evm_latest_target`: fenced before the newest
     /// entry is chosen, fail-closed on unreadable candidates, skipping an
     /// entry that left `pending` mid-listing, `Ok(None)` when nothing is
-    /// visible.
+    /// visible. It follows the entry staged last into `sent`/`failed` too.
+    /// Solana ids are random, so staging time orders them and every finished
+    /// entry is read.
     fn solana_latest_target(
         &self,
         wallet: &str,
@@ -1790,7 +2292,32 @@ impl WalletsHandler {
             }
             pending.push((entry.staged.created_ms, id));
         }
-        Ok(newest_pending_target(pending))
+        let mut done: Option<(u128, String)> = None;
+        for state in [
+            bloom_solana_tx::outbox::SolanaOutboxState::Sent,
+            bloom_solana_tx::outbox::SolanaOutboxState::Failed,
+        ] {
+            for id in engine
+                .outbox()
+                .list(wallet, chain, state)
+                .map_err(solana_outbox_err)?
+            {
+                let Ok(entry) = engine.outbox().read_in_state(wallet, chain, &id, state) else {
+                    continue;
+                };
+                let staged_ms = entry.staged.created_ms;
+                if solana_entry_belongs(&entry.staged, &Self::solana_sender(family))
+                    && done.as_ref().is_none_or(|(ms, _)| staged_ms > *ms)
+                {
+                    done = Some((staged_ms, format!("{}/{id}", state.dirname())));
+                }
+            }
+        }
+        let newest_pending = pending.iter().map(|(ms, _)| *ms).max();
+        Ok(match done {
+            Some((ms, target)) if newest_pending.is_none_or(|pending| ms > pending) => Some(target),
+            _ => newest_pending_target(pending),
+        })
     }
 }
 
@@ -2372,7 +2899,7 @@ fn approval_next_step(
         S::Prepared | S::AwaitingCeremony => (
             "awaiting_ceremony",
             if direct {
-                "Give ceremony_url to the owner, then write retry_body to retry_path. Through bloom vfs write or MCP it waits for their approval and sends; on a mount it is denied until they approve, so write it again after. Neither starts a new ceremony.".into()
+                "Show ceremony_url to the owner. Through bloom vfs write or MCP, write retry_body to retry_path right away, without waiting for their reply: it waits for their approval and sends. On a mount, write retry_body to retry_path after they approve; earlier it is denied. Neither starts a new ceremony. Stop when ceremony_expires_at_ms passes and tell the owner.".into()
             } else {
                 format!("Give ceremony_url to the owner. As soon as they approve, {retry}. Retrying earlier is safe: it starts no new ceremony and returns permission denied again.")
             },

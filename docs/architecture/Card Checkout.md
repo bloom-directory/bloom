@@ -131,7 +131,7 @@ solving or cookie import is used.
 Seller observations are dated evidence of a particular step and itinerary.
 A homepage loading does not prove checkout support; payment review does not
 prove a charge or ticket issuance. Earlier purchases do not verify a changed
-service combination. Current operator guidance lives in `docs/checkout.md`
+service combination. Current operator guidance lives in `docs/pay-with-a-saved-card.md`
 inside the VFS.
 
 ## Private view
