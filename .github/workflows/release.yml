@@ -107,11 +107,12 @@ jobs:
           machine_version="$(sed -n -E 's/^machine = "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' <<<"$matrix")"
           broker_sha="$(sed -n -E 's/^broker_commit = "([0-9a-f]{40})"$/\1/p' <<<"$matrix")"
           signer_sha="$(sed -n -E 's/^signer_commit = "([0-9a-f]{40})"$/\1/p' <<<"$matrix")"
-          skill_version="$(git show "$release_sha:skills/bloom/SKILL.md" |
+          skill_version="$(git show "$release_sha:plugins/bloom/skills/bloom/SKILL.md" |
             sed -n -E 's/^  version: "?([0-9]+\.[0-9]+\.[0-9]+)"?$/\1/p')"
-          plugin_version="$(git show "$release_sha:skills/bloom/.claude-plugin/plugin.json" | jq -r .version)"
+          plugin_versions="$(for f in plugins/bloom/.claude-plugin/plugin.json plugins/bloom/plugin.json; do
+            git show "$release_sha:$f" | jq -r .version; done | sort -u)"
           if [[ "$workspace_version" != "$version" || "$machine_version" != "$version" ||
-            "$skill_version" != "$version" || "$plugin_version" != "$version" ]]; then
+            "$skill_version" != "$version" || "$plugin_versions" != "$version" ]]; then
             echo "::error::$tag must match the workspace, triad matrix, skill, and plugin versions"
             exit 1
           fi
@@ -653,13 +654,9 @@ jobs:
             echo "Bloom $VERSION is already on ClawHub."
             exit 0
           fi
-          # ClawHub refuses a skill folder that contains a plugin manifest.
-          stage="$(mktemp -d)"
-          cp -R skills/bloom "$stage/bloom"
-          rm -r "$stage/bloom/.claude-plugin"
           npx -y clawhub@0.26.0 login --token "$CLAWHUB_TOKEN" --no-browser
           # Hermes files skills by these tags, so each release carries them forward.
-          npx -y clawhub@0.26.0 skill publish "$stage/bloom" --slug bloom --name Bloom \
+          npx -y clawhub@0.26.0 skill publish plugins/bloom/skills/bloom --slug bloom --name Bloom \
             --owner bloom-directory --version "$VERSION" --changelog "Bloom v$VERSION" \
             --tags latest,crypto,defi,ethereum,finance,payments,solana,stablecoins,trading,wallet,x402
 
