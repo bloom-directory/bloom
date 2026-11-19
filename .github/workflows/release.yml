@@ -627,6 +627,43 @@ jobs:
               dist/*
           fi
 
+  clawhub:
+    name: Publish skill to ClawHub
+    needs: [prepare, publish]
+    runs-on: ubuntu-24.04
+    environment: production-release
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.prepare.outputs.release_sha }}
+          persist-credentials: false
+      # prepare already checked that the skill's version matches the tag.
+      - env:
+          CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.release_version }}
+        run: |
+          set -euo pipefail
+          [[ -n "$CLAWHUB_TOKEN" ]] || {
+            echo "::error::configure CLAWHUB_TOKEN in the production-release environment"
+            exit 1
+          }
+          # ClawHub never reuses a version, so a retry skips a published one.
+          if curl -fsS -o /dev/null "https://clawhub.ai/api/v1/skills/bloom/versions/$VERSION?owner=bloom-directory"; then
+            echo "Bloom $VERSION is already on ClawHub."
+            exit 0
+          fi
+          # ClawHub refuses a skill folder that contains a plugin manifest.
+          stage="$(mktemp -d)"
+          cp -R skills/bloom "$stage/bloom"
+          rm -r "$stage/bloom/.claude-plugin"
+          npx -y clawhub@0.26.0 login --token "$CLAWHUB_TOKEN" --no-browser
+          # Hermes files skills by these tags, so each release carries them forward.
+          npx -y clawhub@0.26.0 skill publish "$stage/bloom" --slug bloom --name Bloom \
+            --owner bloom-directory --version "$VERSION" --changelog "Bloom v$VERSION" \
+            --tags latest,crypto,defi,ethereum,finance,payments,solana,stablecoins,trading,wallet,x402
+
   headless-setup:
     name: Published Linux headless setup
     needs: [prepare, publish]

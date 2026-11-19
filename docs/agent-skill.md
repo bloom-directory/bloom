@@ -101,46 +101,41 @@ topic and `gemini-extension.json`.
 
 ## ClawHub
 
-Publish this folder from the release tag, without `.claude-plugin/`: ClawHub
-refuses a folder with a plugin manifest as a skill. A human signs in to ClawHub
-with the GitHub identity that should own the listing:
-
-```sh
-npx clawhub login
-npx clawhub whoami
-stage="$(mktemp -d)"
-git archive vX.Y.Z skills/bloom ':(exclude)skills/bloom/.claude-plugin' | tar -x -C "$stage"
-npx clawhub skill publish "$stage/skills/bloom" --slug bloom --name "Bloom" --owner bloom-directory --version X.Y.Z --changelog "Bloom vX.Y.Z" --dry-run
-```
+The Release workflow's `clawhub` job publishes this folder at each release tag,
+without `.claude-plugin/` (ClawHub refuses a folder with a plugin manifest as a
+skill). It uses the `CLAWHUB_TOKEN` secret in the `production-release`
+environment, an API token of a `@bloom-directory` member. It skips a version
+already on ClawHub, so it is safe to retry. It also moves the keyword tags
+(`crypto`, `wallet`, ...) to the new version. ClawHub cannot remove a tag.
+Hermes files a ClawHub skill by its first tag in alphabetical order that names a
+category, so `crypto` puts Bloom under Blockchain. For skills it lists from
+GitHub, Hermes uses the category in the root `skills.sh.json`: Finance.
 
 The listing is <https://clawhub.ai/bloom-directory/skills/bloom>, owned by the
 `@bloom-directory` publisher. Slugs are per owner, and another publisher also
 has a `bloom` skill, so users install ours with
 `clawhub install @bloom-directory/bloom`.
 
-Publish from the release tag, with the release version (the skill's
-`metadata.version`). ClawHub never reuses a version number, even a withdrawn
-one; republish a corrected skill for the same release as `X.Y.Z+N`, then move
-`latest` with `npx clawhub skill tag @bloom-directory/bloom X.Y.Z+N`. Review
-the dry run, repeat the publish command without `--dry-run`, and check the
-stored scans before announcing it. Name the owner in every command; a bare
-`bloom` is ambiguous:
+Check the stored scans before announcing a release. Name the owner in every
+command; a bare `bloom` is ambiguous:
 
 ```sh
 npx clawhub scan download @bloom-directory/bloom --version X.Y.Z -o scan.zip
 ```
 
-Keep credentials out of the repository. Do not create a publishing workflow or
-store an API token until recurring releases justify automation. See
-<https://docs.openclaw.ai/clawhub/quickstart> for the current authentication and
-publishing flow.
+ClawHub never reuses a version number, even a withdrawn one. To correct a
+release's skill, publish it by hand as `X.Y.Z+N` with the job's `skill publish`
+command, then move `latest` and the keyword tags with
+`npx clawhub skill tag @bloom-directory/bloom X.Y.Z+N --tag <tag>`. See
+<https://docs.openclaw.ai/clawhub/quickstart> for authentication.
 
 ## Releases
 
 The skill's `metadata.version` is the Bloom release version; the Propose
 Release workflow bumps it with `Cargo.toml`. After tagging `vX.Y.Z`:
 
-1. Publish to ClawHub from the tag, as above.
+1. Check that the Release workflow's `clawhub` job published `X.Y.Z`, and its
+   scans, as above.
 2. Repin the website to the tag's commit.
 3. Test the upgrade in a clean `HOME` that has the previous release's skill
    installed: `npx skills update -g -y` and `npx clawhub update @bloom-directory/bloom` must
