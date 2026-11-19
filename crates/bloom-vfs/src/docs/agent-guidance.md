@@ -21,18 +21,23 @@ one of these forms:
 send 0.25 ETH to 0x...
 {"kind":"send","to":"0x...","token":"USDC","amount":"10"}              human units
 {"kind":"approve","token":"0x...","spender":"0x...","amount":"1000000"}  raw units; "0" revokes
-{"kind":"raw","to":"0x...","data":"0x...","value":"0"}                  any contract call
-{"kind":"call","contract":"0x...","method":"transfer(address,uint256)","args":["0x...","1"]}
+{"kind":"call","contract":"0x...","method":"supply(address,uint256,address,uint16)","args":["0x...","1000000","0x...",0]}
+{"kind":"raw","to":"0x...","data":"0x...","value":"0"}                  calldata you built
 ```
+
+`call` encodes the arguments for you (a struct is a JSON array); `value`
+is in wei.
 
 That stages it, asks the owner, and answers with what will be signed and
 their approval link (on a mount the write is refused; both are in
 `latest/plan.md`). `latest/` is that entry, before and after it is sent:
 `latest/plan.md` is what will be signed, writing `y` to
 `latest/confirm` waits for the approval, sends, and answers with the receipt
-of each entry it sent and the account's balances on that chain (on a mount,
+of each entry it sent and the account's balances on that chain, each with
+what it changed by (on a mount,
 read `latest/receipt.json`). `new.tx` takes the same body and only
-stages it; `cancel` written to `latest/confirm` discards an entry.
+stages it; `cancel` written to `latest/confirm` discards an entry, with the rest of
+its batch.
 
 Several bodies in one write, one per line, go under one approval, in order (an
 approve, then the call that spends it).
@@ -44,9 +49,13 @@ approve, then the call that spends it).
 - Give the human the complete approval link, unchanged, and say in a
   sentence what you asked for. Then confirm again in the same turn: that
   write waits for them, so there is nothing to stop and wait for.
-- A refusal (`Operation not permitted`, a policy `deny`) is final. Do not
+- A refusal (`Operation not permitted`, or an error saying `policy denied`) is final. Do not
   change policy, switch accounts or try another interface to get around it.
-  Propose a policy change only when the owner asks for that change.
+  Propose a policy change only when the owner asks for that change; to add
+  a payee, write `{"add_destinations":[{"chain":"<chain>","destination":"0x..."}]}`
+  to `wallets/<wallet>/policy.json`.
 - An error does not show whether the operation happened. Read the result
   before retrying. Never stage a payment again while one is pending or its
   outcome is unknown.
+- Report a failed or partly completed request as a failure, and say which
+  steps did not complete.

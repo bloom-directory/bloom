@@ -110,6 +110,16 @@ impl LooseIntent {
                 Some(nested) => ParseError::Invalid(nested.clone()),
                 None => ParseError::Ambiguous,
             })?;
+        // Calldata that is not hex is refused here, before anything stages.
+        if let Some(data) = &self.data {
+            let digits = data.trim().strip_prefix("0x").unwrap_or(data.trim());
+            hex::decode(digits).map_err(|e| {
+                ParseError::Invalid(format!(
+                    "data is not calldata: {e} ({} hex digits); give it as 0x-prefixed hex, two digits per byte",
+                    digits.len()
+                ))
+            })?;
+        }
         // A known kind with a field missing says which one.
         let needs = |field: &str| {
             ParseError::Invalid(

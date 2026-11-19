@@ -66,6 +66,9 @@ pub enum Written {
     Done,
     /// A confirm sent: one line per entry, from the receipts.
     Sent(String),
+    /// `new.tx` staged without asking the owner: what will be signed and
+    /// the next step. Nothing is signed or sent.
+    Staged(String),
     /// `send.tx` staged and is waiting for the owner. Nothing is signed.
     ApprovalPending {
         id: String,
@@ -131,13 +134,17 @@ pub async fn write(
                     .map(|(_, id)| id.to_owned())
                     .or_else(|| challenge.rsplit('/').nth(1).map(str::to_owned))
                     .unwrap_or_default();
-                let entries: Vec<String> = url
+                let mut entries: Vec<String> = url
                     .as_ref()
                     .and_then(|doc| doc["entries"].as_array())
                     .into_iter()
                     .flatten()
                     .filter_map(|entry| entry.as_str().map(str::to_owned))
                     .collect();
+                // One entry's challenge lists no entries: it is this one.
+                if let ([.., chain, _, _], true) = (path.segments(), entries.is_empty()) {
+                    entries.push(format!("{chain}:{id}"));
+                }
                 let url = url.and_then(|doc| doc["ceremony_url"].as_str().map(str::to_owned));
                 // Staging is not a failure: answer with what will be signed,
                 // so the caller need not read each plan before confirming.
@@ -158,6 +165,13 @@ pub async fn write(
                     )),
                     None => HandlerError::ApprovalPending(challenge).into(),
                 })
+            }
+            // `new.tx` only stages: answer with what will be signed and the
+            // next step, or the caller searches `latest/` for a link.
+            Ok(()) if report && path.segments().last().is_some_and(|leaf| leaf == "new.tx") => {
+                Ok(staged_reply(vfs, path)
+                    .await
+                    .map_or(Written::Done, Written::Staged))
             }
             written => Ok(written.map(|()| Written::Done)?),
         };
@@ -185,6 +199,11 @@ pub async fn write(
         None => vec![batch_ref.clone()],
     };
     let waiting_for = approval_id(vfs, &challenge).await;
+    let reports = report && matches!(bytes.trim_ascii(), b"y" | b"override");
+    let before = match (reports, batch_ref.split_once(':')) {
+        (true, Some((chain, _))) => holdings(vfs, path, chain).await,
+        _ => None,
+    };
     let written: Result<(), WriteError> = match vfs.write(path, bytes).await {
         // An entry asked for as part of a batch waits as its batch does,
         // retrying exactly that batch's entries: a batch another writer
@@ -217,12 +236,33 @@ pub async fn write(
         result => Ok(result?),
     };
     written?;
-    if !report || !matches!(bytes.trim_ascii(), b"y" | b"override") {
+    if !reports {
         return Ok(Written::Done);
     }
-    Ok(sent_report(vfs, path, &sending)
-        .await
-        .map_or(Written::Done, Written::Sent))
+    // Balances are shown for the confirmed entry's chain, the one `before`
+    // was read on, even when its batch spans chains.
+    let chain = batch_ref.split_once(':').map_or("", |(chain, _)| chain);
+    Ok(
+        sent_report(vfs, path, &sending, chain, before.unwrap_or_default())
+            .await
+            .map_or(Written::Done, Written::Sent),
+    )
+}
+
+/// The reply to a `new.tx` write: the entry it staged, up to its confirm
+/// instructions, and how to ask the owner.
+async fn staged_reply(vfs: &Vfs, path: &VfsPath) -> Option<String> {
+    let [root, wallet, number, _, chain, ..] = path.segments() else {
+        return None;
+    };
+    let latest = format!("/{root}/{wallet}/{number}/chains/{chain}/outbox/latest/plan.md");
+    let raw = vfs.read(&VfsPath::parse(&latest).ok()?).await.ok()?;
+    let text = String::from_utf8_lossy(&raw);
+    let id = text.lines().next()?.strip_prefix("# Staged tx ")?.trim();
+    let plans = staged_plans(vfs, path, &[format!("{chain}:{id}")]).await;
+    Some(format!(
+        "{plans}Staged, not yet asked. Write y to pending/{id}/confirm: it answers with the owner's approval link."
+    ))
 }
 
 /// Each staged `chain:id` entry's `plan.md`, up to its confirm instructions.
@@ -248,7 +288,13 @@ async fn staged_plans(vfs: &Vfs, path: &VfsPath, entries: &[String]) -> String {
 
 /// One line per `chain:id` entry: its receipt, or where it is when it has
 /// none. The receipt is shown whole, since its fields differ by chain.
-async fn sent_report(vfs: &Vfs, path: &VfsPath, entries: &[String]) -> Option<String> {
+async fn sent_report(
+    vfs: &Vfs,
+    path: &VfsPath,
+    entries: &[String],
+    chain: &str,
+    before: Vec<Value>,
+) -> Option<String> {
     let [root, wallet, number, ..] = path.segments() else {
         return None;
     };
@@ -281,32 +327,83 @@ async fn sent_report(vfs: &Vfs, path: &VfsPath, entries: &[String]) -> Option<St
             }
         });
     }
-    // What the account holds now on that chain, so the caller need not check
-    // a swap's or supply's result with separate balance reads.
-    let chain = entries.first().and_then(|entry| entry.split_once(':'))?.0;
-    if let Some(balances) = balances(vfs, root, wallet, number, chain).await {
-        lines.push(format!("{chain} balances now: {balances}"));
+    // What the account holds now on that chain, and how each balance
+    // changed, so the caller need not check a swap's or supply's result
+    // with separate balance reads, nor mistake a balance for what it got.
+    if let Some(after) = holdings(vfs, path, chain).await {
+        let changed = changes(&before, &after);
+        // "(change)" only when a delta is shown, so a bare list is never
+        // read as amounts that moved.
+        let label = if changed.contains(" (") {
+            " (change)"
+        } else {
+            ""
+        };
+        if !changed.is_empty() {
+            lines.push(format!("{chain} balances now{label}: {changed}"));
+        }
     }
     Some(lines.join("\n"))
 }
 
-/// The account's balances on `chain` from its `holdings.json`, as one line.
-async fn balances(
-    vfs: &Vfs,
-    root: &str,
-    wallet: &str,
-    number: &str,
-    chain: &str,
-) -> Option<String> {
+/// The account's holdings on `chain`, from its `holdings.json`.
+async fn holdings(vfs: &Vfs, path: &VfsPath, chain: &str) -> Option<Vec<Value>> {
+    let [root, wallet, number, ..] = path.segments() else {
+        return None;
+    };
     let path = VfsPath::parse(&format!("/{root}/{wallet}/{number}/holdings.json")).ok()?;
     let holdings: Value = serde_json::from_slice(&vfs.read(&path).await.ok()?).ok()?;
-    let held: Vec<&str> = holdings["holdings"]
-        .as_array()?
+    Some(
+        holdings["holdings"]
+            .as_array()?
+            .iter()
+            .filter(|holding| holding["chain"] == chain)
+            .cloned()
+            .collect(),
+    )
+}
+
+/// Each holding as `display (+change)`, and a holding that is gone as
+/// `0 SYMBOL (-change)`. A holding without a change shows only its display.
+fn changes(before: &[Value], after: &[Value]) -> String {
+    use alloy::primitives::{I256, U256};
+    let raw = |h: &Value| h["raw"].as_str().and_then(|raw| raw.parse::<U256>().ok());
+    let same = |a: &Value, b: &Value| a["asset"] == b["asset"] && a["symbol"] == b["symbol"];
+    let delta = |was: Option<U256>, now: Option<U256>, decimals: u8| {
+        let (was, now) = (was.unwrap_or_default(), now.unwrap_or_default());
+        let d = I256::from_raw(now).wrapping_sub(I256::from_raw(was));
+        (!d.is_zero()).then(|| {
+            let sign = if d.is_negative() { "-" } else { "+" };
+            format!(
+                " ({sign}{})",
+                bloom_proto::format_units(d.unsigned_abs(), decimals)
+            )
+        })
+    };
+    let decimals = |h: &Value| h["decimals"].as_u64().unwrap_or(0) as u8;
+    let mut shown: Vec<String> = after
         .iter()
-        .filter(|holding| holding["chain"] == chain)
-        .filter_map(|holding| holding["display"].as_str())
+        .filter_map(|now| {
+            let display = now["display"].as_str()?;
+            let was = before.iter().find(|was| same(was, now));
+            let change = match was {
+                Some(was) => delta(raw(was), raw(now), decimals(now)),
+                None if before.is_empty() => None,
+                None => delta(None, raw(now), decimals(now)),
+            };
+            Some(format!("{display}{}", change.unwrap_or_default()))
+        })
         .collect();
-    (!held.is_empty()).then(|| held.join(", "))
+    shown.extend(
+        before
+            .iter()
+            .filter(|was| !after.iter().any(|now| same(was, now)))
+            .filter_map(|was| {
+                let change = delta(raw(was), None, decimals(was))?;
+                Some(format!("0 {}{change}", was["symbol"].as_str()?))
+            }),
+    );
+    shown.join(", ")
 }
 
 /// The batch a `confirm-batch` file reports as waiting for the owner:
@@ -682,6 +779,32 @@ mod tests {
         assert_eq!(mounted.ok(), Some(Written::Done));
     }
 
+    /// A balance is shown with what the confirm changed, so a swap's output
+    /// is not mistaken for the whole balance; one spent to zero still shows.
+    #[test]
+    fn balances_show_what_the_confirm_changed() {
+        let h = |symbol: &str, decimals: u8, raw: &str, display: &str| serde_json::json!({"asset": symbol, "symbol": symbol, "decimals": decimals, "raw": raw, "display": display});
+        let before = [
+            h("ETH", 18, "2000000000000000000", "2 ETH"),
+            h("USDC", 6, "50000000000", "50000 USDC"),
+            h("WETH", 18, "1", "0.000000000000000001 WETH"),
+        ];
+        let after = [
+            h("ETH", 18, "1500000000000000000", "1.5 ETH"),
+            h("USDC", 6, "51144033300", "51144.0333 USDC"),
+            h("WETH", 18, "1", "0.000000000000000001 WETH"),
+            h("DAI", 18, "1000000000000000000", "1 DAI"),
+        ];
+        assert_eq!(
+            changes(&before, &after),
+            "1.5 ETH (-0.5), 51144.0333 USDC (+1144.0333), 0.000000000000000001 WETH, 1 DAI (+1)"
+        );
+        assert_eq!(
+            changes(&after[..2], &after[..1]),
+            "1.5 ETH, 0 USDC (-51144.0333)"
+        );
+    }
+
     /// `send.tx` stages one entry and asks the owner.
     struct Staging;
 
@@ -693,7 +816,7 @@ mod tests {
         async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
             Ok(match p.to_string_path().as_str() {
                 "/w/0/chains/base/outbox/pending/tx-1/approval_challenge.json" => {
-                    br#"{"ceremony_url":"http://localhost/c/1","entries":["base:tx-1"]}"#.to_vec()
+                    br#"{"ceremony_url":"http://localhost/c/1"}"#.to_vec()
                 }
                 "/w/0/chains/base/outbox/pending/tx-1/plan.md" => {
                     b"# Staged tx tx-1\n\nTo: 0xabc\n\n## Confirm\nWrite y\n".to_vec()
@@ -730,6 +853,45 @@ mod tests {
         );
         let mounted = write(&vfs, &path, b"send 1 ETH to 0xabc", wait, &|| false, false).await;
         assert!(matches!(mounted, Err(WriteError::Approval(_))));
+    }
+
+    /// `new.tx` stages without asking; it answers with the plan and the
+    /// next step, so the caller does not search `latest/` for a link.
+    #[tokio::test]
+    async fn staging_only_answers_with_the_plan_and_the_next_step() {
+        struct Staged;
+        #[async_trait::async_trait]
+        impl Handler for Staged {
+            async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+                Ok(Entry::file(p.segments().last().unwrap()))
+            }
+            async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+                match p.to_string_path().as_str() {
+                    "/w/0/chains/base/outbox/latest/plan.md"
+                    | "/w/0/chains/base/outbox/pending/tx-1/plan.md" => {
+                        Ok(b"# Staged tx tx-1\n\nTo: 0xabc\n\n## Confirm\nWrite y\n".to_vec())
+                    }
+                    other => Err(HandlerError::not_found(other)),
+                }
+            }
+            async fn write(&self, _p: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+                Ok(())
+            }
+        }
+        let vfs = Vfs::builder().mount("wallets", Arc::new(Staged)).build();
+        let path = VfsPath::parse("/wallets/w/0/chains/base/outbox/new.tx").unwrap();
+        let wait = Duration::from_secs(50);
+        let staged = write(&vfs, &path, b"send 1 ETH to 0xabc", wait, &|| false, true).await;
+        assert_eq!(
+            staged.ok(),
+            Some(Written::Staged(
+                "# Staged tx tx-1\n\nTo: 0xabc\n\nStaged, not yet asked. Write y to \
+                 pending/tx-1/confirm: it answers with the owner's approval link."
+                    .into()
+            ))
+        );
+        let mounted = write(&vfs, &path, b"send 1 ETH to 0xabc", wait, &|| false, false).await;
+        assert_eq!(mounted.ok(), Some(Written::Done));
     }
 
     /// The first policy write answers with the link at once; the repeat

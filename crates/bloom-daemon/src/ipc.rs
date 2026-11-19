@@ -1154,6 +1154,7 @@ impl IpcServer {
             "write" => match self.do_write(&req.params, &context).await {
                 Ok(Written::Done) => Response::ok(id, Value::Null),
                 Ok(Written::Sent(sent)) => Response::ok(id, json!({ "sent": sent })),
+                Ok(Written::Staged(staged)) => Response::ok(id, json!({ "staged": staged })),
                 Ok(Written::ApprovalPending {
                     id: entry,
                     ceremony_url,
@@ -2298,7 +2299,9 @@ fn map_handler_err(id: Value, e: HandlerError) -> Response {
         HandlerError::NotAFile(s) => (-32006, format!("not a file: {s}")),
         HandlerError::PermissionDenied => (-32007, "permission denied".into()),
         HandlerError::OperationNotPermitted => (-32007, "operation not permitted".into()),
-        e @ HandlerError::ApprovalPending(_) => (-32007, e.to_string()),
+        e @ (HandlerError::ApprovalPending(_) | HandlerError::Refused(_)) => {
+            (-32007, e.to_string())
+        }
         HandlerError::Invalid(s) => (-32602, format!("invalid: {s}")),
         HandlerError::Unsupported(s) => (-32008, format!("unsupported: {s}")),
         HandlerError::Backend(s) => (-32000, format!("backend: {s}")),

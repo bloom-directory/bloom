@@ -404,6 +404,26 @@ pub fn has_hard_violation(checks: &[PolicyCheck]) -> bool {
     checks.iter().any(|c| c.outcome == PolicyOutcome::Deny)
 }
 
+/// What refused it: each `Deny` check, or failing those each `Warn` check,
+/// which only `override` accepts.
+pub fn denial(checks: &[PolicyCheck]) -> String {
+    let named = |outcome| {
+        checks
+            .iter()
+            .filter(|c| c.outcome == outcome)
+            .map(|c| format!("{}: {}", c.rule, c.message))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    match named(PolicyOutcome::Deny) {
+        denied if !denied.is_empty() => denied,
+        _ => format!(
+            "{} (a warning; write `override` to confirm to accept it)",
+            named(PolicyOutcome::Warn)
+        ),
+    }
+}
+
 /// Returns true if any check is `Warn`.
 pub fn has_warning(checks: &[PolicyCheck]) -> bool {
     checks.iter().any(|c| c.outcome == PolicyOutcome::Warn)
