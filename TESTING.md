@@ -43,6 +43,32 @@ recorded compatibility revisions, including the Linux release build and both
 macOS conformance workflows with explicit Broker and Signer refs. Local checks
 do not replace required review or CI on the published candidate.
 
+## Headless Linux setup acceptance
+
+On a disposable Linux/systemd host with OpenSSH, Python 3, and NFS client
+support, run these as root from the candidate checkout:
+
+```sh
+BLOOM_DISPOSABLE_INSTALL_TEST=1 bash tests/packaging/linux-headless-setup.sh first-install
+BLOOM_DISPOSABLE_INSTALL_TEST=1 bash tests/packaging/linux-headless-setup.sh upgrade
+```
+
+The first mode creates a dedicated login; the second reuses a verified
+enrollment and reports whether the version changed or it was a reinstall.
+Both exercise the [install guide](install/install.md), root-private TMPDIR,
+signed handoff, versions, services, VFS, and audit readiness; upgrade also
+checks identity metadata and a Machine-home marker. No wallet operations run.
+Evidence stays in `/var/tmp/bloom-headless-test.*`; do not publish raw logs.
+Full readiness needs NFS support, not a container that rejects mounts.
+
+The release workflow runs these checks on a fresh Ubuntu VM after publication,
+requiring the staged tag to match the release. Its second run proves a same-release
+reinstall, not a version upgrade. Older-to-newer upgrade acceptance remains a
+separate disposable-host check. This is a post-publication smoke check, not a
+pre-publication candidate gate; it uses the checkout's guide and setup script,
+not the separately hosted website copies.
+Run [skill checks and model evals](evals/skills/README.md) separately.
+
 ## Triad and Solana ladders
 
 Select the checks for the changed behavior using the map below. Test an
@@ -129,6 +155,14 @@ The custody entrypoint runs these scripts in order:
 | `scripts/test-triad-projection-fidelity.sh` | Authenticated public projections and custody ceremonies through the real triad and mount |
 | `scripts/test-raw-key-import-transfer.sh` | Imported scalar spends on local Anvil with the expected sender |
 | `scripts/test-bip39-import-transfer.sh` | Real Broker/Signer allocation of EVM and Solana account 1, followed by account-1 EVM spending on Anvil and Solana spending on a local Agave validator (requires `solana-test-validator`, `solana`, and `solana-keygen`) |
+
+The default policy has its own end-to-end script,
+`scripts/test-default-policy-e2e.sh`: setup's chosen Petals are proposed as one
+default policy for a new wallet and approved through a real ceremony on a
+developer triad with the catalog Petals. It uses the same
+`BLOOM_INTEGRATION_*_BIN` binaries plus `BLOOM_INTEGRATION_DEBUG_DRIVER_BIN`.
+Run it after changing `crates/bloom/src/default_policy.rs`, default-policy
+handling in `bloom-daemon` or `bloom-vfs`, or the Broker pin.
 
 Use disposable test inputs. Import/transfer suites require `anvil`, `cast`,
 and the selected `BLOOM_INTEGRATION_*_BIN` binaries. Successful fixture

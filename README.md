@@ -41,9 +41,10 @@ The shortest agent setup path is:
 > Tell your agent: **"Read https://bloom.directory/SKILL.md and set up Bloom."**
 
 To install the agent skill from this repository, use
-`npx skills add bloom-directory/bloom --skill bloom`, or on ClawHub
-`clawhub install @bloom-directory/bloom`. This installs guidance, not the Bloom
-software. The [skill](./skills/bloom/SKILL.md) connects an existing
+`npx skills add bloom-directory/bloom --skill bloom`, on ClawHub
+`clawhub install @bloom-directory/bloom`, or in Claude Code
+`/plugin install bloom --marketplace bloom-directory/bloom`. This installs
+guidance, not the Bloom software. The [skill](./skills/bloom/SKILL.md) connects an existing
 session first and hands operation over to Bloom's filesystem. See
 [skill distribution](./docs/agent-skill.md) for publishing and website updates.
 
@@ -87,6 +88,18 @@ bloom wallet new main
 bloom wallet address main --profile solana
 bloom wallet address main --profile evm
 ```
+
+### The default policy
+
+`bloom init` asks which Petals `main` may use, and Bloom installs its catalog
+Petals when it starts. Every Petal setup offers is chosen unless you decline
+it; Safe is installed but never chosen, since it needs your own Safe's
+address in the policy. Create the wallet once `bloom petals ls` lists the
+Petals you chose: `bloom wallet new main` then asks you to approve one policy
+that allows all of them, in the same step. If you create the wallet first,
+Bloom proposes nothing until they are installed; then run
+`bloom wallet default-policy main` for that one approval. If a Petal stays
+missing, restart Bloom. Every transaction still needs your approval.
 
 Native Solana transfers use the same wallet outbox shape as EVM transfers,
 with genesis pinning, exact-message semantic verification in Broker,
