@@ -500,7 +500,9 @@ fn spawn_ipc_server(
         .enable_all()
         .build()
         .expect("build tokio runtime");
-    let server = IpcServer::new(vfs, "ipc-test-version", vec!["ipc-chain".into()]);
+    let server = IpcServer::new(vfs, "ipc-test-version", vec!["ipc-chain".into()])
+        // A repeated confirm waits this long for the owner; no test has one.
+        .with_approval_wait(Duration::from_millis(200));
     let server_for_thread = server.clone();
     let socket_for_thread = socket.clone();
     let server_thread = std::thread::spawn(move || {
@@ -1214,12 +1216,12 @@ fn vfs_cat_root_agent_guidance_returns_identical_content() {
     assert_eq!(agents, claude);
     let text = String::from_utf8(agents).expect("guidance is utf-8");
     assert!(
-        text.contains("cat docs/README.md"),
-        "guidance should use mounted filesystem examples"
+        text.contains("`docs/`"),
+        "guidance should point at the docs directory"
     );
     assert!(
-        !text.contains("bloom vfs"),
-        "guidance should not mention the bloom vfs CLI"
+        text.contains("outbox/") && text.contains("`send.tx`") && text.contains("`latest/confirm`"),
+        "guidance should name the outbox files a transaction goes through"
     );
 }
 
@@ -2074,7 +2076,11 @@ fn wallet_stage_routes_via_ipc_when_home_write_lock_is_live() {
         .args(["wallet", "stage", "alice", "anvil", "--intent", intent])
         .assert()
         .success()
+        // stdout stays the bare id for scripts; the next step goes to stderr.
         .stdout(predicate::eq("tx-1\n"))
+        .stderr(predicate::str::contains(
+            "bloom wallet confirm alice anvil tx-1\n",
+        ))
         .stderr(predicate::str::contains("already open for writing").not());
 
     bloom_cmd(home.path())
@@ -2090,11 +2096,36 @@ fn wallet_stage_routes_via_ipc_when_home_write_lock_is_live() {
         ])
         .assert()
         .success()
-        .stdout(predicate::eq("tx-2\n"));
+        .stdout(predicate::eq("tx-2\n"))
+        .stderr(predicate::str::contains(
+            "bloom wallet confirm alice anvil tx-2 --account 7",
+        ));
+
+    // --confirm also writes the new entry's confirm file. This handler
+    // records no broadcast, so the result is unknown (exit 4).
+    bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "stage",
+            "alice",
+            "anvil",
+            "--confirm",
+            "--intent",
+            intent,
+        ])
+        .assert()
+        .code(4)
+        .stdout(predicate::str::starts_with("tx-3\nConfirmed;"));
 
     stop_ipc_server(server, server_thread);
     let writes = wallets.writes();
-    assert_eq!(writes.len(), 2, "writes={writes:?}");
+    assert_eq!(writes.len(), 4, "writes={writes:?}");
+    assert_eq!(
+        writes[3].0,
+        "/alice/0/chains/anvil/outbox/pending/tx-3/confirm"
+    );
+    assert_eq!(writes[3].1, b"y");
+    assert_eq!(writes[2].0, "/alice/0/chains/anvil/outbox/new.tx");
     assert_eq!(writes[1].0, "/alice/7/chains/anvil/outbox/new.tx");
     assert_eq!(writes[0].0, "/alice/0/chains/anvil/outbox/new.tx");
     assert_eq!(String::from_utf8_lossy(&writes[0].1), intent);
@@ -2461,7 +2492,9 @@ fn vfs_routes_via_ipc_when_socket_exists() {
         .enable_all()
         .build()
         .expect("build tokio runtime");
-    let server = IpcServer::new(vfs, "ipc-test-version", vec!["ipc-chain".into()]);
+    let server = IpcServer::new(vfs, "ipc-test-version", vec!["ipc-chain".into()])
+        // A repeated confirm waits this long for the owner; no test has one.
+        .with_approval_wait(Duration::from_millis(200));
     let server_for_thread = server.clone();
     let socket_for_thread = socket.clone();
     let server_thread = std::thread::spawn(move || {
@@ -2771,10 +2804,28 @@ fn wallet_confirm_reports_the_pending_ceremony_url() {
         // ceremony. Distinct from 0 (broadcast recorded) and 1 (failed).
         .code(3)
         .stdout(predicate::str::contains(
-            "Approval required: open http://localhost:18734/c/secret",
+            "Approval required: http://localhost:18734/c/secret",
         ))
         .stdout(predicate::str::contains(
-            "re-run this confirm after approving",
+            "Next: bloom wallet confirm alice base 0001-cafe --account 7 (waits",
+        ));
+    // A non-default text is repeated, quoted, so the retry still overrides.
+    bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "confirm",
+            "alice",
+            "base",
+            "0001-cafe",
+            "--account",
+            "7",
+            "--text",
+            "it's override",
+        ])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains(
+            r"Next: bloom wallet confirm alice base 0001-cafe --account 7 --text 'it'\''s override' (waits",
         ));
 
     stop_ipc_server(server, server_thread);
@@ -2818,7 +2869,7 @@ fn wallet_confirm_points_a_petal_staged_entry_back_to_its_petal() {
         .assert()
         .code(3)
         .stdout(predicate::str::contains("retry through petals/pendle/"))
-        .stdout(predicate::str::contains("re-run this confirm").not());
+        .stdout(predicate::str::contains("bloom wallet confirm").not());
 
     stop_ipc_server(server, server_thread);
 }
@@ -2830,6 +2881,10 @@ fn wallet_confirm_reports_an_already_broadcast_transaction_instead_of_not_found(
     files.insert(
         "/alice/0/chains/base/outbox/sent/0001-beef/intent.json".to_string(),
         b"{\"tx_hash\":\"0xabc123\"}".to_vec(),
+    );
+    files.insert(
+        "/alice/0/chains/base/outbox/sent/0001-beef/receipt.json".to_string(),
+        b"{\"outcome\":\"success\"}\n".to_vec(),
     );
     let handler = Arc::new(ServingHandler {
         files,
@@ -2853,7 +2908,10 @@ fn wallet_confirm_reports_an_already_broadcast_transaction_instead_of_not_found(
         .assert()
         .success()
         .stdout(predicate::str::contains("Already broadcast: 0xabc123"))
-        .stdout(predicate::str::contains("outbox/sent/0001-beef"));
+        .stdout(predicate::str::contains("outbox/sent/0001-beef"))
+        .stdout(predicate::str::contains(
+            "Receipt: {\"outcome\":\"success\"}\n",
+        ));
 
     stop_ipc_server(server, server_thread);
 }
@@ -2989,7 +3047,6 @@ impl Handler for ServingHandler {
 /// read over IPC; a hard denial still reads differently.
 #[test]
 fn vfs_write_names_the_approval_challenge_while_owner_approval_is_pending() {
-    let home = fresh_home();
     let outbox = "wallets/alice/0/chains/base/outbox/pending/0001-feed";
     for (error, expected) in [
         (
@@ -3003,6 +3060,9 @@ fn vfs_write_names_the_approval_challenge_while_owner_approval_is_pending() {
             "operation not permitted".to_owned(),
         ),
     ] {
+        // A home per case: the confirm reads the entry after its write, and
+        // the next server could find the first one's socket still closing.
+        let home = fresh_home();
         let handler = Arc::new(ServingHandler {
             write_error: error,
             ..ServingHandler::default()
@@ -3017,6 +3077,92 @@ fn vfs_write_names_the_approval_challenge_while_owner_approval_is_pending() {
             .stderr(predicate::str::contains("ceremony_url").not());
         stop_ipc_server(server, server_thread);
     }
+}
+
+/// `bloom vfs cat a b` and `bloom vfs ls a b` take several paths, as the
+/// shell commands they stand in for do.
+#[test]
+fn vfs_cat_and_ls_take_several_paths() {
+    let home = fresh_home();
+    let mut files = std::collections::HashMap::new();
+    files.insert("/a".to_string(), b"one\n".to_vec());
+    files.insert("/b".to_string(), b"two\n".to_vec());
+    let handler = Arc::new(ServingHandler {
+        files,
+        ..ServingHandler::default()
+    });
+    let vfs = bloom_vfs::Vfs::builder().mount("wallets", handler).build();
+    let (server, server_thread) = spawn_ipc_server(home.path(), vfs);
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/wallets/a", "/wallets/b"])
+        .assert()
+        .success()
+        .stdout(predicate::eq("one\ntwo\n"));
+    // One missing path is reported; the others still print.
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/wallets/nope", "/wallets/b"])
+        .assert()
+        .failure()
+        .stdout(predicate::eq("two\n"))
+        .stderr(predicate::str::contains("/wallets/nope"));
+    bloom_cmd(home.path())
+        .args(["vfs", "ls", "/wallets", "/wallets"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("/wallets:").count(2));
+    stop_ipc_server(server, server_thread);
+}
+
+/// Denies every policy write; the update's status appears with the first.
+#[derive(Default)]
+struct PolicyUpdateHandler {
+    written: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl Handler for PolicyUpdateHandler {
+    async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+        Ok(Entry::read_only_file(
+            p.segments().last().map(String::as_str).unwrap_or("file"),
+        ))
+    }
+
+    async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+        Err(HandlerError::NotADir(p.to_string_path()))
+    }
+
+    async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+        if !self.written.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(HandlerError::not_found(p.to_string_path()));
+        }
+        Ok(br#"{"state":"pending","status":"awaiting_custody","action_id":"a1","ceremony_url":"http://localhost:18734/c/policy","expiry_ms":99999999999999}"#.to_vec())
+    }
+
+    async fn write(&self, _p: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+        self.written
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Err(HandlerError::PermissionDenied)
+    }
+}
+
+/// A policy write that needs the owner's approval prints the ceremony link
+/// rather than a bare "permission denied".
+#[test]
+fn vfs_write_of_a_policy_prints_the_approval_link() {
+    let home = fresh_home();
+    let vfs = bloom_vfs::Vfs::builder()
+        .mount("wallets", Arc::new(PolicyUpdateHandler::default()))
+        .build();
+    let (server, server_thread) = spawn_ipc_server(home.path(), vfs);
+    bloom_cmd(home.path())
+        .args(["vfs", "write", "/wallets/alice/policy.json", "{}"])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains(
+            "Approval required: http://localhost:18734/c/policy",
+        ))
+        .stdout(predicate::str::contains("Next: the same write again"));
+    stop_ipc_server(server, server_thread);
 }
 
 #[test]

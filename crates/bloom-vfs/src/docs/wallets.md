@@ -56,7 +56,7 @@ forward `ceremony_url` to the human. Wait for `ceremony_state: COMPLETED`,
 then read `result.json` and the new wallet projection. Cancel through the
 registration's `cancel` control before acceptance. Do not start a second
 registration because the first is waiting. Commands are in
-`docs/examples.md`.
+`docs/examples/creating-a-wallet.md`.
 
 A localhost ceremony needs a browser on the Bloom host; an assigned HTTPS relay
 ceremony can use another device.
@@ -65,7 +65,8 @@ Create a wallet only when the owner asks. `main`'s default policy, from the
 Petals chosen at setup, is proposed only once every chosen Petal is
 installed: until then `bloom wallet default-policy main` names the missing
 ones and proposes nothing, and once they are installed it proposes the whole
-policy in one ceremony. Forward its link like any other ceremony URL.
+policy in one ceremony. Forward its link like any other ceremony URL. If a
+chosen Petal stays missing, tell the owner to restart Bloom.
 
 ## Recovering a wallet
 
