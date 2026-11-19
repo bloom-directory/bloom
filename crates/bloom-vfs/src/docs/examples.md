@@ -37,46 +37,67 @@ ls "$BLOOM/wallets/"
 cat "$BLOOM/chains/anvil/chain_id"
 cat "$BLOOM/wallets/alice/projection.json"
 
-# 2. Stage once through an explicit account path. Account 0 is the initial
+# 2. Send through an explicit account path. Account 0 is the initial
 #    account; any other numbered path (wallets/alice/1/chains/...) spends
 #    from that account's key and sees only its own outbox entries.
 #    Name the chain's native asset: ETH here, POL on polygon, BNB on bsc.
-printf 'send 0.01 ETH to 0x0000000000000000000000000000000000000001\n' \
-  > "$BLOOM/wallets/alice/0/chains/anvil/outbox/new.tx"
+#    The write stages the transfer and asks the owner, so it is refused
+#    until they approve. `latest/` is the entry it staged.
+O="$BLOOM/wallets/alice/0/chains/anvil/outbox"
+printf 'send 0.01 ETH to 0x0000000000000000000000000000000000000001\n' > "$O/send.tx"
 
-# 3. List pending actions. Set ID to the exact entry created by this staging
-#    operation after matching its intent; do not choose by ordering.
-ls "$BLOOM/wallets/alice/0/chains/anvil/outbox/pending/"
-ID="<exact-id>"
-cat "$BLOOM/wallets/alice/0/chains/anvil/outbox/pending/$ID/intent.json"
-cat "$BLOOM/wallets/alice/0/chains/anvil/outbox/pending/$ID/plan.md"
+# 3. Read what will be signed; it holds the owner's approval link.
+cat "$O/latest/plan.md"
 
-# 4. Confirm only that inspected action.
-echo y > "$BLOOM/wallets/alice/0/chains/anvil/outbox/pending/$ID/confirm"
+# 4. Confirm that entry. The write waits for the approval, then sends.
+echo y > "$O/latest/confirm"
 
-# 5. Inspect the resulting state; a pending action may still need approval.
-ls "$BLOOM/wallets/alice/0/chains/anvil/outbox/pending/"
-ls "$BLOOM/wallets/alice/0/chains/anvil/outbox/sent/"
-ls "$BLOOM/wallets/alice/0/chains/anvil/outbox/failed/"
+# 5. Read the result.
+cat "$O/latest/receipt.json"
 ```
 
-If confirmation requires fresh approval, read this exact pending action's
-`approval_challenge.json`. Check its wallet, action, intent, and expiry before
-forwarding the ceremony URL to the human. Re-read it while they approve: its
-`state` turns from `awaiting_ceremony` to `active` as soon as they finish. Then
-write the challenge's exact `retry_body` to its `retry_path` (an omitted
-`retry_body` means `confirm`). Do not restage while approval is pending.
+Give the owner the approval link unchanged. Do not write `send.tx` again
+while the approval is pending; that stages a second transfer.
 
 
 Follow `$ID` into its resulting state and read its intent and receipt before
 reporting success; listing `sent/` alone does not prove confirmation. A missing
 pending path or transport error is not a reason to repeat the write. Never use
-a glob, list position, or `latest` as action identity.
+a glob or list position as action identity.
 
 The explicit account-0 outbox above spends from account 0. For another account,
 verify `wallets/alice/<n>/account.json` and use
 `wallets/alice/<n>/chains/anvil/outbox/` throughout the same procedure.
 Numbered outboxes expose only actions staged by that account.
+
+## Intent shapes
+
+`outbox/new.tx` and `simulate/new` take one JSON object with its fields at the
+top level, plus an optional `chain`. `simulate/new` also takes `from` (the
+simulated sender) and `state_override`. `outbox/new.tx` also takes the
+one-line form:
+
+```text
+send 0.25 ETH to 0x...                                  native send, one line; outbox/new.tx only
+{"kind":"send","to":"0x...","value":"0.25 eth"}           native send
+{"kind":"send","to":"0x...","token":"USDC","amount":"10"} token send, human units
+{"kind":"approve","token":"0x...","spender":"0x...","amount":"1000000"}
+                                    raw token units; "0" revokes, "max" is unlimited
+{"kind":"raw","to":"0x...","data":"0x...","value":"0"}    any contract call with calldata
+{"kind":"call","contract":"0x...","method":"transfer(address,uint256)","args":["0x...","1"]}
+{"kind":"deploy","data":"0x<initcode>","value":"0"}
+```
+
+A swap or other DeFi action is an approve, then a raw call. Encode calldata
+with your normal tools, for example `cast calldata`. Write both to `send.tx`,
+one per line: they go under one approval and are sent in order.
+
+```sh
+O="$BLOOM/wallets/alice/0/chains/base/outbox"
+printf '%s\n' \
+  '{"kind":"approve","token":"<usdc>","spender":"<router>","amount":"10000000"}' \
+  '{"kind":"raw","to":"<router>","data":"<calldata>","value":"0"}' > "$O/send.tx"
+```
 
 ## Repairing rejected EIP-1559 fees
 
@@ -279,6 +300,9 @@ Inspect `plan.md` before confirmation. Operator-wide approval is broader than
 a single-token approval and should be clearly visible in the policy projection.
 
 ## Updating wallet policy
+
+Use this workflow only for an explicitly requested policy change. A denied
+payment is a refusal to report, not permission to expand an allowlist.
 
 ```sh
 # The proposal is a scratch file in the working directory, outside the mount.

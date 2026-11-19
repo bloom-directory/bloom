@@ -3481,8 +3481,14 @@ impl ipc::BatchConfirmationService for CanonicalBatchConfirmation {
         request: ipc::BatchConfirmIpcRequest,
     ) -> ipc::BatchConfirmFuture<'a> {
         Box::pin(async move {
-            if !(1..=32).contains(&request.txs.len()) {
-                return Err("transaction batch must contain 1 to 32 children".into());
+            let max = bloom_tx::tx_engine::MAX_BATCH_CHILDREN;
+            if !(1..=max).contains(&request.txs.len()) {
+                return Err(format!(
+                    "transaction batch must contain 1 to {max} children"
+                ));
+            }
+            if request.account >= (1_u32 << 31) {
+                return Err("account must be between 0 and 2147483647".into());
             }
             let wallet_id = bloom_broker_api::Token::new(request.wallet.clone())
                 .map_err(|error| format!("invalid wallet ID: {error}"))?;
@@ -3509,6 +3515,10 @@ impl ipc::BatchConfirmationService for CanonicalBatchConfirmation {
                         "transaction batch contains duplicate ref '{reference}'"
                     ));
                 }
+                self.wallets
+                    .require_outbox_account(&request.wallet, request.account, chain_name, id)
+                    .await
+                    .map_err(|error| error.to_string())?;
                 self.wallets
                     .require_outbox_petal_eligibility(&request.wallet, chain_name, id)
                     .await
@@ -3839,6 +3849,14 @@ impl AccountPetalMount for AccountPetals {
             .collect())
     }
 
+    fn installed_package(&self, petal: &str) -> Option<String> {
+        self.runner
+            .store()
+            .resolve_petal_owner(petal)
+            .ok()
+            .flatten()
+    }
+
     async fn stop_session(
         &self,
         account: &AccountPetalContext,
@@ -4145,14 +4163,35 @@ impl Daemon {
         let home_write_permit = self.home_write_permit.clone().ok_or_else(|| {
             "batch confirmation is unavailable without the Machine home write permit".to_owned()
         })?;
-        Ok(Arc::new(CanonicalBatchConfirmation {
-            tx_engine: self.tx_engine.clone(),
-            home_write_permit,
-            chains: self.chains.clone(),
-            wallet_projections: self.wallet_projections.clone(),
-            wallets: self.wallets.clone(),
-            audit: self.audit.clone(),
-        }))
+        let service: Arc<dyn ipc::BatchConfirmationService> =
+            Arc::new(CanonicalBatchConfirmation {
+                tx_engine: self.tx_engine.clone(),
+                home_write_permit,
+                chains: self.chains.clone(),
+                wallet_projections: self.wallet_projections.clone(),
+                wallets: self.wallets.clone(),
+                audit: self.audit.clone(),
+            });
+        // The same service backs `wallets/<wallet>/<n>/confirm-batch`, so a
+        // mount and MCP reach what `bloom wallet confirm-batch` does. Weak:
+        // the service holds the handler.
+        let weak = Arc::downgrade(&service);
+        self.wallets
+            .set_batch_confirm(Arc::new(move |wallet, account, txs, text| {
+                let service = weak.upgrade();
+                Box::pin(async move {
+                    let service = service
+                        .ok_or_else(|| "batch confirmation service has stopped".to_owned())?;
+                    let request = ipc::BatchConfirmIpcRequest {
+                        wallet,
+                        account,
+                        txs,
+                        text,
+                    };
+                    service.confirm_batch(request).await
+                })
+            }));
+        Ok(service)
     }
 
     /// Build a fully-wired daemon from the home directory, materialising
@@ -4882,7 +4921,11 @@ impl Daemon {
         vfs_builder = vfs_builder.with_root_dynamic_async("next.md", move || {
             let projections = next_wallet_projections.clone();
             let wallet_tree = next_wallet_tree.clone();
-            async move { render_next_actions(projections.as_ref(), wallet_tree.as_ref()).await }
+            async move {
+                let packages = wallet_tree.clone();
+                let installed = move |petal: &str| packages.installed_petal_package(petal);
+                render_next_actions(projections.as_ref(), wallet_tree.as_ref(), &installed).await
+            }
         });
 
         let vfs = vfs_builder
@@ -5368,17 +5411,28 @@ fn configured_mount(
     })
 }
 
+/// The installed package hash of a Petal by name.
+type InstalledPetals = dyn Fn(&str) -> Option<String> + Send + Sync;
+
 async fn render_next_actions(
     projections: &dyn WalletProjectionReader,
     wallet_tree: &dyn Handler,
+    installed: &InstalledPetals,
 ) -> Vec<u8> {
-    render_next_actions_with_timeout(projections, wallet_tree, WALLET_PROJECTION_LIVE_TIMEOUT).await
+    render_next_actions_with_timeout(
+        projections,
+        wallet_tree,
+        installed,
+        WALLET_PROJECTION_LIVE_TIMEOUT,
+    )
+    .await
 }
 
 /// Renders `/next.md`. `wallet_tree` is the handler mounted at `wallets/`.
 async fn render_next_actions_with_timeout(
     projections: &dyn WalletProjectionReader,
     wallet_tree: &dyn Handler,
+    installed: &InstalledPetals,
     live_timeout: Duration,
 ) -> Vec<u8> {
     let mut md = String::from("# Next Actions\n\n");
@@ -5424,9 +5478,70 @@ async fn render_next_actions_with_timeout(
             .iter()
             .map(|projection| projection.wallet.wallet_id.as_str().to_owned())
             .collect();
-        md.push_str(&render_pending_actions(wallet_tree, &wallet_ids, live_timeout).await);
+        md.push_str(
+            &render_pending_actions(wallet_tree, installed, &wallet_ids, live_timeout).await,
+        );
+        md.push_str(&render_wallet_paths(wallet_tree, &wallet_ids, live_timeout).await);
     }
     md.into_bytes()
+}
+
+/// Where each account's balances and outboxes are, so a reader of `next.md`
+/// has real paths without listing the tree first.
+async fn render_wallet_paths(
+    wallet_tree: &dyn Handler,
+    wallet_ids: &[String],
+    live_timeout: Duration,
+) -> String {
+    const SHOWN: usize = 8;
+    let names = |path: String| async move {
+        let path = VfsPath::parse(&path).ok()?;
+        let listed = tokio::time::timeout(live_timeout, wallet_tree.list(&path)).await;
+        Some(
+            listed
+                .ok()?
+                .ok()?
+                .into_iter()
+                .filter(|entry| entry.kind == bloom_vfs::handler::EntryKind::Dir)
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>(),
+        )
+    };
+    let mut lines = String::new();
+    let more = |hidden: usize, what: &str| match hidden {
+        0 => String::new(),
+        n => format!("- and {n} more; list `{what}`\n"),
+    };
+    for wallet in wallet_ids.iter().take(SHOWN) {
+        let accounts: Vec<String> = names(format!("/{wallet}"))
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|name| name.parse::<u32>().is_ok())
+            .collect();
+        for account in accounts.iter().take(SHOWN) {
+            let chains = names(format!("/{wallet}/{account}/chains"))
+                .await
+                .unwrap_or_default();
+            if chains.is_empty() {
+                continue;
+            }
+            lines.push_str(&format!(
+                "- `{wallet}` account `{account}`: balances `wallets/{wallet}/{account}/holdings.json`; outbox `wallets/{wallet}/{account}/chains/<chain>/outbox/` on {}\n",
+                chains.join(", ")
+            ));
+        }
+        lines.push_str(&more(
+            accounts.len().saturating_sub(SHOWN),
+            &format!("wallets/{wallet}/"),
+        ));
+    }
+    lines.push_str(&more(wallet_ids.len().saturating_sub(SHOWN), "wallets/"));
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("\n## Wallets\n\n{lines}")
+    }
 }
 
 /// Child directories of `wallets/<path>`. A missing path has none; any other
@@ -5450,17 +5565,44 @@ async fn wallet_dirs(tree: &dyn Handler, path: &str, unreadable: &mut Vec<String
     }
 }
 
+/// The Petal that staged `entry`, from the `execution_origin` in its
+/// `intent.json`, and whether it can still confirm it. Solana and directly
+/// staged entries have none.
+async fn staging_petal(
+    tree: &dyn Handler,
+    installed: &InstalledPetals,
+    entry: &str,
+) -> Option<(String, bool)> {
+    let path = VfsPath::parse(&format!("{entry}/intent.json")).ok()?;
+    let intent: serde_json::Value = serde_json::from_slice(&tree.read(&path).await.ok()?).ok()?;
+    let origin = serde_json::from_value(intent["execution_origin"].clone()).ok()?;
+    bloom_vfs::handlers::outbox::staging_petal(&origin, installed)
+}
+
 /// One line for a pending outbox entry. `ceremony_url` is an owner
 /// capability, so it stays in the challenge file.
-async fn outbox_entry_line(tree: &dyn Handler, entry: &str) -> String {
+async fn outbox_entry_line(tree: &dyn Handler, installed: &InstalledPetals, entry: &str) -> String {
     let read = match VfsPath::parse(&format!("{entry}/approval_challenge.json")) {
         Ok(path) => tree.read(&path).await,
         Err(error) => Err(HandlerError::invalid(error.to_string())),
     };
     let challenge: serde_json::Value = match read {
         Err(HandlerError::NotFound(_)) => {
+            let confirm = match staging_petal(tree, installed, entry).await {
+                Some((petal, false)) => {
+                    return format!(
+                        "- `wallets/{entry}/`: staged, not confirmed. {}\n",
+                        bloom_vfs::handlers::outbox::restage_through(&petal)
+                    );
+                }
+                Some((petal, true)) => format!(
+                    "confirm {}",
+                    bloom_vfs::handlers::outbox::through_staging_petal(&petal)
+                ),
+                None => "write `confirm` to its `confirm`".into(),
+            };
             return format!(
-                "- `wallets/{entry}/`: staged, not confirmed. Review its `plan.md`; write `confirm` to its `confirm` only if the owner still wants it, or `cancel` to discard it.\n"
+                "- `wallets/{entry}/`: staged, not confirmed. Review its `plan.md`; {confirm} only if the owner still wants it, or write `cancel` to its `confirm` to discard it.\n"
             );
         }
         Err(error) => {
@@ -5476,11 +5618,18 @@ async fn outbox_entry_line(tree: &dyn Handler, entry: &str) -> String {
         None | Some(serde_json::Value::Null) => "confirm".into(),
         Some(body) => body.to_string(),
     };
+    // A Petal-staged entry retries through its Petal, which `next` names.
+    let retry = match field("staged_by") {
+        Some(_) => String::new(),
+        None => format!(
+            " `retry_path`: `{}`; `retry_body`: `{retry_body}`.",
+            field("retry_path").unwrap_or("its `confirm`")
+        ),
+    };
     format!(
-        "- `wallets/{entry}/`: owner approval `{}`. {} `retry_path`: `{}`; `retry_body`: `{retry_body}`. `ceremony_url` is in its `approval_challenge.json`.\n",
+        "- `wallets/{entry}/`: owner approval `{}`. {}{retry} `ceremony_url` is in its `approval_challenge.json`.\n",
         field("state").unwrap_or("unknown"),
         field("next").unwrap_or(""),
-        field("retry_path").unwrap_or("its `confirm`"),
     )
 }
 
@@ -5489,6 +5638,7 @@ async fn outbox_entry_line(tree: &dyn Handler, entry: &str) -> String {
 /// cannot read, so the empty case reports what was listed, not an all-clear.
 async fn render_pending_actions(
     tree: &dyn Handler,
+    installed: &InstalledPetals,
     wallets: &[String],
     timeout: Duration,
 ) -> String {
@@ -5525,7 +5675,9 @@ async fn render_pending_actions(
                 for chain in wallet_dirs(tree, &chains, &mut unreadable).await {
                     let pending = format!("{chains}/{chain}/outbox/pending");
                     for id in wallet_dirs(tree, &pending, &mut unreadable).await {
-                        outbox.push(outbox_entry_line(tree, &format!("{pending}/{id}")).await);
+                        outbox.push(
+                            outbox_entry_line(tree, installed, &format!("{pending}/{id}")).await,
+                        );
                     }
                 }
             }
@@ -6306,12 +6458,31 @@ mod tests {
         }
     }
 
+    /// The path list is capped, and says so instead of hiding the rest.
+    #[tokio::test]
+    async fn next_md_names_the_accounts_it_leaves_out() {
+        let tree = WalletTreeFixture {
+            dirs: [
+                (
+                    "alice",
+                    vec!["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"],
+                ),
+                ("alice/0/chains", vec!["base"]),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let text = render_wallet_paths(&tree, &["alice".to_owned()], Duration::from_secs(1)).await;
+        assert!(text.contains("`alice` account `0`"), "{text}");
+        assert!(text.contains("and 2 more; list `wallets/alice/`"), "{text}");
+    }
+
     fn alice_tree() -> WalletTreeFixture {
         WalletTreeFixture {
             dirs: [
                 ("alice", vec!["0", "policy-updates"]),
                 ("alice/0/chains", vec!["base", "ethereum"]),
-                ("alice/0/chains/base/outbox/pending", vec!["tx-staged", "tx-approval"]),
+                ("alice/0/chains/base/outbox/pending", vec!["tx-staged", "tx-approval", "tx-petal", "tx-petal-staged", "tx-petal-stale"]),
                 (
                     "alice/policy-updates/pending",
                     vec!["policy-update-1", "policy-update-expired"],
@@ -6332,6 +6503,19 @@ mod tests {
                 "alice/0/chains/base/outbox/pending/tx-approval/approval_challenge.json",
                 r#"{"state":"awaiting_ceremony","next":"Give ceremony_url to the owner.","ceremony_url":"http://127.0.0.1:18734/c#secret","retry_path":"wallets/alice/0/chains/base/outbox/pending/tx-approval/confirm"}"#,
                 ),
+                (
+                    "alice/0/chains/base/outbox/pending/tx-petal-staged/intent.json",
+                    r#"{"id":"tx-petal-staged","execution_origin":{"petal_id":"petal:pendle","petal_digest":"aa","petal_version":"v1-package","route_id":"r000003"}}"#,
+                ),
+                // Staged by a `pendle` package that has since been upgraded.
+                (
+                    "alice/0/chains/base/outbox/pending/tx-petal-stale/intent.json",
+                    r#"{"id":"tx-petal-stale","execution_origin":{"petal_id":"petal:pendle","petal_digest":"bb","petal_version":"v1-package","route_id":"r000003"}}"#,
+                ),
+                (
+                "alice/0/chains/base/outbox/pending/tx-petal/approval_challenge.json",
+                r#"{"state":"active","next":"The owner approved. Now retry through the Petal that staged this entry (petals/pendle/; see its README) to sign and broadcast.","staged_by":"petals/pendle/"}"#,
+                ),
             ]
             .into(),
             broken: None,
@@ -6340,8 +6524,14 @@ mod tests {
 
     #[tokio::test]
     async fn next_actions_lists_pending_entries_and_approvals() {
-        let md =
-            render_pending_actions(&alice_tree(), &["alice".into()], Duration::from_secs(5)).await;
+        let pendle = |petal: &str| (petal == "pendle").then(|| "aa".to_owned());
+        let md = render_pending_actions(
+            &alice_tree(),
+            &pendle,
+            &["alice".into()],
+            Duration::from_secs(5),
+        )
+        .await;
 
         assert!(
             md.contains(
@@ -6351,6 +6541,40 @@ mod tests {
         );
         assert!(md.contains("`wallets/alice/0/chains/base/outbox/pending/tx-approval/`: owner approval `awaiting_ceremony`"), "{md}");
         assert!(md.contains("`retry_path`: `wallets/alice/0/chains/base/outbox/pending/tx-approval/confirm`; `retry_body`: `confirm`"), "{md}");
+        let petal = md
+            .lines()
+            .find(|line| line.contains("pending/tx-petal/"))
+            .unwrap_or_else(|| panic!("{md}"));
+        assert!(
+            petal.contains("(petals/pendle/; see its README)"),
+            "{petal}"
+        );
+        assert!(
+            !petal.contains("retry_path") && !petal.contains("`confirm`"),
+            "{petal}"
+        );
+        // Before any approval, the first confirm also goes through the Petal.
+        let staged = md
+            .lines()
+            .find(|line| line.contains("pending/tx-petal-staged/"))
+            .unwrap_or_else(|| panic!("{md}"));
+        assert!(
+            staged.contains("confirm through the Petal that staged this entry (petals/pendle/"),
+            "{staged}"
+        );
+        assert!(!staged.contains("write `confirm`"), "{staged}");
+        // An upgraded Petal cannot confirm what its old package staged.
+        let stale = md
+            .lines()
+            .find(|line| line.contains("pending/tx-petal-stale/"))
+            .unwrap_or_else(|| panic!("{md}"));
+        assert!(
+            stale.contains("petals/pendle/ can no longer confirm this entry")
+                && stale.contains("Write `cancel`")
+                && !stale.contains("confirm through"),
+            "{stale}"
+        );
+        assert!(md.contains("pending/tx-staged/`: staged, not confirmed. Review its `plan.md`; write `confirm` to its `confirm`"), "{md}");
         assert!(
             md.contains("`wallets/alice/policy-updates/pending/policy-update-1/`"),
             "{md}"
@@ -6372,13 +6596,15 @@ mod tests {
         tree.dirs.remove("alice/0/chains/base/outbox/pending");
         tree.dirs.remove("alice/policy-updates/pending");
         assert!(
-            render_pending_actions(&tree, &["alice".into()], Duration::from_secs(5))
+            render_pending_actions(&tree, &|_| None, &["alice".into()], Duration::from_secs(5))
                 .await
                 .contains("No outbox entry or policy update is listed as pending")
         );
 
         tree.broken = Some("alice/0/chains/ethereum/outbox/pending");
-        let md = render_pending_actions(&tree, &["alice".into()], Duration::from_secs(5)).await;
+        let md =
+            render_pending_actions(&tree, &|_| None, &["alice".into()], Duration::from_secs(5))
+                .await;
         assert!(md.contains("## Not Checked"), "{md}");
         assert!(
             md.contains("`wallets/alice/0/chains/ethereum/outbox/pending/` could not be read: "),
@@ -6396,7 +6622,8 @@ mod tests {
             calls: std::sync::atomic::AtomicUsize::new(0),
         };
 
-        let rendered = render_next_actions(&projections, &WalletTreeFixture::default()).await;
+        let rendered =
+            render_next_actions(&projections, &WalletTreeFixture::default(), &|_| None).await;
 
         assert_eq!(
             projections.calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -6419,6 +6646,7 @@ mod tests {
         let rendered = render_next_actions_with_timeout(
             &projections,
             &WalletTreeFixture::default(),
+            &|_| None,
             Duration::from_millis(10),
         )
         .await;
@@ -9969,6 +10197,51 @@ allowed = ["bloom:vfs.read"]
             matches!(error, HostError::Denied(ref message) if message.contains("another account")),
             "{error}"
         );
+        assert!(broker.sign_calls.lock().is_empty());
+    }
+
+    /// A hard policy denial ends a Petal-staged entry exactly as it ends one
+    /// staged directly: the confirm through its Petal fails, the entry moves
+    /// to `failed/` with its deny, and nothing is signed or left to retry.
+    #[tokio::test]
+    async fn petal_confirm_of_a_hard_denied_entry_fails_it_without_signing() {
+        let (_dir, daemon, broker) = isolation_daemon().await;
+        let host =
+            test_petal_host(&daemon).with_broker(Some(MachineBrokerClient::new(broker.clone())));
+        let context = account_route_context("w", Some(0), None);
+        let staged: bloom_proto::StagedTx = serde_json::from_value(serde_json::json!({
+            "id": "denied-outbox", "wallet": "w", "chain": "ethereum", "chain_id": 1,
+            "from": broker.child(true, 0).address, "to": broker.child(true, 1).address,
+            "value_wei": "0", "data_hex": "0x", "gas_limit": 21000, "nonce": 0,
+            "policy_checks": [{"rule": "destinations.allow", "outcome": "deny", "message": "not on allowlist"}],
+            "created_ms": 1, "expires_ms": 99999999999999u64, "status": "pending",
+            "execution_origin": DaemonPetalHost::petal_execution_origin(&context).unwrap(),
+        }))
+        .unwrap();
+        daemon
+            .tx_engine
+            .outbox
+            .write_pending(&staged, "# denied fixture")
+            .unwrap();
+        let error = host
+            .evm_tx_confirm(
+                "w".into(),
+                "ethereum".into(),
+                staged.id.clone(),
+                false,
+                Some(context),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("policy"), "{error}");
+        let entry = daemon
+            .tx_engine
+            .outbox
+            .read("w", "ethereum", &staged.id)
+            .unwrap();
+        assert_eq!(entry.state, bloom_tx::outbox::OutboxState::Failed);
+        let checks = std::fs::read_to_string(entry.dir.join("policy_check.json")).unwrap();
+        assert!(checks.contains("\"deny\""), "{checks}");
         assert!(broker.sign_calls.lock().is_empty());
     }
 

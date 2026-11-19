@@ -114,6 +114,9 @@ struct NewSimEnvelope {
     /// Optional structured intent body — pass-through.
     #[serde(default)]
     state_override: Option<serde_json::Value>,
+    /// Simulated sender; not part of the intent.
+    #[serde(default)]
+    from: Option<Address>,
     /// The remaining fields are flattened into the intent itself.
     #[serde(flatten)]
     rest: serde_json::Value,
@@ -128,10 +131,6 @@ fn now_ms() -> u128 {
 
 fn err_be(e: impl std::fmt::Display) -> HandlerError {
     HandlerError::backend(e.to_string())
-}
-
-fn pick_chain(intent: &RawIntent) -> String {
-    intent.chain.clone().unwrap_or_else(|| "anvil".to_string())
 }
 
 /// Convert a JSON state override (`{ "0xaddr": { "balance": "0x..", ... } }`)
@@ -527,22 +526,22 @@ impl SimulateHandler {
     /// Resolve a chain client for an intent, falling back to the only
     /// registered chain if exactly one is registered.
     fn pick_client(&self, intent: &RawIntent) -> Result<bloom_evm::ChainClient, HandlerError> {
-        let preferred = pick_chain(intent);
-        if let Some(c) = self.chains.get(&preferred) {
-            return Ok(c);
-        }
-        // Soft fallback for tests / single-chain setups.
         let names = self.chains.list_names();
-        if names.len() == 1 {
-            return self
-                .chains
-                .get(&names[0])
-                .ok_or_else(|| HandlerError::not_found(format!("chain '{}'", preferred)));
-        }
-        Err(HandlerError::not_found(format!(
-            "chain '{}' not registered (have: {:?})",
-            preferred, names
-        )))
+        let Some(preferred) = intent.chain.clone().or_else(|| match names.as_slice() {
+            [only] => Some(only.clone()),
+            _ => None,
+        }) else {
+            return Err(HandlerError::invalid(format!(
+                "name the chain: add \"chain\":\"<name>\" to the body (one of {})",
+                names.join(", ")
+            )));
+        };
+        self.chains.get(&preferred).ok_or_else(|| {
+            HandlerError::not_found(format!(
+                "chain '{}' not registered (have: {:?})",
+                preferred, names
+            ))
+        })
     }
 
     /// Run the simulation against the chain and stash the result.
@@ -629,19 +628,10 @@ impl SimulateHandler {
         if body.is_empty() {
             return Err(HandlerError::invalid("empty sim intent"));
         }
-        // First parse as an envelope to lift `state_override` off, then
+        // First parse as an envelope to lift `state_override` and `from` off, then
         // re-serialise the rest and run it through the intent_parser.
         let envelope: NewSimEnvelope = serde_json::from_str(body)
             .map_err(|e| HandlerError::invalid(format!("sim envelope: {e}")))?;
-        // Pull `from` off the rest if present (intent_parser ignores it).
-        let from: Option<Address> = envelope
-            .rest
-            .as_object()
-            .and_then(|o| o.get("from"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.parse::<Address>())
-            .transpose()
-            .map_err(|e| HandlerError::invalid(format!("from addr: {e}")))?;
         let intent_json = serde_json::to_string(&envelope.rest)
             .map_err(|e| HandlerError::invalid(format!("re-serialise: {e}")))?;
         let intent = bloom_tx::intent_parser::parse(&intent_json)
@@ -655,7 +645,7 @@ impl SimulateHandler {
                 SimSession {
                     id: id.clone(),
                     intent: Some(intent),
-                    from,
+                    from: envelope.from,
                     state_override: envelope.state_override,
                     result: None,
                     plan_md: None,
@@ -1166,6 +1156,36 @@ mod tests {
         // either an object with "unsupported" or with real trace data.
         assert!(trace.is_object());
 
+        drop(anvil);
+    }
+
+    /// `from` is a simulation-envelope field, so strict intents such as a
+    /// finite approval must still accept it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn anvil_finite_approval_simulation_with_from() {
+        if !anvil_available() {
+            eprintln!("anvil not found at {}; skipping", anvil_bin());
+            return;
+        }
+        let anvil = spawn_anvil().await;
+        let rpc = anvil.rpc_url();
+        let alice = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
+        fund(&rpc, alice, 1).await;
+        let h = SimulateHandler::new(registry_for(&rpc), Arc::new(AddressBook::default()));
+        let intent = serde_json::json!({
+            "kind": "approve",
+            "from": alice,
+            "token": "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC",
+            "spender": "0x90F79bf6EB2c4f870365E785982E1f101E93b906",
+            "amount": "1000",
+            "chain": "anvil",
+        });
+        h.write(
+            &VfsPath::parse("/new").unwrap(),
+            intent.to_string().as_bytes(),
+        )
+        .await
+        .expect("finite approval with from");
         drop(anvil);
     }
 

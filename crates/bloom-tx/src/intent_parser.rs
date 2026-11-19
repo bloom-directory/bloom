@@ -20,12 +20,17 @@ pub enum ParseError {
     Shell(String),
     #[error("invalid intent: {0}")]
     Invalid(String),
-    #[error("ambiguous intent")]
+    #[error("ambiguous intent: expected {SHAPES}")]
     Ambiguous,
 }
 
+/// Every intent shape, named in errors so an agent can correct its write.
+const SHAPES: &str = "kind send (to, value | to, token, amount), approve (token, spender, amount), raw (to, data[, value]) for any contract call with calldata, call (contract, method, args), deploy (data), nft_transfer, nft_approve or nft_approve_all; fields go at the top level";
+
 #[derive(serde::Deserialize, Debug, Clone)]
 struct LooseIntent {
+    #[serde(flatten)]
+    extra: std::collections::BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     kind: Option<String>,
     #[serde(default)]
@@ -71,6 +76,13 @@ struct LooseIntent {
 
 impl LooseIntent {
     fn into_raw(self) -> Result<RawIntent, ParseError> {
+        // Fields nested under "intent" are only a mistake when the top level
+        // does not already hold a complete intent.
+        let nested = self.extra.get("intent").is_some_and(|v| v.is_object()).then(|| {
+            format!(
+                "put the intent's fields at the top level, not under \"intent\"; expected {SHAPES}"
+            )
+        });
         let kind = self
             .kind
             .clone()
@@ -94,7 +106,18 @@ impl LooseIntent {
                     None
                 }
             })
-            .ok_or(ParseError::Ambiguous)?;
+            .ok_or_else(|| match &nested {
+                Some(nested) => ParseError::Invalid(nested.clone()),
+                None => ParseError::Ambiguous,
+            })?;
+        // A known kind with a field missing says which one.
+        let needs = |field: &str| {
+            ParseError::Invalid(
+                nested
+                    .clone()
+                    .unwrap_or_else(|| format!("{kind} needs {field}")),
+            )
+        };
         let body = match kind.as_str() {
             "send" => {
                 let token = self.token;
@@ -113,7 +136,7 @@ impl LooseIntent {
                         ));
                     }
                     RawIntentBody::Send {
-                        to: self.to.ok_or(ParseError::Ambiguous)?,
+                        to: self.to.ok_or_else(|| needs("to"))?,
                         value: String::new(),
                         token,
                         amount,
@@ -126,7 +149,7 @@ impl LooseIntent {
                         ));
                     }
                     RawIntentBody::Send {
-                        to: self.to.ok_or(ParseError::Ambiguous)?,
+                        to: self.to.ok_or_else(|| needs("to"))?,
                         value,
                         token: None,
                         amount: String::new(),
@@ -135,15 +158,15 @@ impl LooseIntent {
                 }
             }
             "call" => RawIntentBody::Call {
-                contract: self.contract.ok_or(ParseError::Ambiguous)?,
-                method: self.method.ok_or(ParseError::Ambiguous)?,
+                contract: self.contract.ok_or_else(|| needs("contract"))?,
+                method: self.method.ok_or_else(|| needs("method"))?,
                 args: self.args.unwrap_or_default(),
                 value: self.value.unwrap_or_default(),
             },
             "raw" => RawIntentBody::Raw {
-                to: self.to.ok_or(ParseError::Ambiguous)?,
+                to: self.to.ok_or_else(|| needs("to"))?,
                 value: self.value.unwrap_or_default(),
-                data: self.data.ok_or(ParseError::Ambiguous)?,
+                data: self.data.ok_or_else(|| needs("data"))?,
             },
             "deploy" => {
                 if self.to.is_some()
@@ -163,7 +186,7 @@ impl LooseIntent {
                         "deploy accepts complete initcode in data and an optional native value; call, token, and NFT fields are not supported".into(),
                     ));
                 }
-                let data = self.data.ok_or(ParseError::Ambiguous)?;
+                let data = self.data.ok_or_else(|| needs("data"))?;
                 let bytes = hex::decode(data.strip_prefix("0x").unwrap_or(&data))
                     .map_err(|_| ParseError::Invalid("deploy requires hex initcode".into()))?;
                 if bytes.is_empty() {
@@ -176,31 +199,54 @@ impl LooseIntent {
                     value: self.value.unwrap_or_default(),
                 }
             }
-            "approve" => RawIntentBody::Approve {
-                token: self.token.ok_or(ParseError::Ambiguous)?,
-                spender: self.spender.ok_or(ParseError::Ambiguous)?,
-                amount: self.amount.unwrap_or_else(|| "max".into()),
-            },
+            "approve" => {
+                if !self.extra.is_empty()
+                    || self.to.is_some()
+                    || self.value.is_some()
+                    || self.data.is_some()
+                    || self.contract.is_some()
+                    || self.method.is_some()
+                    || self.args.is_some()
+                    || self.operator.is_some()
+                    || self.token_id.is_some()
+                    || self.standard.is_some()
+                    || self.safe.is_some()
+                    || self.approved.is_some()
+                {
+                    return Err(ParseError::Invalid("approve accepts token, spender and amount plus transaction options; remove unknown or incompatible fields".into()));
+                }
+                let amount = self.amount.filter(|v| !v.trim().is_empty()).ok_or_else(||
+                    ParseError::Invalid("approve requires amount in raw token units; use 0 to revoke or explicit max for unlimited".into()))?;
+                RawIntentBody::Approve {
+                    token: self.token.ok_or_else(|| needs("token"))?,
+                    spender: self.spender.ok_or_else(|| needs("spender"))?,
+                    amount,
+                }
+            }
             "nft_transfer" => RawIntentBody::NftTransfer {
-                contract: self.contract.ok_or(ParseError::Ambiguous)?,
-                to: self.to.ok_or(ParseError::Ambiguous)?,
-                token_id: self.token_id.ok_or(ParseError::Ambiguous)?,
+                contract: self.contract.ok_or_else(|| needs("contract"))?,
+                to: self.to.ok_or_else(|| needs("to"))?,
+                token_id: self.token_id.ok_or_else(|| needs("token_id"))?,
                 standard: self.standard,
                 amount: self.amount,
                 safe: self.safe.unwrap_or(true),
                 data: self.data,
             },
             "nft_approve" => RawIntentBody::NftApprove {
-                contract: self.contract.ok_or(ParseError::Ambiguous)?,
-                operator: self.operator.ok_or(ParseError::Ambiguous)?,
-                token_id: self.token_id.ok_or(ParseError::Ambiguous)?,
+                contract: self.contract.ok_or_else(|| needs("contract"))?,
+                operator: self.operator.ok_or_else(|| needs("operator"))?,
+                token_id: self.token_id.ok_or_else(|| needs("token_id"))?,
             },
             "nft_approve_all" => RawIntentBody::NftApproveAll {
-                contract: self.contract.ok_or(ParseError::Ambiguous)?,
-                operator: self.operator.ok_or(ParseError::Ambiguous)?,
-                approved: self.approved.ok_or(ParseError::Ambiguous)?,
+                contract: self.contract.ok_or_else(|| needs("contract"))?,
+                operator: self.operator.ok_or_else(|| needs("operator"))?,
+                approved: self.approved.ok_or_else(|| needs("approved"))?,
             },
-            _ => return Err(ParseError::Ambiguous),
+            other => {
+                return Err(ParseError::Invalid(format!(
+                    "unknown kind {other:?}; expected {SHAPES}"
+                )));
+            }
         };
         let gas = match self.gas.or(self.priority).as_deref() {
             Some("auto") | None => bloom_proto::GasStrategy::Auto,
@@ -230,11 +276,48 @@ fn is_empty_or_zero_value(value: &str) -> bool {
     trimmed.is_empty() || trimmed == "0"
 }
 
+/// The bodies one write holds: one per line when more than one line opens a
+/// body (a `send` line or a single-line JSON object), each object when the
+/// input is several JSON objects (pretty-printed, say), else the whole input.
+pub fn bodies(input: &str) -> Vec<&str> {
+    let lines: Vec<&str> = input
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let opens = |line: &&str| line.starts_with("send ") || line.starts_with('{');
+    if lines.len() > 1 && lines.iter().all(opens) {
+        return lines;
+    }
+    let mut objects = Vec::new();
+    let mut stream = serde_json::Deserializer::from_str(input).into_iter::<serde::de::IgnoredAny>();
+    let mut start = 0;
+    while let Some(Ok(_)) = stream.next() {
+        let end = stream.byte_offset();
+        objects.push(input[start..end].trim());
+        start = end;
+    }
+    if objects.len() > 1 && input[start..].trim().is_empty() {
+        objects
+    } else {
+        vec![input]
+    }
+}
+
 /// Parse a textual intent in any of the accepted forms.
 pub fn parse(input: &str) -> Result<RawIntent, ParseError> {
     let s = input.trim();
     if s.is_empty() {
         return Err(ParseError::Empty);
+    }
+    // One write stages one transaction. Two forms in one body (a `send` line
+    // and a JSON object, or two JSON objects) would otherwise fail deep in a
+    // parser with an error that does not say so.
+    let bodies = bodies(s).len();
+    if bodies > 1 {
+        return Err(ParseError::Invalid(format!(
+            "this write holds {bodies} bodies; `send.tx` takes several, one per line, under one approval"
+        )));
     }
     if s.starts_with('{') {
         let loose: LooseIntent = serde_json::from_str(s)?;
@@ -415,6 +498,76 @@ mod tests {
     use bloom_proto::RawIntentBody;
 
     #[test]
+    fn two_bodies_in_one_write_are_refused_plainly() {
+        let both = "send 0.25 ETH to 0x70997970C51812dc3A010C7d01b50e0d17dc79C8\n{\"kind\":\"send\",\"to\":\"0x70997970C51812dc3A010C7d01b50e0d17dc79C8\",\"value\":\"0.25 eth\"}";
+        let error = parse(both).unwrap_err().to_string();
+        assert!(error.contains("2 bodies"), "{error}");
+        assert_eq!(bodies(both).len(), 2);
+        // A pretty-printed JSON body is still one body.
+        let pretty = "{\n  \"kind\": \"send\",\n  \"to\": \"0x70997970C51812dc3A010C7d01b50e0d17dc79C8\",\n  \"value\": \"0.25 eth\"\n}";
+        assert!(parse(pretty).is_ok());
+        assert_eq!(bodies(pretty), vec![pretty]);
+        // A space after the brace, as `jq -c`-style tools may write it.
+        let spaced = "{ \"kind\": \"send\", \"to\": \"0x70997970C51812dc3A010C7d01b50e0d17dc79C8\", \"value\": \"1 eth\" }";
+        assert_eq!(bodies(&format!("{spaced}\n{spaced}")).len(), 2);
+        // Two pretty-printed bodies are two bodies, not a parse error.
+        let two = format!("{pretty}\n{pretty}\n");
+        assert_eq!(bodies(&two), vec![pretty, pretty]);
+    }
+
+    #[test]
+    fn errors_name_the_accepted_shapes() {
+        // Writes an agent made in a 2026-11-04 bench trial (bloom#447).
+        let to = "0xE592427A0AEce92De3Edee1F18E0157C05861564";
+        for (input, start) in [
+            (
+                format!(r#"{{"intent":{{"chain":"ethereum","to":"{to}","data":"0x01"}}}}"#),
+                "invalid intent: put the intent's fields at the top level",
+            ),
+            (
+                format!(r#"{{"kind":"contract_call","to":"{to}","data":"0x01"}}"#),
+                "invalid intent: unknown kind \"contract_call\"",
+            ),
+            (
+                r#"{"chain":"ethereum"}"#.into(),
+                "ambiguous intent: expected",
+            ),
+        ] {
+            let err = super::parse(&input).unwrap_err().to_string();
+            assert!(err.starts_with(start), "{err}");
+            assert!(err.contains("raw (to, data[, value])"), "{err}");
+        }
+        // A known kind says which field is missing, and a complete top
+        // level is not refused for also carrying an "intent" object.
+        let err = super::parse(&format!(
+            r#"{{"kind":"approve","token":"{to}","amount":"1"}}"#
+        ))
+        .unwrap_err()
+        .to_string();
+        assert_eq!(err, "invalid intent: approve needs spender");
+        super::parse(&format!(
+            r#"{{"kind":"send","to":"{to}","value":"1 eth","intent":{{"note":"x"}}}}"#
+        ))
+        .unwrap();
+        // The shapes docs/examples.md lists.
+        for input in [
+            format!("send 0.25 ETH to {to}"),
+            format!(r#"{{"kind":"send","to":"{to}","value":"0.25 eth"}}"#),
+            format!(r#"{{"kind":"send","to":"{to}","token":"USDC","amount":"10"}}"#),
+            format!(r#"{{"kind":"approve","token":"{to}","spender":"{to}","amount":"1000000"}}"#),
+            format!(r#"{{"kind":"raw","to":"{to}","data":"0x01","value":"0"}}"#),
+            format!(
+                r#"{{"kind":"call","contract":"{to}","method":"transfer(address,uint256)","args":["{to}","1"]}}"#
+            ),
+            r#"{"kind":"deploy","data":"0x60006000f3","value":"0"}"#.into(),
+            // A stray string field named "intent" is ignored like any other extra field.
+            format!(r#"{{"kind":"send","to":"{to}","value":"1 eth","intent":"note"}}"#),
+        ] {
+            super::parse(&input).unwrap();
+        }
+    }
+
+    #[test]
     fn parse_explicit_deployment_and_reject_ambiguous_fields() {
         for input in [
             r#"{"kind":"deploy","data":"0x60006000f3","value":"123 wei"}"#,
@@ -573,9 +726,34 @@ value = "0"
     }
 
     #[test]
+    fn approval_requires_explicit_unambiguous_amount() {
+        for amount in ["0", "123", "max"] {
+            let input = serde_json::json!({"kind":"approve", "token":"USDC", "spender":"router", "amount":amount});
+            assert!(parse(&input.to_string()).is_ok());
+        }
+        for extra in [
+            serde_json::json!({}),
+            serde_json::json!({"amount":""}),
+            serde_json::json!({"amount":" "}),
+            serde_json::json!({"ammount":"max"}),
+            serde_json::json!({"amount":"0", "value":"0"}),
+            serde_json::json!({"amount":"0", "unknown":true}),
+        ] {
+            let mut input =
+                serde_json::json!({"kind":"approve", "token":"USDC", "spender":"router"});
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(parse(&input.to_string()).is_err(), "{input}");
+        }
+        assert!(parse("kind = 'approve'\ntoken = 'USDC'\nspender = 'router'").is_err());
+    }
+
+    #[test]
     fn json_approve_inferred_from_fields() {
         // No kind; presence of token+spender disambiguates.
-        let r = parse(r#"{"token":"0xUSDC","spender":"0xRouter"}"#).unwrap();
+        let r = parse(r#"{"token":"0xUSDC","spender":"0xRouter","amount":"max"}"#).unwrap();
         match r.body {
             RawIntentBody::Approve { amount, .. } => assert_eq!(amount, "max"),
             _ => panic!("wrong variant"),
