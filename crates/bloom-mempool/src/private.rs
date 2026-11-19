@@ -50,7 +50,6 @@ pub struct MockPrivateRpcProvider {
     id: &'static str,
     supported: &'static [u64],
     submissions: Arc<Mutex<Vec<Bytes>>>,
-    health: HealthStatus,
 }
 
 impl MockPrivateRpcProvider {
@@ -59,17 +58,11 @@ impl MockPrivateRpcProvider {
             id,
             supported: &[MAINNET_CHAIN_ID],
             submissions: Arc::new(Mutex::new(Vec::new())),
-            health: HealthStatus::Healthy,
         }
     }
 
     pub fn with_supported_chains(mut self, ids: &'static [u64]) -> Self {
         self.supported = ids;
-        self
-    }
-
-    pub fn with_health(mut self, h: HealthStatus) -> Self {
-        self.health = h;
         self
     }
 
@@ -94,7 +87,7 @@ impl PrivateRpcProvider for MockPrivateRpcProvider {
     }
 
     async fn health(&self) -> Result<HealthStatus, PrivateRpcError> {
-        Ok(self.health)
+        Ok(HealthStatus::Healthy)
     }
 }
 

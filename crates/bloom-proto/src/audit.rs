@@ -442,44 +442,6 @@ impl AuditLog {
             .collect()
     }
 
-    /// Installer-only writer for the root-owned trust history. The history is
-    /// public metadata, but must not be writable by the Machine principal.
-    pub fn write_root_trusted_history(
-        path: &Path,
-        predecessors: &[AuditTrustedPredecessor],
-    ) -> Result<(), AuditError> {
-        if path.exists() {
-            require_root_public_metadata(path)?;
-        }
-        let parent = path.parent().ok_or_else(|| {
-            AuditError::Degraded("Machine audit history path has no parent".to_owned())
-        })?;
-        std::fs::create_dir_all(parent)?;
-        let document = TrustedHistoryDocument {
-            schema: "bloom.machine-audit-trust.v1".to_owned(),
-            predecessors: predecessors
-                .iter()
-                .map(|entry| TrustedHistoryEntry {
-                    service_id: entry.service_id.clone(),
-                    key_id: entry.key_id.clone(),
-                    public_key_hex: hex::encode(entry.public_key),
-                    archive_path: entry.archive_path.clone(),
-                })
-                .collect(),
-        };
-        let temporary = path.with_extension("json.tmp");
-        if temporary.exists() {
-            return Err(AuditError::Degraded(format!(
-                "stale Machine audit history temporary exists at {}",
-                temporary.display()
-            )));
-        }
-        write_new_synced(&temporary, &serde_json::to_vec_pretty(&document)?)?;
-        require_root_public_metadata(&temporary)?;
-        std::fs::rename(&temporary, path)?;
-        sync_parent(path)
-    }
-
     /// Open a service-signed production journal. Integrity failures are
     /// latched rather than preventing startup, so read/status surfaces remain
     /// available while every subsequent mutation fails closed.

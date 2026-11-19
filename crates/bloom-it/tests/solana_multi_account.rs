@@ -17,358 +17,24 @@
 //! handler, Solana engine, reconciler, and validator are real. This is not the
 //! separate-process bloom-broker/bloom-signer triad.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+mod common;
+
+use std::sync::atomic::Ordering;
 
 use anyhow::{Result, anyhow};
-use bloom_broker_api::*;
-use bloom_daemon::Daemon;
-use bloom_machine_client::MachineBrokerClient;
-use bloom_proto::{Config, EndpointSpec, HomeDir, HomeWritePermit, SolanaSpec};
+use bloom_broker_api::Digest32;
+use bloom_proto::HomeDir;
 use bloom_vfs::VfsPath;
 use bloom_vfs::handler::Handler;
+use common::*;
 use sha2::{Digest as _, Sha256};
-
-fn rpc_url_str() -> String {
-    std::env::var("BLOOM_IT_SOLANA_RPC").unwrap_or_else(|_| "http://127.0.0.1:8899".into())
-}
-
-const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon \
-abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \
-abandon abandon art";
-
-fn tok(s: &str) -> Token {
-    Token::new(s.to_owned()).unwrap()
-}
-fn dig(b: u8) -> Digest32 {
-    Digest32::from_bytes([b; 32])
-}
-
-/// Canonical Ed25519 SubjectPublicKeyInfo DER: the fixed 12-byte prefix
-/// followed by the raw 32-byte key, as the real Signer publishes it.
-fn spki(pubkey: &[u8; 32]) -> Vec<u8> {
-    let mut out = vec![
-        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
-    ];
-    out.extend_from_slice(pubkey);
-    out
-}
-
-fn fingerprint_of(pubkey: &[u8; 32]) -> Digest32 {
-    Digest32::from_bytes(Sha256::digest(spki(pubkey)).into())
-}
-
-/// One derived Solana child, with the private key the fixture signs with.
-struct Child {
-    account: u32,
-    path: String,
-    pubkey: [u8; 32],
-    address: String,
-    signing_key: ed25519_dalek::SigningKey,
-    key_ref: KeyRef,
-}
-
-impl Child {
-    fn derive(seed: &[u8; 64], account: u32) -> Result<Self> {
-        let derived = bloom_signer_derive::derive_solana_account(seed, account)
-            .map_err(|e| anyhow!("derive account {account}: {e}"))?;
-        let pubkey = derived.public_key;
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&derived.private_key);
-        // The published key must be the one that actually signs.
-        assert_eq!(
-            signing_key.verifying_key().to_bytes(),
-            pubkey,
-            "account {account}: derived public key does not match its private key"
-        );
-        Ok(Self {
-            account,
-            path: derived.path.clone(),
-            pubkey,
-            address: bs58::encode(pubkey).into_string(),
-            signing_key,
-            key_ref: KeyRef {
-                backend: tok("local"),
-                backend_instance: tok("e2e"),
-                locator: format!("wallet/derived/solana-{account}"),
-                key_spec: KeySpec::Ed25519,
-                public_key_fingerprint: fingerprint_of(&pubkey),
-                derivation: Some(DerivationRef::Bip39Multicurve {
-                    wallet_seed_ref: tok("alice-seed"),
-                    profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
-                    path: derived.path,
-                }),
-            },
-        })
-    }
-
-    fn fingerprint_hex(&self) -> &str {
-        self.key_ref.public_key_fingerprint.as_str()
-    }
-
-    fn account_public(&self) -> DerivedAccountPublic {
-        DerivedAccountPublic {
-            key_ref: self.key_ref.clone(),
-            wallet_seed_profile: WalletSeedProfile::Bip39MulticurveV1,
-            derivation_profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
-            path: self.path.clone(),
-            canonical_public_key: Base64UrlBytes::from_bytes(&spki(&self.pubkey)),
-            public_key_encoding: PublicKeyEncoding::Ed25519SpkiDer,
-            public_key_fingerprint: fingerprint_of(&self.pubkey),
-            supported_crypto_suites: vec![CryptoSuite::Ed25519Message],
-            chain_projections: vec![ChainAccountProjection {
-                chain_family: tok("solana"),
-                caip2: "solana:local".into(),
-                caip10: format!("solana:local:{}", self.address),
-                address: self.address.clone(),
-                address_encoding: AddressEncoding::Base58,
-            }],
-            // Both children stay active for the whole test. That is the point.
-            lifecycle: AccountLifecycleState::Active,
-        }
-    }
-}
-
-// ---------------------------------------------------------------- broker ---
-
-struct MultiAccountBroker {
-    children: Vec<Child>,
-    approval_active: AtomicBool,
-    /// Every signing call, as (key_ref locator, signed bytes).
-    sign_calls: parking_lot::Mutex<Vec<(String, Vec<u8>)>>,
-}
-
-impl MultiAccountBroker {
-    fn child_for(&self, key_ref: &KeyRef) -> Option<&Child> {
-        self.children.iter().find(|child| &child.key_ref == key_ref)
-    }
-
-    fn policy(&self, wallet_id: Token) -> SignedPolicySnapshot {
-        let canonical = serde_json::to_vec(&CanonicalWalletPolicy {
-            clear_signing: None,
-            wallet_id: wallet_id.clone(),
-            maximum_approval_lifetime_ms: 3_600_000,
-            allowed_petal_packages: Vec::new(),
-            allowed_destinations: Vec::new(),
-            required_verifiers: Vec::new(),
-        })
-        .unwrap();
-        SignedPolicySnapshot {
-            wallet_id,
-            version: DecimalU64::new(1),
-            canonical_policy: Base64UrlBytes::from_bytes(&canonical),
-            policy_digest: Digest32::from_bytes(Sha256::digest(&canonical).into()),
-            policy_signing_key_id: tok("e2e-policy-key"),
-            policy_verifying_key: Base64UrlBytes::from_bytes(&[12; 32]),
-            signer_signature: Base64UrlBytes::from_bytes(&[13; 64]),
-        }
-    }
-
-    fn wallet_public(&self, wallet_id: Token) -> WalletPublic {
-        let p = self.policy(wallet_id.clone());
-        WalletPublic {
-            wallet_id,
-            wallet_kind: tok("local"),
-            // A BIP-39 seed root is not signable; the children are the keys.
-            root_key_ref: None,
-            key_refs: self.children.iter().map(|c| c.key_ref.clone()).collect(),
-            policy_version: DecimalU64::new(1),
-            policy_digest: p.policy_digest,
-            wallet_revocation_epoch: DecimalU64::new(0),
-        }
-    }
-
-    fn key_public(&self, child: &Child) -> KeyPublic {
-        KeyPublic {
-            key_ref: child.key_ref.clone(),
-            role: KeyRole::Derived,
-            canonical_public_key: Base64UrlBytes::from_bytes(&spki(&child.pubkey)),
-            addresses: vec![child.address.clone()],
-            supported_crypto_suites: vec![CryptoSuite::Ed25519Message],
-        }
-    }
-
-    fn accounts(&self, wallet_id: Token) -> WalletAccountsPublic {
-        WalletAccountsPublic {
-            wallet_id,
-            seed_profile: WalletSeedProfile::Bip39MulticurveV1,
-            accounts: self.children.iter().map(|c| c.account_public()).collect(),
-        }
-    }
-}
-
-impl MachineBrokerService for MultiAccountBroker {
-    fn dispatch<'a>(
-        &'a self,
-        request: MachineBrokerRequest,
-    ) -> ServiceFuture<'a, MachineBrokerResponse> {
-        Box::pin(async move {
-            match request {
-                MachineBrokerRequest::WalletListPublic(_) => {
-                    Ok(MachineBrokerResponse::WalletListPublic(vec![
-                        self.wallet_public(tok("alice")),
-                    ]))
-                }
-                MachineBrokerRequest::WalletGetPublic(r) => Ok(
-                    MachineBrokerResponse::WalletGetPublic(self.wallet_public(r.wallet_id)),
-                ),
-                MachineBrokerRequest::WalletAccounts(WalletRequest { wallet_id }) => Ok(
-                    MachineBrokerResponse::WalletAccounts(self.accounts(wallet_id)),
-                ),
-                MachineBrokerRequest::KeyListPublic(_) => Ok(MachineBrokerResponse::KeyListPublic(
-                    self.children.iter().map(|c| self.key_public(c)).collect(),
-                )),
-                // Answer for the exact key asked about. Returning a fixed key
-                // here would mask a selection bug entirely.
-                MachineBrokerRequest::KeyGetPublic(r) => {
-                    let child = self.child_for(&r.key_ref).ok_or_else(|| {
-                        ProtocolError::new(
-                            ProtocolErrorCode::KeyrefMismatch,
-                            "key is not a child of this wallet",
-                        )
-                    })?;
-                    Ok(MachineBrokerResponse::KeyGetPublic(self.key_public(child)))
-                }
-                MachineBrokerRequest::CredentialListPublic(_) => {
-                    Ok(MachineBrokerResponse::CredentialListPublic(Vec::<
-                        CredentialPublic,
-                    >::new(
-                    )))
-                }
-                MachineBrokerRequest::PolicyRead(WalletRequest { wallet_id }) => {
-                    Ok(MachineBrokerResponse::PolicyRead(self.policy(wallet_id)))
-                }
-                MachineBrokerRequest::SealedApprovalPrepare(r) => Ok(
-                    MachineBrokerResponse::SealedApprovalPrepare(SealedApprovalPrepareResponse {
-                        approval_id: r.terms.approval_id()?,
-                        state: ApprovalPrepareState::AwaitingCeremony,
-                        ceremony_url: "http://localhost:18734/ceremony/multi".into(),
-                        ceremony_expires_at_ms: r.terms.expires_at_ms,
-                        review_manifest_digest: dig(8),
-                    }),
-                ),
-                MachineBrokerRequest::SealedApprovalStatus(r) => {
-                    let active = self.approval_active.load(Ordering::SeqCst);
-                    Ok(MachineBrokerResponse::SealedApprovalStatus(
-                        ApprovalPublicStatus {
-                            approval_id: r.id,
-                            wallet_id: tok("alice"),
-                            state: if active {
-                                ApprovalLifecycleState::Active
-                            } else {
-                                ApprovalLifecycleState::AwaitingCeremony
-                            },
-                            effective_claim_assurance: None,
-                            ceremony_url: (!active)
-                                .then(|| "http://localhost:18734/ceremony/multi".into()),
-                            ceremony_expires_at_ms: (!active).then(|| DecimalU64::new(u64::MAX)),
-                        },
-                    ))
-                }
-                MachineBrokerRequest::SigningSign(r) => {
-                    let SigningPayloads::Single { payload } = &r.payloads else {
-                        return Err(ProtocolError::new(
-                            ProtocolErrorCode::MalformedFrame,
-                            "expected a single payload",
-                        ));
-                    };
-                    // Sign with the key the request names, never a default.
-                    // This is what makes a wrong selection observable.
-                    let child = self.child_for(&r.key_ref).ok_or_else(|| {
-                        ProtocolError::new(
-                            ProtocolErrorCode::KeyrefMismatch,
-                            "signing key is not a child of this wallet",
-                        )
-                    })?;
-                    let bytes = payload.decode();
-                    self.sign_calls
-                        .lock()
-                        .push((child.key_ref.locator.clone(), bytes.clone()));
-                    use ed25519_dalek::Signer as _;
-                    let sig = child.signing_key.sign(&bytes);
-                    Ok(MachineBrokerResponse::SigningSign(SigningResult {
-                        operation_id: r.operation_id,
-                        operation_digest: r.operation_digest,
-                        signatures: vec![NormalizedSignature {
-                            crypto_suite: CryptoSuite::Ed25519Message,
-                            bytes: Base64UrlBytes::from_bytes(&sig.to_bytes()),
-                        }],
-                        signer_receipt_digest: dig(9),
-                        broker_receipt_digest: dig(10),
-                    }))
-                }
-                other => Err(ProtocolError::new(
-                    ProtocolErrorCode::UnknownMethod,
-                    format!("unhandled {other:?}"),
-                )),
-            }
-        })
-    }
-}
-
-// ------------------------------------------------------------------- rpc ---
-
-/// `reqwest::blocking` builds and drops its own runtime, which panics inside
-/// an async context, so it runs on a tokio-naive OS thread.
-fn rpc(method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
-    // Overridable so the suite can run against a validator on a non-default
-    // port (several developer harnesses keep one on 8899).
-    let url = std::env::var("BLOOM_IT_SOLANA_RPC")
-        .unwrap_or_else(|_| "http://127.0.0.1:8899".to_string());
-    let method = method.to_string();
-    std::thread::spawn(move || -> Result<serde_json::Value> {
-        let body = serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":params});
-        let resp: serde_json::Value = reqwest::blocking::Client::new()
-            .post(url)
-            .json(&body)
-            .send()?
-            .json()?;
-        Ok(resp)
-    })
-    .join()
-    .map_err(|_| anyhow!("rpc thread panicked"))?
-}
-
-fn step(n: &str, msg: &str) {
-    println!("\n=== {n} :: {msg}");
-}
-
-fn b64_decode(s: &str) -> Vec<u8> {
-    let table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut acc = 0u32;
-    let mut bits = 0;
-    let mut out = Vec::new();
-    for c in s.chars().filter(|c| *c != '=') {
-        let v = table.find(c).expect("base64 alphabet") as u32;
-        acc = (acc << 6) | v;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-        }
-    }
-    out
-}
-
-async fn read_json(daemon: &Daemon, path: &str) -> Result<serde_json::Value> {
-    let bytes = daemon
-        .vfs
-        .read(&VfsPath::parse(path).unwrap())
-        .await
-        .map_err(|e| anyhow!("read {path}: {e}"))?;
-    Ok(serde_json::from_slice(&bytes)?)
-}
 
 // ------------------------------------------------------------------ main ---
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn two_active_solana_children_select_sign_and_reconcile_independently() -> Result<()> {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,bloom_daemon=debug")),
-        )
-        .try_init();
+    init_tracing();
 
     // 1. Two children from one mnemonic, through the production derivation
     //    crate rather than fixture constants.
@@ -376,9 +42,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
         "1",
         "derive Solana accounts 0 and 1 from the BIP-39 mnemonic",
     );
-    let seed =
-        bloom_signer_derive::seed_from_mnemonic(MNEMONIC).map_err(|e| anyhow!("seed: {e}"))?;
-    let seed64: [u8; 64] = (*seed).as_slice().try_into().unwrap();
+    let seed64 = seed()?;
     let account0 = Child::derive(&seed64, 0)?;
     let account1 = Child::derive(&seed64, 1)?;
     for child in [&account0, &account1] {
@@ -422,108 +86,21 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
 
     // 3. Real daemon, both children active at once.
     step("3", "build a real Daemon with BOTH children active");
-    let broker = Arc::new(MultiAccountBroker {
-        children: vec![account0, account1],
-        approval_active: AtomicBool::new(false),
-        sign_calls: parking_lot::Mutex::new(Vec::new()),
-    });
+    let broker = SolanaBroker::new(vec![account0, account1]);
     let account0 = &broker.children[0];
     let account1 = &broker.children[1];
-
-    let genesis = rpc("getGenesisHash", serde_json::json!([]))?["result"]
-        .as_str()
-        .ok_or_else(|| anyhow!("validator did not answer getGenesisHash"))?
-        .to_string();
-    println!("    local validator genesis = {genesis}");
-
-    let tmp = tempfile::tempdir()?;
-    let mut cfg = Config::local_default();
-    cfg.solana_chains.insert(
-        "solana-local".to_string(),
-        SolanaSpec {
-            name: "solana-local".into(),
-            endpoints: vec![EndpointSpec {
-                url: rpc_url_str(),
-                weight: 100,
-                cu_per_sec: None,
-                max_rps: None,
-                http_only: false,
-            }],
-            expected_genesis_base58: Some(genesis.clone()),
-        },
-    );
-    let config_path = tmp.path().join("config.toml");
-    cfg.save(&config_path).map_err(|e| anyhow!("save: {e}"))?;
-
-    let record = |action: &str, op: &str, chain: &str| ProvenanceRecord {
-        subject: ProvenanceSubject::System {
-            component_id: tok("bloom-machine"),
-            operation_class: tok(action),
-        },
-        publisher: tok("bloom-installer"),
-        petal_lineage: None,
-        operation_classes: vec![ProvenanceOperationClass {
-            operation_class: tok(op),
-            fee_asset: Some(ProvenanceFeeAsset {
-                chain: tok(chain),
-                asset: "native".into(),
-            }),
-        }],
-        installer_key_id: tok("installer-key"),
-        installer_signature: Base64UrlBytes::from_bytes(&[11; 64]),
-    };
-    let catalog = ProvenanceCatalog {
-        schema: PROVENANCE_CATALOG_SCHEMA.into(),
-        records: vec![
-            record("system.readiness", "system.readiness", "ethereum"),
-            record("transaction.confirm", "transaction.confirm", "ethereum"),
-            record(
-                "solana.transfer.confirm",
-                "solana.native-transfer",
-                "solana",
-            ),
-        ],
-    };
-
-    let build_daemon = || -> Result<Daemon> {
-        let home = HomeDir::at(tmp.path());
-        let permit = Arc::new(HomeWritePermit::acquire(&home)?);
-        let service: Arc<dyn MachineBrokerService> = broker.clone();
-        Daemon::from_home_with_permit_and_broker(
-            home,
-            permit,
-            MachineBrokerClient::new(service),
-            catalog.clone(),
-        )
-        .map_err(|e| anyhow!("daemon: {e}"))
-    };
-    let daemon = build_daemon()?;
+    let tmp = solana_home()?;
+    let daemon = daemon_at(tmp.path(), broker.clone(), catalog(&[]))?;
     println!("    daemon constructed with 2 active Solana children");
 
     // 4. Fund ONLY account 1, so a transfer signed by account 0 could not
     //    succeed on-chain even if selection silently fell back to it.
     step("4", "airdrop to account 1 only");
-    rpc(
-        "requestAirdrop",
-        serde_json::json!([account1.address, 2_000_000_000u64]),
-    )?;
-    for _ in 0..40 {
-        let bal = rpc("getBalance", serde_json::json!([account1.address]))?["result"]["value"]
-            .as_u64()
-            .unwrap_or(0);
-        if bal >= 2_000_000_000 {
-            println!("    account 1 funded: {bal} lamports");
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
+    airdrop(&account1.address, 2_000_000_000).await?;
     // Account 0's balance is recorded, not assumed to be zero: the same
     // mnemonic's account 0 may already hold funds from another suite on this
     // validator. What matters is that this transfer leaves it untouched.
-    let account0_balance =
-        rpc("getBalance", serde_json::json!([account0.address]))?["result"]["value"]
-            .as_u64()
-            .unwrap_or(0);
+    let account0_balance = balance(&account0.address)?;
     println!("    account 0 balance before: {account0_balance} lamports");
 
     let new_tx = VfsPath::parse("/wallets/alice/0/chains/solana-local/outbox/new.tx").unwrap();
@@ -611,12 +188,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
 
     // 5c. Stage through account 1's own path, with no selector in the body.
     let numbered_destination = bs58::encode([0xddu8; 32]).into_string();
-    let numbered_destination_before = rpc(
-        "getBalance",
-        serde_json::json!([numbered_destination.clone()]),
-    )?["result"]["value"]
-        .as_u64()
-        .unwrap_or(0);
+    let numbered_destination_before = balance(&numbered_destination)?;
     daemon
         .vfs
         .write(
@@ -744,10 +316,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
     let numbered_receipt = numbered_receipt
         .ok_or_else(|| anyhow!("numbered transfer did not reach a finalized receipt"))?;
     assert_eq!(numbered_receipt["outcome"].as_str(), Some("success"));
-    let numbered_destination_balance =
-        rpc("getBalance", serde_json::json!([numbered_destination]))?["result"]["value"]
-            .as_u64()
-            .unwrap_or(0);
+    let numbered_destination_balance = balance(&numbered_destination)?;
     assert_eq!(
         numbered_destination_balance,
         numbered_destination_before + 250_000_000,
@@ -808,10 +377,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
         "7",
         "wallet-level staging refuses account 1's fingerprint; numbered path stages account 1",
     );
-    let destination_before =
-        rpc("getBalance", serde_json::json!([destination]))?["result"]["value"]
-            .as_u64()
-            .unwrap_or(0);
+    let destination_before = balance(&destination)?;
     let override_intent = serde_json::json!({
         "destination": destination,
         "lamports": 250_000_000u64,
@@ -984,19 +550,13 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
     assert_eq!(receipt["outcome"].as_str(), Some("success"));
     assert_eq!(receipt["signature"].as_str(), Some(signature_b58.as_str()));
 
-    let destination_balance =
-        rpc("getBalance", serde_json::json!([destination]))?["result"]["value"]
-            .as_u64()
-            .unwrap_or(0);
+    let destination_balance = balance(&destination)?;
     assert_eq!(
         destination_balance,
         destination_before + 250_000_000,
         "destination debit"
     );
-    let account0_after =
-        rpc("getBalance", serde_json::json!([account0.address]))?["result"]["value"]
-            .as_u64()
-            .unwrap_or(0);
+    let account0_after = balance(&account0.address)?;
     assert_eq!(
         account0_after, account0_balance,
         "the unselected account's balance must be untouched"
@@ -1099,20 +659,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
     // 14. The other child stays independently selectable while account 1
     //     is also active.
     step("14", "account 0 is still selectable in its own right");
-    rpc(
-        "requestAirdrop",
-        serde_json::json!([account0.address, 1_000_000_000u64]),
-    )?;
-    for _ in 0..40 {
-        let bal = rpc("getBalance", serde_json::json!([account0.address]))?["result"]["value"]
-            .as_u64()
-            .unwrap_or(0);
-        if bal >= 1_000_000_000 {
-            println!("    account 0 funded: {bal} lamports");
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
+    airdrop(&account0.address, 1_000_000_000).await?;
     daemon
         .vfs
         .write(

@@ -165,21 +165,11 @@ macro_rules! provider_test_suite {
 pub struct MockMempoolProvider {
     id: &'static str,
     fixtures: Vec<PendingTx>,
-    delivers_bodies: bool,
 }
 
 impl MockMempoolProvider {
     pub fn new(id: &'static str, fixtures: Vec<PendingTx>) -> Self {
-        Self {
-            id,
-            fixtures,
-            delivers_bodies: true,
-        }
-    }
-
-    pub fn with_hashes_only(mut self) -> Self {
-        self.delivers_bodies = false;
-        self
+        Self { id, fixtures }
     }
 }
 
@@ -195,7 +185,7 @@ impl MempoolProvider for MockMempoolProvider {
     }
 
     fn delivers_bodies(&self) -> bool {
-        self.delivers_bodies
+        true
     }
 }
 

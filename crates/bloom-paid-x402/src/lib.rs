@@ -15,8 +15,6 @@ use std::sync::{Arc, Mutex};
 use alloy::primitives::{Address, FixedBytes, Signature, U256};
 use alloy::sol_types::{Eip712Domain, SolStruct, eip712_domain};
 use async_trait::async_trait;
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as B64;
 use bloom_paid_http::{
     NormalizedChallenge, PaidHttpChainRpcResolver, PaidHttpHostSigner, PaidHttpSigningFacts,
     ParsedRequest, PaymentRequirement, networks_equivalent,
@@ -212,15 +210,6 @@ impl X402PaymentSigner for HostX402PaymentSigner {
             }),
         })
     }
-}
-
-/// Decode a base64 secp256k1 signature returned by the host into 65 raw bytes.
-pub fn decode_host_signature_b64(signature_b64: &str) -> Result<[u8; 65], String> {
-    let bytes = B64
-        .decode(signature_b64)
-        .map_err(|e| format!("decode host signature: {e}"))?;
-    <[u8; 65]>::try_from(bytes.as_slice())
-        .map_err(|_| format!("host signature is {} bytes, expected 65", bytes.len()))
 }
 
 fn parse_payment_required(

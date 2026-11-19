@@ -196,10 +196,11 @@ impl AddressHistorySource for EtherscanClient {
         page_size: u32,
         sort: Sort,
     ) -> Result<Vec<TxRecord>, DataSourceError> {
-        EtherscanClient::get_tx_list(
-            self,
+        self.account_history(
             chain_id,
+            "txlist",
             addr,
+            None,
             start_block,
             end_block,
             page,
@@ -220,10 +221,11 @@ impl AddressHistorySource for EtherscanClient {
         page_size: u32,
         sort: Sort,
     ) -> Result<Vec<TxRecord>, DataSourceError> {
-        EtherscanClient::get_internal_tx_list(
-            self,
+        self.account_history(
             chain_id,
+            "txlistinternal",
             addr,
+            None,
             start_block,
             end_block,
             page,
@@ -245,9 +247,9 @@ impl AddressHistorySource for EtherscanClient {
         page_size: u32,
         sort: Sort,
     ) -> Result<Vec<TokenTransfer>, DataSourceError> {
-        EtherscanClient::get_token_tx(
-            self,
+        self.account_history(
             chain_id,
+            "tokentx",
             addr,
             contract_addr_filter,
             start_block,
@@ -271,9 +273,9 @@ impl AddressHistorySource for EtherscanClient {
         page_size: u32,
         sort: Sort,
     ) -> Result<Vec<TokenTransfer>, DataSourceError> {
-        EtherscanClient::get_nft_tx(
-            self,
+        self.account_history(
             chain_id,
+            "tokennfttx",
             addr,
             contract_addr_filter,
             start_block,
@@ -297,9 +299,9 @@ impl AddressHistorySource for EtherscanClient {
         page_size: u32,
         sort: Sort,
     ) -> Result<Vec<TokenTransfer>, DataSourceError> {
-        EtherscanClient::get_nft1155_tx(
-            self,
+        self.account_history(
             chain_id,
+            "token1155tx",
             addr,
             contract_addr_filter,
             start_block,

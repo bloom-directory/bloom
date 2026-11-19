@@ -8,8 +8,8 @@ use alloy::signers::{Error as SignerError, Result as SignerResult, Signer};
 use alloy::sol_types::{SolCall, SolStruct, eip712_domain};
 use async_trait::async_trait;
 use bloom_paid_http::{
-    EmptyPaidHttpChainRpcResolver, NormalizedChallenge, PaidHttpChainRpcResolver,
-    PaidHttpHostSigner, PaidHttpSigningFacts, ParsedRequest, usd_to_atomic_units,
+    NormalizedChallenge, PaidHttpChainRpcResolver, PaidHttpHostSigner, PaidHttpSigningFacts,
+    ParsedRequest, usd_to_atomic_units,
 };
 use bloom_proto::Policy;
 use mpp::client::tempo::charge::{SignOptions, TempoCharge};
@@ -79,21 +79,6 @@ impl RealMppBackend {
             draft_path: None,
             channel_dir: None,
         }
-    }
-
-    pub fn without_rpc_resolver(
-        client: reqwest::Client,
-        wallet_address: Address,
-        host_signer: Arc<dyn PaidHttpHostSigner>,
-        facts: PaidHttpSigningFacts,
-    ) -> Self {
-        Self::new(
-            client,
-            Arc::new(EmptyPaidHttpChainRpcResolver),
-            wallet_address,
-            host_signer,
-            facts,
-        )
     }
 }
 

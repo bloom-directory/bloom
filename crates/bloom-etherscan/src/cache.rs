@@ -31,12 +31,6 @@ impl EtherscanCache {
         }
     }
 
-    /// Set the default TTL (builder-style).
-    pub fn with_default_ttl(mut self, ttl: Duration) -> Self {
-        self.default_ttl = ttl;
-        self
-    }
-
     /// Root directory.
     pub fn dir(&self) -> &Path {
         &self.dir
@@ -129,30 +123,6 @@ impl EtherscanCache {
             .map_err(|e| EtherscanError::InvalidResponse(format!("cache write {path:?}: {e}")))?;
         Ok(())
     }
-
-    /// Convenience: read-through cache. Calls `fetch` only on miss/expiry.
-    pub async fn get_or_fetch<T, F, Fut>(
-        &self,
-        chain_id: u64,
-        kind: &str,
-        key: &str,
-        ttl: Option<Duration>,
-        fetch: F,
-    ) -> Result<T, EtherscanError>
-    where
-        T: Serialize + DeserializeOwned,
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<T, EtherscanError>>,
-    {
-        if let Some(v) = self.get::<T>(chain_id, kind, key, ttl) {
-            return Ok(v);
-        }
-        let v = fetch().await?;
-        if let Err(e) = self.put(chain_id, kind, key, &v) {
-            warn!(error = %e, "cache.put_failed");
-        }
-        Ok(v)
-    }
 }
 
 #[cfg(test)]
@@ -206,29 +176,6 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         let got2: Option<Demo> = cache.get(1, "abi", "k", Some(Duration::from_millis(1)));
         assert!(got2.is_none(), "expected expiry miss");
-    }
-
-    #[tokio::test]
-    async fn get_or_fetch_calls_fetch_once() {
-        let dir = TempDir::new().unwrap();
-        let cache = EtherscanCache::new(dir.path().to_path_buf());
-        let v1: Demo = cache
-            .get_or_fetch(1, "kind", "k", None, || async {
-                Ok(Demo {
-                    a: 9,
-                    b: "z".into(),
-                })
-            })
-            .await
-            .unwrap();
-        assert_eq!(v1.a, 9);
-        let reloaded: Demo = cache
-            .get_or_fetch(1, "kind", "k", None, || async {
-                panic!("should not call fetch on hit")
-            })
-            .await
-            .unwrap();
-        assert_eq!(reloaded, v1);
     }
 
     #[test]

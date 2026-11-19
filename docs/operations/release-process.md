@@ -10,9 +10,8 @@ support, so retrying that tag cannot add an ARM artifact.
 
 A release tag containing this release machinery publishes signed triad bundles
 for **Linux x86_64**, **Linux aarch64**, and **macOS aarch64**. Each archive
-includes Machine (`bloom`), Broker, Signer,
-`bloom-signer-migrate`, public configuration templates, and installers. The
-published assets are:
+includes Machine (`bloom`), Broker, Signer, public configuration templates,
+and installers. The published assets are:
 
 - `bloom-triad-linux-x86_64.tar.gz` plus `.sha256`, `.sig`, and `.pub` sidecars;
 - `bloom-triad-linux-aarch64.tar.gz` plus `.sha256`, `.sig`, and `.pub` sidecars;

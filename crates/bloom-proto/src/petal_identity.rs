@@ -26,17 +26,6 @@ pub fn is_placeholder_digest(digest: &str) -> bool {
     digest.starts_with(PLACEHOLDER_DIGEST_PREFIX)
 }
 
-/// Placeholder digest for a known first-party Petal, if one exists.
-pub fn placeholder_digest_for(petal_id: &str) -> Option<&'static str> {
-    match petal_id {
-        PETAL_ID_EVM_WALLET => Some(PLACEHOLDER_DIGEST_EVM_WALLET),
-        PETAL_ID_PAID_HTTP => Some(PLACEHOLDER_DIGEST_PAID_HTTP),
-        PETAL_ID_DEFI => Some(PLACEHOLDER_DIGEST_DEFI),
-        PETAL_ID_WALLET_POLICY => Some(PLACEHOLDER_DIGEST_WALLET_POLICY),
-        _ => None,
-    }
-}
-
 /// Human-readable provenance class for audit and status projections.
 pub fn label_petal_digest(digest: &str) -> &'static str {
     if is_placeholder_digest(digest) {

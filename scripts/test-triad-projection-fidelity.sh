@@ -359,17 +359,16 @@ if [ -z "${BLOOM_INTEGRATION_DEBUG_DRIVER_BIN:-}" ]; then
 fi
 start_stack
 
-# Machine exposes paired credential addition, replacement, and explicit legacy
-# receipt migration. Prove the exact CLI inventory and that credential mutation
-# is not exposed as an unaudited mounted control.
+# Machine exposes paired credential addition and replacement. Prove the exact
+# CLI inventory and that credential mutation is not exposed as an unaudited
+# mounted control.
 wallet_help="$(cli wallet --help)"
 credential_commands="$(printf '%s\n' "$wallet_help" |
   sed -n 's/^  \([a-z][a-z-]*\)  *.*/\1/p' |
   grep -E '(credential|passkey|authenticator)' || true)"
 [ "$credential_commands" = "add-passkey
-migrate-passkey
 rebind-passkey" ] ||
-  die "credential-change CLI inventory differs from add-passkey, migrate-passkey, rebind-passkey: ${credential_commands:-<none>}"
+  die "credential-change CLI inventory differs from add-passkey, rebind-passkey: ${credential_commands:-<none>}"
 
 printf 'MA-03: registering wallet through Broker/Signer...\n'
 registration_launch="$(cli wallet new ma03-registration)"

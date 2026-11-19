@@ -33,7 +33,6 @@ upgrade_transaction_scratch=""
 upgrade_old_digest=""
 upgrade_phase=""
 restore_pending=false
-legacy_cli_removed=false
 pf_cleanup_scratch=""
 
 cleanup() {
@@ -111,7 +110,7 @@ snapshot_live_payload() {
 prepare_verified_payload_for_execution() {
   $live || return 0
   xattr -dr com.apple.quarantine "$payload" || die "could not remove quarantine from the verified payload"
-  for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
+  for binary in bloom bloom-broker bloom-signer; do
     if xattr -p com.apple.quarantine "$payload/bin/$binary" >/dev/null 2>&1; then
       die "verified payload binary remains quarantined: $binary"
     fi
@@ -249,7 +248,7 @@ recover_interrupted_fresh_accounts() {
 }
 
 verify_payload() {
-  for path in bin/bloom bin/bloom-broker bin/bloom-signer bin/bloom-signer-migrate PLATFORM_CLAIM; do [[ -f "$payload/$path" ]] || die "payload missing $path"; done
+  for path in bin/bloom bin/bloom-broker bin/bloom-signer PLATFORM_CLAIM; do [[ -f "$payload/$path" ]] || die "payload missing $path"; done
   claim="$(<"$payload/PLATFORM_CLAIM")"
   if $live; then
     case "$claim" in
@@ -403,7 +402,6 @@ remove_legacy_cli() {
       rm -f -- "$legacy"
     fi
     [[ ! -e "$legacy" && ! -L "$legacy" ]] || return 1
-    legacy_cli_removed=true
     echo "Removed legacy $legacy; run 'hash -r' or 'rehash', or open a new terminal"
     return 0
   fi
@@ -411,80 +409,10 @@ remove_legacy_cli() {
   return 1
 }
 
-# A legacy wallet has finished migrating when its staging receipt names the
-# address the running Machine now reports for that wallet. Anything that cannot
-# be confirmed (no receipt, an unreadable one, a Machine that does not answer)
-# counts as not migrated, so its instructions are still shown.
-legacy_wallet_migrated() {
-  local wallet_name="$1" receipt="$2" staged current
-  $live || return 1
-  [[ -f "$receipt" && ! -L "$receipt" ]] || return 1
-  staged="$(/usr/bin/sudo -u "$login_user" -- /usr/bin/plutil -extract address raw -o - "$receipt" 2>/dev/null)" || return 1
-  [[ "$staged" =~ ^0x[0-9a-fA-F]{40}$ ]] || return 1
-  current="$(launchctl asuser "$login_uid" /usr/bin/sudo -u "$login_user" -H "$release_base/current/bloom" --home "$login_home/.bloom" -q wallet address "$wallet_name" 2>/dev/null)" || return 1
-  [[ "$(printf '%s' "$current" | tr 'A-F' 'a-f')" == "$(printf '%s' "$staged" | tr 'A-F' 'a-f')" ]]
-}
-
-report_legacy_wallet_migrations() {
-  local wallet_root wallet_dir kind_file kind wallet_name receipt migrated=""
-  local found_wallet=false found_supported=false
+report_legacy_wallets() {
   resolve_login_home
-  wallet_root="$login_home/.bloom/keystore"
-  if [[ ! -e "$wallet_root" && ! -L "$wallet_root" ]]; then
-    if $legacy_cli_removed; then
-      echo "Legacy Bloom wallets, if present, remain under $wallet_root"
-    fi
-    return 0
-  fi
-  if [[ ! -d "$wallet_root" || -L "$wallet_root" ]]; then
-    echo "Legacy Bloom wallet path is unsafe and was not inspected: $wallet_root" >&2
-    return 0
-  fi
-
-  echo "Legacy Bloom wallets were not modified and remain at: $wallet_root"
-  for wallet_dir in "$wallet_root"/*; do
-    [[ -e "$wallet_dir" || -L "$wallet_dir" ]] || continue
-    found_wallet=true
-    wallet_name="${wallet_dir##*/}"
-    if [[ ! -d "$wallet_dir" || -L "$wallet_dir" ]]; then
-      echo "Skipping unexpected legacy wallet entry: $wallet_dir" >&2
-      continue
-    fi
-    kind_file="$wallet_dir/kind"
-    if [[ ! -f "$kind_file" || -L "$kind_file" ]]; then
-      echo "Legacy wallet $wallet_name has no safe kind file; it was not modified" >&2
-      continue
-    fi
-    if ! kind="$(/bin/cat "$kind_file")"; then
-      echo "Legacy wallet $wallet_name could not be inspected; it was not modified" >&2
-      continue
-    fi
-    if [[ "$kind" != passkey ]]; then
-      echo "Legacy wallet $wallet_name uses unsupported kind '$kind'; only v1 passkey wallets can be migrated automatically" >&2
-      continue
-    fi
-
-    found_supported=true
-    receipt="$login_home/.bloom/$wallet_name.triad-migration-receipt.json"
-    if legacy_wallet_migrated "$wallet_name" "$receipt"; then
-      migrated="${migrated:+$migrated, }$wallet_name"
-      continue
-    fi
-    echo "Migrate legacy passkey wallet $wallet_name with these two commands. Only the staging command requires sudo:"
-    printf '  sudo %q stage --source %q --config %q --source-uid %q --signer-uid %q --signer-gid %q --receipt %q\n' \
-      "$release_base/current/bloom-signer-migrate" "$wallet_dir" \
-      "$signer_config/config.json" "$login_uid" "$BLOOM_MACOS_SIGNER_UID" \
-      "$BLOOM_MACOS_SIGNER_GID" "$receipt"
-    printf '  %q wallet migrate-passkey %q\n' "$cli_link" "$receipt"
-  done
-  if [[ -n "$migrated" ]]; then
-    echo "Already migrated, no action needed: $migrated"
-  fi
-  if ! $found_wallet; then
-    echo "No legacy wallets were found in $wallet_root"
-  elif ! $found_supported; then
-    echo "No supported v1 passkey wallets were detected; legacy wallet data was left in place"
-  fi
+  [[ -e "$login_home/.bloom/keystore" || -L "$login_home/.bloom/keystore" ]] || return 0
+  echo "Legacy v1 Bloom wallets are not supported and were not modified: $login_home/.bloom/keystore"
 }
 
 current_release_digest() {
@@ -702,7 +630,7 @@ install_release() {
   release="$release_base/releases/$BLOOM_RELEASE_DIGEST"; mkdir -p "$release_base/releases"
   if [[ -e "$release" ]]; then
     [[ -d "$release" && ! -L "$release" ]] || die "invalid digest-named release"
-    for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
+    for binary in bloom bloom-broker bloom-signer; do
       if [[ ! -f "$release/$binary" || -L "$release/$binary" ]] || ! cmp "$payload/bin/$binary" "$release/$binary" >/dev/null; then
         die "digest-named release does not match the verified payload"
       fi
@@ -710,7 +638,7 @@ install_release() {
   else
     stage="$release_base/.release.$$.new"; mkdir "$stage"
     install -m 0755 "$payload/bin/bloom" "$stage/bloom"; install -m 0755 "$payload/bin/bloom-broker" "$stage/bloom-broker"
-    install -m 0755 "$payload/bin/bloom-signer" "$stage/bloom-signer"; install -m 0755 "$payload/bin/bloom-signer-migrate" "$stage/bloom-signer-migrate"
+    install -m 0755 "$payload/bin/bloom-signer" "$stage/bloom-signer"
     $live && chown -R root:wheel "$stage"; mv "$stage" "$release"
   fi
   machine_binary="$release_base/current/bloom"; broker_binary="$release_base/current/bloom-broker"; signer_binary="$release_base/current/bloom-signer"
@@ -1381,7 +1309,7 @@ case "$action" in
       upgrade_release "$upgrade_old_digest" "$BLOOM_RELEASE_DIGEST"
       login_uid="$requested_uid"; login_user="$requested_user"; load_names; paths; load_ids
       remove_legacy_cli || die "Bloom is healthy, but legacy CLI cleanup failed; remove ~/.local/bin/bloom and retry"
-      report_legacy_wallet_migrations
+      report_legacy_wallets
       cleanup_legacy_pf
       provision_remote_ceremonies
       echo "Bloom macOS release upgraded atomically"
@@ -1391,7 +1319,7 @@ case "$action" in
       upgrade_release "$shared_digest" "$BLOOM_RELEASE_DIGEST"
       login_uid="$requested_uid"; login_user="$requested_user"; load_names; paths; load_ids
       remove_legacy_cli || die "Bloom is healthy, but legacy CLI cleanup failed; remove ~/.local/bin/bloom and retry"
-      report_legacy_wallet_migrations
+      report_legacy_wallets
       cleanup_legacy_pf
       provision_remote_ceremonies
       echo "Bloom macOS release upgraded atomically"
@@ -1408,7 +1336,7 @@ case "$action" in
     write_state_schema
     if $restoring; then rm -f "$retained"; restore_pending=false; fi
     remove_legacy_cli || die "Bloom is healthy, but legacy CLI cleanup failed; remove ~/.local/bin/bloom and retry"
-    report_legacy_wallet_migrations
+    report_legacy_wallets
     provision_remote_ceremonies
     if $restoring; then echo "Bloom macOS retained custody restored"; else echo "Bloom macOS enrollment installed or repaired"; fi
     ;;

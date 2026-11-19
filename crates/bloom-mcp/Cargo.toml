@@ -14,7 +14,6 @@ bloom-proto.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 percent-encoding.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

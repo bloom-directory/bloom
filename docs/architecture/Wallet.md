@@ -58,8 +58,7 @@ Raw-key migration preserves the corresponding EVM account, but it creates an
 `imported-secp256k1-scalar` wallet rather than a BIP-39 root. It cannot derive
 Solana accounts. A user who needs native Solana support must create or import a
 passphrase-free BIP-39 wallet and transfer assets to its derived accounts.
-Existing v1 passkey wallets use `bloom wallet migrate-passkey <receipt>`; that
-receipt carries public binding data, not the credential secret or root key.
+Legacy v1 passkey wallets are not supported.
 
 Broker projects public derived accounts through `wallet.accounts`; Machine
 exposes the authenticated collection as `wallets/<wallet>/accounts.json`.

@@ -181,7 +181,7 @@ done
   exit 65
 }
 
-for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
+for binary in bloom bloom-broker bloom-signer; do
   install -m 0755 "$candidate_payload/bin/$binary" "$staging_root/bin/$binary"
 done
 w0_signing_key="$local_output_root/w0-release-key"

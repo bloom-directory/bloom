@@ -398,12 +398,7 @@ fn authenticate_installer_payload(payload: &Path, private_key: &Path) {
 fn make_staging(root: &Path) -> PathBuf {
     let staging = root.join("staging");
     fs::create_dir_all(staging.join("bin")).unwrap();
-    for binary in [
-        "bloom",
-        "bloom-broker",
-        "bloom-signer",
-        "bloom-signer-migrate",
-    ] {
+    for binary in ["bloom", "bloom-broker", "bloom-signer"] {
         let path = staging.join("bin").join(binary);
         let version = if binary == "bloom" {
             env!("CARGO_PKG_VERSION")
@@ -1849,20 +1844,6 @@ fn bundle_rejects_a_service_outside_the_current_only_matrix() {
     let key = directory.path().join("release-key.pem");
     generate_ed25519_key(&key);
     let built = build(&staging, &directory.path().join("old-signer.tar.gz"), &key);
-    assert!(!built.status.success());
-    assert!(String::from_utf8_lossy(&built.stderr).contains("compatibility matrix"));
-
-    let staging = make_staging(&directory.path().join("migration-skew"));
-    fs::write(
-        staging.join("bin/bloom-signer-migrate"),
-        b"#!/bin/sh\necho bloom-signer-migrate 0.0.9\n",
-    )
-    .unwrap();
-    let built = build(
-        &staging,
-        &directory.path().join("old-migration-tool.tar.gz"),
-        &key,
-    );
     assert!(!built.status.success());
     assert!(String::from_utf8_lossy(&built.stderr).contains("compatibility matrix"));
 }
@@ -5408,12 +5389,7 @@ fn linux_legacy_interrupted_upgrade_recovers_without_operator_intervention() {
     // previous installer opened with `rewrite_linux_release_set activating`.
     let releases = root.join("usr/libexec/bloom/releases").join(&new_digest);
     fs::create_dir_all(&releases).unwrap();
-    for binary in [
-        "bloom",
-        "bloom-broker",
-        "bloom-signer",
-        "bloom-signer-migrate",
-    ] {
+    for binary in ["bloom", "bloom-broker", "bloom-signer"] {
         fs::copy(payload_b.join("bin").join(binary), releases.join(binary)).unwrap();
         set_linux_mode(&releases.join(binary), 0o755);
     }

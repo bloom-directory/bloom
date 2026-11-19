@@ -613,17 +613,6 @@ impl Outbox {
         }
     }
 
-    /// Mirror a runtime-generated pending action artifact into the central
-    /// outbox projection, when one is attached.
-    pub fn write_central_pending_artifact(
-        &self,
-        action_id: &str,
-        file: &str,
-        data: &[u8],
-    ) -> Result<(), OutboxError> {
-        self.write_central_action_artifact(action_id, OutboxState::Pending, file, data)
-    }
-
     /// Move the central projected action, if a projection is attached.
     pub fn transition_central_action(
         &self,
@@ -808,15 +797,6 @@ impl Outbox {
             return Ok(None);
         }
         Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
-    }
-
-    pub fn has_broadcast_attempt(&self, entry: &OutboxEntry) -> Result<bool, OutboxError> {
-        for kind in BroadcastAttemptKind::ALL {
-            if self.read_broadcast_attempt(entry, kind)?.is_some() {
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
 
     pub fn write_broadcast_raw_tx(
