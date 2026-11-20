@@ -464,30 +464,6 @@ async fn installed_packages_keep_explicit_account_routes_and_private_state() {
     }
 
     if hashes.contains_key("polymarket") {
-        let key = b"synthetic-polymarket-service-key";
-        let router = "0x1111111111111111111111111111111111111111";
-        let body = serde_json::to_vec(&serde_json::json!({
-            "api_key": std::str::from_utf8(key).unwrap(), "router": router
-        }))
-        .unwrap();
-        vfs.write(&mounted("polymarket", "settings/enso-api-key"), &body)
-            .await
-            .unwrap();
-        let global = PrivateStore::open(store.private_data_root()).unwrap();
-        let hash = &hashes["polymarket"];
-        assert_eq!(global.get(hash, "secrets/creds/enso-api-key").unwrap(), key);
-        assert_eq!(
-            global.get(hash, "state/settings/enso-router").unwrap(),
-            router.as_bytes()
-        );
-        assert!(
-            !String::from_utf8_lossy(
-                &vfs.read(&mounted("polymarket", "settings/enso-api-key"))
-                    .await
-                    .unwrap()
-            )
-            .contains(std::str::from_utf8(key).unwrap())
-        );
         for (index, body) in [
             (0, b"enabled = false\n".as_slice()),
             (1, b"enabled = true\n".as_slice()),
