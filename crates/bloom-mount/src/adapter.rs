@@ -1219,6 +1219,19 @@ impl FileSystem for BloomFs {
                                     // an explicit READ can retry the backend.
                                     warn!(path = %path, ?error, "mount.adapter.getattr.using_size_hint_after_render_failure");
                                     e.size
+                                } else if e.mode & 0o200 != 0 {
+                                    // A writable file the backend cannot
+                                    // render yet, e.g. a Petal record whose
+                                    // parameterized route LOOKUP matches but
+                                    // which no WRITE has created. NFS OPEN
+                                    // finds such a name via LOOKUP, skips
+                                    // CREATE, and fails with EIO if its attrs
+                                    // fail, so the write that would create
+                                    // it can never be issued. Report the
+                                    // entry's size and leave the error
+                                    // uncached so READ still surfaces it.
+                                    debug!(path = %path, ?error, "mount.adapter.getattr.writable_render_failed");
+                                    e.size
                                 } else {
                                     self.render_cache.put_error(path, error, RENDER_CACHE_TTL);
                                     warn!(path = %path, ?error, "mount.adapter.getattr.render_failed");
@@ -3819,6 +3832,112 @@ mod tests {
         assert_eq!(attrs.size, 0);
         let err = fs.read(&ctx, &confirm, 0, 1024).await.unwrap_err();
         assert_eq!(err, FsError::IsDirectory);
+    }
+
+    /// Models a Petal parameterized writable route such as
+    /// `deployments/<wallet>/<index>/<id>.json`: LOOKUP reports every name
+    /// as an existing writable file (the route matches it), but READ fails
+    /// with a backend error until a WRITE has created the record.
+    #[derive(Default)]
+    struct UnwrittenRecordHandler {
+        records: parking_lot::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+    }
+    #[async_trait]
+    impl Handler for UnwrittenRecordHandler {
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            match p.segments() {
+                [] => Ok(Entry::dir("")),
+                [name] => Ok(Entry::writable_file(name)),
+                _ => Err(HandlerError::NotFound(p.to_string_path())),
+            }
+        }
+        async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            self.records
+                .lock()
+                .get(&p.to_string_path())
+                .cloned()
+                .ok_or_else(|| HandlerError::Backend("record not found".into()))
+        }
+        async fn write(&self, p: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
+            self.records
+                .lock()
+                .insert(p.to_string_path(), data.to_vec());
+            Ok(())
+        }
+        async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            if p.is_root() {
+                Ok(Vec::new())
+            } else {
+                Err(HandlerError::NotADir(p.to_string_path()))
+            }
+        }
+    }
+
+    /// Regression: `printf '{...}' > <petal>/deployments/<w>/<i>/<id>.json`
+    /// failed with EIO. NFS OPEN(create) finds the name via LOOKUP, so it
+    /// never calls CREATE; it then fetches the opened file's attributes, and
+    /// GETATTR rendered the not-yet-written record, got a backend error and
+    /// failed the OPEN with NFS4ERR_IO. A writable file whose render fails
+    /// must still report attributes so the client can write it.
+    #[tokio::test]
+    async fn open_for_write_of_unwritten_writable_record_does_not_eio() {
+        let handler = Arc::new(UnwrittenRecordHandler::default());
+        let vfs = Vfs::builder().mount("box", handler.clone()).build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BloomHandle::Root, "box").await.unwrap();
+        let record = fs.lookup(&ctx, &dir, "new.json").await.unwrap();
+
+        // OPEN's post-lookup attribute fetch.
+        let attrs = fs.getattr(&ctx, &record).await.unwrap();
+        assert_eq!(attrs.size, 0);
+        assert_eq!(attrs.mode & 0o777, 0o644);
+        // O_TRUNC arrives as SETATTR(size = 0), which also reports attrs.
+        let attrs = fs
+            .setattr(&ctx, &record, &SetAttrs::default())
+            .await
+            .unwrap();
+        assert_eq!(attrs.size, 0);
+
+        let body = br#"{"chain":"anvil"}"#;
+        fs.write(
+            &ctx,
+            &record,
+            0,
+            Bytes::copy_from_slice(body),
+            WriteStability::FileSync,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            handler.records.lock().get("/new.json").map(Vec::as_slice),
+            Some(&body[..])
+        );
+        // The render error was not cached: the written record is visible.
+        assert_eq!(
+            fs.getattr(&ctx, &record).await.unwrap().size,
+            body.len() as u64
+        );
+        assert_eq!(
+            &fs.read(&ctx, &record, 0, 4096).await.unwrap().data[..],
+            body
+        );
+    }
+
+    /// A READ of an unwritten writable record still surfaces the backend
+    /// error; only GETATTR falls back to the entry's size.
+    #[tokio::test]
+    async fn unwritten_writable_record_read_still_reports_render_error() {
+        let vfs = Vfs::builder()
+            .mount("box", Arc::new(UnwrittenRecordHandler::default()))
+            .build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BloomHandle::Root, "box").await.unwrap();
+        let record = fs.lookup(&ctx, &dir, "new.json").await.unwrap();
+        assert_eq!(fs.getattr(&ctx, &record).await.unwrap().size, 0);
+        let error = fs.read(&ctx, &record, 0, 4096).await.unwrap_err();
+        assert_eq!(error, FsError::Io);
     }
 
     /// Handler that exposes a read-only file whose `read` actually
