@@ -11,8 +11,9 @@ Infer what Bloom state settles; ask only for what it cannot:
 - With one wallet or account, use it.
 - A read that names no chain covers every chain: read `holdings.json`.
 - For a write, use the only chain where `holdings.json` shows the asset, or
-  the network the Petal's documentation names as its default. If two or more
-  funded chains remain, ask one question that names them.
+  the network the Petal's documentation names as its default. Drop testnets
+  unless the user names one; if two or more funded chains remain, ask one
+  question that names them.
 - If `holdings.json` has an `errors` entry for a chain that could hold the
   asset, say so rather than treating that chain as empty.
 

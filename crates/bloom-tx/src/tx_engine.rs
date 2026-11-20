@@ -131,10 +131,18 @@ pub enum TxEngineError {
     Address(String),
     #[error("amount: {0}")]
     Amount(String),
+    /// A `call` body whose arguments do not fit its method.
+    #[error("{0}")]
+    Call(String),
+    /// A body's `data` is not hex calldata.
+    #[error("invalid data: {0}; give the calldata as 0x-prefixed hex, two digits per byte")]
+    Data(String),
     #[error("invalid EIP-1559 fee override: {0}")]
     InvalidFeeOverride(String),
-    #[error("policy denied")]
-    PolicyDenied,
+    /// The checks that refused it, so the caller can tell a wrong address
+    /// from a payee the policy does not allow.
+    #[error("policy denied: {0}")]
+    PolicyDenied(String),
     #[error("broadcast approval required {0}")]
     ApprovalRequired(ApprovalRequirement),
     #[error("approval service unavailable: {0}")]
@@ -884,9 +892,56 @@ impl TxEngine {
         }
     }
 
+    /// The native value a `send` body moves on `spec`'s chain, or `None` when
+    /// it names an ERC-20 token. Staging and simulation share it, so one
+    /// body is the same transaction in both.
+    pub fn native_send_value(
+        spec: &ChainSpec,
+        value: &str,
+        token: &Option<String>,
+        amount: &str,
+    ) -> Result<Option<U256>, TxEngineError> {
+        // The chain's own native symbol (POL, BNB, AVAX, ...) is a
+        // native send, not an ERC-20 lookup.
+        if token
+            .as_deref()
+            .is_some_and(|t| t.trim().eq_ignore_ascii_case(&spec.native_symbol))
+        {
+            if !matches!(value.trim(), "" | "0") {
+                return Err(TxEngineError::Amount(
+                    "native sends take one amount; value and amount were both set".into(),
+                ));
+            }
+            return parse_units(amount.trim(), spec.native_decimals)
+                .map(Some)
+                .map_err(|e| TxEngineError::Amount(e.to_string()));
+        }
+        // "eth"/"ether" name an asset. On a chain whose native token is
+        // something else, sending it would move a different asset.
+        if token.is_none() && !spec.native_symbol.eq_ignore_ascii_case("ETH") {
+            let unit = parse_amount(value).map(|p| p.unit).unwrap_or_default();
+            if unit == "eth" || unit == "ether" {
+                return Err(TxEngineError::Amount(format!(
+                    "{} pays in {}, not ETH; write the amount in {}",
+                    spec.name, spec.native_symbol, spec.native_symbol
+                )));
+            }
+        }
+        let Some(v) = Self::resolve_native_value(value, token)? else {
+            return Ok(None);
+        };
+        if !amount.trim().is_empty() {
+            return Err(TxEngineError::Amount(
+                "native sends must use value; amount is only for token sends".into(),
+            ));
+        }
+        Ok(Some(v))
+    }
+
     /// Resolve an ERC-20 token symbol or 0x address into a concrete
-    /// contract address on the given chain.
-    fn resolve_token_address(
+    /// contract address on the given chain. Staging and simulation share
+    /// it, so a token named in a body is the same contract in both.
+    pub fn resolve_token_address(
         token: &str,
         chain_id: u64,
     ) -> Result<(Address, String), TxEngineError> {
@@ -971,40 +1026,7 @@ impl TxEngine {
                 data,
             } => {
                 let to_addr = self.resolve_recipient_async(to, address_book).await?;
-                let spec = chain.spec();
-                // The chain's own native symbol (POL, BNB, AVAX, ...) is a
-                // native send, not an ERC-20 lookup.
-                if token
-                    .as_deref()
-                    .is_some_and(|t| t.trim().eq_ignore_ascii_case(&spec.native_symbol))
-                {
-                    if !matches!(value.trim(), "" | "0") {
-                        return Err(TxEngineError::Amount(
-                            "native sends take one amount; value and amount were both set".into(),
-                        ));
-                    }
-                    let v = parse_units(amount.trim(), spec.native_decimals)
-                        .map_err(|e| TxEngineError::Amount(e.to_string()))?;
-                    let data = data.clone().unwrap_or_else(|| "0x".into());
-                    return Ok((Some(to_addr), v, data, None, None));
-                }
-                // "eth"/"ether" name an asset. On a chain whose native token is
-                // something else, sending it would move a different asset.
-                if token.is_none() && !spec.native_symbol.eq_ignore_ascii_case("ETH") {
-                    let unit = parse_amount(value).map(|p| p.unit).unwrap_or_default();
-                    if unit == "eth" || unit == "ether" {
-                        return Err(TxEngineError::Amount(format!(
-                            "{} pays in {}, not ETH; write the amount in {}",
-                            spec.name, spec.native_symbol, spec.native_symbol
-                        )));
-                    }
-                }
-                if let Some(v) = Self::resolve_native_value(value, token)? {
-                    if !amount.trim().is_empty() {
-                        return Err(TxEngineError::Amount(
-                            "native sends must use value; amount is only for token sends".into(),
-                        ));
-                    }
+                if let Some(v) = Self::native_send_value(chain.spec(), value, token, amount)? {
                     let data = data.clone().unwrap_or_else(|| "0x".into());
                     Ok((Some(to_addr), v, data, None, None))
                 } else {
@@ -1022,29 +1044,8 @@ impl TxEngine {
                     let token_str = token.as_deref().unwrap_or("");
                     let (token_addr, sym_hint) = Self::resolve_token_address(token_str, chain_id)?;
                     let meta = self.token_meta(chain, token_addr, &sym_hint).await?;
-                    let parsed =
-                        parse_amount(amount).map_err(|e| TxEngineError::Amount(e.to_string()))?;
-                    // A native metric unit (wei/gwei/eth) on an ERC-20 amount is
-                    // ambiguous — it would be silently rescaled by token
-                    // decimals. Reject it and point at the unambiguous forms.
-                    // A bare integer (explicit_unit == false) is still accepted
-                    // as a human token amount.
-                    if parsed.explicit_unit && parsed.is_native() {
-                        return Err(TxEngineError::Amount(format!(
-                            "'{amount}' uses a native unit ('{}') for an ERC-20 token; write a human \
-                             amount like '10 {}' or raw base units like '10000000 base'",
-                            parsed.unit, meta.symbol
-                        )));
-                    }
-                    // `base` means the number is already in token base units —
-                    // do not rescale by decimals.
-                    let scale = if parsed.unit == "base" {
-                        0
-                    } else {
-                        meta.decimals
-                    };
-                    let amount = parse_units(&parsed.number, scale)
-                        .map_err(|e| TxEngineError::Amount(e.to_string()))?;
+                    let (amount, number) =
+                        token_amount_base_units(amount, meta.decimals, &meta.symbol)?;
                     let call = IERC20::transferCall {
                         to: to_addr,
                         amount,
@@ -1055,7 +1056,7 @@ impl TxEngine {
                         symbol: meta.symbol.clone(),
                         decimals: meta.decimals,
                         recipient: bloom_proto::checksum_address(&to_addr),
-                        amount: parsed.number.clone(),
+                        amount: number,
                         amount_base_units: Some(amount.to_string()),
                     };
                     Ok((
@@ -1103,7 +1104,7 @@ impl TxEngine {
                     parse_eth(value).map_err(|e| TxEngineError::Amount(e.to_string()))?
                 };
                 let data = bloom_tools::encode_call(method, &serde_json::json!(args))
-                    .map_err(|e| TxEngineError::Amount(format!("encode_call: {e}")))?;
+                    .map_err(|e| TxEngineError::Call(format!("call {method}: {e}")))?;
                 Ok((Some(contract_addr), v, data, None, None))
             }
             RawIntentBody::Approve {
@@ -1579,7 +1580,10 @@ impl TxEngine {
                 advice = %mev_report.advice,
                 "tx.policy_denied"
             );
-            return Err(TxEngineError::PolicyDenied);
+            return Err(TxEngineError::PolicyDenied(format!(
+                "mev.fail_on_high_risk: {}",
+                mev_report.advice
+            )));
         }
 
         // Open a pinned read session for the balance + code reads so the
@@ -1670,6 +1674,9 @@ impl TxEngine {
                 }
             }
         }
+        // A tx staged behind none of this sender's pending entries runs on
+        // today's state, so a failed gas estimate can be judged now.
+        let mut runs_alone = intent.nonce.is_none();
         let nonce = match intent.nonce {
             Some(n) => n,
             None => {
@@ -1677,6 +1684,7 @@ impl TxEngine {
                 let pending_high = self
                     .outbox
                     .highest_pending_nonce(wallet, &spec.name, from)?;
+                runs_alone = pending_high.is_none();
                 // If there are staged-but-unconfirmed txs, use the slot
                 // after the highest pending nonce. After broadcast they
                 // move to sent/ and the chain RPC returns the updated
@@ -1732,6 +1740,17 @@ impl TxEngine {
                 buffered.max(21_000)
             }
             Err(e) => {
+                // A lone tx whose estimate failed because it reverts is
+                // refused here, before the owner is asked to approve it.
+                if runs_alone
+                    && !matches!(intent.body, RawIntentBody::Deploy { .. })
+                    && let Ok(Err(returndata)) =
+                        chain.eth_call_capture_revert(req.clone(), None).await
+                {
+                    return Err(TxEngineError::SimulationReverted {
+                        reason: crate::reconcile::decode_revert(&returndata),
+                    });
+                }
                 // Use the hint from the external estimator (e.g. Enso) when
                 // available, applying the same 25% buffer. Fall back to 500k
                 // only if no hint was provided.
@@ -2104,8 +2123,11 @@ impl TxEngine {
         );
         staged.policy_checks.extend(staged_policy_extras);
 
-        let plan =
+        let mut plan =
             bloom_proto::PlanRender::render(&staged, &spec.native_symbol, spec.native_decimals);
+        if let Some(action) = approve_action(chain, from, to, &data_hex).await {
+            plan = plan.replacen("\nChain:  ", &format!("\n{action}Chain:  "), 1);
+        }
         self.outbox.write_pending(&staged, &plan)?;
         if let Some(body) = conflict_body {
             self.outbox
@@ -2186,7 +2208,9 @@ impl TxEngine {
                 reason = "hard",
                 "tx.policy_denied"
             );
-            return Err(TxEngineError::PolicyDenied);
+            return Err(TxEngineError::PolicyDenied(policy_engine::denial(
+                &staged.policy_checks,
+            )));
         }
         let warn = policy_engine::has_warning(&staged.policy_checks);
         if warn && !override_warnings {
@@ -2197,7 +2221,9 @@ impl TxEngine {
                 reason = "warn_no_override",
                 "tx.policy_denied"
             );
-            return Err(TxEngineError::PolicyDenied);
+            return Err(TxEngineError::PolicyDenied(policy_engine::denial(
+                &staged.policy_checks,
+            )));
         }
 
         if !override_warnings {
@@ -2345,11 +2371,12 @@ impl TxEngine {
                 if let Some(dep_id) = staged.depends_on.as_deref() {
                     self.ensure_dependency_satisfied(wallet, &target.chain_name, dep_id)?;
                 }
-                if policy_engine::has_hard_violation(&staged.policy_checks) {
-                    return Err(TxEngineError::PolicyDenied);
-                }
-                if policy_engine::has_warning(&staged.policy_checks) && !override_warnings {
-                    return Err(TxEngineError::PolicyDenied);
+                if policy_engine::has_hard_violation(&staged.policy_checks)
+                    || policy_engine::has_warning(&staged.policy_checks) && !override_warnings
+                {
+                    return Err(TxEngineError::PolicyDenied(policy_engine::denial(
+                        &staged.policy_checks,
+                    )));
                 }
                 if policy.private.enabled
                     && !matches!(
@@ -2643,7 +2670,9 @@ impl TxEngine {
                 reason = "hard",
                 "tx.policy_denied"
             );
-            return Err(TxEngineError::PolicyDenied);
+            return Err(TxEngineError::PolicyDenied(policy_engine::denial(
+                &staged.policy_checks,
+            )));
         }
         let warn = policy_engine::has_warning(&staged.policy_checks);
         if warn && !override_warnings {
@@ -2654,7 +2683,9 @@ impl TxEngine {
                 reason = "warn_no_override",
                 "tx.policy_denied"
             );
-            return Err(TxEngineError::PolicyDenied);
+            return Err(TxEngineError::PolicyDenied(policy_engine::denial(
+                &staged.policy_checks,
+            )));
         }
 
         // Pre-broadcast simulation first (no side effects): eth_call against
@@ -3246,7 +3277,17 @@ impl TxEngine {
                 returned_hash: Some(returned),
             })
         } else {
-            let returned = chain.send_raw(signed.raw.clone()).await?;
+            let returned = match chain.send_raw(signed.raw.clone()).await {
+                Ok(returned) => returned,
+                // The node may have taken the transaction and lost only its
+                // answer. When the chain knows these exact bytes' hash, the
+                // send happened: report it as sent, not as an unknown error
+                // the caller has to investigate.
+                Err(error) => match chain_knows_tx(chain, signed.hash).await {
+                    Ok(true) => signed.hash,
+                    _ => return Err(error.into()),
+                },
+            };
             if returned != signed.hash {
                 return Err(TxEngineError::BroadcastHashMismatch {
                     expected: format!("{:#x}", signed.hash),
@@ -5574,7 +5615,7 @@ fn decode_data(s: &str) -> Result<Bytes, TxEngineError> {
         return Ok(Bytes::new());
     }
     let s = s.strip_prefix("0x").unwrap_or(s);
-    let v = hex::decode(s).map_err(|e| TxEngineError::Amount(format!("data: {e}")))?;
+    let v = hex::decode(s).map_err(|e| TxEngineError::Data(e.to_string()))?;
     Ok(Bytes::from(v))
 }
 
@@ -5706,6 +5747,49 @@ fn parse_approve_amount(s: &str) -> Result<U256, String> {
     U256::from_str_radix(t, 10).map_err(|e| format!("invalid uint256 '{s}': {e}"))
 }
 
+/// An ERC-20 approve's plan line: the allowance it sets beside the one it
+/// replaces, so neither needs reading from the chain. Best effort: `None`
+/// when the token cannot be read.
+async fn approve_action(
+    chain: &ChainClient,
+    owner: Address,
+    token: Option<Address>,
+    data_hex: &str,
+) -> Option<String> {
+    let call =
+        IERC20::approveCall::abi_decode(&hex::decode(data_hex.trim_start_matches("0x")).ok()?)
+            .ok()?;
+    let token = token?;
+    let decimals = chain.erc20_decimals(token).await.ok()??;
+    // The token contract chooses its symbol: show it only when it cannot
+    // pass for plan text (a newline could forge a line), else the address.
+    let symbol = match chain.erc20_symbol(token).await {
+        Ok(Some(symbol))
+            if (1..=16).contains(&symbol.len())
+                && symbol
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) =>
+        {
+            symbol
+        }
+        _ => short_addr_label(&token),
+    };
+    let now = chain
+        .erc20_allowance(token, owner, call.spender)
+        .await
+        .ok()??;
+    let shown = |amount: U256| match amount {
+        U256::MAX => format!("unlimited {symbol}"),
+        amount => format!("{} {symbol}", bloom_proto::format_units(amount, decimals)),
+    };
+    Some(format!(
+        "Action: Allow {} to spend {} (allowance now {})\n",
+        bloom_proto::checksum_address(&call.spender),
+        shown(call.amount),
+        shown(now)
+    ))
+}
+
 /// Pull the `spender` argument out of an `approve(address,uint256)`
 /// calldata blob. Returns `None` if the buffer doesn't decode as an
 /// approve call — the caller treats that as "no spender hint" and
@@ -5817,6 +5901,32 @@ fn short_addr_label(a: &Address) -> String {
     } else {
         s
     }
+}
+
+/// Base units of an ERC-20 `amount` as an outbox body writes it, with the
+/// number as written. Staging and simulation share it, so the same body
+/// means the same transfer in both.
+pub fn token_amount_base_units(
+    amount: &str,
+    decimals: u8,
+    symbol: &str,
+) -> Result<(U256, String), TxEngineError> {
+    let parsed = parse_amount(amount).map_err(|e| TxEngineError::Amount(e.to_string()))?;
+    // A native metric unit (wei/gwei/eth) on an ERC-20 amount is ambiguous:
+    // it would be silently rescaled by token decimals. Reject it and point
+    // at the unambiguous forms. A bare number is a human token amount.
+    if parsed.explicit_unit && parsed.is_native() {
+        return Err(TxEngineError::Amount(format!(
+            "'{amount}' uses a native unit ('{}') for an ERC-20 token; write a human \
+             amount like '10 {symbol}' or raw base units like '10000000 base'",
+            parsed.unit
+        )));
+    }
+    // `base` means the number is already in token base units.
+    let scale = if parsed.unit == "base" { 0 } else { decimals };
+    let base =
+        parse_units(&parsed.number, scale).map_err(|e| TxEngineError::Amount(e.to_string()))?;
+    Ok((base, parsed.number))
 }
 
 /// Resolve an ERC-20 symbol to its address via the token list Broker also
@@ -6646,6 +6756,67 @@ mod tests {
                 symbol: "TKN".into(),
                 decimals: 6,
             })
+        );
+    }
+
+    /// An approve's plan shows the allowance it replaces, so a revoke needs
+    /// no read of the chain before or after.
+    #[tokio::test]
+    async fn an_approve_plan_shows_the_allowance_it_replaces() {
+        let word = |n: u64| format!("\"0x{n:064x}\"");
+        let symbol = |text: &str| {
+            format!(
+                "\"0x{:064x}{:064x}{:0<64}\"",
+                32,
+                text.len(),
+                hex::encode(text)
+            )
+        };
+        // The second read names a symbol that would forge a plan line.
+        let calls = vec![
+            word(6),
+            symbol("USDC"),
+            word(1_000_000_000),
+            word(6),
+            symbol("X\n## Policy"),
+            word(0),
+        ];
+        let chain =
+            stage_chain(&spawn_queued_rpc(HashMap::from([("eth_call".to_owned(), calls)])).await);
+        let spender: Address = "0x60e4f02b4975fbef4b951938859b7e4d5fd1372d"
+            .parse()
+            .unwrap();
+        let data = format!(
+            "0x{}",
+            hex::encode(
+                IERC20::approveCall {
+                    spender,
+                    amount: U256::ZERO
+                }
+                .abi_encode()
+            )
+        );
+        let token: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+            .parse()
+            .unwrap();
+        let owner: Address = TEST_SIGNER_ADDRESS.parse().unwrap();
+        assert_eq!(
+            approve_action(&chain, owner, Some(token), &data)
+                .await
+                .as_deref(),
+            Some(
+                "Action: Allow 0x60E4f02b4975fbEf4b951938859B7e4d5fD1372d to spend 0 USDC (allowance now 1000 USDC)\n"
+            )
+        );
+        // `stage` splices the line in before the plan's `Chain:` line.
+        let plan = bloom_proto::PlanRender::render(&fake_staged_1559("x"), "ETH", 18);
+        assert!(plan.contains("\nChain:  "), "{plan}");
+        let forged = approve_action(&chain, owner, Some(token), &data)
+            .await
+            .unwrap();
+        assert!(
+            !forged.contains("## Policy") && forged.contains("0xa0b8…eb48"),
+            "{forged}"
         );
     }
 
@@ -7915,6 +8086,71 @@ mod tests {
             .await
             .expect_err("a creation must not be staged on a blind default");
         assert!(error.to_string().contains("cannot estimate gas"), "{error}");
+    }
+
+    /// A tx that reverts against today's state is refused when it is staged,
+    /// with the reason, not after the owner approved it. Behind a pending
+    /// entry it may rely on (a spend after its approval), it is staged.
+    #[tokio::test]
+    async fn a_lone_reverting_tx_is_refused_at_staging() {
+        let stf = format!("0x08c379a0{:064x}{:064x}{:0<64}", 32, 3, hex::encode("STF"));
+        // Each stage reads a fresh node: its answers are queued, not replayed.
+        let node = || async {
+            let mut responses = stage_rpc_responses(false);
+            responses.remove("eth_estimateGas");
+            responses.insert(
+                "eth_call".into(),
+                vec![format!(
+                    r#"error:{{"code":3,"message":"execution reverted","data":"{stf}"}}"#
+                )],
+            );
+            stage_chain(&spawn_queued_rpc(responses).await)
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let engine = TxEngine::new(
+            Outbox::new(directory.path().join("outbox")).unwrap(),
+            60_000,
+        );
+        let permit = permit_for(&directory);
+        let from: Address = TEST_SIGNER_ADDRESS.parse().unwrap();
+        let body = r#"{"kind":"raw","to":"0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45","data":"0x1234","value":"0"}"#;
+        let stage = |chain: ChainClient| {
+            let (engine, permit) = (&engine, &permit);
+            async move {
+                engine
+                    .stage(
+                        permit,
+                        "alice",
+                        from,
+                        crate::intent_parser::parse(body).unwrap(),
+                        &chain,
+                        &Policy::default(),
+                        None,
+                    )
+                    .await
+            }
+        };
+        let error = stage(node().await)
+            .await
+            .expect_err("a reverting tx is not staged");
+        assert!(
+            matches!(&error, TxEngineError::SimulationReverted { reason } if reason.contains("STF")),
+            "{error}"
+        );
+        assert!(
+            engine
+                .outbox
+                .list("alice", "anvil", OutboxState::Pending)
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut earlier = fake_staged_1559("approve");
+        earlier.from = bloom_proto::checksum_address(&from);
+        engine.outbox.write_pending(&earlier, "p").unwrap();
+        stage(node().await)
+            .await
+            .expect("behind a pending entry it is staged");
     }
 
     #[tokio::test]
@@ -11676,6 +11912,83 @@ mod tests {
         }
     }
 
+    /// Calldata with an odd digit says it is the data that is wrong, not an
+    /// amount (an agent retyping calldata by hand hit this in the bench).
+    #[test]
+    fn odd_calldata_is_named_as_data() {
+        let error = decode_data("0xabc").unwrap_err().to_string();
+        assert!(error.starts_with("invalid data: "), "{error}");
+        assert_eq!(decode_data("0xabcd").unwrap().len(), 2);
+    }
+
+    /// The node takes a send but its answer is lost. When the chain knows the
+    /// signed hash, the confirm reports the entry sent instead of an error
+    /// the caller has to investigate (bench task erc20-transfer-recovery).
+    #[tokio::test]
+    async fn a_send_whose_answer_is_lost_but_that_landed_is_sent() {
+        let receipt = serde_json::json!({
+            "transactionHash": format!("{:#x}", alloy::primitives::B256::repeat_byte(7)),
+            "transactionIndex": "0x0",
+            "blockHash": format!("{:#x}", alloy::primitives::B256::repeat_byte(9)),
+            "blockNumber": "0x5",
+            "from": TEST_SIGNER_ADDRESS,
+            "to": "0x0000000000000000000000000000000000000002",
+            "cumulativeGasUsed": "0x5208",
+            "gasUsed": "0x5208",
+            "contractAddress": null,
+            "logs": [],
+            "logsBloom": format!("0x{}", "00".repeat(256)),
+            "status": "0x1",
+            "effectiveGasPrice": "0x1",
+            "type": "0x2"
+        });
+        let lost = r#"error:{"code":-32000,"message":"upstream response lost; submission status unknown"}"#;
+        let url = spawn_queued_rpc(HashMap::from([
+            (
+                "eth_chainId".to_string(),
+                vec!["\"0x7a69\"".to_string(); 20],
+            ),
+            ("eth_call".into(), vec!["\"0x\"".into(); 20]),
+            ("eth_getTransactionCount".into(), vec!["\"0x0\"".into(); 20]),
+            ("eth_sendRawTransaction".into(), vec![lost.into()]),
+            ("eth_getTransactionByHash".into(), vec!["null".into(); 20]),
+            (
+                "eth_getTransactionReceipt".into(),
+                vec![receipt.to_string(); 20],
+            ),
+        ]))
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let (engine, fixture, _) = triad_batch_fixture(outbox.clone(), false, false);
+        let permit = permit_for(&directory);
+        let chain = stage_chain(&url);
+        let policy = Policy::default();
+        let mut staged = fake_staged_1559("lost-answer");
+        staged.created_ms = now_ms();
+        outbox.write_pending(&staged, "p").unwrap();
+        let confirm = || {
+            engine.confirm(
+                &permit,
+                "alice",
+                "anvil",
+                "lost-answer",
+                &chain,
+                &policy,
+                policy.override_sentinel(),
+            )
+        };
+        assert!(matches!(
+            confirm().await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        fixture.active.store(true, Ordering::SeqCst);
+        let sent = confirm().await.unwrap();
+        assert!(sent.tx_hash.is_some());
+        let entry = outbox.read("alice", "anvil", "lost-answer").unwrap();
+        assert_eq!(entry.state, OutboxState::Sent);
+    }
+
     /// A confirm interrupted after its broadcast marker recovers through
     /// `reconcile_confirm_attempt`. Lookup errors (Polygon's public endpoint
     /// answers some with an archive-token error) must surface and leave the
@@ -12280,9 +12593,10 @@ mod tests {
         let r = engine
             .confirm(&permit, "alice", "anvil", "0001-test", &chain, &policy, "y")
             .await;
-        assert!(
-            matches!(r, Err(TxEngineError::PolicyDenied)),
-            "expected PolicyDenied, got {r:?}"
+        // The refusal names the check, so the caller can tell what to fix.
+        assert_eq!(
+            r.unwrap_err().to_string(),
+            "policy denied: caps.max_value_eth: value exceeds max"
         );
 
         // The outbox entry must have been moved to the `failed` state.
@@ -12307,7 +12621,7 @@ mod tests {
                 &permit, "alice", "anvil", &staged.id, &chain, &policy, false,
             )
             .await;
-        assert!(matches!(result, Err(TxEngineError::PolicyDenied)));
+        assert!(matches!(result, Err(TxEngineError::PolicyDenied(_))));
         let entry = engine.outbox.read("alice", "anvil", &staged.id).unwrap();
         assert_eq!(entry.state, OutboxState::Failed);
         assert_eq!(entry.staged.status, TxStatus::Failed);

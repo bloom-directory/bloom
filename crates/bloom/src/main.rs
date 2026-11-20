@@ -1420,6 +1420,7 @@ fn machine_error_from_handler(error: &bloom_vfs::HandlerError, message: String) 
         bloom_vfs::HandlerError::NotFound(_) => MachineErrorKind::NotFound,
         bloom_vfs::HandlerError::PermissionDenied
         | bloom_vfs::HandlerError::OperationNotPermitted
+        | bloom_vfs::HandlerError::Refused(_)
         | bloom_vfs::HandlerError::ApprovalPending(_) => MachineErrorKind::PermissionDenied,
         bloom_vfs::HandlerError::Invalid(_)
         | bloom_vfs::HandlerError::NotADir(_)
@@ -3514,9 +3515,6 @@ async fn confirm_projection(
     None
 }
 
-/// How long a repeated policy write waits for the owner. Matches the
-/// daemon's confirm wait, which stays under common 60 s tool timeouts.
-const POLICY_APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(50);
 const IPC_ERR_NOT_FOUND: i32 = -32004;
 const IPC_ERR_PERMISSION_DENIED: i32 = -32007;
 
@@ -4108,9 +4106,24 @@ async fn run(cli: Cli) -> Result<()> {
                 return write_policy(&client_endpoint, wallet, params).await;
             }
             let client = IpcClient::new(&client_endpoint.socket);
-            try_ipc(&client, &client_endpoint, "write", params)
+            let written = try_ipc(&client, &client_endpoint, "write", params)
                 .await
                 .with_context(|| format!("ipc write via {}", client_endpoint.display))?;
+            // A confirm that sent answers with its receipts; a new.tx
+            // write, with what it staged.
+            if let Some(report) = ["sent", "staged"]
+                .into_iter()
+                .find_map(|key| written.get(key).and_then(serde_json::Value::as_str))
+            {
+                println!("{report}");
+            }
+            // A send.tx that staged and waits for the owner sent nothing:
+            // exit as `wallet confirm` does for the same state.
+            if let Some(text) = written["approval_pending"]["text"].as_str() {
+                println!("{text}");
+                EXIT_CODE_OVERRIDE
+                    .store(EXIT_APPROVAL_PENDING, std::sync::atomic::Ordering::SeqCst);
+            }
             debug!(endpoint = %client_endpoint.display, "cli.vfs.write.via_ipc");
             Ok(())
         }
@@ -5447,76 +5460,89 @@ async fn policy_update(endpoint: &ResolvedEndpoint, wallet: &str) -> Option<serd
     serde_json::from_slice(&ipc_read(endpoint, &path).await.ok()?).ok()
 }
 
-/// Write a wallet policy. A policy change needs the owner's approval, and the
-/// write alone reports that as a bare "permission denied". Print the ceremony
-/// link instead. A repeat of the same write waits for the owner, like a
-/// repeated confirm, and installs the policy only if they approved.
+/// Write a wallet policy. A policy change needs the owner's approval: print
+/// the ceremony link the Machine answers with. A repeat of the same write
+/// waits there for the owner and installs the policy only if they approved.
 async fn write_policy(
     endpoint: &ResolvedEndpoint,
     wallet: &str,
     params: serde_json::Value,
 ) -> Result<()> {
-    const WAITING: &str = "awaiting_custody";
     let client = IpcClient::new(&endpoint.socket);
-    let context = || format!("ipc write via {}", endpoint.display);
-    let waiting_before = policy_update(endpoint, wallet)
-        .await
-        .filter(|update| update["status"] == WAITING)
-        .map(|update| update["action_id"].clone());
-    let (code, error) = match try_ipc_coded(&client, endpoint, "write", params.clone()).await {
-        Ok(_) => {
+    // Say what changed, so the caller need not read the policy back.
+    let added: Vec<(String, String)> = params["bytes_b64"]
+        .as_str()
+        .and_then(|body| B64.decode(body).ok())
+        .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+        .and_then(|body| body["add_destinations"].as_array().cloned())
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            Some((
+                entry["destination"].as_str()?.to_ascii_lowercase(),
+                entry["chain"].as_str()?.to_owned(),
+            ))
+        })
+        .collect();
+    // The Machine answers a first write with the link and makes a repeat
+    // wait for the owner; this only words the answer for a terminal.
+    let (code, error) = match try_ipc_coded(&client, endpoint, "write", params).await {
+        Ok(_) if added.is_empty() => {
             println!("Policy updated.");
+            return Ok(());
+        }
+        // A repeat also returns once the owner cancelled or the ceremony
+        // expired: say what the installed policy now allows, from the
+        // policy itself, never from what was asked.
+        Ok(_) => {
+            let path = format!("/wallets/{wallet}/policy.json");
+            let installed: serde_json::Value = ipc_read(endpoint, &path)
+                .await
+                .ok()
+                .and_then(|raw| serde_json::from_slice(&raw).ok())
+                .unwrap_or_default();
+            let allows = |(destination, chain): &(String, String)| {
+                installed["allowed_destinations"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|entry| {
+                        entry["chain"].as_str() == Some(chain.as_str())
+                            && entry["destination"]
+                                .as_str()
+                                .is_some_and(|d| d.eq_ignore_ascii_case(destination))
+                    })
+            };
+            let (allowed, refused): (Vec<_>, Vec<_>) = added.iter().partition(|a| allows(a));
+            let named = |list: Vec<&(String, String)>| {
+                list.iter()
+                    .map(|(destination, chain)| format!("{destination} on {chain}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            if !allowed.is_empty() {
+                println!("Policy updated: sends to {} are allowed.", named(allowed));
+            }
+            if !refused.is_empty() {
+                println!(
+                    "Not allowed: {}. The owner did not approve (cancelled or expired); write the policy again to ask again.",
+                    named(refused)
+                );
+                // Not pending (3): nothing waits on the owner any more.
+                EXIT_CODE_OVERRIDE.store(1, std::sync::atomic::Ordering::SeqCst);
+            }
             return Ok(());
         }
         Err(denied) => denied,
     };
-    let update = policy_update(endpoint, wallet)
-        .await
-        .filter(|_| code == IPC_ERR_PERMISSION_DENIED);
-    // The owner approved between the write and this read.
-    if update
-        .as_ref()
-        .is_some_and(|update| update["status"] == "ready_to_commit")
-    {
-        try_ipc(&client, endpoint, "write", params)
-            .await
-            .with_context(context)?;
-        println!("Policy updated.");
-        return Ok(());
-    }
-    let Some(update) = update.filter(|update| update["status"] == WAITING) else {
-        return Err(anyhow::Error::new(error).context(context()));
+    let update = policy_update(endpoint, wallet).await.filter(|update| {
+        code == IPC_ERR_PERMISSION_DENIED && update["status"] == "awaiting_custody"
+    });
+    let Some(update) = update else {
+        return Err(
+            anyhow::Error::new(error).context(format!("ipc write via {}", endpoint.display))
+        );
     };
-    if waiting_before.as_ref() == Some(&update["action_id"]) {
-        let deadline = tokio::time::Instant::now() + POLICY_APPROVAL_WAIT;
-        while tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            let Some(now) = policy_update(endpoint, wallet).await else {
-                continue;
-            };
-            anyhow::ensure!(
-                now["action_id"] == update["action_id"],
-                "another policy update replaced this one; read wallets/{wallet}/policy-updates/latest/status.json"
-            );
-            match now["status"].as_str() {
-                // prepare_pending: Broker has not opened the ceremony yet.
-                Some(WAITING | "prepare_pending") => continue,
-                Some("confirmed") => {}
-                // Approved: the same bytes written again install the policy.
-                Some("ready_to_commit") => {
-                    try_ipc(&client, endpoint, "write", params)
-                        .await
-                        .with_context(context)?;
-                }
-                status => bail!(
-                    "policy not changed: the update is {} (declined, expired, or the policy changed meanwhile); see wallets/{wallet}/policy-updates/latest/status.json",
-                    status.unwrap_or("in an unknown state")
-                ),
-            }
-            println!("Policy updated.");
-            return Ok(());
-        }
-    }
     let url = update["ceremony_url"].as_str().unwrap_or_default();
     let remaining = u128::from(update["expiry_ms"].as_u64().unwrap_or_default())
         .saturating_sub(unix_now_ms())
