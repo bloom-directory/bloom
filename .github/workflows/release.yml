@@ -45,7 +45,7 @@ jobs:
       signer_sha: ${{ steps.meta.outputs.signer_sha }}
       dry_run: ${{ steps.meta.outputs.dry_run }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -207,7 +207,7 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Check out Machine
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           ref: ${{ needs.prepare.outputs.release_sha }}
           path: bloom
@@ -215,7 +215,7 @@ jobs:
           persist-credentials: false
 
       - name: Check out locked Broker
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           repository: bloom-directory/bloom-broker
           ref: ${{ needs.prepare.outputs.broker_sha }}
@@ -224,7 +224,7 @@ jobs:
           persist-credentials: false
 
       - name: Check out locked Signer
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           repository: bloom-directory/bloom-signer
           ref: ${{ needs.prepare.outputs.signer_sha }}
@@ -268,7 +268,7 @@ jobs:
       contents: read
     steps:
       - name: Check out Machine
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           ref: ${{ needs.prepare.outputs.release_sha }}
           path: bloom
@@ -276,7 +276,7 @@ jobs:
           persist-credentials: false
 
       - name: Check out locked Broker
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           repository: bloom-directory/bloom-broker
           ref: ${{ needs.prepare.outputs.broker_sha }}
@@ -285,7 +285,7 @@ jobs:
           persist-credentials: false
 
       - name: Check out locked Signer
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           repository: bloom-directory/bloom-signer
           ref: ${{ needs.prepare.outputs.signer_sha }}
@@ -338,7 +338,7 @@ jobs:
         run: *install-build-tools
 
       - name: Check out Machine
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           ref: ${{ needs.prepare.outputs.release_sha }}
           path: bloom
@@ -346,7 +346,7 @@ jobs:
           persist-credentials: false
 
       - name: Check out locked Broker
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           repository: bloom-directory/bloom-broker
           ref: ${{ needs.prepare.outputs.broker_sha }}
@@ -355,7 +355,7 @@ jobs:
           persist-credentials: false
 
       - name: Check out locked Signer
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           repository: bloom-directory/bloom-signer
           ref: ${{ needs.prepare.outputs.signer_sha }}
@@ -400,7 +400,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           ref: ${{ needs.prepare.outputs.release_sha }}
           fetch-depth: 0
@@ -512,7 +512,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -634,7 +634,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           ref: ${{ needs.prepare.outputs.release_sha }}
           persist-credentials: false
