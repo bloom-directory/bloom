@@ -1,29 +1,25 @@
 //! Endpoint health: passive sample tracking, cooldown state machine,
-//! and serialisable snapshots.
+//! endpoint ranking, and serialisable snapshots.
 //!
-//! WP-3 owns this module. Two responsibilities:
+//! Three responsibilities:
 //!
 //! 1. Maintain one `EndpointHealth` per configured endpoint, updated by
-//!    the active probe loop in `transport.rs`. The state machine
-//!    follows §C.7 of the spec: 5 consecutive failures arm a 60 s
-//!    cooldown, 2 consecutive successes clear it, and a fresh cooldown
-//!    within 5 minutes of a recovery escalates to 600 s
-//!    (chronic-failer escalation).
+//!    each transport's active probe loop and by the outcomes of live
+//!    calls. The state machine follows §C.7 of the spec: 5 consecutive
+//!    failures arm a 60 s cooldown, 2 consecutive successes clear it,
+//!    and a fresh cooldown within 5 minutes of a recovery escalates to
+//!    600 s (chronic-failer escalation).
 //!
-//! 2. Produce `EndpointHealthSnapshot` values for the VFS leaves under
+//! 2. Rank endpoints for request routing via
+//!    [`HealthRegistry::selection_order`]. Cooldowns demote an endpoint
+//!    to the back of the order; they never remove it, so a caller that
+//!    walks the whole order still reaches every configured endpoint.
+//!
+//! 3. Produce `EndpointHealthSnapshot` values for the VFS leaves under
 //!    `chains/<n>/endpoints/<idx>/*`. Snapshots use `SystemTime` for
 //!    `cooldown_until` so they serialise cleanly into the daemon's
 //!    JSON/text leaves and can be read by external tooling without
 //!    needing access to the in-process `Instant` clock.
-//!
-//! ## Scope note (filtering the fallback pool)
-//!
-//! Alloy's `FallbackLayer` does not expose a runtime hook to exclude
-//! transports based on Bloom-side health. For WP-3 we therefore observe
-//! and report cooldowns but do not actively yank an endpoint out of
-//! the parallel fan-out — `cooled_down_indices()` is provided for the
-//! day we either gain that hook upstream or build our own selection
-//! layer. Until then, cooldowns are an observability signal only.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -80,7 +76,7 @@ pub struct EndpointHealth {
     /// recovery; never auto-cleared by the passage of time so callers
     /// see the full cooldown window when they snapshot.
     pub cooldown_until: Option<Instant>,
-    /// EWMA of probe round-trip latency.
+    /// EWMA of round-trip latency from probes and live calls.
     pub avg_latency: Duration,
     /// Last `SAMPLE_WINDOW` outcomes — `true` for success.
     pub sample_window: VecDeque<bool>,
@@ -93,6 +89,24 @@ pub struct EndpointHealth {
     /// Wall-clock time of the most recent successful probe. Used by
     /// the chronic-failer escalation logic.
     pub last_ok: Option<Instant>,
+}
+
+/// Routing tier for one endpoint, best first. The derived `Ord` follows
+/// declaration order, so sorting by tier puts `Proven` endpoints ahead of
+/// the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SelectionTier {
+    /// The most recent outcome was a success.
+    Proven,
+    /// No outcome recorded yet. Ranked above `Failing` so an endpoint
+    /// that has never been called is not treated as one that has only
+    /// failed; otherwise configured order would decide every tie and
+    /// later endpoints could never be reached.
+    Untried,
+    /// The most recent outcome was a failure, but no cooldown is armed.
+    Failing,
+    /// A cooldown is armed and has not expired.
+    CoolingDown,
 }
 
 impl EndpointHealth {
@@ -130,6 +144,17 @@ impl EndpointHealth {
         let latency_ms = self.avg_latency.as_millis() as f64;
         let latency_factor = (1.0 - (latency_ms / LATENCY_FLOOR_MS as f64)).clamp(0.0, 1.0);
         stability * 0.7 + latency_factor * 0.3
+    }
+
+    fn selection_tier(&self, now: Instant) -> SelectionTier {
+        if self.cooldown_until.is_some_and(|deadline| deadline > now) {
+            return SelectionTier::CoolingDown;
+        }
+        match self.sample_window.back() {
+            Some(true) => SelectionTier::Proven,
+            Some(false) => SelectionTier::Failing,
+            None => SelectionTier::Untried,
+        }
     }
 
     fn push_sample(&mut self, success: bool) {
@@ -179,8 +204,8 @@ pub struct EndpointHealthSnapshot {
     pub last_block: Option<u64>,
 }
 
-/// Shared registry of endpoint health, owned by `RpcEngine` and
-/// updated by the probe loop.
+/// Shared registry of endpoint health, owned by a chain's transport and
+/// updated by its probe loop and live calls.
 #[derive(Clone)]
 pub struct HealthRegistry {
     inner: Arc<RwLock<Vec<EndpointHealth>>>,
@@ -295,9 +320,29 @@ impl HealthRegistry {
             .collect()
     }
 
-    /// Indices of endpoints currently in cooldown. See the scope note
-    /// at the top of the module: this is exposed for the eventual
-    /// fallback-pool filter, today it is purely observability.
+    /// Every endpoint index, ordered for request routing (best first).
+    ///
+    /// Endpoints are grouped by tier: most recent outcome a success,
+    /// then never called, then most recent outcome a failure, then in
+    /// cooldown. Within a tier, a higher [`EndpointHealth::score`] ranks
+    /// first and configured order breaks the remaining ties. Every index
+    /// is returned exactly once, so a caller that works through the whole
+    /// order reaches every configured endpoint.
+    pub fn selection_order(&self) -> Vec<usize> {
+        let guard = self.inner.read();
+        let now = Instant::now();
+        let mut order: Vec<usize> = (0..guard.len()).collect();
+        order.sort_by(|&a, &b| {
+            let (ha, hb) = (&guard[a], &guard[b]);
+            ha.selection_tier(now)
+                .cmp(&hb.selection_tier(now))
+                .then_with(|| hb.score().total_cmp(&ha.score()))
+                .then_with(|| a.cmp(&b))
+        });
+        order
+    }
+
+    /// Indices of endpoints currently in cooldown.
     pub fn cooled_down_indices(&self) -> Vec<usize> {
         let guard = self.inner.read();
         let now = Instant::now();
@@ -412,6 +457,52 @@ mod tests {
             CooldownDecision::Chronic(d) => assert_eq!(d, CHRONIC_COOLDOWN),
             other => panic!("expected chronic escalation, got {other:?}"),
         }
+    }
+
+    fn registry_of(n: usize) -> HealthRegistry {
+        HealthRegistry::new((0..n).map(|i| format!("http://example/{i}")))
+    }
+
+    #[test]
+    fn selection_order_keeps_configured_order_when_nothing_is_known() {
+        assert_eq!(registry_of(3).selection_order(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn selection_order_ranks_untried_above_failed() {
+        // Regression for #527: an endpoint that has never been called
+        // must not tie with endpoints that have only failed.
+        let reg = registry_of(3);
+        reg.record_failure(0, true, None);
+        reg.record_failure(1, true, None);
+        assert_eq!(reg.selection_order(), vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn selection_order_ranks_proven_endpoints_by_score() {
+        let reg = registry_of(3);
+        reg.record_success(0, Duration::from_millis(1_500), None);
+        reg.record_success(1, Duration::from_millis(900), None);
+        reg.record_success(2, Duration::from_millis(50), None);
+        assert_eq!(reg.selection_order(), vec![2, 1, 0]);
+    }
+
+    #[test]
+    fn selection_order_puts_proven_before_untried() {
+        let reg = registry_of(3);
+        reg.record_success(2, Duration::from_millis(50), None);
+        assert_eq!(reg.selection_order(), vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn selection_order_demotes_cooldowns_without_dropping_them() {
+        let reg = registry_of(3);
+        reg.record_success(0, Duration::from_millis(10), None);
+        force_cooldown(&reg, 0);
+        reg.record_failure(1, true, None);
+        // Cooldown ranks below a merely failing endpoint, and the
+        // cooled-down endpoint stays in the order.
+        assert_eq!(reg.selection_order(), vec![2, 1, 0]);
     }
 
     #[test]

@@ -10,11 +10,12 @@
 //! [Http transport]
 //! ```
 //!
-//! The fallback fan-out wraps the per-endpoint stacks in a single
-//! `FallbackLayer` with `active_transport_count = min(2, endpoints.len())`
-//! so two endpoints race for each call. A two-endpoint chain therefore
-//! always queries both in parallel; bigger lists rotate the top two by
-//! score.
+//! The per-endpoint stacks are joined by an `EndpointPool`, which ranks
+//! them by the `HealthRegistry` on every call and races the top
+//! `min(2, endpoints.len())` in parallel. A read whose whole race fails
+//! moves on to the next endpoints in the ranking, so it reaches any
+//! working endpoint; a submission such as `eth_sendRawTransaction` is
+//! never offered to more than the first race. See `pool.rs`.
 //!
 //! ## HTTP / WS split
 //!
@@ -38,21 +39,13 @@
 //!
 //! On `RpcEngine::build` we also spawn one tokio task per engine that
 //! periodically probes each HTTP endpoint *directly* — bypassing the
-//! fallback fan-out — with a 2 s `eth_blockNumber` call. Outcomes are
-//! folded into the `HealthRegistry` so the cooldown state machine
-//! reflects actual reachability rather than the alloy layer's
-//! private metrics. The task is cancelled when `RpcEngine` drops via
-//! a `tokio::sync::watch` channel.
-//!
-//! ### Scope note: filtering the fallback pool
-//!
-//! Alloy's `FallbackLayer` does not expose a runtime hook to exclude
-//! transports based on Bloom-side health. For WP-3 we therefore record
-//! cooldowns for observability only — the fallback fan-out still
-//! queries cooled-down endpoints in parallel. The eviction story can
-//! land later as either an upstream PR or a thin wrapping layer.
+//! pool — with a 2 s `eth_blockNumber` call. Outcomes are folded into
+//! the `HealthRegistry`, alongside the outcomes of live calls, so every
+//! configured endpoint is measured whether or not the pool has routed
+//! traffic to it. The pool ranks cooled-down endpoints last rather than
+//! removing them. The task is cancelled when `RpcEngine` drops via a
+//! `tokio::sync::watch` channel.
 
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -61,7 +54,7 @@ use alloy::primitives::U64;
 use alloy::providers::RootProvider;
 use alloy::rpc::client::RpcClient;
 use alloy::transports::http::{Http, reqwest};
-use alloy::transports::layers::{FallbackLayer, RetryBackoffLayer, ThrottleLayer};
+use alloy::transports::layers::{RetryBackoffLayer, ThrottleLayer};
 use alloy::transports::ws::WsConnect;
 use alloy::transports::{BoxTransport, IntoBoxTransport};
 use bloom_proto::{ChainSpec, EndpointSpec};
@@ -71,8 +64,9 @@ use tracing::{debug, info, warn};
 
 use crate::endpoint::{EndpointScheme, classify_endpoint, is_subscription_capable};
 use crate::error::BloomRpcError;
-use crate::health::{CooldownDecision, EndpointHealthSnapshot, HealthRegistry};
+use crate::health::{EndpointHealthSnapshot, HealthRegistry};
 use crate::policy::BloomRetryPolicy;
+use crate::pool::{EndpointPool, PoolEndpoint, emit_cooldown_event};
 
 /// Default compute-units-per-second when the operator hasn't set
 /// `cu_per_sec`. Mirrors alloy's own internal default for the retry
@@ -154,7 +148,7 @@ impl RpcEngine {
     ///
     /// Each endpoint URL is classified into HTTP or WS; HTTP-shaped
     /// endpoints are wrapped in retry + optional throttle and joined
-    /// under a fallback layer. WS-shaped endpoints not flagged
+    /// in an `EndpointPool`. WS-shaped endpoints not flagged
     /// `http_only` are stashed as `WsConnect` configurations and
     /// opened lazily by `ws_provider().await` so the build remains
     /// sync.
@@ -164,7 +158,7 @@ impl RpcEngine {
             return Err(BloomRpcError::NoEndpoints(spec.name.clone()));
         }
 
-        let mut http_transports: Vec<BoxTransport> = Vec::new();
+        let mut pool_endpoints: Vec<PoolEndpoint> = Vec::new();
         let mut probe_targets: Vec<ProbeTarget> = Vec::new();
         let mut tracked_urls: Vec<String> = Vec::new();
         let mut ws_connects: Vec<WsConnect> = Vec::new();
@@ -183,15 +177,18 @@ impl RpcEngine {
                     // Keep a clone for the probe loop. `BoxTransport`
                     // is `Clone` (Arc inside), so the per-endpoint
                     // RpcClient shares connection state with the
-                    // fallback fan-out — probes therefore reflect
-                    // exactly what production traffic would see.
+                    // pool — probes therefore reflect exactly what
+                    // production traffic would see.
                     let probe_client = RpcClient::new(transport.clone(), false);
                     probe_targets.push(ProbeTarget {
                         idx,
                         url: ep.url.clone(),
                         client: probe_client,
                     });
-                    http_transports.push(transport);
+                    pool_endpoints.push(PoolEndpoint {
+                        label: redacted(&ep.url),
+                        transport,
+                    });
                     debug!(
                         chain = %spec.name,
                         url = %redacted(&ep.url),
@@ -226,30 +223,21 @@ impl RpcEngine {
             }
         }
 
-        if http_transports.is_empty() {
+        if pool_endpoints.is_empty() {
             return Err(BloomRpcError::NoEndpoints(spec.name.clone()));
         }
 
-        let active = NonZeroUsize::new(http_transports.len().min(2)).unwrap_or(
-            // SAFETY: `http_transports.is_empty()` was rejected above,
-            // so `len() >= 1` and `min(2) >= 1`. The unwrap_or branch
-            // is unreachable; we still write the fallback to avoid an
-            // explicit unwrap that future readers might mis-edit.
-            NonZeroUsize::new(1).unwrap(),
-        );
-        let fallback = FallbackLayer::default().with_active_transport_count(active);
-
-        let service = ServiceBuilder::new()
-            .layer(fallback)
-            .service(http_transports);
+        let http_endpoints = pool_endpoints.len();
+        let health = HealthRegistry::new(tracked_urls);
+        let pool = EndpointPool::new(spec.name.clone(), pool_endpoints, health.clone());
+        let race_width = pool.race_width();
         // Loopback URLs are tagged "local" by alloy's HTTP transport;
         // we don't have visibility into per-endpoint locality at this
         // outer layer, so default to false (the most conservative
         // choice for retry/timeout heuristics).
-        let client: RpcClient = RpcClient::new(service, false);
+        let client: RpcClient = RpcClient::new(pool, false);
         let provider: RootProvider<Ethereum> = RootProvider::<Ethereum>::new(client.clone());
 
-        let health = HealthRegistry::new(tracked_urls);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         spawn_probe_loop(
             spec.name.clone(),
@@ -261,7 +249,8 @@ impl RpcEngine {
         info!(
             chain = %spec.name,
             endpoints = endpoints.len(),
-            http_endpoints = active.get(),
+            http_endpoints,
+            race_width,
             ws_endpoints = ws_connects.len(),
             supports_subscriptions,
             "rpc.engine.built"
@@ -355,9 +344,8 @@ impl RpcEngine {
         }
     }
 
-    /// Per-endpoint health view. Values reflect the most recent probe
-    /// outcomes; production traffic does not (yet) update this view —
-    /// see the scope note in `health.rs`.
+    /// Per-endpoint health view, fed by probe outcomes and by the
+    /// outcomes of live calls routed through the pool.
     pub fn endpoints_snapshot(&self) -> Vec<EndpointHealthSnapshot> {
         self.health.snapshot()
     }
@@ -488,7 +476,7 @@ async fn run_probe_round(chain: &str, targets: &[ProbeTarget], health: &HealthRe
                     error = %err,
                     "rpc.health.probe_failed"
                 );
-                emit_cooldown_event(chain, target, decision);
+                emit_cooldown_event(chain, target.idx, &redacted(&target.url), decision);
             }
             Err(_elapsed) => {
                 warn!(
@@ -499,39 +487,15 @@ async fn run_probe_round(chain: &str, targets: &[ProbeTarget], health: &HealthRe
                     "rpc.health.probe_timeout"
                 );
                 let decision = health.record_failure(target.idx, true, None);
-                emit_cooldown_event(chain, target, decision);
+                emit_cooldown_event(chain, target.idx, &redacted(&target.url), decision);
             }
         }
     }
 }
 
-fn emit_cooldown_event(chain: &str, target: &ProbeTarget, decision: CooldownDecision) {
-    match decision {
-        CooldownDecision::None => {}
-        CooldownDecision::Fresh(d) => {
-            warn!(
-                chain = %chain,
-                idx = target.idx,
-                url = %redacted(&target.url),
-                cooldown_secs = d.as_secs(),
-                "rpc.health.cooldown_set"
-            );
-        }
-        CooldownDecision::Chronic(d) => {
-            warn!(
-                chain = %chain,
-                idx = target.idx,
-                url = %redacted(&target.url),
-                cooldown_secs = d.as_secs(),
-                "rpc.health.chronic_failer_escalated"
-            );
-        }
-    }
-}
-
 /// Build the HTTP transport stack for one endpoint. The result is
-/// box-erased so all endpoints in the fallback layer share a single
-/// concrete type.
+/// box-erased so all endpoints in the pool share a single concrete
+/// type.
 fn build_http_stack(url: &url::Url, ep: &EndpointSpec) -> BoxTransport {
     let cu = ep.cu_per_sec.unwrap_or(DEFAULT_CU_PER_SEC);
     let retry = RetryBackoffLayer::new_with_policy(

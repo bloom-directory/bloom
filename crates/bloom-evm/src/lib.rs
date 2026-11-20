@@ -216,7 +216,7 @@ fn revert_replay_request<T: TxTrait>(from: Address, tx: &T) -> TransactionReques
 /// One alloy provider backed by the layered `bloom-rpc` engine.
 ///
 /// The provider is a `RootProvider<Ethereum>` whose transport is the
-/// fallback fan-out built by `bloom_rpc::RpcEngine::build`. Existing
+/// endpoint pool built by `bloom_rpc::RpcEngine::build`. Existing
 /// call sites that grab `provider()` keep working unchanged — only the
 /// underlying transport changed.
 #[derive(Clone)]
@@ -237,7 +237,7 @@ impl ChainClient {
     /// Construct a client from a `ChainSpec`.
     ///
     /// Builds the layered `bloom_rpc::RpcEngine` (retry → optional
-    /// throttle → HTTP, all behind a `FallbackLayer`) for every entry
+    /// throttle → HTTP, all behind a health-ranked endpoint pool) for every entry
     /// returned by `spec.endpoints()`. Returns
     /// `ChainError::NoEndpoints` when the spec resolves to zero
     /// endpoints (both `rpc_urls` and `rpc_endpoints` empty), and

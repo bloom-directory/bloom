@@ -521,8 +521,8 @@ impl StatusHandler {
             //
             // This makes "≥1 healthy endpoint → connected=true" robust
             // against the live-call path's pathologies: a refused
-            // sibling endpoint racing inside the alloy `FallbackLayer`
-            // can push the aggregate `block_number()` past
+            // sibling endpoint racing inside the `bloom-rpc` endpoint
+            // pool can push the aggregate `block_number()` past
             // `PING_TIMEOUT` even when one endpoint would respond
             // cleanly on its own.
             let snaps = client.endpoints();
