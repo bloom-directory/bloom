@@ -229,6 +229,16 @@ The mounted policy surface uses Broker's policy custody protocol:
 5. Broker calls Signer `policy.compare_and_swap` with the proposed bytes,
    ceremony receipt, and Broker validation receipt.
 
+The review lists the authority the update grants or withdraws. Destinations
+are compared by decoded account, as Broker matches claims: one is added only
+when no spelling of it was allowed before, and removed only when none remains
+allowed. A change only in how an allowed account is written, such as an EIP-55
+address replaced by its lowercase form, is listed separately as a respelling
+and is not an authority change. Machine computes the diff digest it claims with
+the same `bloom_broker_api::canonical_policy_authority_diff`
+(`bloom-policy-authority-diff/v2`), and Broker refuses a request whose digest
+differs. Stored policy bytes are never rewritten into another spelling.
+
 A direct commit, local policy writer, `approval.json`, or `policy-session` path
 is not part of the architecture.
 
