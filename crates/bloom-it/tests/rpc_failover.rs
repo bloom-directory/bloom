@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use bloom_evm::ChainClient;
-use bloom_it::spawn_anvil;
+use bloom_it::{pick_free_port, spawn_anvil};
 use bloom_proto::ChainSpec;
 use tokio::time::timeout;
 
@@ -77,5 +77,47 @@ async fn block_number_failover_when_first_anvil_dies() -> Result<()> {
     }
 
     drop(anvil_b);
+    Ok(())
+}
+
+/// Regression for #527: with the first two endpoints unreachable, reads
+/// must reach the third. Before the health-ranked pool, alloy's
+/// `FallbackLayer` raced only the first two endpoints forever and the
+/// third was never called.
+#[tokio::test(flavor = "multi_thread")]
+async fn block_number_reaches_third_endpoint_when_first_two_are_unreachable() -> Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,bloom_rpc=debug")),
+        )
+        .with_test_writer()
+        .try_init();
+
+    // Ports bound and released at once, so connections are refused.
+    let dead_a = format!("http://127.0.0.1:{}", pick_free_port()?);
+    let dead_b = format!("http://127.0.0.1:{}", pick_free_port()?);
+    let anvil = spawn_anvil().await.context("spawn anvil")?;
+
+    let mut spec = ChainSpec::anvil_default();
+    spec.rpc_urls = vec![dead_a, dead_b, anvil.rpc_url()];
+    spec.rpc_endpoints.clear();
+    let client = ChainClient::new(spec).map_err(|e| anyhow!("build chain client: {e}"))?;
+
+    // The very first read must already succeed through the third endpoint.
+    let started = Instant::now();
+    let res = timeout(Duration::from_secs(5), client.block_number()).await;
+    let elapsed = started.elapsed();
+    res.map_err(|_| anyhow!("first block_number timed out after {elapsed:?}"))?
+        .map_err(|e| anyhow!("first block_number failed: {e}"))?;
+
+    for i in 0..10 {
+        client
+            .block_number()
+            .await
+            .with_context(|| format!("block_number iteration {i}"))?;
+    }
+
+    drop(anvil);
     Ok(())
 }

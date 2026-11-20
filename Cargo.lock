@@ -2749,6 +2749,7 @@ dependencies = [
  "alloy 2.0.5",
  "bloom-proto",
  "bloom-rpc-common",
+ "futures",
  "parking_lot",
  "serde",
  "serde_json",
