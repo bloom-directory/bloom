@@ -160,6 +160,37 @@ fn provider_hosts_card_fields(frame_origin: &str, top_origin: &str, fixture: boo
     known || fixture_host
 }
 
+/// The id binding a recorded Stripe bootstrap to its hosted checkout page:
+/// the payment link id for `buy.stripe.com`, the hosted session id for
+/// `checkout.stripe.com/c/pay/cs_...`.
+fn hosted_stripe_link(url: &url::Url) -> Result<String> {
+    match url.origin().ascii_serialization().as_str() {
+        "https://buy.stripe.com" => Ok(url.path().trim_start_matches('/').to_owned()),
+        "https://checkout.stripe.com" => url
+            .path()
+            .split('/')
+            .find(|segment| segment.starts_with("cs_"))
+            .map(str::to_owned)
+            .context("Missing hosted Stripe session id"),
+        _ => bail!("Not a Stripe hosted checkout"),
+    }
+}
+
+/// Parse the bound Stripe bootstrap. Shared by every hosted checkout origin;
+/// anything that is not one plain payment or subscription session fails closed.
+fn hosted_stripe_facts_parse(page: &Value) -> Result<Value> {
+    if !matches!(page["mode"].as_str(), Some("payment" | "subscription"))
+        || !page["session_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("cs_"))
+    {
+        bail!("Unbound Stripe checkout facts");
+    }
+    Ok(
+        json!({"total_minor":page["total_summary"]["due"],"currency":page["currency"].as_str().map(str::to_uppercase),"recurring":page["mode"]=="subscription","livemode":page["livemode"]}),
+    )
+}
+
 /// Read the already-received Stripe bootstrap, never initialize a second
 /// Checkout Session. Bind it to this exact frame and document loader.
 pub(crate) async fn hosted_stripe_facts(
@@ -169,10 +200,7 @@ pub(crate) async fn hosted_stripe_facts(
     url: &str,
 ) -> Result<Value> {
     let url = url::Url::parse(url)?;
-    if url.origin().ascii_serialization() != "https://buy.stripe.com" {
-        bail!("Not a Stripe Payment Link");
-    }
-    let link = url.path().trim_start_matches('/');
+    let link = hosted_stripe_link(&url)?;
     let tree = cdp
         .call(Some(session), "Page.getFrameTree", json!({}))
         .await?;
@@ -207,16 +235,35 @@ pub(crate) async fn hosted_stripe_facts(
             .as_str()
             .context("Missing Stripe bootstrap body")?,
     )?;
-    if !matches!(page["mode"].as_str(), Some("payment" | "subscription"))
-        || !page["session_id"]
-            .as_str()
-            .is_some_and(|id| id.starts_with("cs_"))
-    {
-        bail!("Unbound Stripe checkout facts");
-    }
-    Ok(
-        json!({"total_minor":page["total_summary"]["due"],"currency":page["currency"].as_str().map(str::to_uppercase),"recurring":page["mode"]=="subscription","livemode":page["livemode"]}),
+    hosted_stripe_facts_parse(&page)
+}
+
+/// Fixed diagnostic for payment methods that keep card fields hidden until
+/// the agent selects them (Shopify's collapsed credit-card radio, Stripe's
+/// wallet tabs). Script-owned flags only, never page text or field values.
+async fn collapsed_payment_hint(
+    tab: &PrivateTab,
+    session: &str,
+    world: i64,
+) -> Option<&'static str> {
+    let hint = evaluate(
+        tab,
+        session,
+        world,
+        "(()=>{const radio=document.querySelector('input#basic-creditCards[name=basic]');\
+         if(radio&&!radio.checked)return 'shopify_credit_card_radio';\
+         if(/^https:\\/\\/(buy|checkout)\\.stripe\\.com$/.test(location.origin)){\
+         const card=[...document.querySelectorAll('[role=tab],button,label')].some(e=>/^(pay by )?card$/i.test((e.textContent||'').trim())&&e.getBoundingClientRect().width>0);\
+         if(card)return 'stripe_card_tab';}return '';})()"
+            .into(),
     )
+    .await
+    .ok()?;
+    match hint.as_str() {
+        Some("shopify_credit_card_radio") => Some("select the credit card payment method, then retry"),
+        Some("stripe_card_tab") => Some("choose the card tab, then retry"),
+        _ => None,
+    }
 }
 
 /// JPEG of the merchant's checkout page for the approval page, captured before
@@ -420,7 +467,10 @@ impl Discovery {
             let world = context.world;
             if position == 0 {
                 top_origin = Some(origin.clone());
-                if origin == "https://buy.stripe.com" {
+                if matches!(
+                    origin.as_str(),
+                    "https://buy.stripe.com" | "https://checkout.stripe.com"
+                ) {
                     let facts =
                         hosted_stripe_facts(&tab.cdp, &session, &context.frame_id, url).await?;
                     evaluate(tab,&session,world,format!("(()=>{{const facts={facts};if(globalThis.__bloomHostedStripeFacts){{if(JSON.stringify(globalThis.__bloomHostedStripeFacts)!==JSON.stringify(facts))throw Error('Facts changed');}}else Object.defineProperty(globalThis,'__bloomHostedStripeFacts',{{value:Object.freeze(facts),writable:false,configurable:false}});return true;}})()")).await?;
@@ -562,6 +612,11 @@ impl Discovery {
                 count("month"),
                 count("year")
             );
+            // Collapsed payment methods keep card fields off the page until
+            // the agent selects them; name the fix with fixed flags only.
+            if let Some(hint) = collapsed_payment_hint(tab, &facts_session, main_world).await {
+                eprintln!("payment fields are collapsed: {hint}");
+            }
             return Err(anyhow::Error::new(PreparationReason::FieldsUnsupported)
                 .context("Payment fields require human review"));
         }
@@ -890,6 +945,257 @@ pub(crate) mod tests {
         assert!((100..=200).contains(&discovery.facts.total_minor));
         assert_eq!(discovery.facts.installments, 1);
         discovery.recheck(&tab).await.unwrap();
+        browser.return_control().await.unwrap();
+    }
+
+    /// Hosted Checkout Sessions bootstrap the same facts as Payment Links,
+    /// bound to the `cs_` session id in the page path.
+    #[test]
+    fn checkout_stripe_com_bootstrap_facts_are_extracted() {
+        let url = url::Url::parse(
+            "https://checkout.stripe.com/c/pay/cs_test_4eC39HqLyjWDarjtT1zdp7dc#fidkdWxOYHwnPyd1blpx",
+        )
+        .unwrap();
+        assert_eq!(
+            hosted_stripe_link(&url).unwrap(),
+            "cs_test_4eC39HqLyjWDarjtT1zdp7dc"
+        );
+        assert!(hosted_stripe_link(&url::Url::parse("https://shop.example/").unwrap()).is_err());
+        let body = json!({
+            "mode": "payment",
+            "session_id": "cs_test_4eC39HqLyjWDarjtT1zdp7dc",
+            "currency": "usd",
+            "livemode": false,
+            "total_summary": {"due": 2000},
+        });
+        let facts = hosted_stripe_facts_parse(&body).unwrap();
+        assert_eq!(facts["total_minor"], 2000);
+        assert_eq!(facts["currency"], "USD");
+        assert_eq!(facts["recurring"], false);
+        assert_eq!(facts["livemode"], false);
+        let recurring = json!({
+            "mode": "subscription",
+            "session_id": "cs_test_4eC39HqLyjWDarjtT1zdp7dc",
+            "currency": "usd",
+            "livemode": false,
+            "total_summary": {"due": 1200},
+        });
+        assert_eq!(hosted_stripe_facts_parse(&recurring).unwrap()["recurring"], true);
+        // Anything that is not one plain session fails closed.
+        assert!(hosted_stripe_facts_parse(&json!({"mode": "payment"})).is_err());
+        assert!(
+            hosted_stripe_facts_parse(&json!({"mode": "payment", "session_id": "pi_123"})).is_err()
+        );
+    }
+
+    /// Shopify's checkout replays end to end against fixture merchants: the
+    /// shipping summary echoes saved shopper details, the PCI card fields sit
+    /// behind the collapsed credit-card radio, and the thank-you page reports
+    /// the order.
+    #[tokio::test]
+    async fn shopify_shaped_checkout_expands_card_fields_and_redacts_echoed_pii() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certificate =
+            rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
+                .unwrap();
+        let config = axum_server::tls_rustls::RustlsConfig::from_pem(
+            certificate.cert.pem().into_bytes(),
+            certificate.signing_key.serialize_pem().into_bytes(),
+        )
+        .await
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let checkout = "<!doctype html><h1>Fixture shop checkout</h1>
+            <div data-bloom-total-minor='100' data-bloom-currency='USD'>Total USD 1.00</div>
+            <p>Shipping to SyntheticPrivateName FixtureFamily, 202 Main Street</p>
+            <p>Confirmation email fixture@example.com, phone +1 202-555-0123</p>
+            <label>Credit card<input id='basic-creditCards' name='basic' type='radio'></label>
+            <button>Pay now</button>
+            <script>document.getElementById('basic-creditCards').addEventListener('change',()=>{
+                if(!document.querySelector('iframe')){const f=document.createElement('iframe');
+                f.src='/card';document.body.append(f);}});</script>"
+            .to_owned();
+        let app = Router::new()
+            .route(
+                "/",
+                get(move || {
+                    let html = checkout.clone();
+                    async move { Html(html) }
+                }),
+            )
+            .route(
+                "/card",
+                get(|| async {
+                    Html(
+                        "<input autocomplete='cc-number'><input autocomplete='cc-exp'>\
+                         <input autocomplete='cc-csc'>"
+                            .to_owned(),
+                    )
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum_server::from_tcp_rustls(listener, config)
+                .unwrap()
+                .serve(app.into_make_service())
+                .await
+                .unwrap();
+        });
+        let url = format!("https://localhost:{port}/");
+        let browser = browser().await;
+        // Saved shopper details were used earlier in the session.
+        browser.add_redacted_terms(vec![
+            "SyntheticPrivateName".to_owned(),
+            "FixtureFamily".to_owned(),
+            "fixture@example.com".to_owned(),
+            "+1 202-555-0123".to_owned(),
+            "202 Main Street".to_owned(),
+        ]);
+        browser
+            .browse(BrowseRequest::Open { url: url.clone() })
+            .await
+            .unwrap();
+        // The public shipping summary never shows the shopper's details back.
+        let snapshot = loop {
+            let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+            if snapshot["elements"].as_array().is_some_and(|e| !e.is_empty()) {
+                break snapshot;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+        let rendered = snapshot.to_string();
+        for pii in [
+            "SyntheticPrivateName",
+            "FixtureFamily",
+            "fixture@example.com",
+            "+1 202-555-0123",
+            "202 Main Street",
+        ] {
+            assert!(!rendered.contains(pii), "{pii} leaked: {rendered}");
+        }
+        let tab = open(&browser, url).await;
+        // The collapsed credit-card radio leaves no card fields to read yet.
+        let error = Discovery::read(&tab).await.err().unwrap();
+        assert_eq!(
+            error.downcast_ref::<PreparationReason>().copied(),
+            Some(PreparationReason::FieldsUnsupported),
+            "{error:#}"
+        );
+        // Selecting it mounts the card fields, exactly as Shopify's PCI frames do.
+        tab.cdp
+            .evaluate(
+                &tab.session,
+                "(()=>{const r=document.getElementById('basic-creditCards');if(!r.checked)r.click();return true;})()"
+                    .into(),
+            )
+            .await
+            .unwrap();
+        let discovery = initialized_processor(&tab).await;
+        assert_eq!(
+            (discovery.facts.total_minor, discovery.facts.currency.as_str()),
+            (100, "USD")
+        );
+        discovery.recheck(&tab).await.unwrap();
+        let mut filled = Vec::new();
+        discovery.fill(&tab, &card(), &mut filled).await.unwrap();
+        assert_eq!(filled.len(), 3);
+        assert!(discovery.submit(&tab).await.unwrap());
+        tab.cdp
+            .evaluate(
+                &tab.session,
+                "document.body.innerHTML='Thank you for your order #FIX123';true".into(),
+            )
+            .await
+            .unwrap();
+        let outcome = tab
+            .cdp
+            .evaluate(
+                &tab.session,
+                concat!(
+                    include_str!("form-attention.js"),
+                    ";",
+                    include_str!("outcome.js")
+                )
+                .into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome["state"], "payment_phrase");
+        assert_eq!(outcome["order_id"], "FIX123");
+        browser.return_control().await.unwrap();
+        server.abort();
+    }
+
+    /// A live Shopify test store with Bogus Gateway enabled: the full
+    /// contact, shipping and card flow with the Bogus test card.
+    #[tokio::test]
+    #[ignore = "live Shopify Bogus Gateway purchase on a test store; requires network and store setup"]
+    async fn shopify_bogus_gateway_live_purchase() {
+        let browser = browser().await;
+        browser
+            .browse(BrowseRequest::Open {
+                url: "https://shop.simplyonpurpose.org/products/story-starters".into(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        let button = snapshot["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|element| {
+                element["label"]
+                    .as_str()
+                    .is_some_and(|label| label.eq_ignore_ascii_case("Add to Cart"))
+            })
+            .unwrap();
+        browser
+            .browse(BrowseRequest::Click {
+                element_ref: button["ref"].as_str().unwrap().into(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        browser
+            .browse(BrowseRequest::Open {
+                url: "https://shop.simplyonpurpose.org/cart".into(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        let button = snapshot["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|element| element["label"] == "Checkout")
+            .unwrap();
+        browser
+            .browse(BrowseRequest::Click {
+                element_ref: button["ref"].as_str().unwrap().into(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let mut tab = browser.handoff().await.unwrap();
+        tab.fixture_payment_hosts = false; // Real provider pages need no fixture trust.
+        let select = "(() => { const card = document.querySelector('input#basic-creditCards[name=basic]'); \
+        if (card && !card.checked) card.click(); \
+        return {card: !!card, frames: document.querySelectorAll('iframe').length}; })()";
+        tab.cdp
+            .evaluate(&tab.session, select.into())
+            .await
+            .map(|state| eprintln!("Shopify payment selection: {state}"))
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let discovery = Discovery::read(&tab).await.unwrap();
+        let mut test_card = card();
+        // Bogus Gateway test card: any card name, "1" as the security code.
+        test_card.cvc = "1".into();
+        discovery.fill(&tab, &test_card, &mut Vec::new()).await.unwrap();
+        assert!(discovery.submit(&tab).await.unwrap());
         browser.return_control().await.unwrap();
     }
 

@@ -1403,6 +1403,13 @@ impl CheckoutService {
                         if let Some(fields) = recorded.as_object_mut() {
                             fields.remove("phrase");
                         }
+                        // The order confirmation code stays visible, with any
+                        // embedded shopper PII masked.
+                        if let Some(order_id) = recorded["order_id"].as_str() {
+                            let terms = self.browser.redacted_terms();
+                            recorded["order_id"] =
+                                json!(crate::browser::redact_text(order_id, &terms));
+                        }
                         let close = !self
                             .saved
                             .lock()
@@ -1716,6 +1723,11 @@ impl CheckoutService {
                     (checkout.tab.cdp.clone(), checkout.view_session.clone())
                 };
                 let text = zeroize::Zeroizing::new(text);
+                // Whatever the human typed privately (email, address,
+                // password) must not be readable back from a later page.
+                if text.trim().len() >= 4 {
+                    self.browser.add_redacted_terms([text.to_string()]);
+                }
                 tokio::time::timeout(
                     Duration::from_secs(2),
                     cdp.call(

@@ -39,6 +39,35 @@ pub(crate) struct ProcessorResponse {
     pub link: String,
 }
 
+/// Stripe serves the hosted checkout bootstrap JSON from these origins. The
+/// payment link id or hosted session id in the path binds a recorded response
+/// to the page that requested it; anything else on these hosts is ignored.
+pub(crate) fn stripe_bootstrap_link(url: &url::Url) -> Option<String> {
+    if url.query().is_some() {
+        return None;
+    }
+    match url.origin().ascii_serialization().as_str() {
+        "https://merchant-ui-api.stripe.com" => url
+            .path()
+            .strip_prefix("/payment-links/")
+            .filter(|link| {
+                !link.is_empty() && link.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            }),
+        // Hosted Checkout Sessions (`checkout.stripe.com/c/pay/cs_...`) load
+        // their session state from a same-origin JSON bootstrap whose path
+        // carries the session id.
+        "https://checkout.stripe.com" => url.path().split('/').find(|segment| {
+            segment.starts_with("cs_")
+                && segment.len() > 10
+                && segment
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        }),
+        _ => None,
+    }
+    .map(str::to_owned)
+}
+
 pub(crate) struct FrameContext {
     pub session: String,
     pub world: i64,
@@ -75,6 +104,10 @@ fn tree_frames(
 /// Chrome's debugging channel is inherited pipe descriptors, never a TCP port.
 pub(crate) struct Cdp {
     pub(crate) processor_responses: Arc<Mutex<Vec<ProcessorResponse>>>,
+    /// Shopper PII the agent must never read back from a page, collected
+    /// from saved traveler values and private typing. Shared with the
+    /// private tab, which fills travelers without a `Browser` handle.
+    redacted_terms: Arc<Mutex<Vec<zeroize::Zeroizing<String>>>>,
     child: Mutex<Child>,
     writer: Mutex<File>,
     replies: Replies,
@@ -295,6 +328,7 @@ impl Cdp {
             writer: Mutex::new(File::from(command_write)),
             replies: replies.clone(),
             processor_responses: processor_responses.clone(),
+            redacted_terms: Arc::new(Mutex::new(Vec::new())),
             iframe_sessions: Mutex::new(HashMap::new()),
             sequence: AtomicU64::new(1),
         });
@@ -322,18 +356,7 @@ impl Cdp {
                                         && let Some(url) = params["response"]["url"]
                                             .as_str()
                                             .and_then(|url| url::Url::parse(url).ok())
-                                        && url.origin().ascii_serialization()
-                                            == "https://merchant-ui-api.stripe.com"
-                                        && url.query().is_none()
-                                        && let Some(link) = url
-                                            .path()
-                                            .strip_prefix("/payment-links/")
-                                            .filter(|link| {
-                                                !link.is_empty()
-                                                    && link.bytes().all(|b| {
-                                                        b.is_ascii_alphanumeric() || b == b'_'
-                                                    })
-                                            })
+                                        && let Some(link) = stripe_bootstrap_link(&url)
                                         && let (
                                             Some(session),
                                             Some(request),
@@ -355,7 +378,7 @@ impl Cdp {
                                             request: request.into(),
                                             frame: frame.into(),
                                             loader: loader.into(),
-                                            link: link.into(),
+                                            link,
                                         });
                                     }
                                 }
@@ -471,6 +494,39 @@ impl Cdp {
             .is_ok_and(|status| status.is_some())
     }
 
+    /// Session-scoped PII the agent must not read back from pages. Terms are
+    /// normalized, deduplicated, and emptied of short or generic tokens so
+    /// ordinary page text is not corrupted.
+    pub(crate) fn add_redacted_terms(&self, terms: impl IntoIterator<Item = String>) {
+        let mut store = self.redacted_terms.lock();
+        for term in terms {
+            let term = term.split_whitespace().collect::<Vec<_>>().join(" ");
+            if term.is_empty() {
+                continue;
+            }
+            // Country and currency codes (US, AR, USD) and any short token
+            // would redact ordinary page text.
+            let generic_code = term.len() <= 3
+                && term.chars().all(|c| c.is_ascii_alphabetic())
+                && term.chars().all(|c| c.is_ascii_uppercase());
+            if term.len() < 4 || generic_code {
+                continue;
+            }
+            if store.iter().any(|known| known.as_str() == term) {
+                continue;
+            }
+            store.push(zeroize::Zeroizing::new(term));
+        }
+    }
+
+    pub(crate) fn redacted_terms(&self) -> Vec<zeroize::Zeroizing<String>> {
+        self.redacted_terms.lock().clone()
+    }
+
+    pub(crate) fn clear_redacted_terms(&self) {
+        self.redacted_terms.lock().clear();
+    }
+
     #[cfg(test)]
     pub async fn evaluate(&self, session: &str, expression: String) -> Result<Value> {
         let result = self
@@ -499,6 +555,29 @@ impl Drop for Cdp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stripe_bootstrap_links_bind_payment_links_and_hosted_sessions() {
+        let link = |url: &str| url::Url::parse(url).ok().and_then(|u| stripe_bootstrap_link(&u));
+        assert_eq!(
+            link("https://merchant-ui-api.stripe.com/payment-links/test_28o7u4eQMcaUgWk8ww"),
+            Some("test_28o7u4eQMcaUgWk8ww".to_owned())
+        );
+        assert_eq!(
+            link("https://checkout.stripe.com/c/pay/cs_test_4eC39HqLyjWDarjtT1zdp7dc"),
+            Some("cs_test_4eC39HqLyjWDarjtT1zdp7dc".to_owned())
+        );
+        // Other Stripe traffic and foreign hosts never become a bootstrap.
+        assert_eq!(link("https://merchant-ui-api.stripe.com/payment-links/"), None);
+        assert_eq!(link("https://merchant-ui-api.stripe.com/other"), None);
+        assert_eq!(
+            link("https://merchant-ui-api.stripe.com/payment-links/test_28o7u4eQMcaUgWk8ww?x=1"),
+            None
+        );
+        assert_eq!(link("https://checkout.stripe.com/c/pay/cs_test_4eC39HqLyjWDarjtT1zdp7dc?key=1"), None);
+        assert_eq!(link("https://checkout.stripe.com/"), None);
+        assert_eq!(link("https://checkout.stripe.com.evil.example/c/pay/cs_test_4eC39Hq"), None);
+    }
 
     #[tokio::test]
     async fn oversized_reply_does_not_disable_later_browser_commands() {

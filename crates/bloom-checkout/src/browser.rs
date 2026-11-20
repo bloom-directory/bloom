@@ -1,6 +1,7 @@
 use crate::cdp::{Cdp, OversizedReply};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
+use zeroize::Zeroizing;
 use std::{
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::Path,
@@ -59,6 +60,16 @@ impl Browser {
 
     pub(crate) fn has_private_traveler_data(&self) -> bool {
         self.private_traveler_used.load(Ordering::SeqCst)
+    }
+
+    /// Register session-scoped PII (saved traveler values, private typing)
+    /// the agent must not read back from shopping pages.
+    pub(crate) fn add_redacted_terms(&self, terms: impl IntoIterator<Item = String>) {
+        self.cdp.add_redacted_terms(terms);
+    }
+
+    pub(crate) fn redacted_terms(&self) -> Vec<Zeroizing<String>> {
+        self.cdp.redacted_terms()
     }
 
     pub fn needs_restart(&self) -> bool {
@@ -255,9 +266,16 @@ impl Browser {
                         elements.push(element);
                     }
                 }
-                Ok(
-                    json!({"url":url,"text":text.chars().take(30000).collect::<String>(),"elements":elements}),
-                )
+                let terms = self.redacted_terms();
+                for element in &mut elements {
+                    for key in ["label", "context", "value"] {
+                        if let Some(value) = element.get(key).and_then(Value::as_str) {
+                            element[key] = json!(redact_text(value, &terms));
+                        }
+                    }
+                }
+                let text = redact_text(&text.chars().take(30000).collect::<String>(), &terms);
+                Ok(json!({"url":url,"text":text,"elements":elements}))
             }
             BrowseRequest::Back => {
                 let history = self
@@ -595,6 +613,12 @@ impl Browser {
         let journey = tab.journey + 1;
         *tab = fresh;
         tab.journey = journey;
+        // The disposed context takes the pages that held saved traveler
+        // values, and their redaction terms, with it. A kept session keeps
+        // both until the person finishes shopping.
+        if !keep_session {
+            self.cdp.clear_redacted_terms();
+        }
         // The pages that held saved traveler values are gone.
         self.private_traveler_used.store(false, Ordering::SeqCst);
         self.revoked.store(false, Ordering::SeqCst);
@@ -674,6 +698,64 @@ fn journey_context(tab: &Tab) -> String {
     format!("{}:{}", tab.context, tab.journey)
 }
 
+/// Replace every session-registered PII term with a fixed marker, matching
+/// case-insensitively on substrings. Longest terms replace first so a full
+/// name is masked as a whole before one of its parts.
+pub(crate) fn redact_text(input: &str, terms: &[Zeroizing<String>]) -> String {
+    let mut terms: Vec<String> = terms
+        .iter()
+        .map(|term| term.to_lowercase())
+        .filter(|term| !term.is_empty())
+        .collect();
+    terms.sort_by_key(|term| std::cmp::Reverse(term.len()));
+    terms.dedup();
+    if terms.is_empty() {
+        return input.to_owned();
+    }
+    // Lowercasing can change a character count (İ). Map every lowercased
+    // character back to its original character instead of assuming equal
+    // lengths, then mask contiguous matched character ranges.
+    let mut original_index = Vec::with_capacity(input.len());
+    for (index, ch) in input.chars().enumerate() {
+        for _ in ch.to_lowercase() {
+            original_index.push(index);
+        }
+    }
+    let lower: String = input.chars().flat_map(char::to_lowercase).collect();
+    let lower: Vec<char> = lower.chars().collect();
+    let mut masked = vec![false; input.chars().count()];
+    for term in terms {
+        let needle: Vec<char> = term.chars().collect();
+        if needle.len() > lower.len() {
+            continue;
+        }
+        for start in 0..=(lower.len() - needle.len()) {
+            if lower[start..start + needle.len()] == needle[..] {
+                for i in start..start + needle.len() {
+                    masked[original_index[i]] = true;
+                }
+            }
+        }
+    }
+    if !masked.iter().any(|m| *m) {
+        return input.to_owned();
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut covering = false;
+    for (index, ch) in input.chars().enumerate() {
+        if masked[index] {
+            if !covering {
+                out.push_str("[redacted]");
+                covering = true;
+            }
+        } else {
+            out.push(ch);
+            covering = false;
+        }
+    }
+    out
+}
+
 fn accessibility_text(tree: &Value) -> Result<String> {
     let nodes = tree["nodes"]
         .as_array()
@@ -741,6 +823,22 @@ fn accessibility_text(tree: &Value) -> Result<String> {
 mod tests {
     use super::*;
     use axum::{Router, response::Html, routing::get};
+
+    #[test]
+    fn redact_text_masks_terms_case_insensitively_longest_first() {
+        let terms = vec![
+            Zeroizing::new("Jane".into()),
+            Zeroizing::new("Jane Doe".into()),
+            Zeroizing::new("jane@example.com".into()),
+        ];
+        assert_eq!(
+            redact_text("Order for Jane Doe <Jane@example.com>", &terms),
+            "Order for [redacted] <[redacted]>"
+        );
+        assert_eq!(redact_text("Ordinary page text", &terms), "Ordinary page text");
+        assert_eq!(redact_text("", &terms), "");
+        assert_eq!(redact_text("no terms", &[]), "no terms");
+    }
 
     #[test]
     fn page_text_names_each_line_once() {

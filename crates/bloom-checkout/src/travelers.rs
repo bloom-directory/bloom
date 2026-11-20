@@ -259,6 +259,26 @@ impl TravelerDiscovery {
         if filled.iter().any(|f| !expected.contains(f)) {
             bail!("Traveler fill incomplete");
         }
+        // Whatever the page can now echo back to the agent stays unreadable:
+        // the filled values join this session's redaction terms.
+        const PII: [&str; 10] = [
+            "given_name",
+            "family_name",
+            "full_name",
+            "email",
+            "phone",
+            "phone_national",
+            "street_address",
+            "postal_code",
+            "document_number",
+            "born_on",
+        ];
+        tab.cdp.add_redacted_terms(
+            values
+                .iter()
+                .filter(|(key, _)| PII.contains(&key.as_str()))
+                .map(|(_, value)| value.to_string()),
+        );
         Ok(filled)
     }
 }
@@ -372,6 +392,86 @@ mod tests {
         assert!(!snapshot["elements"].as_array().unwrap().is_empty());
         server.abort();
     }
+    #[tokio::test]
+    async fn filled_traveler_values_become_session_redaction_terms() {
+        let (browser, server, _) = browser_at(
+            "<!doctype html><input autocomplete='given-name'><input autocomplete='family-name'>\
+             <input type='email'><input type='tel'>",
+        )
+        .await;
+        let tab = browser.handoff().await.unwrap();
+        let fields = [
+            TravelerField::GivenName,
+            TravelerField::FamilyName,
+            TravelerField::Email,
+            TravelerField::Phone,
+        ];
+        let discovery = TravelerDiscovery::read(&tab, &fields).await.unwrap();
+        let values: BTreeMap<String, Zeroizing<String>> = [
+            ("given_name", "SyntheticPrivateName"),
+            ("family_name", "FixtureFamily"),
+            ("email", "fixture@example.com"),
+            ("phone", "+1 202-555-0123"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.into(), Zeroizing::new(v.into())))
+        .collect();
+        discovery.fill(&tab, &values).await.unwrap();
+        let terms = browser.redacted_terms();
+        for expected in [
+            "SyntheticPrivateName",
+            "FixtureFamily",
+            "fixture@example.com",
+            "+1 202-555-0123",
+        ] {
+            assert!(
+                terms.iter().any(|term| term.as_str() == expected),
+                "{expected} not registered: {terms:?}"
+            );
+        }
+        // A kept session keeps the terms for the shopping that follows.
+        browser.return_control_signed_in().await.unwrap();
+        assert_eq!(browser.redacted_terms().len(), terms.len());
+        // Disposing the context drops them.
+        browser.return_control().await.unwrap();
+        assert!(browser.redacted_terms().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn snapshots_redact_saved_traveler_values_echoed_by_merchant_pages() {
+        // A merchant shipping summary echoing the shopper's saved details in
+        // static text and a plain input value.
+        let (browser, server, _) = browser_at(
+            "<!doctype html><h1>Order confirmed</h1>
+             <p>Thank you, SyntheticPrivateName FixtureFamily</p>
+             <p>Ship to SyntheticPrivateName FixtureFamily at 202 Main Street</p>
+             <p>We emailed fixture@example.com and texted +1 202-555-0123</p>
+             <input value='SyntheticPrivateName FixtureFamily'>",
+        )
+        .await;
+        browser.add_redacted_terms(vec![
+            "SyntheticPrivateName".to_owned(),
+            "FixtureFamily".to_owned(),
+            "fixture@example.com".to_owned(),
+            "+1 202-555-0123".to_owned(),
+            "202 Main Street".to_owned(),
+        ]);
+        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        let rendered = snapshot.to_string();
+        for pii in [
+            "SyntheticPrivateName",
+            "FixtureFamily",
+            "fixture@example.com",
+            "+1 202-555-0123",
+            "202 Main Street",
+        ] {
+            assert!(!rendered.contains(pii), "{pii} leaked: {rendered}");
+        }
+        assert!(rendered.contains("[redacted]"), "{rendered}");
+        server.abort();
+    }
+
     #[tokio::test]
     async fn fields_captioned_by_nearby_text_are_found() {
         // Shaped like JetSMART: captions are plain divs beside unlabeled inputs.

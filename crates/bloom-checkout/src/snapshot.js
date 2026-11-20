@@ -56,6 +56,18 @@
     || (field(e) ? caption(e) || e.name : pictured(e)) || '').replace(/\s+/g, ' ').trim();
   // Card and password values never leave the page.
   const secret = BLOOM_CARD_SECRET;
+  // Shopper PII values (name, email, phone, address, birth date) never leave
+  // the page either; only the card classifier ran here before.
+  const piiAutocomplete = ['name', 'given-name', 'family-name', 'additional-name', 'email',
+    'tel', 'tel-national', 'street-address', 'address-line1', 'address-line2', 'address-line3',
+    'postal-code', 'bday', 'bday-day', 'bday-month', 'bday-year'];
+  const piiInput = e => {
+    if (!e.matches('input,textarea')) return false;
+    if ((e.getAttribute('autocomplete') || '').toLowerCase().split(/\s+/).some(token => piiAutocomplete.includes(token))) return true;
+    if (['email', 'tel'].includes(e.type)) return true;
+    const hint = ((e.getAttribute('name') || '') + ' ' + (e.id || '') + ' ' + (e.getAttribute('aria-label') || '')).toLowerCase();
+    return /(^|[^a-z])(e-?mail|phone|tel(?:ephone)?|mobile|first[-_ ]?name|last[-_ ]?name|full[-_ ]?name|family[-_ ]?name|address|street|zip|postal|birthdate|birth[-_ ]?date|bday|passport|document)([^a-z]|$)/.test(hint);
+  };
   // Actions use this same live classifier, including slotted labels and
   // captions beside numeric placeholders, before inserting any public text.
   const privateInput = e => secret(e, /^\d[\d\s]*$/.test(label(e)) ? caption(e) : label(e));
@@ -109,7 +121,7 @@
     context: context(e),
     type: e.type || null,
     // Numeric placeholders can hide the adjacent card-field caption.
-    value: field(e) && e.type !== 'checkbox' && e.type !== 'radio' && !privateInput(e) ? String(e.value).slice(0, 200) : undefined,
+    value: field(e) && e.type !== 'checkbox' && e.type !== 'radio' && !privateInput(e) && !piiInput(e) ? String(e.value).slice(0, 200) : undefined,
     checked: checked(e),
     // Lets an agent read a document link without opening it. Like the page
     // url, the query and fragment, which can carry tokens, are left out.
