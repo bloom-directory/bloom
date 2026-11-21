@@ -684,7 +684,35 @@ impl TxEngine {
                     "transaction operation in progress; retry after it completes".into(),
                 )
             })?;
-        Ok(self.outbox_cancel(wallet, chain, id).await??)
+        let ceremony = self.open_ceremony(wallet, chain, id);
+        self.outbox_cancel(wallet, chain, id).await??;
+        self.end_ceremony(ceremony).await;
+        Ok(())
+    }
+
+    /// The approval operation whose owner ceremony an unsigned pending entry
+    /// holds open. Read before the entry leaves `pending/`.
+    fn open_ceremony(&self, wallet: &str, chain: &str, id: &str) -> Option<OperationId> {
+        let entry = self
+            .outbox
+            .read_in_state(wallet, chain, id, OutboxState::Pending)
+            .ok()?;
+        let state = read_triad_signing_state(&entry.dir.join(TRIAD_SIGNING_STATE_FILE)).ok()??;
+        (state.approval_id.is_some() && !state.sign_dispatched)
+            .then_some(state.approval_operation_id)
+    }
+
+    /// Cancel the owner's ceremony for an entry Bloom has discarded, so the
+    /// Broker page and `sealed-approvals/` stop asking to approve a
+    /// transaction that no longer exists. Best effort: Broker refuses a
+    /// ceremony that already ended, and an unreachable one expires on its own.
+    async fn end_ceremony(&self, operation: Option<OperationId>) {
+        let (Some(operation), Some(service)) = (operation, self.triad_signing.as_ref()) else {
+            return;
+        };
+        if let Err(error) = service.broker.cancel_ceremony(operation).await {
+            tracing::debug!(%error, "outbox.discard.ceremony_cancel_failed");
+        }
     }
 
     /// [`Outbox::cancel`] off the async worker (see [`Self::off_worker`]).
@@ -4737,8 +4765,12 @@ impl TxEngine {
         // A provably unsigned pending entry is released locally; anything
         // possibly signed needs a same-nonce cancellation.
         if entry.state == OutboxState::Pending {
+            let ceremony = self.open_ceremony(wallet, chain_name, original_id);
             match self.outbox_cancel(wallet, chain_name, original_id).await? {
-                Ok(()) => return Ok(self.outbox.read(wallet, chain_name, original_id)?.staged),
+                Ok(()) => {
+                    self.end_ceremony(ceremony).await;
+                    return Ok(self.outbox.read(wallet, chain_name, original_id)?.staged);
+                }
                 Err(OutboxError::PossiblySigned { .. }) => {}
                 Err(error) => return Err(error.into()),
             }
@@ -6140,6 +6172,20 @@ mod tests {
                             ));
                         }
                         Ok(MachineBrokerResponse::SigningSignBatch(result))
+                    }
+                    MachineBrokerRequest::CeremonyCancel(request) => {
+                        *self.approval_terminal.lock() = Some(ApprovalLifecycleState::Cancelled);
+                        Ok(MachineBrokerResponse::CeremonyCancel(
+                            bloom_broker_api::CeremonyPublicStatus {
+                                ceremony_id: Digest32::from_bytes([12; 32]),
+                                ceremony_kind: bloom_broker_api::CeremonyKind::SealedApproval,
+                                operation_id: OperationId::new(request.id.as_str().to_owned())?,
+                                state: bloom_broker_api::CeremonyState::Cancelled,
+                                expires_at_ms: DecimalU64::new(0),
+                                ceremony_url: None,
+                                receipt_digest: None,
+                            },
+                        ))
                     }
                     other => panic!("unexpected triad fixture request: {other:?}"),
                 }
@@ -9631,6 +9677,66 @@ mod tests {
                 .filter(|request| matches!(request, MachineBrokerRequest::SealedApprovalPrepare(_)))
                 .count(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn discard_cancels_the_open_owner_ceremony() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let mut staged = fake_staged_1559("triad-discarded");
+        staged.wallet = "alice".into();
+        staged.created_ms = now_ms();
+        outbox.write_pending(&staged, "exact EVM review").unwrap();
+        let entry = outbox
+            .read_in_state("alice", "anvil", "triad-discarded", OutboxState::Pending)
+            .unwrap();
+        let (engine, fixture, _) = triad_batch_fixture(outbox, false, false);
+        let unsigned = UnsignedEvmTx::Eip1559(TxEip1559 {
+            chain_id: staged.chain_id,
+            nonce: staged.nonce,
+            gas_limit: staged.gas_limit,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 10,
+            to: TxKind::Call(staged.to.as_deref().unwrap().parse().unwrap()),
+            value: U256::ZERO,
+            access_list: AccessList::default(),
+            input: Bytes::new(),
+        });
+        assert!(matches!(
+            engine
+                .triad_sign_evm_payload(
+                    &entry,
+                    &staged,
+                    EvmOutboxActionKind::Confirm,
+                    &TxEngine::unsigned_signing_preimage(&unsigned),
+                    TxEngine::unsigned_signing_hash(&unsigned),
+                )
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        let approval = read_triad_signing_state(&entry.dir.join(TRIAD_SIGNING_STATE_FILE))
+            .unwrap()
+            .unwrap()
+            .approval_operation_id;
+
+        engine
+            .discard_unsigned(&permit_for(&directory), "alice", "anvil", "triad-discarded")
+            .await
+            .unwrap();
+
+        let cancelled: Vec<_> = fixture
+            .requests
+            .lock()
+            .iter()
+            .filter_map(|request| match request {
+                MachineBrokerRequest::CeremonyCancel(request) => Some(request.id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cancelled,
+            [Digest32::new(approval.as_str().to_owned()).unwrap()]
         );
     }
 
