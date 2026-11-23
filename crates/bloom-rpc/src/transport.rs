@@ -7,7 +7,7 @@
 //!  ↓
 //! [ThrottleLayer (only if endpoint.max_rps is Some)]
 //!  ↓
-//! [Http transport]
+//! [Http transport (each request bounded by REQUEST_TIMEOUT)]
 //! ```
 //!
 //! The per-endpoint stacks are joined by an `EndpointPool`, which ranks
@@ -56,7 +56,7 @@ use alloy::rpc::client::RpcClient;
 use alloy::transports::http::{Http, reqwest};
 use alloy::transports::layers::{RetryBackoffLayer, ThrottleLayer};
 use alloy::transports::ws::WsConnect;
-use alloy::transports::{BoxTransport, IntoBoxTransport};
+use alloy::transports::{BoxTransport, IntoBoxTransport, TransportErrorKind};
 use bloom_proto::{ChainSpec, EndpointSpec};
 use tokio::sync::{OnceCell, watch};
 use tower::ServiceBuilder;
@@ -73,7 +73,7 @@ use crate::pool::{EndpointPool, PoolEndpoint, emit_cooldown_event};
 /// layer (Alchemy free-tier 330 CU/s × 2 ≈ 660). The cost is a
 /// conservative throttle on retry pacing only — it doesn't reject
 /// calls.
-const DEFAULT_CU_PER_SEC: u64 = 660;
+pub(crate) const DEFAULT_CU_PER_SEC: u64 = 660;
 
 /// Maximum retries applied by `RetryBackoffLayer`. Three is the value
 /// the spec recommends: one for transient network blips, one for a
@@ -96,6 +96,16 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(15);
 /// is, by definition, no use as a backing transport for live UI
 /// reads.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Hard bound for one HTTP request to one endpoint, from connecting until
+/// the response body has arrived. A race ends only when an endpoint
+/// answers or every endpoint in it has failed, so without this bound an
+/// endpoint that accepts the connection and never answers would hold up
+/// every call that reaches it before a working endpoint does. A timeout
+/// is a transport error: the retry layer does not retry it, and the pool
+/// counts it against the endpoint and moves a read on. Matches
+/// `bloom-solana`'s `REQUEST_TIMEOUT`.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One entry in the per-endpoint probe table. The `transport` is the
 /// fully-layered HTTP stack for one endpoint; the `idx` is the slot
@@ -163,6 +173,11 @@ impl RpcEngine {
         let mut tracked_urls: Vec<String> = Vec::new();
         let mut ws_connects: Vec<WsConnect> = Vec::new();
         let mut supports_subscriptions = false;
+        // One client for every endpoint, so they share its timeout.
+        let http_client = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .map_err(|e| BloomRpcError::Transport(TransportErrorKind::custom(e)))?;
 
         for ep in &endpoints {
             let (url, scheme) = classify_endpoint(ep)?;
@@ -171,7 +186,7 @@ impl RpcEngine {
             }
             match scheme {
                 EndpointScheme::Http => {
-                    let transport = build_http_stack(&url, ep);
+                    let transport = build_http_stack(&url, ep, http_client.clone());
                     let idx = tracked_urls.len();
                     tracked_urls.push(ep.url.clone());
                     // Keep a clone for the probe loop. `BoxTransport`
@@ -493,24 +508,31 @@ async fn run_probe_round(chain: &str, targets: &[ProbeTarget], health: &HealthRe
     }
 }
 
-/// Build the HTTP transport stack for one endpoint. The result is
-/// box-erased so all endpoints in the pool share a single concrete
-/// type.
-fn build_http_stack(url: &url::Url, ep: &EndpointSpec) -> BoxTransport {
-    let cu = ep.cu_per_sec.unwrap_or(DEFAULT_CU_PER_SEC);
-    let retry = RetryBackoffLayer::new_with_policy(
+/// The retry layer every HTTP endpoint sits behind. It retries what
+/// [`BloomRetryPolicy`] classifies as transient (rate limits, 5xx) and
+/// hands any other JSON-RPC error reply to the pool as
+/// `TransportError::ErrorResp`.
+pub(crate) fn retry_layer(cu_per_sec: u64) -> RetryBackoffLayer<BloomRetryPolicy> {
+    RetryBackoffLayer::new_with_policy(
         MAX_RETRIES,
         INITIAL_BACKOFF_MS,
-        cu,
+        cu_per_sec,
         BloomRetryPolicy::default(),
-    );
+    )
+}
+
+/// Build the HTTP transport stack for one endpoint over `client`, which
+/// carries the per-request timeout. The result is box-erased so all
+/// endpoints in the pool share a single concrete type.
+fn build_http_stack(url: &url::Url, ep: &EndpointSpec, client: reqwest::Client) -> BoxTransport {
+    let retry = retry_layer(ep.cu_per_sec.unwrap_or(DEFAULT_CU_PER_SEC));
 
     // ServiceBuilder applies layers outermost-first when reading
     // top-to-bottom; conceptually retry sits *outside* throttle so
     // throttled-and-rate-limited responses still get retried. For
     // endpoints without a configured `max_rps` we skip the throttle
     // layer entirely (the throttle layer panics on `rps == 0`).
-    let http: Http<reqwest::Client> = Http::new(url.clone());
+    let http: Http<reqwest::Client> = Http::with_client(client, url.clone());
     if let Some(rps) = ep.max_rps {
         let throttle = ThrottleLayer::new(rps);
         let stack = ServiceBuilder::new()

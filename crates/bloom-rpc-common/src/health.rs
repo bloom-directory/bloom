@@ -34,9 +34,8 @@ use serde::Serialize;
 /// can't recover from in normal operation.
 const LATENCY_EWMA_ALPHA: f64 = 0.3;
 
-/// Rolling success-rate window length. Mirrors alloy's own internal
-/// `FallbackService` window so the two health views report comparable
-/// shapes for the same traffic.
+/// Rolling success-rate window length: the last ten outcomes, from probes
+/// and live calls alike.
 const SAMPLE_WINDOW: usize = 10;
 
 /// Consecutive failures that arm a fresh cooldown.
@@ -86,8 +85,8 @@ pub struct EndpointHealth {
     pub consecutive_successes: u32,
     /// Last block number observed via this endpoint, if any.
     pub last_block: Option<u64>,
-    /// Wall-clock time of the most recent successful probe. Used by
-    /// the chronic-failer escalation logic.
+    /// Wall-clock time of the most recent success, from a probe or a live
+    /// call. Used by the chronic-failer escalation logic.
     pub last_ok: Option<Instant>,
 }
 
@@ -111,7 +110,7 @@ enum SelectionTier {
 
 impl EndpointHealth {
     /// Build a fresh health record for `url`. All metrics start empty;
-    /// the active probe loop populates them.
+    /// the active probe loop and live calls populate them.
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             last_url: url.into(),
@@ -234,8 +233,9 @@ impl HealthRegistry {
         self.inner.read().is_empty()
     }
 
-    /// Record a successful probe for `idx`. `latency` is folded into
-    /// the EWMA; `block` updates `last_block` when present.
+    /// Record a successful probe or live call for `idx`. `latency` is
+    /// folded into the EWMA; `block` updates `last_block` when present,
+    /// which only probes supply.
     pub fn record_success(&self, idx: usize, latency: Duration, block: Option<u64>) {
         let mut guard = self.inner.write();
         let Some(h) = guard.get_mut(idx) else { return };
@@ -252,8 +252,8 @@ impl HealthRegistry {
         }
     }
 
-    /// Record a failed probe for `idx`. The retryable flag is currently
-    /// informational; the cooldown decision is driven by the
+    /// Record a failed probe or live call for `idx`. The retryable flag
+    /// is currently informational; the cooldown decision is driven by the
     /// consecutive-failure counter so chronic flakiness still arms a
     /// cooldown even when individual errors look transient.
     /// `backoff_hint`, when supplied (e.g. from `Retry-After`), is used
@@ -363,8 +363,8 @@ impl HealthRegistry {
     }
 }
 
-/// What `record_failure` ended up doing — useful to the probe loop for
-/// pretty tracing without it having to re-query the registry.
+/// What `record_failure` ended up doing, so the probe loop and the pool
+/// can log it without re-querying the registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CooldownDecision {
     /// Failure recorded but no cooldown armed.

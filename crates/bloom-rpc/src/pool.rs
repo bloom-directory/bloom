@@ -13,7 +13,10 @@
 //! the request:
 //!
 //! - **Reads** move on to the next window of the ranking, until an
-//!   endpoint answers or every configured endpoint has failed.
+//!   endpoint answers or every configured endpoint has failed. An
+//!   endpoint that never answers fails when its HTTP request times out
+//!   (`REQUEST_TIMEOUT` in `transport.rs`), so it can delay a read but
+//!   not stall it.
 //! - **Submissions** (any method named `<namespace>_send…`, such as
 //!   `eth_sendRawTransaction`) stay in the first window. They are offered
 //!   to at most [`RACE_WIDTH`] endpoints, the same count as before this
@@ -25,10 +28,23 @@
 //!
 //! A batch containing any submission is dispatched as a submission.
 //!
-//! A response that carries a JSON-RPC error payload is a successful
-//! transport round trip: it is returned as is and counts as a success for
-//! endpoint health. Only transport errors (connection failures, HTTP error
-//! statuses, exhausted retries) count as endpoint failures.
+//! An endpoint that replies with a JSON-RPC error (a revert, "nonce too
+//! low", an unknown block) has answered. The retry layer below the pool
+//! hands that reply over as `TransportError::ErrorResp`, and the pool
+//! treats it as the endpoint's answer, not as a failure:
+//!
+//! - It counts as a success for endpoint health.
+//! - It ends a read. Moving on would only send the same request to more
+//!   endpoints, which alloy's `FallbackLayer` never did either.
+//! - It is returned in preference to a transport error from the same
+//!   window, so a revert is never reported as an unreachable endpoint.
+//!   Callers rely on this: a pre-broadcast simulation reads a transport
+//!   error as "simulation unavailable" and lets the transaction through.
+//!
+//! A race still waits for its other endpoints after an error reply,
+//! because one of them may return a result. Only transport errors
+//! (connection failures, timeouts, HTTP error statuses, retries exhausted
+//! on rate limits) count against an endpoint and move a read on.
 
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -86,6 +102,37 @@ fn is_submission(method: &str) -> bool {
     method
         .split_once('_')
         .is_some_and(|(_, name)| name.starts_with("send"))
+}
+
+/// True when the endpoint answered with a JSON-RPC error rather than
+/// failing to answer at all.
+fn is_error_reply(err: &TransportError) -> bool {
+    err.as_error_resp().is_some()
+}
+
+/// The errors one window produced, kept so the most useful is returned:
+/// the first error reply if any endpoint answered, otherwise the last
+/// transport error.
+#[derive(Default)]
+struct WindowOutcome {
+    error_reply: Option<TransportError>,
+    transport_error: Option<TransportError>,
+}
+
+impl WindowOutcome {
+    fn record(&mut self, err: TransportError) {
+        if !is_error_reply(&err) {
+            self.transport_error = Some(err);
+        } else if self.error_reply.is_none() {
+            self.error_reply = Some(err);
+        }
+    }
+
+    fn into_error(self) -> TransportError {
+        self.error_reply
+            .or(self.transport_error)
+            .unwrap_or_else(|| TransportErrorKind::custom_str("no RPC endpoints available"))
+    }
 }
 
 /// One HTTP endpoint in the pool. Its position matches its index in the
@@ -162,6 +209,9 @@ impl PoolInner {
             };
             match result {
                 Ok(response) => return Ok(response),
+                // An endpoint answered. Asking more endpoints would only
+                // repeat the request, which alloy never did either.
+                Err(err) if is_error_reply(&err) => return Err(err),
                 Err(err) => last_error = Some(err),
             }
         }
@@ -170,7 +220,9 @@ impl PoolInner {
     }
 
     /// Call every endpoint in `window` in parallel and return the first
-    /// success. Calls still in flight when one succeeds are dropped.
+    /// success. Calls still in flight when one succeeds are dropped. An
+    /// error reply does not end the race, since another endpoint may still
+    /// return a result, but it is returned over any transport error.
     async fn race(
         &self,
         window: &[usize],
@@ -180,39 +232,40 @@ impl PoolInner {
             .iter()
             .map(|&idx| self.call_endpoint(idx, req.clone()))
             .collect();
-        let mut last_error = None;
+        let mut outcome = WindowOutcome::default();
         while let Some(result) = in_flight.next().await {
             match result {
                 Ok(response) => return Ok(response),
-                Err(err) => last_error = Some(err),
+                Err(err) => outcome.record(err),
             }
         }
-        Err(last_error
-            .unwrap_or_else(|| TransportErrorKind::custom_str("no RPC endpoints available")))
+        Err(outcome.into_error())
     }
 
     /// Call the endpoints in `window` one at a time and return the first
-    /// success.
+    /// success. As in alloy, an error reply moves on to the next endpoint,
+    /// which may return the receipt; it is returned over any transport
+    /// error if none does.
     async fn sequential(
         &self,
         window: &[usize],
         req: &RequestPacket,
     ) -> Result<ResponsePacket, TransportError> {
-        let mut last_error = None;
+        let mut outcome = WindowOutcome::default();
         for &idx in window {
             match self.call_endpoint(idx, req.clone()).await {
                 Ok(response) => return Ok(response),
-                Err(err) => last_error = Some(err),
+                Err(err) => outcome.record(err),
             }
         }
-        Err(last_error
-            .unwrap_or_else(|| TransportErrorKind::custom_str("no RPC endpoints available")))
+        Err(outcome.into_error())
     }
 
-    /// Hand `req` to one endpoint now, and return a future that records
-    /// the outcome in the health registry when it resolves. The request is
-    /// handed over before the future is first polled, so every endpoint in
-    /// a race is offered the request even if another answers first.
+    /// Return a future that calls one endpoint and records the outcome in
+    /// the health registry. Nothing is sent until the future is polled,
+    /// and a race drops the calls still pending once one endpoint answers,
+    /// so an endpoint that loses a race may never see the request and its
+    /// outcome is not recorded.
     fn call_endpoint(
         &self,
         idx: usize,
@@ -225,7 +278,11 @@ impl PoolInner {
         async move {
             let result = call.await;
             match &result {
+                // A result or an error reply: either way the endpoint answered.
                 Ok(_) => self.health.record_success(idx, started.elapsed(), None),
+                Err(err) if is_error_reply(err) => {
+                    self.health.record_success(idx, started.elapsed(), None);
+                }
                 Err(err) => {
                     let decision = self.health.record_failure(idx, true, None);
                     debug!(
@@ -295,22 +352,52 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use alloy::rpc::json_rpc::{Id, Request, Response, ResponsePayload};
+    use alloy::rpc::json_rpc::{ErrorPayload, Id, Request, Response, ResponsePayload};
+    use alloy::transports::IntoBoxTransport;
+    use tower::ServiceBuilder;
 
-    /// A transport that counts its calls and either answers `"0x1"` or
-    /// fails with a transport error.
+    use crate::transport::{DEFAULT_CU_PER_SEC, retry_layer};
+
+    /// What a [`MockEndpoint`] does with each request.
+    #[derive(Clone, Copy)]
+    enum Behaviour {
+        /// Answers `"0x1"`.
+        Answers,
+        /// Fails with a transport error, like a refused connection.
+        Down,
+        /// Replies with a JSON-RPC error, like a node reporting a revert.
+        Reverts,
+    }
+
+    /// A transport that counts the calls it receives and handles each as
+    /// its [`Behaviour`] says, optionally after a delay.
     #[derive(Clone)]
     struct MockEndpoint {
-        healthy: bool,
+        behaviour: Behaviour,
+        delay: Duration,
         calls: Arc<AtomicUsize>,
     }
 
     impl MockEndpoint {
         fn new(healthy: bool) -> Self {
+            Self::with(if healthy {
+                Behaviour::Answers
+            } else {
+                Behaviour::Down
+            })
+        }
+
+        fn with(behaviour: Behaviour) -> Self {
             Self {
-                healthy,
+                behaviour,
+                delay: Duration::ZERO,
                 calls: Arc::new(AtomicUsize::new(0)),
             }
+        }
+
+        fn after(mut self, delay: Duration) -> Self {
+            self.delay = delay;
+            self
         }
 
         fn calls(&self) -> usize {
@@ -329,39 +416,80 @@ mod tests {
 
         fn call(&mut self, req: RequestPacket) -> Self::Future {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let healthy = self.healthy;
+            let (behaviour, delay) = (self.behaviour, self.delay);
             Box::pin(async move {
-                if !healthy {
-                    return Err(TransportErrorKind::custom_str("connection refused"));
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
                 }
                 let id = req
                     .requests()
                     .first()
                     .map(|r| r.id().clone())
                     .unwrap_or(Id::None);
-                let payload = serde_json::value::to_raw_value("0x1").unwrap();
-                Ok(ResponsePacket::Single(Response {
-                    id,
-                    payload: ResponsePayload::Success(payload),
-                }))
+                let payload = match behaviour {
+                    Behaviour::Down => {
+                        return Err(TransportErrorKind::custom_str("connection refused"));
+                    }
+                    Behaviour::Answers => {
+                        ResponsePayload::Success(serde_json::value::to_raw_value("0x1").unwrap())
+                    }
+                    Behaviour::Reverts => ResponsePayload::Failure(revert_payload()),
+                };
+                Ok(ResponsePacket::Single(Response { id, payload }))
             })
         }
     }
 
+    fn revert_payload() -> ErrorPayload {
+        serde_json::from_str(r#"{"code":3,"message":"execution reverted","data":"0x"}"#).unwrap()
+    }
+
+    /// Each mock as the pool's transport, as is.
     fn pool_of(mocks: &[MockEndpoint]) -> (EndpointPool, HealthRegistry) {
+        pool_with(mocks, BoxTransport::new)
+    }
+
+    /// Each mock behind the production retry layer, which is what turns a
+    /// JSON-RPC error reply into `TransportError::ErrorResp`.
+    fn pool_behind_retry_layer(mocks: &[MockEndpoint]) -> (EndpointPool, HealthRegistry) {
+        pool_with(mocks, |mock| {
+            ServiceBuilder::new()
+                .layer(retry_layer(DEFAULT_CU_PER_SEC))
+                .service(mock)
+                .into_box_transport()
+        })
+    }
+
+    fn pool_with(
+        mocks: &[MockEndpoint],
+        transport: impl Fn(MockEndpoint) -> BoxTransport,
+    ) -> (EndpointPool, HealthRegistry) {
         let health = HealthRegistry::new((0..mocks.len()).map(|i| format!("http://mock/{i}")));
         let endpoints = mocks
             .iter()
             .enumerate()
             .map(|(i, m)| PoolEndpoint {
                 label: format!("http://mock/{i}"),
-                transport: BoxTransport::new(m.clone()),
+                transport: transport(m.clone()),
             })
             .collect();
         (
             EndpointPool::new("test".into(), endpoints, health.clone()),
             health,
         )
+    }
+
+    fn calls(mocks: &[MockEndpoint]) -> Vec<usize> {
+        mocks.iter().map(MockEndpoint::calls).collect()
+    }
+
+    /// The JSON-RPC error code a failed call carries, if it was an error
+    /// reply rather than a transport error.
+    fn error_reply_code(result: Result<ResponsePacket, TransportError>) -> Option<i64> {
+        result
+            .expect_err("the call fails")
+            .as_error_resp()
+            .map(|payload| payload.code)
     }
 
     fn request(method: &'static str) -> RequestPacket {
@@ -529,5 +657,124 @@ mod tests {
         assert_eq!(pool.race_width(), 1);
         send(&pool, "eth_chainId").await.unwrap();
         assert_eq!(mocks[0].calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn revert_ends_a_read_and_is_not_masked_by_a_dead_later_endpoint() {
+        // Two endpoints report the revert; the third is down. Moving on to
+        // it would turn the revert into a connection error, which a
+        // pre-broadcast simulation reads as "unavailable".
+        let mocks = [
+            MockEndpoint::with(Behaviour::Reverts),
+            MockEndpoint::with(Behaviour::Reverts),
+            MockEndpoint::with(Behaviour::Down),
+        ];
+        let (pool, _) = pool_behind_retry_layer(&mocks);
+        assert_eq!(error_reply_code(send(&pool, "eth_call").await), Some(3));
+        assert_eq!(calls(&mocks), vec![1, 1, 0]);
+    }
+
+    #[tokio::test]
+    async fn revert_is_returned_over_a_slower_transport_error() {
+        let mocks = [
+            MockEndpoint::with(Behaviour::Reverts),
+            MockEndpoint::with(Behaviour::Down).after(Duration::from_millis(50)),
+        ];
+        let (pool, _) = pool_behind_retry_layer(&mocks);
+        assert_eq!(error_reply_code(send(&pool, "eth_call").await), Some(3));
+    }
+
+    #[tokio::test]
+    async fn race_waits_past_a_revert_for_a_result() {
+        // One node refuses what another can answer (a pruned node and an
+        // archive node, say): the answer wins, as it did under alloy.
+        let mocks = [
+            MockEndpoint::with(Behaviour::Reverts),
+            MockEndpoint::with(Behaviour::Answers).after(Duration::from_millis(50)),
+        ];
+        let (pool, _) = pool_behind_retry_layer(&mocks);
+        send(&pool, "eth_call")
+            .await
+            .expect("the slower result wins");
+    }
+
+    #[tokio::test]
+    async fn reverts_keep_endpoints_healthy() {
+        let mocks = [
+            MockEndpoint::with(Behaviour::Reverts),
+            MockEndpoint::with(Behaviour::Reverts),
+        ];
+        let (pool, health) = pool_behind_retry_layer(&mocks);
+        for _ in 0..10 {
+            send(&pool, "eth_call").await.expect_err("reverts");
+        }
+        assert!(health.cooled_down_indices().is_empty());
+        for snapshot in health.snapshot() {
+            assert_eq!(snapshot.success_rate, 1.0, "{}", snapshot.url);
+        }
+    }
+
+    #[tokio::test]
+    async fn sequential_submission_moves_past_an_error_reply_but_returns_it() {
+        // Another endpoint may still return the receipt.
+        let mocks = [
+            MockEndpoint::with(Behaviour::Reverts),
+            MockEndpoint::with(Behaviour::Answers),
+            MockEndpoint::with(Behaviour::Answers),
+        ];
+        let (pool, _) = pool_behind_retry_layer(&mocks);
+        send(&pool, "eth_sendRawTransactionSync").await.unwrap();
+        assert_eq!(calls(&mocks), vec![1, 1, 0]);
+
+        // With no receipt anywhere, the reply beats the transport error.
+        let mocks = [
+            MockEndpoint::with(Behaviour::Reverts),
+            MockEndpoint::with(Behaviour::Down),
+        ];
+        let (pool, _) = pool_behind_retry_layer(&mocks);
+        assert_eq!(
+            error_reply_code(send(&pool, "eth_sendRawTransactionSync").await),
+            Some(3)
+        );
+    }
+
+    #[tokio::test]
+    async fn sequential_submission_stays_in_the_first_window() {
+        let mocks = [
+            MockEndpoint::new(false),
+            MockEndpoint::new(false),
+            MockEndpoint::new(true),
+        ];
+        let (pool, _) = pool_of(&mocks);
+        send(&pool, "eth_sendRawTransactionSync")
+            .await
+            .expect_err("the first window failed and submissions stop there");
+        assert_eq!(calls(&mocks), vec![1, 1, 0]);
+    }
+
+    #[tokio::test]
+    async fn cooled_down_endpoint_is_still_tried_when_the_others_fail() {
+        let mocks = [
+            MockEndpoint::new(true),
+            MockEndpoint::new(false),
+            MockEndpoint::new(false),
+        ];
+        let (pool, health) = pool_of(&mocks);
+        for _ in 0..5 {
+            health.record_failure(0, true, None);
+        }
+        assert_eq!(health.cooled_down_indices(), vec![0]);
+        send(&pool, "eth_chainId")
+            .await
+            .expect("the cooled-down endpoint answers last");
+        assert_eq!(calls(&mocks), vec![1, 1, 1]);
+    }
+
+    #[tokio::test]
+    async fn live_calls_do_not_set_last_block() {
+        let mocks = [MockEndpoint::new(true), MockEndpoint::new(true)];
+        let (pool, health) = pool_of(&mocks);
+        send(&pool, "eth_blockNumber").await.unwrap();
+        assert!(health.snapshot().iter().all(|s| s.last_block.is_none()));
     }
 }
