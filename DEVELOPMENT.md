@@ -131,21 +131,21 @@ Use the full launcher for ceremonies, authenticated transport, process
 lifecycle, end-to-end signing, and mounted-VFS behavior:
 
 ```sh
-mkdir -p "$HOME/.bloom/triad-dev/machine-home" \
-  /tmp/bloom-triad-mount /tmp/bloom-triad-logs
-
-scripts/triad-dev-launch.sh \
-  --developer-root "$HOME/.bloom/triad-dev" \
-  --machine-home "$HOME/.bloom/triad-dev/machine-home" \
-  --mount /tmp/bloom-triad-mount \
-  --machine-socket /tmp/bloom-triad-machine.sock \
-  --log-dir /tmp/bloom-triad-logs \
-  --ready-file /tmp/bloom-triad-ready
+scripts/triad-dev-launch.sh --developer-root "$HOME/.bloom/triad-dev" \
+  --ceremony-port 28735
 ```
 
-Omit `--mount` unless the test specifically concerns the kernel adapter. Linux
-mounts require a narrowly scoped noninteractive sudo rule for that exact
+The Machine home, socket, logs and ready file default inside the developer
+root. `--machine-home`, `--machine-socket`, `--log-dir` and `--ready-file`
+override them. Add `--mount DIR` only if the test concerns the kernel adapter.
+Linux mounts require a narrowly scoped noninteractive sudo rule for that exact
 mountpoint. VFS commands and services-only mode do not.
+
+When a Chromium is installed, the launcher also builds and starts Checkout,
+the shopping browser. It picks a free view port and on Linux uses Xvfb when
+installed. Xvfb runs in Checkout's own user and mount namespace, so it never
+touches the desktop's `/tmp/.X11-unix`. `--no-checkout` opts out, and
+`BLOOM_INTEGRATION_CHECKOUT_BIN` selects a prebuilt binary.
 
 The launcher uses real protocol implementations and authenticated triad
 transport. The developer profile runs them under the same non-root login and

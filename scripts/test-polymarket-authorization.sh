@@ -42,7 +42,7 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT INT TERM
-bash "$repo_root/scripts/triad-dev-launch.sh" --services-only --retain-temporary-files \
+bash "$repo_root/scripts/triad-dev-launch.sh" --services-only --no-checkout --retain-temporary-files \
   --developer-root "$run_root" --machine-socket "$run_root/m.sock" \
   --log-dir "$run_root/logs" --ready-file "$run_root/ready" \
   --ceremony-port "$(free_port)" --remote-upstream-port "$(free_port)" \
@@ -50,7 +50,7 @@ bash "$repo_root/scripts/triad-dev-launch.sh" --services-only --retain-temporary
 launcher_pid=$!
 for attempt in $(seq 1 900); do
   [ ! -f "$run_root/ready" ] || break
-  kill -0 "$launcher_pid" 2>/dev/null || { echo "Launcher failed; inspect $run_root/launcher.log" >&2; exit 1; }
+  kill -0 "$launcher_pid" 2>/dev/null || { tail -n 40 "$run_root/launcher.log" >&2; echo "Launcher failed; inspect $run_root/launcher.log" >&2; exit 1; }
   sleep 0.1
 done
 [ -f "$run_root/ready" ] || { echo 'Launcher readiness timed out' >&2; exit 1; }
