@@ -49,7 +49,7 @@ AGENTS: dict[str, AgentSpec] = {
 }
 
 AGENT_VERSIONS = {
-    "claude-code": "2.1.245",
+    "claude-code": "2.1.299",
     "codex": "0.149.1",
     "opencode": "1.18.26",
     "pi": "1.4.0",
