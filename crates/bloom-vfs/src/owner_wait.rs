@@ -21,6 +21,9 @@ pub const APPROVAL_POLL: Duration = Duration::from_millis(500);
 pub const BATCH_APPROVAL_POLL: Duration = Duration::from_secs(2);
 /// A receipt read waits this many polls (5 s) for the transaction to be mined.
 pub const RECEIPT_POLLS: u32 = 10;
+/// How long a confirm's report of what it sent may run past the approval
+/// wait. With [`APPROVAL_WAIT`] it stays under a 60 s request timeout.
+pub const REPORT_WAIT: Duration = Duration::from_secs(8);
 
 pub enum WriteError {
     Handler(HandlerError),
@@ -88,6 +91,7 @@ pub async fn write(
     cancelled: Cancelled<'_>,
     report: bool,
 ) -> Result<Written, WriteError> {
+    let report_by = tokio::time::Instant::now() + wait + REPORT_WAIT;
     if let [root, wallet, leaf] = path.segments()
         && root == "wallets"
         && leaf == "policy.json"
@@ -220,7 +224,7 @@ pub async fn write(
     if !report || !matches!(bytes.trim_ascii(), b"y" | b"override") {
         return Ok(Written::Done);
     }
-    Ok(sent_report(vfs, path, &sending)
+    Ok(sent_report(vfs, path, &sending, report_by)
         .await
         .map_or(Written::Done, Written::Sent))
 }
@@ -248,7 +252,14 @@ async fn staged_plans(vfs: &Vfs, path: &VfsPath, entries: &[String]) -> String {
 
 /// One line per `chain:id` entry: its receipt, or where it is when it has
 /// none. The receipt is shown whole, since its fields differ by chain.
-async fn sent_report(vfs: &Vfs, path: &VfsPath, entries: &[String]) -> Option<String> {
+/// Waits end at `deadline`, so the answer arrives before the caller's
+/// request times out; an entry still unmined is reported by its hash.
+async fn sent_report(
+    vfs: &Vfs,
+    path: &VfsPath,
+    entries: &[String],
+    deadline: tokio::time::Instant,
+) -> Option<String> {
     let [root, wallet, number, ..] = path.segments() else {
         return None;
     };
@@ -259,9 +270,9 @@ async fn sent_report(vfs: &Vfs, path: &VfsPath, entries: &[String]) -> Option<St
         let receipt = VfsPath::parse(&format!("/{sent}/receipt.json")).ok()?;
         let raw = match vfs.read(&receipt).await {
             Err(error) if receipt_is_due(vfs, &receipt, &error).await => {
-                match await_receipt(vfs, &receipt, error).await {
-                    Ok(_) => vfs.read(&receipt).await.ok(),
-                    Err(_) => None,
+                match tokio::time::timeout_at(deadline, await_receipt(vfs, &receipt, error)).await {
+                    Ok(Ok(_)) => vfs.read(&receipt).await.ok(),
+                    _ => None,
                 }
             }
             read => read.ok(),
@@ -284,7 +295,9 @@ async fn sent_report(vfs: &Vfs, path: &VfsPath, entries: &[String]) -> Option<St
     // What the account holds now on that chain, so the caller need not check
     // a swap's or supply's result with separate balance reads.
     let chain = entries.first().and_then(|entry| entry.split_once(':'))?.0;
-    if let Some(balances) = balances(vfs, root, wallet, number, chain).await {
+    if let Ok(Some(balances)) =
+        tokio::time::timeout_at(deadline, balances(vfs, root, wallet, number, chain)).await
+    {
         lines.push(format!("{chain} balances now: {balances}"));
     }
     Some(lines.join("\n"))
@@ -680,6 +693,47 @@ mod tests {
         assert_eq!(cancelled.ok(), Some(Written::Done));
         let mounted = write(&vfs, &path, b"y", wait, &|| false, false).await;
         assert_eq!(mounted.ok(), Some(Written::Done));
+    }
+
+    /// Both entries were broadcast and neither is mined, so each receipt
+    /// read would wait 5 s. The report ends at its deadline instead.
+    struct Unmined;
+
+    #[async_trait::async_trait]
+    impl Handler for Unmined {
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            match p.segments().last().unwrap().as_str() {
+                "tx_hash" => Ok(Entry::file("tx_hash")),
+                _ => Err(HandlerError::not_found(p.to_string_path())),
+            }
+        }
+        async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            match p.segments().last().unwrap().as_str() {
+                "tx_hash" => Ok(b"0xbb\n".to_vec()),
+                _ => Err(HandlerError::not_found(p.to_string_path())),
+            }
+        }
+        async fn write(&self, _p: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_sent_report_stops_waiting_at_its_deadline() {
+        let vfs = Vfs::builder().mount("wallets", Arc::new(Unmined)).build();
+        let path = VfsPath::parse("/wallets/w/0/chains/base/outbox/pending/tx-1/confirm").unwrap();
+        let entries = ["base:tx-1".to_owned(), "base:tx-2".to_owned()];
+        let started = tokio::time::Instant::now();
+        let report = sent_report(&vfs, &path, &entries, started + APPROVAL_POLL * 2)
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < APPROVAL_POLL * 4,
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(report.contains("tx-1: broadcast tx 0xbb"), "{report}");
+        assert!(report.contains("tx-2: broadcast tx 0xbb"), "{report}");
     }
 
     /// `send.tx` stages one entry and asks the owner.

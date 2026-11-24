@@ -325,9 +325,14 @@ impl ToolSpec {
                 let sent = result.get("sent").and_then(Value::as_str);
                 let pending = result.get("approval_pending");
                 let report = sent.or_else(|| pending?.get("text")?.as_str());
-                let text = match report {
-                    Some(report) => format!("wrote {written} byte(s) to {path}\n{report}"),
-                    None => format!("wrote {written} byte(s) to {path}"),
+                // Lead with NOT SENT, so a caller that reads only the first
+                // line or sees `isError: false` does not take it as sent.
+                let text = match (report, pending) {
+                    (Some(report), Some(_)) => format!(
+                        "NOT SENT: owner approval required. Staged {written} byte(s) at {path}\n{report}"
+                    ),
+                    (Some(report), None) => format!("wrote {written} byte(s) to {path}\n{report}"),
+                    (None, _) => format!("wrote {written} byte(s) to {path}"),
                 };
                 let mut structured =
                     json!({ "path": path, "bytes_written": written, "sent": sent });
@@ -578,6 +583,22 @@ mod tests {
                 assert!(tool.params(payload.as_object().unwrap()).is_ok());
             }
         }
+    }
+
+    /// A staged `send.tx` is not an error, but its text must not read as sent.
+    #[test]
+    fn a_staged_send_says_it_was_not_sent() {
+        let spec = find("vfs_write").unwrap();
+        let arguments = json!({"path": "/send.tx", "text": "send 1 ETH"});
+        let params = spec.params(arguments.as_object().unwrap()).unwrap();
+        let staged = json!({"approval_pending": {"text": "Staged; owner approval: http://c ."}});
+        let result = spec.success(arguments.as_object().unwrap(), &params, staged);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("NOT SENT: owner approval required."),
+            "{text}"
+        );
+        assert!(text.contains("http://c"), "{text}");
     }
 
     #[test]
