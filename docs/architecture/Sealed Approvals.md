@@ -306,8 +306,10 @@ pinned packages; upgraded wallets still require owner approval of new identities
 Bloom #224 must remain unmergeable until the default Polymarket and Hyperliquid
 catalog pins select compatible published packages. Broker #103 landed as
 `e2f55a7e291eff32d3d544f0f94dc770945bafd7`. Bloom pins Broker
-`94c422210e0ec374d461d500ff849e16d40cf30b`, which carries the Hyperliquid
-builder-order fee check (bloom-broker #131). It also includes the ceremony page
+`34f1e4f474fc0f29b8e886aad795d39122e18028`, which diffs the signed policy
+authority by decoded destination and moves that diff into `bloom-broker-api`
+(pm#88). It builds on `94c422210e0ec374d461d500ff849e16d40cf30b`, which carries
+the Hyperliquid builder-order fee check (bloom-broker #131), the ceremony page
 fixes (#128), the Machine x402 and MPP payment review (#125), `e2f55a7`, the
 trusted clock rollback fix that Bloom v0.4.1 ships (#119), and the native SOL
 fee check (#127).

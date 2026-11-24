@@ -7999,7 +7999,7 @@ value = "0""#,
         assert_eq!(prepared.proposed_canonical_policy.decode(), proposed_bytes);
         assert_eq!(
             prepared.authority_diff_digest.as_str(),
-            "65f348e08a8ded736ad13843456a1afbaacf16bf5518147b1d7d900f703e7401"
+            "8cc51489b9ac2667c953f4c31d9e2b1ae19ac8e3e0596014919a114d6fe970a3"
         );
         assert_eq!(
             handler.read(&path).await.unwrap(),
