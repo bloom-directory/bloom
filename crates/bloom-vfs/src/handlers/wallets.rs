@@ -3256,6 +3256,7 @@ fn tx_open_err(e: TxEngineError) -> HandlerError {
         TxEngineError::PolicyDenied => HandlerError::OperationNotPermitted,
         TxEngineError::DependencyNotSatisfied { .. }
         | TxEngineError::SimulationReverted { .. }
+        | TxEngineError::SimulationFailed { .. }
         | TxEngineError::NonceGap { .. } => HandlerError::invalid(e.to_string()),
         other => err_be(other),
     }

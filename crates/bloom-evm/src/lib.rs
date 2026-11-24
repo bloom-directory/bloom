@@ -13,6 +13,7 @@ use alloy::eips::BlockNumberOrTag;
 use alloy::network::{Ethereum, ReceiptResponse, TransactionBuilder};
 use alloy::primitives::{Address, B256, BlockHash, Bytes, U256};
 use alloy::providers::{Provider, RootProvider};
+use alloy::rpc::json_rpc::ErrorPayload;
 use alloy::rpc::types::eth::state::StateOverride;
 use alloy::rpc::types::eth::{
     Block, Filter, Log, Transaction, TransactionReceipt, TransactionRequest,
@@ -151,11 +152,42 @@ pub fn no_native_asset(spec: &ChainSpec) -> ChainError {
 /// that does not decode). A node failure means: send no more requests.
 fn is_node_failure(error: &alloy::contract::Error) -> bool {
     match error {
-        alloy::contract::Error::TransportError(e) => e.as_error_resp().is_none_or(|resp| {
-            !resp.message.to_ascii_lowercase().contains("revert") && resp.as_revert_data().is_none()
-        }),
+        alloy::contract::Error::TransportError(e) => {
+            e.as_error_resp().is_none_or(|resp| !is_revert_reply(resp))
+        }
         _ => false,
     }
+}
+
+/// Whether a JSON-RPC error reply reports that the call reverted, rather
+/// than that the node could not or would not run it.
+///
+/// Nodes report a revert in one of two ways:
+/// - code 3 with the revert data, which geth, erigon, reth, anvil and
+///   current nethermind send when the revert carries data;
+/// - a message that says so, such as geth's and erigon's `-32000
+///   "execution reverted"` for a revert without data, besu's "Execution
+///   reverted", or hardhat's `-32603` "reverted with reason string".
+///
+/// Every other reply is about the node or the request, not the contract:
+/// an invalid API key, an unsupported method, an internal error, missing
+/// state, out of gas. Older nethermind's `-32015 "VM execution error."`
+/// also lands here, since its message does not mention the revert.
+fn is_revert_reply(payload: &ErrorPayload) -> bool {
+    payload.code == 3 || payload.message.to_ascii_lowercase().contains("revert")
+}
+
+/// The revert data a revert reply carries, or empty when it carries none.
+/// alloy's extraction only looks when the message says "revert", so a code-3
+/// reply worded otherwise is read from its `data` directly.
+fn revert_data(payload: &ErrorPayload) -> Bytes {
+    payload
+        .as_revert_data()
+        .or_else(|| {
+            let data = payload.data.as_ref()?;
+            serde_json::from_str::<Bytes>(data.get()).ok()
+        })
+        .unwrap_or_default()
 }
 
 fn node_failure(error: alloy::contract::Error) -> ChainError {
@@ -605,7 +637,11 @@ impl ChainClient {
     /// * `Ok(Err(returndata))` — the call reverted; `returndata` is the
     ///   raw revert payload (possibly empty when the contract reverted
     ///   with no reason).
-    /// * `Err(e)` — transport/RPC failure unrelated to a revert.
+    /// * `Err(ChainError::Rpc(_))` — the node answered with an error that
+    ///   is not a revert (see `is_revert_reply`): an invalid API key, an
+    ///   unsupported method, out of gas. The message keeps the reply's code
+    ///   and text.
+    /// * `Err(ChainError::Transport(_))` — no answer from any endpoint.
     pub async fn eth_call_capture_revert(
         &self,
         req: TransactionRequest,
@@ -618,19 +654,17 @@ impl ChainClient {
         };
         match result {
             Ok(bytes) => Ok(Ok(bytes)),
-            Err(e) => match &e {
-                TransportError::ErrorResp(payload) => {
-                    let data = payload.as_revert_data().unwrap_or_else(|| {
-                        // The RPC error came back tagged as a revert but
-                        // carried no payload — log so callers chasing an
-                        // empty `Bytes` know it wasn't a decoder bug.
-                        debug!("eth_call_capture_revert.empty_payload");
-                        Default::default()
-                    });
-                    Ok(Err(data))
+            Err(TransportError::ErrorResp(payload)) if is_revert_reply(&payload) => {
+                let data = revert_data(&payload);
+                if data.is_empty() {
+                    // Log so callers chasing an empty `Bytes` know it
+                    // wasn't a decoder bug.
+                    debug!("eth_call_capture_revert.empty_payload");
                 }
-                _ => Err(ChainError::Transport(e.to_string())),
-            },
+                Ok(Err(data))
+            }
+            Err(TransportError::ErrorResp(payload)) => Err(ChainError::Rpc(payload.to_string())),
+            Err(e) => Err(ChainError::Transport(e.to_string())),
         }
     }
 
@@ -2218,6 +2252,102 @@ mod mock_rpc_tests {
         match out {
             Ok(_) => panic!("expected revert"),
             Err(returndata) => assert_eq!(returndata.as_ref(), payload.as_slice()),
+        }
+    }
+
+    #[tokio::test]
+    async fn eth_call_capture_revert_reports_only_reverts_as_reverts() {
+        /// An error reply, and the revert data it must yield, or `None`
+        /// when it must surface as an RPC error instead.
+        struct Case {
+            code: i64,
+            message: &'static str,
+            data: Option<&'static str>,
+            revert: Option<&'static [u8]>,
+        }
+        let case = |code, message, data, revert| Case {
+            code,
+            message,
+            data,
+            revert,
+        };
+        let cases = [
+            // geth, reth and anvil, with revert data.
+            case(
+                3,
+                "execution reverted",
+                Some("0xdead"),
+                Some(&[0xde, 0xad][..]),
+            ),
+            // geth and erigon, revert without data.
+            case(-32000, "execution reverted", None, Some(&[][..])),
+            // besu.
+            case(
+                -32000,
+                "Execution reverted",
+                Some("0xbeef"),
+                Some(&[0xbe, 0xef][..]),
+            ),
+            // hardhat.
+            case(
+                -32603,
+                "VM Exception while processing transaction: reverted with reason string 'x'",
+                None,
+                Some(&[][..]),
+            ),
+            // Code 3 worded without "revert": its data is still the revert.
+            case(
+                3,
+                "execution error",
+                Some("0xc0de"),
+                Some(&[0xc0, 0xde][..]),
+            ),
+            // Replies about the endpoint or the request, not the contract.
+            case(-32000, "invalid project id", None, None),
+            case(
+                -32601,
+                "the method eth_call does not exist/is not available",
+                None,
+                None,
+            ),
+            case(-32603, "internal error", None, None),
+            case(-32000, "out of gas", None, None),
+        ];
+        let mut r = responses();
+        r.insert(
+            "eth_call".into(),
+            cases
+                .iter()
+                .map(|c| {
+                    let data = c.data.map(|hex| format!("\"{hex}\""));
+                    MockResponse::Err(c.code, c.message.into(), data)
+                })
+                .collect(),
+        );
+        let url = spawn_mock(r).await;
+        let client = client_at(&url);
+        for Case {
+            code,
+            message,
+            revert,
+            ..
+        } in cases
+        {
+            let out = client
+                .eth_call_capture_revert(TransactionRequest::default(), None)
+                .await;
+            match (out, revert) {
+                (Ok(Err(data)), Some(expected)) => {
+                    assert_eq!(data.as_ref(), expected, "{code} {message}");
+                }
+                (Err(ChainError::Rpc(text)), None) => {
+                    assert!(text.contains(message), "{code} {message}: {text}");
+                    assert!(text.contains(&code.to_string()), "{code} {message}: {text}");
+                }
+                (other, expected) => {
+                    panic!("{code} {message}: got {other:?}, expected revert data {expected:?}")
+                }
+            }
         }
     }
 
