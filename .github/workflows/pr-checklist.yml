@@ -174,12 +174,6 @@ jobs:
           repository: bloom-directory/bloom-signer
           ref: ${{ steps.release_signer.outputs.ref }}
           path: .pm80-packages/signer
-      - name: Prepare disposable Linux service manager
-        run: |
-          sudo loginctl enable-linger "$(id -un)"
-          sudo systemctl start "user@$(id -u).service"
-          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
-          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
       - name: Build exact developer-mode authority services
         run: |
           cargo test --locked --manifest-path "$RUNNER_TEMP/pm80-broker/Cargo.toml" -p bloom-broker --test w4_authority

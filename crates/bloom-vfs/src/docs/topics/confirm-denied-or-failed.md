@@ -23,3 +23,12 @@ disappeared: list `sent/` and `failed/` first.
 An entry a Petal staged is confirmed where that Petal's README says, and that
 confirm never waits for approval: retry it there once the owner approves.
 Identify an entry by its `intent.json` and `plan.md`, never by position.
+
+When a Petal stages a canonical ERC-20 `transfer(address,uint256)` with no
+native value, to a token Bloom lists, the plan names token, amount and
+recipient, and the destination checked is that recipient, not the token
+contract. It passes if the wallet's policy allows the recipient or the Petal
+itself (`petal:<name>`). The check runs at staging: if the owner allows it
+afterwards, the next stage returns the old entry and its confirm fails; stage
+again after that. Such a call must be exactly 68 bytes with a zero-padded
+address word, or staging refuses it.
