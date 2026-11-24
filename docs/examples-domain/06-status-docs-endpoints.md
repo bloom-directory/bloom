@@ -36,7 +36,7 @@ The `connected` / `block_number` leaves share a 2-second handler-level probe cac
 
 ## Per-endpoint health (WP-3)
 
-Every configured RPC endpoint gets an indexed directory under `status/chains/<chain>/endpoints/<idx>/`. Indices are zero-based and stable for the daemon's lifetime — they map directly to the `endpoints` array in the chain's `ChainSpec`. The leaves are populated by the active probe loop in `crates/bloom-rpc/src/transport.rs`, which issues a direct `eth_blockNumber` against each HTTP endpoint every 15 s with a 2 s timeout, bypassing the endpoint pool so probes measure individual endpoints. The outcomes of live calls routed through the pool are recorded too, except that only probes set `last_block`. A JSON-RPC error reply, such as a revert, counts as a success: the endpoint answered.
+Every configured RPC endpoint gets an indexed directory under `status/chains/<chain>/endpoints/<idx>/`. Indices are zero-based and stable for the daemon's lifetime — they map directly to the `endpoints` array in the chain's `ChainSpec`. The leaves are populated by the active probe loop in `crates/bloom-rpc/src/transport.rs`, which issues a direct `eth_blockNumber` against each HTTP endpoint every 15 s with a 2 s timeout, bypassing the endpoint pool so probes measure individual endpoints. The outcomes of live calls routed through the pool are recorded too, except that only probes set `last_block`. A live call answered with a JSON-RPC error, such as a revert, is not recorded either way: a revert says nothing about the endpoint, and an error such as an invalid API key shows up in the probes.
 
 ```sh
 ls /bloom/status/chains/ethereum/endpoints/            # 0, 1, 2, ... — one dir per configured endpoint
@@ -57,7 +57,7 @@ Cooldown semantics (from `crates/bloom-rpc/src/health.rs`):
 - A fresh cooldown within 5 minutes of a recovery escalates to 600 s (chronic-failer).
 - Rate-limit responses (HTTP 429, or a JSON-RPC rate-limit error) are retried with backoff by `BloomRetryPolicy` (`crates/bloom-rpc/src/policy.rs`) before they count against the endpoint. Once those retries run out, the failure counts like any other.
 
-Endpoint health also orders routing (`crates/bloom-rpc/src/pool.rs`). Each call races the two best-ranked endpoints: those whose last outcome succeeded come first, ordered by score, then endpoints not yet called, then those whose last outcome failed, then those in cooldown. When both fail, a read moves on to the next two in the ranking until one answers, so it reaches every configured endpoint; a broadcast stops after the first two. Each HTTP request to an endpoint is limited to 10 s, so an endpoint that accepts the connection and never answers fails like one that refuses it. The `success_rate` and `cooldown_until` leaves show which endpoints are degraded.
+Endpoint health also orders routing (`crates/bloom-rpc/src/pool.rs`). Each call races the two best-ranked endpoints: those whose last outcome succeeded come first, ordered by score, then endpoints not yet called, then those whose last outcome failed, then those in cooldown. When both fail, a read moves on to the next two in the ranking until one answers, so it reaches every configured endpoint; a broadcast stops after the first two. Each HTTP request to an endpoint is limited to 30 s, and connecting to 5 s, so an endpoint that accepts the connection and never answers, or never accepts it, fails like one that refuses it. The `success_rate` and `cooldown_until` leaves show which endpoints are degraded.
 
 ### WebSocket fast path (WP-4)
 

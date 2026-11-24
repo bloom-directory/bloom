@@ -145,7 +145,8 @@ async fn endpoint_that_never_answers() -> Result<(String, tokio::task::JoinHandl
 /// stall reads. A dead endpoint and a silent one are ranked first, so the
 /// first read waits out the silent endpoint's request timeout and then
 /// reaches the live third endpoint. The silent endpoint then ranks below
-/// the live one, so the next read is quick.
+/// the live one, so the next read is quick. Takes about 30 s, the request
+/// timeout.
 #[tokio::test(flavor = "multi_thread")]
 async fn read_moves_past_an_endpoint_that_never_answers() -> Result<()> {
     let dead = format!("http://127.0.0.1:{}", pick_free_port()?);
@@ -158,7 +159,7 @@ async fn read_moves_past_an_endpoint_that_never_answers() -> Result<()> {
     let client = ChainClient::new(spec).map_err(|e| anyhow!("build chain client: {e}"))?;
 
     let started = Instant::now();
-    let res = timeout(Duration::from_secs(20), client.block_number()).await;
+    let res = timeout(Duration::from_secs(45), client.block_number()).await;
     let elapsed = started.elapsed();
     res.map_err(|_| anyhow!("first block_number still waiting after {elapsed:?}"))?
         .map_err(|e| anyhow!("first block_number failed: {e}"))?;

@@ -103,9 +103,21 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// endpoint that accepts the connection and never answers would hold up
 /// every call that reaches it before a working endpoint does. A timeout
 /// is a transport error: the retry layer does not retry it, and the pool
-/// counts it against the endpoint and moves a read on. Matches
-/// `bloom-solana`'s `REQUEST_TIMEOUT`.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// counts it against the endpoint and moves a read on.
+///
+/// It is longer than `bloom-solana`'s 10 s because EVM calls can be
+/// legitimately slow where Solana's are not: `eth_getLogs` over a
+/// caller-chosen block range, `debug_traceCall`, `eth_simulateV1`. A
+/// tighter bound failed those calls, counted the healthy endpoints that
+/// served them as failing, and turned a slow but accepted broadcast into
+/// an unknown outcome.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bound for establishing the connection, within [`REQUEST_TIMEOUT`]. An
+/// endpoint that drops connection attempts (a filtered network, a
+/// sinkholed address) fails after this rather than after the full
+/// request bound, and no legitimate call needs longer to connect.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One entry in the per-endpoint probe table. The `transport` is the
 /// fully-layered HTTP stack for one endpoint; the `idx` is the slot
@@ -173,9 +185,10 @@ impl RpcEngine {
         let mut tracked_urls: Vec<String> = Vec::new();
         let mut ws_connects: Vec<WsConnect> = Vec::new();
         let mut supports_subscriptions = false;
-        // One client for every endpoint, so they share its timeout.
+        // One client for every endpoint, so they share its timeouts.
         let http_client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .map_err(|e| BloomRpcError::Transport(TransportErrorKind::custom(e)))?;
 
