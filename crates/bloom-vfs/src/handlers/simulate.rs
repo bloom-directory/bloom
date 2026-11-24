@@ -602,11 +602,13 @@ impl SimulateHandler {
                             ));
                         }
                         let token = token.as_deref().unwrap_or_default();
-                        let (contract, _) = bloom_tx::tx_engine::TxEngine::resolve_token_address(
-                            token,
-                            spec.chain_id,
-                        )
-                        .map_err(|e| HandlerError::invalid(e.to_string()))?;
+                        // Staging resolves the symbol by the RPC's chain ID,
+                        // so simulation must too, or the two can pick
+                        // different contracts.
+                        let chain_id = client.chain_id().await.map_err(err_be)?;
+                        let (contract, _) =
+                            bloom_tx::tx_engine::TxEngine::resolve_token_address(token, chain_id)
+                                .map_err(|e| HandlerError::invalid(e.to_string()))?;
                         let decimals = client
                             .erc20_decimals(contract)
                             .await

@@ -280,16 +280,12 @@ async fn sent_report(
         let receipt: Option<Value> = raw.and_then(|raw| serde_json::from_slice(&raw).ok());
         lines.push(match receipt {
             Some(receipt) => format!("{id}: {receipt}"),
-            None => {
-                let hash = VfsPath::parse(&format!("/{sent}/tx_hash")).ok()?;
-                match vfs.read(&hash).await {
-                    Ok(hash) => format!(
-                        "{id}: broadcast tx {}; receipt not recorded yet: {sent}/receipt.json",
-                        String::from_utf8_lossy(&hash).trim()
-                    ),
-                    Err(_) => format!("{id}: not in sent/; read its entry for the outcome"),
-                }
-            }
+            None => match broadcast_hash(vfs, &sent).await {
+                Some(hash) => format!(
+                    "{id}: broadcast tx {hash}; receipt not recorded yet: {sent}/receipt.json"
+                ),
+                None => format!("{id}: not in sent/; read its entry for the outcome"),
+            },
         });
     }
     // What the account holds now on that chain, so the caller need not check
@@ -486,8 +482,23 @@ async fn await_approval(
     }
 }
 
+/// The hash of a sent entry's broadcast: an EVM entry's `tx_hash`, or the
+/// `signature` in a Solana entry's `broadcast_attempted.json`.
+async fn broadcast_hash(vfs: &Vfs, sent: &str) -> Option<String> {
+    let read = |leaf: &str| {
+        let path = VfsPath::parse(&format!("/{sent}/{leaf}"));
+        async move { vfs.read(&path.ok()?).await.ok() }
+    };
+    if let Some(hash) = read("tx_hash").await {
+        return Some(String::from_utf8_lossy(&hash).trim().to_owned());
+    }
+    let attempt: Value = serde_json::from_slice(&read("broadcast_attempted.json").await?).ok()?;
+    Some(attempt.get("signature")?.as_str()?.to_owned())
+}
+
 /// Whether `path` names the receipt of an outbox entry that was broadcast
-/// (it has a `tx_hash`) but has no receipt recorded yet.
+/// (it has an EVM `tx_hash` or a Solana `broadcast_attempted.json`) but has
+/// no receipt recorded yet.
 pub async fn receipt_is_due(vfs: &Vfs, path: &VfsPath, error: &HandlerError) -> bool {
     let segments = path.segments();
     let [.., outbox, sent, _, leaf] = segments else {
@@ -500,11 +511,15 @@ pub async fn receipt_is_due(vfs: &Vfs, path: &VfsPath, error: &HandlerError) -> 
     {
         return false;
     }
-    let sibling = format!("/{}/tx_hash", segments[..segments.len() - 1].join("/"));
-    match VfsPath::parse(&sibling) {
-        Ok(tx_hash) => vfs.lookup(&tx_hash).await.is_ok(),
-        Err(_) => false,
+    let entry = segments[..segments.len() - 1].join("/");
+    for marker in ["tx_hash", "broadcast_attempted.json"] {
+        if let Ok(marker) = VfsPath::parse(&format!("/{entry}/{marker}"))
+            && vfs.lookup(&marker).await.is_ok()
+        {
+            return true;
+        }
     }
+    false
 }
 
 /// A receipt is recorded once the transaction is mined, moments after the
@@ -646,11 +661,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Handler for SentBatch {
-        // `tx_hash` is not looked up, so the answer does not wait 5 s for
-        // `tx-2`'s receipt.
+        // The broadcast markers are not looked up, so the answer does not
+        // wait 5 s for `tx-2`'s receipt.
         async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
             match p.segments().last().unwrap().as_str() {
-                "tx_hash" => Err(HandlerError::not_found(p.to_string_path())),
+                "tx_hash" | "broadcast_attempted.json" => {
+                    Err(HandlerError::not_found(p.to_string_path()))
+                }
                 leaf => Ok(Entry::file(leaf)),
             }
         }
@@ -734,6 +751,49 @@ mod tests {
         );
         assert!(report.contains("tx-1: broadcast tx 0xbb"), "{report}");
         assert!(report.contains("tx-2: broadcast tx 0xbb"), "{report}");
+    }
+
+    /// A Solana entry in `sent/` has no `tx_hash`: its signature is in
+    /// `broadcast_attempted.json`, and the reconciler writes the receipt later.
+    struct SolanaUnmined;
+
+    #[async_trait::async_trait]
+    impl Handler for SolanaUnmined {
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            match p.segments().last().unwrap().as_str() {
+                "broadcast_attempted.json" => Ok(Entry::file("broadcast_attempted.json")),
+                _ => Err(HandlerError::not_found(p.to_string_path())),
+            }
+        }
+        async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            match p.segments().last().unwrap().as_str() {
+                "broadcast_attempted.json" => Ok(br#"{"signature":"5sig"}"#.to_vec()),
+                _ => Err(HandlerError::not_found(p.to_string_path())),
+            }
+        }
+        async fn write(&self, _p: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sent_solana_entry_is_reported_by_its_signature() {
+        let vfs = Vfs::builder()
+            .mount("wallets", Arc::new(SolanaUnmined))
+            .build();
+        let path =
+            VfsPath::parse("/wallets/w/0/chains/solana/outbox/pending/tx-1/confirm").unwrap();
+        let entries = ["solana:tx-1".to_owned()];
+        let deadline = tokio::time::Instant::now() + APPROVAL_POLL * 2;
+        let report = sent_report(&vfs, &path, &entries, deadline).await.unwrap();
+        assert!(
+            report.starts_with("tx-1: broadcast tx 5sig; receipt not recorded yet"),
+            "{report}"
+        );
+        let receipt =
+            VfsPath::parse("/wallets/w/0/chains/solana/outbox/sent/tx-1/receipt.json").unwrap();
+        let absent = HandlerError::not_found(receipt.to_string_path());
+        assert!(receipt_is_due(&vfs, &receipt, &absent).await);
     }
 
     /// `send.tx` stages one entry and asks the owner.
