@@ -7,7 +7,8 @@
 //!  ↓
 //! [ThrottleLayer (only if endpoint.max_rps is Some)]
 //!  ↓
-//! [Http transport (each request bounded by REQUEST_TIMEOUT)]
+//! [EndpointHttp: reqwest, each request bounded by REQUEST_TIMEOUT, URL
+//!  kept out of errors and logs]
 //! ```
 //!
 //! The per-endpoint stacks are joined by an `EndpointPool`, which ranks
@@ -53,7 +54,7 @@ use alloy::network::Ethereum;
 use alloy::primitives::U64;
 use alloy::providers::RootProvider;
 use alloy::rpc::client::RpcClient;
-use alloy::transports::http::{Http, reqwest};
+use alloy::transports::http::reqwest;
 use alloy::transports::layers::{RetryBackoffLayer, ThrottleLayer};
 use alloy::transports::ws::WsConnect;
 use alloy::transports::{BoxTransport, IntoBoxTransport, TransportErrorKind};
@@ -67,6 +68,7 @@ use crate::error::BloomRpcError;
 use crate::health::{EndpointHealthSnapshot, HealthRegistry};
 use crate::policy::BloomRetryPolicy;
 use crate::pool::{EndpointPool, PoolEndpoint, emit_cooldown_event};
+use crate::redact::{EndpointHttp, redact_url};
 
 /// Default compute-units-per-second when the operator hasn't set
 /// `cu_per_sec`. Mirrors alloy's own internal default for the retry
@@ -214,12 +216,12 @@ impl RpcEngine {
                         client: probe_client,
                     });
                     pool_endpoints.push(PoolEndpoint {
-                        label: redacted(&ep.url),
+                        label: redact_url(&ep.url),
                         transport,
                     });
                     debug!(
                         chain = %spec.name,
-                        url = %redacted(&ep.url),
+                        url = %redact_url(&ep.url),
                         weight = ep.weight,
                         cu_per_sec = ep.cu_per_sec,
                         max_rps = ep.max_rps,
@@ -235,7 +237,7 @@ impl RpcEngine {
                     if ep.http_only {
                         debug!(
                             chain = %spec.name,
-                            url = %redacted(&ep.url),
+                            url = %redact_url(&ep.url),
                             "rpc.transport.ws_endpoint_skipped_http_only"
                         );
                         continue;
@@ -243,7 +245,7 @@ impl RpcEngine {
                     ws_connects.push(WsConnect::new(url.as_str()));
                     debug!(
                         chain = %spec.name,
-                        url = %redacted(&ep.url),
+                        url = %redact_url(&ep.url),
                         weight = ep.weight,
                         "rpc.transport.ws_connect_registered"
                     );
@@ -466,7 +468,7 @@ async fn run_probe_round(chain: &str, targets: &[ProbeTarget], health: &HealthRe
         debug!(
             chain = %chain,
             idx = target.idx,
-            url = %redacted(&target.url),
+            url = %redact_url(&target.url),
             "rpc.health.probe_started"
         );
         let call = target.client.request_noparams::<U64>("eth_blockNumber");
@@ -479,7 +481,7 @@ async fn run_probe_round(chain: &str, targets: &[ProbeTarget], health: &HealthRe
                 debug!(
                     chain = %chain,
                     idx = target.idx,
-                    url = %redacted(&target.url),
+                    url = %redact_url(&target.url),
                     latency_ms = elapsed.as_millis() as u64,
                     block,
                     "rpc.health.probe_succeeded"
@@ -500,22 +502,22 @@ async fn run_probe_round(chain: &str, targets: &[ProbeTarget], health: &HealthRe
                 debug!(
                     chain = %chain,
                     idx = target.idx,
-                    url = %redacted(&target.url),
+                    url = %redact_url(&target.url),
                     error = %err,
                     "rpc.health.probe_failed"
                 );
-                emit_cooldown_event(chain, target.idx, &redacted(&target.url), decision);
+                emit_cooldown_event(chain, target.idx, &redact_url(&target.url), decision);
             }
             Err(_elapsed) => {
                 warn!(
                     chain = %chain,
                     idx = target.idx,
-                    url = %redacted(&target.url),
+                    url = %redact_url(&target.url),
                     timeout_ms = PROBE_TIMEOUT.as_millis() as u64,
                     "rpc.health.probe_timeout"
                 );
                 let decision = health.record_failure(target.idx, true, None);
-                emit_cooldown_event(chain, target.idx, &redacted(&target.url), decision);
+                emit_cooldown_event(chain, target.idx, &redact_url(&target.url), decision);
             }
         }
     }
@@ -544,8 +546,10 @@ fn build_http_stack(url: &url::Url, ep: &EndpointSpec, client: reqwest::Client) 
     // top-to-bottom; conceptually retry sits *outside* throttle so
     // throttled-and-rate-limited responses still get retried. For
     // endpoints without a configured `max_rps` we skip the throttle
-    // layer entirely (the throttle layer panics on `rps == 0`).
-    let http: Http<reqwest::Client> = Http::with_client(client, url.clone());
+    // layer entirely (the throttle layer panics on `rps == 0`). The HTTP
+    // transport is Bloom's rather than alloy's so that the URL, which may
+    // carry an API key, reaches neither the logs nor any error.
+    let http = EndpointHttp::new(client, url.clone());
     if let Some(rps) = ep.max_rps {
         let throttle = ThrottleLayer::new(rps);
         let stack = ServiceBuilder::new()
@@ -556,18 +560,6 @@ fn build_http_stack(url: &url::Url, ep: &EndpointSpec, client: reqwest::Client) 
     } else {
         let stack = ServiceBuilder::new().layer(retry).service(http);
         stack.into_box_transport()
-    }
-}
-
-/// Best-effort URL redaction for log lines. Strips the path / query so
-/// vendor API keys baked into the path don't end up in stdout.
-fn redacted(url: &str) -> String {
-    if let Ok(u) = url::Url::parse(url) {
-        let host = u.host_str().unwrap_or("?");
-        let port = u.port().map(|p| format!(":{p}")).unwrap_or_default();
-        format!("{}://{}{}", u.scheme(), host, port)
-    } else {
-        url.to_string()
     }
 }
 
@@ -644,5 +636,94 @@ mod tests {
         let engine = RpcEngine::build(&http_plus_ws_spec()).expect("build engine");
         assert!(engine.supports_subscriptions());
         assert_eq!(engine.ws_connects.len(), 1);
+    }
+
+    /// An endpoint URL with an API key in its userinfo, path and query, on
+    /// a port nothing listens on, and the origin it may be shown as.
+    fn url_with_keys() -> (String, String) {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        (
+            format!("http://user:USERINFO-KEY@127.0.0.1:{port}/v2/PATH-KEY?apikey=QUERY-KEY"),
+            format!("http://127.0.0.1:{port}"),
+        )
+    }
+
+    fn assert_no_keys(text: &str) {
+        for key in ["USERINFO-KEY", "PATH-KEY", "QUERY-KEY", "/v2/"] {
+            assert!(!text.contains(key), "{key} leaked: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_errors_name_the_origin_not_the_url() {
+        use alloy::providers::Provider;
+
+        let (url, origin) = url_with_keys();
+        let mut spec = ChainSpec::anvil_default();
+        spec.rpc_urls = vec![url];
+        spec.rpc_endpoints.clear();
+        let engine = RpcEngine::build(&spec).expect("build engine");
+        let err = engine
+            .provider()
+            .get_block_number()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_no_keys(&err);
+        assert!(
+            err.contains(&format!("connection failed ({origin})")),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_logs_name_the_origin_not_the_url() {
+        /// Collects everything the subscriber writes.
+        #[derive(Clone, Default)]
+        struct Captured(Arc<parking_lot::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (raw, origin) = url_with_keys();
+        let spec = EndpointSpec {
+            url: raw.clone(),
+            weight: 100,
+            cu_per_sec: None,
+            max_rps: None,
+            http_only: false,
+        };
+        let (url, _) = classify_endpoint(&spec).unwrap();
+        let target = ProbeTarget {
+            idx: 0,
+            url: raw.clone(),
+            client: RpcClient::new(build_http_stack(&url, &spec, reqwest::Client::new()), false),
+        };
+        let health = HealthRegistry::new(vec![raw]);
+
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        run_probe_round("test", &[target], &health).await;
+
+        let logs = String::from_utf8(captured.0.lock().clone()).unwrap();
+        assert!(logs.contains("rpc.health.probe_failed"), "{logs}");
+        assert!(logs.contains(&origin), "{logs}");
+        assert_no_keys(&logs);
     }
 }

@@ -2365,6 +2365,20 @@ mod mock_rpc_tests {
         assert!(matches!(err, ChainError::Transport(_)), "got {err:?}");
     }
 
+    #[tokio::test]
+    async fn transport_errors_do_not_quote_the_endpoint_url() {
+        // Vendors put API keys in the userinfo, the path or the query.
+        let c = client_at("http://user:USERINFO-KEY@127.0.0.1:1/v2/PATH-KEY?apikey=QUERY-KEY");
+        let err = c.block_number().await.unwrap_err().to_string();
+        for key in ["USERINFO-KEY", "PATH-KEY", "QUERY-KEY"] {
+            assert!(!err.contains(key), "{key} leaked: {err}");
+        }
+        assert!(
+            err.contains("connection failed (http://127.0.0.1:1)"),
+            "{err}"
+        );
+    }
+
     // -- NFT (ERC-721 / ERC-1155) helpers --------------------------------
 
     /// ABI-encode a bool as a 32-byte word.
