@@ -24,7 +24,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alloy::network::TransactionBuilder;
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::rpc::types::eth::TransactionRequest;
-use bloom_evm::{ChainClient, ChainRegistry};
+use alloy::sol_types::SolCall;
+use bloom_evm::{ChainClient, ChainRegistry, IERC20};
 
 use bloom_ens::EnsClient;
 use bloom_etherscan::EtherscanClient;
@@ -657,16 +658,10 @@ impl DaemonPetalHost {
         let Some(wallets) = self.wallets.as_ref() else {
             return Ok(None);
         };
-        match wallets
-            .ensure_petal_eligibility(wallet, package_hash)
-            .await
-            .map_err(|error| HostError::Denied(error.to_string()))?
-        {
-            bloom_machine_client::PetalEligibility::Allowed(_) => Ok(None),
-            bloom_machine_client::PetalEligibility::AwaitingPolicyApproval(pending) => {
-                Ok(Some(pending))
-            }
-        }
+        petal_eligibility_outcome(
+            wallet,
+            wallets.ensure_petal_eligibility(wallet, package_hash).await,
+        )
     }
 
     fn with_provenance_catalog(
@@ -2741,6 +2736,23 @@ impl PetalHost for DaemonPetalHost {
                 );
             }
         }
+        // The registry is consulted by chain and the signature carries the id
+        // the node reports, not the configured one, so the classifier needs
+        // both. It is read here, after the pending scan, so that reusing an
+        // entry never needs the node; staging then reads the same cached
+        // value, and a node that cannot say which chain it is fails the
+        // stage rather than being guessed at.
+        let reported_chain_id = chain
+            .chain_id()
+            .await
+            .map_err(|error| HostError::Backend(format!("chain id for {}: {error}", req.chain)))?;
+        let typed_erc20_transfer = decode_petal_erc20_transfer(
+            &req,
+            chain.spec().chain_id,
+            reported_chain_id,
+            requested_to,
+            requested_value,
+        )?;
         let staged = service
             .tx_engine
             .stage_with_execution_origin_and_fee_overrides(
@@ -2748,10 +2760,19 @@ impl PetalHost for DaemonPetalHost {
                 &req.wallet,
                 wallet_address,
                 RawIntent {
-                    body: RawIntentBody::Raw {
-                        to: req.to,
-                        value: format!("{} wei", req.value_wei),
-                        data: req.data_hex,
+                    body: match typed_erc20_transfer {
+                        Some((recipient, amount)) => RawIntentBody::Send {
+                            to: bloom_proto::checksum_address(&recipient),
+                            value: "0".into(),
+                            token: Some(req.to),
+                            amount: format!("{amount} base"),
+                            data: None,
+                        },
+                        None => RawIntentBody::Raw {
+                            to: req.to,
+                            value: format!("{} wei", req.value_wei),
+                            data: req.data_hex,
+                        },
                     },
                     chain: Some(req.chain.clone()),
                     gas: GasStrategy::Auto,
@@ -2803,7 +2824,17 @@ impl PetalHost for DaemonPetalHost {
             .map_err(|e| HostError::NotFound(format!("outbox {outbox_id}: {e}")))?;
         self.authorize_petal_outbox_owner(context, &wallet, &entry.staged)
             .await?;
-        if entry.staged.resolved_execution_origin() != origin {
+        // Scoped to the package, like inspection: a Petal that stages from one
+        // route and confirms from another is the documented layout, and Morpho
+        // and Robinhood both use it. Route-binding made their confirm
+        // unreachable, so a multi-step deposit wedged at its first step. The
+        // digest is what establishes "this same trusted Petal"; the route id
+        // names a file inside one immutable artifact, not a principal.
+        if !entry
+            .staged
+            .resolved_execution_origin()
+            .same_package(&origin)
+        {
             return Err(HostError::Denied(
                 "outbox entry was not staged by this trusted Petal".into(),
             ));
@@ -2869,6 +2900,9 @@ impl PetalHost for DaemonPetalHost {
                 &outbox_id,
                 Some(requirement),
             ),
+            Err(bloom_tx::TxEngineError::PolicyDenied) => Err(HostError::Backend(
+                petal_policy_denial(&service.tx_engine, &wallet, &chain_name, &outbox_id),
+            )),
             Err(error) => Err(HostError::Backend(format!("confirm EVM outbox: {error}"))),
         }
     }
@@ -2897,8 +2931,8 @@ impl PetalHost for DaemonPetalHost {
             .await?;
         // Inspection is read-only, so it is scoped to the package rather than
         // to the route that staged the entry: a Petal's status route must be
-        // able to reconcile what its execute route staged. Confirmation stays
-        // route-bound because it dispatches signing.
+        // able to reconcile what its execute route staged. Confirmation is
+        // scoped the same way; see `evm_tx_confirm` for why.
         if !entry
             .staged
             .resolved_execution_origin()
@@ -3114,6 +3148,74 @@ fn parse_petal_hex_bytes(value: &str, field: &str) -> Result<Vec<u8>, HostError>
     hex::decode(value).map_err(|e| HostError::Invalid(format!("{field}: {e}")))
 }
 
+/// Recognize the one contract-call shape whose policy semantics Bloom can
+/// verify without trusting Petal-authored labels: canonical ERC-20
+/// `transfer(address,uint256)`. The transaction engine reconstructs the
+/// calldata from these decoded fields and reads token metadata onchain before
+/// classifying it as an ERC-20 transfer. Everything else remains a generic
+/// contract call, as does any call when the node reports a chain id other
+/// than the configured one.
+fn decode_petal_erc20_transfer(
+    request: &EvmTransactionRequest,
+    spec_chain_id: u64,
+    reported_chain_id: u64,
+    requested_to: Address,
+    requested_value: U256,
+) -> Result<Option<(Address, U256)>, HostError> {
+    if !requested_value.is_zero() {
+        return Ok(None);
+    }
+    // The registry is read by chain, and the signature is for the id the
+    // node reports. If the two disagree, a token curated for the configured
+    // chain would be typed and priced under that chain's name while being
+    // signed for another. Nothing here can say which chain is meant, so the
+    // call stays generic with its bytes intact.
+    if reported_chain_id != spec_chain_id {
+        return Ok(None);
+    }
+    // The selector and ABI shape say what the call looks like, not what the
+    // contract at `to` does with it. Any contract can answer `decimals()`,
+    // return "USDC" from `symbol()`, and run something else entirely under
+    // 0xa9059cbb. Typed treatment vouches for semantics, so it is only given
+    // to a contract Bloom already knows is a token. Anything else stays a
+    // generic call with its bytes intact - and is not validated below either,
+    // because Bloom will not be rebuilding it.
+    if bloom_tx::tx_engine::known_token(reported_chain_id, requested_to).is_none() {
+        return Ok(None);
+    }
+    let calldata = parse_petal_hex_bytes(&request.data_hex, "data-hex")?;
+    if !calldata.starts_with(&IERC20::transferCall::SELECTOR) {
+        return Ok(None);
+    }
+    // A registered token runs `transfer` whatever follows its two words:
+    // Solidity ignores trailing calldata. Left generic, a longer call would
+    // move the same tokens to the same recipient while policy checked the
+    // token contract in place of that recipient, so one extra byte would step
+    // around the recipient rule the canonical call is held to. Only the exact
+    // shape is typed; any other length under this selector is refused.
+    if calldata.len() != IERC20::transferCall::SELECTOR.len() + 64 {
+        return Err(HostError::Invalid(format!(
+            "ERC-20 transfer calldata to a registered token must be exactly 68 bytes, not {}",
+            calldata.len()
+        )));
+    }
+    // The engine rebuilds the call from the decoded fields, so anything the
+    // decoder tolerates and drops would be a silent payload change. Validate
+    // the encoding, then require the re-encoding to reproduce the exact bytes:
+    // dirty padding in the address word fails both checks instead of being
+    // staged as a different transaction than the Petal handed over.
+    let call = IERC20::transferCall::abi_decode_validate(&calldata)
+        .map_err(|error| HostError::Invalid(format!("ERC-20 transfer calldata: {error}")))?;
+    if call.abi_encode() != calldata {
+        return Err(HostError::Invalid(
+            "ERC-20 transfer calldata is not canonical: re-encoding the decoded \
+             recipient and amount does not reproduce the supplied bytes"
+                .into(),
+        ));
+    }
+    Ok(Some((call.to, call.amount)))
+}
+
 /// Retain account-0 operation hashes exactly. Additional accounts bind the
 /// entire parent (or stop target) KeyRef, not a guest slot or display path.
 fn petal_scoped_identity(
@@ -3164,8 +3266,12 @@ fn petal_pending_request_matches(
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(u128::MAX);
+    // Scoped to the package, like confirm and inspection. A route that stages
+    // the step another route already staged (Morpho's `confirm` restaging
+    // after a lost outbox id) must find that entry, not stage a duplicate at
+    // the next nonce that needs its own approval.
     staged.expires_ms > now_ms
-        && staged.resolved_execution_origin() == *origin
+        && staged.resolved_execution_origin().same_package(origin)
         && staged.from.parse::<Address>().ok() == Some(requested_from)
         && staged
             .to
@@ -3173,6 +3279,8 @@ fn petal_pending_request_matches(
             .and_then(|to| to.parse::<Address>().ok())
             == Some(requested_to)
         && staged.value_wei.parse::<U256>().ok() == Some(requested_value)
+        // `evm_tx_stage` accepts only lowercase canonical hex, and the engine
+        // stores calldata lowercase, so the strings compare exactly.
         && staged.data_hex == request.data_hex
         && request.nonce.is_none_or(|nonce| staged.nonce == nonce)
         && request
@@ -3217,6 +3325,38 @@ fn petal_outbox_outcome(
         plan_md,
         approval_required,
     })
+}
+
+/// The refusal a Petal reports when policy denies a confirm, naming each
+/// check that denied it. `policy denied` alone does not say whether the
+/// recipient, the contract or an unacknowledged warning was the cause, so the
+/// agent reading it has nothing to act on. The checks are the ones recorded
+/// at staging, read back from the entry the engine just refused.
+fn petal_policy_denial(tx_engine: &TxEngine, wallet: &str, chain: &str, outbox_id: &str) -> String {
+    use bloom_proto::policy::PolicyOutcome;
+
+    let mut refusal = String::from("confirm EVM outbox: policy denied");
+    let Ok(entry) = tx_engine.outbox.read(wallet, chain, outbox_id) else {
+        return refusal;
+    };
+    let checks = &entry.staged.policy_checks;
+    // A hard deny refuses on its own; without one, the refusal came from
+    // warnings the Petal did not acknowledge.
+    let blocking = if checks.iter().any(|c| c.outcome == PolicyOutcome::Deny) {
+        PolicyOutcome::Deny
+    } else {
+        PolicyOutcome::Warn
+    };
+    let causes: Vec<String> = checks
+        .iter()
+        .filter(|c| c.outcome == blocking)
+        .map(|c| format!("{}: {}", c.rule, c.message))
+        .collect();
+    if !causes.is_empty() {
+        refusal.push_str(": ");
+        refusal.push_str(&causes.join("; "));
+    }
+    refusal
 }
 
 fn petal_http_transport_error(
@@ -3481,8 +3621,11 @@ impl ipc::BatchConfirmationService for CanonicalBatchConfirmation {
         request: ipc::BatchConfirmIpcRequest,
     ) -> ipc::BatchConfirmFuture<'a> {
         Box::pin(async move {
-            if !(1..=32).contains(&request.txs.len()) {
-                return Err("transaction batch must contain 1 to 32 children".into());
+            let max = bloom_tx::tx_engine::MAX_BATCH_CHILDREN;
+            if !(1..=max).contains(&request.txs.len()) {
+                return Err(format!(
+                    "transaction batch must contain 1 to {max} children"
+                ));
             }
             if request.account >= (1_u32 << 31) {
                 return Err("account must be between 0 and 2147483647".into());
@@ -3947,6 +4090,164 @@ impl AccountPetalMount for AccountPetals {
     }
 }
 
+/// What a Petal's use of `wallet` does with its eligibility: go on when the
+/// policy allows it, wait on a policy change, or fail with
+/// [`eligibility_host_error`].
+fn petal_eligibility_outcome(
+    wallet: &str,
+    eligibility: Result<bloom_machine_client::PetalEligibility, bloom_vfs::HandlerError>,
+) -> Result<Option<bloom_machine_client::PendingPolicyUpdate>, HostError> {
+    match eligibility.map_err(|error| eligibility_host_error(wallet, error))? {
+        bloom_machine_client::PetalEligibility::Allowed(_) => Ok(None),
+        bloom_machine_client::PetalEligibility::AwaitingPolicyApproval(pending) => {
+            Ok(Some(pending))
+        }
+        // Not produced here: this request is proposed at any version.
+        bloom_machine_client::PetalEligibility::ChangedSinceCreation(_) => Err(HostError::Denied(
+            "wallet policy does not allow this Petal package".into(),
+        )),
+    }
+}
+
+/// The error a Petal gets when its wallet's policy could not be made to allow
+/// it. What clears up on a retry goes back as a backend error whose message
+/// the Petal shows the agent whole: a wait for the Petals chosen during
+/// setup, or another command holding the wallet's policy for a moment. A
+/// denial would reach the agent only as a refusal, and some Petals answer it
+/// by asking the owner instead. Anything else is a denial.
+fn eligibility_host_error(wallet: &str, error: bloom_vfs::HandlerError) -> HostError {
+    if let Some(message) = bloom_vfs::handlers::wallets::default_policy_waiting_message(&error) {
+        warn!(wallet = %wallet, reason = %message, "petal.default_policy_waiting");
+        return HostError::Backend(message.to_owned());
+    }
+    if bloom_vfs::handlers::wallets::is_policy_coordination_busy(&error) {
+        warn!(wallet = %wallet, reason = %error, "petal.policy_coordination_busy");
+        return HostError::Backend(format!(
+            "{}: another command is changing this wallet's policy; retry this operation in a few seconds",
+            bloom_vfs::handlers::wallets::POLICY_COORDINATION_BUSY
+        ));
+    }
+    HostError::Denied(error.to_string())
+}
+
+/// A wallet's setup resolved against the Petals installed now: what its
+/// default policy allows. Machine's first Petal proposal and `bloom wallet
+/// default-policy` both read a setup through [`chosen_petals`], so which
+/// Petals count, and what each allows, is decided in one place.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ChosenPetals {
+    /// Each chosen, installed Petal.
+    pub installed: Vec<ChosenPetal>,
+    /// The destinations every installed Petal's transactions need.
+    pub destinations: Vec<bloom_broker_api::PolicyDestination>,
+    /// Chosen Petals with no installed package, so not proposed: one may
+    /// still be installing after Machine started, or have failed to.
+    pub not_installed: Vec<String>,
+}
+
+/// A chosen Petal and the package installed for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChosenPetal {
+    pub name: String,
+    /// The installed package's hash, as the Petal store names it.
+    pub hash: String,
+    pub package: bloom_broker_api::Digest32,
+}
+
+/// Resolve a wallet's setup against `store`: each chosen Petal that is
+/// installed, with its package, and the destinations it needs. A chosen
+/// Petal that is not installed is listed in `not_installed`, so a proposal
+/// waits for it rather than leave it out of the policy for good. Only the
+/// Petals setup offers ([`bloom_proto::config::SETUP_PETALS`]) count. One
+/// whose owner record cannot be read, or holds an invalid package hash,
+/// fails the whole setup, so nothing is proposed.
+pub fn chosen_petals(
+    store: &PetalStore,
+    chosen: &bloom_proto::config::WalletSetup,
+) -> Result<ChosenPetals, HandlerError> {
+    let mut petals = ChosenPetals::default();
+    for name in chosen.petals.keys() {
+        // Setup never offers these, so a config naming one, as only a hand
+        // edit or a Petal since dropped from the catalog can, allows nothing
+        // more; no release installs it, so waiting for it would never end.
+        if !bloom_proto::config::SETUP_PETALS.contains(&name.as_str()) {
+            warn!(petal = %name, "default_policy.petal_not_in_setup_ignored");
+            continue;
+        }
+        let installed = store.resolve_petal_owner(name).map_err(|error| {
+            warn!(petal = %name, %error, "petal.default_policy_owner_unreadable");
+            HandlerError::backend(format!("read the installed {name} Petal: {error}"))
+        })?;
+        let Some(hash) = installed else {
+            petals.not_installed.push(name.clone());
+            continue;
+        };
+        let package = bloom_broker_api::Digest32::new(hash.clone()).map_err(|error| {
+            HandlerError::backend(format!(
+                "the installed {name} Petal has an invalid package hash: {error}"
+            ))
+        })?;
+        petals
+            .destinations
+            .extend(default_policy_destinations(name));
+        petals.installed.push(ChosenPetal {
+            name: name.clone(),
+            hash,
+            package,
+        });
+    }
+    Ok(petals)
+}
+
+/// What a wallet's first Petal proposal also allows, from its setup: the
+/// packages and destinations [`chosen_petals`] resolves.
+fn default_policy_setup(
+    store: &PetalStore,
+    chosen: &bloom_proto::config::WalletSetup,
+) -> Result<bloom_vfs::handlers::DefaultPolicySetup, HandlerError> {
+    let chosen = chosen_petals(store, chosen)?;
+    Ok(bloom_vfs::handlers::DefaultPolicySetup {
+        packages: chosen
+            .installed
+            .into_iter()
+            .map(|petal| petal.package)
+            .collect(),
+        destinations: chosen.destinations,
+        not_installed: chosen.not_installed,
+    })
+}
+
+/// [`default_policy_setup`] for `wallet`, from the config on disk now, not a
+/// copy taken when Machine started, so a setup saved since is the one
+/// proposed. A config that cannot be read stops the proposal.
+fn saved_default_policy_setup(
+    store: &PetalStore,
+    config_path: &std::path::Path,
+    wallet: &str,
+) -> Result<bloom_vfs::handlers::DefaultPolicySetup, bloom_vfs::HandlerError> {
+    let config = Config::load(config_path).map_err(|error| {
+        bloom_vfs::HandlerError::backend(format!(
+            "read {wallet}'s setup before proposing its policy: {error}"
+        ))
+    })?;
+    default_policy_setup(store, config.setup.wallet(wallet))
+}
+
+/// The fixed contracts a chosen Petal transacts with, as Broker policy
+/// destinations. The table lives in Bloom's source, never in config, and a
+/// test checks every entry is a valid destination, so none is dropped here.
+pub fn default_policy_destinations(name: &str) -> Vec<bloom_broker_api::PolicyDestination> {
+    bloom_proto::petal_destinations::for_petal(name)
+        .iter()
+        .filter_map(|destination| {
+            Some(bloom_broker_api::PolicyDestination {
+                chain: bloom_broker_api::Token::new(destination.chain.to_owned()).ok()?,
+                destination: destination.destination.to_owned(),
+            })
+        })
+        .collect()
+}
+
 /// All wired-up state the daemon owns. Cheap to clone (everything is
 /// behind Arc/clone-safe inner types).
 #[derive(Clone)]
@@ -4160,14 +4461,35 @@ impl Daemon {
         let home_write_permit = self.home_write_permit.clone().ok_or_else(|| {
             "batch confirmation is unavailable without the Machine home write permit".to_owned()
         })?;
-        Ok(Arc::new(CanonicalBatchConfirmation {
-            tx_engine: self.tx_engine.clone(),
-            home_write_permit,
-            chains: self.chains.clone(),
-            wallet_projections: self.wallet_projections.clone(),
-            wallets: self.wallets.clone(),
-            audit: self.audit.clone(),
-        }))
+        let service: Arc<dyn ipc::BatchConfirmationService> =
+            Arc::new(CanonicalBatchConfirmation {
+                tx_engine: self.tx_engine.clone(),
+                home_write_permit,
+                chains: self.chains.clone(),
+                wallet_projections: self.wallet_projections.clone(),
+                wallets: self.wallets.clone(),
+                audit: self.audit.clone(),
+            });
+        // The same service backs `wallets/<wallet>/<n>/confirm-batch`, so a
+        // mount and MCP reach what `bloom wallet confirm-batch` does. Weak:
+        // the service holds the handler.
+        let weak = Arc::downgrade(&service);
+        self.wallets
+            .set_batch_confirm(Arc::new(move |wallet, account, txs, text| {
+                let service = weak.upgrade();
+                Box::pin(async move {
+                    let service = service
+                        .ok_or_else(|| "batch confirmation service has stopped".to_owned())?;
+                    let request = ipc::BatchConfirmIpcRequest {
+                        wallet,
+                        account,
+                        txs,
+                        text,
+                    };
+                    service.confirm_batch(request).await
+                })
+            }));
+        Ok(service)
     }
 
     /// Build a fully-wired daemon from the home directory, materialising
@@ -4735,6 +5057,25 @@ impl Daemon {
             })),
         );
 
+        // Build the petals runtime: content-addressed store under
+        // `~/.bloom/petals/store`, name registry under
+        // `~/.bloom/petals/registry`, and a wasmtime engine. Petal
+        // packages are exposed under `petals/`.
+        let petals_root = home.root().join("petals");
+        let petal_store = PetalStore::open(petals_root.join("store"))
+            .map_err(|e| DaemonError::Audit(format!("petals store: {e}")))?;
+
+        // A wallet's first Petal proposal also allows every installed Petal
+        // its setup chose.
+        let default_policy_packages: bloom_vfs::handlers::DefaultPolicyPackages = {
+            // Read from disk on each call, not from the copy Machine loaded at
+            // startup, and installed hashes resolved on each call too, so a
+            // Petal update is picked up without a restart. A config that
+            // cannot be read stops the proposal.
+            let config_path = home.config_path();
+            let store = petal_store.clone();
+            Arc::new(move |wallet: &str| saved_default_policy_setup(&store, &config_path, wallet))
+        };
         let wallets_handler = Arc::new(
             WalletsHandler::new(
                 chains.clone(),
@@ -4748,16 +5089,9 @@ impl Daemon {
             .with_home_write_permit_opt(home_write_permit.clone())
             .with_mempool_indexes(mempool_indexes.clone())
             .with_solana(solana_engines)
-            .with_solana_reads(solana_chain_registry.clone()),
+            .with_solana_reads(solana_chain_registry.clone())
+            .with_default_policy_packages(default_policy_packages),
         );
-
-        // Build the petals runtime: content-addressed store under
-        // `~/.bloom/petals/store`, name registry under
-        // `~/.bloom/petals/registry`, and a wasmtime engine. Petal
-        // packages are exposed under `petals/`.
-        let petals_root = home.root().join("petals");
-        let petal_store = PetalStore::open(petals_root.join("store"))
-            .map_err(|e| DaemonError::Audit(format!("petals store: {e}")))?;
         let petal_registry = Arc::new(
             NameRegistry::open(petals_root.join("registry"))
                 .map_err(|e| DaemonError::Audit(format!("petals registry: {e}")))?,
@@ -5147,6 +5481,37 @@ impl Daemon {
         self.machine_broker.clone()
     }
 
+    /// Propose every package in `packages` and every destination in
+    /// `destinations` together through the wallet's existing policy
+    /// operation. `Allowed` means the policy allows all of them. Only the
+    /// policy wallet creation installed is added to: once it has changed,
+    /// nothing is proposed.
+    pub async fn ensure_default_policy(
+        &self,
+        wallet: &str,
+        packages: &[bloom_broker_api::Digest32],
+        destinations: &[bloom_broker_api::PolicyDestination],
+    ) -> Result<bloom_machine_client::PetalEligibility, bloom_vfs::HandlerError> {
+        self.wallets
+            .ensure_petal_packages_allowed(wallet, packages, destinations)
+            .await
+    }
+
+    /// `wallet`'s policy once its retained proposals are reconciled, so a
+    /// change the owner approved meanwhile commits: the change still waiting
+    /// for the owner, or the current policy. The waiting change is this
+    /// request's own only when it adds nothing else. Proposes nothing.
+    pub async fn reconciled_wallet_policy(
+        &self,
+        wallet: &str,
+        packages: &[bloom_broker_api::Digest32],
+        destinations: &[bloom_broker_api::PolicyDestination],
+    ) -> Result<bloom_vfs::handlers::ReconciledPolicy, bloom_vfs::HandlerError> {
+        self.wallets
+            .reconciled_policy(wallet, packages, destinations)
+            .await
+    }
+
     /// Idempotent: ensure background workers are running. Already
     /// invoked by [`from_home`] when a tokio runtime is available; call
     /// this after entering an async context if construction happened
@@ -5457,8 +5822,67 @@ async fn render_next_actions_with_timeout(
         md.push_str(
             &render_pending_actions(wallet_tree, installed, &wallet_ids, live_timeout).await,
         );
+        md.push_str(&render_wallet_paths(wallet_tree, &wallet_ids, live_timeout).await);
     }
     md.into_bytes()
+}
+
+/// Where each account's balances and outboxes are, so a reader of `next.md`
+/// has real paths without listing the tree first.
+async fn render_wallet_paths(
+    wallet_tree: &dyn Handler,
+    wallet_ids: &[String],
+    live_timeout: Duration,
+) -> String {
+    const SHOWN: usize = 8;
+    let names = |path: String| async move {
+        let path = VfsPath::parse(&path).ok()?;
+        let listed = tokio::time::timeout(live_timeout, wallet_tree.list(&path)).await;
+        Some(
+            listed
+                .ok()?
+                .ok()?
+                .into_iter()
+                .filter(|entry| entry.kind == bloom_vfs::handler::EntryKind::Dir)
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>(),
+        )
+    };
+    let mut lines = String::new();
+    let more = |hidden: usize, what: &str| match hidden {
+        0 => String::new(),
+        n => format!("- and {n} more; list `{what}`\n"),
+    };
+    for wallet in wallet_ids.iter().take(SHOWN) {
+        let accounts: Vec<String> = names(format!("/{wallet}"))
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|name| name.parse::<u32>().is_ok())
+            .collect();
+        for account in accounts.iter().take(SHOWN) {
+            let chains = names(format!("/{wallet}/{account}/chains"))
+                .await
+                .unwrap_or_default();
+            if chains.is_empty() {
+                continue;
+            }
+            lines.push_str(&format!(
+                "- `{wallet}` account `{account}`: balances `wallets/{wallet}/{account}/holdings.json`; outbox `wallets/{wallet}/{account}/chains/<chain>/outbox/` on {}\n",
+                chains.join(", ")
+            ));
+        }
+        lines.push_str(&more(
+            accounts.len().saturating_sub(SHOWN),
+            &format!("wallets/{wallet}/"),
+        ));
+    }
+    lines.push_str(&more(wallet_ids.len().saturating_sub(SHOWN), "wallets/"));
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("\n## Wallets\n\n{lines}")
+    }
 }
 
 /// Child directories of `wallets/<path>`. A missing path has none; any other
@@ -6212,6 +6636,442 @@ mod tests {
         assert!(configured_mount(&config, std::path::Path::new("/tmp/bloom-mount")).is_err());
     }
 
+    /// USDC on Ethereum: in the curated registry, so the classifier will look
+    /// at a call addressed to it on mainnet.
+    const KNOWN_TOKEN: &str = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+    /// Not in the registry: a contract Bloom knows nothing about.
+    const UNKNOWN_CONTRACT: &str = "0x0000000000000000000000000000000000000010";
+    const MAINNET: u64 = 1;
+    const ANVIL: u64 = 31337;
+
+    fn petal_evm_request(to: &str, value_wei: &str, data_hex: String) -> EvmTransactionRequest {
+        EvmTransactionRequest {
+            wallet: "alice".into(),
+            chain: "anvil".into(),
+            to: to.into(),
+            value_wei: value_wei.into(),
+            data_hex,
+            nonce: None,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            context: None,
+        }
+    }
+
+    fn classify(
+        request: &EvmTransactionRequest,
+        value: U256,
+    ) -> Result<Option<(Address, U256)>, HostError> {
+        decode_petal_erc20_transfer(
+            request,
+            MAINNET,
+            MAINNET,
+            request.to.parse().unwrap(),
+            value,
+        )
+    }
+
+    fn canonical_transfer(recipient: Address, amount: u64) -> Vec<u8> {
+        IERC20::transferCall {
+            to: recipient,
+            amount: U256::from(amount),
+        }
+        .abi_encode()
+    }
+
+    fn hex0x(bytes: &[u8]) -> String {
+        format!("0x{}", hex::encode(bytes))
+    }
+
+    /// The registry is read by chain and the signature is for the id the node
+    /// reports. When the two disagree a transfer stays generic, even to a
+    /// token curated for the configured chain, rather than being typed for
+    /// one chain and signed for another.
+    #[test]
+    fn a_node_reporting_another_chain_leaves_a_curated_transfer_generic() {
+        let recipient: Address = "0x0000000000000000000000000000000000000020"
+            .parse()
+            .unwrap();
+        let request = petal_evm_request(KNOWN_TOKEN, "0", hex0x(&canonical_transfer(recipient, 1)));
+        let to: Address = KNOWN_TOKEN.parse().unwrap();
+        let classify = |spec: u64, reported: u64| {
+            decode_petal_erc20_transfer(&request, spec, reported, to, U256::ZERO).unwrap()
+        };
+        assert!(classify(MAINNET, MAINNET).is_some(), "agreeing ids: typed");
+        assert!(
+            classify(ANVIL, 1).is_none(),
+            "node says mainnet, config says anvil"
+        );
+        assert!(
+            classify(1, ANVIL).is_none(),
+            "node says anvil, config says mainnet"
+        );
+        // Curated on the reported chain but not the configured one is still
+        // a disagreement, not a lookup on the reported chain.
+        assert!(classify(8453, 1).is_none());
+    }
+
+    /// Chain id 31337 does not prove a node forked mainnet: any code can sit at
+    /// mainnet USDC's address on a local Anvil. With both ids agreeing on
+    /// 31337 the call still stays generic, and it is not validated either,
+    /// because Bloom will not rebuild it.
+    #[test]
+    fn a_local_anvil_does_not_borrow_mainnet_tokens() {
+        let recipient: Address = "0x0000000000000000000000000000000000000020"
+            .parse()
+            .unwrap();
+        let to: Address = KNOWN_TOKEN.parse().unwrap();
+        let mut calldata = canonical_transfer(recipient, 1);
+        let request = petal_evm_request(KNOWN_TOKEN, "0", hex0x(&calldata));
+        assert_eq!(
+            decode_petal_erc20_transfer(&request, ANVIL, ANVIL, to, U256::ZERO).unwrap(),
+            None
+        );
+        calldata[4] = 1;
+        let dirty = petal_evm_request(KNOWN_TOKEN, "0", hex0x(&calldata));
+        assert_eq!(
+            decode_petal_erc20_transfer(&dirty, ANVIL, ANVIL, to, U256::ZERO).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn petal_erc20_transfer_is_decoded_only_from_the_exact_canonical_shape() {
+        let recipient: Address = "0x0000000000000000000000000000000000000020"
+            .parse()
+            .unwrap();
+        let calldata = canonical_transfer(recipient, 42);
+        let request = petal_evm_request(KNOWN_TOKEN, "0", hex0x(&calldata));
+        assert_eq!(
+            classify(&request, U256::ZERO).unwrap(),
+            Some((recipient, U256::from(42_u64)))
+        );
+
+        let mut trailing = calldata;
+        trailing.push(0);
+        let request = petal_evm_request(KNOWN_TOKEN, "0", hex0x(&trailing));
+        assert!(matches!(
+            classify(&request, U256::ZERO),
+            Err(HostError::Invalid(_))
+        ));
+    }
+
+    /// The token ignores trailing calldata and runs the transfer anyway. Left
+    /// generic, the padded call would be checked against the token contract
+    /// instead of its recipient, so one byte would sidestep the recipient rule
+    /// the canonical call meets. Under the `transfer` selector, a registered
+    /// token gets the exact shape or a refusal, never a generic call.
+    #[test]
+    fn a_registered_token_transfer_of_any_other_length_is_refused_not_left_generic() {
+        let recipient: Address = "0x0000000000000000000000000000000000000020"
+            .parse()
+            .unwrap();
+        let canonical = canonical_transfer(recipient, 42);
+        let mut longer = canonical.clone();
+        longer.extend_from_slice(&[0; 32]);
+        for calldata in [
+            [canonical.as_slice(), &[0]].concat(),
+            longer,
+            canonical[..67].to_vec(),
+            IERC20::transferCall::SELECTOR.to_vec(),
+        ] {
+            let request = petal_evm_request(KNOWN_TOKEN, "0", hex0x(&calldata));
+            assert!(
+                matches!(classify(&request, U256::ZERO), Err(HostError::Invalid(_))),
+                "{} bytes under the transfer selector must be refused",
+                calldata.len()
+            );
+        }
+
+        // Another selector on the same token is not a transfer: it stays
+        // generic, bytes intact.
+        let approve = IERC20::approveCall {
+            spender: recipient,
+            amount: U256::from(42_u64),
+        }
+        .abi_encode();
+        let request = petal_evm_request(KNOWN_TOKEN, "0", hex0x(&approve));
+        assert_eq!(classify(&request, U256::ZERO).unwrap(), None);
+
+        // An unregistered contract is never rebuilt, so its length is its own.
+        let request = petal_evm_request(
+            UNKNOWN_CONTRACT,
+            "0",
+            hex0x(&[canonical.as_slice(), &[0]].concat()),
+        );
+        assert_eq!(classify(&request, U256::ZERO).unwrap(), None);
+    }
+
+    /// The selector and ABI shape say what a call looks like, not what the
+    /// contract does with it. A contract Bloom has never heard of can answer
+    /// `decimals()` and `symbol()` and run anything at all under 0xa9059cbb,
+    /// so it gets no typed treatment: the call stays generic, bytes intact,
+    /// and reaches the owner as the opaque contract call it is.
+    #[test]
+    fn a_transfer_shaped_call_to_an_unknown_contract_stays_generic() {
+        let recipient: Address = "0x0000000000000000000000000000000000000020"
+            .parse()
+            .unwrap();
+        let calldata = canonical_transfer(recipient, 42);
+        let request = petal_evm_request(UNKNOWN_CONTRACT, "0", hex0x(&calldata));
+        assert_eq!(
+            classify(&request, U256::ZERO).unwrap(),
+            None,
+            "a canonical transfer to an unregistered contract must not be promoted"
+        );
+    }
+
+    /// Bloom refuses only what it would otherwise rewrite. The same dirty
+    /// padding is an error on a known token, where Bloom rebuilds the call,
+    /// and nothing at all on an unknown contract, where it does not.
+    #[test]
+    fn an_unknown_contract_is_not_validated_because_it_is_not_rebuilt() {
+        let mut calldata = canonical_transfer(
+            "0x0000000000000000000000000000000000000020"
+                .parse()
+                .unwrap(),
+            42,
+        );
+        calldata[4] = 1;
+        let data_hex = hex0x(&calldata);
+
+        let unknown = petal_evm_request(UNKNOWN_CONTRACT, "0", data_hex.clone());
+        assert_eq!(
+            classify(&unknown, U256::ZERO).unwrap(),
+            None,
+            "generic, not an error: the bytes are forwarded untouched"
+        );
+
+        let known = petal_evm_request(KNOWN_TOKEN, "0", data_hex);
+        assert!(
+            matches!(classify(&known, U256::ZERO), Err(HostError::Invalid(_))),
+            "the same bytes are refused where Bloom would rebuild them"
+        );
+    }
+
+    /// The registry is matched by address bytes, so the spelling a Petal uses
+    /// for the token contract does not decide whether it is recognized.
+    #[test]
+    fn a_known_token_is_recognized_in_any_address_case() {
+        let recipient: Address = "0x0000000000000000000000000000000000000020"
+            .parse()
+            .unwrap();
+        let calldata = canonical_transfer(recipient, 7);
+        for spelling in [
+            KNOWN_TOKEN.to_string(),
+            KNOWN_TOKEN.to_ascii_uppercase().replacen("0X", "0x", 1),
+            bloom_proto::checksum_address(&KNOWN_TOKEN.parse().unwrap()),
+        ] {
+            let request = petal_evm_request(&spelling, "0", hex0x(&calldata));
+            assert_eq!(
+                classify(&request, U256::ZERO).unwrap(),
+                Some((recipient, U256::from(7_u64))),
+                "{spelling}"
+            );
+        }
+    }
+
+    /// `abi_decode` accepts a dirty address word and silently zeroes the
+    /// padding, so the engine would rebuild different bytes than the Petal
+    /// handed over. Refuse the call instead.
+    #[test]
+    fn noncanonical_address_padding_is_refused_rather_than_rewritten() {
+        let mut calldata = canonical_transfer(
+            "0x0000000000000000000000000000000000000020"
+                .parse()
+                .unwrap(),
+            42,
+        );
+        // First byte of the address word, which canonical encoding leaves zero.
+        calldata[4] = 1;
+        let request = petal_evm_request(KNOWN_TOKEN, "0", hex0x(&calldata));
+        let error =
+            classify(&request, U256::ZERO).expect_err("dirty address padding must not decode");
+        assert!(
+            matches!(error, HostError::Invalid(_)),
+            "expected an invalid-payload refusal, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn value_bearing_transfer_shaped_calls_remain_generic() {
+        let calldata = canonical_transfer(Address::ZERO, 1);
+        let request = petal_evm_request(KNOWN_TOKEN, "1", hex0x(&calldata));
+        assert_eq!(classify(&request, U256::from(1_u64)).unwrap(), None);
+    }
+
+    /// A wait for the Petals chosen during setup reaches the Petal whole, as a
+    /// backend error free of the words a Petal reads as a refusal or a bad
+    /// request, so the agent sees what to wait for; anything else is denied.
+    #[test]
+    fn a_wait_for_chosen_petals_reaches_the_agent_whole() {
+        let waiting =
+            bloom_vfs::handlers::wallets::default_policy_waiting(&["hyperliquid".to_owned()]);
+        let Err(HostError::Backend(message)) = petal_eligibility_outcome("main", Err(waiting))
+        else {
+            panic!("the wait must not be a denial");
+        };
+        assert!(message.starts_with("DEFAULT_POLICY_WAITING: "), "{message}");
+        assert!(message.contains("hyperliquid"), "{message}");
+        assert!(message.contains("`docs/petals.md`"), "{message}");
+        assert!(
+            message.contains("[setup.wallets.<wallet>.petals]"),
+            "{message}"
+        );
+        let lower = message.to_ascii_lowercase();
+        for word in ["denied", "permission", "invalid", "not found"] {
+            assert!(!lower.contains(word), "{word}: {message}");
+        }
+        assert!(matches!(
+            eligibility_host_error("main", bloom_vfs::HandlerError::backend("broker refused")),
+            HostError::Denied(_)
+        ));
+        // Another command holding the wallet's policy is a retry, not a refusal.
+        let busy = bloom_vfs::HandlerError::backend(format!(
+            "{}; retry: Resource temporarily unavailable (os error 35)",
+            bloom_vfs::handlers::wallets::POLICY_COORDINATION_BUSY
+        ));
+        let Err(HostError::Backend(message)) =
+            petal_eligibility_outcome("denied-wallet", Err(busy))
+        else {
+            panic!("a busy policy must not be a denial");
+        };
+        assert!(message.contains("retry this operation"), "{message}");
+        let lower = message.to_ascii_lowercase();
+        for word in ["denied", "permission", "invalid", "not found"] {
+            assert!(!lower.contains(word), "{word}: {message}");
+        }
+    }
+
+    /// One chosen Petal whose owner record cannot be read fails the whole
+    /// default-policy setup, rather than leaving that Petal out of the first
+    /// proposal. A chosen Petal that is not installed is named, so the
+    /// proposal waits for it; a name setup never offers is ignored, since
+    /// nothing would ever install it.
+    #[test]
+    fn default_policy_setup_fails_when_an_owner_record_is_unreadable() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = PetalStore::open(temp.path()).unwrap();
+        let mut chosen = bloom_proto::config::WalletSetup::default();
+        for name in ["hyperliquid", "polymarket", "safe", "tolly", "Hyperliquid"] {
+            chosen.petals.insert(name.to_owned(), Default::default());
+        }
+
+        let setup = default_policy_setup(&store, &chosen).unwrap();
+        assert!(setup.packages.is_empty(), "nothing is installed yet");
+        // Missing chosen Petals are named, so a Petal's use waits for them;
+        // Safe, which setup never offers, a Petal no release installs, and a
+        // misspelt name are ignored though a config names them.
+        assert_eq!(setup.not_installed, ["hyperliquid", "polymarket"]);
+
+        // Installed: each package is proposed, with the destinations its
+        // transactions need: none for Hyperliquid, `petal:polymarket` on
+        // Polygon for Polymarket.
+        std::fs::create_dir_all(temp.path().join("owners")).unwrap();
+        let install = |name: &str, hash: &str| {
+            std::fs::create_dir_all(store.package_path(hash).unwrap()).unwrap();
+            std::fs::write(
+                temp.path().join("owners").join(format!("{name}.json")),
+                serde_json::json!({"name": name, "hash": hash}).to_string(),
+            )
+            .unwrap();
+        };
+        install("hyperliquid", &"ab".repeat(32));
+        let setup = default_policy_setup(&store, &chosen).unwrap();
+        assert_eq!(setup.not_installed, ["polymarket"]);
+        assert_eq!(
+            setup.packages,
+            [bloom_broker_api::Digest32::new("ab".repeat(32)).unwrap()]
+        );
+        assert!(setup.destinations.is_empty());
+        install("polymarket", &"cd".repeat(32));
+        let setup = default_policy_setup(&store, &chosen).unwrap();
+        assert!(setup.not_installed.is_empty());
+        assert_eq!(setup.packages.len(), 2);
+        // `bloom wallet default-policy` reads the same resolution, with each
+        // Petal's name and store hash, to find its earlier releases.
+        let chosen_now = chosen_petals(&store, &chosen).unwrap();
+        assert_eq!(
+            chosen_now
+                .installed
+                .iter()
+                .map(|petal| (petal.name.as_str(), petal.hash.clone()))
+                .collect::<Vec<_>>(),
+            [
+                ("hyperliquid", "ab".repeat(32)),
+                ("polymarket", "cd".repeat(32))
+            ]
+        );
+        assert_eq!(
+            chosen_now
+                .installed
+                .into_iter()
+                .map(|petal| petal.package)
+                .collect::<Vec<_>>(),
+            setup.packages
+        );
+        assert_eq!(
+            setup.destinations,
+            default_policy_destinations("polymarket")
+        );
+        assert!(
+            setup
+                .destinations
+                .contains(&bloom_broker_api::PolicyDestination {
+                    chain: bloom_broker_api::Token::new("polygon").unwrap(),
+                    destination: "petal:polymarket".into(),
+                })
+        );
+        // Every catalog destination is a valid one, so none is dropped.
+        for name in bloom_proto::config::SETUP_PETALS {
+            assert_eq!(
+                default_policy_destinations(name).len(),
+                bloom_proto::petal_destinations::for_petal(name).len(),
+                "{name}"
+            );
+        }
+
+        std::fs::write(temp.path().join("owners/polymarket.json"), b"not json").unwrap();
+        let error = default_policy_setup(&store, &chosen).unwrap_err();
+        assert!(error.to_string().contains("polymarket"), "{error}");
+        // A wallet without a setup proposes nothing beyond its request.
+        assert_eq!(
+            default_policy_setup(&store, &Default::default()).unwrap(),
+            bloom_vfs::handlers::DefaultPolicySetup::default()
+        );
+    }
+
+    /// A wallet's first proposal reads its setup from the config on disk each
+    /// time, so a setup saved after Machine started is the one proposed, and
+    /// an unreadable config stops the proposal.
+    #[test]
+    fn the_first_proposal_reads_the_saved_setup_each_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = PetalStore::open(temp.path().join("store")).unwrap();
+        let path = temp.path().join("config.toml");
+        let mut config = Config::local_default();
+        config.save(&path).unwrap();
+        assert_eq!(
+            saved_default_policy_setup(&store, &path, "trading").unwrap(),
+            bloom_vfs::handlers::DefaultPolicySetup::default()
+        );
+        config
+            .setup
+            .wallet_mut("trading")
+            .petals
+            .insert("hyperliquid".into(), Default::default());
+        config.save(&path).unwrap();
+        let setup = saved_default_policy_setup(&store, &path, "trading").unwrap();
+        assert_eq!(setup.not_installed, ["hyperliquid"]);
+        assert_eq!(
+            saved_default_policy_setup(&store, &path, "main").unwrap(),
+            bloom_vfs::handlers::DefaultPolicySetup::default(),
+            "another wallet's setup is not main's"
+        );
+        std::fs::write(&path, "not toml").unwrap();
+        assert!(saved_default_policy_setup(&store, &path, "trading").is_err());
+    }
+
     #[test]
     fn batch_approval_requirement_preserves_owner_launch_fields() {
         let value = batch_confirmation_result_json(Err(TxEngineError::ApprovalRequired(
@@ -6373,6 +7233,25 @@ mod tests {
                 .map(|body| body.as_bytes().to_vec())
                 .ok_or_else(|| HandlerError::not_found(key))
         }
+    }
+
+    /// The path list is capped, and says so instead of hiding the rest.
+    #[tokio::test]
+    async fn next_md_names_the_accounts_it_leaves_out() {
+        let tree = WalletTreeFixture {
+            dirs: [
+                (
+                    "alice",
+                    vec!["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"],
+                ),
+                ("alice/0/chains", vec!["base"]),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let text = render_wallet_paths(&tree, &["alice".to_owned()], Duration::from_secs(1)).await;
+        assert!(text.contains("`alice` account `0`"), "{text}");
+        assert!(text.contains("and 2 more; list `wallets/alice/`"), "{text}");
     }
 
     fn alice_tree() -> WalletTreeFixture {
@@ -8056,6 +8935,39 @@ mod tests {
             ),
             "the same request from another account must not reuse this outbox"
         );
+        // Reuse is scoped like confirm: another route of the same package
+        // finds the entry rather than staging a duplicate at the next nonce,
+        // while another digest or another Petal does not.
+        let mut other_route = origin.clone();
+        other_route.route_id = Some("r000099".into());
+        assert!(
+            petal_pending_request_matches(
+                &staged,
+                &request,
+                &other_route,
+                staged.from.parse().unwrap(),
+                staged.to.as_deref().unwrap().parse().unwrap(),
+                staged.value_wei.parse().unwrap(),
+            ),
+            "another route of the same package must reuse this outbox"
+        );
+        let mut other_digest = origin.clone();
+        other_digest.petal_digest = "c".repeat(64);
+        let mut other_petal = origin.clone();
+        other_petal.petal_id = "other".into();
+        for foreign in [other_digest, other_petal] {
+            assert!(
+                !petal_pending_request_matches(
+                    &staged,
+                    &request,
+                    &foreign,
+                    staged.from.parse().unwrap(),
+                    staged.to.as_deref().unwrap().parse().unwrap(),
+                    staged.value_wei.parse().unwrap(),
+                ),
+                "another package must not reuse this outbox: {foreign:?}"
+            );
+        }
         let mut equivalent_fee_request = request.clone();
         equivalent_fee_request.max_fee_per_gas = Some("00100".into());
         equivalent_fee_request.max_priority_fee_per_gas = Some("00010".into());
@@ -10131,7 +11043,12 @@ allowed = ["bloom:vfs.read"]
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("policy"), "{error}");
+        // The refusal names the check that denied it, so the agent reading it
+        // knows the destination is the cause, not only that policy refused.
+        assert_eq!(
+            error.to_string(),
+            "backend: confirm EVM outbox: policy denied: destinations.allow: not on allowlist"
+        );
         let entry = daemon
             .tx_engine
             .outbox
@@ -10140,6 +11057,44 @@ allowed = ["bloom:vfs.read"]
         assert_eq!(entry.state, bloom_tx::outbox::OutboxState::Failed);
         let checks = std::fs::read_to_string(entry.dir.join("policy_check.json")).unwrap();
         assert!(checks.contains("\"deny\""), "{checks}");
+        assert!(broker.sign_calls.lock().is_empty());
+
+        // With no deny, an unacknowledged warning is what refuses, and the
+        // refusal names it the same way. The entry stays pending for a retry
+        // that acknowledges it.
+        let mut warned = staged;
+        warned.id = "warned-outbox".into();
+        warned.policy_checks = vec![bloom_proto::policy::PolicyCheck::soft(
+            "caps.require_confirm_above_usd",
+            bloom_proto::policy::PolicyOutcome::Warn,
+            "usd 12.00 > soft 10.00",
+        )];
+        daemon
+            .tx_engine
+            .outbox
+            .write_pending(&warned, "# warned fixture")
+            .unwrap();
+        let error = host
+            .evm_tx_confirm(
+                "w".into(),
+                "ethereum".into(),
+                warned.id.clone(),
+                false,
+                Some(account_route_context("w", Some(0), None)),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "backend: confirm EVM outbox: policy denied: \
+             caps.require_confirm_above_usd: usd 12.00 > soft 10.00"
+        );
+        let entry = daemon
+            .tx_engine
+            .outbox
+            .read("w", "ethereum", &warned.id)
+            .unwrap();
+        assert_eq!(entry.state, bloom_tx::outbox::OutboxState::Pending);
         assert!(broker.sign_calls.lock().is_empty());
     }
 

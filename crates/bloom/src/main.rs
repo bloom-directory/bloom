@@ -9,6 +9,7 @@
 mod commands {
     pub mod qr;
 }
+mod default_policy;
 mod deploy;
 mod github_source;
 mod macos_runtime;
@@ -1286,6 +1287,17 @@ fn machine_command_event_fields(
             Some(operation_id.clone()),
             MachineCommandEventClass::DurableMutation,
         ),
+        // A waiting command's poll after its ceremony is announced proposes
+        // nothing, so it is logged as a read, not every two seconds.
+        MachineCommand::WalletDefaultPolicy { observe_only, .. } => (
+            "default_policy",
+            None,
+            if *observe_only {
+                MachineCommandEventClass::Read
+            } else {
+                MachineCommandEventClass::Prepared
+            },
+        ),
         MachineCommand::WalletOutboxCancel { id, .. } => (
             "wallet_outbox_cancel",
             Some(id.clone()),
@@ -1781,6 +1793,32 @@ async fn execute_machine_command(
         }
         MachineCommand::WalletPolicyCommit { operation_id } => {
             commit_policy_update(home, machine_broker()?, operation_id).await?
+        }
+        MachineCommand::WalletDefaultPolicy { name, observe_only } => {
+            validate_wallet_name(&name).map_err(|error| {
+                machine_error(
+                    MachineErrorKind::InvalidParams,
+                    format!("wallet name must be a safe single path segment: {error:#}"),
+                )
+            })?;
+            let status = default_policy::advance_default_policy(
+                daemon,
+                &name,
+                default_policy::DefaultPolicyMode::of_command(observe_only),
+            )
+            .await?;
+            // A waiting command's polls are logged as reads, but the one that
+            // settles its ceremony, by committing an approved change or
+            // finding it ended, is a transition worth an info line.
+            if observe_only && let Some(state) = default_policy::settled_state(&status) {
+                info!(
+                    event = "machine.workflow_transition",
+                    workflow = "default_policy",
+                    operation_id = "",
+                    state
+                );
+            }
+            format!("{}\n", serde_json::to_string(&status)?)
         }
         MachineCommand::WalletOutboxCancel {
             wallet,
@@ -2749,18 +2787,24 @@ enum OperationCmd {
 
 #[derive(Subcommand, Debug)]
 enum VfsCmd {
-    /// `cat /bloom/<path>` — read a file via the VFS.
-    Cat { path: String },
-    /// `ls /bloom/<path>` — list a directory via the VFS.
+    /// `cat /bloom/<path>...` — read files via the VFS.
+    Cat {
+        #[arg(required = true)]
+        paths: Vec<String>,
+    },
+    /// `ls /bloom/<path>...` — list directories via the VFS.
     Ls {
         #[arg(default_value = "/")]
-        path: String,
+        paths: Vec<String>,
     },
     /// `stat /bloom/<path>` — inspect VFS metadata without a kernel mount.
     Stat { path: String },
-    /// Write data to a writable VFS path. Reads from stdin if `--data` is omitted.
+    /// Write data to a writable VFS path. Reads from stdin if no data is given.
     Write {
         path: String,
+        /// The data, as a second argument.
+        #[arg(conflicts_with = "data")]
+        body: Option<String>,
         #[arg(long)]
         data: Option<String>,
     },
@@ -2899,6 +2943,11 @@ enum WalletCmd {
         /// Use a browser on the Bloom host instead of the default surface.
         #[arg(long)]
         local: bool,
+        /// Print the ceremony link and exit, without waiting for the wallet
+        /// and its default policy. For `main`, run `bloom wallet
+        /// default-policy main` once the wallet exists.
+        #[arg(long)]
+        no_wait: bool,
     },
     /// Start a Broker-hosted BIP-39 mnemonic import ceremony. The recovery
     /// phrase is entered only in the browser and never crosses Machine.
@@ -2911,7 +2960,15 @@ enum WalletCmd {
         /// Use the canonical localhost ceremony surface.
         #[arg(long)]
         local: bool,
+        /// Print the ceremony link and exit, without waiting for the wallet
+        /// and its default policy. For `main`, run `bloom wallet
+        /// default-policy main` once the wallet exists.
+        #[arg(long)]
+        no_wait: bool,
     },
+    /// Approve the default policy for a wallet: one policy ceremony that allows
+    /// the Petals chosen during setup. `new` and `import` run it for `main`.
+    DefaultPolicy { name: String },
     /// Convert a staged v1 passkey wallet into Signer-owned Triad custody.
     /// The receipt contains public binding data only; Machine never opens the
     /// legacy wallet directory.
@@ -2965,6 +3022,10 @@ enum WalletCmd {
         /// from stdin.
         #[arg(long)]
         intent: Option<String>,
+        /// Also confirm the entry: prints the owner's approval link, or the
+        /// broadcast when no approval is needed.
+        #[arg(long)]
+        confirm: bool,
     },
     /// Submit confirmation of a staged transaction through the Machine VFS.
     ///
@@ -3453,6 +3514,9 @@ async fn confirm_projection(
     None
 }
 
+/// How long a repeated policy write waits for the owner. Matches the
+/// daemon's confirm wait, which stays under common 60 s tool timeouts.
+const POLICY_APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(50);
 const IPC_ERR_NOT_FOUND: i32 = -32004;
 const IPC_ERR_PERMISSION_DENIED: i32 = -32007;
 
@@ -3477,13 +3541,49 @@ async fn try_ipc_coded(
     }
 }
 
-fn print_approval_pending(url: &str, expires_at_ms: u128, petal_next: Option<&str>) {
+fn print_approval_pending(url: &str, expires_at_ms: u128, petal_next: Option<&str>, retry: &str) {
     let remaining = expires_at_ms.saturating_sub(unix_now_ms()) / 1000;
-    println!("Approval required: open {url}");
+    println!("Approval required: {url} (expires in {remaining}s)");
     match petal_next {
-        Some(next) => println!("Ceremony expires in {remaining}s. {next}"),
-        None => println!("Ceremony expires in {remaining}s; re-run this confirm after approving."),
+        Some(next) => println!("{next}"),
+        None => println!("Next: {retry} (waits for the owner's approval, then sends)"),
     }
+}
+
+/// Print the mined result, waiting a few seconds for it, so the caller need
+/// not read `sent/<id>/receipt.json` separately. On a chain that has not mined
+/// the transaction by then, say where the receipt will appear. A reverted
+/// transaction is an error, so confirm does not exit 0 for it.
+async fn print_receipt(
+    endpoint: &ResolvedEndpoint,
+    wallet: &str,
+    account: u32,
+    chain: &str,
+    id: &str,
+) -> Result<()> {
+    let path = format!("/wallets/{wallet}/{account}/chains/{chain}/outbox/sent/{id}/receipt.json");
+    // The Machine's read already waits for a receipt that is due, so bound
+    // the two waits together by the clock, not by a count of reads; a read
+    // still running at the deadline is abandoned.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Ok(Ok(bytes)) = tokio::time::timeout_at(deadline, ipc_read(endpoint, &path)).await {
+            println!("Receipt: {}", String::from_utf8_lossy(&bytes).trim_end());
+            let reverted = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .is_ok_and(|receipt| receipt["outcome"] == "reverted");
+            anyhow::ensure!(!reverted, "the transaction was mined but reverted");
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep_until(
+            deadline.min(tokio::time::Instant::now() + std::time::Duration::from_millis(250)),
+        )
+        .await;
+    }
+    println!("Receipt: not mined yet; read {}", &path[1..]);
+    Ok(())
 }
 
 fn confirm_context_note(projection: &ConfirmProjection) -> Option<String> {
@@ -3574,6 +3674,10 @@ async fn machine_command(
 
 async fn call_machine_command(endpoint: &ResolvedEndpoint, command: MachineCommand) -> Result<()> {
     let output = machine_command(endpoint, command).await?;
+    print_machine_command_output(&output)
+}
+
+fn print_machine_command_output(output: &MachineCommandOutput) -> Result<()> {
     std::io::Write::write_all(&mut std::io::stdout(), output.stdout.as_bytes())?;
     std::io::Write::write_all(&mut std::io::stderr(), output.stderr.as_bytes())?;
     if output.exit_code != 0 {
@@ -3824,7 +3928,43 @@ async fn run(cli: Cli) -> Result<()> {
             if !structured_service_output() {
                 eprintln!("{ALPHA_DISCLOSURE}");
             }
-            let (_home_permit, d) = build_write_daemon(home.clone()).context("init daemon")?;
+            let (_home_permit, mut d) = build_write_daemon(home.clone()).context("init daemon")?;
+            // Building the daemon writes a default config when none exists, and
+            // `bloom serve` does the same, so the file's presence says nothing
+            // about setup. The marker is saved only together with the choices.
+            let first_setup = !d.config.setup.complete;
+            if first_setup {
+                if !structured_service_output() && default_policy::interactive_setup_available() {
+                    default_policy::run_setup_menu(
+                        d.config.setup.main_mut(),
+                        &mut std::io::stdin().lock(),
+                        &mut std::io::stdout(),
+                    )?;
+                } else {
+                    default_policy::accept_setup_suggestions(d.config.setup.main_mut());
+                    println!(
+                        "{}",
+                        default_policy::chosen_without_asking(d.config.setup.main())
+                    );
+                }
+                d.config.setup.complete = true;
+                // Only `[setup]` is written: the rest of the owner's config,
+                // comments included, stays as they wrote it. A config Bloom
+                // cannot write, such as one the owner made read-only, does
+                // not stop the Petals installing: without the choices saved,
+                // no default policy is proposed, and the owner is told what
+                // to add.
+                let config_path = d.home.config_path();
+                if let Err(error) = d.config.save_setup(&config_path) {
+                    let setup = d.config.setup_toml().unwrap_or_default();
+                    eprintln!(
+                        "warning: could not save setup's choices to {}: {error}\n\
+                         Bloom still installs its Petals, but proposes no default policy until \
+                         the config has:\n\n{setup}",
+                        config_path.display()
+                    );
+                }
+            }
             let preinstalled = github_source::ensure_preinstalled_petals(&home, &d)
                 .context("provision canonical pre-installed Petals")?;
             println!("home: {}", d.home.root().display());
@@ -3856,47 +3996,84 @@ async fn run(cli: Cli) -> Result<()> {
             };
             call_machine_command(&client_endpoint, command).await
         }
-        Cmd::Vfs(VfsCmd::Cat { path }) => {
+        // Like `cat a b` and `ls a b`: every path is tried, a failure is
+        // reported and the rest still print, and the exit code says one failed.
+        Cmd::Vfs(VfsCmd::Cat { paths }) => {
             let client = IpcClient::new(&client_endpoint.socket);
-            let res = try_ipc(
-                &client,
-                &client_endpoint,
-                "read",
-                serde_json::json!({ "path": path }),
-            )
-            .await
-            .with_context(|| format!("ipc read via {}", client_endpoint.display))?;
-            debug!(endpoint = %client_endpoint.display, "cli.vfs.cat.via_ipc");
-            let b64 = res
-                .get("bytes_b64")
-                .and_then(|v| v.as_str())
-                .context("ipc read: missing bytes_b64")?;
-            let bytes = B64.decode(b64).context("ipc read: bad base64")?;
-            std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
-            Ok(())
-        }
-        Cmd::Vfs(VfsCmd::Ls { path }) => {
-            let client = IpcClient::new(&client_endpoint.socket);
-            let res = try_ipc(
-                &client,
-                &client_endpoint,
-                "list",
-                serde_json::json!({ "path": path }),
-            )
-            .await
-            .with_context(|| format!("ipc list via {}", client_endpoint.display))?;
-            debug!(endpoint = %client_endpoint.display, "cli.vfs.ls.via_ipc");
-            let arr = res.as_array().context("ipc list: expected array")?;
-            for e in arr {
-                let name = e.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                let kind = match e.get("kind").and_then(|v| v.as_str()).unwrap_or("file") {
-                    "dir" => "Dir",
-                    "symlink" => "Symlink",
-                    _ => "File",
+            let mut failed = None;
+            for path in &paths {
+                let read = async {
+                    let res = try_ipc(
+                        &client,
+                        &client_endpoint,
+                        "read",
+                        serde_json::json!({ "path": path }),
+                    )
+                    .await
+                    .with_context(|| format!("ipc read via {}", client_endpoint.display))?;
+                    let b64 = res
+                        .get("bytes_b64")
+                        .and_then(|v| v.as_str())
+                        .context("ipc read: missing bytes_b64")?;
+                    let bytes = B64.decode(b64).context("ipc read: bad base64")?;
+                    std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
+                    anyhow::Ok(())
                 };
-                println!("{}\t{}", name, kind);
+                if let Err(error) = read.await {
+                    if paths.len() == 1 {
+                        return Err(error);
+                    }
+                    eprintln!("error: {path}: {error:#}");
+                    failed = Some(path);
+                }
             }
-            Ok(())
+            debug!(endpoint = %client_endpoint.display, "cli.vfs.cat.via_ipc");
+            match failed {
+                Some(path) => bail!("could not read {path}"),
+                None => Ok(()),
+            }
+        }
+        Cmd::Vfs(VfsCmd::Ls { paths }) => {
+            let client = IpcClient::new(&client_endpoint.socket);
+            let mut failed = None;
+            for path in &paths {
+                let list = async {
+                    let res = try_ipc(
+                        &client,
+                        &client_endpoint,
+                        "list",
+                        serde_json::json!({ "path": path }),
+                    )
+                    .await
+                    .with_context(|| format!("ipc list via {}", client_endpoint.display))?;
+                    let arr = res.as_array().context("ipc list: expected array")?;
+                    if paths.len() > 1 {
+                        println!("{path}:");
+                    }
+                    for e in arr {
+                        let name = e.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                        let kind = match e.get("kind").and_then(|v| v.as_str()).unwrap_or("file") {
+                            "dir" => "Dir",
+                            "symlink" => "Symlink",
+                            _ => "File",
+                        };
+                        println!("{}\t{}", name, kind);
+                    }
+                    anyhow::Ok(())
+                };
+                if let Err(error) = list.await {
+                    if paths.len() == 1 {
+                        return Err(error);
+                    }
+                    eprintln!("error: {path}: {error:#}");
+                    failed = Some(path);
+                }
+            }
+            debug!(endpoint = %client_endpoint.display, "cli.vfs.ls.via_ipc");
+            match failed {
+                Some(path) => bail!("could not list {path}"),
+                None => Ok(()),
+            }
         }
         Cmd::Vfs(VfsCmd::Stat { path }) => {
             let client = IpcClient::new(&client_endpoint.socket);
@@ -3912,8 +4089,8 @@ async fn run(cli: Cli) -> Result<()> {
             print_vfs_stat_json(&path, &res)?;
             Ok(())
         }
-        Cmd::Vfs(VfsCmd::Write { path, data }) => {
-            let body = match data {
+        Cmd::Vfs(VfsCmd::Write { path, body, data }) => {
+            let body = match data.or(body) {
                 Some(s) => s.into_bytes(),
                 None => {
                     let mut buf = Vec::new();
@@ -3921,15 +4098,19 @@ async fn run(cli: Cli) -> Result<()> {
                     buf
                 }
             };
+            let params = serde_json::json!({ "path": path, "bytes_b64": B64.encode(&body) });
+            if let ["wallets", wallet, "policy.json"] = path
+                .trim_matches('/')
+                .split('/')
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                return write_policy(&client_endpoint, wallet, params).await;
+            }
             let client = IpcClient::new(&client_endpoint.socket);
-            try_ipc(
-                &client,
-                &client_endpoint,
-                "write",
-                serde_json::json!({ "path": path, "bytes_b64": B64.encode(&body) }),
-            )
-            .await
-            .with_context(|| format!("ipc write via {}", client_endpoint.display))?;
+            try_ipc(&client, &client_endpoint, "write", params)
+                .await
+                .with_context(|| format!("ipc write via {}", client_endpoint.display))?;
             debug!(endpoint = %client_endpoint.display, "cli.vfs.write.via_ipc");
             Ok(())
         }
@@ -4016,14 +4197,17 @@ async fn run(cli: Cli) -> Result<()> {
             .await?;
             Ok(())
         }
-        Cmd::Wallet(WalletCmd::New { name, local }) => {
-            call_machine_command(
+        Cmd::Wallet(WalletCmd::New {
+            name,
+            local,
+            no_wait,
+        }) => {
+            default_policy::create_wallet_then_default_policy(
                 &client_endpoint,
-                MachineCommand::WalletCustody {
-                    name,
-                    kind: MachineCustodyKind::New,
-                    local,
-                },
+                name,
+                MachineCustodyKind::New,
+                local,
+                no_wait,
             )
             .await
         }
@@ -4031,14 +4215,24 @@ async fn run(cli: Cli) -> Result<()> {
             name,
             raw_private_key,
             local,
+            no_wait,
         }) => {
-            call_machine_command(
+            default_policy::create_wallet_then_default_policy(
                 &client_endpoint,
-                MachineCommand::WalletCustody {
-                    name,
-                    kind: wallet_import_kind(raw_private_key),
-                    local,
-                },
+                name,
+                wallet_import_kind(raw_private_key),
+                local,
+                no_wait,
+            )
+            .await
+        }
+        Cmd::Wallet(WalletCmd::DefaultPolicy { name }) => {
+            // Wait out a policy lock another command holds; a ceremony this
+            // command opens extends the deadline to its own expiry.
+            default_policy::wait_for_default_policy(
+                &client_endpoint,
+                &name,
+                current_unix_ms().saturating_add(default_policy::POLICY_LOCK_GRACE_MS),
             )
             .await
         }
@@ -4198,6 +4392,7 @@ async fn run(cli: Cli) -> Result<()> {
             chain,
             account,
             intent,
+            confirm,
         }) => {
             let body = match intent {
                 Some(s) => s,
@@ -4230,6 +4425,52 @@ async fn run(cli: Cli) -> Result<()> {
                 .strip_prefix("pending/")
                 .context("ipc wallet stage: invalid latest target")?;
             println!("{id}");
+            // stdout stays the bare id for scripts. The review an agent would
+            // otherwise fetch with three more reads goes to stderr.
+            let entry = format!("/wallets/{wallet}/{account}/chains/{chain}/outbox/pending/{id}");
+            // The plan's last section explains the confirm file; the command
+            // printed below replaces it.
+            match ipc_read(&client_endpoint, &format!("{entry}/plan.md")).await {
+                Ok(bytes) => {
+                    let plan = String::from_utf8_lossy(&bytes);
+                    let plan = plan.split("\n## Confirm").next().unwrap_or_default();
+                    eprintln!("{}", plan.trim_end());
+                }
+                Err(_) => eprintln!("plan not available; read {}/plan.md", &entry[1..]),
+            }
+            // The plan lists each policy result. The full check is worth its
+            // lines only when something did not pass.
+            match ipc_read(&client_endpoint, &format!("{entry}/policy_check.json")).await {
+                Ok(bytes) => {
+                    let passed = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes)
+                        .is_ok_and(|checks| checks.iter().all(|check| check["outcome"] == "pass"));
+                    if !passed {
+                        eprintln!(
+                            "--- policy_check.json\n{}",
+                            String::from_utf8_lossy(&bytes).trim_end()
+                        );
+                    }
+                }
+                Err(_) => eprintln!(
+                    "policy check not available; read {}/policy_check.json",
+                    &entry[1..]
+                ),
+            }
+            if confirm {
+                return wallet_confirm(
+                    &client_endpoint,
+                    wallet,
+                    chain,
+                    id.to_owned(),
+                    account,
+                    "y".into(),
+                )
+                .await;
+            }
+            eprintln!(
+                "Next: bloom wallet confirm {wallet} {chain} {id}{}",
+                account_flag(account)
+            );
             Ok(())
         }
         Cmd::Wallet(WalletCmd::Confirm {
@@ -4238,104 +4479,7 @@ async fn run(cli: Cli) -> Result<()> {
             id,
             account,
             text,
-        }) => {
-            let path =
-                format!("/wallets/{wallet}/{account}/chains/{chain}/outbox/pending/{id}/confirm");
-            let is_cancel = text.trim().eq_ignore_ascii_case("cancel");
-            let body = text.into_bytes();
-            let client = IpcClient::new(&client_endpoint.socket);
-            let outcome = try_ipc_coded(
-                &client,
-                &client_endpoint,
-                "write",
-                serde_json::json!({
-                    "path": path,
-                    "bytes_b64": B64.encode(&body),
-                }),
-            )
-            .await;
-            debug!(endpoint = %client_endpoint.display, "cli.wallet.confirm.via_ipc");
-            // The write's RPC status alone misleads: an approval ceremony
-            // surfaces as "permission denied" and a repeat after broadcast as
-            // "not found". Only those two expected outcomes are translated
-            // into the durable entry's truth; every other failure surfaces,
-            // with the entry's projection offered as context only.
-            let projection =
-                confirm_projection(&client_endpoint, &wallet, account, &chain, &id).await;
-            match (outcome, &projection) {
-                (
-                    Err((code, _)),
-                    Some(ConfirmProjection::Ceremony {
-                        url,
-                        expires_at_ms,
-                        petal_next,
-                    }),
-                ) if code == IPC_ERR_PERMISSION_DENIED => {
-                    print_approval_pending(url, *expires_at_ms, petal_next.as_deref());
-                    // Nothing is signed or broadcast yet, so exit 0 would tell
-                    // a script the transaction went out.
-                    EXIT_CODE_OVERRIDE
-                        .store(EXIT_APPROVAL_PENDING, std::sync::atomic::Ordering::SeqCst);
-                    Ok(())
-                }
-                (Err((code, _)), Some(ConfirmProjection::Broadcast { tx_hash }))
-                    if code == IPC_ERR_NOT_FOUND && !is_cancel =>
-                {
-                    println!("Already broadcast: {tx_hash}");
-                    println!("Entry: wallets/{wallet}/{account}/chains/{chain}/outbox/sent/{id}");
-                    Ok(())
-                }
-                (Err((_, error)), Some(context)) => {
-                    if let Some(note) = confirm_context_note(context) {
-                        eprintln!("Note: {note}");
-                    }
-                    Err(anyhow::Error::new(error).context(format!(
-                        "ipc wallet confirm via {}",
-                        client_endpoint.display
-                    )))
-                }
-                (Err((_, error)), None) => Err(anyhow::Error::new(error).context(format!(
-                    "ipc wallet confirm via {}",
-                    client_endpoint.display
-                ))),
-                (
-                    Ok(_),
-                    Some(ConfirmProjection::Ceremony {
-                        url,
-                        expires_at_ms,
-                        petal_next,
-                    }),
-                ) => {
-                    print_approval_pending(url, *expires_at_ms, petal_next.as_deref());
-                    EXIT_CODE_OVERRIDE
-                        .store(EXIT_APPROVAL_PENDING, std::sync::atomic::Ordering::SeqCst);
-                    Ok(())
-                }
-                (Ok(_), Some(ConfirmProjection::Broadcast { tx_hash })) => {
-                    anyhow::ensure!(
-                        !is_cancel,
-                        "entry already broadcast; use wallet cancel for an on-chain replacement"
-                    );
-                    println!("Broadcast: {tx_hash}");
-                    println!("Entry: wallets/{wallet}/{account}/chains/{chain}/outbox/sent/{id}");
-                    Ok(())
-                }
-                (Ok(_), None) => {
-                    if is_cancel {
-                        println!("Discarded entry {id}.");
-                    } else {
-                        println!(
-                            "Confirmed; no broadcast result recorded yet. Inspect wallets/{wallet}/{account}/chains/{chain}/outbox/"
-                        );
-                        // An accepted cancel is done; an unrecorded broadcast
-                        // is not, and a script must be able to tell.
-                        EXIT_CODE_OVERRIDE
-                            .store(EXIT_RESULT_UNKNOWN, std::sync::atomic::Ordering::SeqCst);
-                    }
-                    Ok(())
-                }
-            }
-        }
+        }) => wallet_confirm(&client_endpoint, wallet, chain, id, account, text).await,
         Cmd::Wallet(WalletCmd::Cancel {
             wallet,
             account,
@@ -4589,7 +4733,11 @@ async fn run(cli: Cli) -> Result<()> {
                 let context = ready_context.clone();
                 *ready_provisioning.lock().expect("provisioning handle") =
                     Some(tokio::task::spawn_blocking(move || {
-                        petal_provisioning::provision(&daemon, &context)
+                        // Machine is already serving, so a Petal's code can be
+                        // running when its update would activate, and a
+                        // download can fail. Those installs are tried again
+                        // rather than left out.
+                        petal_provisioning::provision_and_retry(&daemon, &context)
                     }));
             }));
             // Start audited and durable background effects only after every
@@ -5172,6 +5320,215 @@ fn request_body_with_wallet(mut request: String, wallet: Option<&str>) -> String
     request
 }
 
+fn account_flag(account: u32) -> String {
+    if account == 0 {
+        String::new()
+    } else {
+        format!(" --account {account}")
+    }
+}
+
+/// Confirm a staged entry and print the approval link, or the broadcast hash
+/// and receipt.
+async fn wallet_confirm(
+    client_endpoint: &ResolvedEndpoint,
+    wallet: String,
+    chain: String,
+    id: String,
+    account: u32,
+    text: String,
+) -> Result<()> {
+    let path = format!("/wallets/{wallet}/{account}/chains/{chain}/outbox/pending/{id}/confirm");
+    let is_cancel = text.trim().eq_ignore_ascii_case("cancel");
+    // The retry repeats the text: a bare `y` would refuse warnings the
+    // owner was asked to override.
+    let text_flag = match text.as_str() {
+        "y" => String::new(),
+        _ => format!(" --text '{}'", text.replace('\'', r"'\''")),
+    };
+    let retry = format!(
+        "bloom wallet confirm {wallet} {chain} {id}{}{text_flag}",
+        account_flag(account)
+    );
+    let body = text.into_bytes();
+    let client = IpcClient::new(&client_endpoint.socket);
+    let outcome = try_ipc_coded(
+        &client,
+        client_endpoint,
+        "write",
+        serde_json::json!({
+            "path": path,
+            "bytes_b64": B64.encode(&body),
+        }),
+    )
+    .await;
+    debug!(endpoint = %client_endpoint.display, "cli.wallet.confirm.via_ipc");
+    // The write's RPC status alone misleads: an approval ceremony
+    // surfaces as "permission denied" and a repeat after broadcast as
+    // "not found". Only those two expected outcomes are translated
+    // into the durable entry's truth; every other failure surfaces,
+    // with the entry's projection offered as context only.
+    let projection = confirm_projection(client_endpoint, &wallet, account, &chain, &id).await;
+    match (outcome, &projection) {
+        (
+            Err((code, _)),
+            Some(ConfirmProjection::Ceremony {
+                url,
+                expires_at_ms,
+                petal_next,
+            }),
+        ) if code == IPC_ERR_PERMISSION_DENIED => {
+            print_approval_pending(url, *expires_at_ms, petal_next.as_deref(), &retry);
+            // Nothing is signed or broadcast yet, so exit 0 would tell
+            // a script the transaction went out.
+            EXIT_CODE_OVERRIDE.store(EXIT_APPROVAL_PENDING, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        (Err((code, _)), Some(ConfirmProjection::Broadcast { tx_hash }))
+            if code == IPC_ERR_NOT_FOUND && !is_cancel =>
+        {
+            println!("Already broadcast: {tx_hash}");
+            println!("Entry: wallets/{wallet}/{account}/chains/{chain}/outbox/sent/{id}");
+            print_receipt(client_endpoint, &wallet, account, &chain, &id).await
+        }
+        (Err((_, error)), Some(context)) => {
+            if let Some(note) = confirm_context_note(context) {
+                eprintln!("Note: {note}");
+            }
+            Err(anyhow::Error::new(error).context(format!(
+                "ipc wallet confirm via {}",
+                client_endpoint.display
+            )))
+        }
+        (Err((_, error)), None) => Err(anyhow::Error::new(error).context(format!(
+            "ipc wallet confirm via {}",
+            client_endpoint.display
+        ))),
+        (
+            Ok(_),
+            Some(ConfirmProjection::Ceremony {
+                url,
+                expires_at_ms,
+                petal_next,
+            }),
+        ) => {
+            print_approval_pending(url, *expires_at_ms, petal_next.as_deref(), &retry);
+            EXIT_CODE_OVERRIDE.store(EXIT_APPROVAL_PENDING, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        (Ok(_), Some(ConfirmProjection::Broadcast { tx_hash })) => {
+            anyhow::ensure!(
+                !is_cancel,
+                "entry already broadcast; use wallet cancel for an on-chain replacement"
+            );
+            println!("Broadcast: {tx_hash}");
+            println!("Entry: wallets/{wallet}/{account}/chains/{chain}/outbox/sent/{id}");
+            print_receipt(client_endpoint, &wallet, account, &chain, &id).await
+        }
+        (Ok(_), None) => {
+            if is_cancel {
+                println!("Discarded entry {id}.");
+            } else {
+                println!(
+                    "Confirmed; no broadcast result recorded yet. Inspect wallets/{wallet}/{account}/chains/{chain}/outbox/"
+                );
+                // An accepted cancel is done; an unrecorded broadcast
+                // is not, and a script must be able to tell.
+                EXIT_CODE_OVERRIDE.store(EXIT_RESULT_UNKNOWN, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The wallet's most recent policy update, from its status file.
+async fn policy_update(endpoint: &ResolvedEndpoint, wallet: &str) -> Option<serde_json::Value> {
+    let path = format!("/wallets/{wallet}/policy-updates/latest/status.json");
+    serde_json::from_slice(&ipc_read(endpoint, &path).await.ok()?).ok()
+}
+
+/// Write a wallet policy. A policy change needs the owner's approval, and the
+/// write alone reports that as a bare "permission denied". Print the ceremony
+/// link instead. A repeat of the same write waits for the owner, like a
+/// repeated confirm, and installs the policy only if they approved.
+async fn write_policy(
+    endpoint: &ResolvedEndpoint,
+    wallet: &str,
+    params: serde_json::Value,
+) -> Result<()> {
+    const WAITING: &str = "awaiting_custody";
+    let client = IpcClient::new(&endpoint.socket);
+    let context = || format!("ipc write via {}", endpoint.display);
+    let waiting_before = policy_update(endpoint, wallet)
+        .await
+        .filter(|update| update["status"] == WAITING)
+        .map(|update| update["action_id"].clone());
+    let (code, error) = match try_ipc_coded(&client, endpoint, "write", params.clone()).await {
+        Ok(_) => {
+            println!("Policy updated.");
+            return Ok(());
+        }
+        Err(denied) => denied,
+    };
+    let update = policy_update(endpoint, wallet)
+        .await
+        .filter(|_| code == IPC_ERR_PERMISSION_DENIED);
+    // The owner approved between the write and this read.
+    if update
+        .as_ref()
+        .is_some_and(|update| update["status"] == "ready_to_commit")
+    {
+        try_ipc(&client, endpoint, "write", params)
+            .await
+            .with_context(context)?;
+        println!("Policy updated.");
+        return Ok(());
+    }
+    let Some(update) = update.filter(|update| update["status"] == WAITING) else {
+        return Err(anyhow::Error::new(error).context(context()));
+    };
+    if waiting_before.as_ref() == Some(&update["action_id"]) {
+        let deadline = tokio::time::Instant::now() + POLICY_APPROVAL_WAIT;
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let Some(now) = policy_update(endpoint, wallet).await else {
+                continue;
+            };
+            anyhow::ensure!(
+                now["action_id"] == update["action_id"],
+                "another policy update replaced this one; read wallets/{wallet}/policy-updates/latest/status.json"
+            );
+            match now["status"].as_str() {
+                // prepare_pending: Broker has not opened the ceremony yet.
+                Some(WAITING | "prepare_pending") => continue,
+                Some("confirmed") => {}
+                // Approved: the same bytes written again install the policy.
+                Some("ready_to_commit") => {
+                    try_ipc(&client, endpoint, "write", params)
+                        .await
+                        .with_context(context)?;
+                }
+                status => bail!(
+                    "policy not changed: the update is {} (declined, expired, or the policy changed meanwhile); see wallets/{wallet}/policy-updates/latest/status.json",
+                    status.unwrap_or("in an unknown state")
+                ),
+            }
+            println!("Policy updated.");
+            return Ok(());
+        }
+    }
+    let url = update["ceremony_url"].as_str().unwrap_or_default();
+    let remaining = u128::from(update["expiry_ms"].as_u64().unwrap_or_default())
+        .saturating_sub(unix_now_ms())
+        / 1000;
+    println!("Approval required: {url} (expires in {remaining}s)");
+    println!(
+        "Next: the same write again (waits for the owner's approval, then installs the policy)"
+    );
+    EXIT_CODE_OVERRIDE.store(EXIT_APPROVAL_PENDING, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+
 fn parse_batch_tx_ref(s: &str) -> Result<(String, String)> {
     let (chain, id) = s
         .split_once(':')
@@ -5709,6 +6066,12 @@ mod tests {
             new.cmd,
             Some(Cmd::Wallet(WalletCmd::New { local: true, .. }))
         ));
+        assert!(matches!(
+            Cli::try_parse_from(["bloom", "wallet", "new", "main", "--no-wait"])
+                .unwrap()
+                .cmd,
+            Some(Cmd::Wallet(WalletCmd::New { no_wait: true, .. }))
+        ));
         let import = Cli::try_parse_from(["bloom", "wallet", "import", "main", "--local"]).unwrap();
         assert!(matches!(
             import.cmd,
@@ -5765,6 +6128,7 @@ mod tests {
                 name,
                 raw_private_key: false,
                 local: false,
+                no_wait: false,
             })) if name == "recovered"
         ));
         assert_eq!(
@@ -5794,6 +6158,7 @@ mod tests {
                 name,
                 raw_private_key: true,
                 local: false,
+                no_wait: false,
             })) if name == "legacy-local"
         ));
         assert_eq!(
@@ -6444,6 +6809,7 @@ mod tests {
                 name,
                 raw_private_key: false,
                 local: false,
+                no_wait: false,
             })) if name == "wallet"
         ));
 

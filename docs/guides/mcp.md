@@ -115,10 +115,12 @@ separator, is rejected rather than read as some other path.
 MCP clients treat resources as inert context and commonly fetch them without
 asking a human. Bloom therefore refuses to serve a side-effecting path as a
 resource: `resources/read` calls daemon `read_inert`, which checks the
-`read_side_effecting` flag and reads while holding the package-mutation guard.
-Package replacement cannot race between those steps. Flagged paths return
-`-32010`, naming `vfs_read` as the way to read them
-deliberately. The same refusal keeps the write-only outbox controls from being
+`read_side_effecting` flag (looking up a Petal route it has not evaluated
+yet first, as `vfs_stat` would) and then reads. The Petal router checks a
+Petal route again under that Petal's own gate, which also keeps its package
+from changing during the read, so a package replaced between the two checks
+is still refused. Flagged paths return `-32010`, naming `vfs_read` as the way
+to read them deliberately. The same refusal keeps the write-only outbox controls from being
 served as readable resources. No VFS functionality is lost — the tool still
 performs the read. Run the matching daemon: an older daemon without `read_inert`
 returns method-not-found; the proxy never falls back to an ordinary read.

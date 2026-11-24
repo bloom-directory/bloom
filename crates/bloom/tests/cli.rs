@@ -500,7 +500,9 @@ fn spawn_ipc_server(
         .enable_all()
         .build()
         .expect("build tokio runtime");
-    let server = IpcServer::new(vfs, "ipc-test-version", vec!["ipc-chain".into()]);
+    let server = IpcServer::new(vfs, "ipc-test-version", vec!["ipc-chain".into()])
+        // A repeated confirm waits this long for the owner; no test has one.
+        .with_approval_wait(Duration::from_millis(200));
     let server_for_thread = server.clone();
     let socket_for_thread = socket.clone();
     let server_thread = std::thread::spawn(move || {
@@ -955,6 +957,174 @@ fn init_ignores_legacy_preinstalled_opt_out() {
         ));
 }
 
+/// Setup is recorded when it finishes, not inferred from the config file:
+/// `bloom serve` writes a default config before any `bloom init`, and an
+/// empty `[setup.petals]` is a valid choice rather than "never asked".
+#[test]
+fn init_runs_setup_once_even_when_the_config_already_exists() {
+    let home = fresh_home();
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    home_dir.ensure().unwrap();
+    // What `bloom serve` leaves behind when it starts before any `bloom init`.
+    bloom_proto::Config::local_default()
+        .save(&home_dir.config_path())
+        .unwrap();
+    let init = |home: &Path| {
+        bloom_cmd(home)
+            .env("HTTPS_PROXY", "http://127.0.0.1:1")
+            .env("https_proxy", "http://127.0.0.1:1")
+            .env("NO_PROXY", "")
+            .env("no_proxy", "")
+            .arg("init")
+            .assert()
+            // Setup is saved before Petal provisioning, which is offline here.
+            .failure()
+            .stderr(predicate::str::contains(
+                "provision canonical pre-installed Petals",
+            ));
+    };
+
+    init(home.path());
+    let mut config = bloom_proto::Config::load(&home_dir.config_path()).unwrap();
+    assert!(config.setup.complete);
+    assert!(
+        config.setup.main().petals.contains_key("hyperliquid"),
+        "non-interactive setup records the catalog's suggestions: {:?}",
+        config.setup.main().petals
+    );
+
+    // The owner's choice was "none of them"; a later run must keep it.
+    config.setup.main_mut().petals.clear();
+    config.save(&home_dir.config_path()).unwrap();
+    init(home.path());
+    let config = bloom_proto::Config::load(&home_dir.config_path()).unwrap();
+    assert!(config.setup.complete);
+    assert!(
+        config.setup.main().petals.is_empty(),
+        "{:?}",
+        config.setup.main().petals
+    );
+}
+
+/// On a home whose config predates setup, `bloom init` adds `[setup]` and
+/// leaves the rest of the owner's config as they wrote it, comments included.
+#[test]
+fn init_keeps_an_existing_hand_edited_config() {
+    let home = fresh_home();
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    home_dir.ensure().unwrap();
+    bloom_proto::Config::local_default()
+        .save(&home_dir.config_path())
+        .unwrap();
+    let original = std::fs::read_to_string(home_dir.config_path()).unwrap();
+    let edited = format!("# my RPC notes: keep this\n{original}");
+    std::fs::write(home_dir.config_path(), &edited).unwrap();
+    bloom_cmd(home.path())
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("https_proxy", "http://127.0.0.1:1")
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .arg("init")
+        .assert()
+        // Setup is saved before Petal provisioning, which is offline here.
+        .failure();
+    let after = std::fs::read_to_string(home_dir.config_path()).unwrap();
+    assert!(after.starts_with(&edited), "{after}");
+    let config = bloom_proto::Config::load(&home_dir.config_path()).unwrap();
+    assert!(config.setup.complete);
+}
+
+/// A config the owner keeps read-only, here symlinked into a read-only
+/// directory as a managed dotfiles setup would, is left alone: `bloom init`
+/// says what to add, says what it chose without a terminal, and still goes on
+/// to install the Petals.
+#[cfg(unix)]
+#[test]
+fn init_with_a_read_only_config_still_installs_the_petals() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let home = fresh_home();
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    home_dir.ensure().unwrap();
+    let managed = home.path().join("managed");
+    std::fs::create_dir_all(&managed).unwrap();
+    let real = managed.join("config.toml");
+    bloom_proto::Config::local_default().save(&real).unwrap();
+    let original = std::fs::read_to_string(&real).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o444)).unwrap();
+    std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o555)).unwrap();
+    std::os::unix::fs::symlink(&real, home_dir.config_path()).unwrap();
+    let output = bloom_cmd(home.path())
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("https_proxy", "http://127.0.0.1:1")
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .arg("init")
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("main's default policy will allow"),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains("could not save setup's choices"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("[setup.wallets.main.petals.polymarket]"),
+        "{stderr}"
+    );
+    // Provisioning, offline here, is still attempted.
+    assert!(
+        stderr.contains("provision canonical pre-installed Petals"),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), original);
+}
+
+/// Choices recorded before setup finished, as by a run that stopped
+/// part-way, are kept when `bloom init` runs setup again: a declined Petal
+/// stays declined.
+#[test]
+fn init_setup_on_an_existing_config_keeps_earlier_choices() {
+    let home = fresh_home();
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    home_dir.ensure().unwrap();
+    let mut config = bloom_proto::Config::local_default();
+    config
+        .setup
+        .main_mut()
+        .petals
+        .insert("polymarket".into(), Default::default());
+    assert!(!config.setup.complete);
+    config.save(&home_dir.config_path()).unwrap();
+
+    bloom_cmd(home.path())
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("https_proxy", "http://127.0.0.1:1")
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .arg("init")
+        .assert()
+        // Setup is saved before Petal provisioning, which is offline here.
+        .failure()
+        .stderr(predicate::str::contains(
+            "provision canonical pre-installed Petals",
+        ));
+
+    let config = bloom_proto::Config::load(&home_dir.config_path()).unwrap();
+    assert!(config.setup.complete);
+    assert_eq!(
+        config.setup.main().petals.keys().collect::<Vec<_>>(),
+        ["polymarket"],
+        "declined Petals were added back: {:?}",
+        config.setup.main().petals
+    );
+}
+
 #[test]
 fn vfs_write_help_exposes_no_unlock_or_secret_flags() {
     let home = fresh_home();
@@ -1046,12 +1216,12 @@ fn vfs_cat_root_agent_guidance_returns_identical_content() {
     assert_eq!(agents, claude);
     let text = String::from_utf8(agents).expect("guidance is utf-8");
     assert!(
-        text.contains("cat docs/README.md"),
-        "guidance should use mounted filesystem examples"
+        text.contains("`docs/`"),
+        "guidance should point at the docs directory"
     );
     assert!(
-        !text.contains("bloom vfs"),
-        "guidance should not mention the bloom vfs CLI"
+        text.contains("outbox/") && text.contains("`send.tx`") && text.contains("`latest/confirm`"),
+        "guidance should name the outbox files a transaction goes through"
     );
 }
 
@@ -1906,7 +2076,11 @@ fn wallet_stage_routes_via_ipc_when_home_write_lock_is_live() {
         .args(["wallet", "stage", "alice", "anvil", "--intent", intent])
         .assert()
         .success()
+        // stdout stays the bare id for scripts; the next step goes to stderr.
         .stdout(predicate::eq("tx-1\n"))
+        .stderr(predicate::str::contains(
+            "bloom wallet confirm alice anvil tx-1\n",
+        ))
         .stderr(predicate::str::contains("already open for writing").not());
 
     bloom_cmd(home.path())
@@ -1922,11 +2096,36 @@ fn wallet_stage_routes_via_ipc_when_home_write_lock_is_live() {
         ])
         .assert()
         .success()
-        .stdout(predicate::eq("tx-2\n"));
+        .stdout(predicate::eq("tx-2\n"))
+        .stderr(predicate::str::contains(
+            "bloom wallet confirm alice anvil tx-2 --account 7",
+        ));
+
+    // --confirm also writes the new entry's confirm file. This handler
+    // records no broadcast, so the result is unknown (exit 4).
+    bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "stage",
+            "alice",
+            "anvil",
+            "--confirm",
+            "--intent",
+            intent,
+        ])
+        .assert()
+        .code(4)
+        .stdout(predicate::str::starts_with("tx-3\nConfirmed;"));
 
     stop_ipc_server(server, server_thread);
     let writes = wallets.writes();
-    assert_eq!(writes.len(), 2, "writes={writes:?}");
+    assert_eq!(writes.len(), 4, "writes={writes:?}");
+    assert_eq!(
+        writes[3].0,
+        "/alice/0/chains/anvil/outbox/pending/tx-3/confirm"
+    );
+    assert_eq!(writes[3].1, b"y");
+    assert_eq!(writes[2].0, "/alice/0/chains/anvil/outbox/new.tx");
     assert_eq!(writes[1].0, "/alice/7/chains/anvil/outbox/new.tx");
     assert_eq!(writes[0].0, "/alice/0/chains/anvil/outbox/new.tx");
     assert_eq!(String::from_utf8_lossy(&writes[0].1), intent);
@@ -2293,7 +2492,9 @@ fn vfs_routes_via_ipc_when_socket_exists() {
         .enable_all()
         .build()
         .expect("build tokio runtime");
-    let server = IpcServer::new(vfs, "ipc-test-version", vec!["ipc-chain".into()]);
+    let server = IpcServer::new(vfs, "ipc-test-version", vec!["ipc-chain".into()])
+        // A repeated confirm waits this long for the owner; no test has one.
+        .with_approval_wait(Duration::from_millis(200));
     let server_for_thread = server.clone();
     let socket_for_thread = socket.clone();
     let server_thread = std::thread::spawn(move || {
@@ -2603,10 +2804,28 @@ fn wallet_confirm_reports_the_pending_ceremony_url() {
         // ceremony. Distinct from 0 (broadcast recorded) and 1 (failed).
         .code(3)
         .stdout(predicate::str::contains(
-            "Approval required: open http://localhost:18734/c/secret",
+            "Approval required: http://localhost:18734/c/secret",
         ))
         .stdout(predicate::str::contains(
-            "re-run this confirm after approving",
+            "Next: bloom wallet confirm alice base 0001-cafe --account 7 (waits",
+        ));
+    // A non-default text is repeated, quoted, so the retry still overrides.
+    bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "confirm",
+            "alice",
+            "base",
+            "0001-cafe",
+            "--account",
+            "7",
+            "--text",
+            "it's override",
+        ])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains(
+            r"Next: bloom wallet confirm alice base 0001-cafe --account 7 --text 'it'\''s override' (waits",
         ));
 
     stop_ipc_server(server, server_thread);
@@ -2650,7 +2869,7 @@ fn wallet_confirm_points_a_petal_staged_entry_back_to_its_petal() {
         .assert()
         .code(3)
         .stdout(predicate::str::contains("retry through petals/pendle/"))
-        .stdout(predicate::str::contains("re-run this confirm").not());
+        .stdout(predicate::str::contains("bloom wallet confirm").not());
 
     stop_ipc_server(server, server_thread);
 }
@@ -2662,6 +2881,10 @@ fn wallet_confirm_reports_an_already_broadcast_transaction_instead_of_not_found(
     files.insert(
         "/alice/0/chains/base/outbox/sent/0001-beef/intent.json".to_string(),
         b"{\"tx_hash\":\"0xabc123\"}".to_vec(),
+    );
+    files.insert(
+        "/alice/0/chains/base/outbox/sent/0001-beef/receipt.json".to_string(),
+        b"{\"outcome\":\"success\"}\n".to_vec(),
     );
     let handler = Arc::new(ServingHandler {
         files,
@@ -2685,7 +2908,10 @@ fn wallet_confirm_reports_an_already_broadcast_transaction_instead_of_not_found(
         .assert()
         .success()
         .stdout(predicate::str::contains("Already broadcast: 0xabc123"))
-        .stdout(predicate::str::contains("outbox/sent/0001-beef"));
+        .stdout(predicate::str::contains("outbox/sent/0001-beef"))
+        .stdout(predicate::str::contains(
+            "Receipt: {\"outcome\":\"success\"}\n",
+        ));
 
     stop_ipc_server(server, server_thread);
 }
@@ -2821,7 +3047,6 @@ impl Handler for ServingHandler {
 /// read over IPC; a hard denial still reads differently.
 #[test]
 fn vfs_write_names_the_approval_challenge_while_owner_approval_is_pending() {
-    let home = fresh_home();
     let outbox = "wallets/alice/0/chains/base/outbox/pending/0001-feed";
     for (error, expected) in [
         (
@@ -2835,6 +3060,9 @@ fn vfs_write_names_the_approval_challenge_while_owner_approval_is_pending() {
             "operation not permitted".to_owned(),
         ),
     ] {
+        // A home per case: the confirm reads the entry after its write, and
+        // the next server could find the first one's socket still closing.
+        let home = fresh_home();
         let handler = Arc::new(ServingHandler {
             write_error: error,
             ..ServingHandler::default()
@@ -2849,6 +3077,92 @@ fn vfs_write_names_the_approval_challenge_while_owner_approval_is_pending() {
             .stderr(predicate::str::contains("ceremony_url").not());
         stop_ipc_server(server, server_thread);
     }
+}
+
+/// `bloom vfs cat a b` and `bloom vfs ls a b` take several paths, as the
+/// shell commands they stand in for do.
+#[test]
+fn vfs_cat_and_ls_take_several_paths() {
+    let home = fresh_home();
+    let mut files = std::collections::HashMap::new();
+    files.insert("/a".to_string(), b"one\n".to_vec());
+    files.insert("/b".to_string(), b"two\n".to_vec());
+    let handler = Arc::new(ServingHandler {
+        files,
+        ..ServingHandler::default()
+    });
+    let vfs = bloom_vfs::Vfs::builder().mount("wallets", handler).build();
+    let (server, server_thread) = spawn_ipc_server(home.path(), vfs);
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/wallets/a", "/wallets/b"])
+        .assert()
+        .success()
+        .stdout(predicate::eq("one\ntwo\n"));
+    // One missing path is reported; the others still print.
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/wallets/nope", "/wallets/b"])
+        .assert()
+        .failure()
+        .stdout(predicate::eq("two\n"))
+        .stderr(predicate::str::contains("/wallets/nope"));
+    bloom_cmd(home.path())
+        .args(["vfs", "ls", "/wallets", "/wallets"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("/wallets:").count(2));
+    stop_ipc_server(server, server_thread);
+}
+
+/// Denies every policy write; the update's status appears with the first.
+#[derive(Default)]
+struct PolicyUpdateHandler {
+    written: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl Handler for PolicyUpdateHandler {
+    async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+        Ok(Entry::read_only_file(
+            p.segments().last().map(String::as_str).unwrap_or("file"),
+        ))
+    }
+
+    async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+        Err(HandlerError::NotADir(p.to_string_path()))
+    }
+
+    async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+        if !self.written.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(HandlerError::not_found(p.to_string_path()));
+        }
+        Ok(br#"{"state":"pending","status":"awaiting_custody","action_id":"a1","ceremony_url":"http://localhost:18734/c/policy","expiry_ms":99999999999999}"#.to_vec())
+    }
+
+    async fn write(&self, _p: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+        self.written
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Err(HandlerError::PermissionDenied)
+    }
+}
+
+/// A policy write that needs the owner's approval prints the ceremony link
+/// rather than a bare "permission denied".
+#[test]
+fn vfs_write_of_a_policy_prints_the_approval_link() {
+    let home = fresh_home();
+    let vfs = bloom_vfs::Vfs::builder()
+        .mount("wallets", Arc::new(PolicyUpdateHandler::default()))
+        .build();
+    let (server, server_thread) = spawn_ipc_server(home.path(), vfs);
+    bloom_cmd(home.path())
+        .args(["vfs", "write", "/wallets/alice/policy.json", "{}"])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains(
+            "Approval required: http://localhost:18734/c/policy",
+        ))
+        .stdout(predicate::str::contains("Next: the same write again"));
+    stop_ipc_server(server, server_thread);
 }
 
 #[test]
@@ -3121,7 +3435,7 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         return;
     }
     // Exercise source installation of the current pinned Polymarket release.
-    let petal_ref = "1141037cc840127c48c06f1f4e39da78225ff188";
+    let petal_ref = "b0352659abd53abbf186382803de63d1f8412a98";
     let home = fresh_home();
     let home_dir = bloom_proto::HomeDir::at(home.path());
     let config = bloom_proto::Config::local_default();
@@ -3150,8 +3464,8 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         )))
         .stdout(predicate::str::contains("Building source package..."))
         .stdout(predicate::str::contains("Validating Petal package..."))
-        .stdout(predicate::str::contains("\"routes\": 110"))
-        .stdout(predicate::str::contains("routes: 110"));
+        .stdout(predicate::str::contains("\"routes\": 109"))
+        .stdout(predicate::str::contains("routes: 109"));
 
     bloom_cmd(home.path())
         .args(["petals", "ls"])
