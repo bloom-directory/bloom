@@ -556,74 +556,11 @@ impl StatusHandler {
         probe
     }
 
+    /// An endpoint URL as safe to show: its scheme, host and port. Vendors
+    /// put API keys in the userinfo, any path segment or any query
+    /// parameter, under names no list covers, so none of those is shown.
     fn redact_url(raw: &str) -> String {
-        // Strip api keys appearing in URL userinfo, as the final URL path
-        // segment, or as common query params. Best-effort; on parse failure we
-        // return the original.
-        let mut redacted = match url::Url::parse(raw) {
-            Ok(u) => u,
-            Err(_) => return raw.to_string(),
-        };
-        if !redacted.username().is_empty() {
-            let _ = redacted.set_username("***");
-        }
-        if redacted.password().is_some() {
-            let _ = redacted.set_password(Some("***"));
-        }
-        // Redact suspicious query params.
-        let q: Vec<(String, String)> = redacted
-            .query_pairs()
-            .map(|(k, v)| {
-                let lower = k.to_ascii_lowercase();
-                let secret_like = matches!(
-                    lower.as_str(),
-                    "apikey"
-                        | "api_key"
-                        | "key"
-                        | "token"
-                        | "access_token"
-                        | "auth"
-                        | "authorization"
-                        | "password"
-                        | "passwd"
-                        | "pwd"
-                        | "signature"
-                        | "sig"
-                ) || lower.ends_with("_key")
-                    || lower.ends_with("-key")
-                    || lower.contains("token")
-                    || lower.contains("secret")
-                    || lower.contains("signature");
-                let val = if secret_like && !v.is_empty() {
-                    "***".to_string()
-                } else {
-                    v.into_owned()
-                };
-                (k.into_owned(), val)
-            })
-            .collect();
-        if !q.is_empty() {
-            redacted.query_pairs_mut().clear();
-            for (k, v) in q {
-                redacted.query_pairs_mut().append_pair(&k, &v);
-            }
-        }
-        // Redact long opaque trailing path segments (Alchemy/Infura style:
-        // `/v2/<key>` or `/<key>`). Heuristic: ≥20 chars, alnum/_-.
-        let path = redacted.path().to_string();
-        let mut segs: Vec<&str> = path.split('/').collect();
-        if let Some(last) = segs.last_mut() {
-            let s = *last;
-            if s.len() >= 20
-                && s.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            {
-                *last = "***";
-            }
-        }
-        let new_path = segs.join("/");
-        redacted.set_path(&new_path);
-        redacted.to_string()
+        bloom_rpc::redact_url(raw)
     }
 
     fn etherscan_entries(&self) -> u64 {
@@ -2094,11 +2031,36 @@ mod tests {
         let red = StatusHandler::redact_url(
             "https://eth-mainnet.g.alchemy.com/v2/abcdefghij1234567890ZZZZZZ",
         );
-        assert!(!red.contains("abcdefghij1234567890"), "got: {red}");
-        assert!(red.contains("***"), "expected redaction marker: {red}");
+        assert_eq!(red, "https://eth-mainnet.g.alchemy.com");
 
         let red2 = StatusHandler::redact_url("https://api.example.com/api?apikey=topsecret123");
-        assert!(!red2.contains("topsecret123"), "got: {red2}");
+        assert_eq!(red2, "https://api.example.com");
+    }
+
+    #[test]
+    fn redacts_keys_whatever_their_vendor_shape() {
+        for (raw, key) in [
+            // QuickNode: token path segment followed by a trailing slash.
+            (
+                "https://example.quiknode.pro/QNTOKEN0123456789abcdef0123/",
+                "QNTOKEN0123456789abcdef0123",
+            ),
+            // dRPC: key in the `dkey` query parameter.
+            (
+                "https://lb.drpc.org/ogrpc?network=ethereum&dkey=DRPCKEY0123456789",
+                "DRPCKEY0123456789",
+            ),
+            // Short key in the last path segment.
+            ("https://rpc.example.com/v1/SHORTKEY123", "SHORTKEY123"),
+            // Unparseable (bad port).
+            (
+                "https://rpc.example.com:99999999/v2/UNPARSEABLEKEY",
+                "UNPARSEABLEKEY",
+            ),
+        ] {
+            let shown = StatusHandler::redact_url(raw);
+            assert!(!shown.contains(key), "{raw} shown as {shown}");
+        }
     }
 
     #[test]
@@ -2107,14 +2069,7 @@ mod tests {
             "https://rpc_user:rpc_password@rpc.example.com/path?auth=letmein&signature=abc123&chain=base",
         );
 
-        assert!(!red.contains("rpc_user"), "got: {red}");
-        assert!(!red.contains("rpc_password"), "got: {red}");
-        assert!(!red.contains("letmein"), "got: {red}");
-        assert!(!red.contains("abc123"), "got: {red}");
-        assert!(red.contains("***:***@"), "got: {red}");
-        assert!(red.contains("auth=***"), "got: {red}");
-        assert!(red.contains("signature=***"), "got: {red}");
-        assert!(red.contains("chain=base"), "got: {red}");
+        assert_eq!(red, "https://rpc.example.com");
     }
 
     #[tokio::test]
@@ -2140,7 +2095,7 @@ mod tests {
             .unwrap();
         let s = String::from_utf8(body).unwrap();
         assert!(s.ends_with('\n'));
-        // Redaction either drops the path or replaces it with `***`.
+        // Redaction keeps only the origin.
         assert!(!s.contains("abcdefghij1234567890"), "got: {s}");
         assert!(s.contains("eth-mainnet.g.alchemy.com"), "got: {s}");
 

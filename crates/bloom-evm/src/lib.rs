@@ -26,6 +26,7 @@ use thiserror::Error;
 use tracing::{debug, warn};
 
 use bloom_proto::{ChainId, ChainSpec};
+use bloom_rpc::is_revert_reply;
 
 pub use bloom_rpc::Session;
 
@@ -157,24 +158,6 @@ fn is_node_failure(error: &alloy::contract::Error) -> bool {
         }
         _ => false,
     }
-}
-
-/// Whether a JSON-RPC error reply reports that the call reverted, rather
-/// than that the node could not or would not run it.
-///
-/// Nodes report a revert in one of two ways:
-/// - code 3 with the revert data, which geth, erigon, reth, anvil and
-///   current nethermind send when the revert carries data;
-/// - a message that says so, such as geth's and erigon's `-32000
-///   "execution reverted"` for a revert without data, besu's "Execution
-///   reverted", or hardhat's `-32603` "reverted with reason string".
-///
-/// Every other reply is about the node or the request, not the contract:
-/// an invalid API key, an unsupported method, an internal error, missing
-/// state, out of gas. Older nethermind's `-32015 "VM execution error."`
-/// also lands here, since its message does not mention the revert.
-fn is_revert_reply(payload: &ErrorPayload) -> bool {
-    payload.code == 3 || payload.message.to_ascii_lowercase().contains("revert")
 }
 
 /// The revert data a revert reply carries, or empty when it carries none.
@@ -638,7 +621,7 @@ impl ChainClient {
     ///   raw revert payload (possibly empty when the contract reverted
     ///   with no reason).
     /// * `Err(ChainError::Rpc(_))` — the node answered with an error that
-    ///   is not a revert (see `is_revert_reply`): an invalid API key, an
+    ///   is not a revert (see [`is_revert_reply`]): an invalid API key, an
     ///   unsupported method, out of gas. The message keeps the reply's code
     ///   and text.
     /// * `Err(ChainError::Transport(_))` — no answer from any endpoint.

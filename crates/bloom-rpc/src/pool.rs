@@ -8,9 +8,8 @@
 //!
 //! Each call ranks endpoints with [`HealthRegistry::selection_order`],
 //! which the probe loop and live call outcomes both feed. The top
-//! [`RACE_WIDTH`] endpoints are raced in parallel and the first success
-//! wins, as before. What happens when that whole window fails depends on
-//! the request:
+//! [`RACE_WIDTH`] endpoints are raced in parallel, as before. What happens
+//! when that whole window fails depends on the request:
 //!
 //! - **Reads** move on to the next window of the ranking, until an
 //!   endpoint answers or every configured endpoint has failed. An
@@ -41,27 +40,33 @@
 //!   `eth_blockNumber`, tells the two apart. Counting every reply as a
 //!   success would rank an endpoint that answers everything with an error
 //!   above working ones.
-//! - It ends a read. Moving on would only send the same request to more
-//!   endpoints, which alloy's `FallbackLayer` never did either.
-//! - A read returns it in preference to a transport error from the same
-//!   window, so a revert the node sends as a JSON-RPC reply is never
+//! - A read takes the first answer in its race, a result or an error
+//!   reply, as alloy's `FallbackLayer` does, and that answer ends the read.
+//!   Waiting past an error reply for a result would hold every revert until
+//!   the slowest endpoint in the window answered or timed out, and would
+//!   let a lagging node's result override the revert an up-to-date node
+//!   reported. Moving on would only send the same request to more
+//!   endpoints.
+//! - So a read reports an error reply rather than a transport error from
+//!   the same window: a revert the node sends as a JSON-RPC reply is never
 //!   reported as an unreachable endpoint. Callers rely on this: a
 //!   pre-broadcast simulation reads a transport error as "simulation
 //!   unavailable" and lets the transaction through. A JSON-RPC error sent
-//!   with a non-2xx HTTP status is an error reply too, since the endpoint's
-//!   transport reads the body whatever the status.
-//! - A submission does the opposite: it returns a transport error in
-//!   preference to an error reply. The endpoint that failed may have
-//!   accepted the transaction before its reply was lost, so the outcome is
-//!   unknown, and a refusal from the other endpoint must not make it look
-//!   definite. Callers reconcile an unknown send, but set aside an attempt
-//!   that a node refused.
+//!   with a 4xx HTTP status, or a revert sent with any status, is an error
+//!   reply too (see `EndpointHttp`).
+//! - A submission waits for every endpoint in its window, since one may
+//!   return the transaction hash while another refuses. If none does, it
+//!   reports, in this order of preference: a reply saying the node already
+//!   has the transaction, which proves it was accepted; a transport error,
+//!   since the endpoint that failed may have accepted the transaction
+//!   before its reply was lost, so the outcome is unknown and a refusal
+//!   from the other endpoint must not make it look definite; and only then
+//!   a refusal. Callers finalize an already known send, reconcile an
+//!   unknown one, and set aside an attempt that a node refused.
 //!
-//! A race still waits for its other endpoints after an error reply,
-//! because one of them may return a result. Only transport errors
-//! (connection failures, timeouts, HTTP error statuses without a JSON-RPC
-//! error in the body, retries exhausted on rate limits) count against an
-//! endpoint and move a read on.
+//! Only transport errors (connection failures, timeouts, HTTP error
+//! statuses without a JSON-RPC answer in the body, retries exhausted on
+//! rate limits) count against an endpoint and move a read on.
 
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -74,6 +79,7 @@ use tower::Service;
 use tracing::{debug, warn};
 
 use crate::health::{CooldownDecision, HealthRegistry};
+use crate::reply::is_already_known;
 
 /// Endpoints raced in parallel per window. Two balances tail latency
 /// against duplicate load on public endpoints, and is the count every
@@ -127,43 +133,60 @@ fn is_error_reply(err: &TransportError) -> bool {
     err.as_error_resp().is_some()
 }
 
-/// A response carrying a JSON-RPC error, as `TransportError::ErrorResp`.
-/// alloy's retry layer passes such a response up as a success, and without
-/// this the pool would take a revert or a refusal for a result: a race
-/// would end on it, and the endpoint would be recorded as working.
+/// A single response carrying a JSON-RPC error, as
+/// `TransportError::ErrorResp`. alloy's retry layer passes such a response
+/// up as a success, and without this the pool would take a revert or a
+/// refusal for a result: a race would end on it as if it had succeeded,
+/// and the endpoint would be recorded as working. A batch is left as it
+/// is, so each of its requests gets its own response.
 fn error_reply_as_err(response: ResponsePacket) -> Result<ResponsePacket, TransportError> {
-    match response.as_error() {
-        Some(payload) => Err(TransportError::ErrorResp(payload.clone())),
-        None => Ok(response),
+    match &response {
+        ResponsePacket::Single(_) => match response.as_error() {
+            Some(payload) => Err(TransportError::ErrorResp(payload.clone())),
+            None => Ok(response),
+        },
+        ResponsePacket::Batch(_) => Ok(response),
     }
 }
 
 /// The errors one window produced, kept so the right one is returned.
 #[derive(Default)]
 struct WindowOutcome {
+    /// The first error reply, other than "already known".
     error_reply: Option<TransportError>,
+    /// A reply saying the node already has the transaction.
+    already_known: Option<TransportError>,
     transport_error: Option<TransportError>,
 }
 
 impl WindowOutcome {
     fn record(&mut self, err: TransportError) {
-        if !is_error_reply(&err) {
-            self.transport_error = Some(err);
-        } else if self.error_reply.is_none() {
-            self.error_reply = Some(err);
+        match err.as_error_resp() {
+            None => self.transport_error = Some(err),
+            Some(payload) if is_already_known(payload) => {
+                self.already_known.get_or_insert(err);
+            }
+            Some(_) => {
+                self.error_reply.get_or_insert(err);
+            }
         }
     }
 
-    /// The error that reports the window. A read reports the first error
-    /// reply, since that is the answer to what it asked. A submission
-    /// reports a transport error if it got one, since that endpoint may
-    /// have accepted the transaction and the outcome is unknown.
+    /// The error that reports the window. A read reports an error reply,
+    /// since that is the answer to what it asked. A submission reports
+    /// "already known" if it got it, since the transaction was accepted;
+    /// then a transport error, since that endpoint may have accepted the
+    /// transaction and the outcome is unknown; then a refusal.
     fn into_error(self, dispatch: Dispatch) -> TransportError {
         let reported = match dispatch {
-            Dispatch::Read => self.error_reply.or(self.transport_error),
-            Dispatch::Submission | Dispatch::SequentialSubmission => {
-                self.transport_error.or(self.error_reply)
-            }
+            Dispatch::Read => self
+                .error_reply
+                .or(self.already_known)
+                .or(self.transport_error),
+            Dispatch::Submission | Dispatch::SequentialSubmission => self
+                .already_known
+                .or(self.transport_error)
+                .or(self.error_reply),
         };
         reported.unwrap_or_else(|| TransportErrorKind::custom_str("no RPC endpoints available"))
     }
@@ -253,11 +276,13 @@ impl PoolInner {
             .unwrap_or_else(|| TransportErrorKind::custom_str("no RPC endpoints available")))
     }
 
-    /// Call every endpoint in `window` in parallel and return the first
-    /// success. Calls still in flight when one succeeds are dropped. An
-    /// error reply does not end the race, since another endpoint may still
-    /// return a result. If none does, `dispatch` decides which error
-    /// reports the window (see [`WindowOutcome::into_error`]).
+    /// Call every endpoint in `window` in parallel. A read returns the
+    /// first answer, a result or an error reply. A submission returns the
+    /// first success, since another endpoint may still return the hash
+    /// after one refuses. Calls still in flight when the race ends are
+    /// dropped. If no endpoint answers (or, for a submission, none
+    /// succeeds), `dispatch` decides which error reports the window (see
+    /// [`WindowOutcome::into_error`]).
     async fn race(
         &self,
         window: &[usize],
@@ -272,6 +297,7 @@ impl PoolInner {
         while let Some(result) = in_flight.next().await {
             match result {
                 Ok(response) => return Ok(response),
+                Err(err) if dispatch == Dispatch::Read && is_error_reply(&err) => return Err(err),
                 Err(err) => outcome.record(err),
             }
         }
@@ -280,8 +306,8 @@ impl PoolInner {
 
     /// Call the endpoints in `window` one at a time and return the first
     /// success. As in alloy, an error reply moves on to the next endpoint,
-    /// which may return the receipt. If none does, a transport error is
-    /// returned over an error reply, since the outcome is then unknown.
+    /// which may return the receipt. If none does, the window is reported
+    /// as a submission's is (see [`WindowOutcome::into_error`]).
     async fn sequential(
         &self,
         window: &[usize],
@@ -406,6 +432,8 @@ mod tests {
         /// Refuses a transaction with a JSON-RPC error, as a node does when
         /// a replacement is underpriced.
         Refuses,
+        /// Says it already has the transaction.
+        AlreadyKnown,
     }
 
     /// A transport that counts the calls it receives and handles each as
@@ -474,6 +502,10 @@ mod tests {
                     }
                     Behaviour::Reverts => ResponsePayload::Failure(revert_payload()),
                     Behaviour::Refuses => ResponsePayload::Failure(refusal_payload()),
+                    Behaviour::AlreadyKnown => ResponsePayload::Failure(
+                        serde_json::from_str(r#"{"code":-32000,"message":"already known"}"#)
+                            .unwrap(),
+                    ),
                 };
                 Ok(ResponsePacket::Single(Response { id, payload }))
             })
@@ -716,7 +748,7 @@ mod tests {
         ];
         let (pool, _) = pool_behind_retry_layer(&mocks);
         assert_eq!(error_reply_code(send(&pool, "eth_call").await), Some(3));
-        assert_eq!(calls(&mocks), vec![1, 1, 0]);
+        assert_eq!(mocks[2].calls(), 0, "the read stopped at the revert");
     }
 
     #[tokio::test]
@@ -730,17 +762,85 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn race_waits_past_a_revert_for_a_result() {
-        // One node refuses what another can answer (a pruned node and an
-        // archive node, say): the answer wins, as it did under alloy.
+    async fn a_read_takes_the_first_answer() {
+        // A revert does not wait for a slower endpoint's result: that
+        // endpoint may be lagging behind the state that reverts, or may not
+        // answer until it times out.
         let mocks = [
             MockEndpoint::with(Behaviour::Reverts),
+            MockEndpoint::with(Behaviour::Answers).after(Duration::from_secs(5)),
+        ];
+        let (pool, _) = pool_behind_retry_layer(&mocks);
+        let started = Instant::now();
+        assert_eq!(error_reply_code(send(&pool, "eth_call").await), Some(3));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        // A result that comes first wins the same way.
+        let mocks = [
+            MockEndpoint::with(Behaviour::Reverts).after(Duration::from_millis(50)),
+            MockEndpoint::with(Behaviour::Answers),
+        ];
+        let (pool, _) = pool_behind_retry_layer(&mocks);
+        let response = send(&pool, "eth_call").await.expect("the result wins");
+        assert!(response.as_error().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_submission_waits_past_a_refusal_for_the_hash() {
+        // One node refuses the transaction that another accepts.
+        let mocks = [
+            MockEndpoint::with(Behaviour::Refuses),
             MockEndpoint::with(Behaviour::Answers).after(Duration::from_millis(50)),
         ];
         let (pool, _) = pool_behind_retry_layer(&mocks);
-        send(&pool, "eth_call")
+        let response = send(&pool, "eth_sendRawTransaction")
             .await
-            .expect("the slower result wins");
+            .expect("the hash wins");
+        assert!(response.as_error().is_none());
+    }
+
+    #[tokio::test]
+    async fn already_known_reports_a_submission() {
+        // The node has the transaction, so it was accepted, whatever the
+        // other endpoint says and in either order.
+        for other in [Behaviour::Down, Behaviour::Refuses] {
+            for known_first in [true, false] {
+                let (known, other) = (
+                    MockEndpoint::with(Behaviour::AlreadyKnown),
+                    MockEndpoint::with(other),
+                );
+                let mocks = if known_first {
+                    [known, other.after(Duration::from_millis(50))]
+                } else {
+                    [other, known.after(Duration::from_millis(50))]
+                };
+                let (pool, _) = pool_behind_retry_layer(&mocks);
+                let err = send(&pool, "eth_sendRawTransaction")
+                    .await
+                    .expect_err("no hash");
+                let payload = err.as_error_resp().expect("an error reply");
+                assert_eq!(payload.message, "already known");
+            }
+        }
+    }
+
+    #[test]
+    fn a_batch_keeps_each_response() {
+        let failure = Response {
+            id: Id::Number(1),
+            payload: ResponsePayload::Failure(revert_payload()),
+        };
+        let success = Response {
+            id: Id::Number(2),
+            payload: ResponsePayload::Success(serde_json::value::to_raw_value("0x1").unwrap()),
+        };
+        let batch = ResponsePacket::Batch(vec![failure.clone(), success]);
+        let kept = error_reply_as_err(batch).expect("a batch passes through");
+        assert_eq!(kept.responses().len(), 2);
+
+        let single = ResponsePacket::Single(failure);
+        let err = error_reply_as_err(single).expect_err("a single error reply");
+        assert_eq!(err.as_error_resp().map(|payload| payload.code), Some(3));
     }
 
     #[tokio::test]
@@ -760,7 +860,7 @@ mod tests {
         // Replies neither clear endpoint 0's cooldown nor arm one for
         // endpoint 1.
         assert_eq!(health.cooled_down_indices(), vec![0]);
-        assert_eq!(calls(&mocks), vec![10, 10]);
+        assert!(calls(&mocks).iter().sum::<usize>() >= 10);
     }
 
     #[tokio::test]

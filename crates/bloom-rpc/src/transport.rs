@@ -749,6 +749,44 @@ mod tests {
         assert!(err.to_string().contains("400"), "{err}");
     }
 
+    /// A gateway's 5xx is the endpoint failing even when its body is a
+    /// JSON-RPC error: the gateway may have forwarded a transaction before
+    /// it failed, and 502, 503 and 504 must still be retried and failed
+    /// over. A revert is the node's answer whatever the status.
+    #[tokio::test]
+    async fn a_server_error_is_the_endpoint_failing_unless_it_reports_a_revert() {
+        use alloy::providers::Provider;
+
+        for status in ["500 Internal Server Error", "504 Gateway Timeout"] {
+            let url = endpoint_answering(
+                status,
+                r#"{"jsonrpc":"2.0","id":0,"error":{"code":-32603,"message":"upstream request timeout"}}"#,
+            )
+            .await;
+            let err = engine_over(vec![url])
+                .provider()
+                .get_block_number()
+                .await
+                .unwrap_err();
+            assert!(err.as_error_resp().is_none(), "{status}: {err}");
+        }
+
+        let url = endpoint_answering(
+            "500 Internal Server Error",
+            r#"{"jsonrpc":"2.0","id":0,"error":{"code":-32000,"message":"execution reverted"}}"#,
+        )
+        .await;
+        let err = engine_over(vec![url])
+            .provider()
+            .get_block_number()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.as_error_resp().map(|payload| payload.code),
+            Some(-32000)
+        );
+    }
+
     #[tokio::test]
     async fn transport_errors_name_the_origin_not_the_url() {
         use alloy::providers::Provider;
@@ -771,21 +809,39 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn probe_logs_name_the_origin_not_the_url() {
-        /// Collects everything the subscriber writes.
-        #[derive(Clone, Default)]
-        struct Captured(Arc<parking_lot::Mutex<Vec<u8>>>);
-        impl std::io::Write for Captured {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
+    /// Collects everything a tracing subscriber writes.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Captured {
+        /// Capture debug logs on this thread until the guard drops.
+        fn debug_logs(&self) -> tracing::subscriber::DefaultGuard {
+            let writer = self.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::set_default(subscriber)
         }
 
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().clone()).unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_logs_name_the_origin_not_the_url() {
         let (raw, origin) = url_with_keys();
         let spec = EndpointSpec {
             url: raw.clone(),
@@ -803,17 +859,32 @@ mod tests {
         let health = HealthRegistry::new(vec![raw]);
 
         let captured = Captured::default();
-        let writer = captured.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = captured.debug_logs();
         run_probe_round("test", &[target], &health).await;
 
-        let logs = String::from_utf8(captured.0.lock().clone()).unwrap();
+        let logs = captured.text();
         assert!(logs.contains("rpc.health.probe_failed"), "{logs}");
+        assert!(logs.contains(&origin), "{logs}");
+        assert_no_keys(&logs);
+    }
+
+    /// The pool's own lines about live calls: the failed call and the
+    /// cooldown that repeated failures arm.
+    #[tokio::test]
+    async fn live_call_logs_name_the_origin_not_the_url() {
+        use alloy::providers::Provider;
+
+        let (raw, origin) = url_with_keys();
+        let captured = Captured::default();
+        let _guard = captured.debug_logs();
+        let engine = engine_over(vec![raw]);
+        for _ in 0..6 {
+            engine.provider().get_block_number().await.unwrap_err();
+        }
+
+        let logs = captured.text();
+        assert!(logs.contains("rpc.pool.endpoint_failed"), "{logs}");
+        assert!(logs.contains("rpc.health.cooldown_set"), "{logs}");
         assert!(logs.contains(&origin), "{logs}");
         assert_no_keys(&logs);
     }

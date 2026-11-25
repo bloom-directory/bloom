@@ -18,26 +18,28 @@ use std::fmt;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use alloy::rpc::json_rpc::{RequestPacket, ResponsePacket};
+use alloy::rpc::json_rpc::{ErrorPayload, RequestPacket, ResponsePacket};
 use alloy::transports::http::reqwest;
 use alloy::transports::{TransportError, TransportErrorKind, TransportFut, TransportResult};
 use tower::Service;
 use tracing::{Instrument, debug, debug_span};
 use url::Url;
 
+use crate::reply::is_revert_reply;
+
 /// The URL as safe to show: scheme, host and port, without userinfo, path,
 /// query or fragment. A string that does not parse keeps only what looks
-/// like its scheme and host.
+/// like its scheme and host, and not even the host if it contains an `@`:
+/// without a parse, that `@` may end userinfo that itself contains `/`,
+/// `?` or `#`, so nothing tells the host from a password.
 pub fn redact_url(raw: &str) -> String {
     if let Ok(url) = Url::parse(raw) {
         return origin(&url);
     }
     match raw.split_once("://") {
+        Some((scheme, rest)) if rest.contains('@') => format!("{scheme}://<redacted>"),
         Some((scheme, rest)) => {
-            let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-            let host = authority
-                .rsplit_once('@')
-                .map_or(authority, |(_, host)| host);
+            let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
             format!("{scheme}://{host}")
         }
         None => "<unparseable url>".to_owned(),
@@ -51,13 +53,16 @@ fn origin(url: &Url) -> String {
 }
 
 /// One endpoint's HTTP transport. It posts each JSON-RPC request and reads
-/// the reply as alloy's `Http<reqwest::Client>` does: a JSON-RPC error is
-/// the node's answer whatever the HTTP status, any other non-2xx status is
-/// an HTTP error carrying the body, and a body that is not JSON-RPC is a
-/// deserialization error carrying it. Unlike alloy's, neither its tracing
-/// span nor its errors contain the URL, and it does not turn a
-/// `Retry-After` header into a retry delay: the pool moves a call on to
-/// another endpoint rather than wait out whatever delay a server asks for.
+/// the reply much as alloy's `Http<reqwest::Client>` does: a non-2xx status
+/// is an HTTP error carrying the body, and a body that is not JSON-RPC is a
+/// deserialization error carrying it. A JSON-RPC error that comes with an
+/// error status is the node's answer when [`answers_despite_status`] says
+/// so.
+///
+/// Unlike alloy's, neither its tracing span nor its errors contain the URL,
+/// and it does not turn a `Retry-After` header into a retry delay: the pool
+/// moves a call on to another endpoint rather than wait out whatever delay
+/// a server asks for.
 #[derive(Clone)]
 pub(crate) struct EndpointHttp {
     client: reqwest::Client,
@@ -92,10 +97,10 @@ impl EndpointHttp {
         // explain itself in it.
         let body = resp.bytes().await.map_err(failed)?;
         if !status.is_success() {
-            // Nodes and providers send some JSON-RPC errors, reverts among
-            // them, with a 4xx or 5xx status.
             if let Ok(reply) = serde_json::from_slice::<ResponsePacket>(&body)
-                && reply.is_error()
+                && reply
+                    .as_error()
+                    .is_some_and(|payload| answers_despite_status(status, payload))
             {
                 return Ok(reply);
             }
@@ -107,6 +112,21 @@ impl EndpointHttp {
         serde_json::from_slice(&body)
             .map_err(|err| TransportError::deser_err(err, String::from_utf8_lossy(&body)))
     }
+}
+
+/// Whether a JSON-RPC error sent with an error status is the node's answer
+/// rather than the endpoint failing.
+///
+/// A 4xx is the node or provider answering the request: an invalid API
+/// key, a malformed call, a refused transaction, a revert some providers
+/// send with 400. A 5xx, and 408 and 429, say the server failed or wants
+/// the request later, whatever the body says: a gateway in front of the
+/// node may have forwarded a transaction before it failed, so a broadcast's
+/// outcome is unknown, and the retry rules for these statuses must still
+/// apply. A revert is the contract's answer whatever the status.
+fn answers_despite_status<E>(status: reqwest::StatusCode, payload: &ErrorPayload<E>) -> bool {
+    let client_error = status.is_client_error() && !matches!(status.as_u16(), 408 | 429);
+    client_error || is_revert_reply(payload)
 }
 
 impl Service<RequestPacket> for EndpointHttp {
@@ -188,10 +208,23 @@ mod tests {
                 "wss://user:SECRET@ws.example.com/v3/SECRET",
                 "wss://ws.example.com",
             ),
-            // Unparseable (an invalid port): still no userinfo or path.
+            // Unparseable (an invalid port): no path, and no host either
+            // once an `@` appears, since the password may contain `/`.
+            (
+                "https://rpc.example.com:99999999/v2/SECRET",
+                "https://rpc.example.com:99999999",
+            ),
             (
                 "https://user:SECRET@rpc.example.com:99999999/v2/SECRET",
-                "https://rpc.example.com:99999999",
+                "https://<redacted>",
+            ),
+            (
+                "https://user:SEC/RET@rpc.example.com:99999999/v2/SECRET",
+                "https://<redacted>",
+            ),
+            (
+                "https://rpc.example.com:99999999/v2@SECRET",
+                "https://<redacted>",
             ),
             ("not a url SECRET", "<unparseable url>"),
         ] {

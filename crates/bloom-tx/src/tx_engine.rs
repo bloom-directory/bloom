@@ -8732,6 +8732,32 @@ mod tests {
         assert!(!entry.dir.join("replacement_intent.json").exists());
     }
 
+    /// A revert reason the contract chose, here one mentioning "capacity",
+    /// is not a rate limit. Were it retried, the exhausted retries would come
+    /// back as a transport error, which the simulation reads as
+    /// "unavailable", and the repair would go on to signing a transaction
+    /// the node said reverts.
+    #[tokio::test]
+    async fn fee_repair_refuses_a_revert_whose_reason_reads_like_a_rate_limit() {
+        let revert = r#"error:{"code":3,"message":"execution reverted: Vault capacity exceeded","data":"0x08c379a0000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000175661756c74206361706163697479206578636565646564000000000000000000"}"#;
+        let url = spawn_queued_rpc(HashMap::from([(
+            "eth_call".into(),
+            vec![revert.to_string(); 4],
+        )]))
+        .await;
+        let f = fee_repair_fixture(&url, |_| {});
+        f.fixture.active.store(true, Ordering::SeqCst);
+        let result = f.repair(repair_fees("500", "250")).await;
+        assert!(
+            matches!(&result, Err(TxEngineError::SimulationReverted { .. })),
+            "{:?}",
+            result.err()
+        );
+        assert!(f.fixture.requests.lock().is_empty());
+        let entry = f.outbox.read("alice", "anvil", "fee-repair").unwrap();
+        assert_eq!(entry.state, OutboxState::Pending);
+    }
+
     /// The node accepts a repair but its response is lost; the retry answers
     /// "already known". The retry, and one interrupted before the move to
     /// sent, must settle the recorded replacement without signing again.

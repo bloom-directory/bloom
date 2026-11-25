@@ -118,16 +118,28 @@ mod tests {
 
     #[test]
     fn rejected_urls_are_reported_without_credentials() {
-        for raw in [
-            // Unparseable: the port is out of range.
-            "https://user:SECRET@rpc.example.com:99999999/v2/SECRET?key=SECRET",
+        for (raw, host_shown) in [
+            // Unparseable (the port is out of range), with no userinfo.
+            (
+                "https://rpc.example.com:99999999/v2/SECRET?key=SECRET",
+                true,
+            ),
+            // Unparseable with userinfo: the host cannot be told from the
+            // password, so neither is shown.
+            (
+                "https://user:SECRET@rpc.example.com:99999999/v2/SECRET?key=SECRET",
+                false,
+            ),
             // Parseable, unsupported scheme.
-            "ftp://user:SECRET@rpc.example.com/v2/SECRET?key=SECRET",
+            (
+                "ftp://user:SECRET@rpc.example.com/v2/SECRET?key=SECRET",
+                true,
+            ),
         ] {
             let err = classify_endpoint(&ep(raw)).unwrap_err();
             for shown in [err.to_string(), format!("{err:?}")] {
                 assert!(!shown.contains("SECRET"), "{shown}");
-                assert!(shown.contains("rpc.example.com"), "{shown}");
+                assert_eq!(shown.contains("rpc.example.com"), host_shown, "{shown}");
             }
         }
     }

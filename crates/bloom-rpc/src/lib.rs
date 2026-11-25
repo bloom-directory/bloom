@@ -24,6 +24,7 @@ pub mod error;
 pub mod policy;
 mod pool;
 mod redact;
+mod reply;
 pub mod session;
 pub mod transport;
 
@@ -31,6 +32,7 @@ pub use endpoint::{EndpointScheme, is_subscription_capable};
 pub use error::BloomRpcError;
 pub use policy::BloomRetryPolicy;
 pub use redact::redact_url;
+pub use reply::is_revert_reply;
 pub use session::Session;
 pub use transport::RpcEngine;
 
