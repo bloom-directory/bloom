@@ -337,6 +337,10 @@ struct PrivateCheckout {
     /// Checkout pressed the pay button, or may have. Without this or a manual
     /// submission, no page text can make the checkout paid or booked.
     submitted: bool,
+    /// Whether the person chose to keep the browser context signed in when
+    /// this view closes. Defaults to true for take-overs (without traveler PII)
+    /// and false for payments.
+    stay_signed_in: bool,
 }
 
 struct CompletedView {
@@ -785,6 +789,8 @@ impl CheckoutService {
                             approved: false,
                             manual_submission: false,
                             submitted: false,
+                            stay_signed_in: mode == Mode::TakeOver
+                                && !self.browser.has_private_traveler_data(),
                         });
                         let service = self.clone();
                         tokio::spawn(async move {
@@ -1085,7 +1091,12 @@ pub enum ViewAction {
     SelectPage {
         target: String,
     },
-    /// `stay_signed_in` keeps a take-over's cookies for later shopping. Only
+    /// `stay_signed_in` keeps cookies for later shopping when the person
+    /// explicitly enables it and no saved traveler data was used.
+    StaySignedIn {
+        stay_signed_in: bool,
+    },
+    /// `stay_signed_in` keeps cookies for later shopping. Only
     /// the person chooses it; the agent then sees signed-in pages.
     Finish {
         #[serde(default)]
@@ -1273,31 +1284,25 @@ impl CheckoutService {
         }
     }
 
-    /// Closes the private view. A take-over keeps its sign-in when asked; the
-    /// agent may then act only if that sign-in created a new account, which
-    /// cannot hold a saved payment method yet.
+    /// Closes the private view, keeping cookies when `stay_signed_in` is true
+    /// and no saved traveler data was used.
     async fn finish(&self, operation_id: &str, mode: Mode, stay_signed_in: bool) -> Result<()> {
-        if mode == Mode::TakeOver {
-            if stay_signed_in {
-                self.saved.lock().take();
-                self.browser.return_control_signed_in().await?;
-            } else {
-                self.return_control().await?;
-            }
-            let current = self.store.get(operation_id)?.state;
-            self.set_state(
-                operation_id,
-                if current == "human_control" {
-                    "returned"
-                } else {
-                    closing_state(&current)
-                },
-            );
+        let keep = stay_signed_in && !self.browser.has_private_traveler_data();
+        if keep {
+            self.saved.lock().take();
+            self.browser.return_control_signed_in().await?;
         } else {
-            let current = self.store.get(operation_id)?.state;
-            self.set_state(operation_id, closing_state(&current));
             self.return_control().await?;
         }
+        let current = self.store.get(operation_id)?.state;
+        self.set_state(
+            operation_id,
+            if mode == Mode::TakeOver && current == "human_control" {
+                "returned"
+            } else {
+                closing_state(&current)
+            },
+        );
         let mut private = self.private.lock().await;
         if let Some(checkout) = private
             .as_ref()
@@ -1366,7 +1371,14 @@ impl CheckoutService {
                 )
             };
             if mode == Mode::TakeOver && self.sign_in_finished(&id, &tab, &view_session).await {
-                if self.finish(&id, mode, true).await.is_err() {
+                let stay_signed_in = self
+                    .private
+                    .lock()
+                    .await
+                    .as_ref()
+                    .filter(|p| p.operation_id == id)
+                    .is_some_and(|p| p.stay_signed_in);
+                if self.finish(&id, mode, stay_signed_in).await.is_err() {
                     self.mark_paused(&id);
                 }
                 return;
@@ -1503,17 +1515,33 @@ impl CheckoutService {
                         status.outcome = serde_json::from_value(recorded).ok();
                         status.ceremony_url = None;
                         let stored = self.store.update(&status).is_ok();
-                        if close && stored && self.return_control().await.is_ok() {
-                            let mut private = self.private.lock().await;
-                            if let Some(checkout) =
-                                private.as_ref().filter(|p| p.operation_id == id)
-                            {
-                                self.retain_completed(checkout, status);
-                                *private = None;
+                        if close && stored {
+                            let stay_signed_in = self
+                                .private
+                                .lock()
+                                .await
+                                .as_ref()
+                                .filter(|p| p.operation_id == id)
+                                .is_some_and(|p| p.stay_signed_in)
+                                && !self.browser.has_private_traveler_data();
+                            let returned = if stay_signed_in {
+                                self.saved.lock().take();
+                                self.browser.return_control_signed_in().await.is_ok()
+                            } else {
+                                self.return_control().await.is_ok()
+                            };
+                            if returned {
+                                let mut private = self.private.lock().await;
+                                if let Some(checkout) =
+                                    private.as_ref().filter(|p| p.operation_id == id)
+                                {
+                                    self.retain_completed(checkout, status);
+                                    *private = None;
+                                }
+                            } else {
+                                status.paused = true;
+                                let _ = self.store.update(&status);
                             }
-                        } else if close && stored {
-                            status.paused = true;
-                            let _ = self.store.update(&status);
                         } else {
                             let _ = self.store.update(&status);
                         }
@@ -1658,17 +1686,23 @@ impl CheckoutService {
         };
         let status = self.store.get(&operation_id)?;
         let saved = self.saved_status(&operation_id);
-        let can_use_saved = self
-            .private
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|c| c.mode == Mode::TakeOver);
-        let can_stay_signed_in = can_use_saved && !self.browser.has_private_traveler_data();
+        let (can_use_saved, stay_signed_in) = {
+            let private = self.private.lock().await;
+            (
+                private.as_ref().is_some_and(|c| c.mode == Mode::TakeOver),
+                private.as_ref().is_some_and(|c| c.stay_signed_in),
+            )
+        };
+        let can_stay_signed_in = !self.browser.has_private_traveler_data();
+        let stay_signed_in = can_stay_signed_in && stay_signed_in;
+        let signing_in = {
+            let sign_in = self.sign_in.lock();
+            sign_in.operation == operation_id && sign_in.secret_seen && sign_in.quiet == 0
+        };
         // The agent's words, shown as such: they explain the task, not facts.
         let agent_description = self.store.description(&operation_id)?;
         Ok(
-            json!({"state":status.state,"outcome":status.outcome,"pages":pages,"selected_page":selected_page,"closed":false,"saved":saved,"can_use_saved":can_use_saved,"can_stay_signed_in":can_stay_signed_in,"agent_description":agent_description}),
+            json!({"state":status.state,"outcome":status.outcome,"pages":pages,"selected_page":selected_page,"closed":false,"saved":saved,"can_use_saved":can_use_saved,"can_stay_signed_in":can_stay_signed_in,"stay_signed_in":stay_signed_in,"human_control":can_use_saved,"signing_in":signing_in,"agent_description":agent_description}),
         )
     }
 
@@ -1822,6 +1856,9 @@ impl CheckoutService {
                     "Escape" => 27,
                     "ArrowDown" => 40,
                     "ArrowUp" => 38,
+                    "ArrowLeft" => 37,
+                    "ArrowRight" => 39,
+                    "Delete" => 46,
                     _ => bail!("Unsupported private key"),
                 };
                 let (tab, session, operation_id, discovery) = {
@@ -1936,6 +1973,15 @@ impl CheckoutService {
                 checkout.view_target = target;
                 checkout.view_session = session;
             }
+            ViewAction::StaySignedIn { stay_signed_in } => {
+                let mut private = self.private.lock().await;
+                let checkout = private.as_mut().context("No active private checkout")?;
+                authorize_view(checkout, token)?;
+                if stay_signed_in && self.browser.has_private_traveler_data() {
+                    bail!("Saved traveler details were used here; this session cannot be kept");
+                }
+                checkout.stay_signed_in = stay_signed_in;
+            }
             ViewAction::Finish { stay_signed_in } => {
                 let (operation_id, mode) = {
                     let private = self.private.lock().await;
@@ -1943,8 +1989,8 @@ impl CheckoutService {
                     authorize_view(checkout, token)?;
                     (checkout.operation_id.clone(), checkout.mode)
                 };
-                if stay_signed_in && mode != Mode::TakeOver {
-                    bail!("Only a take-over can keep its sign-in");
+                if stay_signed_in && self.browser.has_private_traveler_data() {
+                    bail!("Saved traveler details were used here; this session cannot be kept");
                 }
                 self.finish(&operation_id, mode, stay_signed_in).await?;
             }
@@ -2193,6 +2239,7 @@ mod tests {
             approved: true,
             manual_submission: false,
             submitted,
+            stay_signed_in: false,
         });
         (service, status.operation_id, token, server)
     }
@@ -2414,7 +2461,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_the_person_in_a_take_over_can_stay_signed_in() {
+    async fn person_can_choose_to_stay_signed_in_when_no_traveler_data() {
         let (service, browser, _, server) = shopping_service("<p>Account</p>").await;
         let parsed: ViewAction = serde_json::from_str(r#"{"action":"finish"}"#).unwrap();
         assert!(matches!(
@@ -2457,29 +2504,40 @@ mod tests {
                 approved: true,
                 manual_submission: false,
                 submitted: false,
+                stay_signed_in: mode == Mode::TakeOver,
             });
             let state = service.private_state(&token).await.unwrap();
-            assert_eq!(state["can_stay_signed_in"], mode == Mode::TakeOver);
+            assert_eq!(state["can_stay_signed_in"], true);
+            assert_eq!(state["stay_signed_in"], mode == Mode::TakeOver);
             // The view shows the person what the agent asked for.
             assert_eq!(state["agent_description"], "Fixture");
-            let stay = ViewAction::Finish {
-                stay_signed_in: true,
-            };
             if mode == Mode::Site {
-                assert!(service.private_action(&token, stay).await.is_err());
                 service
                     .private_action(
                         &token,
-                        ViewAction::Finish {
-                            stay_signed_in: false,
+                        ViewAction::StaySignedIn {
+                            stay_signed_in: true,
                         },
                     )
                     .await
                     .unwrap();
-            } else {
-                service.private_action(&token, stay).await.unwrap();
+                let updated = service.private_state(&token).await.unwrap();
+                assert_eq!(updated["stay_signed_in"], true);
+            }
+            service
+                .private_action(
+                    &token,
+                    ViewAction::Finish {
+                        stay_signed_in: true,
+                    },
+                )
+                .await
+                .unwrap();
+            if mode == Mode::TakeOver {
                 // An untouched take-over still returns cleanly.
                 assert_eq!(service.store.get(&operation_id).unwrap().state, "returned");
+            } else {
+                assert_eq!(service.store.get(&operation_id).unwrap().state, "uncertain");
             }
             assert!(service.private.lock().await.is_none());
         }
@@ -2629,6 +2687,7 @@ mod tests {
                 approved: true,
                 manual_submission: true,
                 submitted: false,
+                stay_signed_in: false,
             });
             let watcher = tokio::spawn({
                 let service = service.clone();
@@ -2691,6 +2750,7 @@ mod tests {
             approved: true,
             manual_submission: false,
             submitted: false,
+            stay_signed_in: false,
         });
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -2767,6 +2827,7 @@ mod tests {
             approved: true,
             manual_submission: false,
             submitted: false,
+            stay_signed_in: false,
         });
         tokio::time::timeout(
             Duration::from_secs(4),
@@ -2855,6 +2916,7 @@ mod tests {
             approved: true,
             manual_submission: false,
             submitted: false,
+            stay_signed_in: false,
         });
         let finished = tokio::time::timeout(
             Duration::from_secs(3),
@@ -3037,6 +3099,7 @@ mod tests {
                 approved: true,
                 manual_submission: false,
                 submitted: false,
+                stay_signed_in: false,
             };
             service
                 .consume_and_fill(&mut checkout, None, None)
@@ -3093,6 +3156,7 @@ mod tests {
             approved: true,
             manual_submission: false,
             submitted: true,
+            stay_signed_in: false,
         });
         let watcher = {
             let service = service.clone();
@@ -3203,6 +3267,7 @@ mod tests {
             approved: true,
             manual_submission: false,
             submitted: false,
+            stay_signed_in: false,
         });
         let finished = tokio::time::timeout(
             Duration::from_secs(3),
@@ -3259,6 +3324,7 @@ mod tests {
             approved: true,
             manual_submission: false,
             submitted: false,
+            stay_signed_in: false,
         });
         let watcher = tokio::spawn({
             let service = service.clone();
@@ -3392,6 +3458,7 @@ mod tests {
             approved: true,
             manual_submission: false,
             submitted: false,
+            stay_signed_in: false,
         });
         let started = tokio::time::Instant::now();
         let capture = {
@@ -3713,6 +3780,7 @@ mod tests {
             approved: true,
             manual_submission: false,
             submitted: false,
+            stay_signed_in: false,
         });
         service
             .private_action(
@@ -3875,6 +3943,7 @@ mod tests {
             approved: false,
             manual_submission: false,
             submitted: false,
+            stay_signed_in: false,
         });
         let router = crate::view::router(service.clone());
         let viewer = tokio::spawn(async move {
@@ -4192,6 +4261,7 @@ mod tests {
             approved: true,
             manual_submission: false,
             submitted: false,
+            stay_signed_in: false,
         });
         service
             .private_action(&token, ViewAction::Click { x: 20., y: 15. })
