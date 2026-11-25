@@ -14,8 +14,9 @@
 //! | `vfs_write_then_stat` | `write_with_lookup` | (staging flows)   |
 //!
 //! `resources/read` maps `bloom:///<path>` onto daemon `read_inert`, which
-//! checks safety and reads under the package-mutation guard. Side-effecting
-//! reads and write-only controls remain tool-only.
+//! checks safety and reads, with a Petal route checked again under that
+//! Petal's own gate. Side-effecting reads and write-only controls remain
+//! tool-only.
 //!
 //! Because the proxy delegates, path parsing, authorization, policy gates,
 //! audit journalling, caching, and error codes all keep happening in

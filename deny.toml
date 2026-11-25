@@ -17,4 +17,9 @@ ignore = [
   { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; heimdall-only (bytecode-decompile feature)" },
   { id = "RUSTSEC-2025-0119", reason = "number_prefix unmaintained; heimdall-only (bytecode-decompile feature)" },
   { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; heimdall-only (bytecode-decompile feature)" },
+  # Wasmtime advisories the RustSec entries mark for every release before the
+  # fix, though the GitHub advisories they cite list only later ones as
+  # affected. Revisit on the next wasmtime upgrade (see bloom-petals' vm.rs).
+  { id = "RUSTSEC-2026-0567", reason = "GHSA-2674-w29h-wqvj affects wasmtime >=39 only, and only an engine that enables the threads proposal; Bloom pins 36 and never enables it" },
+  { id = "RUSTSEC-2026-0573", reason = "GHSA-wvgq-g5hf-6gm6 affects wasmtime >=47 only, and only with a GC heap or memory that may not move and a reservation that is not page-aligned; Bloom pins 36 and sets neither" },
 ]

@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import type { UnifiedConfig } from 'promptfoo';
 
 const evalDir = dirname(fileURLToPath(import.meta.url));
-const skillDir = resolve(evalDir, '../../skills/bloom');
+const skillDir = resolve(evalDir, '../../plugins/bloom/skills/bloom');
 
 function read(relativePath: string): string {
   return readFileSync(resolve(evalDir, relativePath), 'utf8').trim();
