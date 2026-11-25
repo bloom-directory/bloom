@@ -133,10 +133,6 @@ fn err_be(e: impl std::fmt::Display) -> HandlerError {
     HandlerError::backend(e.to_string())
 }
 
-fn pick_chain(intent: &RawIntent) -> String {
-    intent.chain.clone().unwrap_or_else(|| "anvil".to_string())
-}
-
 /// Convert a JSON state override (`{ "0xaddr": { "balance": "0x..", ... } }`)
 /// into alloy's typed `StateOverride`. Tolerates "balance" expressed either as
 /// a decimal string, a "0x"-hex string, or a positive integer; "code" as
@@ -530,22 +526,22 @@ impl SimulateHandler {
     /// Resolve a chain client for an intent, falling back to the only
     /// registered chain if exactly one is registered.
     fn pick_client(&self, intent: &RawIntent) -> Result<bloom_evm::ChainClient, HandlerError> {
-        let preferred = pick_chain(intent);
-        if let Some(c) = self.chains.get(&preferred) {
-            return Ok(c);
-        }
-        // Soft fallback for tests / single-chain setups.
         let names = self.chains.list_names();
-        if names.len() == 1 {
-            return self
-                .chains
-                .get(&names[0])
-                .ok_or_else(|| HandlerError::not_found(format!("chain '{}'", preferred)));
-        }
-        Err(HandlerError::not_found(format!(
-            "chain '{}' not registered (have: {:?})",
-            preferred, names
-        )))
+        let Some(preferred) = intent.chain.clone().or_else(|| match names.as_slice() {
+            [only] => Some(only.clone()),
+            _ => None,
+        }) else {
+            return Err(HandlerError::invalid(format!(
+                "name the chain: add \"chain\":\"<name>\" to the body (one of {})",
+                names.join(", ")
+            )));
+        };
+        self.chains.get(&preferred).ok_or_else(|| {
+            HandlerError::not_found(format!(
+                "chain '{}' not registered (have: {:?})",
+                preferred, names
+            ))
+        })
     }
 
     /// Run the simulation against the chain and stash the result.
