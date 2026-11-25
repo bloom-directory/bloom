@@ -123,6 +123,72 @@ pub const BACKGROUND_EFFECT_AUDIT_MATRIX: &[(&str, &str)] = &[
     ),
 ];
 
+/// Development builds only: `BLOOM_DEV_PETAL_ENDPOINTS="api.example.com=http://127.0.0.1:18080,..."`
+/// sends a Petal's HTTPS request for that host to a local stand-in server, with the venue's
+/// host in the `Host` header. Network policy and the audit log still see the venue's own URL.
+/// Benchmarks use it to run Petals against simulated venues; release builds ignore it.
+#[cfg(feature = "triad-dev-harness")]
+fn dev_petal_endpoint(url: &str) -> Option<(String, String)> {
+    static MAP: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+    let map = MAP.get_or_init(|| {
+        parse_dev_petal_endpoints(&std::env::var("BLOOM_DEV_PETAL_ENDPOINTS").unwrap_or_default())
+    });
+    rewrite_dev_petal_endpoint(map, url)
+}
+
+#[cfg(not(feature = "triad-dev-harness"))]
+fn dev_petal_endpoint(_url: &str) -> Option<(String, String)> {
+    None
+}
+
+#[cfg(any(test, feature = "triad-dev-harness"))]
+fn parse_dev_petal_endpoints(value: &str) -> Vec<(String, String)> {
+    value
+        .split(',')
+        .filter_map(|pair| pair.trim().split_once('='))
+        .filter(|(_, origin)| origin.starts_with("http://127.0.0.1:"))
+        .map(|(host, origin)| {
+            (
+                host.trim().to_ascii_lowercase(),
+                origin.trim_end_matches('/').to_string(),
+            )
+        })
+        .collect()
+}
+
+#[cfg(any(test, feature = "triad-dev-harness"))]
+fn rewrite_dev_petal_endpoint(map: &[(String, String)], url: &str) -> Option<(String, String)> {
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let (_, origin) = map.iter().find(|(name, _)| *name == host)?;
+    let query = parsed.query().map(|q| format!("?{q}")).unwrap_or_default();
+    Some((format!("{origin}{}{query}", parsed.path()), host))
+}
+
+#[cfg(test)]
+mod dev_petal_endpoint_tests {
+    use super::*;
+
+    #[test]
+    fn a_mapped_venue_goes_to_its_local_stand_in_with_its_own_host() {
+        let map = parse_dev_petal_endpoints(
+            "api.hyperliquid.xyz=http://127.0.0.1:18080/, evil.example=https://attacker.example",
+        );
+        assert_eq!(map.len(), 1, "only loopback http origins are accepted");
+        assert_eq!(
+            rewrite_dev_petal_endpoint(&map, "https://API.hyperliquid.xyz/info?x=1"),
+            Some((
+                "http://127.0.0.1:18080/info?x=1".into(),
+                "api.hyperliquid.xyz".into()
+            ))
+        );
+        assert_eq!(
+            rewrite_dev_petal_endpoint(&map, "https://clob.polymarket.com/book"),
+            None
+        );
+    }
+}
+
 const PETAL_HTTP_MAX_REDIRECTS: usize = 5;
 
 /// Concrete adapter that bridges the Machine-owned central outbox and
@@ -1820,7 +1886,14 @@ impl PetalHost for DaemonPetalHost {
                 let err = HostError::Invalid(format!("http method: {e}"));
                 self.audited_http_error(&correlation_id, &method, &url, "error", None, None, err)
             })?;
-            let mut builder = self.http.request(reqwest_method, &url);
+            let mut builder = match dev_petal_endpoint(&url) {
+                // Policy and audit above saw the venue's own URL; only the socket differs.
+                Some((local, host)) => self
+                    .http
+                    .request(reqwest_method, local)
+                    .header(reqwest::header::HOST, host),
+                None => self.http.request(reqwest_method, &url),
+            };
             for (name, value) in &headers {
                 builder = builder.header(name.as_str(), value.as_str());
             }
@@ -3088,6 +3161,28 @@ async fn daemon_petal_chain_read(
                 .await
                 .map_err(|e| HostError::Backend(format!("eth_call: {e}")))?;
             format!("0x{}", hex::encode(bytes))
+        }
+        "eth_getTransactionReceipt" => {
+            let [hash_param] = params.as_slice() else {
+                return Err(HostError::Invalid(
+                    "eth_getTransactionReceipt takes a single transaction hash".into(),
+                ));
+            };
+            let hash: alloy::primitives::B256 = hash_param
+                .as_str()
+                .ok_or_else(|| {
+                    HostError::Invalid("eth_getTransactionReceipt hash must be a string".into())
+                })?
+                .parse()
+                .map_err(|e| HostError::Invalid(format!("eth_getTransactionReceipt hash: {e}")))?;
+            // The guest parses this response as raw JSON, so return the
+            // receipt object (or null) without the string-quoting tail below.
+            let receipt = chain
+                .receipt_json(hash)
+                .await
+                .map_err(|e| HostError::Backend(format!("transaction receipt: {e}")))?;
+            return serde_json::to_string(&receipt)
+                .map_err(|e| HostError::Backend(format!("encode receipt: {e}")));
         }
         "eth_chainId" | "eth_getBalance" | "eth_getCode" | "eth_call" => {
             return Err(HostError::Invalid(format!(
@@ -8957,6 +9052,75 @@ mod tests {
         assert!(parse_petal_hex_bytes("70a08231", "data").is_err());
         assert!(parse_petal_hex_quantity("0x0", "value").is_ok());
         assert!(parse_petal_hex_quantity("0", "value").is_err());
+    }
+
+    #[tokio::test]
+    async fn daemon_petal_chain_read_returns_receipt_object_and_null() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let hash = format!("0x{}", "ab".repeat(32));
+        let block = format!("0x{}", "cd".repeat(32));
+        let to = format!("0x{}", "22".repeat(20));
+        let log = serde_json::json!({
+            "address": to, "topics": [format!("0x{}", "33".repeat(32))], "data": "0x1234",
+            "logIndex": "0x0", "transactionIndex": "0x0", "transactionHash": hash,
+            "blockHash": block, "blockNumber": "0x1", "removed": false
+        });
+        let receipt = serde_json::json!({
+            "transactionHash": hash, "transactionIndex": "0x0", "blockHash": block,
+            "blockNumber": "0x1", "from": format!("0x{}", "11".repeat(20)), "to": to,
+            "cumulativeGasUsed": "0x5208", "gasUsed": "0x5208", "effectiveGasPrice": "0x1",
+            "contractAddress": null, "status": "0x1", "type": "0x2",
+            "logsBloom": format!("0x{}", "00".repeat(256)), "logs": [log]
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let rpc = tokio::spawn(async move {
+            for result in [receipt, serde_json::Value::Null] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let request: serde_json::Value = loop {
+                    let mut chunk = [0; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n")
+                        && let Ok(request) = serde_json::from_slice(&bytes[end + 4..])
+                    {
+                        break request;
+                    }
+                };
+                assert_eq!(request["method"], "eth_getTransactionReceipt");
+                let body =
+                    serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+                        .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let mut spec = bloom_proto::ChainSpec::anvil_default();
+        spec.rpc_urls = vec![format!("http://{address}")];
+        let chain = ChainClient::new(spec).unwrap();
+        let method = "eth_getTransactionReceipt";
+
+        let bad = daemon_petal_chain_read(&chain, method, r#"["not-a-hash"]"#).await;
+        assert!(matches!(bad, Err(HostError::Invalid(_))), "{bad:?}");
+
+        let params = serde_json::json!([hash]).to_string();
+        let found: serde_json::Value = serde_json::from_str(
+            &daemon_petal_chain_read(&chain, method, &params)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(found["logs"], serde_json::json!([log]));
+        let missing = daemon_petal_chain_read(&chain, method, &params)
+            .await
+            .unwrap();
+        assert_eq!(missing, "null");
+        rpc.await.unwrap();
     }
 
     #[tokio::test]

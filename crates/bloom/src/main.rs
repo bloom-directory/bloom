@@ -1827,16 +1827,44 @@ async fn execute_machine_command(
             id,
             text,
         } => {
-            execute_wallet_outbox_action(
-                &daemon.vfs,
-                &wallet,
-                account,
-                &chain,
-                &id,
-                "cancel",
-                text.as_bytes(),
-            )
-            .await?;
+            let cancel = || {
+                execute_wallet_outbox_action(
+                    &daemon.vfs,
+                    &wallet,
+                    account,
+                    &chain,
+                    &id,
+                    "cancel",
+                    text.as_bytes(),
+                )
+            };
+            let mut result = cancel().await;
+            if let Err(error) = &result
+                && let Some(bloom_vfs::HandlerError::ApprovalPending(challenge)) =
+                    error.downcast_ref::<bloom_vfs::HandlerError>()
+            {
+                match pending_cancel_step(approval_challenge(&daemon.vfs, challenge).await) {
+                    // The cancellation is prepared and waits on the owner;
+                    // this is not a failure. Exit 3, as `wallet confirm` does.
+                    PendingCancelStep::Wait(url, expires_at_ms) => {
+                        return Ok(MachineCommandOutput {
+                            stdout: approval_pending_text(
+                                &url,
+                                expires_at_ms,
+                                None,
+                                "re-run this cancel after the owner approves",
+                            ),
+                            stderr: String::new(),
+                            exit_code: EXIT_APPROVAL_PENDING,
+                        });
+                    }
+                    // The owner approved after the write and before the
+                    // read, so the link is gone: send the cancel now.
+                    PendingCancelStep::Retry => result = cancel().await,
+                    PendingCancelStep::Fail => {}
+                }
+            }
+            result?;
             emit_machine_mutation("wallet_outbox_cancel", Some(&id), "committed");
             format!("cancel submitted for {id}\n")
         }
@@ -3470,22 +3498,7 @@ async fn confirm_projection(
     );
     if let Ok(bytes) = ipc_read(endpoint, &challenge_path).await {
         let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-        let url = value
-            .get("ceremony_url")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        let expires_at_ms = value
-            .get("expiry_ms")
-            .and_then(|field| {
-                field
-                    .as_u64()
-                    .or_else(|| field.as_str().and_then(|s| s.parse::<u64>().ok()))
-            })
-            .map(u128::from);
-        if let Some(url) = url
-            && !url.trim().is_empty()
-            && expires_at_ms.is_some_and(|expires| expires > unix_now_ms())
-        {
+        if let Some((url, expires_at_ms)) = live_ceremony(&value) {
             let petal_next = value
                 .get("staged_by")
                 .is_some_and(serde_json::Value::is_string)
@@ -3494,7 +3507,7 @@ async fn confirm_projection(
                 .map(str::to_string);
             return Some(ConfirmProjection::Ceremony {
                 url,
-                expires_at_ms: expires_at_ms.unwrap_or(0),
+                expires_at_ms,
                 petal_next,
             });
         }
@@ -3539,12 +3552,75 @@ async fn try_ipc_coded(
 }
 
 fn print_approval_pending(url: &str, expires_at_ms: u128, petal_next: Option<&str>, retry: &str) {
+    print!(
+        "{}",
+        approval_pending_text(
+            url,
+            expires_at_ms,
+            petal_next,
+            &format!("{retry} (waits for the owner's approval, then sends)")
+        )
+    );
+}
+
+fn approval_pending_text(
+    url: &str,
+    expires_at_ms: u128,
+    petal_next: Option<&str>,
+    next: &str,
+) -> String {
     let remaining = expires_at_ms.saturating_sub(unix_now_ms()) / 1000;
-    println!("Approval required: {url} (expires in {remaining}s)");
     match petal_next {
-        Some(next) => println!("{next}"),
-        None => println!("Next: {retry} (waits for the owner's approval, then sends)"),
+        Some(petal_next) => {
+            format!("Approval required: {url} (expires in {remaining}s)\n{petal_next}\n")
+        }
+        None => format!("Approval required: {url} (expires in {remaining}s)\nNext: {next}\n"),
     }
+}
+
+/// A projected `approval_challenge.json`, if it can be read.
+async fn approval_challenge(vfs: &bloom_vfs::Vfs, path: &str) -> Option<serde_json::Value> {
+    let path = bloom_vfs::VfsPath::parse(&format!("/{}", path.trim_start_matches('/'))).ok()?;
+    let bytes = bloom_vfs::Handler::read(vfs, &path).await.ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// What a cancel that came back approval-pending does next.
+#[derive(Debug, PartialEq)]
+enum PendingCancelStep {
+    /// The ceremony is open: give the caller its link and exit 3.
+    Wait(String, u128),
+    /// The owner already approved: send the cancel again.
+    Retry,
+    /// The ceremony ended without approval, or cannot be read: report the error.
+    Fail,
+}
+
+fn pending_cancel_step(challenge: Option<serde_json::Value>) -> PendingCancelStep {
+    let Some(challenge) = challenge else {
+        return PendingCancelStep::Fail;
+    };
+    if let Some((url, expires_at_ms)) = live_ceremony(&challenge) {
+        return PendingCancelStep::Wait(url, expires_at_ms);
+    }
+    if challenge.get("state").and_then(serde_json::Value::as_str) == Some("active") {
+        return PendingCancelStep::Retry;
+    }
+    PendingCancelStep::Fail
+}
+
+/// The ceremony link and expiry of an `approval_challenge.json` whose
+/// ceremony has not expired.
+fn live_ceremony(challenge: &serde_json::Value) -> Option<(String, u128)> {
+    let url = challenge.get("ceremony_url")?.as_str()?;
+    let expires_at_ms = challenge.get("expiry_ms").and_then(|field| {
+        field
+            .as_u64()
+            .or_else(|| field.as_str().and_then(|text| text.parse().ok()))
+    })?;
+    let expires_at_ms = u128::from(expires_at_ms);
+    (!url.trim().is_empty() && expires_at_ms > unix_now_ms())
+        .then(|| (url.to_string(), expires_at_ms))
 }
 
 /// Print the mined result, waiting a few seconds for it, so the caller need
@@ -5575,7 +5651,7 @@ mod tests {
 
     use super::{
         CeremonyCmd, Cli, Cmd, CustodyInputShape, LegacyMigrationReceiptFile,
-        MachineCommandEventClass, WalletCmd, ceremony_cancel_remote_result,
+        MachineCommandEventClass, PendingCancelStep, WalletCmd, ceremony_cancel_remote_result,
         ceremony_projection_path, commit_policy_update, emit_machine_mutation,
         emit_machine_mutation_rejection_if_needed, emit_machine_preparation_rejection_if_needed,
         emit_machine_ready, emit_remote_preparation, endpoint_connection_error,
@@ -5586,9 +5662,10 @@ mod tests {
         launch_passkey_enrollment_via_vfs, launch_wallet_registration_via_vfs,
         load_ceremony_projection, long_running_role, machine_command_event_fields,
         machine_error_from_anyhow, machine_wallet_lookup_error, open_machine_audit_with_history,
-        operation_cancel_remote_result, persist_ceremony_projection, policy_commit_remote_result,
-        request_body_with_wallet, wallet_import_kind,
+        operation_cancel_remote_result, pending_cancel_step, persist_ceremony_projection,
+        policy_commit_remote_result, request_body_with_wallet, wallet_import_kind,
     };
+    use super::{approval_pending_text, live_ceremony, unix_now_ms};
     use bloom_daemon::ipc::{
         MachineCeremonyAction, MachineCommand, MachineCustodyKind, MachineOperationAction,
     };
@@ -6885,6 +6962,58 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("unix:/restricted/bloom.sock"), "{message}");
         assert!(message.contains("bloom serve"), "{message}");
+    }
+
+    /// A waiting cancel tells the agent to re-run the cancel, not a confirm,
+    /// and only a challenge with an open ceremony yields a link.
+    #[test]
+    fn approval_pending_names_the_command_and_needs_a_live_ceremony() {
+        let later = unix_now_ms() + 60_000;
+        let text = approval_pending_text(
+            "https://relay.test/c",
+            later,
+            None,
+            "re-run this cancel after the owner approves",
+        );
+        assert!(
+            text.contains("Approval required: https://relay.test/c"),
+            "{text}"
+        );
+        assert!(text.contains("Next: re-run this cancel after"), "{text}");
+        let challenge = |url: &str, expiry: serde_json::Value| {
+            live_ceremony(&serde_json::json!({"ceremony_url": url, "expiry_ms": expiry}))
+        };
+        assert_eq!(
+            challenge("https://relay.test/c", later.to_string().into()),
+            Some(("https://relay.test/c".into(), later))
+        );
+        assert_eq!(challenge("https://relay.test/c", 1.into()), None);
+        assert_eq!(challenge(" ", later.to_string().into()), None);
+    }
+
+    /// The owner can approve between the cancel write and the challenge read.
+    /// The challenge is then active with no link, and the cancel is resent.
+    #[test]
+    fn a_pending_cancel_resends_once_the_owner_has_approved() {
+        let later = unix_now_ms() + 60_000;
+        let step = |challenge: serde_json::Value| pending_cancel_step(Some(challenge));
+        assert_eq!(
+            step(serde_json::json!({
+                "state": "awaiting_ceremony",
+                "ceremony_url": "https://relay.test/c",
+                "expiry_ms": later
+            })),
+            PendingCancelStep::Wait("https://relay.test/c".into(), later)
+        );
+        assert_eq!(
+            step(serde_json::json!({"state": "active", "next": "The owner approved."})),
+            PendingCancelStep::Retry
+        );
+        assert_eq!(
+            step(serde_json::json!({"state": "expired"})),
+            PendingCancelStep::Fail
+        );
+        assert_eq!(pending_cancel_step(None), PendingCancelStep::Fail);
     }
 }
 
