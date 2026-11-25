@@ -230,8 +230,8 @@ mod tests {
     use super::*;
     use crate::handler::EntryKind;
 
-    /// The body forms the guide and the outbox doc list are one list, and
-    /// every form in it parses, so neither drifts from the parser.
+    /// The guide lists the body forms once (the outbox doc points at it), and
+    /// every form in it parses, so the list never drifts from the parser.
     #[test]
     fn the_listed_send_tx_forms_match_and_parse() {
         let forms = |doc: &str| -> String {
@@ -242,7 +242,7 @@ mod tests {
             block.split_once("```").expect("closed").0.to_owned()
         };
         let guide = forms(include_str!("../docs/agent-guidance.md"));
-        assert_eq!(guide, forms(include_str!("../docs/outbox-evm.md")));
+        assert!(include_str!("../docs/outbox-evm.md").contains("`/AGENTS.md`"));
         let to = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
         for line in guide.lines() {
             // A JSON form is followed by a note on its units.

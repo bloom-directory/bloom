@@ -26,11 +26,14 @@ send 0.25 ETH to 0x...
 ```
 
 `call` encodes the arguments for you (a struct is a JSON array); `value`
-is in wei.
+is in wei. A swap, loan, stake or bridge is an approve, then a `call` to the
+protocol's own contract, in one write. `petals/` holds installed venue packages
+(each with a `README.md`); use one when the request names its venue. No route
+signs an off-chain message (a permit or other EIP-712 data) for you.
 
 That stages it, asks the owner, and answers with what will be signed and
 their approval link (on a mount the write is refused; both are in
-`latest/plan.md`). `latest/` is that entry, before and after it is sent:
+`latest/plan.md`). `latest/` is that entry (the answer names it as `pending/<id>/`), before and after it is sent:
 `latest/plan.md` is what will be signed, writing `y` to
 `latest/confirm` waits for the approval, sends, and answers with the receipt
 of each entry it sent and the account's balances on that chain, each with
@@ -40,7 +43,9 @@ stages it; `cancel` written to `latest/confirm` discards an entry, with the rest
 its batch.
 
 Several bodies in one write, one per line, go under one approval, in order (an
-approve, then the call that spends it).
+approve, then the call that spends it). Bloom simulates them in that order
+before asking the owner and refuses the write, naming the line, if one would
+revert; you need not simulate them yourself.
 
 ## Rules
 
