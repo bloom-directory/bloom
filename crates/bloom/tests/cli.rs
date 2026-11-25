@@ -957,6 +957,174 @@ fn init_ignores_legacy_preinstalled_opt_out() {
         ));
 }
 
+/// Setup is recorded when it finishes, not inferred from the config file:
+/// `bloom serve` writes a default config before any `bloom init`, and an
+/// empty `[setup.petals]` is a valid choice rather than "never asked".
+#[test]
+fn init_runs_setup_once_even_when_the_config_already_exists() {
+    let home = fresh_home();
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    home_dir.ensure().unwrap();
+    // What `bloom serve` leaves behind when it starts before any `bloom init`.
+    bloom_proto::Config::local_default()
+        .save(&home_dir.config_path())
+        .unwrap();
+    let init = |home: &Path| {
+        bloom_cmd(home)
+            .env("HTTPS_PROXY", "http://127.0.0.1:1")
+            .env("https_proxy", "http://127.0.0.1:1")
+            .env("NO_PROXY", "")
+            .env("no_proxy", "")
+            .arg("init")
+            .assert()
+            // Setup is saved before Petal provisioning, which is offline here.
+            .failure()
+            .stderr(predicate::str::contains(
+                "provision canonical pre-installed Petals",
+            ));
+    };
+
+    init(home.path());
+    let mut config = bloom_proto::Config::load(&home_dir.config_path()).unwrap();
+    assert!(config.setup.complete);
+    assert!(
+        config.setup.main().petals.contains_key("hyperliquid"),
+        "non-interactive setup records the catalog's suggestions: {:?}",
+        config.setup.main().petals
+    );
+
+    // The owner's choice was "none of them"; a later run must keep it.
+    config.setup.main_mut().petals.clear();
+    config.save(&home_dir.config_path()).unwrap();
+    init(home.path());
+    let config = bloom_proto::Config::load(&home_dir.config_path()).unwrap();
+    assert!(config.setup.complete);
+    assert!(
+        config.setup.main().petals.is_empty(),
+        "{:?}",
+        config.setup.main().petals
+    );
+}
+
+/// On a home whose config predates setup, `bloom init` adds `[setup]` and
+/// leaves the rest of the owner's config as they wrote it, comments included.
+#[test]
+fn init_keeps_an_existing_hand_edited_config() {
+    let home = fresh_home();
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    home_dir.ensure().unwrap();
+    bloom_proto::Config::local_default()
+        .save(&home_dir.config_path())
+        .unwrap();
+    let original = std::fs::read_to_string(home_dir.config_path()).unwrap();
+    let edited = format!("# my RPC notes: keep this\n{original}");
+    std::fs::write(home_dir.config_path(), &edited).unwrap();
+    bloom_cmd(home.path())
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("https_proxy", "http://127.0.0.1:1")
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .arg("init")
+        .assert()
+        // Setup is saved before Petal provisioning, which is offline here.
+        .failure();
+    let after = std::fs::read_to_string(home_dir.config_path()).unwrap();
+    assert!(after.starts_with(&edited), "{after}");
+    let config = bloom_proto::Config::load(&home_dir.config_path()).unwrap();
+    assert!(config.setup.complete);
+}
+
+/// A config the owner keeps read-only, here symlinked into a read-only
+/// directory as a managed dotfiles setup would, is left alone: `bloom init`
+/// says what to add, says what it chose without a terminal, and still goes on
+/// to install the Petals.
+#[cfg(unix)]
+#[test]
+fn init_with_a_read_only_config_still_installs_the_petals() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let home = fresh_home();
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    home_dir.ensure().unwrap();
+    let managed = home.path().join("managed");
+    std::fs::create_dir_all(&managed).unwrap();
+    let real = managed.join("config.toml");
+    bloom_proto::Config::local_default().save(&real).unwrap();
+    let original = std::fs::read_to_string(&real).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o444)).unwrap();
+    std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o555)).unwrap();
+    std::os::unix::fs::symlink(&real, home_dir.config_path()).unwrap();
+    let output = bloom_cmd(home.path())
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("https_proxy", "http://127.0.0.1:1")
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .arg("init")
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("main's default policy will allow"),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains("could not save setup's choices"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("[setup.wallets.main.petals.polymarket]"),
+        "{stderr}"
+    );
+    // Provisioning, offline here, is still attempted.
+    assert!(
+        stderr.contains("provision canonical pre-installed Petals"),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), original);
+}
+
+/// Choices recorded before setup finished, as by a run that stopped
+/// part-way, are kept when `bloom init` runs setup again: a declined Petal
+/// stays declined.
+#[test]
+fn init_setup_on_an_existing_config_keeps_earlier_choices() {
+    let home = fresh_home();
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    home_dir.ensure().unwrap();
+    let mut config = bloom_proto::Config::local_default();
+    config
+        .setup
+        .main_mut()
+        .petals
+        .insert("polymarket".into(), Default::default());
+    assert!(!config.setup.complete);
+    config.save(&home_dir.config_path()).unwrap();
+
+    bloom_cmd(home.path())
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("https_proxy", "http://127.0.0.1:1")
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .arg("init")
+        .assert()
+        // Setup is saved before Petal provisioning, which is offline here.
+        .failure()
+        .stderr(predicate::str::contains(
+            "provision canonical pre-installed Petals",
+        ));
+
+    let config = bloom_proto::Config::load(&home_dir.config_path()).unwrap();
+    assert!(config.setup.complete);
+    assert_eq!(
+        config.setup.main().petals.keys().collect::<Vec<_>>(),
+        ["polymarket"],
+        "declined Petals were added back: {:?}",
+        config.setup.main().petals
+    );
+}
+
 #[test]
 fn vfs_write_help_exposes_no_unlock_or_secret_flags() {
     let home = fresh_home();
@@ -3267,7 +3435,7 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         return;
     }
     // Exercise source installation of the current pinned Polymarket release.
-    let petal_ref = "1141037cc840127c48c06f1f4e39da78225ff188";
+    let petal_ref = "b0352659abd53abbf186382803de63d1f8412a98";
     let home = fresh_home();
     let home_dir = bloom_proto::HomeDir::at(home.path());
     let config = bloom_proto::Config::local_default();
@@ -3296,8 +3464,8 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         )))
         .stdout(predicate::str::contains("Building source package..."))
         .stdout(predicate::str::contains("Validating Petal package..."))
-        .stdout(predicate::str::contains("\"routes\": 110"))
-        .stdout(predicate::str::contains("routes: 110"));
+        .stdout(predicate::str::contains("\"routes\": 109"))
+        .stdout(predicate::str::contains("routes: 109"));
 
     bloom_cmd(home.path())
         .args(["petals", "ls"])

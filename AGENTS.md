@@ -56,7 +56,7 @@ Agent evals live in [evals/harbor](./evals/harbor/README.md); read its Purpose
 before changing Bloom's agent-facing docs, routes or errors.
 Evals of the published agent skill live in
 [evals/skills](./evals/skills/README.md); run its `check` after changing
-`skills/bloom/`.
+`plugins/bloom/`.
 
 Use separate target directories for concurrent Cargo builds. Select the exact
 Machine, Broker, and Signer binaries for integration work, and record their
