@@ -9,14 +9,17 @@ approval, and key custody are enforced outside the agent: every transaction
 waits for the user's passkey in a browser ceremony, or for a Sealed Approval
 the user signed in advance.
 
-This package is one skill, `SKILL.md`. It contains guidance only; it does not
-install Bloom or create a wallet. Install it with
+This plugin holds one skill, `skills/bloom/SKILL.md`. It contains guidance
+only; it does not install Bloom or create a wallet. Install it with
 `clawhub install @bloom-directory/bloom` or `npx skills add bloom-directory/bloom`,
-or in Claude Code with:
+in Claude Code with:
 
 ```text
 /plugin install bloom --marketplace bloom-directory/bloom
 ```
+
+or in Codex with
+`codex plugin marketplace add bloom-directory/bloom && codex plugin add bloom@bloom`.
 
 ## What it runs
 
