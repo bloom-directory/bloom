@@ -457,6 +457,16 @@ impl CheckoutService {
         self.browser.return_control_signed_in().await
     }
 
+    /// Hands back control, keeping the signed-in session only when `stay_signed_in`
+    /// is true and no saved traveler data was filled.
+    async fn return_with_consent(&self, stay_signed_in: bool) -> Result<()> {
+        if stay_signed_in {
+            self.return_unreleased().await
+        } else {
+            self.return_control().await
+        }
+    }
+
     pub fn new(
         browser: Arc<Browser>,
         state: &Path,
@@ -895,7 +905,7 @@ impl CheckoutService {
                             .get(&operation_id)
                             .is_ok_and(|status| status.state == "failed_before_release")
                         {
-                            if self.return_control().await.is_ok() {
+                            if self.return_unreleased().await.is_ok() {
                                 *private = None;
                             } else {
                                 self.mark_paused(&operation_id);
@@ -911,7 +921,7 @@ impl CheckoutService {
                     | CardOperationState::Failed
                     | CardOperationState::Missing => {
                         self.set_state(&operation_id, "failed_before_release");
-                        if self.return_control().await.is_ok() {
+                        if self.return_unreleased().await.is_ok() {
                             *private = None;
                         } else {
                             self.mark_paused(&operation_id);
@@ -923,7 +933,7 @@ impl CheckoutService {
             }
             if tokio::time::Instant::now() >= deadline {
                 self.set_state(&operation_id, "expired");
-                if self.return_control().await.is_ok() {
+                if self.return_unreleased().await.is_ok() {
                     *private = None;
                 } else {
                     self.mark_paused(&operation_id);
@@ -1287,13 +1297,7 @@ impl CheckoutService {
     /// Closes the private view, keeping cookies when `stay_signed_in` is true
     /// and no saved traveler data was used.
     async fn finish(&self, operation_id: &str, mode: Mode, stay_signed_in: bool) -> Result<()> {
-        let keep = stay_signed_in && !self.browser.has_private_traveler_data();
-        if keep {
-            self.saved.lock().take();
-            self.browser.return_control_signed_in().await?;
-        } else {
-            self.return_control().await?;
-        }
+        self.return_with_consent(stay_signed_in).await?;
         let current = self.store.get(operation_id)?.state;
         self.set_state(
             operation_id,
@@ -1522,14 +1526,8 @@ impl CheckoutService {
                                 .await
                                 .as_ref()
                                 .filter(|p| p.operation_id == id)
-                                .is_some_and(|p| p.stay_signed_in)
-                                && !self.browser.has_private_traveler_data();
-                            let returned = if stay_signed_in {
-                                self.saved.lock().take();
-                                self.browser.return_control_signed_in().await.is_ok()
-                            } else {
-                                self.return_control().await.is_ok()
-                            };
+                                .is_some_and(|p| p.stay_signed_in);
+                            let returned = self.return_with_consent(stay_signed_in).await.is_ok();
                             if returned {
                                 let mut private = self.private.lock().await;
                                 if let Some(checkout) =
@@ -1550,9 +1548,14 @@ impl CheckoutService {
                 }
             }
             if tokio::time::Instant::now() >= deadline {
-                // Every handback discards the browsing context: a login the
-                // person made must never stay usable by shopping.
-                if self.return_control().await.is_ok() {
+                let stay_signed_in = self
+                    .private
+                    .lock()
+                    .await
+                    .as_ref()
+                    .filter(|p| p.operation_id == id)
+                    .is_some_and(|p| p.stay_signed_in);
+                if self.return_with_consent(stay_signed_in).await.is_ok() {
                     let current = self.store.get(&id).map(|s| s.state).unwrap_or_default();
                     let final_state = if mode == Mode::TakeOver && current == "human_control" {
                         "returned"
