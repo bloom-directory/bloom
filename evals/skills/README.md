@@ -1,6 +1,6 @@
 # Skill evaluations
 
-Promptfoo evaluations of the agent skill in [`skills/bloom`](../../skills/bloom/)
+Promptfoo evaluations of the agent skill in [`plugins/bloom/skills/bloom`](../../plugins/bloom/skills/bloom/)
 and the [install guide](../../install/install.md) it links. They read the files
 directly, so an evaluation always covers them as committed on this branch. The
 website serves the same files at a pinned commit and has no evaluation of its own.
