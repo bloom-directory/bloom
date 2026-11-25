@@ -30,8 +30,10 @@
 //!
 //! An endpoint that replies with a JSON-RPC error (a revert, "nonce too
 //! low", an unknown block) has answered. The retry layer below the pool
-//! hands that reply over as `TransportError::ErrorResp`, and the pool
-//! treats it as the endpoint's answer, not as a failure:
+//! passes that reply up as a response, as if it were a result, so the pool
+//! turns it into `TransportError::ErrorResp`, as alloy's RPC client reports
+//! it to the caller anyway. The pool treats it as the endpoint's answer,
+//! not as a failure:
 //!
 //! - It is not recorded in endpoint health, for or against. A revert says
 //!   nothing about the endpoint, while a reply such as "invalid project
@@ -45,9 +47,9 @@
 //!   window, so a revert the node sends as a JSON-RPC reply is never
 //!   reported as an unreachable endpoint. Callers rely on this: a
 //!   pre-broadcast simulation reads a transport error as "simulation
-//!   unavailable" and lets the transaction through. A revert sent with a
-//!   non-2xx HTTP status is a transport error, since alloy turns such a
-//!   response into one without reading its body.
+//!   unavailable" and lets the transaction through. A JSON-RPC error sent
+//!   with a non-2xx HTTP status is an error reply too, since the endpoint's
+//!   transport reads the body whatever the status.
 //! - A submission does the opposite: it returns a transport error in
 //!   preference to an error reply. The endpoint that failed may have
 //!   accepted the transaction before its reply was lost, so the outcome is
@@ -57,8 +59,9 @@
 //!
 //! A race still waits for its other endpoints after an error reply,
 //! because one of them may return a result. Only transport errors
-//! (connection failures, timeouts, HTTP error statuses, retries exhausted
-//! on rate limits) count against an endpoint and move a read on.
+//! (connection failures, timeouts, HTTP error statuses without a JSON-RPC
+//! error in the body, retries exhausted on rate limits) count against an
+//! endpoint and move a read on.
 
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -122,6 +125,17 @@ fn is_submission(method: &str) -> bool {
 /// failing to answer at all.
 fn is_error_reply(err: &TransportError) -> bool {
     err.as_error_resp().is_some()
+}
+
+/// A response carrying a JSON-RPC error, as `TransportError::ErrorResp`.
+/// alloy's retry layer passes such a response up as a success, and without
+/// this the pool would take a revert or a refusal for a result: a race
+/// would end on it, and the endpoint would be recorded as working.
+fn error_reply_as_err(response: ResponsePacket) -> Result<ResponsePacket, TransportError> {
+    match response.as_error() {
+        Some(payload) => Err(TransportError::ErrorResp(payload.clone())),
+        None => Ok(response),
+    }
 }
 
 /// The errors one window produced, kept so the right one is returned.
@@ -298,7 +312,7 @@ impl PoolInner {
         let started = Instant::now();
         let call = transport.call(req);
         async move {
-            let result = call.await;
+            let result = call.await.and_then(error_reply_as_err);
             match &result {
                 Ok(_) => self.health.record_success(idx, started.elapsed(), None),
                 // The endpoint answered, but whether the reply reflects on
@@ -480,8 +494,8 @@ mod tests {
         pool_with(mocks, BoxTransport::new)
     }
 
-    /// Each mock behind the production retry layer, which is what turns a
-    /// JSON-RPC error reply into `TransportError::ErrorResp`.
+    /// Each mock behind the production retry layer, which retries rate
+    /// limits and passes every other JSON-RPC error reply up as a response.
     fn pool_behind_retry_layer(mocks: &[MockEndpoint]) -> (EndpointPool, HealthRegistry) {
         pool_with(mocks, |mock| {
             ServiceBuilder::new()

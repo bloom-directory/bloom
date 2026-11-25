@@ -525,8 +525,7 @@ async fn run_probe_round(chain: &str, targets: &[ProbeTarget], health: &HealthRe
 
 /// The retry layer every HTTP endpoint sits behind. It retries what
 /// [`BloomRetryPolicy`] classifies as transient (rate limits, 5xx) and
-/// hands any other JSON-RPC error reply to the pool as
-/// `TransportError::ErrorResp`.
+/// passes any other JSON-RPC error reply up to the pool as a response.
 pub(crate) fn retry_layer(cu_per_sec: u64) -> RetryBackoffLayer<BloomRetryPolicy> {
     RetryBackoffLayer::new_with_policy(
         MAX_RETRIES,
@@ -656,6 +655,98 @@ mod tests {
         for key in ["USERINFO-KEY", "PATH-KEY", "QUERY-KEY", "/v2/"] {
             assert!(!text.contains(key), "{key} leaked: {text}");
         }
+    }
+
+    /// A local HTTP endpoint that reads each request and answers it with
+    /// `status` and `body`.
+    async fn endpoint_answering(status: &'static str, body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    // Read the whole request first, so the client sees the
+                    // answer rather than a reset connection.
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                        let Some(head) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                            continue;
+                        };
+                        let length = String::from_utf8_lossy(&request[..head])
+                            .to_ascii_lowercase()
+                            .lines()
+                            .find_map(|line| {
+                                line.strip_prefix("content-length:")?.trim().parse().ok()
+                            })
+                            .unwrap_or(0usize);
+                        if request.len() >= head + 4 + length {
+                            break;
+                        }
+                    }
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        url
+    }
+
+    /// An engine over `urls`, with no configured endpoint overrides.
+    fn engine_over(urls: Vec<String>) -> RpcEngine {
+        let mut spec = ChainSpec::anvil_default();
+        spec.rpc_urls = urls;
+        spec.rpc_endpoints.clear();
+        RpcEngine::build(&spec).expect("build engine")
+    }
+
+    /// Some nodes and providers send a JSON-RPC error, a revert among
+    /// them, with a 4xx status. It is the node's answer: it must reach the
+    /// caller as an error reply, not lose to a dead endpoint's transport
+    /// error, which a pre-broadcast simulation reads as "unavailable".
+    #[tokio::test]
+    async fn a_json_rpc_error_sent_with_an_error_status_is_an_error_reply() {
+        use alloy::providers::Provider;
+
+        let reverts = endpoint_answering(
+            "400 Bad Request",
+            r#"{"jsonrpc":"2.0","id":0,"error":{"code":3,"message":"execution reverted","data":"0x"}}"#,
+        )
+        .await;
+        let (dead, _) = url_with_keys();
+        let engine = engine_over(vec![reverts, dead]);
+        let err = engine.provider().get_block_number().await.unwrap_err();
+        let payload = err
+            .as_error_resp()
+            .unwrap_or_else(|| panic!("expected an error reply, got {err}"));
+        assert_eq!(payload.code, 3);
+    }
+
+    /// An error status whose body is not a JSON-RPC error is the
+    /// endpoint failing, as before.
+    #[tokio::test]
+    async fn an_error_status_without_a_json_rpc_error_is_a_transport_error() {
+        use alloy::providers::Provider;
+
+        let url = endpoint_answering("400 Bad Request", "bad request").await;
+        let err = engine_over(vec![url])
+            .provider()
+            .get_block_number()
+            .await
+            .unwrap_err();
+        assert!(err.as_error_resp().is_none(), "{err}");
+        assert!(err.to_string().contains("400"), "{err}");
     }
 
     #[tokio::test]

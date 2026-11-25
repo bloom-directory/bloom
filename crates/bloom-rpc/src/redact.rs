@@ -51,10 +51,13 @@ fn origin(url: &Url) -> String {
 }
 
 /// One endpoint's HTTP transport. It posts each JSON-RPC request and reads
-/// the reply as alloy's `Http<reqwest::Client>` does: a non-2xx status is an
-/// HTTP error carrying the body, and a body that is not JSON-RPC is a
+/// the reply as alloy's `Http<reqwest::Client>` does: a JSON-RPC error is
+/// the node's answer whatever the HTTP status, any other non-2xx status is
+/// an HTTP error carrying the body, and a body that is not JSON-RPC is a
 /// deserialization error carrying it. Unlike alloy's, neither its tracing
-/// span nor its errors contain the URL.
+/// span nor its errors contain the URL, and it does not turn a
+/// `Retry-After` header into a retry delay: the pool moves a call on to
+/// another endpoint rather than wait out whatever delay a server asks for.
 #[derive(Clone)]
 pub(crate) struct EndpointHttp {
     client: reqwest::Client,
@@ -89,6 +92,13 @@ impl EndpointHttp {
         // explain itself in it.
         let body = resp.bytes().await.map_err(failed)?;
         if !status.is_success() {
+            // Nodes and providers send some JSON-RPC errors, reverts among
+            // them, with a 4xx or 5xx status.
+            if let Ok(reply) = serde_json::from_slice::<ResponsePacket>(&body)
+                && reply.is_error()
+            {
+                return Ok(reply);
+            }
             return Err(TransportErrorKind::http_error(
                 status.as_u16(),
                 String::from_utf8_lossy(&body).into_owned(),
