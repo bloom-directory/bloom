@@ -8,6 +8,7 @@ description = "Layered RPC engine (retry + fallback + throttle) for bloom"
 [dependencies]
 bloom-proto.workspace = true
 bloom-rpc-common.workspace = true
+futures.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
 thiserror.workspace = true
@@ -16,7 +17,9 @@ tracing.workspace = true
 url.workspace = true
 alloy.workspace = true
 tower = "0.5"
+serde_json.workspace = true
 
 [dev-dependencies]
+tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 serde_json.workspace = true

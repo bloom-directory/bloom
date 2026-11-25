@@ -7,14 +7,16 @@
 //!  ↓
 //! [ThrottleLayer (only if endpoint.max_rps is Some)]
 //!  ↓
-//! [Http transport]
+//! [EndpointHttp: reqwest, each request bounded by REQUEST_TIMEOUT, URL
+//!  kept out of errors and logs]
 //! ```
 //!
-//! The fallback fan-out wraps the per-endpoint stacks in a single
-//! `FallbackLayer` with `active_transport_count = min(2, endpoints.len())`
-//! so two endpoints race for each call. A two-endpoint chain therefore
-//! always queries both in parallel; bigger lists rotate the top two by
-//! score.
+//! The per-endpoint stacks are joined by an `EndpointPool`, which ranks
+//! them by the `HealthRegistry` on every call and races the top
+//! `min(2, endpoints.len())` in parallel. A read whose whole race fails
+//! moves on to the next endpoints in the ranking, so it reaches any
+//! working endpoint; a submission such as `eth_sendRawTransaction` is
+//! never offered to more than the first race. See `pool.rs`.
 //!
 //! ## HTTP / WS split
 //!
@@ -38,21 +40,13 @@
 //!
 //! On `RpcEngine::build` we also spawn one tokio task per engine that
 //! periodically probes each HTTP endpoint *directly* — bypassing the
-//! fallback fan-out — with a 2 s `eth_blockNumber` call. Outcomes are
-//! folded into the `HealthRegistry` so the cooldown state machine
-//! reflects actual reachability rather than the alloy layer's
-//! private metrics. The task is cancelled when `RpcEngine` drops via
-//! a `tokio::sync::watch` channel.
-//!
-//! ### Scope note: filtering the fallback pool
-//!
-//! Alloy's `FallbackLayer` does not expose a runtime hook to exclude
-//! transports based on Bloom-side health. For WP-3 we therefore record
-//! cooldowns for observability only — the fallback fan-out still
-//! queries cooled-down endpoints in parallel. The eviction story can
-//! land later as either an upstream PR or a thin wrapping layer.
+//! pool — with a 2 s `eth_blockNumber` call. Outcomes are folded into
+//! the `HealthRegistry`, alongside the outcomes of live calls, so every
+//! configured endpoint is measured whether or not the pool has routed
+//! traffic to it. The pool ranks cooled-down endpoints last rather than
+//! removing them. The task is cancelled when `RpcEngine` drops via a
+//! `tokio::sync::watch` channel.
 
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -60,10 +54,10 @@ use alloy::network::Ethereum;
 use alloy::primitives::U64;
 use alloy::providers::RootProvider;
 use alloy::rpc::client::RpcClient;
-use alloy::transports::http::{Http, reqwest};
-use alloy::transports::layers::{FallbackLayer, RetryBackoffLayer, ThrottleLayer};
+use alloy::transports::http::reqwest;
+use alloy::transports::layers::{RetryBackoffLayer, ThrottleLayer};
 use alloy::transports::ws::WsConnect;
-use alloy::transports::{BoxTransport, IntoBoxTransport};
+use alloy::transports::{BoxTransport, IntoBoxTransport, TransportErrorKind};
 use bloom_proto::{ChainSpec, EndpointSpec};
 use tokio::sync::{OnceCell, watch};
 use tower::ServiceBuilder;
@@ -71,15 +65,17 @@ use tracing::{debug, info, warn};
 
 use crate::endpoint::{EndpointScheme, classify_endpoint, is_subscription_capable};
 use crate::error::BloomRpcError;
-use crate::health::{CooldownDecision, EndpointHealthSnapshot, HealthRegistry};
+use crate::health::{EndpointHealthSnapshot, HealthRegistry};
 use crate::policy::BloomRetryPolicy;
+use crate::pool::{EndpointPool, PoolEndpoint, emit_cooldown_event};
+use crate::redact::{EndpointHttp, redact_url};
 
 /// Default compute-units-per-second when the operator hasn't set
 /// `cu_per_sec`. Mirrors alloy's own internal default for the retry
 /// layer (Alchemy free-tier 330 CU/s × 2 ≈ 660). The cost is a
 /// conservative throttle on retry pacing only — it doesn't reject
 /// calls.
-const DEFAULT_CU_PER_SEC: u64 = 660;
+pub(crate) const DEFAULT_CU_PER_SEC: u64 = 660;
 
 /// Maximum retries applied by `RetryBackoffLayer`. Three is the value
 /// the spec recommends: one for transient network blips, one for a
@@ -102,6 +98,28 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(15);
 /// is, by definition, no use as a backing transport for live UI
 /// reads.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Hard bound for one HTTP request to one endpoint, from connecting until
+/// the response body has arrived. A race ends only when an endpoint
+/// answers or every endpoint in it has failed, so without this bound an
+/// endpoint that accepts the connection and never answers would hold up
+/// every call that reaches it before a working endpoint does. A timeout
+/// is a transport error: the retry layer does not retry it, and the pool
+/// counts it against the endpoint and moves a read on.
+///
+/// It is longer than `bloom-solana`'s 10 s because EVM calls can be
+/// legitimately slow where Solana's are not: `eth_getLogs` over a
+/// caller-chosen block range, `debug_traceCall`, `eth_simulateV1`. A
+/// tighter bound failed those calls, counted the healthy endpoints that
+/// served them as failing, and turned a slow but accepted broadcast into
+/// an unknown outcome.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bound for establishing the connection, within [`REQUEST_TIMEOUT`]. An
+/// endpoint that drops connection attempts (a filtered network, a
+/// sinkholed address) fails after this rather than after the full
+/// request bound, and no legitimate call needs longer to connect.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One entry in the per-endpoint probe table. The `transport` is the
 /// fully-layered HTTP stack for one endpoint; the `idx` is the slot
@@ -154,7 +172,7 @@ impl RpcEngine {
     ///
     /// Each endpoint URL is classified into HTTP or WS; HTTP-shaped
     /// endpoints are wrapped in retry + optional throttle and joined
-    /// under a fallback layer. WS-shaped endpoints not flagged
+    /// in an `EndpointPool`. WS-shaped endpoints not flagged
     /// `http_only` are stashed as `WsConnect` configurations and
     /// opened lazily by `ws_provider().await` so the build remains
     /// sync.
@@ -164,11 +182,17 @@ impl RpcEngine {
             return Err(BloomRpcError::NoEndpoints(spec.name.clone()));
         }
 
-        let mut http_transports: Vec<BoxTransport> = Vec::new();
+        let mut pool_endpoints: Vec<PoolEndpoint> = Vec::new();
         let mut probe_targets: Vec<ProbeTarget> = Vec::new();
         let mut tracked_urls: Vec<String> = Vec::new();
         let mut ws_connects: Vec<WsConnect> = Vec::new();
         let mut supports_subscriptions = false;
+        // One client for every endpoint, so they share its timeouts.
+        let http_client = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+            .map_err(|e| BloomRpcError::Transport(TransportErrorKind::custom(e)))?;
 
         for ep in &endpoints {
             let (url, scheme) = classify_endpoint(ep)?;
@@ -177,24 +201,27 @@ impl RpcEngine {
             }
             match scheme {
                 EndpointScheme::Http => {
-                    let transport = build_http_stack(&url, ep);
+                    let transport = build_http_stack(&url, ep, http_client.clone());
                     let idx = tracked_urls.len();
                     tracked_urls.push(ep.url.clone());
                     // Keep a clone for the probe loop. `BoxTransport`
                     // is `Clone` (Arc inside), so the per-endpoint
                     // RpcClient shares connection state with the
-                    // fallback fan-out — probes therefore reflect
-                    // exactly what production traffic would see.
+                    // pool — probes therefore reflect exactly what
+                    // production traffic would see.
                     let probe_client = RpcClient::new(transport.clone(), false);
                     probe_targets.push(ProbeTarget {
                         idx,
                         url: ep.url.clone(),
                         client: probe_client,
                     });
-                    http_transports.push(transport);
+                    pool_endpoints.push(PoolEndpoint {
+                        label: redact_url(&ep.url),
+                        transport,
+                    });
                     debug!(
                         chain = %spec.name,
-                        url = %redacted(&ep.url),
+                        url = %redact_url(&ep.url),
                         weight = ep.weight,
                         cu_per_sec = ep.cu_per_sec,
                         max_rps = ep.max_rps,
@@ -210,7 +237,7 @@ impl RpcEngine {
                     if ep.http_only {
                         debug!(
                             chain = %spec.name,
-                            url = %redacted(&ep.url),
+                            url = %redact_url(&ep.url),
                             "rpc.transport.ws_endpoint_skipped_http_only"
                         );
                         continue;
@@ -218,7 +245,7 @@ impl RpcEngine {
                     ws_connects.push(WsConnect::new(url.as_str()));
                     debug!(
                         chain = %spec.name,
-                        url = %redacted(&ep.url),
+                        url = %redact_url(&ep.url),
                         weight = ep.weight,
                         "rpc.transport.ws_connect_registered"
                     );
@@ -226,30 +253,21 @@ impl RpcEngine {
             }
         }
 
-        if http_transports.is_empty() {
+        if pool_endpoints.is_empty() {
             return Err(BloomRpcError::NoEndpoints(spec.name.clone()));
         }
 
-        let active = NonZeroUsize::new(http_transports.len().min(2)).unwrap_or(
-            // SAFETY: `http_transports.is_empty()` was rejected above,
-            // so `len() >= 1` and `min(2) >= 1`. The unwrap_or branch
-            // is unreachable; we still write the fallback to avoid an
-            // explicit unwrap that future readers might mis-edit.
-            NonZeroUsize::new(1).unwrap(),
-        );
-        let fallback = FallbackLayer::default().with_active_transport_count(active);
-
-        let service = ServiceBuilder::new()
-            .layer(fallback)
-            .service(http_transports);
+        let http_endpoints = pool_endpoints.len();
+        let health = HealthRegistry::new(tracked_urls);
+        let pool = EndpointPool::new(spec.name.clone(), pool_endpoints, health.clone());
+        let race_width = pool.race_width();
         // Loopback URLs are tagged "local" by alloy's HTTP transport;
         // we don't have visibility into per-endpoint locality at this
         // outer layer, so default to false (the most conservative
         // choice for retry/timeout heuristics).
-        let client: RpcClient = RpcClient::new(service, false);
+        let client: RpcClient = RpcClient::new(pool, false);
         let provider: RootProvider<Ethereum> = RootProvider::<Ethereum>::new(client.clone());
 
-        let health = HealthRegistry::new(tracked_urls);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         spawn_probe_loop(
             spec.name.clone(),
@@ -261,7 +279,8 @@ impl RpcEngine {
         info!(
             chain = %spec.name,
             endpoints = endpoints.len(),
-            http_endpoints = active.get(),
+            http_endpoints,
+            race_width,
             ws_endpoints = ws_connects.len(),
             supports_subscriptions,
             "rpc.engine.built"
@@ -355,9 +374,8 @@ impl RpcEngine {
         }
     }
 
-    /// Per-endpoint health view. Values reflect the most recent probe
-    /// outcomes; production traffic does not (yet) update this view —
-    /// see the scope note in `health.rs`.
+    /// Per-endpoint health view, fed by probe outcomes and by the
+    /// outcomes of live calls routed through the pool.
     pub fn endpoints_snapshot(&self) -> Vec<EndpointHealthSnapshot> {
         self.health.snapshot()
     }
@@ -450,7 +468,7 @@ async fn run_probe_round(chain: &str, targets: &[ProbeTarget], health: &HealthRe
         debug!(
             chain = %chain,
             idx = target.idx,
-            url = %redacted(&target.url),
+            url = %redact_url(&target.url),
             "rpc.health.probe_started"
         );
         let call = target.client.request_noparams::<U64>("eth_blockNumber");
@@ -463,7 +481,7 @@ async fn run_probe_round(chain: &str, targets: &[ProbeTarget], health: &HealthRe
                 debug!(
                     chain = %chain,
                     idx = target.idx,
-                    url = %redacted(&target.url),
+                    url = %redact_url(&target.url),
                     latency_ms = elapsed.as_millis() as u64,
                     block,
                     "rpc.health.probe_succeeded"
@@ -484,69 +502,53 @@ async fn run_probe_round(chain: &str, targets: &[ProbeTarget], health: &HealthRe
                 debug!(
                     chain = %chain,
                     idx = target.idx,
-                    url = %redacted(&target.url),
+                    url = %redact_url(&target.url),
                     error = %err,
                     "rpc.health.probe_failed"
                 );
-                emit_cooldown_event(chain, target, decision);
+                emit_cooldown_event(chain, target.idx, &redact_url(&target.url), decision);
             }
             Err(_elapsed) => {
                 warn!(
                     chain = %chain,
                     idx = target.idx,
-                    url = %redacted(&target.url),
+                    url = %redact_url(&target.url),
                     timeout_ms = PROBE_TIMEOUT.as_millis() as u64,
                     "rpc.health.probe_timeout"
                 );
                 let decision = health.record_failure(target.idx, true, None);
-                emit_cooldown_event(chain, target, decision);
+                emit_cooldown_event(chain, target.idx, &redact_url(&target.url), decision);
             }
         }
     }
 }
 
-fn emit_cooldown_event(chain: &str, target: &ProbeTarget, decision: CooldownDecision) {
-    match decision {
-        CooldownDecision::None => {}
-        CooldownDecision::Fresh(d) => {
-            warn!(
-                chain = %chain,
-                idx = target.idx,
-                url = %redacted(&target.url),
-                cooldown_secs = d.as_secs(),
-                "rpc.health.cooldown_set"
-            );
-        }
-        CooldownDecision::Chronic(d) => {
-            warn!(
-                chain = %chain,
-                idx = target.idx,
-                url = %redacted(&target.url),
-                cooldown_secs = d.as_secs(),
-                "rpc.health.chronic_failer_escalated"
-            );
-        }
-    }
-}
-
-/// Build the HTTP transport stack for one endpoint. The result is
-/// box-erased so all endpoints in the fallback layer share a single
-/// concrete type.
-fn build_http_stack(url: &url::Url, ep: &EndpointSpec) -> BoxTransport {
-    let cu = ep.cu_per_sec.unwrap_or(DEFAULT_CU_PER_SEC);
-    let retry = RetryBackoffLayer::new_with_policy(
+/// The retry layer every HTTP endpoint sits behind. It retries what
+/// [`BloomRetryPolicy`] classifies as transient (rate limits, 5xx) and
+/// passes any other JSON-RPC error reply up to the pool as a response.
+pub(crate) fn retry_layer(cu_per_sec: u64) -> RetryBackoffLayer<BloomRetryPolicy> {
+    RetryBackoffLayer::new_with_policy(
         MAX_RETRIES,
         INITIAL_BACKOFF_MS,
-        cu,
+        cu_per_sec,
         BloomRetryPolicy::default(),
-    );
+    )
+}
+
+/// Build the HTTP transport stack for one endpoint over `client`, which
+/// carries the per-request timeout. The result is box-erased so all
+/// endpoints in the pool share a single concrete type.
+fn build_http_stack(url: &url::Url, ep: &EndpointSpec, client: reqwest::Client) -> BoxTransport {
+    let retry = retry_layer(ep.cu_per_sec.unwrap_or(DEFAULT_CU_PER_SEC));
 
     // ServiceBuilder applies layers outermost-first when reading
     // top-to-bottom; conceptually retry sits *outside* throttle so
     // throttled-and-rate-limited responses still get retried. For
     // endpoints without a configured `max_rps` we skip the throttle
-    // layer entirely (the throttle layer panics on `rps == 0`).
-    let http: Http<reqwest::Client> = Http::new(url.clone());
+    // layer entirely (the throttle layer panics on `rps == 0`). The HTTP
+    // transport is Bloom's rather than alloy's so that the URL, which may
+    // carry an API key, reaches neither the logs nor any error.
+    let http = EndpointHttp::new(client, url.clone());
     if let Some(rps) = ep.max_rps {
         let throttle = ThrottleLayer::new(rps);
         let stack = ServiceBuilder::new()
@@ -557,18 +559,6 @@ fn build_http_stack(url: &url::Url, ep: &EndpointSpec) -> BoxTransport {
     } else {
         let stack = ServiceBuilder::new().layer(retry).service(http);
         stack.into_box_transport()
-    }
-}
-
-/// Best-effort URL redaction for log lines. Strips the path / query so
-/// vendor API keys baked into the path don't end up in stdout.
-fn redacted(url: &str) -> String {
-    if let Ok(u) = url::Url::parse(url) {
-        let host = u.host_str().unwrap_or("?");
-        let port = u.port().map(|p| format!(":{p}")).unwrap_or_default();
-        format!("{}://{}{}", u.scheme(), host, port)
-    } else {
-        url.to_string()
     }
 }
 
@@ -645,5 +635,257 @@ mod tests {
         let engine = RpcEngine::build(&http_plus_ws_spec()).expect("build engine");
         assert!(engine.supports_subscriptions());
         assert_eq!(engine.ws_connects.len(), 1);
+    }
+
+    /// An endpoint URL with an API key in its userinfo, path and query, on
+    /// a port nothing listens on, and the origin it may be shown as.
+    fn url_with_keys() -> (String, String) {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        (
+            format!("http://user:USERINFO-KEY@127.0.0.1:{port}/v2/PATH-KEY?apikey=QUERY-KEY"),
+            format!("http://127.0.0.1:{port}"),
+        )
+    }
+
+    fn assert_no_keys(text: &str) {
+        for key in ["USERINFO-KEY", "PATH-KEY", "QUERY-KEY", "/v2/"] {
+            assert!(!text.contains(key), "{key} leaked: {text}");
+        }
+    }
+
+    /// A local HTTP endpoint that reads each request and answers it with
+    /// `status` and `body`.
+    async fn endpoint_answering(status: &'static str, body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    // Read the whole request first, so the client sees the
+                    // answer rather than a reset connection.
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                        let Some(head) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                            continue;
+                        };
+                        let length = String::from_utf8_lossy(&request[..head])
+                            .to_ascii_lowercase()
+                            .lines()
+                            .find_map(|line| {
+                                line.strip_prefix("content-length:")?.trim().parse().ok()
+                            })
+                            .unwrap_or(0usize);
+                        if request.len() >= head + 4 + length {
+                            break;
+                        }
+                    }
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        url
+    }
+
+    /// An engine over `urls`, with no configured endpoint overrides.
+    fn engine_over(urls: Vec<String>) -> RpcEngine {
+        let mut spec = ChainSpec::anvil_default();
+        spec.rpc_urls = urls;
+        spec.rpc_endpoints.clear();
+        RpcEngine::build(&spec).expect("build engine")
+    }
+
+    /// Some nodes and providers send a JSON-RPC error, a revert among
+    /// them, with a 4xx status. It is the node's answer: it must reach the
+    /// caller as an error reply, not lose to a dead endpoint's transport
+    /// error, which a pre-broadcast simulation reads as "unavailable".
+    #[tokio::test]
+    async fn a_json_rpc_error_sent_with_an_error_status_is_an_error_reply() {
+        use alloy::providers::Provider;
+
+        let reverts = endpoint_answering(
+            "400 Bad Request",
+            r#"{"jsonrpc":"2.0","id":0,"error":{"code":3,"message":"execution reverted","data":"0x"}}"#,
+        )
+        .await;
+        let (dead, _) = url_with_keys();
+        let engine = engine_over(vec![reverts, dead]);
+        let err = engine.provider().get_block_number().await.unwrap_err();
+        let payload = err
+            .as_error_resp()
+            .unwrap_or_else(|| panic!("expected an error reply, got {err}"));
+        assert_eq!(payload.code, 3);
+    }
+
+    /// An error status whose body is not a JSON-RPC error is the
+    /// endpoint failing, as before.
+    #[tokio::test]
+    async fn an_error_status_without_a_json_rpc_error_is_a_transport_error() {
+        use alloy::providers::Provider;
+
+        let url = endpoint_answering("400 Bad Request", "bad request").await;
+        let err = engine_over(vec![url])
+            .provider()
+            .get_block_number()
+            .await
+            .unwrap_err();
+        assert!(err.as_error_resp().is_none(), "{err}");
+        assert!(err.to_string().contains("400"), "{err}");
+    }
+
+    /// A gateway's 5xx is the endpoint failing even when its body is a
+    /// JSON-RPC error: the gateway may have forwarded a transaction before
+    /// it failed, and 502, 503 and 504 must still be retried and failed
+    /// over. A revert is the node's answer whatever the status.
+    #[tokio::test]
+    async fn a_server_error_is_the_endpoint_failing_unless_it_reports_a_revert() {
+        use alloy::providers::Provider;
+
+        for status in ["500 Internal Server Error", "504 Gateway Timeout"] {
+            let url = endpoint_answering(
+                status,
+                r#"{"jsonrpc":"2.0","id":0,"error":{"code":-32603,"message":"upstream request timeout"}}"#,
+            )
+            .await;
+            let err = engine_over(vec![url])
+                .provider()
+                .get_block_number()
+                .await
+                .unwrap_err();
+            assert!(err.as_error_resp().is_none(), "{status}: {err}");
+        }
+
+        let url = endpoint_answering(
+            "500 Internal Server Error",
+            r#"{"jsonrpc":"2.0","id":0,"error":{"code":-32000,"message":"execution reverted"}}"#,
+        )
+        .await;
+        let err = engine_over(vec![url])
+            .provider()
+            .get_block_number()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.as_error_resp().map(|payload| payload.code),
+            Some(-32000)
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_errors_name_the_origin_not_the_url() {
+        use alloy::providers::Provider;
+
+        let (url, origin) = url_with_keys();
+        let mut spec = ChainSpec::anvil_default();
+        spec.rpc_urls = vec![url];
+        spec.rpc_endpoints.clear();
+        let engine = RpcEngine::build(&spec).expect("build engine");
+        let err = engine
+            .provider()
+            .get_block_number()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_no_keys(&err);
+        assert!(
+            err.contains(&format!("connection failed ({origin})")),
+            "{err}"
+        );
+    }
+
+    /// Collects everything a tracing subscriber writes.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Captured {
+        /// Capture debug logs on this thread until the guard drops.
+        fn debug_logs(&self) -> tracing::subscriber::DefaultGuard {
+            let writer = self.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::set_default(subscriber)
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().clone()).unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_logs_name_the_origin_not_the_url() {
+        let (raw, origin) = url_with_keys();
+        let spec = EndpointSpec {
+            url: raw.clone(),
+            weight: 100,
+            cu_per_sec: None,
+            max_rps: None,
+            http_only: false,
+        };
+        let (url, _) = classify_endpoint(&spec).unwrap();
+        let target = ProbeTarget {
+            idx: 0,
+            url: raw.clone(),
+            client: RpcClient::new(build_http_stack(&url, &spec, reqwest::Client::new()), false),
+        };
+        let health = HealthRegistry::new(vec![raw]);
+
+        let captured = Captured::default();
+        let _guard = captured.debug_logs();
+        run_probe_round("test", &[target], &health).await;
+
+        let logs = captured.text();
+        assert!(logs.contains("rpc.health.probe_failed"), "{logs}");
+        assert!(logs.contains(&origin), "{logs}");
+        assert_no_keys(&logs);
+    }
+
+    /// The pool's own lines about live calls: the failed call and the
+    /// cooldown that repeated failures arm.
+    #[tokio::test]
+    async fn live_call_logs_name_the_origin_not_the_url() {
+        use alloy::providers::Provider;
+
+        let (raw, origin) = url_with_keys();
+        let captured = Captured::default();
+        let _guard = captured.debug_logs();
+        let engine = engine_over(vec![raw]);
+        for _ in 0..6 {
+            engine.provider().get_block_number().await.unwrap_err();
+        }
+
+        let logs = captured.text();
+        assert!(logs.contains("rpc.pool.endpoint_failed"), "{logs}");
+        assert!(logs.contains("rpc.health.cooldown_set"), "{logs}");
+        assert!(logs.contains(&origin), "{logs}");
+        assert_no_keys(&logs);
     }
 }

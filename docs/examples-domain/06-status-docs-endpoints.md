@@ -27,7 +27,7 @@ ls /bloom/status/chains/ethereum/                      # chain_id, connected, bl
 cat /bloom/status/chains/ethereum/chain_id             # decimal chain id, e.g. 1
 cat /bloom/status/chains/ethereum/connected            # "true" / "false" — RPC ping with 750 ms timeout, 2 s cached
 cat /bloom/status/chains/ethereum/block_number         # latest block from the same probe; errors if unreachable
-cat /bloom/status/chains/ethereum/rpc_url              # first configured RPC URL, redacted (api keys → ***)
+cat /bloom/status/chains/ethereum/rpc_url              # first configured RPC URL as scheme://host[:port]; no path, query or credentials
 cat /bloom/status/chains/base/chain_id                 # → 8453
 cat /bloom/status/chains/base/connected                # → true
 ```
@@ -36,12 +36,12 @@ The `connected` / `block_number` leaves share a 2-second handler-level probe cac
 
 ## Per-endpoint health (WP-3)
 
-Every configured RPC endpoint gets an indexed directory under `status/chains/<chain>/endpoints/<idx>/`. Indices are zero-based and stable for the daemon's lifetime — they map directly to the `endpoints` array in the chain's `ChainSpec`. The leaves are populated by the active probe loop in `crates/bloom-rpc/src/transport.rs`, which issues a direct `eth_blockNumber` against each HTTP endpoint every 15 s with a 2 s timeout, bypassing the alloy `FallbackLayer` so probes measure individual endpoints.
+Every configured RPC endpoint gets an indexed directory under `status/chains/<chain>/endpoints/<idx>/`. Indices are zero-based and stable for the daemon's lifetime — they map directly to the `endpoints` array in the chain's `ChainSpec`. The leaves are populated by the active probe loop in `crates/bloom-rpc/src/transport.rs`, which issues a direct `eth_blockNumber` against each HTTP endpoint every 15 s with a 2 s timeout, bypassing the endpoint pool so probes measure individual endpoints. The outcomes of live calls routed through the pool are recorded too, except that only probes set `last_block`. A live call answered with a JSON-RPC error, such as a revert, is not recorded either way: a revert says nothing about the endpoint, and an error such as an invalid API key shows up in the probes.
 
 ```sh
 ls /bloom/status/chains/ethereum/endpoints/            # 0, 1, 2, ... — one dir per configured endpoint
 ls /bloom/status/chains/ethereum/endpoints/0/          # url, score, cooldown_until, latency_ms, success_rate, last_block
-cat /bloom/status/chains/ethereum/endpoints/0/url      # the endpoint URL, redacted (text)
+cat /bloom/status/chains/ethereum/endpoints/0/url      # the endpoint URL as scheme://host[:port] (text)
 cat /bloom/status/chains/ethereum/endpoints/0/score    # composite score in [0,1] (3-decimal text), 70% success + 30% latency
 cat /bloom/status/chains/ethereum/endpoints/0/latency_ms       # EWMA round-trip latency in ms (alpha=0.3)
 cat /bloom/status/chains/ethereum/endpoints/0/success_rate     # rolling success rate over the last 10 probes (3-decimal text)
@@ -55,9 +55,9 @@ Cooldown semantics (from `crates/bloom-rpc/src/health.rs`):
 - 5 consecutive failures arm a 60 s cooldown. The `cooldown_until` leaf becomes a Unix-seconds timestamp.
 - 2 consecutive successes during cooldown clear it; `cooldown_until` reverts to blank.
 - A fresh cooldown within 5 minutes of a recovery escalates to 600 s (chronic-failer).
-- Rate-limit responses (HTTP 429) feed `Retry-After` to `record_failure` as a `backoff_hint`, which is used as the cooldown duration instead of the 60 s default. See `BloomRetryPolicy` in `crates/bloom-rpc/src/policy.rs`.
+- Rate-limit responses (HTTP 429, or a JSON-RPC rate-limit error) are retried with backoff by `BloomRetryPolicy` (`crates/bloom-rpc/src/policy.rs`) before they count against the endpoint. Once those retries run out, the failure counts like any other.
 
-Important scope note: cooldowns are observability-only today. Alloy's `FallbackLayer` does not expose a runtime hook to evict cooled-down endpoints, so the parallel fan-out still queries them. The `success_rate` and `cooldown_until` leaves are the operator's signal that a given endpoint is degraded.
+Endpoint health also orders routing (`crates/bloom-rpc/src/pool.rs`). Each call races the two best-ranked endpoints: those whose last outcome succeeded come first, ordered by score, then endpoints not yet called, then those whose last outcome failed, then those in cooldown. A read takes the first answer, a result or a JSON-RPC error such as a revert. When both endpoints fail to answer, it moves on to the next two in the ranking until one answers, so it reaches every configured endpoint. A broadcast stops after the first two, and waits for both before reporting a refusal. Each HTTP request to an endpoint is limited to 30 s, and connecting to 5 s, so an endpoint that accepts the connection and never answers, or never accepts it, fails like one that refuses it. The `success_rate` and `cooldown_until` leaves show which endpoints are degraded.
 
 ### WebSocket fast path (WP-4)
 

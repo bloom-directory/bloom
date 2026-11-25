@@ -12,12 +12,30 @@
 //! PLAN-SOLANA-PR-FIXES.md). Deterministic JSON-RPC errors like "method
 //! not supported" are explicitly NOT retried — pinned by a unit test
 //! below.
+//!
+//! A revert is never retried, whatever its message says: the message
+//! carries the contract's revert reason, so "execution reverted: Vault
+//! capacity exceeded" is the contract's answer, not a rate limit. Retrying
+//! it would end in "max retries exceeded", a transport error that a
+//! pre-broadcast simulation reads as "unavailable".
+//!
+//! A delay the server asks for is honoured only up to
+//! [`MAX_BACKOFF_HINT`]: the endpoint pool fails over to another endpoint
+//! instead of waiting out a long one.
 
 use std::time::Duration;
 
 use alloy::transports::TransportError;
 use alloy::transports::layers::{RateLimitRetryPolicy, RetryPolicy};
 use bloom_rpc_common::retry::{RetrySignal, should_retry as shared_should_retry};
+
+use crate::reply::is_revert_reply;
+
+/// The longest retry delay a server can choose, through a JSON-RPC
+/// payload such as Infura's `data.rate.backoff_seconds` or a "try again
+/// in 4s" message. With three retries, a rate-limited endpoint holds a
+/// call for at most a few seconds before the pool moves on.
+pub const MAX_BACKOFF_HINT: Duration = Duration::from_secs(1);
 
 /// Bloom's retry policy. Composes alloy's default with extra
 /// detection rules; the alloy policy still runs as the fallback so any
@@ -30,6 +48,9 @@ pub struct BloomRetryPolicy {
 
 impl RetryPolicy for BloomRetryPolicy {
     fn should_retry(&self, error: &TransportError) -> bool {
+        if is_revert(error) {
+            return false;
+        }
         if self.inner.should_retry(error) {
             return true;
         }
@@ -40,8 +61,17 @@ impl RetryPolicy for BloomRetryPolicy {
     }
 
     fn backoff_hint(&self, error: &TransportError) -> Option<Duration> {
-        self.inner.backoff_hint(error)
+        if is_revert(error) {
+            return None;
+        }
+        self.inner
+            .backoff_hint(error)
+            .map(|hint| hint.min(MAX_BACKOFF_HINT))
     }
+}
+
+fn is_revert(error: &TransportError) -> bool {
+    error.as_error_resp().is_some_and(is_revert_reply)
 }
 
 /// Returns true if the error matches one of the shared retry rules.
@@ -147,5 +177,41 @@ mod tests {
         let policy = BloomRetryPolicy::default();
         assert!(policy.should_retry(&err_resp(429, "you are over rate limit")));
         assert!(policy.should_retry(&err_resp(429, "node at capacity, try later")));
+    }
+
+    #[test]
+    fn a_revert_reason_is_not_a_rate_limit() {
+        let policy = BloomRetryPolicy::default();
+        for (code, message) in [
+            (3, "execution reverted: Vault capacity exceeded"),
+            (3, "execution reverted: rate limited, try again in 300s"),
+            (-32000, "execution reverted: over rate limit"),
+            (
+                -32603,
+                "reverted with reason string 'exceeded its compute units'",
+            ),
+        ] {
+            let err = err_resp(code, message);
+            assert!(!policy.should_retry(&err), "{message}");
+            assert_eq!(policy.backoff_hint(&err), None, "{message}");
+        }
+    }
+
+    #[test]
+    fn a_server_cannot_choose_a_long_retry_delay() {
+        let policy = BloomRetryPolicy::default();
+        let infura: ErrorPayload = serde_json::from_str(
+            r#"{"code":-32005,"message":"daily request count exceeded, request rate limited",
+                "data":{"rate":{"backoff_seconds":300}}}"#,
+        )
+        .unwrap();
+        let err = TransportError::ErrorResp(infura);
+        assert!(policy.should_retry(&err));
+        assert_eq!(policy.backoff_hint(&err), Some(MAX_BACKOFF_HINT));
+        let err = err_resp(-32005, "rate limited, try again in 30s");
+        assert_eq!(policy.backoff_hint(&err), Some(MAX_BACKOFF_HINT));
+        // A short hint is kept as it is.
+        let err = err_resp(-32005, "rate limited, try again in 4ms");
+        assert_eq!(policy.backoff_hint(&err), Some(Duration::from_millis(4)));
     }
 }

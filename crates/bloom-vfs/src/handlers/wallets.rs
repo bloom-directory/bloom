@@ -3256,6 +3256,7 @@ fn tx_open_err(e: TxEngineError) -> HandlerError {
         TxEngineError::PolicyDenied => HandlerError::OperationNotPermitted,
         TxEngineError::DependencyNotSatisfied { .. }
         | TxEngineError::SimulationReverted { .. }
+        | TxEngineError::SimulationFailed { .. }
         | TxEngineError::NonceGap { .. } => HandlerError::invalid(e.to_string()),
         other => err_be(other),
     }
@@ -5213,6 +5214,29 @@ impl WalletsHandler {
 }
 #[cfg(test)]
 mod tests {
+    /// A simulation the node refused to run is an invalid request, as a
+    /// revert is: the agent must fix the endpoint or the request, and
+    /// nothing was sent.
+    #[test]
+    fn a_failed_simulation_is_an_invalid_request() {
+        use super::{HandlerError, TxEngineError, tx_open_err};
+
+        for error in [
+            TxEngineError::SimulationReverted {
+                reason: "Too little received".into(),
+            },
+            TxEngineError::SimulationFailed {
+                reason: "error code -32000: invalid project id".into(),
+            },
+        ] {
+            let shown = error.to_string();
+            match tx_open_err(error) {
+                HandlerError::Invalid(message) => assert_eq!(message, shown),
+                other => panic!("expected an invalid request, got {other:?}"),
+            }
+        }
+    }
+
     /// A waiting change is a default-policy request's own only when it is the
     /// current policy with nothing but the request added: every other
     /// difference, in any field, makes it somebody else's.

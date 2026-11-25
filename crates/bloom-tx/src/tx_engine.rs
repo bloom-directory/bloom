@@ -180,6 +180,10 @@ pub enum TxEngineError {
     )]
     SimulationReverted { reason: String },
     #[error(
+        "pre-broadcast simulation failed: the node answered the eth_call with an error that is not a revert ({reason}) — the call did not run to a result, so the transaction is not sent. An invalid API key or an unsupported method on the chain's RPC endpoint shows up here, as does a call that runs out of gas; fix the endpoint or the request before retrying"
+    )]
+    SimulationFailed { reason: String },
+    #[error(
         "nonce gap: tx for {from} uses nonce {staged} but the account's next on-chain nonce is {chain_next} — the node would queue it behind the missing nonce(s) and it could never mine.{blocking} Broadcast the earlier transaction, or discard it and restage with the explicit missing `nonce`. Discarding alone does not renumber this transaction."
     )]
     NonceGap {
@@ -4272,8 +4276,11 @@ impl TxEngine {
         }
     }
 
-    /// `eth_call` the staged tx against current state; reject on revert. RPC
-    /// failures simulating are non-fatal (don't block broadcast on infra).
+    /// `eth_call` the staged tx against current state; reject on revert. An
+    /// endpoint that does not answer is non-fatal (don't block broadcast on
+    /// infra). An error reply that is not a revert also rejects, as its own
+    /// error: it covers execution failures such as out of gas, which would
+    /// fail on chain too, so letting it through would sign a doomed tx.
     async fn simulate_or_reject(
         &self,
         staged: &StagedTx,
@@ -4285,6 +4292,9 @@ impl TxEngine {
             Ok(Err(returndata)) => Err(TxEngineError::SimulationReverted {
                 reason: crate::reconcile::decode_revert(&returndata),
             }),
+            Err(bloom_evm::ChainError::Rpc(reason)) => {
+                Err(TxEngineError::SimulationFailed { reason })
+            }
             Err(e) => {
                 debug!(id = %staged.id, error = %e, "tx.simulate_unavailable");
                 Ok(())
@@ -8693,6 +8703,59 @@ mod tests {
         let entry = f.outbox.read("alice", "anvil", "fee-repair").unwrap();
         assert_eq!(entry.state, OutboxState::Pending);
         assert!(!entry.dir.join("replacement_intent.json").exists());
+    }
+
+    /// A node error that is not a revert, such as an invalid API key, still
+    /// stops the repair before any ceremony, but as its own error rather
+    /// than as a revert the contract never made.
+    #[tokio::test]
+    async fn fee_repair_refuses_a_simulation_the_node_did_not_run() {
+        let url = spawn_queued_rpc(HashMap::from([(
+            "eth_call".into(),
+            vec![r#"error:{"code":-32000,"message":"invalid project id"}"#.into()],
+        )]))
+        .await;
+        let f = fee_repair_fixture(&url, |_| {});
+        f.fixture.active.store(true, Ordering::SeqCst);
+        let result = f.repair(repair_fees("500", "250")).await;
+        assert!(
+            matches!(
+                &result,
+                Err(TxEngineError::SimulationFailed { reason }) if reason.contains("invalid project id")
+            ),
+            "{:?}",
+            result.err()
+        );
+        assert!(f.fixture.requests.lock().is_empty());
+        let entry = f.outbox.read("alice", "anvil", "fee-repair").unwrap();
+        assert_eq!(entry.state, OutboxState::Pending);
+        assert!(!entry.dir.join("replacement_intent.json").exists());
+    }
+
+    /// A revert reason the contract chose, here one mentioning "capacity",
+    /// is not a rate limit. Were it retried, the exhausted retries would come
+    /// back as a transport error, which the simulation reads as
+    /// "unavailable", and the repair would go on to signing a transaction
+    /// the node said reverts.
+    #[tokio::test]
+    async fn fee_repair_refuses_a_revert_whose_reason_reads_like_a_rate_limit() {
+        let revert = r#"error:{"code":3,"message":"execution reverted: Vault capacity exceeded","data":"0x08c379a0000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000175661756c74206361706163697479206578636565646564000000000000000000"}"#;
+        let url = spawn_queued_rpc(HashMap::from([(
+            "eth_call".into(),
+            vec![revert.to_string(); 4],
+        )]))
+        .await;
+        let f = fee_repair_fixture(&url, |_| {});
+        f.fixture.active.store(true, Ordering::SeqCst);
+        let result = f.repair(repair_fees("500", "250")).await;
+        assert!(
+            matches!(&result, Err(TxEngineError::SimulationReverted { .. })),
+            "{:?}",
+            result.err()
+        );
+        assert!(f.fixture.requests.lock().is_empty());
+        let entry = f.outbox.read("alice", "anvil", "fee-repair").unwrap();
+        assert_eq!(entry.state, OutboxState::Pending);
     }
 
     /// The node accepts a repair but its response is lost; the retry answers

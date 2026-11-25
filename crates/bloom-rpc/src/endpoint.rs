@@ -9,6 +9,7 @@ use bloom_proto::EndpointSpec;
 use url::Url;
 
 use crate::error::BloomRpcError;
+use crate::redact::redact_url;
 
 /// What kind of transport an endpoint declares via its URL scheme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,7 +36,7 @@ impl EndpointScheme {
 /// `Unknown` variant.
 pub fn classify_endpoint(spec: &EndpointSpec) -> Result<(Url, EndpointScheme), BloomRpcError> {
     let url = Url::parse(&spec.url).map_err(|e| BloomRpcError::InvalidUrl {
-        url: spec.url.clone(),
+        url: redact_url(&spec.url),
         source: e,
     })?;
     let scheme = match url.scheme() {
@@ -43,7 +44,7 @@ pub fn classify_endpoint(spec: &EndpointSpec) -> Result<(Url, EndpointScheme), B
         "ws" | "wss" => EndpointScheme::Ws,
         other => {
             return Err(BloomRpcError::InvalidUrl {
-                url: spec.url.clone(),
+                url: redact_url(&spec.url),
                 source: url::ParseError::IdnaError, // closest stable variant for "unsupported scheme"
             }
             .tag_with_scheme(other));
@@ -113,6 +114,34 @@ mod tests {
             matches!(err, BloomRpcError::InvalidUrl { .. }),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn rejected_urls_are_reported_without_credentials() {
+        for (raw, host_shown) in [
+            // Unparseable (the port is out of range), with no userinfo.
+            (
+                "https://rpc.example.com:99999999/v2/SECRET?key=SECRET",
+                true,
+            ),
+            // Unparseable with userinfo: the host cannot be told from the
+            // password, so neither is shown.
+            (
+                "https://user:SECRET@rpc.example.com:99999999/v2/SECRET?key=SECRET",
+                false,
+            ),
+            // Parseable, unsupported scheme.
+            (
+                "ftp://user:SECRET@rpc.example.com/v2/SECRET?key=SECRET",
+                true,
+            ),
+        ] {
+            let err = classify_endpoint(&ep(raw)).unwrap_err();
+            for shown in [err.to_string(), format!("{err:?}")] {
+                assert!(!shown.contains("SECRET"), "{shown}");
+                assert_eq!(shown.contains("rpc.example.com"), host_shown, "{shown}");
+            }
+        }
     }
 
     #[test]

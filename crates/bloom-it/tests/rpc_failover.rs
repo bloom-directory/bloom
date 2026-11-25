@@ -12,9 +12,12 @@
 
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use alloy::primitives::Address;
+use alloy::providers::Provider;
+use alloy::rpc::types::TransactionRequest;
+use anyhow::{Context, Result, anyhow, bail};
 use bloom_evm::ChainClient;
-use bloom_it::spawn_anvil;
+use bloom_it::{pick_free_port, spawn_anvil};
 use bloom_proto::ChainSpec;
 use tokio::time::timeout;
 
@@ -77,5 +80,144 @@ async fn block_number_failover_when_first_anvil_dies() -> Result<()> {
     }
 
     drop(anvil_b);
+    Ok(())
+}
+
+/// Regression for #527: with the first two endpoints unreachable, reads
+/// must reach the third. Before the health-ranked pool, alloy's
+/// `FallbackLayer` raced only the first two endpoints forever and the
+/// third was never called.
+#[tokio::test(flavor = "multi_thread")]
+async fn block_number_reaches_third_endpoint_when_first_two_are_unreachable() -> Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,bloom_rpc=debug")),
+        )
+        .with_test_writer()
+        .try_init();
+
+    // Ports bound and released at once, so connections are refused.
+    let dead_a = format!("http://127.0.0.1:{}", pick_free_port()?);
+    let dead_b = format!("http://127.0.0.1:{}", pick_free_port()?);
+    let anvil = spawn_anvil().await.context("spawn anvil")?;
+
+    let mut spec = ChainSpec::anvil_default();
+    spec.rpc_urls = vec![dead_a, dead_b, anvil.rpc_url()];
+    spec.rpc_endpoints.clear();
+    let client = ChainClient::new(spec).map_err(|e| anyhow!("build chain client: {e}"))?;
+
+    // The very first read must already succeed through the third endpoint.
+    let started = Instant::now();
+    let res = timeout(Duration::from_secs(5), client.block_number()).await;
+    let elapsed = started.elapsed();
+    res.map_err(|_| anyhow!("first block_number timed out after {elapsed:?}"))?
+        .map_err(|e| anyhow!("first block_number failed: {e}"))?;
+
+    for i in 0..10 {
+        client
+            .block_number()
+            .await
+            .with_context(|| format!("block_number iteration {i}"))?;
+    }
+
+    drop(anvil);
+    Ok(())
+}
+
+/// An HTTP endpoint that accepts connections, reads nothing and never
+/// answers. Abort the returned task to close its connections.
+async fn endpoint_that_never_answers() -> Result<(String, tokio::task::JoinHandle<()>)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("bind silent endpoint")?;
+    let url = format!("http://{}", listener.local_addr()?);
+    let task = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    Ok((url, task))
+}
+
+/// An endpoint that accepts the connection and never answers must not
+/// stall reads. A dead endpoint and a silent one are ranked first, so the
+/// first read waits out the silent endpoint's request timeout and then
+/// reaches the live third endpoint. The silent endpoint then ranks below
+/// the live one, so the next read is quick. Takes about 30 s, the request
+/// timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn read_moves_past_an_endpoint_that_never_answers() -> Result<()> {
+    let dead = format!("http://127.0.0.1:{}", pick_free_port()?);
+    let (silent, silent_task) = endpoint_that_never_answers().await?;
+    let anvil = spawn_anvil().await.context("spawn anvil")?;
+
+    let mut spec = ChainSpec::anvil_default();
+    spec.rpc_urls = vec![dead, silent, anvil.rpc_url()];
+    spec.rpc_endpoints.clear();
+    let client = ChainClient::new(spec).map_err(|e| anyhow!("build chain client: {e}"))?;
+
+    let started = Instant::now();
+    let res = timeout(Duration::from_secs(45), client.block_number()).await;
+    let elapsed = started.elapsed();
+    res.map_err(|_| anyhow!("first block_number still waiting after {elapsed:?}"))?
+        .map_err(|e| anyhow!("first block_number failed: {e}"))?;
+
+    let started = Instant::now();
+    let res = timeout(Duration::from_secs(2), client.block_number()).await;
+    let elapsed = started.elapsed();
+    res.map_err(|_| anyhow!("second block_number still waiting after {elapsed:?}"))?
+        .map_err(|e| anyhow!("second block_number failed: {e}"))?;
+
+    silent_task.abort();
+    Ok(())
+}
+
+/// Runtime code that always reverts: `PUSH1 0 PUSH1 0 REVERT`.
+const ALWAYS_REVERTS: &str = "0x60006000fd";
+
+/// Two live endpoints report a revert and a third is down. The caller must
+/// see the revert, not the third endpoint's connection error: a
+/// pre-broadcast simulation reads a transport error as "simulation
+/// unavailable" and would let a reverting transaction through to signing.
+#[tokio::test(flavor = "multi_thread")]
+async fn revert_is_reported_when_a_later_endpoint_is_down() -> Result<()> {
+    let anvil_a = spawn_anvil().await.context("spawn anvil A")?;
+    let anvil_b = spawn_anvil().await.context("spawn anvil B")?;
+    let reverter = Address::repeat_byte(0xde);
+    for anvil in [&anvil_a, &anvil_b] {
+        let mut spec = ChainSpec::anvil_default();
+        spec.rpc_urls = vec![anvil.rpc_url()];
+        spec.rpc_endpoints.clear();
+        let single = ChainClient::new(spec).map_err(|e| anyhow!("build chain client: {e}"))?;
+        let _: serde_json::Value = single
+            .provider()
+            .raw_request("anvil_setCode".into(), (reverter, ALWAYS_REVERTS))
+            .await
+            .context("install reverting code")?;
+    }
+
+    let dead = format!("http://127.0.0.1:{}", pick_free_port()?);
+    let mut spec = ChainSpec::anvil_default();
+    spec.rpc_urls = vec![anvil_a.rpc_url(), anvil_b.rpc_url(), dead];
+    spec.rpc_endpoints.clear();
+    let client = ChainClient::new(spec).map_err(|e| anyhow!("build chain client: {e}"))?;
+
+    // Repeated, so a revert that wrongly damaged endpoint health would
+    // push a later call onto the dead endpoint.
+    for i in 0..6 {
+        let call = TransactionRequest::default().to(reverter);
+        let outcome = timeout(
+            Duration::from_secs(5),
+            client.eth_call_capture_revert(call, None),
+        )
+        .await
+        .map_err(|_| anyhow!("call {i} timed out"))?;
+        match outcome {
+            Ok(Err(_revert)) => {}
+            other => bail!("call {i}: expected the revert, got {other:?}"),
+        }
+    }
     Ok(())
 }

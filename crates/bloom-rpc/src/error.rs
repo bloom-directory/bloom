@@ -12,7 +12,8 @@ pub enum BloomRpcError {
     /// One of the configured endpoints had an unparsable URL.
     #[error("invalid endpoint url '{url}': {source}")]
     InvalidUrl {
-        /// The URL string that failed to parse.
+        /// The URL that failed to parse, redacted by
+        /// [`crate::redact_url`]: it may carry an API key.
         url: String,
         /// The underlying parser error.
         #[source]

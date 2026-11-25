@@ -424,6 +424,23 @@ fn make_staging(root: &Path) -> PathBuf {
     staging
 }
 
+/// The `current` state schema that `compatibility-v1.toml` declares for
+/// `component`, read the way the installers' `compat_field` reads it.
+fn declared_current_state(component: &str) -> u32 {
+    let compatibility = fs::read_to_string(release_script("compatibility-v1.toml")).unwrap();
+    let section = format!("[state.{component}]");
+    compatibility
+        .lines()
+        .skip_while(|line| line.trim() != section)
+        .skip(1)
+        .take_while(|line| !line.trim_start().starts_with('['))
+        .find_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == "current").then(|| value.trim().trim_matches('"').parse().unwrap())
+        })
+        .unwrap_or_else(|| panic!("compatibility-v1.toml declares no {section} current"))
+}
+
 fn make_installer_payload(root: &Path) -> PathBuf {
     let payload = make_staging(root);
     fs::write(payload.join("SHA256SUMS"), b"test payload\n").unwrap();
@@ -3165,14 +3182,26 @@ fn macos_staged_lifecycle_upgrades_repairs_retains_restores_and_rejects_downgrad
     );
     assert_eq!(fs::read(&identity).unwrap(), identity_before);
 
+    // Installed Machine state one past what the candidate declares, so the
+    // candidate would be a downgrade whatever the current schema is.
     fs::write(
         root.join("Library/Application Support/BloomTriad/state-schema"),
-        b"machine=3\nbroker=2\nsigner=2\n",
+        format!(
+            "machine={}\nbroker={}\nsigner={}\n",
+            declared_current_state("machine") + 1,
+            declared_current_state("broker"),
+            declared_current_state("signer"),
+        ),
     )
     .unwrap();
     let downgrade = stage_macos_install_digest(&installer, &root, &candidate, &new_digest);
     assert!(!downgrade.status.success());
-    assert!(String::from_utf8_lossy(&downgrade.stderr).contains("downgrade rejected"));
+    assert!(
+        String::from_utf8_lossy(&downgrade.stderr)
+            .contains("machine state-schema downgrade rejected"),
+        "{}",
+        String::from_utf8_lossy(&downgrade.stderr)
+    );
     assert_eq!(fs::read(&identity).unwrap(), identity_before);
 
     fs::write(
