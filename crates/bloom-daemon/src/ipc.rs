@@ -942,6 +942,15 @@ fn confirm_challenge_path(path: &VfsPath) -> Option<VfsPath> {
     }
 }
 
+/// `.../outbox/pending/<id>/confirm` → `.../outbox/sent/<id>`.
+fn sent_entry_path(confirm: &VfsPath) -> Option<VfsPath> {
+    let mut segments = confirm.segments().to_vec();
+    segments.pop();
+    let state = segments.len().checked_sub(2)?;
+    segments[state] = "sent".into();
+    VfsPath::parse(&format!("/{}", segments.join("/"))).ok()
+}
+
 impl IpcServer {
     pub fn new(vfs: Vfs, version: impl Into<String>, chains: Vec<String>) -> Self {
         Self {
@@ -1696,6 +1705,23 @@ impl IpcServer {
         }
     }
 
+    /// Whether another confirm already signed this entry and moved it to
+    /// `sent/`.
+    async fn sent_elsewhere(&self, confirm: &VfsPath) -> bool {
+        match sent_entry_path(confirm) {
+            Some(sent) => self.vfs.lookup(&sent).await.is_ok(),
+            None => false,
+        }
+    }
+
+    /// Repeat the confirm; an entry that reached `sent/` meanwhile is the send.
+    async fn write_or_sent(&self, path: &VfsPath, bytes: &[u8]) -> Result<(), WriteError> {
+        match self.vfs.write(path, bytes).await {
+            Err(_) if self.sent_elsewhere(path).await => Ok(()),
+            result => Ok(result?),
+        }
+    }
+
     /// The batch a `confirm-batch` file reports as waiting for the owner:
     /// its action, link and entries in order.
     async fn awaited_batch(&self, path: &VfsPath) -> Option<(String, String, Vec<String>)> {
@@ -1802,7 +1828,10 @@ impl IpcServer {
                 if first {
                     return Err(denied.into());
                 }
-                return Ok(self.vfs.write(path, bytes).await?);
+                if self.sent_elsewhere(path).await {
+                    return Ok(());
+                }
+                return self.write_or_sent(path, bytes).await;
             };
             let challenge: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
             let url = challenge["ceremony_url"].as_str().unwrap_or_default();
@@ -1821,15 +1850,38 @@ impl IpcServer {
                 )));
             }
             match challenge["state"].as_str().unwrap_or("unknown") {
-                "active" if retried_active => return Err(HandlerError::PermissionDenied.into()),
+                "active" if retried_active => {
+                    if self.sent_elsewhere(path).await {
+                        return Ok(());
+                    }
+                    return Err(HandlerError::PermissionDenied.into());
+                }
                 "active" => {
                     retried_active = true;
                     match self.vfs.write(path, bytes).await {
                         Err(HandlerError::PermissionDenied | HandlerError::ApprovalPending(_)) => {
                             continue;
                         }
+                        // The write waited on the entry lock while the other
+                        // confirm signed, then found the entry in sent/.
+                        Err(_) if self.sent_elsewhere(path).await => return Ok(()),
                         result => return Ok(result?),
                     }
+                }
+                // Used while the entry is still pending: another confirm may
+                // be signing with it. The write waits for its entry lock and
+                // then reports where the entry went.
+                "exhausted" => {
+                    return match self.vfs.write(path, bytes).await {
+                        Err(_) if self.sent_elsewhere(path).await => Ok(()),
+                        Err(HandlerError::PermissionDenied | HandlerError::ApprovalPending(_)) => {
+                            let next = challenge["next"].as_str().unwrap_or_default();
+                            Err(WriteError::Approval(format!(
+                                "permission denied: owner approval exhausted. {next} Details: {challenge_file}"
+                            )))
+                        }
+                        result => Ok(result?),
+                    };
                 }
                 "awaiting_ceremony" | "unknown" => retried_active = false,
                 state => {
@@ -3401,14 +3453,21 @@ allowed = ["bloom:vfs.read"]
     /// One pending outbox entry as the wallets handler presents it: the
     /// first denied confirm creates the challenge, a confirm signs only while
     /// Broker reports the approval active, a signed entry leaves `pending/`,
-    /// and the challenge reports Broker's live state.
+    /// and the challenge reports Broker's live state. Like the real handler,
+    /// a confirm holds the entry lock while it signs: Broker reports the
+    /// approval `exhausted` once it is used, and the entry reaches `sent/`
+    /// only after signing, broadcast and fsyncs finish.
     struct ApprovalEntry {
         state: std::sync::Mutex<&'static str>,
         challenged: AtomicBool,
         writes: AtomicUsize,
         signatures: AtomicUsize,
         staged_by: Option<&'static str>,
+        entry_lock: tokio::sync::Mutex<()>,
     }
+
+    const BROKER_CALL: std::time::Duration = std::time::Duration::from_millis(100);
+    const SIGN_AND_SEND: std::time::Duration = std::time::Duration::from_millis(400);
 
     impl ApprovalEntry {
         fn new() -> Arc<Self> {
@@ -3421,6 +3480,7 @@ allowed = ["bloom:vfs.read"]
                 writes: AtomicUsize::new(0),
                 signatures: AtomicUsize::new(0),
                 staged_by,
+                entry_lock: tokio::sync::Mutex::new(()),
             })
         }
         fn set(&self, state: &'static str) {
@@ -3434,6 +3494,10 @@ allowed = ["bloom:vfs.read"]
     #[async_trait::async_trait]
     impl Handler for ApprovalEntry {
         async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+            // A signed entry leaves pending/ for sent/.
+            if path.segments().iter().any(|s| s == "sent") && self.signatures() == 0 {
+                return Err(HandlerError::NotFound(path.to_string_path()));
+            }
             Ok(Entry::file(path.segments().last().unwrap()))
         }
 
@@ -3454,14 +3518,26 @@ allowed = ["bloom:vfs.read"]
 
         async fn write(&self, path: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
             self.writes.fetch_add(1, Ordering::SeqCst);
+            let _entry = self.entry_lock.lock().await;
             if self.signatures() > 0 {
-                return Err(HandlerError::NotFound(path.to_string_path()));
+                return Err(HandlerError::backend(
+                    "staged tx 'tx-1' is in 'sent', not 'pending'",
+                ));
             }
             self.challenged.store(true, Ordering::SeqCst);
-            if *self.state.lock().unwrap() != "active" {
+            let state = *self.state.lock().unwrap();
+            if state == "exhausted" {
+                return Err(HandlerError::PermissionDenied);
+            }
+            if state != "active" {
                 // The variant the real wallet handler returns.
                 return Err(HandlerError::ApprovalPending(path.to_string_path()));
             }
+            // Broker verifies, then consumes, the approval; the entry moves
+            // to sent/ only once signing and broadcast are recorded.
+            tokio::time::sleep(BROKER_CALL).await;
+            self.set("exhausted");
+            tokio::time::sleep(SIGN_AND_SEND).await;
             self.signatures.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -3525,12 +3601,30 @@ allowed = ["bloom:vfs.read"]
             approve_after(&entry, 700, "active")
         );
         assert_eq!(entry.signatures(), 1);
+        // Both report the send; neither tells its agent the confirm failed.
         let outcomes = [first.map(|e| e.code), second.map(|e| e.code)];
-        assert!(outcomes.contains(&None), "{outcomes:?}");
-        assert!(
-            outcomes.iter().all(|o| matches!(o, None | Some(-32004))),
-            "{outcomes:?}"
-        );
+        assert_eq!(outcomes, [None, None]);
+    }
+
+    /// A waiter that polls while the other confirm signs reads `exhausted`
+    /// with the entry still pending; it must report the send, not a refusal.
+    #[tokio::test]
+    async fn a_waiter_that_sees_the_approval_used_mid_signing_reports_the_send() {
+        let entry = ApprovalEntry::new();
+        let server = approval_server(&entry, 10_000);
+        confirm(&server).await.expect("approval required");
+        let late = async {
+            tokio::time::sleep(APPROVAL_POLL / 2).await;
+            confirm(&server).await
+        };
+        let (first, second, ()) =
+            tokio::join!(confirm(&server), late, approve_after(&entry, 700, "active"));
+        assert_eq!(entry.signatures(), 1);
+        let outcomes = [
+            first.map(|e| (e.code, e.message)),
+            second.map(|e| (e.code, e.message)),
+        ];
+        assert_eq!(outcomes, [None, None]);
     }
 
     #[tokio::test]
