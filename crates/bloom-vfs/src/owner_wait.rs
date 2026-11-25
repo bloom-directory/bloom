@@ -21,6 +21,9 @@ pub const APPROVAL_POLL: Duration = Duration::from_millis(500);
 pub const BATCH_APPROVAL_POLL: Duration = Duration::from_secs(2);
 /// A receipt read waits this many polls (5 s) for the transaction to be mined.
 pub const RECEIPT_POLLS: u32 = 10;
+/// How long a confirm's report of what it sent may run past the approval
+/// wait. With [`APPROVAL_WAIT`] it stays under a 60 s request timeout.
+pub const REPORT_WAIT: Duration = Duration::from_secs(8);
 
 pub enum WriteError {
     Handler(HandlerError),
@@ -91,6 +94,7 @@ pub async fn write(
     cancelled: Cancelled<'_>,
     report: bool,
 ) -> Result<Written, WriteError> {
+    let report_by = tokio::time::Instant::now() + wait + REPORT_WAIT;
     if let [root, wallet, leaf] = path.segments()
         && root == "wallets"
         && leaf == "policy.json"
@@ -242,11 +246,10 @@ pub async fn write(
     // Balances are shown for the confirmed entry's chain, the one `before`
     // was read on, even when its batch spans chains.
     let chain = batch_ref.split_once(':').map_or("", |(chain, _)| chain);
-    Ok(
-        sent_report(vfs, path, &sending, chain, before.unwrap_or_default())
-            .await
-            .map_or(Written::Done, Written::Sent),
-    )
+    let before = before.unwrap_or_default();
+    Ok(sent_report(vfs, path, &sending, chain, before, report_by)
+        .await
+        .map_or(Written::Done, Written::Sent))
 }
 
 /// The reply to a `new.tx` write: the entry it staged, up to its confirm
@@ -288,12 +291,15 @@ async fn staged_plans(vfs: &Vfs, path: &VfsPath, entries: &[String]) -> String {
 
 /// One line per `chain:id` entry: its receipt, or where it is when it has
 /// none. The receipt is shown whole, since its fields differ by chain.
+/// Waits end at `deadline`, so the answer arrives before the caller's
+/// request times out; an entry still unmined is reported by its hash.
 async fn sent_report(
     vfs: &Vfs,
     path: &VfsPath,
     entries: &[String],
     chain: &str,
     before: Vec<Value>,
+    deadline: tokio::time::Instant,
 ) -> Option<String> {
     let [root, wallet, number, ..] = path.segments() else {
         return None;
@@ -305,9 +311,9 @@ async fn sent_report(
         let receipt = VfsPath::parse(&format!("/{sent}/receipt.json")).ok()?;
         let raw = match vfs.read(&receipt).await {
             Err(error) if receipt_is_due(vfs, &receipt, &error).await => {
-                match await_receipt(vfs, &receipt, error).await {
-                    Ok(_) => vfs.read(&receipt).await.ok(),
-                    Err(_) => None,
+                match tokio::time::timeout_at(deadline, await_receipt(vfs, &receipt, error)).await {
+                    Ok(Ok(_)) => vfs.read(&receipt).await.ok(),
+                    _ => None,
                 }
             }
             read => read.ok(),
@@ -315,22 +321,18 @@ async fn sent_report(
         let receipt: Option<Value> = raw.and_then(|raw| serde_json::from_slice(&raw).ok());
         lines.push(match receipt {
             Some(receipt) => format!("{id}: {receipt}"),
-            None => {
-                let hash = VfsPath::parse(&format!("/{sent}/tx_hash")).ok()?;
-                match vfs.read(&hash).await {
-                    Ok(hash) => format!(
-                        "{id}: broadcast tx {}; receipt not recorded yet: {sent}/receipt.json",
-                        String::from_utf8_lossy(&hash).trim()
-                    ),
-                    Err(_) => format!("{id}: not in sent/; read its entry for the outcome"),
-                }
-            }
+            None => match broadcast_hash(vfs, &sent).await {
+                Some(hash) => format!(
+                    "{id}: broadcast tx {hash}; receipt not recorded yet: {sent}/receipt.json"
+                ),
+                None => format!("{id}: not in sent/; read its entry for the outcome"),
+            },
         });
     }
     // What the account holds now on that chain, and how each balance
     // changed, so the caller need not check a swap's or supply's result
     // with separate balance reads, nor mistake a balance for what it got.
-    if let Some(after) = holdings(vfs, path, chain).await {
+    if let Ok(Some(after)) = tokio::time::timeout_at(deadline, holdings(vfs, path, chain)).await {
         let changed = changes(&before, &after);
         // "(change)" only when a delta is shown, so a bare list is never
         // read as amounts that moved.
@@ -570,8 +572,23 @@ async fn await_approval(
     }
 }
 
+/// The hash of a sent entry's broadcast: an EVM entry's `tx_hash`, or the
+/// `signature` in a Solana entry's `broadcast_attempted.json`.
+async fn broadcast_hash(vfs: &Vfs, sent: &str) -> Option<String> {
+    let read = |leaf: &str| {
+        let path = VfsPath::parse(&format!("/{sent}/{leaf}"));
+        async move { vfs.read(&path.ok()?).await.ok() }
+    };
+    if let Some(hash) = read("tx_hash").await {
+        return Some(String::from_utf8_lossy(&hash).trim().to_owned());
+    }
+    let attempt: Value = serde_json::from_slice(&read("broadcast_attempted.json").await?).ok()?;
+    Some(attempt.get("signature")?.as_str()?.to_owned())
+}
+
 /// Whether `path` names the receipt of an outbox entry that was broadcast
-/// (it has a `tx_hash`) but has no receipt recorded yet.
+/// (it has an EVM `tx_hash` or a Solana `broadcast_attempted.json`) but has
+/// no receipt recorded yet.
 pub async fn receipt_is_due(vfs: &Vfs, path: &VfsPath, error: &HandlerError) -> bool {
     let segments = path.segments();
     let [.., outbox, sent, _, leaf] = segments else {
@@ -584,11 +601,15 @@ pub async fn receipt_is_due(vfs: &Vfs, path: &VfsPath, error: &HandlerError) -> 
     {
         return false;
     }
-    let sibling = format!("/{}/tx_hash", segments[..segments.len() - 1].join("/"));
-    match VfsPath::parse(&sibling) {
-        Ok(tx_hash) => vfs.lookup(&tx_hash).await.is_ok(),
-        Err(_) => false,
+    let entry = segments[..segments.len() - 1].join("/");
+    for marker in ["tx_hash", "broadcast_attempted.json"] {
+        if let Ok(marker) = VfsPath::parse(&format!("/{entry}/{marker}"))
+            && vfs.lookup(&marker).await.is_ok()
+        {
+            return true;
+        }
     }
+    false
 }
 
 /// A receipt is recorded once the transaction is mined, moments after the
@@ -730,11 +751,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Handler for SentBatch {
-        // `tx_hash` is not looked up, so the answer does not wait 5 s for
-        // `tx-2`'s receipt.
+        // The broadcast markers are not looked up, so the answer does not
+        // wait 5 s for `tx-2`'s receipt.
         async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
             match p.segments().last().unwrap().as_str() {
-                "tx_hash" => Err(HandlerError::not_found(p.to_string_path())),
+                "tx_hash" | "broadcast_attempted.json" => {
+                    Err(HandlerError::not_found(p.to_string_path()))
+                }
                 leaf => Ok(Entry::file(leaf)),
             }
         }
@@ -803,6 +826,93 @@ mod tests {
             changes(&after[..2], &after[..1]),
             "1.5 ETH, 0 USDC (-51144.0333)"
         );
+    }
+
+    /// Both entries were broadcast and neither is mined, so each receipt
+    /// read would wait 5 s. The report ends at its deadline instead.
+    struct Unmined;
+
+    #[async_trait::async_trait]
+    impl Handler for Unmined {
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            match p.segments().last().unwrap().as_str() {
+                "tx_hash" => Ok(Entry::file("tx_hash")),
+                _ => Err(HandlerError::not_found(p.to_string_path())),
+            }
+        }
+        async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            match p.segments().last().unwrap().as_str() {
+                "tx_hash" => Ok(b"0xbb\n".to_vec()),
+                _ => Err(HandlerError::not_found(p.to_string_path())),
+            }
+        }
+        async fn write(&self, _p: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_sent_report_stops_waiting_at_its_deadline() {
+        let vfs = Vfs::builder().mount("wallets", Arc::new(Unmined)).build();
+        let path = VfsPath::parse("/wallets/w/0/chains/base/outbox/pending/tx-1/confirm").unwrap();
+        let entries = ["base:tx-1".to_owned(), "base:tx-2".to_owned()];
+        let started = tokio::time::Instant::now();
+        let deadline = started + APPROVAL_POLL * 2;
+        let report = sent_report(&vfs, &path, &entries, "base", Vec::new(), deadline)
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < APPROVAL_POLL * 4,
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(report.contains("tx-1: broadcast tx 0xbb"), "{report}");
+        assert!(report.contains("tx-2: broadcast tx 0xbb"), "{report}");
+    }
+
+    /// A Solana entry in `sent/` has no `tx_hash`: its signature is in
+    /// `broadcast_attempted.json`, and the reconciler writes the receipt later.
+    struct SolanaUnmined;
+
+    #[async_trait::async_trait]
+    impl Handler for SolanaUnmined {
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            match p.segments().last().unwrap().as_str() {
+                "broadcast_attempted.json" => Ok(Entry::file("broadcast_attempted.json")),
+                _ => Err(HandlerError::not_found(p.to_string_path())),
+            }
+        }
+        async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            match p.segments().last().unwrap().as_str() {
+                "broadcast_attempted.json" => Ok(br#"{"signature":"5sig"}"#.to_vec()),
+                _ => Err(HandlerError::not_found(p.to_string_path())),
+            }
+        }
+        async fn write(&self, _p: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sent_solana_entry_is_reported_by_its_signature() {
+        let vfs = Vfs::builder()
+            .mount("wallets", Arc::new(SolanaUnmined))
+            .build();
+        let path =
+            VfsPath::parse("/wallets/w/0/chains/solana/outbox/pending/tx-1/confirm").unwrap();
+        let entries = ["solana:tx-1".to_owned()];
+        let deadline = tokio::time::Instant::now() + APPROVAL_POLL * 2;
+        let report = sent_report(&vfs, &path, &entries, "solana", Vec::new(), deadline)
+            .await
+            .unwrap();
+        assert!(
+            report.starts_with("tx-1: broadcast tx 5sig; receipt not recorded yet"),
+            "{report}"
+        );
+        let receipt =
+            VfsPath::parse("/wallets/w/0/chains/solana/outbox/sent/tx-1/receipt.json").unwrap();
+        let absent = HandlerError::not_found(receipt.to_string_path());
+        assert!(receipt_is_due(&vfs, &receipt, &absent).await);
     }
 
     /// `send.tx` stages one entry and asks the owner.
