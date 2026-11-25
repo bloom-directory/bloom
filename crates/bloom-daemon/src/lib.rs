@@ -2973,7 +2973,7 @@ impl PetalHost for DaemonPetalHost {
                 &outbox_id,
                 Some(requirement),
             ),
-            Err(bloom_tx::TxEngineError::PolicyDenied) => Err(HostError::Backend(
+            Err(bloom_tx::TxEngineError::PolicyDenied(_)) => Err(HostError::Backend(
                 petal_policy_denial(&service.tx_engine, &wallet, &chain_name, &outbox_id),
             )),
             Err(error) => Err(HostError::Backend(format!("confirm EVM outbox: {error}"))),

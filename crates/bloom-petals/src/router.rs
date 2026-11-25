@@ -985,7 +985,8 @@ fn validate_link_target(target: &str) -> Result<(), HandlerError> {
 fn dispatch_error(code: i32, message: String, path: String) -> HandlerError {
     match code {
         -1 => HandlerError::NotFound(if message.is_empty() { path } else { message }),
-        -2 => HandlerError::PermissionDenied,
+        -2 if message.is_empty() => HandlerError::PermissionDenied,
+        -2 => HandlerError::Denied(message),
         -3 => HandlerError::Invalid(message),
         -4 => HandlerError::Backend(message),
         COMPONENT_NOT_A_DIR_CODE => {
@@ -2022,7 +2023,7 @@ name = "example"
 
         // A -2 refusal reaches the mount as a bare EACCES; its reason must survive.
         let error = vfs.write(&failing, b"payload").await.unwrap_err();
-        assert!(matches!(error, HandlerError::PermissionDenied), "{error}");
+        assert!(matches!(error, HandlerError::Denied(_)), "{error}");
         let record: serde_json::Value =
             serde_json::from_slice(&vfs.read(&last_error).await.unwrap()).unwrap();
         assert_eq!(record["path"], "operations/alice/0/submit");

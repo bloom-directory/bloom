@@ -185,6 +185,10 @@ pub enum HandlerError {
     NotAFile(String),
     #[error("permission denied")]
     PermissionDenied,
+    /// A permission denial that says why (a Petal's -2 with a message):
+    /// a mount still reads it as `Permission denied`, other callers get the reason.
+    #[error("permission denied: {0}")]
+    Denied(String),
     #[error("operation not permitted")]
     OperationNotPermitted,
     /// A refusal that names its rule: a mount still reads it as

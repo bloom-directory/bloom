@@ -2969,7 +2969,7 @@ fn approval_next_step(
             if direct {
                 "Show ceremony_url to the owner. Write retry_body to retry_path right away, without waiting for their reply: it waits for their approval and sends. It starts no new ceremony. Stop when ceremony_expires_at_ms passes and tell the owner.".into()
             } else {
-                format!("Give ceremony_url to the owner. As soon as they approve, {retry}. Retrying earlier is safe: it starts no new ceremony and returns permission denied again.")
+                format!("Give ceremony_url to the owner. As soon as they approve, {retry}. Until then a retry only returns permission denied again. If the owner declines, this state becomes cancelled; at ceremony_expires_at_ms it becomes expired. Either way, stop and tell the owner.")
             },
         ),
         S::Active => (

@@ -182,7 +182,7 @@ fn host_from_handler(e: HandlerError) -> HostError {
         HandlerError::PermissionDenied
         | HandlerError::OperationNotPermitted
         | HandlerError::ApprovalPending(_) => HostError::Denied("vfs".into()),
-        HandlerError::Refused(s) => HostError::Denied(s),
+        HandlerError::Refused(s) | HandlerError::Denied(s) => HostError::Denied(s),
         HandlerError::Invalid(s) => HostError::Invalid(s),
         HandlerError::Unsupported(s) => HostError::Backend(format!("unsupported: {s}")),
         HandlerError::Backend(s) => HostError::Backend(s),

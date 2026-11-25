@@ -1421,6 +1421,7 @@ fn machine_error_from_handler(error: &bloom_vfs::HandlerError, message: String) 
         bloom_vfs::HandlerError::PermissionDenied
         | bloom_vfs::HandlerError::OperationNotPermitted
         | bloom_vfs::HandlerError::Refused(_)
+        | bloom_vfs::HandlerError::Denied(_)
         | bloom_vfs::HandlerError::ApprovalPending(_) => MachineErrorKind::PermissionDenied,
         bloom_vfs::HandlerError::Invalid(_)
         | bloom_vfs::HandlerError::NotADir(_)
@@ -4117,12 +4118,10 @@ async fn run(cli: Cli) -> Result<()> {
             {
                 println!("{report}");
             }
-            // A send.tx that staged and waits for the owner sent nothing:
-            // exit as `wallet confirm` does for the same state.
+            // A send.tx that staged did what it was asked: exit 0, so an
+            // agent's shell does not report the stage as a failed command.
             if let Some(text) = written["approval_pending"]["text"].as_str() {
                 println!("{text}");
-                EXIT_CODE_OVERRIDE
-                    .store(EXIT_APPROVAL_PENDING, std::sync::atomic::Ordering::SeqCst);
             }
             debug!(endpoint = %client_endpoint.display, "cli.vfs.write.via_ipc");
             Ok(())
