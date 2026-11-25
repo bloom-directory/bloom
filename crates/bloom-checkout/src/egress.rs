@@ -172,11 +172,18 @@ fn public_v6(ip: Ipv6Addr) -> bool {
         return public_v4(v4);
     }
     let s = ip.segments();
-    // NAT64 embeds an IPv4 address; judge that address.
-    if s[0] == 0x64 && s[1] == 0xff9b && s[2..6] == [0; 4] {
+    // NAT64 embeds an IPv4 address; judge that address. This covers the
+    // well-known prefix 64:ff9b::/96 and the local-use 64:ff9b:1::/48
+    // (RFC 8215) when it is used as a /96.
+    if s[0] == 0x64 && s[1] == 0xff9b && (s[2..6] == [0; 4] || (s[2] == 1 && s[3..6] == [0; 3])) {
         let [a, b] = s[6].to_be_bytes();
         let [c, d] = s[7].to_be_bytes();
         return public_v4(Ipv4Addr::new(a, b, c, d));
+    }
+    // Other lengths inside 64:ff9b:1::/48 put the IPv4 address elsewhere, so
+    // refuse them rather than guess.
+    if s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1 {
+        return false;
     }
     !(ip.is_unspecified()
         || ip.is_loopback()
@@ -212,6 +219,9 @@ mod tests {
             "::ffff:127.0.0.1",
             "::ffff:169.254.169.254",
             "64:ff9b::a9fe:a9fe",
+            "64:ff9b:1::169.254.169.254",
+            "64:ff9b:1::10.0.0.1",
+            "64:ff9b:1:a9fe:a9:fe00::",
             "2002:c0a8:0101::1",
         ] {
             assert!(!allowed(refused.parse().unwrap(), false), "{refused}");
@@ -221,6 +231,7 @@ mod tests {
             "1.1.1.1",
             "2606:4700:4700::1111",
             "64:ff9b::808:808",
+            "64:ff9b:1::8.8.8.8",
         ] {
             assert!(allowed(public.parse().unwrap(), false), "{public}");
         }

@@ -1403,6 +1403,10 @@ impl CheckoutService {
                         if let Some(fields) = recorded.as_object_mut() {
                             fields.remove("phrase");
                         }
+                        // Never close the private browser for an operation the
+                        // person started there with a saved card or traveler.
+                        // Its parent checkout owns the browser, and the person
+                        // is still using it.
                         let close = !self
                             .saved
                             .lock()
@@ -1858,6 +1862,11 @@ impl CheckoutService {
                 };
                 if stay_signed_in && mode != Mode::TakeOver {
                     bail!("Only a take-over can keep its sign-in");
+                }
+                // Refuse before any change: the view hides this choice, but a
+                // direct request must not keep pages that held traveler values.
+                if stay_signed_in && self.browser.has_private_traveler_data() {
+                    bail!("Saved traveler details were used here; this session cannot be kept");
                 }
                 if mode == Mode::TakeOver {
                     if stay_signed_in {
@@ -2332,7 +2341,13 @@ mod tests {
             }
         ));
         let token = hex_token(&[46; 32]);
-        for (id, mode) in [("4", Mode::Site), ("5", Mode::TakeOver)] {
+        for (id, mode) in [
+            ("4", Mode::Site),
+            ("5", Mode::TakeOver),
+            ("6", Mode::TakeOver),
+        ] {
+            // Operation 6 filled saved traveler values, so it cannot stay signed in.
+            let traveler = id == "6";
             let tab = browser.handoff().await.unwrap();
             let operation_id = id.repeat(64);
             let status = Status {
@@ -2366,15 +2381,22 @@ mod tests {
                 manual_submission: false,
                 submitted: false,
             });
+            if traveler {
+                browser.remember_private_traveler_use();
+            }
             let state = service.private_state(&token).await.unwrap();
-            assert_eq!(state["can_stay_signed_in"], mode == Mode::TakeOver);
+            assert_eq!(
+                state["can_stay_signed_in"],
+                mode == Mode::TakeOver && !traveler
+            );
             // The view shows the person what the agent asked for.
             assert_eq!(state["agent_description"], "Fixture");
             let stay = ViewAction::Finish {
                 stay_signed_in: true,
             };
-            if mode == Mode::Site {
+            if mode == Mode::Site || traveler {
                 assert!(service.private_action(&token, stay).await.is_err());
+                assert!(service.private.lock().await.is_some());
                 service
                     .private_action(
                         &token,
