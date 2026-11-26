@@ -108,6 +108,11 @@ pub async fn write(
         return Ok(Written::Done);
     }
     let Some(challenge) = confirm_challenge_path(path) else {
+        // `new.tx` only stages: answer with what will be signed and the
+        // next step, or the caller searches `latest/` for a link.
+        if report && path.segments().last().is_some_and(|leaf| leaf == "new.tx") {
+            return Ok(staged_reply(vfs, path, bytes).await?);
+        }
         return match vfs.write(path, bytes).await {
             // `outbox/send.tx` stages and asks the owner in one write:
             // answer as a first confirm does, with the link.
@@ -169,13 +174,6 @@ pub async fn write(
                     )),
                     None => HandlerError::ApprovalPending(challenge).into(),
                 })
-            }
-            // `new.tx` only stages: answer with what will be signed and the
-            // next step, or the caller searches `latest/` for a link.
-            Ok(()) if report && path.segments().last().is_some_and(|leaf| leaf == "new.tx") => {
-                Ok(staged_reply(vfs, path)
-                    .await
-                    .map_or(Written::Done, Written::Staged))
             }
             written => Ok(written.map(|()| Written::Done)?),
         };
@@ -252,20 +250,35 @@ pub async fn write(
         .map_or(Written::Done, Written::Sent))
 }
 
-/// The reply to a `new.tx` write: the entry it staged, up to its confirm
-/// instructions, and how to ask the owner.
-async fn staged_reply(vfs: &Vfs, path: &VfsPath) -> Option<String> {
-    let [root, wallet, number, _, chain, ..] = path.segments() else {
-        return None;
+/// Write `new.tx` and reply with the entry it staged, up to its confirm
+/// instructions, and how to ask the owner. The entry's ID is captured with
+/// the write: `latest` is whatever was staged last, which another writer
+/// may change before the reply is built.
+async fn staged_reply(vfs: &Vfs, path: &VfsPath, bytes: &[u8]) -> Result<Written, HandlerError> {
+    let latest = match path.segments() {
+        [root, wallet, number, _, chain, ..] => VfsPath::parse(&format!(
+            "/{root}/{wallet}/{number}/chains/{chain}/outbox/latest"
+        ))
+        .ok()
+        .map(|latest| (chain, latest)),
+        _ => None,
     };
-    let latest = format!("/{root}/{wallet}/{number}/chains/{chain}/outbox/latest/plan.md");
-    let raw = vfs.read(&VfsPath::parse(&latest).ok()?).await.ok()?;
-    let text = String::from_utf8_lossy(&raw);
-    let id = text.lines().next()?.strip_prefix("# Staged tx ")?.trim();
+    let Some((chain, latest)) = latest else {
+        vfs.write(path, bytes).await?;
+        return Ok(Written::Done);
+    };
+    let staged = vfs.write_then_lookup(path, bytes, &latest).await?;
+    let Some(id) = staged
+        .link_target
+        .as_deref()
+        .and_then(|target| target.strip_prefix("pending/"))
+    else {
+        return Ok(Written::Done);
+    };
     let plans = staged_plans(vfs, path, &[format!("{chain}:{id}")]).await;
-    Some(format!(
+    Ok(Written::Staged(format!(
         "{plans}Staged, not yet asked. Write y to pending/{id}/confirm: it answers with the owner's approval link."
-    ))
+    )))
 }
 
 /// Each staged `chain:id` entry's `plan.md`, up to its confirm instructions.
@@ -370,7 +383,9 @@ async fn holdings(vfs: &Vfs, path: &VfsPath, chain: &str) -> Option<Vec<Value>> 
 fn changes(before: &[Value], after: &[Value]) -> String {
     use alloy::primitives::{I256, U256};
     let raw = |h: &Value| h["raw"].as_str().and_then(|raw| raw.parse::<U256>().ok());
-    let same = |a: &Value, b: &Value| a["asset"] == b["asset"] && a["symbol"] == b["symbol"];
+    // A token is its contract: two ERC-20s may share a symbol. The native
+    // asset has no address, and there is one per chain.
+    let same = |a: &Value, b: &Value| a["asset"] == b["asset"] && a["address"] == b["address"];
     let delta = |was: Option<U256>, now: Option<U256>, decimals: u8| {
         let (was, now) = (was.unwrap_or_default(), now.unwrap_or_default());
         let d = I256::from_raw(now).wrapping_sub(I256::from_raw(was));
@@ -973,12 +988,16 @@ mod tests {
         #[async_trait::async_trait]
         impl Handler for Staged {
             async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
-                Ok(Entry::file(p.segments().last().unwrap()))
+                match p.to_string_path().as_str() {
+                    "/w/0/chains/base/outbox/latest" => {
+                        Ok(Entry::symlink("latest", "pending/tx-1"))
+                    }
+                    _ => Ok(Entry::file(p.segments().last().unwrap())),
+                }
             }
             async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
                 match p.to_string_path().as_str() {
-                    "/w/0/chains/base/outbox/latest/plan.md"
-                    | "/w/0/chains/base/outbox/pending/tx-1/plan.md" => {
+                    "/w/0/chains/base/outbox/pending/tx-1/plan.md" => {
                         Ok(b"# Staged tx tx-1\n\nTo: 0xabc\n\n## Confirm\nWrite y\n".to_vec())
                     }
                     other => Err(HandlerError::not_found(other)),
@@ -1002,6 +1021,78 @@ mod tests {
         );
         let mounted = write(&vfs, &path, b"send 1 ETH to 0xabc", wait, &|| false, false).await;
         assert_eq!(mounted.ok(), Some(Written::Done));
+    }
+
+    /// Each `new.tx` write stages `tx-<n>` and moves `latest` to it. The
+    /// first read after the first write waits until `resume`.
+    #[derive(Default)]
+    struct Restaged {
+        staged: AtomicUsize,
+        paused: std::sync::atomic::AtomicBool,
+        reading: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl Handler for Restaged {
+        async fn lookup(&self, _p: &VfsPath) -> Result<Entry, HandlerError> {
+            let latest = format!("pending/tx-{}", self.staged.load(Ordering::SeqCst));
+            Ok(Entry::symlink("latest", &latest))
+        }
+        async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            if !self.paused.swap(true, Ordering::SeqCst) {
+                self.reading.notify_one();
+                self.resume.notified().await;
+            }
+            let id = match p.segments() {
+                [.., state, id, _] if state == "pending" => id.clone(),
+                _ => format!("tx-{}", self.staged.load(Ordering::SeqCst)),
+            };
+            Ok(format!("# Staged tx {id}\n\n## Confirm\nWrite y\n").into_bytes())
+        }
+        async fn write(&self, _p: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+            self.staged.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A `new.tx` reply names the entry its own write staged, even when
+    /// another writer stages after it and moves `latest`.
+    #[tokio::test]
+    async fn a_staging_reply_names_its_own_entry() {
+        let wallet = Arc::new(Restaged::default());
+        let vfs = Vfs::builder().mount("wallets", wallet.clone()).build();
+        let path = VfsPath::parse("/wallets/w/0/chains/base/outbox/new.tx").unwrap();
+        let wait = Duration::from_secs(50);
+        let first = tokio::spawn({
+            let (vfs, path) = (vfs.clone(), path.clone());
+            async move {
+                write(&vfs, &path, b"send", wait, &|| false, true)
+                    .await
+                    .ok()
+            }
+        });
+        wallet.reading.notified().await;
+        let second = write(&vfs, &path, b"send", wait, &|| false, true).await;
+        wallet.resume.notify_one();
+        let reply = |id: &str| {
+            Some(Written::Staged(format!(
+                "# Staged tx {id}\n\nStaged, not yet asked. Write y to pending/{id}/confirm: \
+                 it answers with the owner's approval link."
+            )))
+        };
+        assert_eq!(second.ok(), reply("tx-2"));
+        assert_eq!(first.await.unwrap(), reply("tx-1"));
+    }
+
+    /// Two tokens with one symbol are told apart by their contract.
+    #[test]
+    fn same_symbol_tokens_keep_their_own_balances() {
+        let h = |address: &str, raw: &str, display: &str| serde_json::json!({"asset": "erc20", "address": address, "symbol": "USDC", "decimals": 6, "raw": raw, "display": display});
+        let before = [h("0xA", "1000000", "1 USDC"), h("0xB", "5000000", "5 USDC")];
+        let after = [h("0xA", "3000000", "3 USDC"), h("0xB", "5000000", "5 USDC")];
+        assert_eq!(changes(&before, &after), "3 USDC (+2), 5 USDC");
+        assert_eq!(changes(&before, &after[..1]), "3 USDC (+2), 0 USDC (-5)");
     }
 
     /// The first policy write answers with the link at once; the repeat
