@@ -181,6 +181,7 @@ pub async fn write(
                     entries.push(format!("{chain}:{id}"));
                 }
                 let url = url.and_then(|doc| doc["ceremony_url"].as_str().map(str::to_owned));
+                let outbox = outbox_dir(path);
                 // Staging is not a failure: answer with what will be signed,
                 // so the caller need not read each plan before confirming.
                 // Nothing is sent, so it is never reported as `Sent`.
@@ -188,7 +189,7 @@ pub async fn write(
                     let plans = staged_plans(vfs, path, &entries).await;
                     return Ok(Written::ApprovalPending {
                         text: format!(
-                            "{plans}Staged; owner approval{staged}: {url} . Write y to pending/{id}/confirm: it waits for their approval, then sends."
+                            "{plans}Staged; owner approval{staged}: {url} . Write y to {outbox}/pending/{id}/confirm: it waits for their approval, then sends."
                         ),
                         id,
                         ceremony_url: url.clone(),
@@ -196,7 +197,7 @@ pub async fn write(
                 }
                 Err(match url {
                     Some(url) => WriteError::Approval(format!(
-                        "permission denied: owner approval required{staged}: {url} . Write y to pending/{id}/confirm: it waits for their approval, then sends."
+                        "permission denied: owner approval required{staged}: {url} . Write y to {outbox}/pending/{id}/confirm: it waits for their approval, then sends."
                     )),
                     None => HandlerError::ApprovalPending(challenge).into(),
                 })
@@ -280,6 +281,14 @@ pub async fn write(
 /// instructions, and how to ask the owner. The entry's ID is captured with
 /// the write: `latest` is whatever was staged last, which another writer
 /// may change before the reply is built.
+/// The full path of the outbox a write went to, without a leading `/`, as
+/// AGENTS.md writes paths: an agent that runs `bloom vfs` from the root
+/// confirms with it as given.
+fn outbox_dir(path: &VfsPath) -> String {
+    let segments = path.segments();
+    segments[..segments.len().saturating_sub(1)].join("/")
+}
+
 async fn staged_reply(vfs: &Vfs, path: &VfsPath, bytes: &[u8]) -> Result<Written, HandlerError> {
     let latest = match path.segments() {
         [root, wallet, number, _, chain, ..] => VfsPath::parse(&format!(
@@ -302,8 +311,9 @@ async fn staged_reply(vfs: &Vfs, path: &VfsPath, bytes: &[u8]) -> Result<Written
         return Ok(Written::Done);
     };
     let plans = staged_plans(vfs, path, &[format!("{chain}:{id}")]).await;
+    let outbox = outbox_dir(path);
     Ok(Written::Staged(format!(
-        "{plans}Staged, not yet asked. Write y to pending/{id}/confirm: it answers with the owner's approval link."
+        "{plans}Staged, not yet asked. Write y to {outbox}/pending/{id}/confirm: it answers with the owner's approval link."
     )))
 }
 
@@ -1024,7 +1034,7 @@ mod tests {
                 id: "tx-1".into(),
                 ceremony_url: "http://localhost/c/1".into(),
                 text: "# Staged tx tx-1\n\nTo: 0xabc\n\nStaged; owner approval: http://localhost/c/1 . \
-                 Write y to pending/tx-1/confirm: it waits for their approval, then sends."
+                 Write y to wallets/w/0/chains/base/outbox/pending/tx-1/confirm: it waits for their approval, then sends."
                     .into(),
             })
         );
@@ -1067,7 +1077,7 @@ mod tests {
             staged.ok(),
             Some(Written::Staged(
                 "# Staged tx tx-1\n\nTo: 0xabc\n\nStaged, not yet asked. Write y to \
-                 pending/tx-1/confirm: it answers with the owner's approval link."
+                 wallets/w/0/chains/base/outbox/pending/tx-1/confirm: it answers with the owner's approval link."
                     .into()
             ))
         );
@@ -1129,7 +1139,7 @@ mod tests {
         wallet.resume.notify_one();
         let reply = |id: &str| {
             Some(Written::Staged(format!(
-                "# Staged tx {id}\n\nStaged, not yet asked. Write y to pending/{id}/confirm: \
+                "# Staged tx {id}\n\nStaged, not yet asked. Write y to wallets/w/0/chains/base/outbox/pending/{id}/confirm: \
                  it answers with the owner's approval link."
             )))
         };
