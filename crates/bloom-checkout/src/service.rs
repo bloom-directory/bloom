@@ -671,121 +671,150 @@ impl CheckoutService {
                     return Err(Refusal::IdUsed.into());
                 }
                 let tab = self.browser.handoff().await?;
-                let read = match mode {
-                    Mode::Card => Some(Discovery::read(&tab).await),
-                    Mode::Site => Some(Discovery::read_site(&tab).await),
-                    Mode::TakeOver => None,
-                };
-                let discovery = match read {
-                    Some(Ok(discovery)) => Some(discovery),
-                    // The agent learns the code Checkout chose, never page,
-                    // merchant or card content.
-                    Some(Err(error)) => {
-                        eprintln!("payment page needs the private view: {error:#}");
-                        status.reason = error.downcast_ref::<PreparationReason>().copied();
-                        None
-                    }
-                    None => None,
-                };
-                let shop = match &discovery {
-                    Some(discovery) => Some(discovery.facts.origin.clone()),
-                    None => tab_url(&tab)
-                        .await
-                        .and_then(|url| url::Url::parse(&url).ok())
-                        .filter(|url| {
-                            matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
-                        })
-                        .map(|url| url.origin().ascii_serialization()),
-                };
-                if matches!(mode, Mode::Card | Mode::Site) {
-                    let check = (|| -> Result<()> {
+                // Handoff revoked shopping. Until the private checkout is
+                // installed, every failure must hand the browser back and
+                // cancel an approval the Broker already prepared.
+                let mut prepared = false;
+                let setup: Result<(Value, bool)> = async {
+                    let read = match mode {
+                        Mode::Card => Some(Discovery::read(&tab).await),
+                        Mode::Site => Some(Discovery::read_site(&tab).await),
+                        Mode::TakeOver => None,
+                    };
+                    let discovery = match read {
+                        Some(Ok(discovery)) => Some(discovery),
+                        // The agent learns the code Checkout chose, never page,
+                        // merchant or card content.
+                        Some(Err(error)) => {
+                            eprintln!("payment page needs the private view: {error:#}");
+                            status.reason = error.downcast_ref::<PreparationReason>().copied();
+                            None
+                        }
+                        None => None,
+                    };
+                    let shop = match &discovery {
+                        Some(discovery) => Some(discovery.facts.origin.clone()),
+                        None => tab_url(&tab)
+                            .await
+                            .and_then(|url| url::Url::parse(&url).ok())
+                            .filter(|url| {
+                                matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
+                            })
+                            .map(|url| url.origin().ascii_serialization()),
+                    };
+                    if matches!(mode, Mode::Card | Mode::Site) {
                         let origin = shop
                             .as_deref()
                             .context("Cannot determine checkout origin")?;
                         if let Some(open) = self.store.unresolved(origin)? {
                             return Err(Refusal::Blocked(open).into());
                         }
-                        Ok(())
-                    })();
-                    if let Err(error) = check {
-                        self.return_control().await?;
-                        return Err(error);
+                    }
+                    self.store.insert(&status, kind, &agent_description)?;
+                    status.state = "preparing".into();
+                    self.store.update(&status)?;
+                    self.store.record_order(
+                        &operation_id,
+                        shop.as_deref(),
+                        discovery
+                            .as_ref()
+                            .map(|d| (d.facts.total_minor, d.facts.currency.as_str())),
+                        discovery.as_ref().and_then(|d| renewal_terms(&d.facts)),
+                    )?;
+                    let recipient =
+                        (mode == Mode::Card && discovery.is_some()).then(Recipient::generate);
+                    let capability = new_view_token();
+                    let challenge_url = challenge_url(self.view_port, &capability);
+                    // The approval URL is available to the agent. A page preview
+                    // or field value may contain private traveler information.
+                    let (order_preview, order_fields) = if discovery.is_some() {
+                        self.approval_order_details(&tab).await
+                    } else {
+                        (None, json!([]))
+                    };
+                    let request = match (&discovery, &recipient) {
+                        (Some(discovery), Some(recipient)) => {
+                            json!({"method":"prepare","operation_id":operation_id,"card_id":card_id,
+                            "facts":discovery.facts,"recipient_key":recipient.public,
+                            "agent_description":agent_description,"challenge_url":challenge_url,
+                            "order_preview":order_preview,
+                            "order_fields":order_fields})
+                        }
+                        (Some(discovery), None) => {
+                            json!({"method":"site","operation_id":operation_id,
+                            "facts":discovery.facts,"agent_description":agent_description,
+                            "challenge_url":challenge_url,
+                            "order_preview":order_preview,
+                            "order_fields":order_fields})
+                        }
+                        _ => {
+                            json!({"method":"manual","operation_id":operation_id,"card_id":card_id,
+                            "agent_description":agent_description,"challenge_url":challenge_url})
+                        }
+                    };
+                    match self.intake(request).await {
+                        Ok(IntakeResponse::Prepared { ceremony_url }) => {
+                            prepared = true;
+                            status.state = "awaiting_approval".into();
+                            status.ceremony_url = Some(ceremony_url);
+                            self.store.update(&status)?;
+                            let value = serde_json::to_value(&status)?;
+                            *private = Some(PrivateCheckout {
+                                operation_id: operation_id.clone(),
+                                mode,
+                                view_target: tab.target.clone(),
+                                view_session: tab.session.clone(),
+                                seen_pages: std::collections::HashSet::from([tab.target.clone()]),
+                                tab,
+                                discovery,
+                                recipient,
+                                capability,
+                                session: None,
+                                approved: false,
+                                manual_submission: false,
+                                submitted: false,
+                            });
+                            let service = self.clone();
+                            let operation_id = operation_id.clone();
+                            tokio::spawn(async move {
+                                service.finish_approved(operation_id).await;
+                            });
+                            Ok((value, true))
+                        }
+                        _ => {
+                            status.state = "failed_before_release".into();
+                            self.store.update(&status)?;
+                            Ok((serde_json::to_value(status)?, false))
+                        }
                     }
                 }
-                if let Err(error) = self.store.insert(&status, kind, &agent_description) {
-                    let _ = self.return_control().await;
-                    return Err(error);
-                }
-                status.state = "preparing".into();
-                self.store.update(&status)?;
-                self.store.record_order(
-                    &operation_id,
-                    shop.as_deref(),
-                    discovery
-                        .as_ref()
-                        .map(|d| (d.facts.total_minor, d.facts.currency.as_str())),
-                    discovery.as_ref().and_then(|d| renewal_terms(&d.facts)),
-                )?;
-                let recipient =
-                    (mode == Mode::Card && discovery.is_some()).then(Recipient::generate);
-                let capability = new_view_token();
-                let challenge_url = challenge_url(self.view_port, &capability);
-                // The approval URL is available to the agent. A page preview
-                // or field value may contain private traveler information.
-                let (order_preview, order_fields) = if discovery.is_some() {
-                    self.approval_order_details(&tab).await
-                } else {
-                    (None, json!([]))
-                };
-                let request = match (&discovery, &recipient) {
-                    (Some(discovery), Some(recipient)) => {
-                        json!({"method":"prepare","operation_id":operation_id,"card_id":card_id,
-                        "facts":discovery.facts,"recipient_key":recipient.public,
-                        "agent_description":agent_description,"challenge_url":challenge_url,
-                        "order_preview":order_preview,
-                        "order_fields":order_fields})
-                    }
-                    (Some(discovery), None) => {
-                        json!({"method":"site","operation_id":operation_id,
-                        "facts":discovery.facts,"agent_description":agent_description,
-                        "challenge_url":challenge_url,
-                        "order_preview":order_preview,
-                        "order_fields":order_fields})
-                    }
-                    _ => json!({"method":"manual","operation_id":operation_id,"card_id":card_id,
-                        "agent_description":agent_description,"challenge_url":challenge_url}),
-                };
-                match self.intake(request).await {
-                    Ok(IntakeResponse::Prepared { ceremony_url }) => {
-                        status.state = "awaiting_approval".into();
-                        status.ceremony_url = Some(ceremony_url);
-                        self.store.update(&status)?;
-                        *private = Some(PrivateCheckout {
-                            operation_id: operation_id.clone(),
-                            mode,
-                            view_target: tab.target.clone(),
-                            view_session: tab.session.clone(),
-                            seen_pages: std::collections::HashSet::from([tab.target.clone()]),
-                            tab,
-                            discovery,
-                            recipient,
-                            capability,
-                            session: None,
-                            approved: false,
-                            manual_submission: false,
-                            submitted: false,
-                        });
-                        let service = self.clone();
-                        tokio::spawn(async move {
-                            service.finish_approved(operation_id).await;
-                        });
-                        Ok(serde_json::to_value(status)?)
-                    }
-                    _ => {
-                        status.state = "failed_before_release".into();
-                        self.store.update(&status)?;
+                .await;
+                match setup {
+                    Ok((value, true)) => Ok(value),
+                    Ok((value, false)) => {
                         self.return_control().await?;
-                        Ok(serde_json::to_value(status)?)
+                        Ok(value)
+                    }
+                    Err(error) => {
+                        if prepared {
+                            let cancel = self
+                                .intake(json!({"method":"cancel","operation_id":operation_id}))
+                                .await;
+                            if matches!(
+                                cancel,
+                                Ok(IntakeResponse::Result {
+                                    status: CardOperationStatus {
+                                        state: CardOperationState::Cancelled,
+                                        ..
+                                    },
+                                    ..
+                                })
+                            ) {
+                                self.set_state(&operation_id, "failed_before_release");
+                            }
+                        }
+                        let _ = self.return_control().await;
+                        Err(error)
                     }
                 }
             }
@@ -3426,6 +3455,77 @@ mod tests {
         assert_eq!(result["error_code"], "blocked");
         assert_eq!(result["operation_id"], prior);
         api.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_store_failure_after_prepare_cancels_the_approval_and_returns_shopping() {
+        let (_, browser, url, server) = shopping_service("<h1>Account</h1>").await;
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("broker.sock");
+        let service = CheckoutService::new(
+            browser.clone(),
+            &root.path().join("state.db"),
+            socket.clone(),
+            unsafe { libc::geteuid() },
+            47999,
+        )
+        .unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let methods = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = methods.clone();
+        let broker = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader).read_line(&mut line).await.unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let id = request["operation_id"].as_str().unwrap().to_owned();
+                let method = request["method"].as_str().unwrap().to_owned();
+                seen.lock().push(method.clone());
+                let response = if method == "cancel" {
+                    json!({"kind":"result","status":{"operation_id":id,"state":"cancelled"},"receipt":null,"output_aad":null})
+                } else {
+                    json!({"kind":"prepared","ceremony_url":"http://localhost/approve"})
+                };
+                writer
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        // Fail the write that records the prepared approval.
+        service
+            .store
+            .0
+            .lock()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail BEFORE UPDATE ON operations \
+                 WHEN NEW.state='awaiting_approval' BEGIN SELECT RAISE(ABORT,'injected'); END;",
+            )
+            .unwrap();
+        let id = "d".repeat(64);
+        let error = service
+            .request(Request::Checkout {
+                operation_id: id.clone(),
+                card_id: None,
+                agent_description: "Fixture".into(),
+                take_over: true,
+                resolves: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("injected"), "{error:#}");
+        assert_eq!(*methods.lock(), ["manual", "cancel"]);
+        assert_eq!(
+            service.store.get(&id).unwrap().state,
+            "failed_before_release"
+        );
+        assert!(service.private.lock().await.is_none());
+        browser.browse(BrowseRequest::Open { url }).await.unwrap();
+        browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        broker.abort();
         server.abort();
     }
 
