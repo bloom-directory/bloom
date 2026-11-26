@@ -70,7 +70,7 @@ impl Browser {
         profile: &Path,
         test_flags: &[String],
     ) -> Result<Arc<Self>> {
-        Self::launch_on(executable, profile, test_flags, &[]).await
+        Self::launch_on(executable, profile, test_flags, &[], Default::default()).await
     }
 
     /// `display` holds the X display variables for a headed browser.
@@ -79,13 +79,14 @@ impl Browser {
         profile: &Path,
         test_flags: &[String],
         display: &[(&str, std::ffi::OsString)],
+        ipv6: crate::egress::Ipv6Routes,
     ) -> Result<Arc<Self>> {
         // Fixture merchants listen on loopback in tests and developer Triads.
         Self::launch_with_egress(
             executable,
             profile,
             test_flags,
-            crate::egress::policy(cfg!(any(test, feature = "triad-dev-harness"))),
+            crate::egress::policy(cfg!(any(test, feature = "triad-dev-harness")), ipv6),
             display,
         )
         .await
@@ -804,7 +805,13 @@ mod tests {
             &crate::test_chromium(),
             &root.path().join("profile"),
             &["--no-sandbox".into()],
-            Arc::new(move |address| address == shop_address),
+            Arc::new(move |address| {
+                if address == shop_address {
+                    crate::egress::Reach::Allow
+                } else {
+                    crate::egress::Reach::Refuse
+                }
+            }),
             &[],
         )
         .await

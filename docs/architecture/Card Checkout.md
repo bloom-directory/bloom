@@ -175,6 +175,21 @@ other special-use addresses are refused, and a name with any refused address
 is refused whole, so DNS rebinding cannot pick one. Only test and
 `triad-dev-harness` builds also allow loopback, for fixture merchants.
 
+Global IPv6 is not used by default, because a network's own NAT64 prefix
+looks like any global address and can reach private or metadata IPv4. The
+proxy skips those addresses and connects to a dual-stack name over IPv4.
+Addresses in the well-known NAT64 prefix `64:ff9b::/96` are judged by the
+IPv4 address they embed. Two Checkout options change this:
+
+- `--egress-native-ipv6`: native global IPv6 reaches the internet from this
+  host, so use it.
+- `--egress-nat64-prefix <prefix>`: a NAT64 prefix on this network, such as
+  `64:ff9b:1::/96`. Repeat it for each prefix. Lengths 32, 40, 48, 56, 64 and
+  96 are accepted. Addresses inside are judged by their embedded IPv4.
+
+Set both on an IPv6-only host behind NAT64. Add them to Checkout's command
+line in its systemd unit or launchd plist.
+
 ## Durable states and recovery
 
 The operation store is written before every irreversible step:
