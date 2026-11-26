@@ -1746,6 +1746,10 @@ impl TxEngine {
             Err(e) => {
                 // A lone tx whose estimate failed because it reverts is
                 // refused here, before the owner is asked to approve it.
+                // An explicit nonce runs alone when it is the chain's next:
+                // every lower nonce is mined, so nothing staged precedes it.
+                let runs_alone = runs_alone
+                    || (intent.nonce.is_some() && chain.nonce(from).await.ok() == Some(nonce));
                 if runs_alone
                     && !matches!(intent.body, RawIntentBody::Deploy { .. })
                     && let Ok(Err(returndata)) =
@@ -8772,6 +8776,26 @@ mod tests {
         stage(node().await)
             .await
             .expect("behind a pending entry it is staged");
+
+        // An explicit nonce equal to the chain's next has nothing before it,
+        // so it is judged too, even with an unrelated entry in the outbox.
+        let explicit = r#"{"kind":"raw","to":"0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45","data":"0x1234","value":"0","nonce":0}"#;
+        let error = engine
+            .stage(
+                &permit,
+                "alice",
+                from,
+                crate::intent_parser::parse(explicit).unwrap(),
+                &node().await,
+                &Policy::default(),
+                None,
+            )
+            .await
+            .expect_err("an explicit next nonce that reverts is not staged");
+        assert!(
+            matches!(&error, TxEngineError::SimulationReverted { reason } if reason.contains("STF")),
+            "{error}"
+        );
     }
 
     #[tokio::test]
