@@ -539,6 +539,31 @@ async fn await_batch(
     }
 }
 
+/// `.../outbox/pending/<id>/confirm` → `.../outbox/sent/<id>`.
+fn sent_entry_path(confirm: &VfsPath) -> Option<VfsPath> {
+    let mut segments = confirm.segments().to_vec();
+    segments.pop();
+    let state = segments.len().checked_sub(2)?;
+    segments[state] = "sent".into();
+    VfsPath::parse(&format!("/{}", segments.join("/"))).ok()
+}
+
+/// Whether another confirm already signed this entry and moved it to `sent/`.
+async fn sent_elsewhere(vfs: &Vfs, confirm: &VfsPath) -> bool {
+    match sent_entry_path(confirm) {
+        Some(sent) => vfs.lookup(&sent).await.is_ok(),
+        None => false,
+    }
+}
+
+/// Repeat the confirm; an entry that reached `sent/` meanwhile is the send.
+async fn write_or_sent(vfs: &Vfs, path: &VfsPath, bytes: &[u8]) -> Result<(), WriteError> {
+    match vfs.write(path, bytes).await {
+        Err(_) if sent_elsewhere(vfs, path).await => Ok(()),
+        result => Ok(result?),
+    }
+}
+
 async fn approval_id(vfs: &Vfs, challenge_path: &VfsPath) -> Option<String> {
     let raw = vfs.read(challenge_path).await.ok()?;
     let challenge: Value = serde_json::from_slice(&raw).ok()?;
@@ -575,7 +600,10 @@ async fn await_approval(
             if first {
                 return Err(denied.into());
             }
-            return Ok(vfs.write(path, bytes).await?);
+            if sent_elsewhere(vfs, path).await {
+                return Ok(());
+            }
+            return write_or_sent(vfs, path, bytes).await;
         };
         let challenge: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
         let url = challenge["ceremony_url"].as_str().unwrap_or_default();
@@ -594,15 +622,38 @@ async fn await_approval(
             )));
         }
         match challenge["state"].as_str().unwrap_or("unknown") {
-            "active" if retried_active => return Err(HandlerError::PermissionDenied.into()),
+            "active" if retried_active => {
+                if sent_elsewhere(vfs, path).await {
+                    return Ok(());
+                }
+                return Err(HandlerError::PermissionDenied.into());
+            }
             "active" => {
                 retried_active = true;
                 match vfs.write(path, bytes).await {
                     Err(HandlerError::PermissionDenied | HandlerError::ApprovalPending(_)) => {
                         continue;
                     }
+                    // The write waited on the entry lock while the other
+                    // confirm signed, then found the entry in sent/.
+                    Err(_) if sent_elsewhere(vfs, path).await => return Ok(()),
                     result => return Ok(result?),
                 }
+            }
+            // Used while the entry is still pending: another confirm may
+            // be signing with it. The write waits for its entry lock and
+            // then reports where the entry went.
+            "exhausted" => {
+                return match vfs.write(path, bytes).await {
+                    Err(_) if sent_elsewhere(vfs, path).await => Ok(()),
+                    Err(HandlerError::PermissionDenied | HandlerError::ApprovalPending(_)) => {
+                        let next = challenge["next"].as_str().unwrap_or_default();
+                        Err(WriteError::Approval(format!(
+                            "permission denied: owner approval exhausted. {next} Details: {challenge_file}"
+                        )))
+                    }
+                    result => Ok(result?),
+                };
             }
             "awaiting_ceremony" | "unknown" => retried_active = false,
             state => {
