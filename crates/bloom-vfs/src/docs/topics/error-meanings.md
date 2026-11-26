@@ -16,8 +16,9 @@ An error alone does not show whether an earlier operation completed.
 
 A refused Petal write says why after `permission denied:`; on a mount the
 reason is in `petals/<name>/last_error.json` (check its `path` and `at_ms`
-match your write). When the reason is an owner approval, tell the owner and
-write the same request again once they approve. Otherwise report the route
+match your write). When the reason is an owner approval, `bloom vfs write`
+and MCP wait for it. If it is still not approved, tell the owner, then write
+the same request again in the same turn. Otherwise report the route
 and reason rather than reinstalling, switching accounts or dropping fields.
 
 A Petal operation that needs a policy change answers

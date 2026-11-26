@@ -202,6 +202,16 @@ pub async fn write(
                     None => HandlerError::ApprovalPending(challenge).into(),
                 })
             }
+            // A Petal write the owner must approve answers with its action
+            // id. The same bytes written again sign once they approve (the
+            // Petal keys the pending action by them), so wait here as a
+            // confirm does, instead of the caller stopping or polling.
+            Err(HandlerError::Denied(message))
+                if path.segments().first().is_some_and(|root| root == "petals")
+                    && petal_approval_pending(&message) =>
+            {
+                wait_for_petal_approval(vfs, path, bytes, message, wait, cancelled).await
+            }
             written => Ok(written.map(|()| Written::Done)?),
         };
     };
@@ -277,10 +287,36 @@ pub async fn write(
         .map_or(Written::Done, Written::Sent))
 }
 
-/// Write `new.tx` and reply with the entry it staged, up to its confirm
-/// instructions, and how to ask the owner. The entry's ID is captured with
-/// the write: `latest` is whatever was staged last, which another writer
-/// may change before the reply is built.
+/// Whether a Petal's refusal says only that the owner has not approved yet.
+fn petal_approval_pending(message: &str) -> bool {
+    message.contains("action_id")
+        && (message.starts_with("approval required") || message.contains("APPROVAL_PENDING"))
+}
+
+/// Write the same Petal request again until the owner approves it, `wait`
+/// runs out or the caller gives up.
+async fn wait_for_petal_approval(
+    vfs: &Vfs,
+    path: &VfsPath,
+    bytes: &[u8],
+    mut message: String,
+    wait: Duration,
+    cancelled: Cancelled<'_>,
+) -> Result<Written, WriteError> {
+    let deadline = tokio::time::Instant::now() + wait;
+    while !cancelled() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(BATCH_APPROVAL_POLL).await;
+        match vfs.write(path, bytes).await {
+            Ok(()) => return Ok(Written::Done),
+            Err(HandlerError::Denied(again)) if petal_approval_pending(&again) => message = again,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(WriteError::Approval(format!(
+        "permission denied: {message} . The owner has not approved it yet: tell them, then write the same body again; it waits for their approval, then sends."
+    )))
+}
+
 /// The full path of the outbox a write went to, without a leading `/`, as
 /// AGENTS.md writes paths: an agent that runs `bloom vfs` from the root
 /// confirms with it as given.
@@ -289,6 +325,10 @@ fn outbox_dir(path: &VfsPath) -> String {
     segments[..segments.len().saturating_sub(1)].join("/")
 }
 
+/// Write `new.tx` and reply with the entry it staged, up to its confirm
+/// instructions, and how to ask the owner. The entry's ID is captured with
+/// the write: `latest` is whatever was staged last, which another writer
+/// may change before the reply is built.
 async fn staged_reply(vfs: &Vfs, path: &VfsPath, bytes: &[u8]) -> Result<Written, HandlerError> {
     let latest = match path.segments() {
         [root, wallet, number, _, chain, ..] => VfsPath::parse(&format!(
@@ -1016,6 +1056,57 @@ mod tests {
                 "wallets/w/0/chains/base/outbox/pending/tx-1/approval_challenge.json".into(),
             ))
         }
+    }
+
+    /// Answers "approval required" until `approved` writes have been made.
+    struct PendingPetal {
+        writes: std::sync::atomic::AtomicUsize,
+        approved: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl Handler for PendingPetal {
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            Ok(Entry::file(p.segments().last().unwrap()))
+        }
+        async fn write(&self, _p: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+            let n = self
+                .writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if n >= self.approved {
+                return Ok(());
+            }
+            Err(HandlerError::Denied(
+                r#"approval required for exchange: {"action_id":"a1","expires_ms":9}"#.into(),
+            ))
+        }
+    }
+
+    /// A Petal write the owner must approve waits for them and then succeeds;
+    /// without the approval it says to write the same body again.
+    #[tokio::test]
+    async fn a_petal_write_waits_for_the_owner() {
+        let path =
+            VfsPath::parse("/petals/hyperliquid/mainnet/exchange/main/0/order.json").unwrap();
+        let petal = |approved| {
+            Arc::new(PendingPetal {
+                writes: Default::default(),
+                approved,
+            })
+        };
+        // Two polls of BATCH_APPROVAL_POLL: approved on the third write.
+        let vfs = Vfs::builder().mount("petals", petal(3)).build();
+        let written = write(&vfs, &path, b"{}", Duration::from_secs(10), &|| false, true).await;
+        assert_eq!(written.ok(), Some(Written::Done));
+
+        let vfs = Vfs::builder().mount("petals", petal(usize::MAX)).build();
+        let Err(WriteError::Approval(message)) =
+            write(&vfs, &path, b"{}", Duration::ZERO, &|| false, true).await
+        else {
+            panic!("an unapproved Petal write must say it waits");
+        };
+        assert!(message.contains("write the same body again"), "{message}");
     }
 
     /// Staging answers with the plan and the link instead of an error, so the
