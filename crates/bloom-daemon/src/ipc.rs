@@ -2404,9 +2404,9 @@ fn map_handler_err(id: Value, e: HandlerError) -> Response {
         HandlerError::NotAFile(s) => (-32006, format!("not a file: {s}")),
         HandlerError::PermissionDenied => (-32007, "permission denied".into()),
         HandlerError::OperationNotPermitted => (-32007, "operation not permitted".into()),
-        e @ (HandlerError::ApprovalPending(_) | HandlerError::Refused(_) | HandlerError::Denied(_)) => {
-            (-32007, e.to_string())
-        }
+        e @ (HandlerError::ApprovalPending(_)
+        | HandlerError::Refused(_)
+        | HandlerError::Denied(_)) => (-32007, e.to_string()),
         HandlerError::Invalid(s) => (-32602, format!("invalid: {s}")),
         HandlerError::Unsupported(s) => (-32008, format!("unsupported: {s}")),
         HandlerError::Backend(s) => (-32000, format!("backend: {s}")),
@@ -5353,7 +5353,10 @@ summary = "Demo app used by IPC tests."
             (id.as_str(), ceremony_url.as_str()),
             ("tx-9", "http://localhost:1/c/s")
         );
-        assert!(text.contains("Write y to wallets/w/0/chains/base/outbox/pending/tx-9/confirm"), "{text}");
+        assert!(
+            text.contains("Write y to wallets/w/0/chains/base/outbox/pending/tx-9/confirm"),
+            "{text}"
+        );
         // Nothing was signed: the answer is never under `sent`.
         let answer = server
             .dispatch(Request {
