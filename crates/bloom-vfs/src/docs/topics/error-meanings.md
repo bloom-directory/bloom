@@ -8,7 +8,9 @@ An error alone does not show whether an earlier operation completed.
   Read-only targets also deny.
 - **Operation not permitted**: policy or a safety check refused it. Do not
   change policy, switch accounts, remount a read-only route or try another
-  interface to get around it.
+  interface to get around it. If it refused a contract you chose, such as a
+  router, use one for the same action that `wallets/<wallet>/policy.json`
+  allows; never change a payee.
 - **Input/output error**: on an outbox confirm, see
   `confirm-denied-or-failed.md`.
 
