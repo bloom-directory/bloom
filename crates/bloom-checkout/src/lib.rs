@@ -4,7 +4,7 @@ mod cdp;
 mod discovery;
 #[cfg(target_os = "linux")]
 pub mod display;
-mod egress;
+pub mod egress;
 mod hpke;
 mod scripts;
 pub mod service;

@@ -283,6 +283,7 @@ mod tests {
             &dir.path().join("profile"),
             &["--no-sandbox".into()],
             &environment,
+            Default::default(),
         )
         .await
         .unwrap();

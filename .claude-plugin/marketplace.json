@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "bloom",
-      "source": "./skills/bloom",
+      "source": "./plugins/bloom",
       "description": "Use Bloom, the programmable financial harness for AI agents: balances, payments, trades, and wallets on EVM chains and Solana."
     }
   ]

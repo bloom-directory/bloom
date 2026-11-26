@@ -34,6 +34,14 @@ struct Args {
     /// Exit cleanly when the session-bound Broker disappears (launchd lifecycle).
     #[arg(long)]
     follow_broker_lifecycle: bool,
+    /// Native global IPv6 reaches the internet from this host. Without it,
+    /// shopping uses only IPv4 and known NAT64 prefixes.
+    #[arg(long)]
+    egress_native_ipv6: bool,
+    /// A NAT64 prefix on this network, such as 64:ff9b:1::/96. Repeat for
+    /// each. Shopping judges these addresses by the IPv4 address inside.
+    #[arg(long)]
+    egress_nat64_prefix: Vec<bloom_checkout::egress::Nat64Prefix>,
     #[cfg(feature = "triad-dev-harness")]
     #[arg(long)]
     fixture_allow_insecure_tls: bool,
@@ -86,8 +94,18 @@ async fn main() -> Result<()> {
         Some(_) => anyhow::bail!("--xvfb is supported only on Linux"),
         None => Vec::new(),
     };
-    let browser =
-        Browser::launch_on(&args.chromium, &args.profile, &flags, &display_environment).await?;
+    let ipv6 = bloom_checkout::egress::Ipv6Routes {
+        native: args.egress_native_ipv6,
+        nat64: args.egress_nat64_prefix,
+    };
+    let browser = Browser::launch_on(
+        &args.chromium,
+        &args.profile,
+        &flags,
+        &display_environment,
+        ipv6,
+    )
+    .await?;
     let view_listener =
         tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, args.view_port)).await?;
     let view_port = view_listener.local_addr()?.port();

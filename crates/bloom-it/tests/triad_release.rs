@@ -816,38 +816,18 @@ fn triad_developer_launcher_supports_linux_without_weakening_root_boundary() {
     assert!(launcher.contains("sudo -n -l -- \"$umount_bin\" -l -f \"$mount_dir\""));
     assert!(launcher.contains("Linux developer mount privilege is not installed"));
     assert!(launcher.contains("packaging/triad/linux/config/${name}"));
-    assert!(launcher.contains("systemctl --user"));
     assert!(launcher.contains("export LC_ALL=C"));
-    assert!(launcher.contains("Linux developer systemd user unit directory is unsafe"));
-    assert!(launcher.contains("Linux developer systemd unit paths may contain only ASCII"));
-    assert!(launcher.contains("write_linux_socket_unit \"$broker_ceremony_v4_socket_unit\""));
-    assert!(launcher.contains("write_linux_socket_unit \"$broker_ceremony_v6_socket_unit\""));
-    assert!(!launcher.contains("write_linux_loopback_socket_unit"));
-    assert!(launcher.contains("printf 'FileDescriptorName=%s\\n' \"$descriptor\""));
-    assert!(!launcher.contains("signer_socket_unit"));
-    assert!(!launcher.contains("BLOOM_SIGNER_ACTIVATION_NAME"));
-    assert!(!launcher.contains("BLOOM_SIGNER_CONTROL_ACTIVATION_NAME"));
-    assert!(launcher.contains("\"BLOOM_SIGNER_SOCKET=$signer_socket\""));
-    assert!(launcher.contains("\"BLOOM_SIGNER_CONTROL_SOCKET=$signer_control_socket\""));
-    assert!(!launcher.contains("broker_socket_unit"));
-    assert!(!launcher.contains("broker_control_socket_unit"));
-    assert!(!launcher.contains("BLOOM_BROKER_ACTIVATION_NAME"));
-    assert!(!launcher.contains("BLOOM_BROKER_CONTROL_ACTIVATION_NAME"));
-    assert!(launcher.contains("\"BLOOM_BROKER_SOCKET=$broker_socket\""));
-    assert!(launcher.contains("\"BLOOM_BROKER_CONTROL_SOCKET=$broker_control_socket\""));
-    assert!(launcher.contains("broker_ceremony_v4_socket_unit"));
-    assert!(launcher.contains("broker_ceremony_v6_socket_unit"));
-    assert!(launcher.contains("\"127.0.0.1:${ceremony_port}\" broker-ceremony-ipv4"));
-    assert!(launcher.contains("\"[::1]:${ceremony_port}\" broker-ceremony-ipv6"));
-    assert!(launcher.contains("BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV4=broker-ceremony-ipv4"));
-    assert!(launcher.contains("BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV6=broker-ceremony-ipv6"));
-    assert_eq!(
-        launcher
-            .matches("\"BLOOM_AUTHORITY_EDGE_HISTORY=$authority_edge_history\"")
-            .count(),
-        2
-    );
-    assert!(launcher.contains("Linux developer services require an active systemd user manager"));
+    // Linux hands the Broker its ceremony listeners the way production
+    // does, as named inherited sockets, but without a systemd manager.
+    assert!(!launcher.contains("systemctl"));
+    assert!(launcher.contains("command -v systemd-socket-activate"));
+    assert!(launcher.contains("-l \"127.0.0.1:${ceremony_port}\" -l \"[::1]:${ceremony_port}\""));
+    assert!(launcher.contains("--fdname=broker-ceremony-ipv4:broker-ceremony-ipv6"));
+    assert!(launcher.contains("systemd-socket-activate did not report both ceremony listeners"));
+    assert!(launcher.contains("BLOOM_SIGNER_SOCKET=\"$signer_socket\""));
+    assert!(launcher.contains("BLOOM_BROKER_SOCKET=\"$broker_socket\""));
+    assert!(launcher.contains("wait_for_socket \"$broker_control_socket\""));
+    assert!(launcher.contains("export BLOOM_AUTHORITY_EDGE_HISTORY=\"$authority_edge_history\""));
     assert!(launcher.contains("BLOOM_TRIAD_DEV_SOCKET_TIMEOUT_SECONDS"));
 
     let linux_manifest =
