@@ -206,11 +206,11 @@ pub async fn write(
             // id. The same bytes written again sign once they approve (the
             // Petal keys the pending action by them), so wait here as a
             // confirm does, instead of the caller stopping or polling.
-            Err(HandlerError::Denied(message))
+            Err(error)
                 if path.segments().first().is_some_and(|root| root == "petals")
-                    && petal_approval_pending(&message) =>
+                    && petal_approval_pending(&error) =>
             {
-                wait_for_petal_approval(vfs, path, bytes, message, wait, cancelled).await
+                wait_for_petal_approval(vfs, path, bytes, error.to_string(), wait, cancelled).await
             }
             written => Ok(written.map(|()| Written::Done)?),
         };
@@ -288,9 +288,18 @@ pub async fn write(
 }
 
 /// Whether a Petal's refusal says only that the owner has not approved yet.
-fn petal_approval_pending(message: &str) -> bool {
-    message.contains("action_id")
-        && (message.starts_with("approval required") || message.contains("APPROVAL_PENDING"))
+/// Petals word it differently: `approval required for exchange: {"action_id":…}`,
+/// `APPROVAL_PENDING action_id=…`, or `Sealed Approval required for action …;
+/// … retry the exact write`.
+fn petal_approval_pending(error: &HandlerError) -> bool {
+    let (HandlerError::Denied(message) | HandlerError::Invalid(message)) = error else {
+        return false;
+    };
+    let asks = message.contains("APPROVAL_PENDING")
+        || message.to_ascii_lowercase().contains("approval required");
+    asks && (message.contains("action_id")
+        || message.contains("for action ")
+        || message.contains("retry the exact write"))
 }
 
 /// Write the same Petal request again until the owner approves it, `wait`
@@ -308,12 +317,12 @@ async fn wait_for_petal_approval(
         tokio::time::sleep(BATCH_APPROVAL_POLL).await;
         match vfs.write(path, bytes).await {
             Ok(()) => return Ok(Written::Done),
-            Err(HandlerError::Denied(again)) if petal_approval_pending(&again) => message = again,
+            Err(again) if petal_approval_pending(&again) => message = again.to_string(),
             Err(error) => return Err(error.into()),
         }
     }
     Err(WriteError::Approval(format!(
-        "permission denied: {message} . The owner has not approved it yet: tell them, then write the same body again; it waits for their approval, then sends."
+        "{message} . The owner has not approved it yet: tell them, then write the same body again; it waits for their approval, then sends."
     )))
 }
 
@@ -1077,9 +1086,17 @@ mod tests {
             if n >= self.approved {
                 return Ok(());
             }
-            Err(HandlerError::Denied(
-                r#"approval required for exchange: {"action_id":"a1","expires_ms":9}"#.into(),
-            ))
+            Err(if n.is_multiple_of(2) {
+                HandlerError::Denied(
+                    r#"approval required for exchange: {"action_id":"a1","expires_ms":9}"#.into(),
+                )
+            } else {
+                HandlerError::Invalid(
+                    "Sealed Approval required for action 03f3; open the owner-visible Bloom \
+                     status, approve it, then retry the exact write"
+                        .into(),
+                )
+            })
         }
     }
 
