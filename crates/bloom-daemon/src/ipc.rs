@@ -5311,7 +5311,7 @@ summary = "Demo app used by IPC tests."
             (id.as_str(), ceremony_url.as_str()),
             ("tx-9", "http://localhost:1/c/s")
         );
-        assert!(text.contains("Write y to pending/tx-9/confirm"), "{text}");
+        assert!(text.contains("Write y to wallets/w/0/chains/base/outbox/pending/tx-9/confirm"), "{text}");
         // Nothing was signed: the answer is never under `sent`.
         let answer = server
             .dispatch(Request {
