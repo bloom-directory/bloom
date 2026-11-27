@@ -7,9 +7,12 @@ on:
 permissions:
   contents: read
 
+# A new push cancels the run for the old head. A description edit waits
+# instead: cancelling would leave the 30-minute signing job cancelled on the
+# current head, and the required checks would show it as failed.
 concurrency:
   group: pr-checklist-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event.action != 'edited' }}
 
 env:
   CARGO_TERM_COLOR: always
