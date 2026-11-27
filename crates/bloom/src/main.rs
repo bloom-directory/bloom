@@ -5568,46 +5568,14 @@ async fn write_policy(
             println!("Policy updated.");
             return Ok(());
         }
-        // A repeat also returns once the owner cancelled or the ceremony
-        // expired: say what the installed policy now allows, from the
-        // policy itself, never from what was asked.
+        // The Machine answers Ok only once the policy is installed, so it
+        // holds every added destination. A decline or expiry is an Err.
         Ok(_) => {
-            let path = format!("/wallets/{wallet}/policy.json");
-            let installed: serde_json::Value = ipc_read(endpoint, &path)
-                .await
-                .ok()
-                .and_then(|raw| serde_json::from_slice(&raw).ok())
-                .unwrap_or_default();
-            let allows = |(destination, chain): &(String, String)| {
-                installed["allowed_destinations"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .any(|entry| {
-                        entry["chain"].as_str() == Some(chain.as_str())
-                            && entry["destination"]
-                                .as_str()
-                                .is_some_and(|d| d.eq_ignore_ascii_case(destination))
-                    })
-            };
-            let (allowed, refused): (Vec<_>, Vec<_>) = added.iter().partition(|a| allows(a));
-            let named = |list: Vec<&(String, String)>| {
-                list.iter()
-                    .map(|(destination, chain)| format!("{destination} on {chain}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            if !allowed.is_empty() {
-                println!("Policy updated: sends to {} are allowed.", named(allowed));
-            }
-            if !refused.is_empty() {
-                println!(
-                    "Not allowed: {}. The owner did not approve (cancelled or expired); write the policy again to ask again.",
-                    named(refused)
-                );
-                // Not pending (3): nothing waits on the owner any more.
-                EXIT_CODE_OVERRIDE.store(1, std::sync::atomic::Ordering::SeqCst);
-            }
+            let named: Vec<_> = added
+                .iter()
+                .map(|(destination, chain)| format!("{destination} on {chain}"))
+                .collect();
+            println!("Policy updated: sends to {} are allowed.", named.join(", "));
             return Ok(());
         }
         Err(denied) => denied,
