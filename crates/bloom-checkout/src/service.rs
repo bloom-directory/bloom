@@ -37,6 +37,9 @@ const UNREADABLE: &str = "\u{0}";
 /// Approval links last fifteen minutes; allow a short result-delivery grace.
 const APPROVAL_RESULT_WAIT: Duration = Duration::from_secs(15 * 60 + 30);
 
+/// Private views stay open for fifteen minutes after approval.
+const PRIVATE_VIEW_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
 #[derive(Debug)]
 enum Refusal {
     Blocked(String),
@@ -343,12 +346,15 @@ struct PrivateCheckout {
     stay_signed_in: bool,
     /// Earlier unresolved payment the person is inspecting in this take-over.
     resolves: Option<String>,
+    /// When the approved private view expires.
+    expires_at: Option<tokio::time::Instant>,
 }
 
 struct CompletedView {
     capability: String,
     session: Option<String>,
     status: Status,
+    timed_out: bool,
 }
 
 /// What the take-over watcher has seen of a sign-in in the private view.
@@ -737,6 +743,8 @@ impl CheckoutService {
                         if let Some(open) = self.store.unresolved(origin)? {
                             return Err(Refusal::Blocked(open).into());
                         }
+                    } else if shop.is_none() {
+                        bail!("Open a shop page before requesting a take-over");
                     }
                     self.store.insert(&status, kind, &agent_description)?;
                     status.state = "preparing".into();
@@ -804,6 +812,7 @@ impl CheckoutService {
                                 stay_signed_in: mode == Mode::TakeOver
                                     && !self.browser.has_private_traveler_data(),
                                 resolves: resolves.clone(),
+                                expires_at: None,
                             });
                             let service = self.clone();
                             let operation_id = operation_id.clone();
@@ -930,6 +939,7 @@ impl CheckoutService {
                 match status.state {
                     CardOperationState::Succeeded => {
                         checkout.approved = true;
+                        checkout.expires_at = Some(tokio::time::Instant::now() + PRIVATE_VIEW_TIMEOUT);
                         let result = self
                             .consume_and_fill(checkout, receipt, output_aad.map(|aad| *aad))
                             .await;
@@ -1217,11 +1227,12 @@ fn challenge_url(view_port: u16, capability: &str) -> String {
 }
 
 impl CheckoutService {
-    fn retain_completed(&self, checkout: &PrivateCheckout, status: Status) {
+    fn retain_completed(&self, checkout: &PrivateCheckout, status: Status, timed_out: bool) {
         *self.completed.lock() = Some(CompletedView {
             capability: checkout.capability.clone(),
             session: checkout.session.clone(),
             status,
+            timed_out,
         });
     }
 
@@ -1350,7 +1361,7 @@ impl CheckoutService {
             .as_ref()
             .filter(|checkout| checkout.operation_id == operation_id)
         {
-            self.retain_completed(checkout, self.store.get(operation_id)?);
+            self.retain_completed(checkout, self.store.get(operation_id)?, false);
             *private = None;
         }
         Ok(())
@@ -1434,7 +1445,7 @@ impl CheckoutService {
             };
             // A take-over may include a login with an emailed or texted code;
             // a payment may need a bank check or a correction from the human.
-            let deadline = started + Duration::from_secs(900);
+            let deadline = started + PRIVATE_VIEW_TIMEOUT;
             if mode != Mode::TakeOver
                 && matches!(
                     status.state.as_str(),
@@ -1579,7 +1590,7 @@ impl CheckoutService {
                                 if let Some(checkout) =
                                     private.as_ref().filter(|p| p.operation_id == id)
                                 {
-                                    self.retain_completed(checkout, status);
+                                    self.retain_completed(checkout, status, false);
                                     *private = None;
                                 }
                             } else {
@@ -1612,7 +1623,7 @@ impl CheckoutService {
                     if let Ok(status) = self.store.get(&id) {
                         let mut private = self.private.lock().await;
                         if let Some(checkout) = private.as_ref().filter(|p| p.operation_id == id) {
-                            self.retain_completed(checkout, status);
+                            self.retain_completed(checkout, status, true);
                             *private = None;
                         }
                     }
@@ -1666,7 +1677,7 @@ impl CheckoutService {
             })
             .context("Private view rejected")?;
         Ok(
-            json!({"state":completed.status.state,"outcome":completed.status.outcome,"closed":true,"pages":[]}),
+            json!({"state":completed.status.state,"outcome":completed.status.outcome,"closed":true,"timed_out":completed.timed_out,"pages":[]}),
         )
     }
 
@@ -1735,12 +1746,16 @@ impl CheckoutService {
         };
         let status = self.store.get(&operation_id)?;
         let saved = self.saved_status(&operation_id);
-        let (can_use_saved, stay_signed_in, resolves) = {
+        let (can_use_saved, stay_signed_in, resolves, remaining_secs) = {
             let private = self.private.lock().await;
             (
                 private.as_ref().is_some_and(|c| c.mode == Mode::TakeOver),
                 private.as_ref().is_some_and(|c| c.stay_signed_in),
                 private.as_ref().and_then(|c| c.resolves.clone()),
+                private
+                    .as_ref()
+                    .and_then(|c| c.expires_at)
+                    .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()).as_secs()),
             )
         };
         let can_stay_signed_in = !self.browser.has_private_traveler_data();
@@ -1752,7 +1767,7 @@ impl CheckoutService {
         // The agent's words, shown as such: they explain the task, not facts.
         let agent_description = self.store.description(&operation_id)?;
         Ok(
-            json!({"state":status.state,"outcome":status.outcome,"pages":pages,"selected_page":selected_page,"closed":false,"saved":saved,"can_use_saved":can_use_saved,"can_stay_signed_in":can_stay_signed_in,"stay_signed_in":stay_signed_in,"human_control":can_use_saved,"signing_in":signing_in,"resolves":resolves,"agent_description":agent_description}),
+            json!({"state":status.state,"outcome":status.outcome,"pages":pages,"selected_page":selected_page,"closed":false,"saved":saved,"can_use_saved":can_use_saved,"can_stay_signed_in":can_stay_signed_in,"stay_signed_in":stay_signed_in,"human_control":can_use_saved,"signing_in":signing_in,"resolves":resolves,"remaining_secs":remaining_secs,"agent_description":agent_description}),
         )
     }
 
@@ -2306,6 +2321,7 @@ mod tests {
             submitted,
             stay_signed_in: false,
             resolves: None,
+            expires_at: None,
         });
         (service, status.operation_id, token, server)
     }
@@ -2579,6 +2595,7 @@ mod tests {
                 submitted: false,
                 stay_signed_in: mode == Mode::TakeOver,
                 resolves: None,
+                expires_at: None,
             });
             if traveler {
                 browser.remember_private_traveler_use();
@@ -2765,6 +2782,7 @@ mod tests {
                 submitted: false,
                 stay_signed_in: false,
                 resolves: None,
+                expires_at: None,
             });
             let watcher = tokio::spawn({
                 let service = service.clone();
@@ -2829,6 +2847,7 @@ mod tests {
             submitted: false,
             stay_signed_in: false,
             resolves: None,
+            expires_at: None,
         });
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -2907,6 +2926,7 @@ mod tests {
             submitted: false,
             stay_signed_in: false,
             resolves: None,
+            expires_at: None,
         });
         tokio::time::timeout(
             Duration::from_secs(4),
@@ -2997,6 +3017,7 @@ mod tests {
             submitted: false,
             stay_signed_in: false,
             resolves: None,
+            expires_at: None,
         });
         let finished = tokio::time::timeout(
             Duration::from_secs(3),
@@ -3181,6 +3202,7 @@ mod tests {
                 submitted: false,
                 stay_signed_in: false,
                 resolves: None,
+                expires_at: None,
             };
             service
                 .consume_and_fill(&mut checkout, None, None)
@@ -3239,6 +3261,7 @@ mod tests {
             submitted: true,
             stay_signed_in: false,
             resolves: None,
+            expires_at: None,
         });
         let watcher = {
             let service = service.clone();
@@ -3351,6 +3374,7 @@ mod tests {
             submitted: false,
             stay_signed_in: false,
             resolves: None,
+            expires_at: None,
         });
         let finished = tokio::time::timeout(
             Duration::from_secs(3),
@@ -3409,6 +3433,7 @@ mod tests {
             submitted: false,
             stay_signed_in: false,
             resolves: None,
+            expires_at: None,
         });
         let watcher = tokio::spawn({
             let service = service.clone();
@@ -3544,6 +3569,7 @@ mod tests {
             submitted: false,
             stay_signed_in: false,
             resolves: None,
+            expires_at: None,
         });
         let started = tokio::time::Instant::now();
         let capture = {
@@ -3938,6 +3964,7 @@ mod tests {
             submitted: false,
             stay_signed_in: false,
             resolves: None,
+            expires_at: None,
         });
         service
             .private_action(
@@ -3952,7 +3979,9 @@ mod tests {
         let resolved = service.store.get(&prior).unwrap();
         assert_eq!(resolved.state, "uncertain");
         browser
-            .browse(BrowseRequest::Open { url: shop_url })
+            .browse(BrowseRequest::Open {
+                url: shop_url.clone(),
+            })
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -4005,6 +4034,7 @@ mod tests {
             submitted: false,
             stay_signed_in: false,
             resolves: None,
+            expires_at: None,
         });
         assert!(
             service
@@ -4033,6 +4063,74 @@ mod tests {
             .unwrap();
         assert_eq!(service.store.get(&prior).unwrap().state, "resolved");
         assert_eq!(service.store.unresolved(&origin).unwrap(), None);
+        // After Finish, the browser is on about:blank; a take-over on a blank
+        // page is refused before minting a ceremony.
+        let blank_err = service
+            .request(Request::Checkout {
+                operation_id: "6".repeat(64),
+                card_id: None,
+                agent_description: "Blank take-over".into(),
+                take_over: true,
+                resolves: None,
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(blank_err.contains("Open a shop page"), "{blank_err}");
+        // Private-view timer and expiry state are reported to the view.
+        browser
+            .browse(BrowseRequest::Open {
+                url: shop_url.clone(),
+            })
+            .await
+            .unwrap();
+        let tab = browser.handoff().await.unwrap();
+        let token = hex_token(&[48; 32]);
+        let exp_id = "7".repeat(64);
+        service
+            .store
+            .insert(
+                &Status {
+                    operation_id: exp_id.clone(),
+                    state: "human_control".into(),
+                    ceremony_url: None,
+                    filled_fields: vec![],
+                    outcome: None,
+                    paused: false,
+                    reason: None,
+                    view_url: None,
+                },
+                "take_over",
+                "Timer check",
+            )
+            .unwrap();
+        let checkout = PrivateCheckout {
+            operation_id: exp_id.clone(),
+            mode: Mode::TakeOver,
+            view_target: tab.target.clone(),
+            view_session: tab.session.clone(),
+            seen_pages: std::collections::HashSet::from([tab.target.clone()]),
+            tab,
+            discovery: None,
+            recipient: None,
+            capability: token.clone(),
+            session: Some(token.clone()),
+            approved: true,
+            manual_submission: false,
+            submitted: false,
+            stay_signed_in: true,
+            resolves: None,
+            expires_at: Some(tokio::time::Instant::now() + Duration::from_secs(120)),
+        };
+        *service.private.lock().await = Some(checkout);
+        let active = service.private_state(&token).await.unwrap();
+        assert!(active["remaining_secs"].as_u64().is_some_and(|s| s > 0 && s <= 120));
+        let finished = service.private.lock().await.take().unwrap();
+        service.retain_completed(&finished, service.store.get(&exp_id).unwrap(), true);
+        let closed = service.private_state(&token).await.unwrap();
+        assert_eq!(closed["closed"], true);
+        assert_eq!(closed["timed_out"], true);
+        browser.return_control().await.unwrap();
         let pending = "d".repeat(64);
         service
             .store
@@ -4168,6 +4266,7 @@ mod tests {
             submitted: false,
             stay_signed_in: false,
             resolves: None,
+            expires_at: None,
         });
         let router = crate::view::router(service.clone());
         let viewer = tokio::spawn(async move {
@@ -4488,6 +4587,7 @@ mod tests {
             submitted: false,
             stay_signed_in: false,
             resolves: None,
+            expires_at: None,
         });
         service
             .private_action(&token, ViewAction::Click { x: 20., y: 15. })

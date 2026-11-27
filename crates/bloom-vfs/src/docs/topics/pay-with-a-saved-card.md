@@ -88,9 +88,14 @@ take-over for that step; never bypass the guard.
 
 ## Blocks: take-over
 
-For a login, code, captcha or bot check, write a request with
-`"take_over": true` and an `agent_description` telling the person what to do.
-Send the ceremony URL. They work in Bloom's browser and click Done.
+Before requesting a take-over, `open` the shop page and `snapshot` it to verify
+its controls loaded; Bloom refuses a take-over on a blank page. Combine
+sign-in, unblock (`resolves`), and account forms into one take-over when
+possible so the person approves one ceremony. For a login, code, captcha or bot
+check, write a request with `"take_over": true` and an `agent_description`
+telling the person what to do. Send the ceremony URL with short numbered steps:
+open the link, approve with the passkey first, complete the task in the private
+view, and click Done. They work in Bloom's browser and click Done.
 Any interaction may charge a shop-saved method, so the result remains
 `uncertain` unless merchant evidence establishes an outcome; that does not
 block later payments at the shop. An untouched

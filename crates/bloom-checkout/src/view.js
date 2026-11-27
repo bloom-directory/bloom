@@ -1,6 +1,7 @@
 const screen = document.getElementById('screen');
 const status = document.getElementById('status');
 const pages = document.getElementById('pages');
+const timer = document.getElementById('timer');
 let closed = false;
 let approvalBusy = false;
 let savedRequestBusy = false;
@@ -25,6 +26,7 @@ function closeView(message) {
   document.getElementById('saved-tools').hidden = true;
   document.getElementById('task').hidden = true;
   document.getElementById('purpose').hidden = true;
+  timer.hidden = true;
   document.getElementById('saved-approval').removeAttribute('href');
   pages.replaceChildren();
   screen.hidden = true;
@@ -165,6 +167,7 @@ const describe = state => ({
   uncertain: 'Bloom could not confirm the result. Do not pay again yet: check your email and bank or card app first.',
   manual_required: 'Finish the payment yourself in this window.',
   human_control: "You're in control. The agent can't see this view.",
+  returned: 'Session returned to Bloom.',
 }[state.state] || state.state.replaceAll('_', ' '));
 async function refresh() {
   try {
@@ -208,8 +211,19 @@ async function refresh() {
       document.getElementById('note').hidden=false;
     }
     if(state.closed) {
-      closeView(describe(state) + ' You can close this tab and return to Bloom.');
+      closeView(state.timed_out
+        ? 'This private view expired after 15 minutes. Ask your agent for a new link.'
+        : describe(state) + ' You can close this tab and return to Bloom.');
       return;
+    }
+    if (typeof state.remaining_secs === 'number') {
+      const m = Math.floor(state.remaining_secs / 60);
+      const s = String(state.remaining_secs % 60).padStart(2, '0');
+      timer.textContent = `${m}:${s} left`;
+      timer.classList.toggle('warn', state.remaining_secs <= 120);
+      timer.hidden = false;
+    } else {
+      timer.hidden = true;
     }
     // An opaque origin ("null") is a blank or error tab, not a site.
     pages.replaceChildren(...state.pages.map(page=>{const option=document.createElement('option');option.value=page.target;option.textContent=page.origin==='null'?'Blank page':page.origin;option.selected=page.target===state.selected_page;return option;}));
