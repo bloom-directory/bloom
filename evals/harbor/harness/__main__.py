@@ -15,6 +15,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import unquote, urlparse
 
+from .casual import (
+    CasualAnvilStatusEval,
+    CasualEthInMainEval,
+    CasualSentHistoryEval,
+    CasualSupportedChainsEval,
+    CasualWalletBalancesEval,
+)
 from .clarification import ClarificationEval
 from .core import AGENTS, EvalError, EvalEvidence, run_eval
 from .default_petals import (
@@ -34,6 +41,11 @@ DEFINITIONS = {
     "hyperliquid-order-proposal": HyperliquidProposalEval,
     "near-intents-swap-proposal": NearIntentsProposalEval,
     "polymarket-clarification": ClarificationEval,
+    "casual-wallet-balances": CasualWalletBalancesEval,
+    "casual-eth-in-main": CasualEthInMainEval,
+    "casual-supported-chains": CasualSupportedChainsEval,
+    "casual-sent-history": CasualSentHistoryEval,
+    "casual-anvil-status": CasualAnvilStatusEval,
 }
 
 

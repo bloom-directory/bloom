@@ -1220,7 +1220,7 @@ fn vfs_cat_root_agent_guidance_returns_identical_content() {
         "guidance should point at the docs directory"
     );
     assert!(
-        text.contains("outbox/") && text.contains("`send.tx`") && text.contains("`latest/confirm`"),
+        text.contains("outbox/") && text.contains("`send.tx`") && text.contains("confirm path"),
         "guidance should name the outbox files a transaction goes through"
     );
 }
