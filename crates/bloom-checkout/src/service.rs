@@ -341,6 +341,8 @@ struct PrivateCheckout {
     /// this view closes. Defaults to true for take-overs (without traveler PII)
     /// and false for payments.
     stay_signed_in: bool,
+    /// Earlier unresolved payment the person is inspecting in this take-over.
+    resolves: Option<String>,
 }
 
 struct CompletedView {
@@ -432,6 +434,7 @@ impl CheckoutService {
             "submitted"
                 | "needs_input"
                 | "uncertain"
+                | "declined"
                 | "disclosure_unknown"
                 | "partially_filled"
                 | "filled"
@@ -630,8 +633,8 @@ impl CheckoutService {
                         let shop = self.store.shop(prior)?.unwrap_or("this shop".into());
                         let note = format!(
                             "Bloom does not know whether an earlier payment at {shop} went through. \
-                             Check the shop account, email or bank. Done closes the view; \
-                             it does not prove that payment failed or permit another attempt. Agent: "
+                             Check the shop account, email or bank. Check the confirmation box before \
+                             clicking Done only if you confirmed it did not go through. Agent: "
                         );
                         let room = 1024usize.saturating_sub(note.len());
                         let mut end = agent_description.len().min(room);
@@ -800,6 +803,7 @@ impl CheckoutService {
                                 submitted: false,
                                 stay_signed_in: mode == Mode::TakeOver
                                     && !self.browser.has_private_traveler_data(),
+                                resolves: resolves.clone(),
                             });
                             let service = self.clone();
                             let operation_id = operation_id.clone();
@@ -1139,9 +1143,12 @@ pub enum ViewAction {
     },
     /// `stay_signed_in` keeps cookies for later shopping. Only
     /// the person chooses it; the agent then sees signed-in pages.
+    /// `resolve_prior` marks the take-over's `resolves` payment as resolved.
     Finish {
         #[serde(default)]
         stay_signed_in: bool,
+        #[serde(default)]
+        resolve_prior: bool,
     },
 }
 
@@ -1393,7 +1400,7 @@ impl CheckoutService {
             }
             // Outcome polling must not own the private-view lock while Chromium
             // is slow. Copy the stable browser handles, then do bounded calls.
-            let (mode, tab, submitted, view_session) = {
+            let (mode, tab, submitted, view_session, resolving) = {
                 let private = self.private.lock().await;
                 let Some(checkout) = private.as_ref().filter(|p| p.operation_id == id) else {
                     return;
@@ -1403,9 +1410,13 @@ impl CheckoutService {
                     checkout.tab.clone(),
                     checkout.submitted || checkout.manual_submission,
                     checkout.view_session.clone(),
+                    checkout.resolves.is_some(),
                 )
             };
-            if mode == Mode::TakeOver && self.sign_in_finished(&id, &tab, &view_session).await {
+            if mode == Mode::TakeOver
+                && !resolving
+                && self.sign_in_finished(&id, &tab, &view_session).await
+            {
                 let stay_signed_in = self
                     .private
                     .lock()
@@ -1724,11 +1735,12 @@ impl CheckoutService {
         };
         let status = self.store.get(&operation_id)?;
         let saved = self.saved_status(&operation_id);
-        let (can_use_saved, stay_signed_in) = {
+        let (can_use_saved, stay_signed_in, resolves) = {
             let private = self.private.lock().await;
             (
                 private.as_ref().is_some_and(|c| c.mode == Mode::TakeOver),
                 private.as_ref().is_some_and(|c| c.stay_signed_in),
+                private.as_ref().and_then(|c| c.resolves.clone()),
             )
         };
         let can_stay_signed_in = !self.browser.has_private_traveler_data();
@@ -1740,7 +1752,7 @@ impl CheckoutService {
         // The agent's words, shown as such: they explain the task, not facts.
         let agent_description = self.store.description(&operation_id)?;
         Ok(
-            json!({"state":status.state,"outcome":status.outcome,"pages":pages,"selected_page":selected_page,"closed":false,"saved":saved,"can_use_saved":can_use_saved,"can_stay_signed_in":can_stay_signed_in,"stay_signed_in":stay_signed_in,"human_control":can_use_saved,"signing_in":signing_in,"agent_description":agent_description}),
+            json!({"state":status.state,"outcome":status.outcome,"pages":pages,"selected_page":selected_page,"closed":false,"saved":saved,"can_use_saved":can_use_saved,"can_stay_signed_in":can_stay_signed_in,"stay_signed_in":stay_signed_in,"human_control":can_use_saved,"signing_in":signing_in,"resolves":resolves,"agent_description":agent_description}),
         )
     }
 
@@ -2020,17 +2032,30 @@ impl CheckoutService {
                 }
                 checkout.stay_signed_in = stay_signed_in;
             }
-            ViewAction::Finish { stay_signed_in } => {
-                let (operation_id, mode) = {
+            ViewAction::Finish {
+                stay_signed_in,
+                resolve_prior,
+            } => {
+                let (operation_id, mode, resolves) = {
                     let private = self.private.lock().await;
                     let checkout = private.as_ref().context("No active private checkout")?;
                     authorize_view(checkout, token)?;
-                    (checkout.operation_id.clone(), checkout.mode)
+                    (
+                        checkout.operation_id.clone(),
+                        checkout.mode,
+                        checkout.resolves.clone(),
+                    )
                 };
                 // Refuse before any change: the view hides this choice, but a
                 // direct request must not keep pages that held traveler values.
                 if stay_signed_in && self.browser.has_private_traveler_data() {
                     bail!("Saved traveler details were used here; this session cannot be kept");
+                }
+                if resolve_prior {
+                    let Some(prior) = resolves.as_deref() else {
+                        bail!("No earlier payment to resolve");
+                    };
+                    self.set_state(prior, "resolved");
                 }
                 self.finish(&operation_id, mode, stay_signed_in).await?;
             }
@@ -2280,6 +2305,7 @@ mod tests {
             manual_submission: false,
             submitted,
             stay_signed_in: false,
+            resolves: None,
         });
         (service, status.operation_id, token, server)
     }
@@ -2508,6 +2534,7 @@ mod tests {
             parsed,
             ViewAction::Finish {
                 stay_signed_in: false,
+                resolve_prior: false,
             }
         ));
         let token = hex_token(&[46; 32]);
@@ -2551,6 +2578,7 @@ mod tests {
                 manual_submission: false,
                 submitted: false,
                 stay_signed_in: mode == Mode::TakeOver,
+                resolves: None,
             });
             if traveler {
                 browser.remember_private_traveler_use();
@@ -2561,7 +2589,10 @@ mod tests {
             // The view shows the person what the agent asked for.
             assert_eq!(state["agent_description"], "Fixture");
             let stay = |stay_signed_in| ViewAction::StaySignedIn { stay_signed_in };
-            let finish = |stay_signed_in| ViewAction::Finish { stay_signed_in };
+            let finish = |stay_signed_in| ViewAction::Finish {
+                stay_signed_in,
+                resolve_prior: false,
+            };
             if traveler {
                 // Pages that held traveler values are never kept, even on a
                 // direct request the view would not offer.
@@ -2620,6 +2651,7 @@ mod tests {
                 &token,
                 ViewAction::Finish {
                     stay_signed_in: false,
+                    resolve_prior: false,
                 },
             )
             .await;
@@ -2732,6 +2764,7 @@ mod tests {
                 manual_submission: true,
                 submitted: false,
                 stay_signed_in: false,
+                resolves: None,
             });
             let watcher = tokio::spawn({
                 let service = service.clone();
@@ -2795,6 +2828,7 @@ mod tests {
             manual_submission: false,
             submitted: false,
             stay_signed_in: false,
+            resolves: None,
         });
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -2872,6 +2906,7 @@ mod tests {
             manual_submission: false,
             submitted: false,
             stay_signed_in: false,
+            resolves: None,
         });
         tokio::time::timeout(
             Duration::from_secs(4),
@@ -2961,6 +2996,7 @@ mod tests {
             manual_submission: false,
             submitted: false,
             stay_signed_in: false,
+            resolves: None,
         });
         let finished = tokio::time::timeout(
             Duration::from_secs(3),
@@ -3144,6 +3180,7 @@ mod tests {
                 manual_submission: false,
                 submitted: false,
                 stay_signed_in: false,
+                resolves: None,
             };
             service
                 .consume_and_fill(&mut checkout, None, None)
@@ -3201,6 +3238,7 @@ mod tests {
             manual_submission: false,
             submitted: true,
             stay_signed_in: false,
+            resolves: None,
         });
         let watcher = {
             let service = service.clone();
@@ -3312,6 +3350,7 @@ mod tests {
             manual_submission: false,
             submitted: false,
             stay_signed_in: false,
+            resolves: None,
         });
         let finished = tokio::time::timeout(
             Duration::from_secs(3),
@@ -3369,6 +3408,7 @@ mod tests {
             manual_submission: false,
             submitted: false,
             stay_signed_in: false,
+            resolves: None,
         });
         let watcher = tokio::spawn({
             let service = service.clone();
@@ -3503,6 +3543,7 @@ mod tests {
             manual_submission: false,
             submitted: false,
             stay_signed_in: false,
+            resolves: None,
         });
         let started = tokio::time::Instant::now();
         let capture = {
@@ -3896,12 +3937,14 @@ mod tests {
             manual_submission: false,
             submitted: false,
             stay_signed_in: false,
+            resolves: None,
         });
         service
             .private_action(
                 &token,
                 ViewAction::Finish {
                     stay_signed_in: false,
+                    resolve_prior: false,
                 },
             )
             .await
@@ -3925,6 +3968,71 @@ mod tests {
             .unwrap_err();
         assert!(again.to_string().contains(&prior));
         assert!(service.store.get(&"c".repeat(64)).is_err());
+        // Explicit confirmation inside a resolves take-over marks the earlier
+        // payment resolved and unblocks the shop; without resolves it is refused.
+        let tab = browser.handoff().await.unwrap();
+        let token = hex_token(&[47; 32]);
+        service
+            .store
+            .insert(
+                &Status {
+                    operation_id: "5".repeat(64),
+                    state: "human_control".into(),
+                    ceremony_url: None,
+                    filled_fields: vec![],
+                    outcome: None,
+                    paused: false,
+                    reason: None,
+                    view_url: None,
+                },
+                "take_over",
+                "Fixture check",
+            )
+            .unwrap();
+        *service.private.lock().await = Some(PrivateCheckout {
+            operation_id: "5".repeat(64),
+            mode: Mode::TakeOver,
+            view_target: tab.target.clone(),
+            view_session: tab.session.clone(),
+            seen_pages: std::collections::HashSet::from([tab.target.clone()]),
+            tab,
+            discovery: None,
+            recipient: None,
+            capability: token.clone(),
+            session: Some(token.clone()),
+            approved: true,
+            manual_submission: false,
+            submitted: false,
+            stay_signed_in: false,
+            resolves: None,
+        });
+        assert!(
+            service
+                .private_action(
+                    &token,
+                    ViewAction::Finish {
+                        stay_signed_in: false,
+                        resolve_prior: true,
+                    },
+                )
+                .await
+                .is_err()
+        );
+        service.private.lock().await.as_mut().unwrap().resolves = Some(prior.clone());
+        let state = service.private_state(&token).await.unwrap();
+        assert_eq!(state["resolves"], prior);
+        service
+            .private_action(
+                &token,
+                ViewAction::Finish {
+                    stay_signed_in: false,
+                    resolve_prior: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(service.store.get(&prior).unwrap().state, "resolved");
+        assert_eq!(service.store.unresolved(&origin).unwrap(), None);
         let pending = "d".repeat(64);
         service
             .store
@@ -4059,6 +4167,7 @@ mod tests {
             manual_submission: false,
             submitted: false,
             stay_signed_in: false,
+            resolves: None,
         });
         let router = crate::view::router(service.clone());
         let viewer = tokio::spawn(async move {
@@ -4293,6 +4402,7 @@ mod tests {
                 session_token,
                 ViewAction::Finish {
                     stay_signed_in: false,
+                    resolve_prior: false,
                 },
             )
             .await
@@ -4377,6 +4487,7 @@ mod tests {
             manual_submission: false,
             submitted: false,
             stay_signed_in: false,
+            resolves: None,
         });
         service
             .private_action(&token, ViewAction::Click { x: 20., y: 15. })
@@ -4412,6 +4523,7 @@ mod tests {
                 &token,
                 ViewAction::Finish {
                     stay_signed_in: false,
+                    resolve_prior: false,
                 },
             )
             .await

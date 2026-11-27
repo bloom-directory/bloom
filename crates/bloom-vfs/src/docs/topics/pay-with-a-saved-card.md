@@ -116,7 +116,7 @@ bank charge.
 | `declined` | A merchant page reported a decline. Have the person check before another checkout. |
 | `filled`, `submitted` | Payment details were filled or a submission was attempted; neither proves payment. The shop remains blocked until the result is checked. |
 | `needs_input` | The page wants more input; payment may already be submitted. The person finishes in the private view. Optional wallet signup can add fields: complete or decline it there. |
-| `partially_filled`, `disclosure_unknown`, `uncertain` | Unknown whether money moved. Bloom refuses another checkout at that shop. A take-over with `"resolves": "<id>"` lets the person inspect it; Done alone does not clear uncertainty or permit a duplicate attempt. |
+| `partially_filled`, `disclosure_unknown`, `uncertain` | Unknown whether money moved. Bloom refuses another checkout at that shop. A take-over with `"resolves": "<id>"` lets the person inspect it; Done alone does not clear uncertainty, and checking the confirmation box before clicking Done unblocks the shop. |
 | `manual_required`, `human_control` | The person must continue in the private view. |
 | `failed_before_release`, `cancelled`, `expired`, `resolved` | The request has ended. Check its history before deciding what to do next. |
 

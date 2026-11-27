@@ -74,11 +74,13 @@ screen.addEventListener('wheel', event => {
 },{passive:false});
 let staySignedIn=false;
 const stayCheckbox=document.getElementById('stay-signed-in');
+const resolveRow=document.getElementById('resolve-row');
+const resolveCheckbox=document.getElementById('resolve-prior');
 stayCheckbox.addEventListener('change',()=>{
   staySignedIn=stayCheckbox.checked;
   act({action:'stay_signed_in',stay_signed_in:staySignedIn});
 });
-document.getElementById('finish').addEventListener('click',()=>act({action:'finish',stay_signed_in:staySignedIn}));
+document.getElementById('finish').addEventListener('click',()=>act({action:'finish',stay_signed_in:staySignedIn,resolve_prior:!resolveRow.hidden&&resolveCheckbox.checked}));
 async function savedOptions() {
   const response = await privateFetch('/saved');
   if (!response.ok) return;
@@ -174,6 +176,9 @@ async function refresh() {
     }
     const state=await response.json();status.textContent=describe(state);
     document.getElementById('saved-tools').hidden = !state.can_use_saved || !hasSaved || Boolean(state.signing_in);
+    const resolving = Boolean(state.resolves);
+    resolveRow.hidden = !resolving;
+    if (!resolving) resolveCheckbox.checked = false;
     const canStay = Boolean(state.can_stay_signed_in);
     staySignedIn = canStay && Boolean(state.stay_signed_in);
     document.getElementById('stay-row').hidden = !canStay;
@@ -182,7 +187,9 @@ async function refresh() {
     stayNote.hidden = !canStay;
     if (canStay) {
       stayNote.textContent = state.human_control
-        ? 'When you finish signing in, this view closes by itself. If checked, you stay signed in; the agent can read and click account pages, but cannot press pay buttons or use card or password fields.'
+        ? (resolving
+          ? 'If checked, you stay signed in; the agent can read and click account pages, but cannot press pay buttons or use card or password fields.'
+          : 'When you finish signing in, this view closes by itself. If checked, you stay signed in; the agent can read and click account pages, but cannot press pay buttons or use card or password fields.')
         : 'Do not save your card in the merchant app. Keeping the session signed in lets the agent act in your account, so only enable this if no payment method is saved there.';
     }
     document.getElementById('task').hidden = !state.agent_description;
