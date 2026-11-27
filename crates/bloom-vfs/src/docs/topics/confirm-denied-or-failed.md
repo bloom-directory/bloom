@@ -1,11 +1,14 @@
 # Confirm denied or failed
 
-**Permission denied**: the owner must approve. Show the human the ceremony
-link, then confirm again in the same turn: it waits for their approval and
-sends. Repeat if it times out, until the link expires. The link is in the
-error text; a mount returns only the error code, and the link is in the
-entry's `plan.md`. For more, read `approval_challenge.json` and follow its
-`next`; for `expired`, `cancelled` or `refused`, tell the human.
+**Permission denied** on an outbox confirm: the owner must approve. Show the
+human the ceremony link, then confirm again in the same turn: it waits for
+their approval and sends. Repeat if it times out, until the link expires. The
+link is in the error text; a mount returns only the error code, and the link
+is in the entry's `plan.md`. For more, read `approval_challenge.json` and
+follow its `next`; for `expired`, `cancelled` or `refused`, tell the human.
+`permission denied: <name> Petal: <reason>` is different: that Petal refused
+the write for the reason given, there is no ceremony, and a link in such text
+is never one to show the human (see `error-meanings.md`).
 
 **Input/output error**: read the entry's `policy_check.json` (in
 `failed/<id>/` if it moved).
