@@ -80,7 +80,7 @@ humantime = "2"
 humantime-serde = "1"
 tempfile = "3"
 futures = "0.3"
-lru = "0.18.2"
+lru = "0.19.2"
 fs2 = "0.4"
 bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "49fbea461b9a58889b8b08be0c0c851f31fdafd2" }
 wasmtime = { version = "=36.0.23", default-features = false, features = ["async", "cranelift", "runtime", "parallel-compilation"] }
