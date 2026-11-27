@@ -12,8 +12,12 @@ An error alone does not show whether an earlier operation completed.
 - **Input/output error**: on an outbox confirm, see
   `confirm-denied-or-failed.md`.
 
-A refused Petal write leaves its reason in `petals/<name>/last_error.json`.
-Check its `path` and `at_ms` match your write; no record means no
+A Petal route that refuses says why in the error itself, as
+`permission denied: <name> Petal: <reason>`. That is the Petal's refusal, not
+a ceremony: it never carries a link, and the reason is what to act on
+(which approval is missing, which policy forbids it, what the venue
+rejected). A write's reason is also kept in `petals/<name>/last_error.json`;
+check its `path` and `at_ms` match your write; no record means no
 information, not success. A Petal write denied with no ceremony link: report
 the route and error rather than reinstalling, switching accounts or dropping
 fields.

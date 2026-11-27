@@ -189,8 +189,10 @@ pub enum HandlerError {
     /// own agent-facing prose — which approval is required, which policy
     /// forbids the write, why the venue cannot be asked — and that reason is
     /// what the caller needs next; a bare `PermissionDenied` hides it in the
-    /// Machine log. The text is logged, so like every error here it must
-    /// never carry a ceremony link.
+    /// Machine log. The text is the Petal's, not Machine's: the Petal router
+    /// prefixes the Petal's name, caps it, blanks control characters and
+    /// withholds any link before it lands here, so it cannot read as the
+    /// `owner approval required: <url>` prompt Machine itself writes.
     #[error("permission denied: {0}")]
     Denied(String),
     #[error("operation not permitted")]
