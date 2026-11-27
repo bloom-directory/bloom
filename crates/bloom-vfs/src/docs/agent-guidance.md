@@ -28,7 +28,7 @@ only when the request names its venue. Nothing signs off-chain messages
 The write answers with what will be signed, the owner's approval link and the
 confirm path. Write `y` there: it waits for the approval, sends, and answers
 with each receipt and the balance changes. `new.tx` only stages; `cancel` to the
-confirm path discards the entry. On a mount a write answers nothing: read
+confirm path discards the entry and the rest of its batch. On a mount a write answers nothing: read
 `latest/plan.md`, then `latest/receipt.json`.
 
 ## Rules
