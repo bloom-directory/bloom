@@ -2317,7 +2317,7 @@ dependencies = [
  "assert_cmd",
  "async-trait",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "bloom-broker-api",
  "bloom-daemon",
@@ -2398,7 +2398,7 @@ dependencies = [
  "alloy 2.4.2",
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "bloom-broker-api",
  "bloom-daemon",
@@ -2499,7 +2499,7 @@ dependencies = [
  "alloy-signer-local 2.5.0",
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bloom-broker-api",
  "bloom-daemon",
  "bloom-evm",
@@ -2573,7 +2573,7 @@ name = "bloom-mcp"
 version = "0.5.2"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bloom-daemon",
  "bloom-proto",
  "bloom-vfs",
@@ -2630,7 +2630,7 @@ name = "bloom-paid-http"
 version = "0.5.2"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bloom-proto",
  "mpp",
  "reqwest 0.12.28",
@@ -2664,7 +2664,7 @@ dependencies = [
  "alloy 2.4.2",
  "alloy-dyn-abi",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bloom-paid-http",
  "reqwest 0.12.28",
  "serde_json",
@@ -2892,7 +2892,7 @@ name = "bloom-solana-tx"
 version = "0.5.2"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "bloom-broker-api",
  "bloom-machine-client",
@@ -2922,7 +2922,7 @@ version = "0.5.2"
 dependencies = [
  "alloy 2.4.2",
  "alloy-dyn-abi",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "hex",
  "serde_json",
@@ -2966,7 +2966,7 @@ dependencies = [
  "alloy-signer-local 2.5.0",
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "bloom-broker-api",
  "bloom-evm",
@@ -3011,7 +3011,7 @@ version = "0.5.2"
 dependencies = [
  "alloy 2.4.2",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "bloom-broker-api",
  "bloom-ens",
