@@ -1,11 +1,11 @@
 # Confirm denied or failed
 
 **Permission denied**: the owner must approve. Show the human the ceremony
-link from the error, then confirm again in the same turn: through the CLI or
-MCP it waits for their approval and sends. Repeat if it times out, until the
-link expires. On a mount it does not wait: read `approval_challenge.json`,
-check its wallet, action, intent and expiry, and follow its `next`. For
-`expired`, `cancelled` or `refused`, tell the human.
+link, then confirm again in the same turn: it waits for their approval and
+sends. Repeat if it times out, until the link expires. The link is in the
+error text; a mount returns only the error code, and the link is in the
+entry's `plan.md`. For more, read `approval_challenge.json` and follow its
+`next`; for `expired`, `cancelled` or `refused`, tell the human.
 
 **Input/output error**: read the entry's `policy_check.json` (in
 `failed/<id>/` if it moved).
