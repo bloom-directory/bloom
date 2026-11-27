@@ -1,9 +1,9 @@
 schema = "bloom.triad-compatibility/1"
 
 [revisions]
-broker_commit = "94c422210e0ec374d461d500ff849e16d40cf30b"
-signer_commit = "7b8e848e0657075e94ef0cffb86b5844bc07a1c7"
-service_runtime_commit = "48b83c54c1787b4aff2456bd3adbe18856902e45"
+broker_commit = "220fe8de0c9afb1b2806dee0c1364c2bc93e58e8"
+signer_commit = "ea1f7bc9bb9d47f0b8ec57718ce695e8171577ce"
+service_runtime_commit = "49fbea461b9a58889b8b08be0c0c851f31fdafd2"
 petal_contract_commit = "7dd2722db5de305dd63ca4ed03591f3ab82fa40b"
 
 # Persisted credential surfaces and registration selections are unreadable by
