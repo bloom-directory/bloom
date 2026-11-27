@@ -54,6 +54,9 @@ revert; you need not simulate them yourself.
 - Give the human the complete approval link, unchanged, and say in a
   sentence what you asked for. Then confirm again in the same turn: that
   write waits for them, so there is nothing to stop and wait for.
+- A Petal write that needs the owner's approval also waits for it, through
+  `bloom vfs write` and MCP. If it answers that the owner has not approved
+  yet, tell them, then write the same body again in the same turn.
 - A refusal (`Operation not permitted`, or an error saying `policy denied`) is final. Do not
   change policy, switch accounts or try another interface to get around it.
   If it refused a contract you chose, such as a router, use a contract for
