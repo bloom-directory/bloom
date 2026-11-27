@@ -180,6 +180,7 @@ fn host_from_handler(e: HandlerError) -> HostError {
         HandlerError::NotFound(s) => HostError::NotFound(s),
         HandlerError::NotADir(s) | HandlerError::NotAFile(s) => HostError::Invalid(s),
         HandlerError::PermissionDenied
+        | HandlerError::Denied(_)
         | HandlerError::OperationNotPermitted
         | HandlerError::ApprovalPending(_) => HostError::Denied("vfs".into()),
         HandlerError::Invalid(s) => HostError::Invalid(s),
@@ -340,6 +341,34 @@ impl PetalRunner {
                 self.carry_private_store(meta, None).map(|_| ())
             },
         )
+    }
+
+    /// [`Self::install_staged_petal_package`] with the permit to change the
+    /// package's Petal already held, as from
+    /// [`crate::store::PetalStore::activation_permit_waiting`].
+    pub fn install_staged_petal_package_permitted<F>(
+        &self,
+        permit: crate::store::ActivationPermit,
+        staged: crate::store::StagedPetalPackage,
+        source: Option<crate::meta::PetalSourceProvenance>,
+        commit_guard: F,
+    ) -> Result<
+        (
+            crate::store::InstallResult,
+            crate::meta::PetalMeta,
+            RouteIndex,
+        ),
+        PetalError,
+    >
+    where
+        F: Fn() -> Result<(), PetalError>,
+    {
+        self.store
+            .install_staged_with_permit(permit, staged, source, commit_guard, |meta| {
+                let name = meta.name.as_deref().expect("staged package name");
+                self.check_activation(&meta.hash, name)?;
+                self.carry_private_store(meta, None).map(|_| ())
+            })
     }
 
     fn prepare_private_store(
@@ -740,7 +769,7 @@ impl PetalRunner {
         trusted_params: &[(String, String)],
         account: Option<&AccountPetalContext>,
     ) -> Result<DispatchOutput, PetalError> {
-        let execution = self.store.execution_guard().await;
+        let execution = self.store.execution_guard(mount).await;
         self.dispatch_petal_route_with_execution_permit(
             mount,
             request,
@@ -765,7 +794,7 @@ impl PetalRunner {
         opts: RunOptions,
         trusted_params: &[(String, String)],
         account: Option<&AccountPetalContext>,
-        _execution: &tokio::sync::RwLockReadGuard<'_, ()>,
+        _execution: &crate::store::ExecutionGuard,
     ) -> Result<DispatchOutput, PetalError> {
         if let Some((name, _)) = request
             .ctx
@@ -1580,10 +1609,15 @@ namespaces = ["settings"]
         let data =
             crate::private_store::PrivateStore::open(runner.store().private_data_root()).unwrap();
         // This is the same shared permit dispatch holds for the guest lifetime.
-        let active = runner.store().execution_guard().await;
-        let concurrent = runner.store().execution_guard().await;
+        let active = runner.store().execution_guard("echo").await;
+        let concurrent = runner.store().execution_guard("echo").await;
         data.put(&predecessor, "settings/value", b"before", false)
             .unwrap();
+        // Typed, so Machine can try a refused install again.
+        assert!(matches!(
+            runner.store().uninstall(&predecessor),
+            Err(crate::PetalError::Busy)
+        ));
         assert!(
             runner
                 .store()

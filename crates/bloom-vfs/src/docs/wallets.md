@@ -61,6 +61,13 @@ registration because the first is waiting. Commands are in
 A localhost ceremony needs a browser on the Bloom host; an assigned HTTPS relay
 ceremony can use another device.
 
+Create a wallet only when the owner asks. `main`'s default policy, from the
+Petals chosen at setup, is proposed only once every chosen Petal is
+installed: until then `bloom wallet default-policy main` names the missing
+ones and proposes nothing, and once they are installed it proposes the whole
+policy in one ceremony. Forward its link like any other ceremony URL. If a
+chosen Petal stays missing, tell the owner to restart Bloom.
+
 ## Recovering a wallet
 
 To recover a wallet after losing its passkeys, write only its name to
@@ -142,8 +149,9 @@ still revokes them.
 
 ## Outbox recovery
 
-`bloom wallet confirm` exits 3 when owner approval is pending and 4 when
-confirmation has no recorded result yet; `--text cancel` discards an unsigned
+`bloom wallet confirm` and `bloom wallet cancel`, and `bloom vfs write` to
+`send.tx`, exit 3 when owner approval is pending and print its link; confirm
+exits 4 when confirmation has no recorded result yet; `--text cancel` discards an unsigned
 entry. Discard is refused while another operation is active, and an expired
 entry that may be signed stays pending.
 

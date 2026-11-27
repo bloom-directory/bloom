@@ -125,6 +125,16 @@ impl Vfs {
         Self::builder().build()
     }
 
+    /// The guide's size is known only while it is static; once it ends with
+    /// `next.md` it is reported unsized, like the other rendered root files.
+    fn agent_guidance_entry(&self, name: &str) -> Entry {
+        let mut entry = Entry::file(name);
+        if !self.root_dynamic.contains_key("next.md") {
+            entry.size = AGENT_GUIDANCE.len() as u64;
+        }
+        entry
+    }
+
     pub fn builder() -> VfsBuilder {
         VfsBuilder::default()
     }
@@ -460,9 +470,7 @@ impl Handler for Vfs {
             return Err(HandlerError::NotFound(path.to_string_path()));
         }
         if let Some(name) = root_agent_guidance_entry(path) {
-            let mut entry = Entry::file(name);
-            entry.size = AGENT_GUIDANCE.len() as u64;
-            return Ok(entry);
+            return Ok(self.agent_guidance_entry(name));
         }
         if let Some(name) = root_dynamic_entry(path, &self.root_dynamic) {
             return Ok(Entry::file(name));
@@ -487,7 +495,14 @@ impl Handler for Vfs {
             return Err(HandlerError::NotFound(path.to_string_path()));
         }
         if root_agent_guidance_entry(path).is_some() {
-            return Ok(AGENT_GUIDANCE.to_vec());
+            // The guide ends with this machine's wallets and pending work, so
+            // one read is enough to act.
+            let mut body = AGENT_GUIDANCE.to_vec();
+            if let Some(next) = self.root_dynamic.get("next.md") {
+                body.push(b'\n');
+                body.extend(next().await);
+            }
+            return Ok(body);
         }
         if let Some(renderer) = root_dynamic_renderer(path, &self.root_dynamic) {
             return Ok(renderer().await);
@@ -580,9 +595,7 @@ impl Handler for Vfs {
         if path.is_root() {
             let mut out = Vec::new();
             for name in AGENT_GUIDANCE_FILES {
-                let mut entry = Entry::file(name);
-                entry.size = AGENT_GUIDANCE.len() as u64;
-                out.push(entry);
+                out.push(self.agent_guidance_entry(name));
             }
             for name in self.handlers.keys() {
                 out.push(Entry::dir(name));
@@ -895,6 +908,20 @@ mod tests {
             assert_eq!(entry.kind, EntryKind::File);
             assert_eq!(entry.mode, 0o444);
         }
+    }
+
+    #[tokio::test]
+    async fn agent_guidance_ends_with_next_actions() {
+        let vfs = Vfs::builder()
+            .mount("echo", Arc::new(EchoHandler))
+            .with_root_dynamic("next.md", Arc::new(|| b"# Next Actions\n".to_vec()))
+            .build();
+        let agents = vfs
+            .read(&VfsPath::parse("/AGENTS.md").unwrap())
+            .await
+            .unwrap();
+        assert!(agents.starts_with(AGENT_GUIDANCE));
+        assert!(agents.ends_with(b"\n\n# Next Actions\n"));
     }
 
     #[test]

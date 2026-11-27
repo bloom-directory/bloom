@@ -131,6 +131,9 @@ pub enum TxEngineError {
     Address(String),
     #[error("amount: {0}")]
     Amount(String),
+    /// A body's `data` is not hex calldata.
+    #[error("invalid data: {0}; give the calldata as 0x-prefixed hex, two digits per byte")]
+    Data(String),
     #[error("invalid EIP-1559 fee override: {0}")]
     InvalidFeeOverride(String),
     #[error("policy denied")]
@@ -180,7 +183,7 @@ pub enum TxEngineError {
     )]
     SimulationReverted { reason: String },
     #[error(
-        "nonce gap: tx for {from} uses nonce {staged} but the account's next on-chain nonce is {chain_next} — the node would queue it behind the missing nonce(s) and it could never mine.{blocking} Broadcast the earlier transaction, or discard it and restage with the explicit missing `nonce`. Discarding alone does not renumber this transaction."
+        "nonce gap: tx for {from} uses nonce {staged} but the account's next on-chain nonce is {chain_next} — the node would queue it behind the missing nonce(s) and it could never mine.{blocking} Broadcast the earlier transaction (if it is already broadcast, wait for it to mine or cancel it), or discard it and restage with the explicit missing `nonce`. Discarding alone does not renumber this transaction."
     )]
     NonceGap {
         from: String,
@@ -427,6 +430,8 @@ type EntryLocks =
     Arc<parking_lot::Mutex<HashMap<(String, String, String), Weak<tokio::sync::Mutex<()>>>>>;
 
 const TRIAD_SIGNING_STATE_FILE: &str = crate::outbox::SIGNING_STATE_FILE;
+/// Why a policy-denied entry is in `failed/`.
+pub const DENIED_MARKER: &str = "denied.txt";
 const TRIAD_BATCH_STATE_DIR: &str = crate::outbox::BATCH_SIGNING_STATE_DIR;
 const TRIAD_BATCH_STATE_FILE: &str = crate::outbox::SIGNING_STATE_FILE;
 const TRIAD_EXACT_APPROVAL_TTL_MS: u64 = 10 * 60 * 1_000;
@@ -884,9 +889,56 @@ impl TxEngine {
         }
     }
 
+    /// The native value a `send` body moves on `spec`'s chain, or `None` when
+    /// it names an ERC-20 token. Staging and simulation share it, so one
+    /// body is the same transaction in both.
+    pub fn native_send_value(
+        spec: &ChainSpec,
+        value: &str,
+        token: &Option<String>,
+        amount: &str,
+    ) -> Result<Option<U256>, TxEngineError> {
+        // The chain's own native symbol (POL, BNB, AVAX, ...) is a
+        // native send, not an ERC-20 lookup.
+        if token
+            .as_deref()
+            .is_some_and(|t| t.trim().eq_ignore_ascii_case(&spec.native_symbol))
+        {
+            if !matches!(value.trim(), "" | "0") {
+                return Err(TxEngineError::Amount(
+                    "native sends take one amount; value and amount were both set".into(),
+                ));
+            }
+            return parse_units(amount.trim(), spec.native_decimals)
+                .map(Some)
+                .map_err(|e| TxEngineError::Amount(e.to_string()));
+        }
+        // "eth"/"ether" name an asset. On a chain whose native token is
+        // something else, sending it would move a different asset.
+        if token.is_none() && !spec.native_symbol.eq_ignore_ascii_case("ETH") {
+            let unit = parse_amount(value).map(|p| p.unit).unwrap_or_default();
+            if unit == "eth" || unit == "ether" {
+                return Err(TxEngineError::Amount(format!(
+                    "{} pays in {}, not ETH; write the amount in {}",
+                    spec.name, spec.native_symbol, spec.native_symbol
+                )));
+            }
+        }
+        let Some(v) = Self::resolve_native_value(value, token)? else {
+            return Ok(None);
+        };
+        if !amount.trim().is_empty() {
+            return Err(TxEngineError::Amount(
+                "native sends must use value; amount is only for token sends".into(),
+            ));
+        }
+        Ok(Some(v))
+    }
+
     /// Resolve an ERC-20 token symbol or 0x address into a concrete
-    /// contract address on the given chain.
-    fn resolve_token_address(
+    /// contract address on the given chain. Staging and simulation share
+    /// it, so a token named in a body is the same contract in both.
+    pub fn resolve_token_address(
         token: &str,
         chain_id: u64,
     ) -> Result<(Address, String), TxEngineError> {
@@ -928,8 +980,11 @@ impl TxEngine {
                 bloom_proto::checksum_address(&addr)
             ))
         })?;
+        // An address-shaped hint carries no symbol, which is what a Petal-staged
+        // transfer always supplies: it names the token by address because that
+        // is the only part of the calldata Bloom can verify.
         let symbol = if symbol_hint.starts_with("0x") || symbol_hint.starts_with("0X") {
-            short_addr_label(&addr)
+            address_hint_symbol(chain_id, addr)
         } else {
             symbol_hint.to_ascii_uppercase()
         };
@@ -971,40 +1026,7 @@ impl TxEngine {
                 data,
             } => {
                 let to_addr = self.resolve_recipient_async(to, address_book).await?;
-                let spec = chain.spec();
-                // The chain's own native symbol (POL, BNB, AVAX, ...) is a
-                // native send, not an ERC-20 lookup.
-                if token
-                    .as_deref()
-                    .is_some_and(|t| t.trim().eq_ignore_ascii_case(&spec.native_symbol))
-                {
-                    if !matches!(value.trim(), "" | "0") {
-                        return Err(TxEngineError::Amount(
-                            "native sends take one amount; value and amount were both set".into(),
-                        ));
-                    }
-                    let v = parse_units(amount.trim(), spec.native_decimals)
-                        .map_err(|e| TxEngineError::Amount(e.to_string()))?;
-                    let data = data.clone().unwrap_or_else(|| "0x".into());
-                    return Ok((Some(to_addr), v, data, None, None));
-                }
-                // "eth"/"ether" name an asset. On a chain whose native token is
-                // something else, sending it would move a different asset.
-                if token.is_none() && !spec.native_symbol.eq_ignore_ascii_case("ETH") {
-                    let unit = parse_amount(value).map(|p| p.unit).unwrap_or_default();
-                    if unit == "eth" || unit == "ether" {
-                        return Err(TxEngineError::Amount(format!(
-                            "{} pays in {}, not ETH; write the amount in {}",
-                            spec.name, spec.native_symbol, spec.native_symbol
-                        )));
-                    }
-                }
-                if let Some(v) = Self::resolve_native_value(value, token)? {
-                    if !amount.trim().is_empty() {
-                        return Err(TxEngineError::Amount(
-                            "native sends must use value; amount is only for token sends".into(),
-                        ));
-                    }
+                if let Some(v) = Self::native_send_value(chain.spec(), value, token, amount)? {
                     let data = data.clone().unwrap_or_else(|| "0x".into());
                     Ok((Some(to_addr), v, data, None, None))
                 } else {
@@ -1022,29 +1044,8 @@ impl TxEngine {
                     let token_str = token.as_deref().unwrap_or("");
                     let (token_addr, sym_hint) = Self::resolve_token_address(token_str, chain_id)?;
                     let meta = self.token_meta(chain, token_addr, &sym_hint).await?;
-                    let parsed =
-                        parse_amount(amount).map_err(|e| TxEngineError::Amount(e.to_string()))?;
-                    // A native metric unit (wei/gwei/eth) on an ERC-20 amount is
-                    // ambiguous — it would be silently rescaled by token
-                    // decimals. Reject it and point at the unambiguous forms.
-                    // A bare integer (explicit_unit == false) is still accepted
-                    // as a human token amount.
-                    if parsed.explicit_unit && parsed.is_native() {
-                        return Err(TxEngineError::Amount(format!(
-                            "'{amount}' uses a native unit ('{}') for an ERC-20 token; write a human \
-                             amount like '10 {}' or raw base units like '10000000 base'",
-                            parsed.unit, meta.symbol
-                        )));
-                    }
-                    // `base` means the number is already in token base units —
-                    // do not rescale by decimals.
-                    let scale = if parsed.unit == "base" {
-                        0
-                    } else {
-                        meta.decimals
-                    };
-                    let amount = parse_units(&parsed.number, scale)
-                        .map_err(|e| TxEngineError::Amount(e.to_string()))?;
+                    let (amount, number) =
+                        token_amount_base_units(amount, meta.decimals, &meta.symbol)?;
                     let call = IERC20::transferCall {
                         to: to_addr,
                         amount,
@@ -1055,7 +1056,7 @@ impl TxEngine {
                         symbol: meta.symbol.clone(),
                         decimals: meta.decimals,
                         recipient: bloom_proto::checksum_address(&to_addr),
-                        amount: parsed.number.clone(),
+                        amount: number,
                         amount_base_units: Some(amount.to_string()),
                     };
                     Ok((
@@ -1676,11 +1677,10 @@ impl TxEngine {
                 let chain_nonce = chain.nonce(from).await?;
                 let pending_high = self
                     .outbox
-                    .highest_pending_nonce(wallet, &spec.name, from)?;
-                // If there are staged-but-unconfirmed txs, use the slot
-                // after the highest pending nonce. After broadcast they
-                // move to sent/ and the chain RPC returns the updated
-                // next nonce — no stale-data risk once the queue drains.
+                    .highest_reserved_nonce(wallet, &spec.name, from)?;
+                // Use the slot after the highest nonce still held by a
+                // pending or unmined sent entry: the RPC's pending count can
+                // lag a broadcast that just happened.
                 pending_high.map_or(chain_nonce, |h| chain_nonce.max(h + 1))
             }
         };
@@ -1804,7 +1804,15 @@ impl TxEngine {
         // the destination has bytecode we still flag it as a contract
         // call; the heuristic mirrors the spec's "code length > 0 OR data
         // is non-empty" rule.
-        let mut policy_ctx = policy_engine::AddressContext::default();
+        let mut policy_ctx = policy_engine::AddressContext {
+            // A Petal's own destinations are only trusted when the policy names
+            // it; the engine merely reports which Petal staged this.
+            staged_by_petal: execution_origin
+                .as_ref()
+                .map(|origin| origin.petal_id.clone())
+                .filter(|petal| !petal.is_empty()),
+            ..Default::default()
+        };
         // Synthetic policy checks contributed by NFT-aware code paths
         // (e.g. operator-wide approvals) — appended after the rules engine
         // has produced its own checks so they all show up in plan.md.
@@ -1839,7 +1847,18 @@ impl TxEngine {
                     policy_ctx.token = to;
                     policy_ctx.contract = to;
                     policy_ctx.destination_is_contract = true;
-                    policy_ctx.token_symbol = Some(t.symbol.clone());
+                    // A symbol rule matches the symbol the curated registry
+                    // gives this contract, and nothing else. A symbol read
+                    // off the contract is its own claim about itself - any
+                    // contract can return "USDC" - so it never satisfies a
+                    // rule, and a Petal always names a token by address, so
+                    // its hint carries no symbol either. A caller's symbol
+                    // hint only ever resolves through the same registry, so
+                    // this is the one source for all three. Address rules
+                    // still see the token through `policy_ctx.token`.
+                    policy_ctx.token_symbol = to
+                        .and_then(|to| known_token(chain_id, to))
+                        .map(|known| known.symbol.to_string());
                     if let Ok(rec) = t.recipient.parse::<Address>() {
                         policy_ctx.recipient = Some(rec);
                     }
@@ -2167,10 +2186,7 @@ impl TxEngine {
 
         let hard = policy_engine::has_hard_violation(&staged.policy_checks);
         if hard {
-            // The denial stands even if recording it fails.
-            if let Err(e) = self.outbox.transition_with_status(&entry, TxStatus::Failed) {
-                warn!(id = %staged.id, error = %e, "tx.policy_denied_record_failed");
-            }
+            self.record_policy_denial(&entry);
             debug!(
                 id = %staged.id,
                 wallet,
@@ -2420,7 +2436,7 @@ impl TxEngine {
             }
             if let Some(chain_next) = next_nonces.get_mut(&key).and_then(Option::as_mut) {
                 if staged.nonce > *chain_next {
-                    let holders = self.pending_nonce_holders(
+                    let holders = self.nonce_holders(
                         &staged.wallet,
                         &staged.chain,
                         &from,
@@ -2624,10 +2640,7 @@ impl TxEngine {
         // Policy gate.
         let hard = policy_engine::has_hard_violation(&staged.policy_checks);
         if hard {
-            // The denial stands even if recording it fails.
-            if let Err(e) = self.outbox.transition_with_status(&entry, TxStatus::Failed) {
-                warn!(id = %staged.id, error = %e, "tx.policy_denied_record_failed");
-            }
+            self.record_policy_denial(&entry);
             debug!(
                 id = %staged.id,
                 wallet,
@@ -2979,7 +2992,7 @@ impl TxEngine {
     /// Refuse to broadcast a tx whose nonce is ahead of the account's next
     /// on-chain nonce with nothing filling the gap.
     ///
-    /// The auto-increment nonce default ([`Outbox::highest_pending_nonce`]) is
+    /// The auto-increment nonce default ([`Outbox::highest_reserved_nonce`]) is
     /// optimistic: a pending entry reserves its slot before it broadcasts, so a
     /// staged-but-never-broadcast (or later-abandoned) entry can push a
     /// subsequent tx one nonce past a gap that never fills. The RPC accepts such
@@ -3067,6 +3080,30 @@ impl TxEngine {
         Ok(())
     }
 
+    /// Move a policy-denied entry to `failed/` and write `denied.txt` naming
+    /// the refusing rules, beside expiry's `expired.txt` and a user cancel's
+    /// `cancel.txt`, so a reader can tell why it failed. The denial stands
+    /// even if recording it fails.
+    fn record_policy_denial(&self, entry: &crate::outbox::OutboxEntry) {
+        let reasons: String = entry
+            .staged
+            .policy_checks
+            .iter()
+            .filter(|check| check.outcome == bloom_proto::PolicyOutcome::Deny)
+            .map(|check| format!("denied by policy: {}: {}\n", check.rule, check.message))
+            .collect();
+        if let Err(e) = self
+            .outbox
+            .transition_with_status(entry, TxStatus::Failed)
+            .and_then(|dir| {
+                self.outbox
+                    .write_artefact(&dir, DENIED_MARKER, reasons.as_bytes())
+            })
+        {
+            warn!(id = %entry.staged.id, error = %e, "tx.policy_denied_record_failed");
+        }
+    }
+
     /// Persist a machine-readable advisory beside a pending entry when its
     /// broadcast was refused by [`Self::assert_nonce_not_ahead_of_chain`], so an
     /// agent can see the exact gap and how to resolve it without re-deriving it.
@@ -3080,27 +3117,38 @@ impl TxEngine {
     /// told to "broadcast nonce N first" with nothing saying which row that
     /// is. Discarding a never-signed row releases its nonce and needs no
     /// approval, so naming the holder is the whole fix.
-    fn pending_nonce_holders(
+    fn nonce_holders(
         &self,
         wallet: &str,
         chain: &str,
         from: &Address,
         chain_next: u64,
         staged: u64,
-    ) -> Vec<(u64, String)> {
+    ) -> Vec<NonceHolder> {
         let sender = bloom_proto::checksum_address(from);
-        let Ok(ids) = self.outbox.list(wallet, chain, OutboxState::Pending) else {
-            return Vec::new();
-        };
-        let mut holders: Vec<(u64, String)> = ids
-            .iter()
-            .filter_map(|id| self.outbox.read(wallet, chain, id).ok())
+        // An unmined sent entry holds its nonce too; if it was dropped, it is
+        // the one to replace or cancel.
+        let entries = [OutboxState::Pending, OutboxState::Sent]
+            .into_iter()
+            .flat_map(|state| {
+                self.outbox
+                    .list(wallet, chain, state)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(move |id| self.outbox.read_in_state(wallet, chain, &id, state).ok())
+            })
+            .filter(|entry| !entry.dir.join(crate::outbox::RECEIPT_FILE).exists());
+        let mut holders: Vec<NonceHolder> = entries
             .filter(|entry| {
                 entry.staged.from.eq_ignore_ascii_case(&sender)
                     && entry.staged.nonce >= chain_next
                     && entry.staged.nonce < staged
             })
-            .map(|entry| (entry.staged.nonce, entry.staged.id.clone()))
+            .map(|entry| NonceHolder {
+                nonce: entry.staged.nonce,
+                id: entry.staged.id.clone(),
+                sent: entry.state == OutboxState::Sent,
+            })
             .collect();
         holders.sort();
         holders
@@ -3111,8 +3159,26 @@ impl TxEngine {
         entry: &crate::outbox::OutboxEntry,
         staged: u64,
         chain_next: u64,
-        holders: &[(u64, String)],
+        holders: &[NonceHolder],
     ) -> Result<(), TxEngineError> {
+        let (wallet, chain) = (&entry.staged.wallet, &entry.staged.chain);
+        let sent: Vec<&str> = holders
+            .iter()
+            .filter(|holder| holder.sent)
+            .map(|holder| holder.id.as_str())
+            .collect();
+        let advice = if holders.is_empty() {
+            format!(
+                "no pending transaction holds nonce {chain_next}; restage with an explicit `nonce` to fill the gap deliberately"
+            )
+        } else if sent.is_empty() {
+            "confirm the transactions listed in `blocked_by`, or discard them by writing `cancel` to their `confirm` file, which releases their nonces without an approval".to_owned()
+        } else {
+            format!(
+                "{} already broadcast and not mined: wait for it to mine, or cancel it with `bloom wallet cancel {wallet} {chain} <id> --account <n>`, where `n` is the account that staged it, which needs an owner approval; confirm or discard any other `blocked_by` entry through its `confirm` file",
+                sent.join(", ")
+            )
+        };
         let body = serde_json::json!({
             "schema": "bloom.nonce_gap.v1",
             "id": entry.staged.id,
@@ -3123,15 +3189,9 @@ impl TxEngine {
             "chain_next_nonce": chain_next,
             "blocked_by": holders
                 .iter()
-                .map(|(nonce, id)| serde_json::json!({"nonce": nonce, "id": id}))
+                .map(|holder| serde_json::json!({"nonce": holder.nonce, "id": holder.id}))
                 .collect::<Vec<_>>(),
-            "advice": if holders.is_empty() {
-                format!(
-                    "no pending transaction holds nonce {chain_next}; restage with an explicit `nonce` to fill the gap deliberately"
-                )
-            } else {
-                "confirm the transactions listed in `blocked_by`, or discard them by writing `cancel` to their `confirm` file, which releases their nonces without an approval".to_owned()
-            },
+            "advice": advice,
             "created_ms": now_ms(),
         });
         self.outbox.write_artefact(
@@ -3238,7 +3298,17 @@ impl TxEngine {
                 returned_hash: Some(returned),
             })
         } else {
-            let returned = chain.send_raw(signed.raw.clone()).await?;
+            let returned = match chain.send_raw(signed.raw.clone()).await {
+                Ok(returned) => returned,
+                // The node may have taken the transaction and lost only its
+                // answer. When the chain knows these exact bytes' hash, the
+                // send happened: report it as sent, not as an unknown error
+                // the caller has to investigate.
+                Err(error) => match chain_knows_tx(chain, signed.hash).await {
+                    Ok(true) => signed.hash,
+                    _ => return Err(error.into()),
+                },
+            };
             if returned != signed.hash {
                 return Err(TxEngineError::BroadcastHashMismatch {
                     expected: format!("{:#x}", signed.hash),
@@ -3290,13 +3360,8 @@ impl TxEngine {
                 ..
             } = &e
             {
-                let holders = self.pending_nonce_holders(
-                    &staged.wallet,
-                    &staged.chain,
-                    &from,
-                    *chain_next,
-                    *s,
-                );
+                let holders =
+                    self.nonce_holders(&staged.wallet, &staged.chain, &from, *chain_next, *s);
                 let _ = self.write_nonce_gap_advisory(entry, *s, *chain_next, &holders);
                 return Err(TxEngineError::NonceGap {
                     from: bloom_proto::checksum_address(&from),
@@ -4801,7 +4866,9 @@ impl TxEngine {
     }
 }
 
-fn cancellation_candidate(original: &StagedTx) -> Result<StagedTx, TxEngineError> {
+/// The same-nonce, zero-value self-send that cancels `original`, before
+/// its fee bump.
+pub fn cancellation_candidate(original: &StagedTx) -> Result<StagedTx, TxEngineError> {
     let from_addr: Address = original
         .from
         .parse()
@@ -4851,18 +4918,33 @@ fn bump_fees_in_place(staged: &mut StagedTx, pct: u32) {
 /// One sentence naming the pending rows that hold the missing nonces, or
 /// nothing at all when none does — an empty string keeps the generic advice
 /// intact rather than claiming a holder that is not there.
-fn render_nonce_holders(holders: &[(u64, String)]) -> String {
+/// An outbox entry holding a nonce below the one being broadcast.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct NonceHolder {
+    nonce: u64,
+    id: String,
+    /// Broadcast and not mined, in `sent/`; otherwise staged in `pending/`.
+    sent: bool,
+}
+
+fn render_nonce_holders(holders: &[NonceHolder]) -> String {
+    let kind = |holder: &NonceHolder| if holder.sent { "broadcast" } else { "staged" };
     match holders {
         [] => String::new(),
-        [(nonce, id)] => format!(" Nonce {nonce} is held by staged transaction {id}."),
+        [holder] => format!(
+            " Nonce {} is held by {} transaction {}.",
+            holder.nonce,
+            kind(holder),
+            holder.id
+        ),
         many => format!(
-            " Nonces {} are held by staged transactions {}.",
+            " Nonces {} are held by transactions {}.",
             many.iter()
-                .map(|(nonce, _)| nonce.to_string())
+                .map(|holder| holder.nonce.to_string())
                 .collect::<Vec<_>>()
                 .join(", "),
             many.iter()
-                .map(|(_, id)| id.clone())
+                .map(|holder| format!("{} ({})", holder.id, kind(holder)))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -5566,7 +5648,7 @@ fn decode_data(s: &str) -> Result<Bytes, TxEngineError> {
         return Ok(Bytes::new());
     }
     let s = s.strip_prefix("0x").unwrap_or(s);
-    let v = hex::decode(s).map_err(|e| TxEngineError::Amount(format!("data: {e}")))?;
+    let v = hex::decode(s).map_err(|e| TxEngineError::Data(e.to_string()))?;
     Ok(Bytes::from(v))
 }
 
@@ -5584,8 +5666,13 @@ fn outbox_action_id(staged: &StagedTx, action_kind: EvmOutboxActionKind) -> Stri
             .clone()
             .unwrap_or_else(|| format!("{}:{}", staged.chain_id, staged.id)),
         EvmOutboxActionKind::Replace => format!("{}:{}:replace", staged.chain_id, staged.id),
-        EvmOutboxActionKind::Cancel => format!("{}:{}:cancel", staged.chain_id, staged.id),
+        EvmOutboxActionKind::Cancel => cancel_action_id(staged),
     }
+}
+
+/// The signing action id of `bloom wallet cancel` for `staged`.
+pub fn cancel_action_id(staged: &StagedTx) -> String {
+    format!("{}:{}:cancel", staged.chain_id, staged.id)
 }
 
 /// True when the node answered with a validation error for these exact
@@ -5802,6 +5889,16 @@ fn parse_u256(s: &str) -> Result<U256, String> {
     U256::from_str_radix(t, 10).map_err(|e| format!("invalid uint256 '{s}': {e}"))
 }
 
+/// The label a plan shows for a token named by address: the curated
+/// registry's symbol for a listed token, and the short address otherwise. A
+/// contract's own `symbol()` is its claim about itself, and any contract can
+/// answer "USDC", so it never labels an amount an owner reads.
+fn address_hint_symbol(chain_id: u64, addr: Address) -> String {
+    known_token(chain_id, addr)
+        .map(|known| known.symbol.to_string())
+        .unwrap_or_else(|| short_addr_label(&addr))
+}
+
 fn short_addr_label(a: &Address) -> String {
     let s = format!("{a:#x}");
     if s.len() > 10 {
@@ -5811,14 +5908,61 @@ fn short_addr_label(a: &Address) -> String {
     }
 }
 
-/// Resolve an ERC-20 symbol to its address via the token list Broker also
-/// compiles in, so a symbol resolves to the token Broker names on the
-/// approval page. An ambiguous symbol resolves to nothing. Anvil mainnet forks share chain
-/// id 31337 with vanilla Anvil, so they reuse the Ethereum (id 1) majors; a
-/// caller can always pass a 0x address explicitly.
+/// Base units of an ERC-20 `amount` as an outbox body writes it, and the
+/// human figure a plan prints. A caller who wrote base units gave the
+/// unscaled integer; scaling it back keeps the two from disagreeing by a
+/// factor of 10^decimals in front of an owner. Staging and simulation share
+/// it, so the same body means the same transfer in both.
+pub fn token_amount_base_units(
+    amount: &str,
+    decimals: u8,
+    symbol: &str,
+) -> Result<(U256, String), TxEngineError> {
+    let parsed = parse_amount(amount).map_err(|e| TxEngineError::Amount(e.to_string()))?;
+    // A native metric unit (wei/gwei/eth) on an ERC-20 amount is ambiguous:
+    // it would be silently rescaled by token decimals. Reject it and point
+    // at the unambiguous forms. A bare number is a human token amount.
+    if parsed.explicit_unit && parsed.is_native() {
+        return Err(TxEngineError::Amount(format!(
+            "'{amount}' uses a native unit ('{}') for an ERC-20 token; write a human \
+             amount like '10 {symbol}' or raw base units like '10000000 base'",
+            parsed.unit
+        )));
+    }
+    // `base` means the number is already in token base units.
+    let scale = if parsed.unit == "base" { 0 } else { decimals };
+    let base =
+        parse_units(&parsed.number, scale).map_err(|e| TxEngineError::Amount(e.to_string()))?;
+    let display = if parsed.unit == "base" {
+        bloom_proto::format_units(base, decimals)
+    } else {
+        parsed.number
+    };
+    Ok((base, display))
+}
+
+/// The curated registry entry for `addr` on exactly `chain_id`, if any.
+///
+/// This one lookup decides both whether Bloom treats a contract as a token,
+/// which gives a transfer-shaped Petal call typed treatment, and which symbol
+/// plans and policy see, so the two cannot drift apart. It reads the token
+/// list Broker also compiles in, so the symbol matches the one Broker names
+/// on the approval page. A contract cannot put itself in the registry, and no
+/// chain borrows another chain's list: a chain id does not prove what a node
+/// forked. A node reporting 31337 may be a plain Anvil, an Anvil fork started
+/// with `--chain-id 31337`, or a Hardhat fork, and the id says nothing about
+/// what is deployed. A fork that keeps its source chain's id reads that
+/// chain's list; a chain with no entries of its own has no curated tokens.
+pub fn known_token(chain_id: u64, addr: Address) -> Option<&'static bloom_broker_api::KnownToken> {
+    let addr = format!("{addr:#x}");
+    bloom_broker_api::tokens_on(chain_id).find(|known| known.address.eq_ignore_ascii_case(&addr))
+}
+
+/// Resolve an ERC-20 symbol to its address in the token list for exactly
+/// `chain_id`, as `known_token` reads it. An ambiguous symbol resolves to
+/// nothing. A caller can always pass a 0x address explicitly.
 fn lookup_known_token(chain_id: u64, symbol_upper: &str) -> Option<&'static str> {
-    let lookup_chain = if chain_id == 31337 { 1 } else { chain_id };
-    let hit = bloom_broker_api::token_by_symbol(lookup_chain, symbol_upper)
+    let hit = bloom_broker_api::token_by_symbol(chain_id, symbol_upper)
         .map(|token| token.address.as_str());
     if hit.is_none() {
         debug!(chain_id, symbol = symbol_upper, "tx.known_token_miss");
@@ -6467,9 +6611,15 @@ mod tests {
     }
 
     fn stage_chain(url: &str) -> ChainClient {
+        stage_chain_on(url, "anvil", 31337)
+    }
+
+    /// `stage_chain` for another configured chain. The RPC fixture must report
+    /// the same id from `eth_chainId`.
+    fn stage_chain_on(url: &str, name: &str, chain_id: u64) -> ChainClient {
         let spec = ChainSpec {
-            name: "anvil".into(),
-            chain_id: 31337,
+            name: name.into(),
+            chain_id,
             rpc_urls: vec![url.into()],
             rpc_endpoints: Vec::new(),
             etherscan_api_url: None,
@@ -6486,12 +6636,26 @@ mod tests {
         url: &str,
         oracle: RecordingOracle,
     ) -> (TxEngine, tempfile::TempDir, HomeWritePermit, ChainClient) {
+        stage_fixture_on(oracle, stage_chain(url))
+    }
+
+    fn stage_fixture_on(
+        oracle: RecordingOracle,
+        chain: ChainClient,
+    ) -> (TxEngine, tempfile::TempDir, HomeWritePermit, ChainClient) {
         let dir = tempfile::tempdir().unwrap();
         let outbox = crate::outbox::Outbox::new(dir.path().join("outbox")).unwrap();
         let engine = TxEngine::new(outbox, 60_000).with_price_oracle(Arc::new(oracle));
         let permit = permit_for(&dir);
-        let chain = stage_chain(url);
         (engine, dir, permit, chain)
+    }
+
+    /// A stage RPC fixture whose node reports Ethereum mainnet, so the curated
+    /// registry has entries for it.
+    async fn spawn_mainnet_stage_rpc() -> String {
+        let mut responses = stage_rpc_responses(false);
+        responses.insert("eth_chainId".into(), vec!["\"0x1\"".into()]);
+        spawn_queued_rpc(responses).await
     }
 
     fn policy_with_usd_cap() -> Policy {
@@ -6780,6 +6944,68 @@ mod tests {
         );
     }
 
+    /// bloom#217: step one of a multi-step action has just broadcast and sits
+    /// in `sent/`, but the RPC's pending nonce (0 here) has not caught up.
+    /// Step two must take the next nonce, not the one already in flight.
+    #[tokio::test]
+    async fn staging_skips_the_nonce_of_an_unmined_sent_entry_when_the_rpc_lags() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let mut approve = fake_staged_1559("0017-approve");
+        approve.nonce = 0;
+        outbox.write_pending(&approve, "approve").unwrap();
+        let pending = outbox.read("alice", "anvil", &approve.id).unwrap();
+        outbox
+            .transition_with_status(&pending, TxStatus::Sent)
+            .unwrap();
+        let engine = TxEngine::new(outbox, 60_000);
+        let permit = permit_for(&directory);
+        let deposit = crate::intent_parser::parse(
+            r#"{"kind":"send","to":"0x0000000000000000000000000000000000000001","value":"1 wei"}"#,
+        )
+        .unwrap();
+        let staged = engine
+            .stage(
+                &permit,
+                "alice",
+                TEST_SIGNER_ADDRESS.parse().unwrap(),
+                deposit,
+                &stage_chain(&spawn_stage_rpc(false).await),
+                &Policy::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(staged.nonce, 1);
+
+        // A sent blocker has no `confirm` file, so the gap advice names the
+        // owner-approved cancel instead.
+        let from: Address = TEST_SIGNER_ADDRESS.parse().unwrap();
+        let holders = engine.nonce_holders("alice", "anvil", &from, 0, 1);
+        assert_eq!(holders, vec![holder(0, &approve.id, true)]);
+        let rendered = render_nonce_holders(&holders);
+        assert!(
+            rendered.contains("held by broadcast transaction 0017-approve"),
+            "{rendered}"
+        );
+        let entry = engine.outbox.read("alice", "anvil", &staged.id).unwrap();
+        engine
+            .write_nonce_gap_advisory(&entry, 1, 0, &holders)
+            .unwrap();
+        let gap: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(entry.dir.join("nonce_gap.json")).unwrap())
+                .unwrap();
+        let advice = gap["advice"].as_str().unwrap();
+        assert!(
+            advice.contains("0017-approve already broadcast"),
+            "{advice}"
+        );
+        assert!(
+            advice.contains("bloom wallet cancel alice anvil <id> --account <n>"),
+            "{advice}"
+        );
+    }
+
     #[tokio::test]
     async fn cancel_replacement_keeps_sent_original_available_for_reconciliation() {
         check_cancel_keeps_original(None, false).await;
@@ -6867,11 +7093,13 @@ mod tests {
         assert!(original.dir.join("cancel_tx_hash").exists());
         assert!(original.dir.join("cancel_intent.json").exists());
         assert_eq!(outbox.walk_all_sent().unwrap().len(), 1);
-        assert!(
+        // The original or its cancellation still holds the nonce until one
+        // is mined, so new staging must not reuse it.
+        assert_eq!(
             outbox
-                .highest_pending_nonce("alice", "anvil", TEST_SIGNER_ADDRESS.parse().unwrap())
-                .unwrap()
-                .is_none()
+                .highest_reserved_nonce("alice", "anvil", TEST_SIGNER_ADDRESS.parse().unwrap())
+                .unwrap(),
+            Some(staged.nonce)
         );
         let err = engine
             .replace_fees(
@@ -6947,7 +7175,7 @@ mod tests {
         assert_eq!(original.state, OutboxState::Pending);
         assert_eq!(
             outbox
-                .highest_pending_nonce("alice", "anvil", TEST_SIGNER_ADDRESS.parse().unwrap())
+                .highest_reserved_nonce("alice", "anvil", TEST_SIGNER_ADDRESS.parse().unwrap())
                 .unwrap(),
             Some(staged.nonce)
         );
@@ -6997,7 +7225,7 @@ mod tests {
         assert!(
             engine
                 .outbox
-                .highest_pending_nonce("alice", "anvil", TEST_SIGNER_ADDRESS.parse().unwrap())
+                .highest_reserved_nonce("alice", "anvil", TEST_SIGNER_ADDRESS.parse().unwrap())
                 .unwrap()
                 .is_none()
         );
@@ -7504,6 +7732,524 @@ mod tests {
         assert_eq!(subject.total_value_usd_micro, Some(1_250_000));
         assert_eq!(calls.lock().len(), 1);
         assert_eq!(calls.lock()[0].1, "1250000");
+    }
+
+    /// A Petal stages base units, because it never converts a display amount.
+    /// The plan still has to print the human figure: `1250000 base` on a
+    /// six-decimal token is 1.25 tokens, and an owner reading `Transfer
+    /// 1250000 USDC` would misjudge it by a factor of a million.
+    #[tokio::test]
+    async fn base_unit_amounts_reach_the_plan_as_a_human_token_amount() {
+        let url = spawn_stage_rpc(false).await;
+        let oracle = RecordingOracle {
+            calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            usd_micro: 1_250_000,
+            age_ms: 0,
+            max_age_ms: 60_000,
+        };
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle);
+        let token_addr: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        engine.token_cache.write().insert(
+            (31337, token_addr),
+            TokenMeta {
+                address: token_addr,
+                symbol: "USDC".into(),
+                decimals: 6,
+            },
+        );
+        let intent = RawIntent {
+            body: RawIntentBody::Send {
+                to: "0x2222222222222222222222222222222222222222".into(),
+                value: "0".into(),
+                token: Some(token_addr.to_string()),
+                amount: "1250000 base".into(),
+                data: None,
+            },
+            chain: Some("anvil".into()),
+            gas: bloom_proto::intent::GasStrategy::Auto,
+            nonce: None,
+            gas_limit_hint: None,
+            usd_value_hint: None,
+        };
+        let staged = engine
+            .stage(
+                &permit,
+                "alice",
+                "0x3333333333333333333333333333333333333333"
+                    .parse()
+                    .unwrap(),
+                intent,
+                &chain,
+                &policy_with_usd_cap(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(staged.action_kind, TxActionKind::Erc20Transfer);
+        let token = staged.token.as_ref().unwrap();
+        // Same transfer as `stage_erc20_transfer_uses_exact_base_units_for_oracle`,
+        // written in base units instead of a display amount: both records must
+        // come out identical.
+        assert_eq!(token.amount, "1.25");
+        assert_eq!(token.amount_base_units.as_deref(), Some("1250000"));
+        let plan = bloom_proto::PlanRender::render(&staged, "ETH", 18);
+        assert!(
+            plan.contains(
+                "Action: Transfer 1.25 USDC to 0x2222222222222222222222222222222222222222"
+            ),
+            "plan must print the human amount, got:\n{plan}"
+        );
+    }
+
+    /// A symbol read off the contract is the contract's word for itself. A
+    /// token rule written by symbol must not be satisfied by it - any
+    /// contract can return "USDC" - while the same rule written by address is
+    /// the owner's own word and passes.
+    #[tokio::test]
+    async fn a_contract_supplied_symbol_does_not_satisfy_a_symbol_rule() {
+        let url = spawn_stage_rpc(false).await;
+        let token_addr: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let from: Address = "0x3333333333333333333333333333333333333333"
+            .parse()
+            .unwrap();
+        let oracle = || RecordingOracle {
+            calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            usd_micro: 1_250_000,
+            age_ms: 0,
+            max_age_ms: 60_000,
+        };
+        // An address-shaped hint for an unlisted contract. The seeded metadata
+        // calls it USDC, as the contract's own `symbol()` would; policy must
+        // not take that as the token's symbol.
+        let intent = || RawIntent {
+            body: RawIntentBody::Send {
+                to: "0x2222222222222222222222222222222222222222".into(),
+                value: "0".into(),
+                token: Some(format!("{token_addr:#x}")),
+                amount: "1250000 base".into(),
+                data: None,
+            },
+            chain: Some("anvil".into()),
+            gas: bloom_proto::intent::GasStrategy::Auto,
+            nonce: None,
+            gas_limit_hint: None,
+            usd_value_hint: None,
+        };
+        let seed = |engine: &TxEngine| {
+            engine.token_cache.write().insert(
+                (31337, token_addr),
+                TokenMeta {
+                    address: token_addr,
+                    symbol: "USDC".into(),
+                    decimals: 6,
+                },
+            );
+        };
+        let outcomes = |staged: &bloom_proto::StagedTx| -> Vec<bloom_proto::policy::PolicyOutcome> {
+            staged
+                .policy_checks
+                .iter()
+                .filter(|c| c.rule == "tokens.allow")
+                .map(|c| c.outcome)
+                .collect()
+        };
+
+        // Rule by symbol: the contract's "USDC" must not satisfy it.
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle());
+        seed(&engine);
+        let mut policy = policy_with_usd_cap();
+        policy.tokens.allow.insert("USDC".into());
+        let staged = engine
+            .stage(&permit, "alice", from, intent(), &chain, &policy, None)
+            .await
+            .unwrap();
+        let by_symbol = outcomes(&staged);
+        assert!(
+            !by_symbol.is_empty()
+                && by_symbol
+                    .iter()
+                    .all(|o| *o == bloom_proto::policy::PolicyOutcome::Deny),
+            "a contract-supplied symbol must not pass a symbol rule, got {by_symbol:?}"
+        );
+
+        // Rule by address: the owner named this contract, and that passes.
+        // A fresh mock server: each fixture consumes the scripted responses.
+        let url = spawn_stage_rpc(false).await;
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle());
+        seed(&engine);
+        let mut policy = policy_with_usd_cap();
+        policy.tokens.allow.insert(format!("{token_addr:#x}"));
+        let staged = engine
+            .stage(&permit, "alice", from, intent(), &chain, &policy, None)
+            .await
+            .unwrap();
+        assert!(
+            outcomes(&staged).contains(&bloom_proto::policy::PolicyOutcome::Pass),
+            "an address entry names the token and passes"
+        );
+    }
+
+    /// A Petal names a token by address, and the registry is the only word
+    /// for what that contract is. A curated token named by address must meet
+    /// a symbol rule exactly as if the owner had written the symbol: a deny
+    /// list naming it is a hard deny, an allow list naming it passes. The
+    /// same deny stays silent for a contract outside the registry, whatever
+    /// symbol it claims - the rule has nothing verified to match against -
+    /// and for mainnet's USDC address on a local Anvil, whose chain id says
+    /// nothing about what is deployed there.
+    #[tokio::test]
+    async fn a_registered_token_named_by_address_meets_symbol_rules() {
+        use bloom_proto::policy::PolicyOutcome;
+        let usdc: Address = bloom_broker_api::token_by_symbol(1, "USDC")
+            .expect("mainnet USDC is curated")
+            .address
+            .parse()
+            .unwrap();
+        let unknown: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let from: Address = "0x3333333333333333333333333333333333333333"
+            .parse()
+            .unwrap();
+        let oracle = || RecordingOracle {
+            calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            usd_micro: 1_250_000,
+            age_ms: 0,
+            max_age_ms: 60_000,
+        };
+        // Address-shaped hints, as a classified Petal transfer stages them.
+        let intent = |token: Address, chain: &str| RawIntent {
+            body: RawIntentBody::Send {
+                to: "0x2222222222222222222222222222222222222222".into(),
+                value: "0".into(),
+                token: Some(format!("{token:#x}")),
+                amount: "1250000 base".into(),
+                data: None,
+            },
+            chain: Some(chain.into()),
+            gas: bloom_proto::intent::GasStrategy::Auto,
+            nonce: None,
+            gas_limit_hint: None,
+            usd_value_hint: None,
+        };
+        // Every contract here calls itself USDC; only mainnet's is curated.
+        let seed = |engine: &TxEngine, chain_id: u64, token: Address| {
+            engine.token_cache.write().insert(
+                (chain_id, token),
+                TokenMeta {
+                    address: token,
+                    symbol: "USDC".into(),
+                    decimals: 6,
+                },
+            );
+        };
+        let outcomes = |staged: &bloom_proto::StagedTx, rule: &str| -> Vec<PolicyOutcome> {
+            staged
+                .policy_checks
+                .iter()
+                .filter(|c| c.rule == rule)
+                .map(|c| c.outcome)
+                .collect()
+        };
+
+        let mainnet = |url: &str| stage_fixture_on(oracle(), stage_chain_on(url, "ethereum", 1));
+
+        // Curated token, denied by symbol: a hard deny.
+        let url = spawn_mainnet_stage_rpc().await;
+        let (engine, _dir, permit, chain) = mainnet(&url);
+        seed(&engine, 1, usdc);
+        let mut policy = policy_with_usd_cap();
+        policy.tokens.deny.insert("USDC".into());
+        let staged = engine
+            .stage(
+                &permit,
+                "alice",
+                from,
+                intent(usdc, "ethereum"),
+                &chain,
+                &policy,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcomes(&staged, "tokens.deny"),
+            vec![PolicyOutcome::Deny],
+            "a symbol deny must catch the curated token named by address"
+        );
+
+        // Curated token, allowed by symbol: passes.
+        let url = spawn_mainnet_stage_rpc().await;
+        let (engine, _dir, permit, chain) = mainnet(&url);
+        seed(&engine, 1, usdc);
+        let mut policy = policy_with_usd_cap();
+        policy.tokens.allow.insert("USDC".into());
+        let staged = engine
+            .stage(
+                &permit,
+                "alice",
+                from,
+                intent(usdc, "ethereum"),
+                &chain,
+                &policy,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcomes(&staged, "tokens.allow"),
+            vec![PolicyOutcome::Pass],
+            "a symbol allow must admit the curated token named by address"
+        );
+
+        // A contract outside the registry claiming USDC: the deny is silent.
+        let url = spawn_mainnet_stage_rpc().await;
+        let (engine, _dir, permit, chain) = mainnet(&url);
+        seed(&engine, 1, unknown);
+        let mut policy = policy_with_usd_cap();
+        policy.tokens.deny.insert("USDC".into());
+        let staged = engine
+            .stage(
+                &permit,
+                "alice",
+                from,
+                intent(unknown, "ethereum"),
+                &chain,
+                &policy,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            outcomes(&staged, "tokens.deny").is_empty(),
+            "a contract's own symbol must not be what a deny matches"
+        );
+
+        // Mainnet's USDC address on a local Anvil: nothing is curated there,
+        // so the deny is just as silent.
+        let url = spawn_stage_rpc(false).await;
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle());
+        seed(&engine, 31337, usdc);
+        let mut policy = policy_with_usd_cap();
+        policy.tokens.deny.insert("USDC".into());
+        let staged = engine
+            .stage(
+                &permit,
+                "alice",
+                from,
+                intent(usdc, "anvil"),
+                &chain,
+                &policy,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            outcomes(&staged, "tokens.deny").is_empty(),
+            "a local Anvil must not borrow mainnet's registry"
+        );
+    }
+
+    /// A wallet policy's `petal:<name>` entry lets the transaction that
+    /// Petal stages go to a destination it chose. The engine reports which
+    /// Petal staged it; a hand-staged transaction, or one another Petal
+    /// staged, is still matched against the listed addresses.
+    #[tokio::test]
+    async fn a_petal_entry_covers_only_what_that_petal_staged() {
+        let mut policy = Policy::default();
+        policy
+            .allowlists
+            .recipients
+            .insert("petal:polymarket".into());
+        let stage = |origin: Option<ExecutionOrigin>| {
+            let policy = policy.clone();
+            async move {
+                let url = spawn_stage_rpc(false).await;
+                let oracle = RecordingOracle {
+                    calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                    usd_micro: 1_250_000,
+                    age_ms: 0,
+                    max_age_ms: 60_000,
+                };
+                let (engine, _dir, permit, chain) = stage_fixture(&url, oracle);
+                let intent = RawIntent {
+                    body: RawIntentBody::Send {
+                        to: "0x2222222222222222222222222222222222222222".into(),
+                        value: "0.001 eth".into(),
+                        token: None,
+                        amount: String::new(),
+                        data: None,
+                    },
+                    chain: Some("anvil".into()),
+                    gas: bloom_proto::intent::GasStrategy::Auto,
+                    nonce: None,
+                    gas_limit_hint: None,
+                    usd_value_hint: None,
+                };
+                engine
+                    .stage_with_execution_origin(
+                        &permit,
+                        "alice",
+                        "0x3333333333333333333333333333333333333333"
+                            .parse()
+                            .unwrap(),
+                        intent,
+                        &chain,
+                        &policy,
+                        None,
+                        origin,
+                    )
+                    .await
+            }
+        };
+        let petal = |id: &str| ExecutionOrigin {
+            petal_id: id.into(),
+            ..ExecutionOrigin::default()
+        };
+        let staged = stage(Some(petal("petal:polymarket"))).await.unwrap();
+        assert!(
+            !crate::policy_engine::has_hard_violation(&staged.policy_checks),
+            "{:?}",
+            staged.policy_checks
+        );
+        assert!(
+            staged.policy_checks.iter().any(|check| check
+                .message
+                .contains("destination chosen by petal:polymarket")),
+            "{:?}",
+            staged.policy_checks
+        );
+        // The same transfer from another Petal, or from the agent, stages
+        // with the destination refused, not with some unrelated error.
+        for origin in [None, Some(petal("petal:near-intents"))] {
+            let staged = stage(origin.clone()).await.unwrap();
+            assert!(
+                crate::policy_engine::has_hard_violation(&staged.policy_checks)
+                    && staged
+                        .policy_checks
+                        .iter()
+                        .any(|check| check.message.contains("not on allowlist")),
+                "{origin:?}: {:?}",
+                staged.policy_checks
+            );
+        }
+    }
+
+    /// A Petal's typed ERC-20 transfer is checked against its recipient, and a
+    /// venue may choose that per transaction (a per-quote deposit address), so
+    /// no owner can list it ahead of time. The wallet's `petal:<name>` entry
+    /// is what lets it through: it covers the typed transfer that Petal
+    /// staged, and nothing another Petal or the agent staged. Listing the
+    /// token contract, which passed while the call was still generic, no
+    /// longer does.
+    #[tokio::test]
+    async fn a_petal_entry_covers_the_typed_transfer_that_petal_staged() {
+        use bloom_proto::policy::PolicyOutcome;
+        const DEPOSIT: &str = "0x2222222222222222222222222222222222222222";
+        let usdc: Address = bloom_broker_api::token_by_symbol(1, "USDC")
+            .expect("mainnet USDC is curated")
+            .address
+            .parse()
+            .unwrap();
+        let stage = |entries: Vec<String>, origin: Option<ExecutionOrigin>| async move {
+            let mut policy = Policy::default();
+            policy.allowlists.recipients.extend(entries);
+            let url = spawn_mainnet_stage_rpc().await;
+            let oracle = RecordingOracle {
+                calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                usd_micro: 1_250_000,
+                age_ms: 0,
+                max_age_ms: 60_000,
+            };
+            let (engine, _dir, permit, chain) =
+                stage_fixture_on(oracle, stage_chain_on(&url, "ethereum", 1));
+            engine.token_cache.write().insert(
+                (1, usdc),
+                TokenMeta {
+                    address: usdc,
+                    symbol: "USDC".into(),
+                    decimals: 6,
+                },
+            );
+            // The body Machine builds for a Petal call it classified.
+            let intent = RawIntent {
+                body: RawIntentBody::Send {
+                    to: DEPOSIT.into(),
+                    value: "0".into(),
+                    token: Some(format!("{usdc:#x}")),
+                    amount: "1250000 base".into(),
+                    data: None,
+                },
+                chain: Some("ethereum".into()),
+                gas: bloom_proto::intent::GasStrategy::Auto,
+                nonce: None,
+                gas_limit_hint: None,
+                usd_value_hint: None,
+            };
+            let staged = engine
+                .stage_with_execution_origin(
+                    &permit,
+                    "alice",
+                    "0x3333333333333333333333333333333333333333"
+                        .parse()
+                        .unwrap(),
+                    intent,
+                    &chain,
+                    &policy,
+                    None,
+                    origin,
+                )
+                .await
+                .unwrap();
+            assert_eq!(staged.action_kind, TxActionKind::Erc20Transfer);
+            assert_eq!(staged.token.as_ref().unwrap().recipient, DEPOSIT);
+            staged
+                .policy_checks
+                .iter()
+                .filter(|check| check.rule == "allowlists.recipients")
+                .map(|check| (check.outcome, check.message.clone()))
+                .collect::<Vec<_>>()
+        };
+        let petal = |id: &str| ExecutionOrigin {
+            petal_id: id.into(),
+            ..ExecutionOrigin::default()
+        };
+        let refused = vec![(PolicyOutcome::Deny, format!("{DEPOSIT} not on allowlist"))];
+
+        // The Petal's own entry passes a recipient the policy never listed.
+        assert_eq!(
+            stage(
+                vec!["petal:near-intents".into()],
+                Some(petal("petal:near-intents"))
+            )
+            .await,
+            vec![(
+                PolicyOutcome::Pass,
+                "destination chosen by petal:near-intents, which wallet policy allows".to_owned()
+            )]
+        );
+        // The token contract is not the destination of a typed transfer.
+        assert_eq!(
+            stage(
+                vec![format!("{usdc:#x}")],
+                Some(petal("petal:near-intents"))
+            )
+            .await,
+            refused
+        );
+        // The entry covers only its own Petal.
+        for origin in [None, Some(petal("petal:enso"))] {
+            assert_eq!(
+                stage(vec!["petal:near-intents".into()], origin.clone()).await,
+                refused,
+                "{origin:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -11191,10 +11937,10 @@ mod tests {
         let from: Address = TEST_SIGNER_ADDRESS.parse().unwrap();
 
         // Confirming nonce 3 is blocked by the two rows ahead of it, named.
-        let holders = engine.pending_nonce_holders("clearsign", "anvil", &from, 1, 3);
+        let holders = engine.nonce_holders("clearsign", "anvil", &from, 1, 3);
         assert_eq!(
             holders,
-            vec![(1, "0002-aaaa".to_owned()), (2, "0003-bbbb".to_owned())]
+            vec![holder(1, "0002-aaaa", false), holder(2, "0003-bbbb", false)]
         );
         let rendered = render_nonce_holders(&holders);
         assert!(rendered.contains("0002-aaaa"), "{rendered}");
@@ -11204,8 +11950,8 @@ mod tests {
         // block it: a row that already mined does not, and neither does one
         // staged further out.
         assert_eq!(
-            engine.pending_nonce_holders("clearsign", "anvil", &from, 2, 3),
-            vec![(2, "0003-bbbb".to_owned())]
+            engine.nonce_holders("clearsign", "anvil", &from, 2, 3),
+            vec![holder(2, "0003-bbbb", false)]
         );
 
         // Discarding the refused row releases its nonce, with no approval and
@@ -11215,16 +11961,24 @@ mod tests {
             .cancel("clearsign", "anvil", "0002-aaaa")
             .unwrap();
         assert_eq!(
-            engine.pending_nonce_holders("clearsign", "anvil", &from, 1, 3),
-            vec![(2, "0003-bbbb".to_owned())]
+            engine.nonce_holders("clearsign", "anvil", &from, 1, 3),
+            vec![holder(2, "0003-bbbb", false)]
         );
 
         // A gap nothing is holding says so rather than naming a row.
         assert_eq!(
-            engine.pending_nonce_holders("clearsign", "anvil", &from, 7, 9),
+            engine.nonce_holders("clearsign", "anvil", &from, 7, 9),
             Vec::new()
         );
         assert_eq!(render_nonce_holders(&[]), "");
+    }
+
+    fn holder(nonce: u64, id: &str, sent: bool) -> NonceHolder {
+        NonceHolder {
+            nonce,
+            id: id.to_owned(),
+            sent,
+        }
     }
 
     #[test]
@@ -11307,6 +12061,42 @@ mod tests {
             "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
         );
         assert_eq!(sym, "USDC");
+    }
+
+    /// A token named by address is labelled from the curated registry, never
+    /// from its own `symbol()`: an unlisted contract shows its short address
+    /// even if it calls itself "USDC".
+    #[test]
+    fn an_address_named_token_shows_the_registry_symbol_or_its_address() {
+        let usdc: Address = bloom_broker_api::token_by_symbol(1, "USDC")
+            .expect("mainnet USDC is curated")
+            .address
+            .parse()
+            .unwrap();
+        assert_eq!(address_hint_symbol(1, usdc), "USDC");
+        assert_eq!(
+            known_token(1, usdc).map(|known| known.symbol.as_str()),
+            Some("USDC")
+        );
+        // A local Anvil's chain id says nothing about what it forked, so
+        // mainnet's address is not curated there.
+        assert_eq!(address_hint_symbol(31337, usdc), short_addr_label(&usdc));
+        assert!(known_token(31337, usdc).is_none());
+        // Naming the token by symbol borrows nothing either.
+        assert!(lookup_known_token(1, "USDC").is_some());
+        assert!(lookup_known_token(31337, "USDC").is_none());
+        // The miss tells the caller what works there: the token's address.
+        let miss = TxEngine::resolve_token_address("USDC", 31337).unwrap_err();
+        assert_eq!(
+            miss.to_string(),
+            "token: unknown token 'USDC' on chain id 31337: pass its 0x address \
+             (tokens/known.json lists the tokens Bloom knows by symbol)"
+        );
+        let unknown: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        assert_eq!(address_hint_symbol(1, unknown), short_addr_label(&unknown));
+        assert!(known_token(1, unknown).is_none());
     }
 
     #[test]
@@ -11581,6 +12371,83 @@ mod tests {
             }
             other => panic!("expected StateMismatch, got {other:?}"),
         }
+    }
+
+    /// Calldata with an odd digit says it is the data that is wrong, not an
+    /// amount (an agent retyping calldata by hand hit this in the bench).
+    #[test]
+    fn odd_calldata_is_named_as_data() {
+        let error = decode_data("0xabc").unwrap_err().to_string();
+        assert!(error.starts_with("invalid data: "), "{error}");
+        assert_eq!(decode_data("0xabcd").unwrap().len(), 2);
+    }
+
+    /// The node takes a send but its answer is lost. When the chain knows the
+    /// signed hash, the confirm reports the entry sent instead of an error
+    /// the caller has to investigate (bench task erc20-transfer-recovery).
+    #[tokio::test]
+    async fn a_send_whose_answer_is_lost_but_that_landed_is_sent() {
+        let receipt = serde_json::json!({
+            "transactionHash": format!("{:#x}", alloy::primitives::B256::repeat_byte(7)),
+            "transactionIndex": "0x0",
+            "blockHash": format!("{:#x}", alloy::primitives::B256::repeat_byte(9)),
+            "blockNumber": "0x5",
+            "from": TEST_SIGNER_ADDRESS,
+            "to": "0x0000000000000000000000000000000000000002",
+            "cumulativeGasUsed": "0x5208",
+            "gasUsed": "0x5208",
+            "contractAddress": null,
+            "logs": [],
+            "logsBloom": format!("0x{}", "00".repeat(256)),
+            "status": "0x1",
+            "effectiveGasPrice": "0x1",
+            "type": "0x2"
+        });
+        let lost = r#"error:{"code":-32000,"message":"upstream response lost; submission status unknown"}"#;
+        let url = spawn_queued_rpc(HashMap::from([
+            (
+                "eth_chainId".to_string(),
+                vec!["\"0x7a69\"".to_string(); 20],
+            ),
+            ("eth_call".into(), vec!["\"0x\"".into(); 20]),
+            ("eth_getTransactionCount".into(), vec!["\"0x0\"".into(); 20]),
+            ("eth_sendRawTransaction".into(), vec![lost.into()]),
+            ("eth_getTransactionByHash".into(), vec!["null".into(); 20]),
+            (
+                "eth_getTransactionReceipt".into(),
+                vec![receipt.to_string(); 20],
+            ),
+        ]))
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let (engine, fixture, _) = triad_batch_fixture(outbox.clone(), false, false);
+        let permit = permit_for(&directory);
+        let chain = stage_chain(&url);
+        let policy = Policy::default();
+        let mut staged = fake_staged_1559("lost-answer");
+        staged.created_ms = now_ms();
+        outbox.write_pending(&staged, "p").unwrap();
+        let confirm = || {
+            engine.confirm(
+                &permit,
+                "alice",
+                "anvil",
+                "lost-answer",
+                &chain,
+                &policy,
+                policy.override_sentinel(),
+            )
+        };
+        assert!(matches!(
+            confirm().await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        fixture.active.store(true, Ordering::SeqCst);
+        let sent = confirm().await.unwrap();
+        assert!(sent.tx_hash.is_some());
+        let entry = outbox.read("alice", "anvil", "lost-answer").unwrap();
+        assert_eq!(entry.state, OutboxState::Sent);
     }
 
     /// A confirm interrupted after its broadcast marker recovers through
@@ -12204,6 +13071,12 @@ mod tests {
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(entry.dir.join("intent.json")).unwrap()).unwrap();
         assert_eq!(raw["status"], "failed");
+        // bloom#285: the entry says why it failed, unlike an expiry.
+        assert_eq!(
+            std::fs::read_to_string(entry.dir.join(DENIED_MARKER)).unwrap(),
+            "denied by policy: caps.max_value_eth: value exceeds max\n"
+        );
+        assert!(!entry.dir.join("expired.txt").exists());
 
         // The mounted confirm path prepares before it submits. It must expose
         // the same terminal outcome to a Petal reconciling its execution.
@@ -12218,6 +13091,7 @@ mod tests {
         let entry = engine.outbox.read("alice", "anvil", &staged.id).unwrap();
         assert_eq!(entry.state, OutboxState::Failed);
         assert_eq!(entry.staged.status, TxStatus::Failed);
+        assert!(entry.dir.join(DENIED_MARKER).exists());
     }
 
     #[tokio::test]

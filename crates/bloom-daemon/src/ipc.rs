@@ -54,6 +54,9 @@ use std::time::UNIX_EPOCH;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use bloom_petals::{PetalError, PetalRunner};
+use bloom_vfs::owner_wait::{
+    self, APPROVAL_POLL, APPROVAL_WAIT, RECEIPT_POLLS, WriteError, Written,
+};
 use bloom_vfs::{Entry, EntryKind, Handler, HandlerError, Vfs, VfsPath};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -499,6 +502,9 @@ pub struct IpcOperationContext {
     petal_active_sessions: Option<ActiveSessionSlots>,
     /// Set by an install that explicitly overrides the session guard.
     petal_install_force: bool,
+    /// How long an install queues for its turn to activate
+    /// ([`Self::waiting_to_activate`]).
+    activation_wait: Option<std::time::Duration>,
 }
 
 impl IpcOperationContext {
@@ -509,6 +515,7 @@ impl IpcOperationContext {
             petal_mutation: None,
             petal_active_sessions: None,
             petal_install_force: false,
+            activation_wait: None,
         }
     }
 
@@ -519,7 +526,28 @@ impl IpcOperationContext {
             petal_mutation: None,
             petal_active_sessions: None,
             petal_install_force: false,
+            activation_wait: None,
         }
+    }
+
+    /// This context, for an install that queues up to `limit` for its turn
+    /// to activate. The store refuses to change a Petal's package while that
+    /// Petal's code runs (bloom#328); an install retrying such a refusal
+    /// instead queues for the permit to change that Petal after staging: its
+    /// running calls finish, and its calls that start meanwhile wait behind
+    /// it, so busy callers cannot starve it. Keep `limit` short: it is how
+    /// long those calls can wait. Cancelling
+    /// either context cancels both.
+    pub fn waiting_to_activate(&self, limit: std::time::Duration) -> Self {
+        let mut context = self.clone();
+        context.activation_wait = Some(limit);
+        context
+    }
+
+    /// How long an install under this context queues for its turn to
+    /// activate, if it does ([`Self::waiting_to_activate`]).
+    pub fn activation_wait(&self) -> Option<std::time::Duration> {
+        self.activation_wait
     }
 
     /// Common installation seam for local, source and background installs.
@@ -577,21 +605,73 @@ impl IpcOperationContext {
             return Err(PetalError::vm("Petal install cancelled"));
         }
         let staged = store.stage_petal_package(package)?;
-        let _mutation = if let Some(mutation) = &self.petal_mutation {
-            Some(loop {
+        // Take the Petal mutation lock in turn, as listing and managing
+        // Petals do: an install that only tried it could wait forever behind
+        // callers that hold it back to back. Then a waiting install queues,
+        // briefly, for the permit to change this Petal: its calls already
+        // running finish, and its calls starting meanwhile wait behind it
+        // for at most `activation_wait`. Other Petals' calls are unaffected.
+        let _mutation = match &self.petal_mutation {
+            Some(mutation) => Some(self.lock_petal_mutation(mutation)?),
+            None => None,
+        };
+        let permit = match self.activation_wait {
+            Some(limit) => {
+                Some(store.activation_permit_waiting(&name, limit, || self.is_cancelled())?)
+            }
+            None => None,
+        };
+        if self.is_cancelled() {
+            return Err(PetalError::vm("Petal install cancelled"));
+        }
+        check()?;
+        match permit {
+            Some(permit) => {
+                runner.install_staged_petal_package_permitted(permit, staged, source, check)
+            }
+            None => runner.install_staged_petal_package(staged, source, check),
+        }
+    }
+
+    /// Wait for `mutation` in turn, stopping soon after this operation is
+    /// cancelled. Waits in turn only within a multi-threaded Tokio runtime,
+    /// as in Machine; elsewhere it tries the lock until it is free.
+    fn lock_petal_mutation<'m>(
+        &self,
+        mutation: &'m tokio::sync::Mutex<()>,
+    ) -> Result<tokio::sync::MutexGuard<'m, ()>, PetalError> {
+        let cancelled = || PetalError::vm("Petal install cancelled");
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime)
+                if runtime.runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread =>
+            {
+                tokio::task::block_in_place(|| {
+                    runtime.block_on(async {
+                        let lock = mutation.lock();
+                        tokio::pin!(lock);
+                        loop {
+                            tokio::select! {
+                                guard = &mut lock => return Ok(guard),
+                                () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
+                                    if self.is_cancelled() {
+                                        return Err(cancelled());
+                                    }
+                                }
+                            }
+                        }
+                    })
+                })
+            }
+            _ => loop {
                 if self.is_cancelled() {
-                    return Err(PetalError::vm("Petal install cancelled"));
+                    return Err(cancelled());
                 }
                 if let Ok(guard) = mutation.try_lock() {
-                    break guard;
+                    return Ok(guard);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
-            })
-        } else {
-            None
-        };
-        check()?;
-        runner.install_staged_petal_package(staged, source, check)
+            },
+        }
     }
 
     pub fn emit(&self, stream: IpcOutputStream, bytes: impl Into<Vec<u8>>) -> bool {
@@ -748,6 +828,17 @@ pub enum MachineCommand {
     WalletPolicyCommit {
         operation_id: String,
     },
+    /// Propose the Petals chosen during setup for a wallet through its policy
+    /// operation, and report where that default policy stands.
+    WalletDefaultPolicy {
+        name: String,
+        /// Set by a command waiting on a ceremony it has already announced:
+        /// settle and report, committing a change the owner approved, but
+        /// propose nothing, so an owner who leaves the link is not handed a
+        /// new one each time it expires.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        observe_only: bool,
+    },
     WalletOutboxCancel {
         wallet: String,
         #[serde(default, skip_serializing_if = "is_account_zero")]
@@ -814,44 +905,6 @@ pub struct IpcServer {
     ready: Option<Arc<dyn Fn() + Send + Sync>>,
     shutdown: Arc<Notify>,
     approval_wait: std::time::Duration,
-}
-
-/// How long an IPC confirm waits for the owner's approval before it returns.
-/// It stays under the 60 s request timeout common MCP clients default to.
-const APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(50);
-const APPROVAL_POLL: std::time::Duration = std::time::Duration::from_millis(500);
-const BATCH_APPROVAL_POLL: std::time::Duration = std::time::Duration::from_secs(2);
-/// A receipt read waits this many polls (5 s) for the transaction to be mined.
-const RECEIPT_POLLS: u32 = 10;
-
-enum WriteError {
-    Handler(HandlerError),
-    /// The owner's approval did not arrive; the message says what to do.
-    Approval(String),
-}
-
-impl From<HandlerError> for WriteError {
-    fn from(error: HandlerError) -> Self {
-        WriteError::Handler(error)
-    }
-}
-
-/// The approval challenge beside a pending outbox `confirm` sink.
-fn confirm_challenge_path(path: &VfsPath) -> Option<VfsPath> {
-    match path.segments() {
-        [root, _, _, chains, _, outbox, pending, _, control]
-            if root == "wallets"
-                && chains == "chains"
-                && outbox == "outbox"
-                && pending == "pending"
-                && matches!(control.as_str(), "confirm" | "confirm.override") =>
-        {
-            let mut segments = path.segments().to_vec();
-            segments.pop();
-            VfsPath::parse(&format!("/{}/approval_challenge.json", segments.join("/"))).ok()
-        }
-        _ => None,
-    }
 }
 
 impl IpcServer {
@@ -1166,19 +1219,35 @@ impl IpcServer {
                 Err(e) => map_handler_err(id, e),
             },
             "read_inert" => {
-                // Installation and removal use this same guard. Keep route safety
-                // classification and execution bound to the same installed package.
-                let _mutation = self.petal_mutation.lock().await;
-                match parse_path(&req.params) {
-                    Ok(path) if self.vfs.is_read_side_effecting(&path) => Response::err(
-                        id,
+                // A Petal route's safety can change with its package, so the
+                // Petal router checks it again under that Petal's own gate,
+                // which also keeps the package from changing until the read
+                // ends. Holding Machine's Petal mutation lock here instead
+                // would hold up every Petal's install for as long as the read.
+                let not_inert = || {
+                    Response::err(
+                        id.clone(),
                         -32010,
                         "path is not an inert resource; use vfs_read deliberately",
-                    ),
-                    Ok(_) => match self.do_read(&req.params, &context).await {
-                        Ok(value) => Response::ok(id, value),
-                        Err(error) => map_handler_err(id, error),
-                    },
+                    )
+                };
+                match parse_path(&req.params) {
+                    Ok(path) => {
+                        // A parameterized Petal route counts as acting until a
+                        // lookup evaluates it, as `bloom vfs stat` would; a
+                        // lookup never acts.
+                        if self.vfs.is_read_side_effecting(&path) {
+                            let _ = self.vfs.lookup(&path).await;
+                        }
+                        if self.vfs.is_read_side_effecting(&path) {
+                            return not_inert();
+                        }
+                        match bloom_petals::inert_read(self.do_read(&req.params, &context)).await {
+                            (_, true) => not_inert(),
+                            (Ok(value), false) => Response::ok(id, value),
+                            (Err(error), false) => map_handler_err(id, error),
+                        }
+                    }
                     Err(error) => map_handler_err(id, error),
                 }
             }
@@ -1187,7 +1256,20 @@ impl IpcServer {
                 Err(e) => map_handler_err(id, e),
             },
             "write" => match self.do_write(&req.params, &context).await {
-                Ok(()) => Response::ok(id, Value::Null),
+                Ok(Written::Done) => Response::ok(id, Value::Null),
+                Ok(Written::Sent(sent)) => Response::ok(id, json!({ "sent": sent })),
+                Ok(Written::ApprovalPending {
+                    id: entry,
+                    ceremony_url,
+                    text,
+                }) => Response::ok(
+                    id,
+                    json!({ "approval_pending": {
+                        "id": entry,
+                        "ceremony_url": ceremony_url,
+                        "text": text,
+                    } }),
+                ),
                 Err(WriteError::Handler(e)) => map_handler_err(id, e),
                 Err(WriteError::Approval(message)) => Response::err(id, -32007, message),
             },
@@ -1413,23 +1495,8 @@ impl IpcServer {
     /// Whether `params` names the receipt of an outbox entry that was
     /// broadcast (it has a `tx_hash`) but has no receipt recorded yet.
     async fn receipt_is_due(&self, params: &Value, error: &HandlerError) -> bool {
-        let Ok(path) = parse_path(params) else {
-            return false;
-        };
-        let segments = path.segments();
-        let [.., outbox, sent, _, leaf] = segments else {
-            return false;
-        };
-        if !matches!(error, HandlerError::NotFound(_))
-            || outbox != "outbox"
-            || sent != "sent"
-            || leaf != "receipt.json"
-        {
-            return false;
-        }
-        let sibling = format!("/{}/tx_hash", segments[..segments.len() - 1].join("/"));
-        match VfsPath::parse(&sibling) {
-            Ok(tx_hash) => self.vfs.lookup(&tx_hash).await.is_ok(),
+        match parse_path(params) {
+            Ok(path) => owner_wait::receipt_is_due(&self.vfs, &path, error).await,
             Err(_) => false,
         }
     }
@@ -1484,7 +1551,7 @@ impl IpcServer {
         &self,
         params: &Value,
         context: &IpcOperationContext,
-    ) -> Result<(), WriteError> {
+    ) -> Result<Written, WriteError> {
         match self.write_direct(params, context).await {
             Err(WriteError::Handler(error)) => match self.relinked(params, &error, false).await {
                 Some(real) => self.write_direct(&real, context).await,
@@ -1498,258 +1565,21 @@ impl IpcServer {
         &self,
         params: &Value,
         context: &IpcOperationContext,
-    ) -> Result<(), WriteError> {
+    ) -> Result<Written, WriteError> {
         let path = parse_path(params)?;
         if write_path_uses_wallet_signer(&path) && !is_fee_repair_write(&path, params) {
             return Err(HandlerError::PermissionDenied.into());
         }
         let bytes = parse_write_bytes(params)?;
-        if matches!(path.segments(), [root, _, _, leaf] if root == "wallets" && leaf == "confirm-batch")
-        {
-            return self.write_batch_confirm(&path, &bytes, context).await;
-        }
-        let Some(challenge) = confirm_challenge_path(&path) else {
-            return match self.vfs.write(&path, &bytes).await {
-                // `outbox/send.tx` stages and asks the owner in one write:
-                // answer as a first confirm does, with the link.
-                Err(HandlerError::ApprovalPending(challenge))
-                    if path.segments().last().is_some_and(|leaf| leaf == "send.tx") =>
-                {
-                    let url = match VfsPath::parse(&format!("/{challenge}")) {
-                        Ok(challenge) => self.vfs.read(&challenge).await.ok(),
-                        Err(_) => None,
-                    }
-                    .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok());
-                    // Several bodies were staged: say so, or the caller
-                    // checks each entry before asking the owner.
-                    let staged = url
-                        .as_ref()
-                        .and_then(|doc| doc["entries"].as_array())
-                        .filter(|entries| entries.len() > 1)
-                        .map(|entries| {
-                            format!(" for {} staged transactions, sent in order", entries.len())
-                        })
-                        .unwrap_or_default();
-                    // Name the entry: `latest` is whatever was staged last,
-                    // which another writer may have changed since.
-                    let id = url
-                        .as_ref()
-                        .and_then(|doc| doc["entries"].as_array()?.last()?.as_str())
-                        .and_then(|entry| entry.split_once(':'))
-                        .map(|(_, id)| id.to_owned())
-                        .or_else(|| challenge.rsplit('/').nth(1).map(str::to_owned))
-                        .unwrap_or_default();
-                    let url = url.and_then(|doc| doc["ceremony_url"].as_str().map(str::to_owned));
-                    Err(match url {
-                        Some(url) => WriteError::Approval(format!(
-                            "permission denied: owner approval required{staged}: {url} . Write y to pending/{id}/confirm: it waits for their approval, then sends."
-                        )),
-                        None => HandlerError::ApprovalPending(challenge).into(),
-                    })
-                }
-                written => Ok(written?),
-            };
-        };
-        // The batch the latest `confirm-batch` shows, if this entry is in it:
-        // a confirm repeated after its link was returned waits for it.
-        let batch_ref = match path.segments() {
-            [_, _, _, _, chain, _, _, id, _] => format!("{chain}:{id}"),
-            _ => String::new(),
-        };
-        let seen_batch = match path.segments() {
-            [_, wallet, number, ..] => {
-                VfsPath::parse(&format!("/wallets/{wallet}/{number}/confirm-batch")).ok()
-            }
-            _ => None,
-        };
-        let seen_batch = match &seen_batch {
-            Some(batch) => self.awaited_batch(batch).await,
-            None => None,
-        }
-        .filter(|(_, _, entries)| entries.contains(&batch_ref));
-        let waiting_for = self.approval_id(&challenge).await;
-        match self.vfs.write(&path, &bytes).await {
-            // An entry asked for as part of a batch waits as its batch does,
-            // retrying exactly that batch's entries: a batch another writer
-            // starts meanwhile is never sent in its place.
-            Err(HandlerError::ApprovalPending(batch)) if batch.ends_with("/confirm-batch") => {
-                let pending = || HandlerError::ApprovalPending(batch.clone());
-                let batch_path = VfsPath::parse(&format!("/{batch}")).map_err(|_| pending())?;
-                match self.awaited_batch(&batch_path).await {
-                    Some((_, _, entries)) if entries.contains(&batch_ref) => {
-                        let seen = seen_batch.map(|(action, ..)| action);
-                        self.await_batch(&batch_path, entries.join(" ").as_bytes(), seen, context)
-                            .await
-                    }
-                    _ => Err(pending().into()),
-                }
-            }
-            Err(denied @ (HandlerError::PermissionDenied | HandlerError::ApprovalPending(_))) => {
-                self.await_approval(&path, &bytes, &challenge, waiting_for, denied, context)
-                    .await
-            }
-            result => Ok(result?),
-        }
-    }
-
-    /// The batch a `confirm-batch` file reports as waiting for the owner:
-    /// its action, link and entries in order.
-    async fn awaited_batch(&self, path: &VfsPath) -> Option<(String, String, Vec<String>)> {
-        let status: Value = serde_json::from_slice(&self.vfs.read(path).await.ok()?).ok()?;
-        let field = |name: &str| status[name].as_str().unwrap_or_default().to_owned();
-        let entries = status["entries"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| entry.as_str().map(str::to_owned))
-            .collect();
-        (status["status"] == "awaiting_ceremony")
-            .then(|| (field("action_id"), field("ceremony_url"), entries))
-    }
-
-    /// `confirm-batch` behaves as a single confirm does: the first write
-    /// returns the owner's link at once, and a repeat for the same batch
-    /// waits for their approval, then sends.
-    async fn write_batch_confirm(
-        &self,
-        path: &VfsPath,
-        bytes: &[u8],
-        context: &IpcOperationContext,
-    ) -> Result<(), WriteError> {
-        let awaited = self.awaited_batch(path).await;
-        // `y` repeats the batch waiting now. Retry it by its entries, so a
-        // batch another writer starts meanwhile is never sent in its place.
-        let named = match &awaited {
-            Some((_, _, entries)) if bytes.trim_ascii() == b"y" && !entries.is_empty() => {
-                entries.join(" ").into_bytes()
-            }
-            _ => bytes.to_vec(),
-        };
-        match self.vfs.write(path, &named).await {
-            Err(HandlerError::ApprovalPending(_)) => {}
-            result => return Ok(result?),
-        }
-        let waiting_for = awaited.map(|(action, ..)| action);
-        self.await_batch(path, &named, waiting_for, context).await
-    }
-
-    /// After a batch write was denied for approval: when the caller already
-    /// saw that approval (`waiting_for`), repeat `bytes` until the owner
-    /// approves; otherwise return the link.
-    async fn await_batch(
-        &self,
-        path: &VfsPath,
-        bytes: &[u8],
-        waiting_for: Option<String>,
-        context: &IpcOperationContext,
-    ) -> Result<(), WriteError> {
-        let deadline = tokio::time::Instant::now() + self.approval_wait;
-        loop {
-            let (action, url, _) = self.awaited_batch(path).await.unwrap_or_default();
-            if waiting_for.as_deref() != Some(action.as_str())
-                || context.is_cancelled()
-                || tokio::time::Instant::now() >= deadline
-            {
-                return Err(WriteError::Approval(format!(
-                    "permission denied: owner approval required: {url} . Write y to confirm-batch: it waits for their approval, then sends."
-                )));
-            }
-            // Each attempt is an audited request, so poll less often than a
-            // single confirm does.
-            tokio::time::sleep(BATCH_APPROVAL_POLL).await;
-            match self.vfs.write(path, bytes).await {
-                Err(HandlerError::ApprovalPending(_)) => {}
-                result => return Ok(result?),
-            }
-        }
-    }
-
-    async fn approval_id(&self, challenge_path: &VfsPath) -> Option<String> {
-        let raw = self.vfs.read(challenge_path).await.ok()?;
-        let challenge: Value = serde_json::from_slice(&raw).ok()?;
-        challenge["approval_id"].as_str().map(str::to_owned)
-    }
-
-    /// A confirm denied for owner approval returns the ceremony link at once
-    /// when the approval is new to the caller. A confirm made after the
-    /// caller already saw that approval waits, outside every VFS lock, for
-    /// Broker to report it active, then repeats the same write. That retry is
-    /// the ordinary confirm path: it re-verifies the approval with Broker and
-    /// signs at most once under the entry's dispatch marker. Waiting never
-    /// starts a ceremony or restages anything.
-    async fn await_approval(
-        &self,
-        path: &VfsPath,
-        bytes: &[u8],
-        challenge_path: &VfsPath,
-        waiting_for: Option<String>,
-        denied: HandlerError,
-        context: &IpcOperationContext,
-    ) -> Result<(), WriteError> {
-        let deadline = tokio::time::Instant::now() + self.approval_wait;
-        let challenge_file = challenge_path.to_string_path();
-        let mut retried_active = false;
-        let mut first = true;
-        loop {
-            let Ok(raw) = self.vfs.read(challenge_path).await else {
-                // A denial with no challenge is not an approval wait. A
-                // challenge that disappears mid-wait means the entry left
-                // `pending/` (sent, cancelled, expired): report where it went.
-                if first {
-                    return Err(denied.into());
-                }
-                return Ok(self.vfs.write(path, bytes).await?);
-            };
-            let challenge: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
-            let url = challenge["ceremony_url"].as_str().unwrap_or_default();
-            let new_approval = challenge["approval_id"].as_str() != waiting_for.as_deref();
-            // A Petal rechecks its conditions when it confirms, so its entries
-            // are retried through it, never by rewriting this raw confirm.
-            if challenge["staged_by"].is_string() {
-                let next = challenge["next"].as_str().unwrap_or_default();
-                let link = if url.is_empty() {
-                    String::new()
-                } else {
-                    format!(" Ceremony link: {url}.")
-                };
-                return Err(WriteError::Approval(format!(
-                    "permission denied: owner approval required.{link} {next} Details: {challenge_file}"
-                )));
-            }
-            match challenge["state"].as_str().unwrap_or("unknown") {
-                "active" if retried_active => return Err(HandlerError::PermissionDenied.into()),
-                "active" => {
-                    retried_active = true;
-                    match self.vfs.write(path, bytes).await {
-                        Err(HandlerError::PermissionDenied | HandlerError::ApprovalPending(_)) => {
-                            continue;
-                        }
-                        result => return Ok(result?),
-                    }
-                }
-                "awaiting_ceremony" | "unknown" => retried_active = false,
-                state => {
-                    let next = challenge["next"].as_str().unwrap_or_default();
-                    return Err(WriteError::Approval(format!(
-                        "permission denied: owner approval {state}. {next} Details: {challenge_file}"
-                    )));
-                }
-            }
-            if new_approval || context.is_cancelled() || tokio::time::Instant::now() >= deadline {
-                // Short on purpose: naming the challenge file here sent
-                // agents off to read it before retrying.
-                let link = if url.is_empty() {
-                    format!("the link in {challenge_file}")
-                } else {
-                    url.to_owned()
-                };
-                return Err(WriteError::Approval(format!(
-                    "permission denied: owner approval required: {link} . Write confirm again: it waits for their approval, then sends."
-                )));
-            }
-            first = false;
-            tokio::time::sleep(APPROVAL_POLL).await;
-        }
+        owner_wait::write(
+            &self.vfs,
+            &path,
+            &bytes,
+            self.approval_wait,
+            &|| context.is_cancelled(),
+            true,
+        )
+        .await
     }
 
     /// Serialize a VFS mutation with lookup of the identity projection it
@@ -2540,6 +2370,7 @@ fn map_petal_err(id: Value, e: PetalError) -> Response {
             format!("capability denied: petal={petal} cap={cap}"),
         ),
         PetalError::Vm(s) => (-32000, format!("vm: {s}")),
+        PetalError::Busy => (-32000, PetalError::Busy.to_string()),
         PetalError::Io(e) => (-32001, format!("io: {e}")),
         PetalError::Serde(s) => (-32602, format!("serde: {s}")),
         PetalError::ModeCapMismatch { mode, cap } => (
@@ -2572,7 +2403,7 @@ fn map_handler_err(id: Value, e: HandlerError) -> Response {
         HandlerError::NotAFile(s) => (-32006, format!("not a file: {s}")),
         HandlerError::PermissionDenied => (-32007, "permission denied".into()),
         HandlerError::OperationNotPermitted => (-32007, "operation not permitted".into()),
-        e @ HandlerError::ApprovalPending(_) => (-32007, e.to_string()),
+        e @ (HandlerError::ApprovalPending(_) | HandlerError::Denied(_)) => (-32007, e.to_string()),
         HandlerError::Invalid(s) => (-32602, format!("invalid: {s}")),
         HandlerError::Unsupported(s) => (-32008, format!("unsupported: {s}")),
         HandlerError::Backend(s) => (-32000, format!("backend: {s}")),
@@ -2815,6 +2646,264 @@ mod tests {
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
+    fn echo_package(root: &std::path::Path) -> std::path::PathBuf {
+        let package = root.join("echo-app");
+        for (path, bytes) in [
+            (
+                "petal.toml",
+                &br#"schema = "bloom.petal.package.v1"
+name = "echo"
+
+[consent]
+summary = "Echo values for install tests."
+
+[caps]
+allowed = ["bloom:vfs.read"]
+"#[..],
+            ),
+            ("README.md", &b"# echo"[..]),
+            ("AGENTS.md", &b"# echo agents"[..]),
+            (
+                "petal/echo/message.txt.wasm",
+                &include_bytes!(
+                    "../../bloom-petals/tests/fixtures/route_component_no_imports.wasm"
+                )[..],
+            ),
+        ] {
+            let file = package.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, bytes).unwrap();
+        }
+        package
+    }
+
+    fn echo_runner(root: &std::path::Path) -> bloom_petals::runner::PetalRunner {
+        bloom_petals::runner::PetalRunner::new(
+            bloom_petals::store::PetalStore::open(root.join("store")).unwrap(),
+            Arc::new(bloom_petals::NameRegistry::open(root.join("reg")).unwrap()),
+            bloom_petals::vm::PetalVm::new().unwrap(),
+        )
+    }
+
+    /// While Petal code runs, a plain install is refused at once. A waiting
+    /// install queues: a Petal call that starts after it waits behind it,
+    /// and it activates as soon as the running call ends. It gives up as
+    /// busy at its limit, releasing the calls behind it, and stops when
+    /// cancelled.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_waiting_install_queues_ahead_of_new_petal_calls() {
+        use bloom_petals::package::PreparedPetalPackage;
+        let dir = tempfile::tempdir().unwrap();
+        let runner = echo_runner(dir.path());
+        let package = echo_package(dir.path());
+        let mutation = Arc::new(tokio::sync::Mutex::new(()));
+        let mut context = IpcOperationContext::detached();
+        context.petal_mutation = Some(mutation.clone());
+        let commit = |context: IpcOperationContext| {
+            let (runner, package) = (runner.clone(), package.clone());
+            tokio::task::spawn_blocking(move || {
+                context.commit_petal_package(
+                    &runner,
+                    PreparedPetalPackage::from_dir(&package).unwrap(),
+                    None,
+                    None,
+                )
+            })
+        };
+
+        let running = runner.store().execution_guard("echo").await;
+        assert!(matches!(
+            commit(context.clone()).await.unwrap(),
+            Err(PetalError::Busy)
+        ));
+        // The running call outlasts a short limit: busy, nothing installed,
+        // and a call behind it waited no longer than that limit.
+        let task = commit(context.waiting_to_activate(std::time::Duration::from_millis(300)));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let started = std::time::Instant::now();
+        drop(runner.store().execution_guard("echo").await);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(matches!(task.await.unwrap(), Err(PetalError::Busy)));
+        assert!(
+            runner
+                .store()
+                .resolve_petal_owner("echo")
+                .unwrap()
+                .is_none()
+        );
+        // Cancelled while queued: stops with the cancellation.
+        let cancelled = context.waiting_to_activate(std::time::Duration::from_secs(30));
+        let task = commit(cancelled.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        cancelled.cancel();
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(PetalError::Vm(message)) if message == "Petal install cancelled"
+        ));
+
+        // Cancelling a waiting context cancels the one it came from too.
+        assert!(context.is_cancelled());
+        let mut context = IpcOperationContext::detached();
+        context.petal_mutation = Some(mutation.clone());
+        let task = commit(context.waiting_to_activate(std::time::Duration::from_secs(30)));
+        until_install_queued(runner.store(), "echo").await;
+        // A call starting now waits behind the queued install.
+        let store = runner.store().clone();
+        let later = tokio::spawn(async move {
+            let _call = store.execution_guard("echo").await;
+            store.resolve_petal_owner("echo").unwrap()
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!task.is_finished(), "activated while Petal code ran");
+        assert!(
+            !later.is_finished(),
+            "a later call cut in ahead of the install"
+        );
+        drop(running);
+        task.await.unwrap().unwrap();
+        assert!(
+            later.await.unwrap().is_some(),
+            "the later call ran before the install activated"
+        );
+    }
+
+    /// Wait until an install of `petal` is queued, so that a new call to it
+    /// would have to wait. Staging can take a while on a busy machine, so a
+    /// fixed sleep is not enough.
+    async fn until_install_queued(store: &bloom_petals::store::PetalStore, petal: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !store.call_would_wait(petal) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the install never queued"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Another Petal's calls neither hold up an install nor wait behind one:
+    /// a plain install goes in while another Petal's code runs, and with an
+    /// install queued behind this Petal's call, another Petal's call starts
+    /// at once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn other_petals_calls_neither_block_nor_wait_on_an_install() {
+        use bloom_petals::package::PreparedPetalPackage;
+        let dir = tempfile::tempdir().unwrap();
+        let runner = echo_runner(dir.path());
+        let package = echo_package(dir.path());
+        let mut context = IpcOperationContext::detached();
+        context.petal_mutation = Some(Arc::new(tokio::sync::Mutex::new(())));
+        let commit = |context: IpcOperationContext| {
+            let (runner, package) = (runner.clone(), package.clone());
+            tokio::task::spawn_blocking(move || {
+                context
+                    .commit_petal_package(
+                        &runner,
+                        PreparedPetalPackage::from_dir(&package).unwrap(),
+                        None,
+                        None,
+                    )
+                    .map(|_| ())
+            })
+        };
+        let other = runner.store().execution_guard("polymarket").await;
+        commit(context.clone()).await.unwrap().unwrap();
+        drop(other);
+
+        let running = runner.store().execution_guard("echo").await;
+        let queued = commit(context.waiting_to_activate(std::time::Duration::from_secs(30)));
+        until_install_queued(runner.store(), "echo").await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                runner.store().execution_guard("polymarket")
+            )
+            .await
+            .is_ok(),
+            "another Petal's call waited behind the queued install"
+        );
+        assert!(!queued.is_finished());
+        drop(running);
+        queued.await.unwrap().unwrap();
+    }
+
+    /// Callers that take the Petal mutation lock and then run Petal code
+    /// back to back cannot starve an install: it takes the lock in turn, both
+    /// plain and waiting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn readers_holding_the_mutation_lock_cannot_starve_an_install() {
+        use bloom_petals::package::PreparedPetalPackage;
+        for waiting in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let runner = echo_runner(dir.path());
+            let package = echo_package(dir.path());
+            let mutation = Arc::new(tokio::sync::Mutex::new(()));
+            let mut context = IpcOperationContext::detached();
+            context.petal_mutation = Some(mutation.clone());
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut readers = Vec::new();
+            for _ in 0..4 {
+                let (store, mutation, stop) =
+                    (runner.store().clone(), mutation.clone(), stop.clone());
+                readers.push(tokio::spawn(async move {
+                    while !stop.load(Ordering::SeqCst) {
+                        let _held = mutation.lock().await;
+                        let _call = store.execution_guard("echo").await;
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                }));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let context = if waiting {
+                context.waiting_to_activate(std::time::Duration::from_secs(5))
+            } else {
+                context
+            };
+            let (r, p) = (runner.clone(), package.clone());
+            let install = tokio::task::spawn_blocking(move || {
+                context
+                    .commit_petal_package(
+                        &r,
+                        PreparedPetalPackage::from_dir(&p).unwrap(),
+                        None,
+                        None,
+                    )
+                    .map(|_| ())
+            });
+            let installed = tokio::time::timeout(std::time::Duration::from_secs(10), install).await;
+            stop.store(true, Ordering::SeqCst);
+            for reader in readers {
+                reader.await.unwrap();
+            }
+            let installed = installed
+                .expect("the install never got the Petal mutation lock")
+                .unwrap();
+            // A plain install is refused while a reader's call runs, but it
+            // gets its turn rather than waiting on the lock forever.
+            if waiting {
+                installed.unwrap();
+            } else {
+                assert!(matches!(installed, Ok(()) | Err(PetalError::Busy)));
+            }
+        }
+    }
+
+    /// Only a context asked to queue for activation does, and it shares
+    /// cancellation with the one it came from.
+    #[test]
+    fn a_waiting_context_shares_cancellation() {
+        let context = IpcOperationContext::detached();
+        assert_eq!(context.activation_wait, None);
+        let waiting = context.waiting_to_activate(std::time::Duration::from_secs(30));
+        assert_eq!(
+            waiting.activation_wait,
+            Some(std::time::Duration::from_secs(30))
+        );
+        assert_eq!(context.activation_wait, None);
+        context.cancel();
+        assert!(waiting.is_cancelled());
+    }
+
     #[tokio::test]
     async fn bounded_frame_reader_rejects_oversized_input_before_newline() {
         let input = vec![b'x'; MAX_IPC_FRAME_BYTES + 1];
@@ -3038,14 +3127,21 @@ mod tests {
     /// One pending outbox entry as the wallets handler presents it: the
     /// first denied confirm creates the challenge, a confirm signs only while
     /// Broker reports the approval active, a signed entry leaves `pending/`,
-    /// and the challenge reports Broker's live state.
+    /// and the challenge reports Broker's live state. Like the real handler,
+    /// a confirm holds the entry lock while it signs: Broker reports the
+    /// approval `exhausted` once it is used, and the entry reaches `sent/`
+    /// only after signing, broadcast and fsyncs finish.
     struct ApprovalEntry {
         state: std::sync::Mutex<&'static str>,
         challenged: AtomicBool,
         writes: AtomicUsize,
         signatures: AtomicUsize,
         staged_by: Option<&'static str>,
+        entry_lock: tokio::sync::Mutex<()>,
     }
+
+    const BROKER_CALL: std::time::Duration = std::time::Duration::from_millis(100);
+    const SIGN_AND_SEND: std::time::Duration = std::time::Duration::from_millis(400);
 
     impl ApprovalEntry {
         fn new() -> Arc<Self> {
@@ -3058,6 +3154,7 @@ mod tests {
                 writes: AtomicUsize::new(0),
                 signatures: AtomicUsize::new(0),
                 staged_by,
+                entry_lock: tokio::sync::Mutex::new(()),
             })
         }
         fn set(&self, state: &'static str) {
@@ -3071,6 +3168,10 @@ mod tests {
     #[async_trait::async_trait]
     impl Handler for ApprovalEntry {
         async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+            // A signed entry leaves pending/ for sent/.
+            if path.segments().iter().any(|s| s == "sent") && self.signatures() == 0 {
+                return Err(HandlerError::NotFound(path.to_string_path()));
+            }
             Ok(Entry::file(path.segments().last().unwrap()))
         }
 
@@ -3091,14 +3192,26 @@ mod tests {
 
         async fn write(&self, path: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
             self.writes.fetch_add(1, Ordering::SeqCst);
+            let _entry = self.entry_lock.lock().await;
             if self.signatures() > 0 {
-                return Err(HandlerError::NotFound(path.to_string_path()));
+                return Err(HandlerError::backend(
+                    "staged tx 'tx-1' is in 'sent', not 'pending'",
+                ));
             }
             self.challenged.store(true, Ordering::SeqCst);
-            if *self.state.lock().unwrap() != "active" {
+            let state = *self.state.lock().unwrap();
+            if state == "exhausted" {
+                return Err(HandlerError::PermissionDenied);
+            }
+            if state != "active" {
                 // The variant the real wallet handler returns.
                 return Err(HandlerError::ApprovalPending(path.to_string_path()));
             }
+            // Broker verifies, then consumes, the approval; the entry moves
+            // to sent/ only once signing and broadcast are recorded.
+            tokio::time::sleep(BROKER_CALL).await;
+            self.set("exhausted");
+            tokio::time::sleep(SIGN_AND_SEND).await;
             self.signatures.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -3162,12 +3275,30 @@ mod tests {
             approve_after(&entry, 700, "active")
         );
         assert_eq!(entry.signatures(), 1);
+        // Both report the send; neither tells its agent the confirm failed.
         let outcomes = [first.map(|e| e.code), second.map(|e| e.code)];
-        assert!(outcomes.contains(&None), "{outcomes:?}");
-        assert!(
-            outcomes.iter().all(|o| matches!(o, None | Some(-32004))),
-            "{outcomes:?}"
-        );
+        assert_eq!(outcomes, [None, None]);
+    }
+
+    /// A waiter that polls while the other confirm signs reads `exhausted`
+    /// with the entry still pending; it must report the send, not a refusal.
+    #[tokio::test]
+    async fn a_waiter_that_sees_the_approval_used_mid_signing_reports_the_send() {
+        let entry = ApprovalEntry::new();
+        let server = approval_server(&entry, 10_000);
+        confirm(&server).await.expect("approval required");
+        let late = async {
+            tokio::time::sleep(APPROVAL_POLL / 2).await;
+            confirm(&server).await
+        };
+        let (first, second, ()) =
+            tokio::join!(confirm(&server), late, approve_after(&entry, 700, "active"));
+        assert_eq!(entry.signatures(), 1);
+        let outcomes = [
+            first.map(|e| (e.code, e.message)),
+            second.map(|e| (e.code, e.message)),
+        ];
+        assert_eq!(outcomes, [None, None]);
     }
 
     #[tokio::test]
@@ -3278,7 +3409,14 @@ mod tests {
 
     struct GuardedReadHandler {
         side_effecting: AtomicBool,
+        /// Counts as acting until looked up, as a parameterized Petal route
+        /// does before its metadata is evaluated.
+        cold: AtomicBool,
+        /// Refuses the read as acting once it starts, as the Petal router
+        /// does when the package changed after the first check.
+        refuse: AtomicBool,
         reads: AtomicUsize,
+        inert: AtomicBool,
         started: Notify,
         release: Notify,
     }
@@ -3286,24 +3424,39 @@ mod tests {
     #[async_trait::async_trait]
     impl Handler for GuardedReadHandler {
         async fn lookup(&self, _: &VfsPath) -> Result<Entry, HandlerError> {
+            self.cold.store(false, Ordering::SeqCst);
             Ok(Entry::read_only_file("value"))
         }
         fn is_read_side_effecting(&self, _: &VfsPath) -> bool {
-            self.side_effecting.load(Ordering::SeqCst)
+            self.side_effecting.load(Ordering::SeqCst) || self.cold.load(Ordering::SeqCst)
         }
         async fn read(&self, _: &VfsPath) -> Result<Vec<u8>, HandlerError> {
             self.reads.fetch_add(1, Ordering::SeqCst);
+            if self.refuse.load(Ordering::SeqCst) {
+                return Err(bloom_petals::refuse_inert_read());
+            }
+            self.inert
+                .store(bloom_petals::is_inert_read(), Ordering::SeqCst);
             self.started.notify_one();
             self.release.notified().await;
             Ok(b"safe".to_vec())
         }
     }
 
+    /// An inert read of a route not yet evaluated looks it up first, then runs
+    /// as an inert read, so the Petal router checks the route's safety again
+    /// under that Petal's own gate, and it does not hold the Petal mutation
+    /// lock: no install waits for it. A read that acts is refused before
+    /// anything runs, and one refused as acting once it started gets the
+    /// same error.
     #[tokio::test]
-    async fn inert_read_serializes_safety_check_and_execution_with_package_mutation() {
+    async fn inert_read_runs_as_one_without_holding_up_installs() {
         let handler = Arc::new(GuardedReadHandler {
             side_effecting: AtomicBool::new(false),
+            cold: AtomicBool::new(true),
+            refuse: AtomicBool::new(false),
             reads: AtomicUsize::new(0),
+            inert: AtomicBool::new(false),
             started: Notify::new(),
             release: Notify::new(),
         });
@@ -3332,26 +3485,25 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            server.petal_mutation.try_lock().is_err(),
-            "package replacement must wait through execution"
+            handler.inert.load(Ordering::SeqCst),
+            "the read ran as an inert one"
+        );
+        assert!(
+            server.petal_mutation.try_lock().is_ok(),
+            "an inert read holds up no install"
         );
         handler.release.notify_one();
         assert!(pending.await.unwrap().error.is_none());
 
-        // A queued resource request must inspect the successor's safety, not
-        // the outgoing package's flag sampled before acquiring the guard.
-        let mutation = server.petal_mutation.lock().await;
-        let mut pending = read(server.clone());
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(30), &mut pending)
-                .await
-                .is_err()
-        );
-        handler.side_effecting.store(true, Ordering::SeqCst);
-        drop(mutation);
-        let refused = pending.await.unwrap();
+        handler.refuse.store(true, Ordering::SeqCst);
+        let refused = read(server.clone()).await.unwrap();
         assert_eq!(refused.error.unwrap().code, -32010);
-        assert_eq!(handler.reads.load(Ordering::SeqCst), 1);
+        assert_eq!(handler.reads.load(Ordering::SeqCst), 2);
+
+        handler.side_effecting.store(true, Ordering::SeqCst);
+        let refused = read(server.clone()).await.unwrap();
+        assert_eq!(refused.error.unwrap().code, -32010);
+        assert_eq!(handler.reads.load(Ordering::SeqCst), 2);
     }
 
     struct AtomicProjectionHandler {
@@ -5028,10 +5180,10 @@ summary = "Demo app used by IPC tests."
             panic!("the first write must report the approval link");
         };
         assert!(message.contains("http://localhost:1/c/b"), "{message}");
-        assert!(started.elapsed() < BATCH_APPROVAL_POLL);
+        assert!(started.elapsed() < owner_wait::BATCH_APPROVAL_POLL);
         // Still waiting on this write; approved by the next attempt.
         assert!(server.do_write(&write, &context).await.is_ok());
-        assert!(started.elapsed() >= BATCH_APPROVAL_POLL);
+        assert!(started.elapsed() >= owner_wait::BATCH_APPROVAL_POLL);
     }
 
     /// A batch of `tx-1` waiting for the owner; records the paths written.
@@ -5186,14 +5338,32 @@ summary = "Demo app used by IPC tests."
         );
         let write = json!({"path": "/wallets/w/0/chains/base/outbox/send.tx", "bytes_b64": B64.encode("send 1 ETH to 0x01")});
         let context = IpcOperationContext::detached();
-        let Err(WriteError::Approval(message)) = server.do_write(&write, &context).await else {
+        let Ok(Written::ApprovalPending {
+            id,
+            ceremony_url,
+            text,
+        }) = server.do_write(&write, &context).await
+        else {
             panic!("send.tx must report the approval link");
         };
-        assert!(
-            message.contains("http://localhost:1/c/s")
-                && message.contains("Write y to pending/tx-9/confirm"),
-            "{message}"
+        assert_eq!(
+            (id.as_str(), ceremony_url.as_str()),
+            ("tx-9", "http://localhost:1/c/s")
         );
+        assert!(text.contains("Write y to pending/tx-9/confirm"), "{text}");
+        // Nothing was signed: the answer is never under `sent`.
+        let answer = server
+            .dispatch(Request {
+                jsonrpc: "2.0".into(),
+                id: json!(1),
+                method: "write".into(),
+                params: write,
+            })
+            .await
+            .result
+            .expect("staging is not an error");
+        assert!(answer.get("sent").is_none(), "{answer}");
+        assert_eq!(answer["approval_pending"]["id"], "tx-9", "{answer}");
     }
 
     /// A sent entry whose receipt is recorded only on the fourth read.
