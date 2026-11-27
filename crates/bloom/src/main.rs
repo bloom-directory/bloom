@@ -1419,6 +1419,7 @@ fn machine_error_from_handler(error: &bloom_vfs::HandlerError, message: String) 
     let kind = match error {
         bloom_vfs::HandlerError::NotFound(_) => MachineErrorKind::NotFound,
         bloom_vfs::HandlerError::PermissionDenied
+        | bloom_vfs::HandlerError::Denied(_)
         | bloom_vfs::HandlerError::OperationNotPermitted
         | bloom_vfs::HandlerError::Refused(_)
         | bloom_vfs::HandlerError::ApprovalPending(_) => MachineErrorKind::PermissionDenied,
