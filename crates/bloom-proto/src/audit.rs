@@ -97,11 +97,33 @@ thread_local! {
     /// the journal at the latest point inside the verified window.
     static AFTER_OPEN_VERIFICATION_FOR_TEST: std::cell::Cell<Option<fn(&Path)>> =
         const { std::cell::Cell::new(None) };
+    /// Runs once inside an append, right before the journal is opened for
+    /// writing, so a test can move the file's metadata between the precheck
+    /// and the lock-time check.
+    static BEFORE_APPEND_OPEN_FOR_TEST: std::cell::Cell<Option<fn(&Path)>> =
+        const { std::cell::Cell::new(None) };
+    /// Runs once inside an append, after the write is synced and its snapshot
+    /// taken, before the path is read back for the commit check.
+    static AFTER_APPEND_SYNC_FOR_TEST: std::cell::Cell<Option<fn(&Path)>> =
+        const { std::cell::Cell::new(None) };
+    /// Runs once inside `metadata_only_drift`, after the whole journal has
+    /// re-verified and right before the drift is accepted: the last point at
+    /// which an edit can land behind an acceptance.
+    static AFTER_DRIFT_REVERIFICATION_FOR_TEST: std::cell::Cell<Option<fn(&Path)>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Cheap identity and mutation evidence for the journal verified at startup.
 /// This detects replacement, truncation, growth, and ordinary in-place edits
 /// without re-authenticating every historical signature before each append.
+///
+/// Both timestamps are kept. A content write moves mtime; mtime can also be
+/// reset by a writer, which ctime cannot, so ctime is what makes an in-place
+/// edit evident. ctime alone over-reports, though: chmod, chown and extended
+/// attributes move it without touching a byte (macOS stamps a
+/// `com.apple.provenance` xattr on files a newly built binary touches). A
+/// mismatch confined to ctime is therefore not taken at face value either way;
+/// `metadata_only_drift` settles it by re-verifying the journal.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct JournalSnapshot {
     len: u64,
@@ -109,6 +131,10 @@ struct JournalSnapshot {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(unix)]
+    modified_secs: i64,
+    #[cfg(unix)]
+    modified_nanos: i64,
     #[cfg(unix)]
     change_time_secs: i64,
     #[cfg(unix)]
@@ -589,8 +615,26 @@ impl AuditLog {
         // between these two snapshots; a write anywhere in that window means
         // what was verified is not the file later appends will trust.
         let journal_snapshot = journal_snapshot(&path)?;
-        let changed_during_verification = (journal_snapshot != snapshot_before)
-            .then(|| "journal changed while it was being verified".to_owned());
+        let changed_during_verification = if journal_snapshot == snapshot_before {
+            None
+        } else if metadata_only_drift(
+            snapshot_before.as_ref(),
+            journal_snapshot.as_ref(),
+            &path,
+            verifier.as_ref(),
+            &last_digest,
+            sequence,
+        ) {
+            warn_accepted_drift(
+                "open_verification",
+                &path,
+                snapshot_before.as_ref(),
+                journal_snapshot.as_ref(),
+            );
+            None
+        } else {
+            Some("journal changed while it was being verified".to_owned())
+        };
         let degradation_latched = inspected_latched
             || changed_during_verification.is_some()
             || legacy_error.is_some()
@@ -668,9 +712,28 @@ impl AuditLog {
             }
         };
         if observed_snapshot != g.journal_snapshot {
-            let reason = "journal changed since its last verified mutation".to_owned();
-            latch_degradation(g, reason.clone(), "audit_journal_changed");
-            return Err(AuditError::Degraded(reason));
+            let verifier = g.identity.as_ref().map(AuditIdentity::verifier);
+            if metadata_only_drift(
+                g.journal_snapshot.as_ref(),
+                observed_snapshot.as_ref(),
+                &g.path,
+                verifier.as_ref(),
+                &g.last_digest,
+                g.sequence,
+            ) {
+                warn_accepted_drift(
+                    "append_precheck",
+                    &g.path,
+                    g.journal_snapshot.as_ref(),
+                    observed_snapshot.as_ref(),
+                );
+                // Carry the moved change time forward; the bytes are verified.
+                g.journal_snapshot = observed_snapshot;
+            } else {
+                let reason = "journal changed since its last verified mutation".to_owned();
+                latch_degradation(g, reason.clone(), "audit_journal_changed");
+                return Err(AuditError::Degraded(reason));
+            }
         }
         let mut next_pending_effects = g.pending_effects.clone();
         if !apply_effect_transition(&mut next_pending_effects, &record) {
@@ -726,6 +789,12 @@ impl AuditLog {
             *remaining -= 1;
         }
         let file_existed = g.journal_snapshot.is_some();
+        let verifier = g.identity.as_ref().map(AuditIdentity::verifier);
+        let committed_sequence = if g.identity.is_some() {
+            g.sequence.saturating_add(1)
+        } else {
+            g.sequence
+        };
         let write_result = (|| -> Result<JournalSnapshot, std::io::Error> {
             let mut options = OpenOptions::new();
             options.append(true).write(true);
@@ -739,27 +808,76 @@ impl AuditLog {
                 use std::os::unix::fs::OpenOptionsExt as _;
                 options.mode(0o600);
             }
+            #[cfg(test)]
+            if let Some(hook) = BEFORE_APPEND_OPEN_FOR_TEST.with(|hook| hook.take()) {
+                hook(&g.path);
+            }
             let mut f = options.open(&g.path)?;
             // Coordinate independent Machine processes as well as clones of
             // this AuditLog. The metadata recheck after acquiring the lock
             // turns a concurrent append into a fail-closed snapshot mismatch.
             fs2::FileExt::lock_exclusive(&f)?;
             let opened_snapshot = snapshot_from_metadata(&f.metadata()?);
-            if file_existed && Some(opened_snapshot.clone()) != g.journal_snapshot {
-                return Err(std::io::Error::other(
-                    "journal changed while opening it for append",
-                ));
+            if file_existed && Some(&opened_snapshot) != g.journal_snapshot.as_ref() {
+                let accepted = metadata_only_drift(
+                    g.journal_snapshot.as_ref(),
+                    Some(&opened_snapshot),
+                    &g.path,
+                    verifier.as_ref(),
+                    &g.last_digest,
+                    g.sequence,
+                );
+                // The re-verification read the whole journal, and a writer
+                // that does not take this lock can edit it during that read.
+                // Such an edit is in the file but not in `opened_snapshot`,
+                // and the snapshot taken after the write below would absorb
+                // it as trusted. So the metadata must still be what was
+                // verified against, or the append fails closed.
+                if !accepted || snapshot_from_metadata(&f.metadata()?) != opened_snapshot {
+                    return Err(std::io::Error::other(
+                        "journal changed while opening it for append",
+                    ));
+                }
+                warn_accepted_drift(
+                    "append_open",
+                    &g.path,
+                    g.journal_snapshot.as_ref(),
+                    Some(&opened_snapshot),
+                );
             }
             f.write_all(line.as_bytes())?;
             f.write_all(b"\n")?;
             f.sync_data()?;
             let written_snapshot = snapshot_from_metadata(&f.metadata()?);
-            if journal_snapshot(&g.path)? != Some(written_snapshot.clone()) {
-                return Err(std::io::Error::other(
-                    "journal changed while committing an append",
-                ));
+            #[cfg(test)]
+            if let Some(hook) = AFTER_APPEND_SYNC_FOR_TEST.with(|hook| hook.take()) {
+                hook(&g.path);
             }
-            Ok(written_snapshot)
+            let committed_snapshot = journal_snapshot(&g.path)?;
+            if committed_snapshot.as_ref() != Some(&written_snapshot) {
+                // No recheck is needed here: an edit landing during this
+                // re-verification is not in `committed_snapshot`, which is
+                // what the next append compares against, so it latches then.
+                if !metadata_only_drift(
+                    Some(&written_snapshot),
+                    committed_snapshot.as_ref(),
+                    &g.path,
+                    verifier.as_ref(),
+                    &digest,
+                    committed_sequence,
+                ) {
+                    return Err(std::io::Error::other(
+                        "journal changed while committing an append",
+                    ));
+                }
+                warn_accepted_drift(
+                    "append_commit",
+                    &g.path,
+                    Some(&written_snapshot),
+                    committed_snapshot.as_ref(),
+                );
+            }
+            Ok(committed_snapshot.unwrap_or(written_snapshot))
         })();
         let written_snapshot = match write_result {
             Ok(snapshot) => snapshot,
@@ -777,9 +895,8 @@ impl AuditLog {
         g.last_digest = digest;
         g.pending_effects = next_pending_effects;
         g.journal_snapshot = Some(written_snapshot);
-        if g.identity.is_some() {
-            g.sequence += 1;
-        }
+        // The same next-sequence rule the commit check verified against.
+        g.sequence = committed_sequence;
         Ok(record)
     }
 
@@ -1656,6 +1773,8 @@ fn snapshot_from_metadata(metadata: &std::fs::Metadata) -> JournalSnapshot {
             len: metadata.len(),
             device: metadata.dev(),
             inode: metadata.ino(),
+            modified_secs: metadata.mtime(),
+            modified_nanos: metadata.mtime_nsec(),
             change_time_secs: metadata.ctime(),
             change_time_nanos: metadata.ctime_nsec(),
         }
@@ -1667,6 +1786,79 @@ fn snapshot_from_metadata(metadata: &std::fs::Metadata) -> JournalSnapshot {
             modified: metadata.modified().ok(),
         }
     }
+}
+
+/// Whether `observed` differs from `expected` in its change time alone: same
+/// length, same file, same mtime, different ctime. That is the signature of a
+/// metadata operation rather than a content write, but mtime is forgeable, so
+/// this is evidence to be checked, not a verdict; see `metadata_only_drift`.
+fn differs_only_in_change_time(expected: &JournalSnapshot, observed: &JournalSnapshot) -> bool {
+    #[cfg(unix)]
+    {
+        expected.len == observed.len
+            && expected.device == observed.device
+            && expected.inode == observed.inode
+            && expected.modified_secs == observed.modified_secs
+            && expected.modified_nanos == observed.modified_nanos
+            && (expected.change_time_secs, expected.change_time_nanos)
+                != (observed.change_time_secs, observed.change_time_nanos)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (expected, observed);
+        false
+    }
+}
+
+/// Whether a snapshot mismatch is a metadata-only change the verified journal
+/// survives: only its change time moved, and a full re-verification of the
+/// file still ends at the record this log last trusted, at the sequence it
+/// last trusted. The re-verification is a pass over the whole journal, which
+/// is what keeps the ordinary append path cheap: it runs once per metadata
+/// event, not once per append. A read or verification failure answers false,
+/// so every caller fails closed exactly as it would for a changed file.
+fn metadata_only_drift(
+    expected: Option<&JournalSnapshot>,
+    observed: Option<&JournalSnapshot>,
+    path: &Path,
+    identity: Option<&AuditVerifierIdentity>,
+    last_digest: &str,
+    sequence: u64,
+) -> bool {
+    let (Some(expected), Some(observed)) = (expected, observed) else {
+        return false;
+    };
+    if !differs_only_in_change_time(expected, observed) {
+        return false;
+    }
+    let reverified = matches!(
+        inspect(path, identity),
+        Ok((digest, tail)) if digest == last_digest && tail.sequence == sequence
+    );
+    #[cfg(test)]
+    if reverified && let Some(hook) = AFTER_DRIFT_REVERIFICATION_FOR_TEST.with(|hook| hook.take()) {
+        hook(path);
+    }
+    reverified
+}
+
+/// An accepted drift is still a change to the journal's inode that Machine
+/// did not make — a chmod, a chown, an xattr, a move behind a link. The bytes
+/// re-verified, so the log goes on, but an operator reading the Machine log
+/// must be able to see that it happened and where.
+fn warn_accepted_drift(
+    site: &str,
+    path: &Path,
+    expected: Option<&JournalSnapshot>,
+    observed: Option<&JournalSnapshot>,
+) {
+    tracing::warn!(
+        site,
+        path = %path.display(),
+        expected = ?expected,
+        observed = ?observed,
+        "audit.journal.metadata_drift_accepted"
+    );
 }
 
 fn inspect(
@@ -2095,6 +2287,173 @@ mod tests {
         assert!(restarted.mutation_degradation().is_some());
         assert!(restarted.append(record("blocked", 4)).is_err());
         assert_eq!(restarted.tail(10).unwrap().len(), 2);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn runtime_snapshot_survives_a_change_time_only_metadata_update() {
+        let (_dir, path, identity) = signed_fixture(2);
+        let running = AuditLog::open_signed(&path, identity.clone()).unwrap();
+        let before = journal_snapshot(&path).unwrap().unwrap();
+        touch_change_time_only(&path);
+        let after = journal_snapshot(&path).unwrap().unwrap();
+        // The reproduction: not a byte changed, yet the snapshot moved, and
+        // on the old len/inode/ctime comparison that alone latched the log.
+        assert_ne!(before, after);
+        assert!(differs_only_in_change_time(&before, &after));
+        running.append(record("after-metadata", 2)).unwrap();
+        assert!(running.mutation_degradation().is_none());
+        // Another metadata-only move after the carried-forward snapshot.
+        touch_change_time_only(&path);
+        running.append(record("after-metadata", 3)).unwrap();
+        let restarted = AuditLog::open_signed(&path, identity).unwrap();
+        assert!(restarted.mutation_degradation().is_none());
+        assert_eq!(restarted.tail(10).unwrap().len(), 4);
+    }
+
+    /// Moves the journal's ctime without touching its bytes or its mtime,
+    /// the way chmod, chown or an xattr write does. On macOS the system's
+    /// `com.apple.provenance` xattr did exactly this on the Machine's first
+    /// start after a rebuild, and latched the journal.
+    #[cfg(unix)]
+    fn touch_change_time_only(path: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(path).unwrap().permissions().mode();
+        let start = change_time(path);
+        // Two real mode changes, ending where it started: each one is a ctime
+        // update POSIX guarantees, whatever the filesystem's view of a no-op.
+        // On a filesystem with coarse timestamps both can land in the tick
+        // the file was written in, so repeat until the clock has moved.
+        for _ in 0..2_000 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode ^ 0o040)).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+            if change_time(path) != start {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("the journal's change time did not move in four seconds");
+    }
+
+    #[cfg(unix)]
+    fn change_time(path: &Path) -> (i64, i64) {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = std::fs::metadata(path).unwrap();
+        (metadata.ctime(), metadata.ctime_nsec())
+    }
+
+    /// The two drift checks inside the append closure, exercised one hook at
+    /// a time: a change-time-only move between the precheck and the lock, and
+    /// one between the synced write and the commit read-back. Each is
+    /// accepted, the append lands, and nothing latches. With either check
+    /// reverted to plain equality this fails.
+    #[cfg(unix)]
+    #[test]
+    fn append_survives_a_change_time_only_move_inside_its_own_window() {
+        let (_dir, path, identity) = signed_fixture(2);
+        let running = AuditLog::open_signed(&path, identity.clone()).unwrap();
+        BEFORE_APPEND_OPEN_FOR_TEST.with(|hook| hook.set(Some(touch_change_time_only)));
+        running.append(record("before-open", 2)).unwrap();
+        assert!(running.mutation_degradation().is_none());
+        AFTER_APPEND_SYNC_FOR_TEST.with(|hook| hook.set(Some(touch_change_time_only)));
+        running.append(record("after-sync", 3)).unwrap();
+        assert!(running.mutation_degradation().is_none());
+        assert_eq!(running.sequence(), 4);
+        let restarted = AuditLog::open_signed(&path, identity).unwrap();
+        assert!(restarted.mutation_degradation().is_none());
+        assert_eq!(restarted.tail(10).unwrap().len(), 4);
+    }
+
+    /// An edit that lands while the lock-time drift is being re-verified is
+    /// in the file but not in the snapshot the acceptance was based on. The
+    /// append must fail closed rather than absorb it into the trusted
+    /// post-write snapshot.
+    #[cfg(unix)]
+    #[test]
+    fn append_rejects_an_edit_that_lands_behind_an_accepted_drift() {
+        fn append_a_foreign_line(path: &Path) {
+            OpenOptions::new()
+                .append(true)
+                .open(path)
+                .unwrap()
+                .write_all(b"{\"forged\":true}\n")
+                .unwrap();
+        }
+        let (_dir, path, identity) = signed_fixture(2);
+        let running = AuditLog::open_signed(&path, identity.clone()).unwrap();
+        BEFORE_APPEND_OPEN_FOR_TEST.with(|hook| hook.set(Some(touch_change_time_only)));
+        AFTER_DRIFT_REVERIFICATION_FOR_TEST.with(|hook| hook.set(Some(append_a_foreign_line)));
+        let error = running.append(record("raced", 2)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("journal changed while opening it for append"),
+            "{error}"
+        );
+        assert!(running.mutation_degradation().is_some());
+        assert_eq!(running.sequence(), 2, "nothing was trusted");
+        // The foreign line is what a restart finds, and it latches there too.
+        let restarted = AuditLog::open_signed(&path, identity).unwrap();
+        assert!(restarted.mutation_degradation().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_survives_a_change_time_only_update_during_verification() {
+        let (_dir, path, identity) = signed_fixture(2);
+        AFTER_OPEN_VERIFICATION_FOR_TEST.with(|hook| hook.set(Some(touch_change_time_only)));
+        let restarted = AuditLog::open_signed(&path, identity).unwrap();
+        assert!(restarted.mutation_degradation().is_none());
+        restarted.append(record("after-metadata", 2)).unwrap();
+        assert_eq!(restarted.tail(10).unwrap().len(), 3);
+    }
+
+    /// mtime can be put back by whoever edited the file; ctime cannot. An
+    /// in-place edit that keeps the length and restores mtime therefore looks
+    /// like a change-time-only move, and must still latch, which is why that
+    /// move is accepted only after the whole journal re-verifies.
+    #[cfg(unix)]
+    #[test]
+    fn runtime_snapshot_rejects_an_in_place_edit_behind_a_restored_mtime() {
+        let (_dir, path, identity) = signed_fixture(2);
+        let running = AuditLog::open_signed(&path, identity).unwrap();
+        let before = journal_snapshot(&path).unwrap().unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let edited = String::from_utf8(original.clone()).unwrap().replacen(
+            r#""value":1"#,
+            r#""value":2"#,
+            1,
+        );
+        assert_eq!(edited.len(), original.len());
+        assert_ne!(edited.as_bytes(), original.as_slice());
+        // The edit must land in a later ctime tick than the fixture write,
+        // or on a coarse-timestamp filesystem it presents as no change at
+        // all; rewriting the same bytes moves ctime each time.
+        let after = loop {
+            let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+            file.write_all(edited.as_bytes()).unwrap();
+            file.sync_all().unwrap();
+            file.set_modified(modified).unwrap();
+            drop(file);
+            let after = journal_snapshot(&path).unwrap().unwrap();
+            if after != before {
+                break after;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        assert!(
+            differs_only_in_change_time(&before, &after),
+            "the edit must present as a change-time-only move for this test to mean anything"
+        );
+        assert!(matches!(
+            running.append(record("blocked", 2)),
+            Err(AuditError::Degraded(_))
+        ));
+        assert_eq!(
+            running.mutation_degradation().as_deref(),
+            Some("journal changed since its last verified mutation")
+        );
     }
 
     #[test]
