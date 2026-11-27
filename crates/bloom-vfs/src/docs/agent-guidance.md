@@ -2,10 +2,12 @@
 
 Bloom holds this machine's wallets. You propose; the owner approves each
 action on a Broker browser page; Bloom signs and sends. Paths here are
-relative to this file's directory. Without a mount,
-`bloom vfs cat|ls|write <path>` reaches them (this file is `/AGENTS.md`).
+relative to this file's directory. Without a mount, `bloom vfs cat|ls <path>`
+and `bloom vfs write <path> '<body>'` (or the body on stdin) reach them (this
+file is `/AGENTS.md`).
 
-- `next.md`: this machine's wallets, with their paths, and what is pending.
+- `next.md`, also at the end of this file: this machine's wallets, with their
+  paths and balances, and what is pending.
 - `wallets/<wallet>/<n>/holdings.json`: balances of account `<n>`; the first
   is `0`.
 - `docs/`: for when a write is refused or fails; one short file per
@@ -25,13 +27,14 @@ send 0.25 ETH to 0x...
 {"kind":"call","contract":"0x...","method":"transfer(address,uint256)","args":["0x...","1"]}
 ```
 
-That stages it and asks the owner; their approval link is in the error, or
-on a mount in `latest/plan.md`. `latest/` is that entry, before and after it
-is sent: `latest/plan.md` is what will be signed, writing `y` to
-`latest/confirm` waits for the approval and sends (a mount refuses it until
-they approve), and then `latest/receipt.json` holds the result. `new.tx`
-takes the same body and only stages it; `cancel` written to `latest/confirm`
-discards an entry.
+That stages it, asks the owner, and answers with what will be signed and
+their approval link (on a mount the write is refused; both are in
+`latest/plan.md`). `latest/` is that entry, before and after it is sent:
+`latest/plan.md` is what will be signed, writing `y` to
+`latest/confirm` waits for the approval, sends, and answers with the receipt
+of each entry it sent and the account's balances on that chain (on a mount,
+read `latest/receipt.json`). `new.tx` takes the same body and only
+stages it; `cancel` written to `latest/confirm` discards an entry.
 
 Several bodies in one write, one per line, go under one approval, in order (an
 approve, then the call that spends it).

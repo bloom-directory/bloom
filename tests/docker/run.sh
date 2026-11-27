@@ -3,12 +3,15 @@
 # integration suite.
 #
 # Usage:
-#   ./tests/docker/run.sh [--rebuild] [--workspace|--mount|--fork|--mempool]
+#   ./tests/docker/run.sh [--rebuild] [--workspace|--mount|--owner-wait|--fork|--mempool]
 #
 # Modes:
 #   default       — runs tests/docker/test.sh (NFS mount integration test).
 #                   Container runs with SYS_ADMIN + apparmor=unconfined +
 #                   /dev/fuse so mount.nfs4 can do its thing.
+#   --owner-wait  — runs tests/docker/test_owner_wait.sh: a repeated
+#                   confirm waits for the owner through the kernel NFS
+#                   client. Same privileges as the default mode.
 #   --workspace   — runs tests/docker/test_workspace.sh (cargo test
 #                   --workspace --lib). Skips the privileged flags
 #                   because the workspace unit tests don't mount.
@@ -38,7 +41,7 @@ CARGO_CACHE_VOLUME=bloom-cargo-cache
 
 usage() {
     cat <<EOF
-Usage: $0 [--rebuild] [--workspace|--mount|--fork|--mempool]
+Usage: $0 [--rebuild] [--workspace|--mount|--owner-wait|--fork|--mempool]
 
 Default mode runs the NFS mount integration test.
 --workspace runs \`cargo test --workspace --lib\` inside the same image.
@@ -105,6 +108,7 @@ for arg in "$@"; do
         --rebuild) REBUILD=1 ;;
         --workspace) MODE=workspace ;;
         --mount) MODE=mount ;;
+        --owner-wait) MODE=owner-wait ;;
         --fork) MODE=fork ;;
         --mempool) MODE=mempool ;;
         -h|--help)
@@ -138,6 +142,10 @@ case "$MODE" in
         #                                 SYS_ADMIN; unconfined gets us past it
         run_args+=("${mount_privileges[@]}")
         cmd=(bash tests/docker/test.sh)
+        ;;
+    owner-wait)
+        run_args+=("${mount_privileges[@]}")
+        cmd=(bash tests/docker/test_owner_wait.sh)
         ;;
     workspace)
         # Workspace unit tests don't need any of the mount privileges.
