@@ -367,6 +367,9 @@ async fn staged_reply(vfs: &Vfs, path: &VfsPath, bytes: &[u8]) -> Result<Written
 }
 
 /// Each staged `chain:id` entry's `plan.md`, up to its confirm instructions.
+/// plan.md lines a staging reply leaves out; the agent never acts on them.
+const PLAN_DETAIL: [&str; 5] = ["Wallet:", "From:", "Nonce:", "Gas:", "Data:"];
+
 async fn staged_plans(vfs: &Vfs, path: &VfsPath, entries: &[String]) -> String {
     let [root, wallet, number, ..] = path.segments() else {
         return String::new();
@@ -380,7 +383,13 @@ async fn staged_plans(vfs: &Vfs, path: &VfsPath, entries: &[String]) -> String {
         if let Ok(raw) = vfs.read(&plan).await {
             let text = String::from_utf8_lossy(&raw);
             let shown = text.split("\n## Confirm").next().unwrap_or_default();
-            plans.push_str(shown.trim_end());
+            // The reply carries what the agent checks: target, action, value and policy.
+            // Signing details (sender, nonce, gas, calldata size) stay in plan.md.
+            let shown: Vec<&str> = shown
+                .lines()
+                .filter(|line| !PLAN_DETAIL.iter().any(|label| line.starts_with(label)))
+                .collect();
+            plans.push_str(shown.join("\n").trim_end());
             plans.push_str("\n\n");
         }
     }
@@ -1055,7 +1064,8 @@ mod tests {
                     br#"{"ceremony_url":"http://localhost/c/1"}"#.to_vec()
                 }
                 "/w/0/chains/base/outbox/pending/tx-1/plan.md" => {
-                    b"# Staged tx tx-1\n\nTo: 0xabc\n\n## Confirm\nWrite y\n".to_vec()
+                    // Signing details the reply leaves out (PLAN_DETAIL) around the line it keeps.
+                    b"# Staged tx tx-1\n\nFrom: 0xowner\nTo: 0xabc\nNonce: 1\nGas: limit=1\n\n## Confirm\nWrite y\n".to_vec()
                 }
                 other => return Err(HandlerError::not_found(other)),
             })
