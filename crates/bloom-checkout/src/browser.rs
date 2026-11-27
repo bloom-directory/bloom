@@ -468,9 +468,20 @@ impl Browser {
             .filter_map(|page| page["targetId"].as_str())
             .collect::<Vec<_>>();
         let (context, generation, journey) = (tab.context.clone(), tab.generation + 1, tab.journey);
-        *tab = match pages.as_slice() {
-            [page] => attach_tab(&self.cdp, context, (*page).to_owned(), generation).await?,
-            _ => new_tab(&self.cdp, Some(context), generation).await?,
+        let survivor = match pages.as_slice() {
+            [page] => {
+                match attach_tab(&self.cdp, context.clone(), (*page).to_owned(), generation).await {
+                    Ok(survivor) => Some(survivor),
+                    // The last page can close while attaching; open a blank one.
+                    Err(_) if !self.target_exists(page).await => None,
+                    Err(error) => return Err(error),
+                }
+            }
+            _ => None,
+        };
+        *tab = match survivor {
+            Some(survivor) => survivor,
+            None => new_tab(&self.cdp, Some(context), generation).await?,
         };
         tab.journey = journey;
         eprintln!("checkout recovered shopping after its page closed");

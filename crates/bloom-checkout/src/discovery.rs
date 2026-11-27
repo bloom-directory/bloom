@@ -309,8 +309,9 @@ pub(crate) enum Script<'a> {
 }
 
 impl Script<'_> {
-    fn expression(&self) -> Result<String> {
-        Ok(match self {
+    /// Zeroizing, because a fill expression carries a card value.
+    fn expression(&self) -> Result<zeroize::Zeroizing<String>> {
+        Ok(zeroize::Zeroizing::new(match self {
             Script::Facts { fixture } => crate::scripts::prepare(include_str!("facts.js"))
                 .replace("BLOOM_FIXTURE_TOTALS", &fixture.to_string()),
             Script::Fields => crate::scripts::prepare(include_str!("fields.js")),
@@ -329,7 +330,7 @@ impl Script<'_> {
                     encoded_value.as_str()
                 )
             }
-        })
+        }))
     }
 }
 
@@ -340,8 +341,7 @@ pub(crate) async fn run(
     world: i64,
     script: Script<'_>,
 ) -> Result<Value> {
-    // A fill expression carries a card value: wipe it after use.
-    let expression = zeroize::Zeroizing::new(script.expression()?);
+    let expression = script.expression()?;
     let response = tab
         .cdp
         .evaluate_in_world(session, world, &expression)

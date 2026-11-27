@@ -111,6 +111,8 @@ impl Store {
         ] {
             let _ = conn.execute(&format!("ALTER TABLE operations ADD COLUMN {column}"), []);
         }
+        // The restart migrations below commit together or not at all.
+        conn.execute_batch("BEGIN IMMEDIATE")?;
         // A lost recipient cannot be reconstructed. Interrupted disclosure is never retried.
         // Form errors can arrive after a pay click. Older versions incorrectly
         // converted them to not_submitted; neither state proves no charge.
@@ -124,6 +126,7 @@ impl Store {
         conn.execute("UPDATE operations SET state='restart_cancelling',status=json_set(status,'$.state','restart_cancelling','$.ceremony_url',NULL) WHERE state='awaiting_approval'",[])?;
         // This process owns a fresh browser; no earlier private view can pause it.
         conn.execute("UPDATE operations SET status=json_set(status,'$.paused',json('false')) WHERE json_extract(status,'$.paused')=1",[])?;
+        conn.execute_batch("COMMIT")?;
         Ok(Self(Mutex::new(conn)))
     }
     fn get(&self, id: &str) -> Result<Status> {
@@ -2008,12 +2011,15 @@ pub(crate) fn loggable(error: &anyhow::Error) -> String {
         if !out.is_empty() {
             out.push_str(": ");
         }
-        let mut quoted = None;
+        let (mut quoted, mut previous) = (None, ' ');
         for c in cause.to_string().chars() {
+            // A mid-word apostrophe, as in "can't", opens no quote.
+            let opens = matches!(c, '"' | '`') || (c == '\'' && !previous.is_alphanumeric());
+            previous = c;
             match quoted {
                 Some(q) if c == q => quoted = None,
                 Some(_) => {}
-                None if matches!(c, '"' | '`' | '\'') => {
+                None if opens => {
                     quoted = Some(c);
                     out.push_str("[...]");
                 }
@@ -2491,6 +2497,12 @@ mod tests {
         assert_eq!(
             loggable(&error),
             "Checkout browser command failed during Runtime.evaluate: invalid type: string [...], expected u64"
+        );
+        assert_eq!(
+            loggable(&anyhow::anyhow!(
+                "the tab's target can't attach: 'Ada' left"
+            )),
+            "the tab's target can't attach: [...] left"
         );
         assert!(loggable(&anyhow::anyhow!("{}", "x".repeat(500))).len() <= 300);
     }
