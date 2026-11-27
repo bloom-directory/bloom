@@ -185,8 +185,12 @@ pub enum HandlerError {
     NotAFile(String),
     #[error("permission denied")]
     PermissionDenied,
-    /// A permission denial that says why (a Petal's -2 with a message):
-    /// a mount still reads it as `Permission denied`, other callers get the reason.
+    /// A refusal that names its reason. A Petal route answers `-2` with its
+    /// own agent-facing prose — which approval is required, which policy
+    /// forbids the write, why the venue cannot be asked — and that reason is
+    /// what the caller needs next; a bare `PermissionDenied` hides it in the
+    /// Machine log. The text is logged, so like every error here it must
+    /// never carry a ceremony link.
     #[error("permission denied: {0}")]
     Denied(String),
     #[error("operation not permitted")]
@@ -451,6 +455,10 @@ mod tests {
         assert_eq!(
             HandlerError::PermissionDenied.to_string(),
             "permission denied"
+        );
+        assert_eq!(
+            HandlerError::Denied("CLAIM_INVALID: outside wallet policy".into()).to_string(),
+            "permission denied: CLAIM_INVALID: outside wallet policy"
         );
         assert_eq!(
             HandlerError::Invalid("y".into()).to_string(),

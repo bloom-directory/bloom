@@ -805,7 +805,7 @@ impl Handler for PetalRouter {
         if rest.is_empty() || Self::is_host_file(&rest) {
             return Err(HandlerError::PermissionDenied);
         }
-        // dispatch_error drops a -2 message, so keep the Petal's own reason.
+        // Record the Petal's own reason verbatim, whatever error it maps to.
         let mut reason = None;
         let result = match self
             .dispatch(mount, DispatchOp::Write, rest.clone(), data.to_vec())
@@ -985,6 +985,9 @@ fn validate_link_target(target: &str) -> Result<(), HandlerError> {
 fn dispatch_error(code: i32, message: String, path: String) -> HandlerError {
     match code {
         -1 => HandlerError::NotFound(if message.is_empty() { path } else { message }),
+        // A Petal's refusal says why — approval required, policy, a rate
+        // limit — and the caller acts on that, so the reason travels with the
+        // error instead of only into last_error.json and the Machine log.
         -2 if message.is_empty() => HandlerError::PermissionDenied,
         -2 => HandlerError::Denied(message),
         -3 => HandlerError::Invalid(message),
@@ -1035,6 +1038,33 @@ fn map_petal_err(e: PetalError) -> HandlerError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dispatch_error_keeps_a_petal_refusal_reason() {
+        // -2 with a reason is the Petal telling the caller what to do next:
+        // which approval is required, which policy forbids the write, or that
+        // the wallet is rate-limited. It must reach the caller, not only the
+        // Machine log and last_error.json.
+        match dispatch_error(-2, "approval required for usd_send".into(), "p".into()) {
+            HandlerError::Denied(reason) => assert_eq!(reason, "approval required for usd_send"),
+            other => panic!("expected Denied, got {other:?}"),
+        }
+        // A reasonless refusal stays the bare permission-denied the mount
+        // translates to EACCES.
+        assert!(matches!(
+            dispatch_error(-2, String::new(), "p".into()),
+            HandlerError::PermissionDenied
+        ));
+        assert_eq!(
+            dispatch_error(
+                -2,
+                "CLAIM_INVALID: outside wallet policy".into(),
+                "p".into()
+            )
+            .to_string(),
+            "permission denied: CLAIM_INVALID: outside wallet policy"
+        );
+    }
+
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
@@ -2021,9 +2051,13 @@ name = "example"
                 .unwrap()
         ));
 
-        // A -2 refusal reaches the mount as a bare EACCES; its reason must survive.
+        // A -2 refusal reaches the mount as EACCES and the IPC caller as
+        // "permission denied: <reason>"; the reason also survives in last_error.
         let error = vfs.write(&failing, b"payload").await.unwrap_err();
-        assert!(matches!(error, HandlerError::Denied(_)), "{error}");
+        assert!(
+            matches!(&error, HandlerError::Denied(reason) if reason == crate::package::route_fixtures::DENY_REASON),
+            "{error}"
+        );
         let record: serde_json::Value =
             serde_json::from_slice(&vfs.read(&last_error).await.unwrap()).unwrap();
         assert_eq!(record["path"], "operations/alice/0/submit");
