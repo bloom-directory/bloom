@@ -382,9 +382,81 @@ pub fn parse(input: &str) -> Result<RawIntent, ParseError> {
     if s.starts_with("nft ") {
         return parse_nft_shell(s);
     }
+    // Reject a multi-line write that mixes a non-intent header/description line
+    // with JSON or `send` bodies, rather than failing with a confusing TOML error.
+    let non_empty: Vec<&str> = s.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let opens = |line: &&str| line.starts_with("send ") || line.starts_with('{');
+    if non_empty.len() > 1
+        && non_empty.iter().any(opens)
+        && let Some(idx) = non_empty.iter().position(|line| !opens(line))
+    {
+        return Err(ParseError::Invalid(format!(
+            "line {} is not a transaction body; write one JSON object or 'send ...' per line with no header or comment lines",
+            idx + 1
+        )));
+    }
+    if !s.contains('=') {
+        return Err(ParseError::Invalid(format!(
+            "unrecognized intent; expected {SHAPES}"
+        )));
+    }
     // Try TOML.
     let loose: LooseIntent = toml::from_str(s)?;
     loose.into_raw()
+}
+
+/// Reject a multi-line batch that mixes a `send ...` shell line and a JSON
+/// `send` object for the exact same transfer (e.g. an agent writing both forms
+/// for one transaction instead of choosing one).
+pub fn check_batch(bodies: &[&str], parsed: &[RawIntent]) -> Result<(), ParseError> {
+    if bodies.len() <= 1 || bodies.len() != parsed.len() {
+        return Ok(());
+    }
+    let same_send = |a: &RawIntentBody, b: &RawIntentBody| -> bool {
+        match (a, b) {
+            (
+                RawIntentBody::Send {
+                    to: to_a,
+                    value: val_a,
+                    token: tok_a,
+                    amount: amt_a,
+                    data: data_a,
+                },
+                RawIntentBody::Send {
+                    to: to_b,
+                    value: val_b,
+                    token: tok_b,
+                    amount: amt_b,
+                    data: data_b,
+                },
+            ) => {
+                to_a.trim().eq_ignore_ascii_case(to_b.trim())
+                    && tok_a.as_deref().map(|t| t.trim().to_ascii_lowercase())
+                        == tok_b.as_deref().map(|t| t.trim().to_ascii_lowercase())
+                    && amt_a.trim() == amt_b.trim()
+                    && val_a.trim().eq_ignore_ascii_case(val_b.trim())
+                    && data_a == data_b
+            }
+            _ => false,
+        }
+    };
+    for i in 0..bodies.len() {
+        let a_shell = bodies[i].trim_start().starts_with("send ");
+        let a_json = bodies[i].trim_start().starts_with('{');
+        for j in (i + 1)..bodies.len() {
+            let b_shell = bodies[j].trim_start().starts_with("send ");
+            let b_json = bodies[j].trim_start().starts_with('{');
+            if ((a_shell && b_json) || (a_json && b_shell))
+                && same_send(&parsed[i].body, &parsed[j].body)
+            {
+                return Err(ParseError::Invalid(
+                    "duplicate send in one write (both 'send ...' and JSON forms for the same transfer); write only one form per transaction"
+                        .into(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Parse the shell-style NFT intents:
@@ -896,5 +968,46 @@ usd_value_hint = "42.5""#,
     fn shell_send_has_no_usd_value_hint() {
         let r = parse("send 1 eth to 0xabc on base").unwrap();
         assert!(r.usd_value_hint.is_none());
+    }
+
+    #[test]
+    fn header_line_above_json_reports_invalid_not_toml() {
+        let input = "repay all Aave USDC debt\n{\"kind\":\"approve\",\"token\":\"0xUSDC\",\"spender\":\"0xPool\",\"amount\":\"100\"}";
+        let err = parse(input).unwrap_err();
+        assert!(matches!(err, ParseError::Invalid(_)), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("line 1 is not a transaction body"), "{msg}");
+        assert!(!msg.contains("toml"), "{msg}");
+    }
+
+    #[test]
+    fn plain_text_without_equals_reports_invalid_not_toml() {
+        let err = parse("repay all Aave USDC debt").unwrap_err();
+        assert!(matches!(err, ParseError::Invalid(_)), "{err}");
+        assert!(!err.to_string().contains("toml"), "{err}");
+    }
+
+    #[test]
+    fn batch_rejects_duplicate_shell_and_json_send() {
+        let input = "send 1000 USDC to 0x70997970C51812dc3A010C7d01b50e0d17dc79C8\n{\"kind\":\"send\",\"to\":\"0x70997970c51812dc3a010c7d01b50e0d17dc79c8\",\"token\":\"usdc\",\"amount\":\"1000\"}";
+        let parts = bodies(input);
+        assert_eq!(parts.len(), 2);
+        let parsed: Vec<RawIntent> = parts.iter().map(|b| parse(b).unwrap()).collect();
+        let err = check_batch(&parts, &parsed).unwrap_err();
+        assert!(matches!(err, ParseError::Invalid(_)), "{err}");
+        assert!(err.to_string().contains("duplicate send"), "{err}");
+    }
+
+    #[test]
+    fn batch_allows_distinct_sends_and_approve_plus_call() {
+        let input = "send 100 USDC to 0x1111111111111111111111111111111111111111\n{\"kind\":\"send\",\"to\":\"0x2222222222222222222222222222222222222222\",\"token\":\"USDC\",\"amount\":\"100\"}";
+        let parts = bodies(input);
+        let parsed: Vec<RawIntent> = parts.iter().map(|b| parse(b).unwrap()).collect();
+        check_batch(&parts, &parsed).unwrap();
+
+        let defi = "{\"kind\":\"approve\",\"token\":\"0xUSDC\",\"spender\":\"0xPool\",\"amount\":\"100\"}\n{\"kind\":\"call\",\"contract\":\"0xPool\",\"method\":\"supply(address,uint256)\",\"args\":[\"0xUSDC\",\"100\"]}";
+        let parts = bodies(defi);
+        let parsed: Vec<RawIntent> = parts.iter().map(|b| parse(b).unwrap()).collect();
+        check_batch(&parts, &parsed).unwrap();
     }
 }

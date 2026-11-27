@@ -1315,14 +1315,20 @@ impl WalletsHandler {
                 bodies.len()
             )));
         }
-        for (n, body) in bodies.iter().enumerate().filter(|_| bodies.len() > 1) {
-            bloom_tx::intent_parser::parse(body).map_err(|e| {
-                HandlerError::invalid(format!(
-                    "line {} of {}: {e}; nothing was staged",
-                    n + 1,
-                    bodies.len()
-                ))
-            })?;
+        if bodies.len() > 1 {
+            let mut parsed = Vec::with_capacity(bodies.len());
+            for (n, body) in bodies.iter().enumerate() {
+                let intent = bloom_tx::intent_parser::parse(body).map_err(|e| {
+                    HandlerError::invalid(format!(
+                        "line {} of {}: {e}; nothing was staged",
+                        n + 1,
+                        bodies.len()
+                    ))
+                })?;
+                parsed.push(intent);
+            }
+            bloom_tx::intent_parser::check_batch(&bodies, &parsed)
+                .map_err(|e| HandlerError::invalid(format!("{e}; nothing was staged")))?;
         }
         for (n, body) in bodies.iter().enumerate() {
             match self.stage_from(wallet, chain, from, policy, body).await {
