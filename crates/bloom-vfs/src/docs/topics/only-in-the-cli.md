@@ -5,7 +5,7 @@ purpose: each removes something, rebinds who controls a wallet, or changes
 what code this machine runs.
 
 - `bloom wallet delete`, `bloom wallet account-retire`
-- `bloom wallet rebind-passkey`, `bloom wallet migrate-passkey`
+- `bloom wallet rebind-passkey`
 - `bloom petals install`, `uninstall`, `build`
 - `bloom audit reconcile`
 - `bloom deploy` from a Foundry or Hardhat project. Bytecode you already

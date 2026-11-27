@@ -19,13 +19,6 @@ pub enum EndpointScheme {
     Ws,
 }
 
-impl EndpointScheme {
-    /// True if this scheme can carry an `eth_subscribe`.
-    pub const fn supports_pubsub(self) -> bool {
-        matches!(self, Self::Ws)
-    }
-}
-
 /// Parse `spec.url` into a validated `(Url, scheme)` pair.
 ///
 /// Returns `BloomRpcError::InvalidUrl` for unparseable strings and for

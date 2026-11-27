@@ -16,8 +16,8 @@ This committed file is the source of truth for
 the Broker and Signer revisions: candidate builds require the supplied
 checkouts to match its exact pins and never rewrite them.
 
-`build-bundle.sh` accepts the three service binaries, the bounded
-`bloom-signer-migrate` staging tool, and an ephemeral candidate key. It verifies semantic versions, scans every
+`build-bundle.sh` accepts the three service binaries and an ephemeral
+candidate key. It verifies semantic versions, scans every
 staged and generated bundle file for release-blocking markers, records all
 three Git revisions, embeds both platform installers, signs the internal
 payload manifest for post-elevation verification, normalizes metadata, and
@@ -296,16 +296,8 @@ entries fail preflight, and legacy cleanup runs only after authenticated health
 has committed; users may need `hash -r`, `rehash`, or a new terminal to clear a
 cached command location.
 
-The legacy command migration does not remove old wallet data. If the resolved
-login home contains `~/.bloom/keystore`, the installer prints that exact
-location and a principal-bound two-command conversion for each detected v1
-passkey wallet. The first command runs the packaged `bloom-signer-migrate` as
-an administrator because it must read the Signer-owned configuration, stage
-data in Signer's private state, and set the isolated Signer ownership. The
-second `/usr/local/bin/bloom wallet migrate-passkey RECEIPT` command runs as
-the login user and opens the normal Broker ceremony. Unsupported legacy wallet
-kinds are identified but never modified; the staging tool supports only the
-single v1 passkey format.
+Legacy v1 wallets in `~/.bloom/keystore` are not supported; the installer
+reports that location and never modifies it.
 
 `uninstall --retain-custody` removes runtime integration while preserving the
 exact service principals, private configuration, and custody state. `restore`

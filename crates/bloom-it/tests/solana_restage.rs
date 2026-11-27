@@ -18,248 +18,17 @@
 //! in-process fixture. The Daemon, VFS, wallet handler, Solana engine,
 //! reconciler, and validator are real.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+mod common;
+
+use std::sync::atomic::Ordering;
 
 use anyhow::{Result, anyhow};
-use bloom_broker_api::*;
-use bloom_daemon::Daemon;
-use bloom_machine_client::MachineBrokerClient;
-use bloom_proto::{Config, EndpointSpec, HomeDir, HomeWritePermit, SolanaSpec};
 use bloom_vfs::VfsPath;
 use bloom_vfs::handler::Handler;
+use common::*;
 use sha2::{Digest as _, Sha256};
 
-const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon \
-abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \
-abandon abandon art";
-const RPC: &str = "http://127.0.0.1:8899";
 const LAMPORTS: u64 = 250_000_000;
-
-fn tok(s: &str) -> Token {
-    Token::new(s.to_owned()).unwrap()
-}
-fn dig(b: u8) -> Digest32 {
-    Digest32::from_bytes([b; 32])
-}
-/// Canonical Ed25519 SubjectPublicKeyInfo DER: the fixed 12-byte prefix
-/// followed by the raw 32-byte key. Matches what the real Signer publishes.
-fn spki(pubkey: &[u8; 32]) -> Vec<u8> {
-    let mut out = vec![
-        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
-    ];
-    out.extend_from_slice(pubkey);
-    out
-}
-
-// ---------------------------------------------------------------- broker ---
-
-struct SolanaBroker {
-    signing_key: ed25519_dalek::SigningKey,
-    pubkey: [u8; 32],
-    key_ref: KeyRef,
-    approval_active: AtomicBool,
-    sign_calls: parking_lot::Mutex<Vec<Vec<u8>>>,
-}
-
-impl SolanaBroker {
-    fn policy(&self, wallet_id: Token) -> SignedPolicySnapshot {
-        let canonical = serde_json::to_vec(&CanonicalWalletPolicy {
-            clear_signing: None,
-            wallet_id: wallet_id.clone(),
-            maximum_approval_lifetime_ms: 3_600_000,
-            allowed_petal_packages: Vec::new(),
-            allowed_destinations: Vec::new(),
-            required_verifiers: Vec::new(),
-        })
-        .unwrap();
-        SignedPolicySnapshot {
-            wallet_id,
-            version: DecimalU64::new(1),
-            canonical_policy: Base64UrlBytes::from_bytes(&canonical),
-            policy_digest: Digest32::from_bytes(Sha256::digest(&canonical).into()),
-            policy_signing_key_id: tok("e2e-policy-key"),
-            policy_verifying_key: Base64UrlBytes::from_bytes(&[12; 32]),
-            signer_signature: Base64UrlBytes::from_bytes(&[13; 64]),
-        }
-    }
-
-    fn wallet_public(&self, wallet_id: Token) -> WalletPublic {
-        let p = self.policy(wallet_id.clone());
-        WalletPublic {
-            wallet_id,
-            wallet_kind: tok("local"),
-            root_key_ref: None,
-            key_refs: vec![self.key_ref.clone()],
-            policy_version: DecimalU64::new(1),
-            policy_digest: p.policy_digest,
-            wallet_revocation_epoch: DecimalU64::new(0),
-        }
-    }
-
-    fn key_public(&self) -> KeyPublic {
-        KeyPublic {
-            key_ref: self.key_ref.clone(),
-            role: KeyRole::Derived,
-            canonical_public_key: Base64UrlBytes::from_bytes(&spki(&self.pubkey)),
-            addresses: vec![bs58::encode(self.pubkey).into_string()],
-            supported_crypto_suites: vec![CryptoSuite::Ed25519Message],
-        }
-    }
-
-    fn accounts(&self, wallet_id: Token) -> WalletAccountsPublic {
-        let address = bs58::encode(self.pubkey).into_string();
-        WalletAccountsPublic {
-            wallet_id,
-            seed_profile: WalletSeedProfile::Bip39MulticurveV1,
-            accounts: vec![DerivedAccountPublic {
-                key_ref: self.key_ref.clone(),
-                wallet_seed_profile: WalletSeedProfile::Bip39MulticurveV1,
-                derivation_profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
-                path: "m/44'/501'/0'/0'".into(),
-                canonical_public_key: Base64UrlBytes::from_bytes(&spki(&self.pubkey)),
-                public_key_encoding: PublicKeyEncoding::Ed25519SpkiDer,
-                public_key_fingerprint: Digest32::from_bytes(
-                    Sha256::digest(spki(&self.pubkey)).into(),
-                ),
-                supported_crypto_suites: vec![CryptoSuite::Ed25519Message],
-                chain_projections: vec![ChainAccountProjection {
-                    chain_family: tok("solana"),
-                    caip2: "solana:local".into(),
-                    caip10: format!("solana:local:{address}"),
-                    address,
-                    address_encoding: AddressEncoding::Base58,
-                }],
-                lifecycle: AccountLifecycleState::Active,
-            }],
-        }
-    }
-}
-
-impl MachineBrokerService for SolanaBroker {
-    fn dispatch<'a>(
-        &'a self,
-        request: MachineBrokerRequest,
-    ) -> ServiceFuture<'a, MachineBrokerResponse> {
-        Box::pin(async move {
-            match request {
-                MachineBrokerRequest::WalletListPublic(_) => {
-                    Ok(MachineBrokerResponse::WalletListPublic(vec![
-                        self.wallet_public(tok("alice")),
-                    ]))
-                }
-                MachineBrokerRequest::WalletGetPublic(r) => Ok(
-                    MachineBrokerResponse::WalletGetPublic(self.wallet_public(r.wallet_id)),
-                ),
-                MachineBrokerRequest::WalletAccounts(WalletRequest { wallet_id }) => Ok(
-                    MachineBrokerResponse::WalletAccounts(self.accounts(wallet_id)),
-                ),
-                MachineBrokerRequest::KeyListPublic(_) => {
-                    Ok(MachineBrokerResponse::KeyListPublic(vec![
-                        self.key_public(),
-                    ]))
-                }
-                MachineBrokerRequest::KeyGetPublic(_) => {
-                    Ok(MachineBrokerResponse::KeyGetPublic(self.key_public()))
-                }
-                MachineBrokerRequest::CredentialListPublic(_) => {
-                    Ok(MachineBrokerResponse::CredentialListPublic(Vec::<
-                        CredentialPublic,
-                    >::new(
-                    )))
-                }
-                MachineBrokerRequest::PolicyRead(WalletRequest { wallet_id }) => {
-                    Ok(MachineBrokerResponse::PolicyRead(self.policy(wallet_id)))
-                }
-                MachineBrokerRequest::SealedApprovalPrepare(r) => Ok(
-                    MachineBrokerResponse::SealedApprovalPrepare(SealedApprovalPrepareResponse {
-                        approval_id: r.terms.approval_id()?,
-                        state: ApprovalPrepareState::AwaitingCeremony,
-                        ceremony_url: "http://localhost:18734/ceremony/e2e".into(),
-                        ceremony_expires_at_ms: r.terms.expires_at_ms,
-                        review_manifest_digest: dig(8),
-                    }),
-                ),
-                MachineBrokerRequest::SealedApprovalStatus(r) => {
-                    let active = self.approval_active.load(Ordering::SeqCst);
-                    Ok(MachineBrokerResponse::SealedApprovalStatus(
-                        ApprovalPublicStatus {
-                            approval_id: r.id,
-                            wallet_id: tok("alice"),
-                            state: if active {
-                                ApprovalLifecycleState::Active
-                            } else {
-                                ApprovalLifecycleState::AwaitingCeremony
-                            },
-                            effective_claim_assurance: None,
-                            ceremony_url: (!active)
-                                .then(|| "http://localhost:18734/ceremony/e2e".into()),
-                            ceremony_expires_at_ms: (!active).then(|| DecimalU64::new(u64::MAX)),
-                        },
-                    ))
-                }
-                MachineBrokerRequest::SigningSign(r) => {
-                    let SigningPayloads::Single { payload } = &r.payloads else {
-                        return Err(ProtocolError::new(
-                            ProtocolErrorCode::MalformedFrame,
-                            "expected a single payload",
-                        ));
-                    };
-                    let bytes = payload.decode();
-                    self.sign_calls.lock().push(bytes.clone());
-                    use ed25519_dalek::Signer as _;
-                    let sig = self.signing_key.sign(&bytes);
-                    Ok(MachineBrokerResponse::SigningSign(SigningResult {
-                        operation_id: r.operation_id,
-                        operation_digest: r.operation_digest,
-                        signatures: vec![NormalizedSignature {
-                            crypto_suite: CryptoSuite::Ed25519Message,
-                            bytes: Base64UrlBytes::from_bytes(&sig.to_bytes()),
-                        }],
-                        signer_receipt_digest: dig(9),
-                        broker_receipt_digest: dig(10),
-                    }))
-                }
-                other => Err(ProtocolError::new(
-                    ProtocolErrorCode::UnknownMethod,
-                    format!("unhandled {other:?}"),
-                )),
-            }
-        })
-    }
-}
-
-// ------------------------------------------------------------------- rpc ---
-
-/// `reqwest::blocking` builds and drops its own runtime, which panics if that
-/// happens inside an async context — so run it on a tokio-naive OS thread.
-fn rpc(method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
-    let method = method.to_string();
-    std::thread::spawn(move || -> Result<serde_json::Value> {
-        let body = serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":params});
-        let resp: serde_json::Value = reqwest::blocking::Client::new()
-            .post(RPC)
-            .json(&body)
-            .send()?
-            .json()?;
-        Ok(resp)
-    })
-    .join()
-    .map_err(|_| anyhow!("rpc thread panicked"))?
-}
-
-fn step(n: &str, msg: &str) {
-    println!("\n=== {n} :: {msg}");
-}
-
-async fn read_json(daemon: &Daemon, path: &str) -> Result<serde_json::Value> {
-    let bytes = daemon
-        .vfs
-        .read(&VfsPath::parse(path).unwrap())
-        .await
-        .map_err(|e| anyhow!("read {path}: {e}"))?;
-    Ok(serde_json::from_slice(&bytes)?)
-}
 
 fn block_height() -> Result<u64> {
     rpc("getBlockHeight", serde_json::json!([]))?["result"]
@@ -283,147 +52,34 @@ fn unique_destination() -> [u8; 32] {
     hasher.finalize().into()
 }
 
-// ------------------------------------------------------------------ main ---
-
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn solana_expired_blockhash_fails_closed_then_restages() -> Result<()> {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,bloom_daemon=debug")),
-        )
-        .try_init();
+    init_tracing();
 
-    // 1. Derive the Solana child from the mnemonic through the production
-    //    derivation crate — not a hardcoded fixture key.
     step("1", "derive the Solana account from the BIP-39 mnemonic");
-    let seed =
-        bloom_signer_derive::seed_from_mnemonic(MNEMONIC).map_err(|e| anyhow!("seed: {e}"))?;
-    let seed64: [u8; 64] = (*seed).as_slice().try_into().unwrap();
-    let derived = bloom_signer_derive::derive_solana_account(&seed64, 0)
-        .map_err(|e| anyhow!("derive: {e}"))?;
-    let pubkey = derived.public_key;
-    let address = bs58::encode(pubkey).into_string();
-    println!("    path        {}", derived.path);
+    let child = Child::derive(&seed()?, 0)?;
+    let address = child.address.clone();
+    println!("    path        {}", child.path);
     println!("    address     {address}");
-    let signing_key = ed25519_dalek::SigningKey::from_bytes(&derived.private_key);
-    assert_eq!(signing_key.verifying_key().to_bytes(), pubkey);
 
     // 2. Real daemon over a temp home, wired to the local validator.
     step("2", "build a real Daemon with the Solana chain configured");
-    let broker = Arc::new(SolanaBroker {
-        signing_key,
-        pubkey,
-        key_ref: KeyRef {
-            backend: tok("local"),
-            backend_instance: tok("e2e"),
-            locator: "wallet/derived/solana-0".into(),
-            key_spec: KeySpec::Ed25519,
-            public_key_fingerprint: Digest32::from_bytes(Sha256::digest(spki(&pubkey)).into()),
-            derivation: Some(DerivationRef::Bip39Multicurve {
-                wallet_seed_ref: tok("wallet-seed"),
-                profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
-                path: derived.path.clone(),
-            }),
-        },
-        approval_active: AtomicBool::new(false),
-        sign_calls: parking_lot::Mutex::new(Vec::new()),
-    });
-
-    let genesis = rpc("getGenesisHash", serde_json::json!([]))?["result"]
-        .as_str()
-        .ok_or_else(|| anyhow!("validator did not answer getGenesisHash"))?
-        .to_string();
-    println!("    local validator genesis = {genesis}");
-
-    let tmp = tempfile::tempdir()?;
-    let mut cfg = Config::local_default();
-    cfg.solana_chains.insert(
-        "solana-local".to_string(),
-        SolanaSpec {
-            name: "solana-local".into(),
-            endpoints: vec![EndpointSpec {
-                url: RPC.into(),
-                weight: 100,
-                cu_per_sec: None,
-                max_rps: None,
-                http_only: false,
-            }],
-            expected_genesis_base58: Some(genesis.clone()),
-        },
-    );
-    cfg.save(&tmp.path().join("config.toml"))
-        .map_err(|e| anyhow!("save config: {e}"))?;
-
-    let home = HomeDir::at(tmp.path());
-    let permit = Arc::new(HomeWritePermit::acquire(&home)?);
-    let record = |action: &str, op: &str, chain: &str| ProvenanceRecord {
-        subject: ProvenanceSubject::System {
-            component_id: tok("bloom-machine"),
-            operation_class: tok(action),
-        },
-        publisher: tok("bloom-installer"),
-        petal_lineage: None,
-        operation_classes: vec![ProvenanceOperationClass {
-            operation_class: tok(op),
-            fee_asset: Some(ProvenanceFeeAsset {
-                chain: tok(chain),
-                asset: "native".into(),
-            }),
-        }],
-        installer_key_id: tok("installer-key"),
-        installer_signature: Base64UrlBytes::from_bytes(&[11; 64]),
-    };
-    let catalog = ProvenanceCatalog {
-        schema: PROVENANCE_CATALOG_SCHEMA.into(),
-        records: vec![
-            record("system.readiness", "system.readiness", "ethereum"),
-            record("transaction.confirm", "transaction.confirm", "ethereum"),
-            record(
-                "solana.transfer.confirm",
-                "solana.native-transfer",
-                "solana",
-            ),
-        ],
-    };
-    let service: Arc<dyn MachineBrokerService> = broker.clone();
-    let daemon = Daemon::from_home_with_permit_and_broker(
-        home,
-        permit,
-        MachineBrokerClient::new(service),
-        catalog,
-    )
-    .map_err(|e| anyhow!("daemon: {e}"))?;
+    let broker = SolanaBroker::new(vec![child]);
+    let tmp = solana_home()?;
+    let daemon = daemon_at(tmp.path(), broker.clone(), catalog(&[]))?;
     println!("    daemon constructed; solana-local admitted by the genesis guard");
 
     // 3. Fund the derived child and record its starting balance.
     step("3", "airdrop to the mnemonic-derived fee payer");
-    rpc(
-        "requestAirdrop",
-        serde_json::json!([address, 2_000_000_000u64]),
-    )?;
-    for _ in 0..40 {
-        let bal = rpc("getBalance", serde_json::json!([address]))?["result"]["value"]
-            .as_u64()
-            .unwrap_or(0);
-        if bal >= 2_000_000_000 {
-            println!("    funded: {bal} lamports");
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
-    let payer_before = rpc("getBalance", serde_json::json!([address]))?["result"]["value"]
-        .as_u64()
-        .unwrap_or(0);
+    airdrop(&address, 2_000_000_000).await?;
+    let payer_before = balance(&address)?;
     println!("    fee payer balance before = {payer_before} lamports");
 
     // 4. A unique, non-fixed destination — idempotent on a reused ledger.
     let destination_bytes = unique_destination();
     let destination = bs58::encode(destination_bytes).into_string();
-    let dest_before = rpc("getBalance", serde_json::json!([destination]))?["result"]["value"]
-        .as_u64()
-        .unwrap_or(0);
+    let dest_before = balance(&destination)?;
     println!("    unique destination {destination} balance before = {dest_before} lamports");
     assert_eq!(
         dest_before, 0,
@@ -520,9 +176,7 @@ async fn solana_expired_blockhash_fails_closed_then_restages() -> Result<()> {
         !sent.iter().any(|e| e.name == t1_id),
         "an expired T1 must never appear in sent/"
     );
-    let dest_mid = rpc("getBalance", serde_json::json!([destination]))?["result"]["value"]
-        .as_u64()
-        .unwrap_or(0);
+    let dest_mid = balance(&destination)?;
     assert_eq!(
         dest_mid, 0,
         "no broadcast means the destination stays empty"
@@ -685,16 +339,12 @@ async fn solana_expired_blockhash_fails_closed_then_restages() -> Result<()> {
     // 12. Exactly one on-chain transfer landed: destination credited once,
     //     fee payer debited once (amount + T2 fee).
     step("12", "verify exactly one on-chain transfer");
-    let dest_after = rpc("getBalance", serde_json::json!([destination]))?["result"]["value"]
-        .as_u64()
-        .unwrap_or(0);
+    let dest_after = balance(&destination)?;
     assert_eq!(
         dest_after, LAMPORTS,
         "the destination must receive exactly the transfer amount, once"
     );
-    let payer_after = rpc("getBalance", serde_json::json!([address]))?["result"]["value"]
-        .as_u64()
-        .unwrap_or(0);
+    let payer_after = balance(&address)?;
     let debit = payer_before - payer_after;
     println!(
         "    destination {dest_after} lamports; fee payer debited {debit} (= {LAMPORTS} + fee {t2_fee})"

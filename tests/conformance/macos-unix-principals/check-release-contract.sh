@@ -11,7 +11,7 @@ release_dir="$main_root/packaging/triad/release"
 work="$(mktemp -d)"
 trap 'rm -rf -- "$work"' EXIT
 mkdir -p "$work/staging/bin"
-for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
+for binary in bloom bloom-broker bloom-signer; do
   cp "$payload/bin/$binary" "$work/staging/bin/$binary"
 done
 

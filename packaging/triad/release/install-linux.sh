@@ -585,7 +585,7 @@ install_linux_release() {
       echo "installed Linux release is unsafe" >&2
       return 65
     }
-    for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
+    for binary in bloom bloom-broker bloom-signer; do
       [[ -f "$release/$binary" && ! -L "$release/$binary" ]] && \
         cmp -s "$payload/bin/$binary" "$release/$binary" || {
           echo "installed Linux release does not match signed payload" >&2
@@ -596,7 +596,7 @@ install_linux_release() {
   fi
   stage="$release_base/.release.$$.new"
   mkdir "$stage"
-  for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
+  for binary in bloom bloom-broker bloom-signer; do
     install -m 0755 "$payload/bin/$binary" "$stage/$binary"
   done
   # Records the state versions this release's services migrate to, so a later
@@ -1486,7 +1486,6 @@ case "$action" in
       bin/bloom \
       bin/bloom-broker \
       bin/bloom-signer \
-      bin/bloom-signer-migrate \
       SHA256SUMS \
       installer/linux/config/edge-manifest.json.in \
       installer/linux/config/broker.json.in \

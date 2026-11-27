@@ -31,13 +31,7 @@ migration rules in this document are forward-looking release policy. The
 implementation may make a clean break from current formats, APIs, origins, and
 crate boundaries.
 
-One compatibility exception is normative: an explicitly staged Bloom v1
-single-passkey wallet may be converted once by Signer into the current WKEK
-format. Machine never reads the legacy wallet, Broker never receives its
-ciphertext or plaintext key, and Signer never signs from the legacy format.
-The existing passkey assertion and HPKE-protected PRF output authorize the
-conversion. This exception does not preserve any legacy approval, policy
-session, daemon signer, or runtime fallback.
+Legacy v1 wallets are not converted or supported.
 
 ### 1.1 What v1 authorization does and does not contain
 
@@ -1429,36 +1423,6 @@ Credential public keys, PRF salts, and wrapped WKEKs are Signer-owned durable
 state. PRF outputs, credential wrap keys, plaintext WKEK, root seed, and child
 private keys are never persisted or returned to Broker/Machine.
 
-#### 13.2.1 One-time v1 passkey conversion
-
-An administrator may stage the bounded v1 passkey envelope into a
-Signer-owned pending-import location. Staging validates ownership, regular-file
-type, size, the exact `PasskeyEncrypted v1` shape, the `localhost` ES256
-credential, and a canonical bundle digest. It emits a public receipt containing
-only operation identity, wallet name, address, public fingerprints, format,
-bundle digest, policy mode, and their exact terms digest.
-
-Machine may read that public receipt and call the existing
-`wallet.import_prepare` method with `ceremony_kind=wallet_import` and
-`expected_input_class=legacy_passkey_v1_prf`. No new RPC method is introduced.
-Broker renders the exact public migration review. The ceremony uses
-`navigator.credentials.get` for the staged credential and HPKE-encrypts its PRF
-output to Signer.
-
-Signer verifies the assertion and user verification before consuming the PRF,
-decrypts the v1 envelope using its historical BLAKE3/ChaCha20-Poly1305
-construction, and checks that the recovered secp256k1 key reproduces both
-staged public projections. It then immediately commits ordinary WKEK custody,
-the credential wrap, backend enrollment, restrictive current policy, public
-projection, operation result, and audit effect through the normal crash-safe
-custody commit. Temporary secrets are zeroized. The staged private record is
-consumed only after the durable result exists.
-
-The converted wallet has no legacy runtime mode. Exact retries return the
-durable result; changed receipts, bundles, operations, assertions, PRFs, or
-public identities fail closed. The original user-owned directory is not
-silently deleted and is ignored by production Machine.
-
 ### 13.3 Initial wallet registration
 
 Initial registration is a custody ceremony, not a Sealed Approval because no
@@ -2628,13 +2592,6 @@ ownership table in section 26.
   `UNSUPPORTED_VERSION` on every route, no shim synthesizes a preimage or a
   claim, and release scans prove no hash-only signing path exists in a
   production artifact.
-- **AC-36** The one-time v1 passkey-wallet conversion accepts only a staged,
-  digest-bound legacy bundle; requires a valid assertion from that bundle's
-  existing passkey and a matching PRF result encrypted end-to-end to Signer;
-  rejects a changed bundle, credential, PRF result, public key, or address;
-  commits the root only through current WKEK custody; and leaves no callable
-  legacy decrypt or signing backend in Machine, Broker, or Signer's normal
-  runtime surface.
 
 ## 28. Fixed decisions
 

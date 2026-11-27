@@ -394,6 +394,11 @@ pub fn pick_free_port() -> Result<u16> {
 /// Spawn anvil on a free port and wait until its stdout reports it is
 /// listening. Returns a guard that kills the child on drop.
 pub async fn spawn_anvil() -> Result<AnvilGuard> {
+    spawn_anvil_with(&[]).await
+}
+
+/// [`spawn_anvil`] with extra anvil arguments (e.g. `--no-mining`).
+pub async fn spawn_anvil_with(extra_args: &[&str]) -> Result<AnvilGuard> {
     let port = pick_free_port()?;
     let mut cmd = Command::new(anvil_bin());
     cmd.arg("--port")
@@ -403,6 +408,7 @@ pub async fn spawn_anvil() -> Result<AnvilGuard> {
         // Determinism: chain id 31337, default mnemonic.
         .arg("--chain-id")
         .arg("31337")
+        .args(extra_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);

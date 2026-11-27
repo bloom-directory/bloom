@@ -47,7 +47,6 @@ serde.workspace = true
 serde_json.workspace = true
 serde_jcs.workspace = true
 sha2.workspace = true
-toml.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 tokio.workspace = true

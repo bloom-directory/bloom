@@ -22,24 +22,19 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy::primitives::{Address, B256};
-use anyhow::{Context, Result, anyhow};
+mod reverter;
+
+use alloy::primitives::Address;
+use anyhow::Result;
 use async_trait::async_trait;
 use bloom_evm::ChainClient;
-use bloom_it::{FUNDER_PRIV_KEY, cast_send, spawn_anvil};
-use bloom_proto::ChainSpec;
+use bloom_it::{FUNDER_PRIV_KEY, spawn_anvil};
 use bloom_revert::{
     BuiltinDecoder, BytecodeSource, DecodeContext, DecodeSource, DecoderChain,
     HeimdallDecompileDecoder, boxed,
 };
+use reverter::*;
 use tokio::time::sleep;
-
-/// Same Reverter contract as `revert_decoding.rs`. We re-deploy it
-/// locally so the heimdall path actually has live bytecode to fetch.
-const REVERTER_BYTECODE: &str = "0x6080604052348015600e575f5ffd5b506102a28061001c5f395ff3fe608060405234801561000f575f5ffd5b506004361061003f575f3560e01c806376764977146100435780639af2e98214610061578063f89ecf4c1461006b575b5f5ffd5b61004b610075565b6040516100589190610123565b60405180910390f35b610069610092565b005b6100736100cd565b005b5f5f600190505f5f9050808261008b9190610169565b9250505090565b6040517f08c379a00000000000000000000000000000000000000000000000000000000081526004016100c4906101f3565b60405180910390fd5b602a6040517f1167d8fb0000000000000000000000000000000000000000000000000000000081526004016101029190610253565b60405180910390fd5b5f819050919050565b61011d8161010b565b82525050565b5f6020820190506101365f830184610114565b92915050565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52601260045260245ffd5b5f6101738261010b565b915061017e8361010b565b92508261018e5761018d61013c565b5b828204905092915050565b5f82825260208201905092915050565b7f626f6f6d000000000000000000000000000000000000000000000000000000005f82015250565b5f6101dd600483610199565b91506101e8826101a9565b602082019050919050565b5f6020820190508181035f83015261020a816101d1565b9050919050565b5f819050919050565b5f819050919050565b5f61023d61023861023384610211565b61021a565b61010b565b9050919050565b61024d81610223565b82525050565b5f6020820190506102665f830184610244565b9291505056fea26469706673582212205a030e5a0c4b57beea5bbeefe8fb9a089760752121d1f1a9bc5b7e3c55a52c2464736f6c634300081e0033";
-
-const SEL_CUSTOM: &str = "0xf89ecf4c"; // customRevert()
-const SEL_BOOM: [u8; 4] = [0x11, 0x67, 0xd8, 0xfb]; // Boom(uint256)
 
 /// BytecodeSource that pulls runtime code via the live ChainClient.
 /// The decoder asks for `(chain_id, addr)`; we ignore chain_id since
@@ -54,46 +49,6 @@ impl BytecodeSource for ClientBytecodeSource {
             _ => None,
         }
     }
-}
-
-async fn deploy(rpc_url: &str) -> Result<Address> {
-    let stdout = cast_send(rpc_url, &["--create", REVERTER_BYTECODE, "--json"]).await?;
-    let v: serde_json::Value = serde_json::from_str(stdout.trim())
-        .with_context(|| format!("parse cast output: {stdout}"))?;
-    let addr_hex = v
-        .get("contractAddress")
-        .and_then(|x| x.as_str())
-        .ok_or_else(|| anyhow!("no contractAddress in receipt: {stdout}"))?;
-    Ok(addr_hex.parse()?)
-}
-
-async fn send_revert(rpc_url: &str, to: Address, selector: &str) -> Result<B256> {
-    let to_str = format!("{to:#x}");
-    let stdout = cast_send(
-        rpc_url,
-        &[
-            "--legacy",
-            "--gas-limit",
-            "200000",
-            "--json",
-            &to_str,
-            selector,
-        ],
-    )
-    .await?;
-    let v: serde_json::Value = serde_json::from_str(stdout.trim())
-        .with_context(|| format!("parse cast output: {stdout}"))?;
-    let h = v
-        .get("transactionHash")
-        .and_then(|x| x.as_str())
-        .ok_or_else(|| anyhow!("no txHash: {stdout}"))?;
-    Ok(h.parse()?)
-}
-
-fn build_chain_client(rpc_url: &str) -> Result<ChainClient> {
-    let mut spec = ChainSpec::anvil_default();
-    spec.rpc_urls = vec![rpc_url.to_string()];
-    Ok(ChainClient::new(spec)?)
 }
 
 #[tokio::test(flavor = "multi_thread")]

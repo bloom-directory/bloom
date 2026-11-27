@@ -78,10 +78,6 @@ impl ValuationError {
 }
 
 impl ValuationQuote {
-    pub fn is_fresh_at(&self, now_ms: u64) -> bool {
-        now_ms.saturating_sub(self.fetched_at_ms) <= self.max_age_ms
-    }
-
     pub fn validate_for_authorization(
         &self,
         policy: &ValuationPolicy,
