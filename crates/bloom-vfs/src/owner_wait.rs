@@ -95,6 +95,9 @@ pub enum Written {
     Done,
     /// A confirm sent: one line per entry, from the receipts.
     Sent(String),
+    /// `new.tx` staged without asking the owner: what will be signed and
+    /// the next step. Nothing is signed or sent.
+    Staged(String),
     /// `send.tx` staged and is waiting for the owner. Nothing is signed.
     ApprovalPending {
         id: String,
@@ -131,6 +134,11 @@ pub async fn write(
         return Ok(Written::Done);
     }
     let Some(challenge) = confirm_challenge_path(path) else {
+        // `new.tx` only stages: answer with what will be signed and the
+        // next step, or the caller searches `latest/` for a link.
+        if report && path.segments().last().is_some_and(|leaf| leaf == "new.tx") {
+            return Ok(staged_reply(vfs, path, bytes).await?);
+        }
         return match vfs.write(path, bytes).await {
             // `outbox/send.tx` stages and asks the owner in one write:
             // answer as a first confirm does, with the link.
@@ -161,13 +169,17 @@ pub async fn write(
                     .map(|(_, id)| id.to_owned())
                     .or_else(|| challenge.rsplit('/').nth(1).map(str::to_owned))
                     .unwrap_or_default();
-                let entries: Vec<String> = url
+                let mut entries: Vec<String> = url
                     .as_ref()
                     .and_then(|doc| doc["entries"].as_array())
                     .into_iter()
                     .flatten()
                     .filter_map(|entry| entry.as_str().map(str::to_owned))
                     .collect();
+                // One entry's challenge lists no entries: it is this one.
+                if let ([.., chain, _, _], true) = (path.segments(), entries.is_empty()) {
+                    entries.push(format!("{chain}:{id}"));
+                }
                 let url = url.and_then(|doc| doc["ceremony_url"].as_str().map(str::to_owned));
                 // Staging is not a failure: answer with what will be signed,
                 // so the caller need not read each plan before confirming.
@@ -215,6 +227,11 @@ pub async fn write(
         None => vec![batch_ref.clone()],
     };
     let waiting_for = approval_id(vfs, &challenge).await;
+    let reports = report && matches!(bytes.trim_ascii(), b"y" | b"override");
+    let before = match (reports, batch_ref.split_once(':')) {
+        (true, Some((chain, _))) => holdings(vfs, path, chain).await,
+        _ => None,
+    };
     let written: Result<(), WriteError> = match vfs.write(path, bytes).await {
         // An entry asked for as part of a batch waits as its batch does,
         // retrying exactly that batch's entries: a batch another writer
@@ -247,12 +264,47 @@ pub async fn write(
         result => Ok(result?),
     };
     written?;
-    if !report || !matches!(bytes.trim_ascii(), b"y" | b"override") {
+    if !reports {
         return Ok(Written::Done);
     }
-    Ok(sent_report(vfs, path, &sending, report_by)
+    // Balances are shown for the confirmed entry's chain, the one `before`
+    // was read on, even when its batch spans chains.
+    let chain = batch_ref.split_once(':').map_or("", |(chain, _)| chain);
+    let before = before.unwrap_or_default();
+    Ok(sent_report(vfs, path, &sending, chain, before, report_by)
         .await
         .map_or(Written::Done, Written::Sent))
+}
+
+/// Write `new.tx` and reply with the entry it staged, up to its confirm
+/// instructions, and how to ask the owner. The entry's ID is captured with
+/// the write: `latest` is whatever was staged last, which another writer
+/// may change before the reply is built.
+async fn staged_reply(vfs: &Vfs, path: &VfsPath, bytes: &[u8]) -> Result<Written, HandlerError> {
+    let latest = match path.segments() {
+        [root, wallet, number, _, chain, ..] => VfsPath::parse(&format!(
+            "/{root}/{wallet}/{number}/chains/{chain}/outbox/latest"
+        ))
+        .ok()
+        .map(|latest| (chain, latest)),
+        _ => None,
+    };
+    let Some((chain, latest)) = latest else {
+        vfs.write(path, bytes).await?;
+        return Ok(Written::Done);
+    };
+    let staged = vfs.write_then_lookup(path, bytes, &latest).await?;
+    let Some(id) = staged
+        .link_target
+        .as_deref()
+        .and_then(|target| target.strip_prefix("pending/"))
+    else {
+        return Ok(Written::Done);
+    };
+    let plans = staged_plans(vfs, path, &[format!("{chain}:{id}")]).await;
+    Ok(Written::Staged(format!(
+        "{plans}Staged, not yet asked. Write y to pending/{id}/confirm: it answers with the owner's approval link."
+    )))
 }
 
 /// Each staged `chain:id` entry's `plan.md`, up to its confirm instructions.
@@ -284,6 +336,8 @@ async fn sent_report(
     vfs: &Vfs,
     path: &VfsPath,
     entries: &[String],
+    chain: &str,
+    before: Vec<Value>,
     deadline: tokio::time::Instant,
 ) -> Option<String> {
     let [root, wallet, number, ..] = path.segments() else {
@@ -314,34 +368,85 @@ async fn sent_report(
             },
         });
     }
-    // What the account holds now on that chain, so the caller need not check
-    // a swap's or supply's result with separate balance reads.
-    let chain = entries.first().and_then(|entry| entry.split_once(':'))?.0;
-    if let Ok(Some(balances)) =
-        tokio::time::timeout_at(deadline, balances(vfs, root, wallet, number, chain)).await
-    {
-        lines.push(format!("{chain} balances now: {balances}"));
+    // What the account holds now on that chain, and how each balance
+    // changed, so the caller need not check a swap's or supply's result
+    // with separate balance reads, nor mistake a balance for what it got.
+    if let Ok(Some(after)) = tokio::time::timeout_at(deadline, holdings(vfs, path, chain)).await {
+        let changed = changes(&before, &after);
+        // "(change)" only when a delta is shown, so a bare list is never
+        // read as amounts that moved.
+        let label = if changed.contains(" (") {
+            " (change)"
+        } else {
+            ""
+        };
+        if !changed.is_empty() {
+            lines.push(format!("{chain} balances now{label}: {changed}"));
+        }
     }
     Some(lines.join("\n"))
 }
 
-/// The account's balances on `chain` from its `holdings.json`, as one line.
-async fn balances(
-    vfs: &Vfs,
-    root: &str,
-    wallet: &str,
-    number: &str,
-    chain: &str,
-) -> Option<String> {
+/// The account's holdings on `chain`, from its `holdings.json`.
+async fn holdings(vfs: &Vfs, path: &VfsPath, chain: &str) -> Option<Vec<Value>> {
+    let [root, wallet, number, ..] = path.segments() else {
+        return None;
+    };
     let path = VfsPath::parse(&format!("/{root}/{wallet}/{number}/holdings.json")).ok()?;
     let holdings: Value = serde_json::from_slice(&vfs.read(&path).await.ok()?).ok()?;
-    let held: Vec<&str> = holdings["holdings"]
-        .as_array()?
+    Some(
+        holdings["holdings"]
+            .as_array()?
+            .iter()
+            .filter(|holding| holding["chain"] == chain)
+            .cloned()
+            .collect(),
+    )
+}
+
+/// Each holding as `display (+change)`, and a holding that is gone as
+/// `0 SYMBOL (-change)`. A holding without a change shows only its display.
+fn changes(before: &[Value], after: &[Value]) -> String {
+    use alloy::primitives::{I256, U256};
+    let raw = |h: &Value| h["raw"].as_str().and_then(|raw| raw.parse::<U256>().ok());
+    // A token is its contract: two ERC-20s may share a symbol. The native
+    // asset has no address, and there is one per chain.
+    let same = |a: &Value, b: &Value| a["asset"] == b["asset"] && a["address"] == b["address"];
+    let delta = |was: Option<U256>, now: Option<U256>, decimals: u8| {
+        let (was, now) = (was.unwrap_or_default(), now.unwrap_or_default());
+        let d = I256::from_raw(now).wrapping_sub(I256::from_raw(was));
+        (!d.is_zero()).then(|| {
+            let sign = if d.is_negative() { "-" } else { "+" };
+            format!(
+                " ({sign}{})",
+                bloom_proto::format_units(d.unsigned_abs(), decimals)
+            )
+        })
+    };
+    let decimals = |h: &Value| h["decimals"].as_u64().unwrap_or(0) as u8;
+    let mut shown: Vec<String> = after
         .iter()
-        .filter(|holding| holding["chain"] == chain)
-        .filter_map(|holding| holding["display"].as_str())
+        .filter_map(|now| {
+            let display = now["display"].as_str()?;
+            let was = before.iter().find(|was| same(was, now));
+            let change = match was {
+                Some(was) => delta(raw(was), raw(now), decimals(now)),
+                None if before.is_empty() => None,
+                None => delta(None, raw(now), decimals(now)),
+            };
+            Some(format!("{display}{}", change.unwrap_or_default()))
+        })
         .collect();
-    (!held.is_empty()).then(|| held.join(", "))
+    shown.extend(
+        before
+            .iter()
+            .filter(|was| !after.iter().any(|now| same(was, now)))
+            .filter_map(|was| {
+                let change = delta(raw(was), None, decimals(was))?;
+                Some(format!("0 {}{change}", was["symbol"].as_str()?))
+            }),
+    );
+    shown.join(", ")
 }
 
 /// The batch a `confirm-batch` file reports as waiting for the owner:
@@ -764,6 +869,32 @@ mod tests {
         assert_eq!(mounted.ok(), Some(Written::Done));
     }
 
+    /// A balance is shown with what the confirm changed, so a swap's output
+    /// is not mistaken for the whole balance; one spent to zero still shows.
+    #[test]
+    fn balances_show_what_the_confirm_changed() {
+        let h = |symbol: &str, decimals: u8, raw: &str, display: &str| serde_json::json!({"asset": symbol, "symbol": symbol, "decimals": decimals, "raw": raw, "display": display});
+        let before = [
+            h("ETH", 18, "2000000000000000000", "2 ETH"),
+            h("USDC", 6, "50000000000", "50000 USDC"),
+            h("WETH", 18, "1", "0.000000000000000001 WETH"),
+        ];
+        let after = [
+            h("ETH", 18, "1500000000000000000", "1.5 ETH"),
+            h("USDC", 6, "51144033300", "51144.0333 USDC"),
+            h("WETH", 18, "1", "0.000000000000000001 WETH"),
+            h("DAI", 18, "1000000000000000000", "1 DAI"),
+        ];
+        assert_eq!(
+            changes(&before, &after),
+            "1.5 ETH (-0.5), 51144.0333 USDC (+1144.0333), 0.000000000000000001 WETH, 1 DAI (+1)"
+        );
+        assert_eq!(
+            changes(&after[..2], &after[..1]),
+            "1.5 ETH, 0 USDC (-51144.0333)"
+        );
+    }
+
     /// Both entries were broadcast and neither is mined, so each receipt
     /// read would wait 5 s. The report ends at its deadline instead.
     struct Unmined;
@@ -793,7 +924,8 @@ mod tests {
         let path = VfsPath::parse("/wallets/w/0/chains/base/outbox/pending/tx-1/confirm").unwrap();
         let entries = ["base:tx-1".to_owned(), "base:tx-2".to_owned()];
         let started = tokio::time::Instant::now();
-        let report = sent_report(&vfs, &path, &entries, started + APPROVAL_POLL * 2)
+        let deadline = started + APPROVAL_POLL * 2;
+        let report = sent_report(&vfs, &path, &entries, "base", Vec::new(), deadline)
             .await
             .unwrap();
         assert!(
@@ -837,7 +969,9 @@ mod tests {
             VfsPath::parse("/wallets/w/0/chains/solana/outbox/pending/tx-1/confirm").unwrap();
         let entries = ["solana:tx-1".to_owned()];
         let deadline = tokio::time::Instant::now() + APPROVAL_POLL * 2;
-        let report = sent_report(&vfs, &path, &entries, deadline).await.unwrap();
+        let report = sent_report(&vfs, &path, &entries, "solana", Vec::new(), deadline)
+            .await
+            .unwrap();
         assert!(
             report.starts_with("tx-1: broadcast tx 5sig; receipt not recorded yet"),
             "{report}"
@@ -859,7 +993,7 @@ mod tests {
         async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
             Ok(match p.to_string_path().as_str() {
                 "/w/0/chains/base/outbox/pending/tx-1/approval_challenge.json" => {
-                    br#"{"ceremony_url":"http://localhost/c/1","entries":["base:tx-1"]}"#.to_vec()
+                    br#"{"ceremony_url":"http://localhost/c/1"}"#.to_vec()
                 }
                 "/w/0/chains/base/outbox/pending/tx-1/plan.md" => {
                     b"# Staged tx tx-1\n\nTo: 0xabc\n\n## Confirm\nWrite y\n".to_vec()
@@ -896,6 +1030,121 @@ mod tests {
         );
         let mounted = write(&vfs, &path, b"send 1 ETH to 0xabc", wait, &|| false, false).await;
         assert!(matches!(mounted, Err(WriteError::Approval(_))));
+    }
+
+    /// `new.tx` stages without asking; it answers with the plan and the
+    /// next step, so the caller does not search `latest/` for a link.
+    #[tokio::test]
+    async fn staging_only_answers_with_the_plan_and_the_next_step() {
+        struct Staged;
+        #[async_trait::async_trait]
+        impl Handler for Staged {
+            async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+                match p.to_string_path().as_str() {
+                    "/w/0/chains/base/outbox/latest" => {
+                        Ok(Entry::symlink("latest", "pending/tx-1"))
+                    }
+                    _ => Ok(Entry::file(p.segments().last().unwrap())),
+                }
+            }
+            async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+                match p.to_string_path().as_str() {
+                    "/w/0/chains/base/outbox/pending/tx-1/plan.md" => {
+                        Ok(b"# Staged tx tx-1\n\nTo: 0xabc\n\n## Confirm\nWrite y\n".to_vec())
+                    }
+                    other => Err(HandlerError::not_found(other)),
+                }
+            }
+            async fn write(&self, _p: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+                Ok(())
+            }
+        }
+        let vfs = Vfs::builder().mount("wallets", Arc::new(Staged)).build();
+        let path = VfsPath::parse("/wallets/w/0/chains/base/outbox/new.tx").unwrap();
+        let wait = Duration::from_secs(50);
+        let staged = write(&vfs, &path, b"send 1 ETH to 0xabc", wait, &|| false, true).await;
+        assert_eq!(
+            staged.ok(),
+            Some(Written::Staged(
+                "# Staged tx tx-1\n\nTo: 0xabc\n\nStaged, not yet asked. Write y to \
+                 pending/tx-1/confirm: it answers with the owner's approval link."
+                    .into()
+            ))
+        );
+        let mounted = write(&vfs, &path, b"send 1 ETH to 0xabc", wait, &|| false, false).await;
+        assert_eq!(mounted.ok(), Some(Written::Done));
+    }
+
+    /// Each `new.tx` write stages `tx-<n>` and moves `latest` to it. The
+    /// first read after the first write waits until `resume`.
+    #[derive(Default)]
+    struct Restaged {
+        staged: AtomicUsize,
+        paused: std::sync::atomic::AtomicBool,
+        reading: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl Handler for Restaged {
+        async fn lookup(&self, _p: &VfsPath) -> Result<Entry, HandlerError> {
+            let latest = format!("pending/tx-{}", self.staged.load(Ordering::SeqCst));
+            Ok(Entry::symlink("latest", &latest))
+        }
+        async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            if !self.paused.swap(true, Ordering::SeqCst) {
+                self.reading.notify_one();
+                self.resume.notified().await;
+            }
+            let id = match p.segments() {
+                [.., state, id, _] if state == "pending" => id.clone(),
+                _ => format!("tx-{}", self.staged.load(Ordering::SeqCst)),
+            };
+            Ok(format!("# Staged tx {id}\n\n## Confirm\nWrite y\n").into_bytes())
+        }
+        async fn write(&self, _p: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+            self.staged.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A `new.tx` reply names the entry its own write staged, even when
+    /// another writer stages after it and moves `latest`.
+    #[tokio::test]
+    async fn a_staging_reply_names_its_own_entry() {
+        let wallet = Arc::new(Restaged::default());
+        let vfs = Vfs::builder().mount("wallets", wallet.clone()).build();
+        let path = VfsPath::parse("/wallets/w/0/chains/base/outbox/new.tx").unwrap();
+        let wait = Duration::from_secs(50);
+        let first = tokio::spawn({
+            let (vfs, path) = (vfs.clone(), path.clone());
+            async move {
+                write(&vfs, &path, b"send", wait, &|| false, true)
+                    .await
+                    .ok()
+            }
+        });
+        wallet.reading.notified().await;
+        let second = write(&vfs, &path, b"send", wait, &|| false, true).await;
+        wallet.resume.notify_one();
+        let reply = |id: &str| {
+            Some(Written::Staged(format!(
+                "# Staged tx {id}\n\nStaged, not yet asked. Write y to pending/{id}/confirm: \
+                 it answers with the owner's approval link."
+            )))
+        };
+        assert_eq!(second.ok(), reply("tx-2"));
+        assert_eq!(first.await.unwrap(), reply("tx-1"));
+    }
+
+    /// Two tokens with one symbol are told apart by their contract.
+    #[test]
+    fn same_symbol_tokens_keep_their_own_balances() {
+        let h = |address: &str, raw: &str, display: &str| serde_json::json!({"asset": "erc20", "address": address, "symbol": "USDC", "decimals": 6, "raw": raw, "display": display});
+        let before = [h("0xA", "1000000", "1 USDC"), h("0xB", "5000000", "5 USDC")];
+        let after = [h("0xA", "3000000", "3 USDC"), h("0xB", "5000000", "5 USDC")];
+        assert_eq!(changes(&before, &after), "3 USDC (+2), 5 USDC");
+        assert_eq!(changes(&before, &after[..1]), "3 USDC (+2), 0 USDC (-5)");
     }
 
     /// The first policy write answers with the link at once; the repeat

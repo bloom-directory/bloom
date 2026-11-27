@@ -1216,6 +1216,63 @@ impl WalletsHandler {
         {
             return self.confirm_batch_entries(wallet, number, refs).await;
         }
+        // `cancel` discards the whole batch: an entry left behind would hold
+        // its nonce and block whatever is staged next.
+        if let [state, id, control] = chain_rest
+            && state == "pending"
+            && control == "confirm"
+            && data.trim_ascii().eq_ignore_ascii_case(b"cancel")
+            && let Some((refs, _)) =
+                self.awaited_batch_with(wallet, number, &format!("{chain}:{id}"))
+        {
+            // A batch may span chains: each entry is cancelled at its own
+            // outbox, under that chain's policy.
+            let mut left = Vec::new();
+            for (entry_chain, entry) in refs.iter().filter_map(|r| r.split_once(':')) {
+                let cancel = ["pending".to_owned(), entry.to_owned(), "confirm".to_owned()];
+                let Some(client) = self.chains.get(entry_chain) else {
+                    left.push(format!("{entry_chain}:{entry}"));
+                    continue;
+                };
+                let still_pending = self
+                    .tx_engine
+                    .outbox
+                    .read_in_state(wallet, entry_chain, entry, OutboxState::Pending)
+                    .is_ok();
+                if !still_pending {
+                    continue;
+                }
+                let other;
+                let policy = if entry_chain == chain {
+                    &policy
+                } else {
+                    other = crate::advisory_exact_evm_policy(
+                        &projection,
+                        entry_chain,
+                        client.spec().chain_id,
+                    )
+                    .map_err(err_be)?;
+                    &other
+                };
+                self.write_outbox_from(
+                    wallet,
+                    entry_chain,
+                    from,
+                    policy,
+                    &cancel,
+                    b"cancel",
+                    number,
+                )
+                .await?;
+            }
+            if !left.is_empty() {
+                return Err(HandlerError::invalid(format!(
+                    "the rest of this batch was cancelled; {} are not on an EVM chain here: cancel each at its own outbox",
+                    left.join(", ")
+                )));
+            }
+            return Ok(());
+        }
         if let [control] = chain_rest
             && EVM_PENDING_CONTROLS.contains(&control.as_str())
         {
@@ -1258,16 +1315,29 @@ impl WalletsHandler {
                 bodies.len()
             )));
         }
-        for body in bodies.iter().filter(|_| bodies.len() > 1) {
-            bloom_tx::intent_parser::parse(body)
-                .map_err(|e| HandlerError::invalid(format!("{e}; nothing was staged")))?;
+        for (n, body) in bodies.iter().enumerate().filter(|_| bodies.len() > 1) {
+            bloom_tx::intent_parser::parse(body).map_err(|e| {
+                HandlerError::invalid(format!(
+                    "line {} of {}: {e}; nothing was staged",
+                    n + 1,
+                    bodies.len()
+                ))
+            })?;
         }
-        for body in &bodies {
+        for (n, body) in bodies.iter().enumerate() {
             match self.stage_from(wallet, chain, from, policy, body).await {
                 Ok(id) => staged.push(id),
                 // A body the chain or policy refused: discard the ones
-                // before it, which were only ever meant to go together.
+                // before it, which were only ever meant to go together. The
+                // error names the line, so the fix is made to that one.
                 Err(error) => {
+                    let error = if bodies.len() > 1 {
+                        reworded(error, |m| {
+                            format!("line {} of {}: {m}", n + 1, bodies.len())
+                        })
+                    } else {
+                        error
+                    };
                     return Err(self
                         .discard_staged(wallet, chain, from, policy, &staged, number, error)
                         .await);
@@ -1276,9 +1346,17 @@ impl WalletsHandler {
         }
         if let [id] = staged.as_slice() {
             let confirm = ["pending".to_owned(), id.clone(), "confirm".to_owned()];
-            return self
+            // One that failed (not one waiting for the owner) is discarded,
+            // so a corrected retry is not blocked behind its nonce.
+            return match self
                 .write_outbox_from(wallet, chain, from, policy, &confirm, b"y", number)
-                .await;
+                .await
+            {
+                Err(error @ (HandlerError::Invalid(_) | HandlerError::Backend(_))) => Err(self
+                    .discard_staged(wallet, chain, from, policy, &staged, number, error)
+                    .await),
+                result => result,
+            };
         }
         // Several bodies go under one approval, in the order written. A
         // batch that failed (not one waiting for the owner) is discarded too.
@@ -1306,6 +1384,7 @@ impl WalletsHandler {
         error: HandlerError,
     ) -> HandlerError {
         let mut left = Vec::new();
+        let mut all_discarded = true;
         for id in staged {
             let cancel = ["pending".to_owned(), id.clone(), "confirm".to_owned()];
             let discarded = self
@@ -1316,12 +1395,18 @@ impl WalletsHandler {
                 .outbox
                 .read_in_state(wallet, chain, id, OutboxState::Pending)
                 .is_ok();
+            all_discarded &= discarded.is_ok();
             if discarded.is_err() && pending {
                 left.push(format!("pending/{id}"));
             }
         }
         if left.is_empty() {
-            return error;
+            let discarded = all_discarded && !staged.is_empty();
+            return if discarded {
+                reworded(error, |m| format!("{m}; nothing was staged"))
+            } else {
+                error
+            };
         }
         HandlerError::backend(format!(
             "{error}; still staged, cancel before retrying: {}",
@@ -2983,9 +3068,37 @@ impl WalletsHandler {
     }
 }
 
+/// `error` with its message rewritten, keeping its kind; kinds without a
+/// free-text message pass through unchanged.
+fn reworded(error: HandlerError, f: impl Fn(&str) -> String) -> HandlerError {
+    match error {
+        HandlerError::Invalid(m) => HandlerError::Invalid(f(&m)),
+        HandlerError::Backend(m) => HandlerError::Backend(f(&m)),
+        HandlerError::Refused(m) => HandlerError::Refused(f(&m)),
+        error => error,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A batch line the policy refused keeps its kind (`Operation not
+    /// permitted`) and still names its line and that nothing was staged.
+    #[test]
+    fn a_policy_refusal_in_a_batch_names_its_line() {
+        let refused = HandlerError::Refused("policy denied: allowlists.recipients: 0xdead".into());
+        let refused = reworded(refused, |m| format!("line 2 of 2: {m}"));
+        let refused = reworded(refused, |m| format!("{m}; nothing was staged"));
+        assert_eq!(
+            refused.to_string(),
+            "operation not permitted: line 2 of 2: policy denied: allowlists.recipients: 0xdead; nothing was staged"
+        );
+        assert!(matches!(
+            reworded(HandlerError::OperationNotPermitted, |m| m.to_owned()),
+            HandlerError::OperationNotPermitted
+        ));
+    }
 
     /// bloom#285: `bloom wallet cancel` on a broadcast entry waits on an owner
     /// approval. Its challenge is projected from `sent/` and describes the

@@ -3299,13 +3299,14 @@ pub fn is_policy_coordination_busy(error: &HandlerError) -> bool {
 fn tx_open_err(e: TxEngineError) -> HandlerError {
     match e {
         TxEngineError::ApprovalRequired(_) => HandlerError::PermissionDenied,
-        TxEngineError::PolicyDenied => HandlerError::OperationNotPermitted,
+        TxEngineError::PolicyDenied(_) => HandlerError::Refused(e.to_string()),
         TxEngineError::DependencyNotSatisfied { .. }
         | TxEngineError::SimulationReverted { .. }
         | TxEngineError::NonceGap { .. }
         // What the body said, not a Bloom failure.
         | TxEngineError::Address(_)
         | TxEngineError::Amount(_)
+        | TxEngineError::Call(_)
         | TxEngineError::Data(_) => HandlerError::invalid(e.to_string()),
         other => err_be(other),
     }
@@ -4448,6 +4449,12 @@ impl WalletsHandler {
             .get(1)
             .and_then(|segment| parse_account_segment(segment))
         {
+            // Policy is set per wallet; say where instead of a bare denial.
+            if segs.len() == 3 && segs[2] == "policy.json" {
+                return Err(HandlerError::invalid(format!(
+                    "policy belongs to the wallet, not an account: write `wallets/{wallet}/policy.json`"
+                )));
+            }
             return self.write_account(wallet, number, &segs[2..], data).await;
         }
         if segs.get(1).map(String::as_str) == Some("passkeys") {
@@ -5091,7 +5098,7 @@ impl WalletsHandler {
                 Some(&self.address_book),
             )
             .await
-            .map_err(err_be)?;
+            .map_err(tx_open_err)?;
         tracing::info!(wallet, chain, id = %staged.id, "outbox.staged");
         Ok(staged.id)
     }
@@ -5390,6 +5397,20 @@ mod tests {
     };
     use bloom_machine_client::{ProjectionFreshness, ProjectionVerification};
     use bloom_proto::AddressBook;
+
+    /// A policy denial reads as `operation not permitted` and names its rule,
+    /// whether it refuses the stage or the confirm.
+    #[test]
+    fn a_policy_denial_is_refused_with_its_rule() {
+        let refused = tx_open_err(TxEngineError::PolicyDenied(
+            "allowlists.recipients: 0xdead is not on the allowlist".into(),
+        ));
+        assert!(matches!(refused, HandlerError::Refused(_)), "{refused:?}");
+        assert_eq!(
+            refused.to_string(),
+            "operation not permitted: policy denied: allowlists.recipients: 0xdead is not on the allowlist"
+        );
+    }
     use bloom_tx::outbox::Outbox;
     use bloom_tx::tx_engine::TxEngine;
     use std::sync::Mutex;
@@ -8083,6 +8104,21 @@ value = "0""#,
         );
     }
 
+    /// A policy written at an account's path names the wallet's path instead
+    /// of a bare denial, which reads as a refusal of the change itself.
+    #[tokio::test]
+    async fn a_policy_written_to_an_account_names_the_wallet_path() {
+        let f = make_handler();
+        let path = VfsPath::parse(&format!("/{}/0/policy.json", f.wallet_name)).unwrap();
+        let error = f.handler.write(&path, b"{}").await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("write `wallets/{}/policy.json`", f.wallet_name)),
+            "{error}"
+        );
+    }
+
     /// `add_destinations` proposes the current policy plus the new payees,
     /// once each, whatever their letter case.
     #[tokio::test]
@@ -8914,11 +8950,15 @@ value = "0""#,
     }
 
     fn seed_pending_with_created_ms(f: &Fixture, id: &str, created_ms: u128) {
+        seed_pending_on(f, "anvil", 31337, id, created_ms);
+    }
+
+    fn seed_pending_on(f: &Fixture, chain: &str, chain_id: u64, id: &str, created_ms: u128) {
         let staged = bloom_proto::StagedTx {
             id: id.into(),
             wallet: f.wallet_name.clone(),
-            chain: "anvil".into(),
-            chain_id: 31337,
+            chain: chain.into(),
+            chain_id,
             from: bloom_proto::checksum_address(&f.wallet_addr),
             to: Some("0x0000000000000000000000000000000000000002".into()),
             value_wei: "0".into(),
@@ -11060,6 +11100,88 @@ value = "0""#,
         );
     }
 
+    /// `cancel` written to one entry of an awaited batch discards the whole
+    /// batch, so no entry is left holding a nonce; others stay pending.
+    #[tokio::test]
+    async fn cancelling_an_entry_of_an_awaited_batch_cancels_the_batch() {
+        let f = cancel_fixture();
+        for id in ["0001-first", "0002-second", "0003-other"] {
+            seed_pending(&f, id);
+        }
+        f.handler
+            .set_batch_confirm(Arc::new(move |_wallet, _account, _txs, _text| {
+                Box::pin(async move { Ok(serde_json::json!({"status": "awaiting_ceremony"})) })
+            }));
+        let batch = vfs(format!("/{}/0/confirm-batch", f.wallet_name));
+        let _ = f
+            .handler
+            .write(&batch, b"anvil:0001-first anvil:0002-second")
+            .await;
+        let confirm = vfs(format!(
+            "/{}/0/chains/anvil/outbox/pending/0002-second/confirm",
+            f.wallet_name
+        ));
+        f.handler.write(&confirm, b"cancel\n").await.unwrap();
+        let pending = f
+            .handler
+            .tx_engine
+            .outbox
+            .list(&f.wallet_name, "anvil", OutboxState::Pending)
+            .unwrap();
+        assert_eq!(pending, ["0001-test", "0003-other"]);
+    }
+
+    /// A batch spanning two chains is cancelled on both: an entry left on
+    /// the other chain would hold its nonce.
+    #[tokio::test]
+    async fn cancelling_a_batch_cancels_its_entries_on_every_chain() {
+        let f = cancel_fixture();
+        f.handler.chains.add(
+            bloom_evm::ChainClient::new(bloom_proto::ChainSpec {
+                name: "base".into(),
+                chain_id: 8453,
+                rpc_urls: vec!["http://127.0.0.1:1".into()],
+                rpc_endpoints: Vec::new(),
+                etherscan_api_url: None,
+                display_name: None,
+                native_symbol: "ETH".into(),
+                native_decimals: 18,
+                legacy_tx: false,
+                op_stack: false,
+            })
+            .unwrap(),
+        );
+        seed_pending(&f, "0002-anvil");
+        seed_pending_on(&f, "base", 8453, "0003-base", 0);
+        f.handler
+            .set_batch_confirm(Arc::new(move |_wallet, _account, _txs, _text| {
+                Box::pin(async move { Ok(serde_json::json!({"status": "awaiting_ceremony"})) })
+            }));
+        let batch = vfs(format!("/{}/0/confirm-batch", f.wallet_name));
+        let _ = f
+            .handler
+            .write(&batch, b"anvil:0002-anvil base:0003-base")
+            .await;
+        let confirm = vfs(format!(
+            "/{}/0/chains/anvil/outbox/pending/0002-anvil/confirm",
+            f.wallet_name
+        ));
+        f.handler.write(&confirm, b"cancel").await.unwrap();
+        let outbox = &f.handler.tx_engine.outbox;
+        assert_eq!(
+            outbox
+                .list(&f.wallet_name, "anvil", OutboxState::Pending)
+                .unwrap(),
+            ["0001-test"]
+        );
+        assert!(
+            outbox
+                .list(&f.wallet_name, "base", OutboxState::Pending)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     /// The plan of an entry asked for with others names them all, and a
     /// control written to an entry that already left `pending` says where
     /// it went.
@@ -11142,6 +11264,35 @@ value = "0""#,
         assert!(
             error.to_string().contains("approve needs spender")
                 && error.to_string().contains("nothing was staged"),
+            "{error}"
+        );
+        let pending = handler
+            .tx_engine
+            .outbox
+            .list(&f.wallet_name, "anvil", OutboxState::Pending)
+            .unwrap();
+        assert!(pending.is_empty(), "{pending:?}");
+    }
+
+    /// A line refused while staging is named, and the lines staged before it
+    /// are discarded, so the fix is made to that line and the write repeated.
+    #[tokio::test]
+    async fn a_batch_line_refused_while_staging_is_named() {
+        let f = make_handler_with_chain(true);
+        let (projection, _evm0, _evm1) = two_account_projection(&f);
+        let mut handler = f.handler.clone();
+        handler.wallet_projections = Some(projection);
+        let to = "0x0000000000000000000000000000000000000002";
+        let body = format!(
+            "{{\"kind\":\"send\",\"to\":\"{to}\",\"value\":\"1 wei\"}}\n{{\"kind\":\"raw\",\"to\":\"{to}\",\"data\":\"0xabc\",\"value\":\"0\"}}\n"
+        );
+        let send = vfs(format!("/{}/0/chains/anvil/outbox/send.tx", f.wallet_name));
+        let error = handler.write(&send, body.as_bytes()).await.unwrap_err();
+        let error = error.to_string();
+        assert!(
+            error.contains("line 2 of 2: ")
+                && error.contains("two digits per byte")
+                && error.ends_with("nothing was staged"),
             "{error}"
         );
         let pending = handler

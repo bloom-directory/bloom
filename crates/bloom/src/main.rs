@@ -1421,6 +1421,7 @@ fn machine_error_from_handler(error: &bloom_vfs::HandlerError, message: String) 
         bloom_vfs::HandlerError::PermissionDenied
         | bloom_vfs::HandlerError::Denied(_)
         | bloom_vfs::HandlerError::OperationNotPermitted
+        | bloom_vfs::HandlerError::Refused(_)
         | bloom_vfs::HandlerError::ApprovalPending(_) => MachineErrorKind::PermissionDenied,
         bloom_vfs::HandlerError::Invalid(_)
         | bloom_vfs::HandlerError::NotADir(_)
@@ -4185,9 +4186,13 @@ async fn run(cli: Cli) -> Result<()> {
             let written = try_ipc(&client, &client_endpoint, "write", params)
                 .await
                 .with_context(|| format!("ipc write via {}", client_endpoint.display))?;
-            // A confirm that sent answers with its receipts.
-            if let Some(sent) = written.get("sent").and_then(serde_json::Value::as_str) {
-                println!("{sent}");
+            // A confirm that sent answers with its receipts; a new.tx
+            // write, with what it staged.
+            if let Some(report) = ["sent", "staged"]
+                .into_iter()
+                .find_map(|key| written.get(key).and_then(serde_json::Value::as_str))
+            {
+                println!("{report}");
             }
             // A send.tx that staged and waits for the owner sent nothing:
             // exit as `wallet confirm` does for the same state.
@@ -5541,11 +5546,36 @@ async fn write_policy(
     params: serde_json::Value,
 ) -> Result<()> {
     let client = IpcClient::new(&endpoint.socket);
+    // Say what changed, so the caller need not read the policy back.
+    let added: Vec<(String, String)> = params["bytes_b64"]
+        .as_str()
+        .and_then(|body| B64.decode(body).ok())
+        .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+        .and_then(|body| body["add_destinations"].as_array().cloned())
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            Some((
+                entry["destination"].as_str()?.to_ascii_lowercase(),
+                entry["chain"].as_str()?.to_owned(),
+            ))
+        })
+        .collect();
     // The Machine answers a first write with the link and makes a repeat
     // wait for the owner; this only words the answer for a terminal.
     let (code, error) = match try_ipc_coded(&client, endpoint, "write", params).await {
-        Ok(_) => {
+        Ok(_) if added.is_empty() => {
             println!("Policy updated.");
+            return Ok(());
+        }
+        // The Machine answers Ok only once the policy is installed, so it
+        // holds every added destination. A decline or expiry is an Err.
+        Ok(_) => {
+            let named: Vec<_> = added
+                .iter()
+                .map(|(destination, chain)| format!("{destination} on {chain}"))
+                .collect();
+            println!("Policy updated: sends to {} are allowed.", named.join(", "));
             return Ok(());
         }
         Err(denied) => denied,

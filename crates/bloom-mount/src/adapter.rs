@@ -233,7 +233,7 @@ fn map_err(e: HandlerError) -> FsError {
         HandlerError::PermissionDenied
         | HandlerError::Denied(_)
         | HandlerError::ApprovalPending(_) => FsError::AccessDenied,
-        HandlerError::OperationNotPermitted => FsError::PermissionDenied,
+        HandlerError::OperationNotPermitted | HandlerError::Refused(_) => FsError::PermissionDenied,
         HandlerError::Invalid(_) => FsError::InvalidInput,
         HandlerError::Unsupported(_) => FsError::Unsupported,
         HandlerError::Backend(_) => FsError::Io,
@@ -1871,6 +1871,16 @@ mod tests {
     use std::sync::Arc;
 
     use bloom_vfs::handler::{Entry, Handler, HandlerError};
+
+    /// A refusal that names its rule is still `Operation not permitted` on a
+    /// mount, as AGENTS.md says, never an I/O error.
+    #[test]
+    fn a_named_refusal_is_operation_not_permitted() {
+        assert!(matches!(
+            map_err(HandlerError::Refused("policy denied: x".into())),
+            FsError::PermissionDenied
+        ));
+    }
 
     struct StaticHandler;
 

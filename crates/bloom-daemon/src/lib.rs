@@ -2973,7 +2973,7 @@ impl PetalHost for DaemonPetalHost {
                 &outbox_id,
                 Some(requirement),
             ),
-            Err(bloom_tx::TxEngineError::PolicyDenied) => Err(HostError::Backend(
+            Err(bloom_tx::TxEngineError::PolicyDenied(_)) => Err(HostError::Backend(
                 petal_policy_denial(&service.tx_engine, &wallet, &chain_name, &outbox_id),
             )),
             Err(error) => Err(HostError::Backend(format!("confirm EVM outbox: {error}"))),
@@ -5922,38 +5922,30 @@ async fn render_next_actions_with_timeout(
     md.into_bytes()
 }
 
-/// The account's nonzero balances, as ` (now: 1.5 ETH on base, ...)`, or
-/// nothing when `holdings.json` cannot be read in time.
-async fn held_now(tree: &dyn Handler, wallet: &str, account: &str, limit: Duration) -> String {
-    let Ok(path) = VfsPath::parse(&format!("/{wallet}/{account}/holdings.json")) else {
-        return String::new();
-    };
+/// The account's nonzero balances as `(chain, display)`, or `None` when
+/// `holdings.json` cannot be read in time.
+async fn held_now(
+    tree: &dyn Handler,
+    wallet: &str,
+    account: &str,
+    limit: Duration,
+) -> Option<Vec<(String, String)>> {
+    let path = VfsPath::parse(&format!("/{wallet}/{account}/holdings.json")).ok()?;
     let read = tokio::time::timeout(limit.min(Duration::from_secs(3)), tree.read(&path)).await;
-    let Some(holdings) = read
-        .ok()
-        .and_then(Result::ok)
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-    else {
-        return String::new();
-    };
-    let held: Vec<String> = holdings["holdings"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|h| h["raw"].as_str() != Some("0"))
-        .filter_map(|h| {
-            Some(format!(
-                "{} on {}",
-                h["display"].as_str()?,
-                h["chain"].as_str()?
-            ))
-        })
-        .collect();
-    if held.is_empty() {
-        String::new()
-    } else {
-        format!(" (now: {})", held.join(", "))
-    }
+    let holdings: serde_json::Value = serde_json::from_slice(&read.ok()?.ok()?).ok()?;
+    Some(
+        holdings["holdings"]
+            .as_array()?
+            .iter()
+            .filter(|h| h["raw"].as_str() != Some("0"))
+            .filter_map(|h| {
+                Some((
+                    h["chain"].as_str()?.to_owned(),
+                    h["display"].as_str()?.to_owned(),
+                ))
+            })
+            .collect(),
+    )
 }
 
 /// Where each account's balances and outboxes are, so a reader of `next.md`
@@ -6012,17 +6004,48 @@ async fn render_wallet_paths(
     let held = futures::future::join_all(rows.iter().map(|(wallet, account, chains)| async move {
         match chains {
             Some(_) => held_now(wallet_tree, wallet, account, live_timeout).await,
-            None => String::new(),
+            None => None,
         }
     }))
     .await;
     for ((wallet, account, chains), held) in rows.iter().zip(held) {
-        match chains {
-            Some(chains) => lines.push_str(&format!(
-                "- `{wallet}` account `{account}`: balances `wallets/{wallet}/{account}/holdings.json`{held}; outbox `wallets/{wallet}/{account}/chains/<chain>/outbox/` on {}\n",
+        let Some(chains) = chains else {
+            lines.push_str(account);
+            continue;
+        };
+        let root = format!("wallets/{wallet}/{account}");
+        let Some(held) = held else {
+            lines.push_str(&format!(
+                "- `{wallet}` account `{account}`: balances `{root}/holdings.json`; outbox `{root}/chains/<chain>/outbox/` on {}\n",
                 chains.join(", ")
-            )),
-            None => lines.push_str(account),
+            ));
+            continue;
+        };
+        // Each funded chain with its balances and outbox, so the send
+        // path is known without listing the tree.
+        lines.push_str(&format!(
+            "- `{wallet}` account `{account}` (balances `{root}/holdings.json`):\n"
+        ));
+        let (funded, empty): (Vec<&String>, Vec<&String>) = chains
+            .iter()
+            .partition(|chain| held.iter().any(|(on, _)| on == *chain));
+        for chain in funded {
+            let here: Vec<&str> = held
+                .iter()
+                .filter(|(on, _)| on == chain)
+                .map(|(_, display)| display.as_str())
+                .collect();
+            lines.push_str(&format!(
+                "  - {chain}: {}; outbox `{root}/chains/{chain}/outbox/`\n",
+                here.join(", ")
+            ));
+        }
+        if !empty.is_empty() {
+            let empty: Vec<&str> = empty.iter().map(|c| c.as_str()).collect();
+            lines.push_str(&format!(
+                "  - nothing held on {}; outbox `{root}/chains/<chain>/outbox/`\n",
+                empty.join(", ")
+            ));
         }
     }
     lines.push_str(&more(wallet_ids.len().saturating_sub(SHOWN), "wallets/"));
@@ -7410,7 +7433,7 @@ mod tests {
     #[tokio::test]
     async fn next_md_shows_what_each_account_holds() {
         let tree = WalletTreeFixture {
-            dirs: [("alice", vec!["0"]), ("alice/0/chains", vec!["base"])].into(),
+            dirs: [("alice", vec!["0"]), ("alice/0/chains", vec!["arc", "base", "solana"])].into(),
             files: [(
                 "alice/0/holdings.json",
                 r#"{"holdings":[{"chain":"base","raw":"15","display":"1.5 ETH"},{"chain":"base","raw":"0","display":"0 USDC"}]}"#,
@@ -7419,9 +7442,11 @@ mod tests {
             ..Default::default()
         };
         let text = render_wallet_paths(&tree, &["alice".to_owned()], Duration::from_secs(1)).await;
-        assert!(
-            text.contains("holdings.json` (now: 1.5 ETH on base);"),
-            "{text}"
+        assert_eq!(
+            text,
+            "\n## Wallets\n\n- `alice` account `0` (balances `wallets/alice/0/holdings.json`):\n  \
+             - base: 1.5 ETH; outbox `wallets/alice/0/chains/base/outbox/`\n  \
+             - nothing held on arc, solana; outbox `wallets/alice/0/chains/<chain>/outbox/`\n"
         );
     }
 

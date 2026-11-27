@@ -5,7 +5,7 @@
 
 #![forbid(unsafe_code)]
 
-use alloy::dyn_abi::{DynSolType, JsonAbiExt};
+use alloy::dyn_abi::{DynSolType, JsonAbiExt, Specifier};
 use alloy::json_abi::Function;
 use alloy::primitives::{Address, B256, keccak256};
 use thiserror::Error;
@@ -93,10 +93,10 @@ pub fn encode_call(signature: &str, args: &serde_json::Value) -> Result<String, 
     }
     let mut sol_values = Vec::with_capacity(arg_array.len());
     for (i, (param, arg)) in func.inputs.iter().zip(arg_array.iter()).enumerate() {
+        // `resolve`, not `ty`: a struct parameter's `ty` is just "tuple".
         let ty: DynSolType = param
-            .ty
-            .parse()
-            .map_err(|e: alloy::dyn_abi::Error| ToolError::Abi(format!("input {i}: {e}")))?;
+            .resolve()
+            .map_err(|e| ToolError::Abi(format!("input {i}: {e}")))?;
         let value =
             abi::json_to_sol(&ty, arg).map_err(|e| ToolError::Abi(format!("input {i}: {e}")))?;
         sol_values.push(value);
@@ -165,6 +165,38 @@ mod tests {
     fn selector_transfer() {
         // bytes4(keccak256("transfer(address,uint256)")) = 0xa9059cbb
         assert_eq!(selector("transfer(address,uint256)"), "0xa9059cbb");
+    }
+
+    #[test]
+    fn encode_call_takes_a_struct_as_an_array() {
+        // Uniswap SwapRouter02 exactInputSingle, checked word for word
+        // against `cast calldata` for the same arguments.
+        let calldata = encode_call(
+            "exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))",
+            &serde_json::json!([[
+                "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+                "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+                500,
+                "0xa0066F3b71eFa96D0Dc37cE59ccD60bA50b2d7Bc",
+                "1000000000000000000",
+                "2265159854",
+                0
+            ]]),
+        )
+        .unwrap();
+        assert_eq!(
+            calldata,
+            concat!(
+                "0x04e45aaf",
+                "000000000000000000000000c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+                "000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                "00000000000000000000000000000000000000000000000000000000000001f4",
+                "000000000000000000000000a0066f3b71efa96d0dc37ce59ccd60ba50b2d7bc",
+                "0000000000000000000000000000000000000000000000000de0b6b3a7640000",
+                "00000000000000000000000000000000000000000000000000000000870398ae",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+        );
     }
 
     #[test]

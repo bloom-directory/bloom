@@ -131,13 +131,18 @@ pub enum TxEngineError {
     Address(String),
     #[error("amount: {0}")]
     Amount(String),
+    /// A `call` body whose arguments do not fit its method.
+    #[error("{0}")]
+    Call(String),
     /// A body's `data` is not hex calldata.
     #[error("invalid data: {0}; give the calldata as 0x-prefixed hex, two digits per byte")]
     Data(String),
     #[error("invalid EIP-1559 fee override: {0}")]
     InvalidFeeOverride(String),
-    #[error("policy denied")]
-    PolicyDenied,
+    /// The checks that refused it, so the caller can tell a wrong address
+    /// from a payee the policy does not allow.
+    #[error("policy denied: {0}")]
+    PolicyDenied(String),
     #[error("broadcast approval required {0}")]
     ApprovalRequired(ApprovalRequirement),
     #[error("approval service unavailable: {0}")]
@@ -1104,7 +1109,7 @@ impl TxEngine {
                     parse_eth(value).map_err(|e| TxEngineError::Amount(e.to_string()))?
                 };
                 let data = bloom_tools::encode_call(method, &serde_json::json!(args))
-                    .map_err(|e| TxEngineError::Amount(format!("encode_call: {e}")))?;
+                    .map_err(|e| TxEngineError::Call(format!("call {method}: {e}")))?;
                 Ok((Some(contract_addr), v, data, None, None))
             }
             RawIntentBody::Approve {
@@ -1580,7 +1585,10 @@ impl TxEngine {
                 advice = %mev_report.advice,
                 "tx.policy_denied"
             );
-            return Err(TxEngineError::PolicyDenied);
+            return Err(TxEngineError::PolicyDenied(format!(
+                "mev.fail_on_high_risk: {}",
+                mev_report.advice
+            )));
         }
 
         // Open a pinned read session for the balance + code reads so the
@@ -1671,6 +1679,9 @@ impl TxEngine {
                 }
             }
         }
+        // A tx staged behind none of this sender's pending entries runs on
+        // today's state, so a failed gas estimate can be judged now.
+        let mut runs_alone = intent.nonce.is_none();
         let nonce = match intent.nonce {
             Some(n) => n,
             None => {
@@ -1678,6 +1689,7 @@ impl TxEngine {
                 let pending_high = self
                     .outbox
                     .highest_reserved_nonce(wallet, &spec.name, from)?;
+                runs_alone = pending_high.is_none();
                 // Use the slot after the highest nonce still held by a
                 // pending or unmined sent entry: the RPC's pending count can
                 // lag a broadcast that just happened.
@@ -1732,6 +1744,21 @@ impl TxEngine {
                 buffered.max(21_000)
             }
             Err(e) => {
+                // A lone tx whose estimate failed because it reverts is
+                // refused here, before the owner is asked to approve it.
+                // An explicit nonce runs alone when it is the chain's next:
+                // every lower nonce is mined, so nothing staged precedes it.
+                let runs_alone = runs_alone
+                    || (intent.nonce.is_some() && chain.nonce(from).await.ok() == Some(nonce));
+                if runs_alone
+                    && !matches!(intent.body, RawIntentBody::Deploy { .. })
+                    && let Ok(Err(returndata)) =
+                        chain.eth_call_capture_revert(req.clone(), None).await
+                {
+                    return Err(TxEngineError::SimulationReverted {
+                        reason: crate::reconcile::decode_revert(&returndata),
+                    });
+                }
                 // Use the hint from the external estimator (e.g. Enso) when
                 // available, applying the same 25% buffer. Fall back to 500k
                 // only if no hint was provided.
@@ -2115,8 +2142,11 @@ impl TxEngine {
         );
         staged.policy_checks.extend(staged_policy_extras);
 
-        let plan =
+        let mut plan =
             bloom_proto::PlanRender::render(&staged, &spec.native_symbol, spec.native_decimals);
+        if let Some(action) = approve_action(chain, from, to, &data_hex).await {
+            plan = plan.replacen("\nChain:  ", &format!("\n{action}Chain:  "), 1);
+        }
         self.outbox.write_pending(&staged, &plan)?;
         if let Some(body) = conflict_body {
             self.outbox
@@ -2194,7 +2224,9 @@ impl TxEngine {
                 reason = "hard",
                 "tx.policy_denied"
             );
-            return Err(TxEngineError::PolicyDenied);
+            return Err(TxEngineError::PolicyDenied(policy_engine::denial(
+                &staged.policy_checks,
+            )));
         }
         let warn = policy_engine::has_warning(&staged.policy_checks);
         if warn && !override_warnings {
@@ -2205,7 +2237,9 @@ impl TxEngine {
                 reason = "warn_no_override",
                 "tx.policy_denied"
             );
-            return Err(TxEngineError::PolicyDenied);
+            return Err(TxEngineError::PolicyDenied(policy_engine::denial(
+                &staged.policy_checks,
+            )));
         }
 
         if !override_warnings {
@@ -2353,11 +2387,12 @@ impl TxEngine {
                 if let Some(dep_id) = staged.depends_on.as_deref() {
                     self.ensure_dependency_satisfied(wallet, &target.chain_name, dep_id)?;
                 }
-                if policy_engine::has_hard_violation(&staged.policy_checks) {
-                    return Err(TxEngineError::PolicyDenied);
-                }
-                if policy_engine::has_warning(&staged.policy_checks) && !override_warnings {
-                    return Err(TxEngineError::PolicyDenied);
+                if policy_engine::has_hard_violation(&staged.policy_checks)
+                    || policy_engine::has_warning(&staged.policy_checks) && !override_warnings
+                {
+                    return Err(TxEngineError::PolicyDenied(policy_engine::denial(
+                        &staged.policy_checks,
+                    )));
                 }
                 if policy.private.enabled
                     && !matches!(
@@ -2648,7 +2683,9 @@ impl TxEngine {
                 reason = "hard",
                 "tx.policy_denied"
             );
-            return Err(TxEngineError::PolicyDenied);
+            return Err(TxEngineError::PolicyDenied(policy_engine::denial(
+                &staged.policy_checks,
+            )));
         }
         let warn = policy_engine::has_warning(&staged.policy_checks);
         if warn && !override_warnings {
@@ -2659,7 +2696,9 @@ impl TxEngine {
                 reason = "warn_no_override",
                 "tx.policy_denied"
             );
-            return Err(TxEngineError::PolicyDenied);
+            return Err(TxEngineError::PolicyDenied(policy_engine::denial(
+                &staged.policy_checks,
+            )));
         }
 
         // Pre-broadcast simulation first (no side effects): eth_call against
@@ -5785,6 +5824,49 @@ fn parse_approve_amount(s: &str) -> Result<U256, String> {
     U256::from_str_radix(t, 10).map_err(|e| format!("invalid uint256 '{s}': {e}"))
 }
 
+/// An ERC-20 approve's plan line: the allowance it sets beside the one it
+/// replaces, so neither needs reading from the chain. Best effort: `None`
+/// when the token cannot be read.
+async fn approve_action(
+    chain: &ChainClient,
+    owner: Address,
+    token: Option<Address>,
+    data_hex: &str,
+) -> Option<String> {
+    let call =
+        IERC20::approveCall::abi_decode(&hex::decode(data_hex.trim_start_matches("0x")).ok()?)
+            .ok()?;
+    let token = token?;
+    let decimals = chain.erc20_decimals(token).await.ok()??;
+    // The token contract chooses its symbol: show it only when it cannot
+    // pass for plan text (a newline could forge a line), else the address.
+    let symbol = match chain.erc20_symbol(token).await {
+        Ok(Some(symbol))
+            if (1..=16).contains(&symbol.len())
+                && symbol
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) =>
+        {
+            symbol
+        }
+        _ => short_addr_label(&token),
+    };
+    let now = chain
+        .erc20_allowance(token, owner, call.spender)
+        .await
+        .ok()??;
+    let shown = |amount: U256| match amount {
+        U256::MAX => format!("unlimited {symbol}"),
+        amount => format!("{} {symbol}", bloom_proto::format_units(amount, decimals)),
+    };
+    Some(format!(
+        "Action: Allow {} to spend {} (allowance now {})\n",
+        bloom_proto::checksum_address(&call.spender),
+        shown(call.amount),
+        shown(now)
+    ))
+}
+
 /// Pull the `spender` argument out of an `approve(address,uint256)`
 /// calldata blob. Returns `None` if the buffer doesn't decode as an
 /// approve call — the caller treats that as "no spender hint" and
@@ -6802,6 +6884,67 @@ mod tests {
                 symbol: "TKN".into(),
                 decimals: 6,
             })
+        );
+    }
+
+    /// An approve's plan shows the allowance it replaces, so a revoke needs
+    /// no read of the chain before or after.
+    #[tokio::test]
+    async fn an_approve_plan_shows_the_allowance_it_replaces() {
+        let word = |n: u64| format!("\"0x{n:064x}\"");
+        let symbol = |text: &str| {
+            format!(
+                "\"0x{:064x}{:064x}{:0<64}\"",
+                32,
+                text.len(),
+                hex::encode(text)
+            )
+        };
+        // The second read names a symbol that would forge a plan line.
+        let calls = vec![
+            word(6),
+            symbol("USDC"),
+            word(1_000_000_000),
+            word(6),
+            symbol("X\n## Policy"),
+            word(0),
+        ];
+        let chain =
+            stage_chain(&spawn_queued_rpc(HashMap::from([("eth_call".to_owned(), calls)])).await);
+        let spender: Address = "0x60e4f02b4975fbef4b951938859b7e4d5fd1372d"
+            .parse()
+            .unwrap();
+        let data = format!(
+            "0x{}",
+            hex::encode(
+                IERC20::approveCall {
+                    spender,
+                    amount: U256::ZERO
+                }
+                .abi_encode()
+            )
+        );
+        let token: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+            .parse()
+            .unwrap();
+        let owner: Address = TEST_SIGNER_ADDRESS.parse().unwrap();
+        assert_eq!(
+            approve_action(&chain, owner, Some(token), &data)
+                .await
+                .as_deref(),
+            Some(
+                "Action: Allow 0x60E4f02b4975fbEf4b951938859B7e4d5fD1372d to spend 0 USDC (allowance now 1000 USDC)\n"
+            )
+        );
+        // `stage` splices the line in before the plan's `Chain:` line.
+        let plan = bloom_proto::PlanRender::render(&fake_staged_1559("x"), "ETH", 18);
+        assert!(plan.contains("\nChain:  "), "{plan}");
+        let forged = approve_action(&chain, owner, Some(token), &data)
+            .await
+            .unwrap();
+        assert!(
+            !forged.contains("## Policy") && forged.contains("0xa0b8…eb48"),
+            "{forged}"
         );
     }
 
@@ -8568,6 +8711,91 @@ mod tests {
             .await
             .expect_err("a creation must not be staged on a blind default");
         assert!(error.to_string().contains("cannot estimate gas"), "{error}");
+    }
+
+    /// A tx that reverts against today's state is refused when it is staged,
+    /// with the reason, not after the owner approved it. Behind a pending
+    /// entry it may rely on (a spend after its approval), it is staged.
+    #[tokio::test]
+    async fn a_lone_reverting_tx_is_refused_at_staging() {
+        let stf = format!("0x08c379a0{:064x}{:064x}{:0<64}", 32, 3, hex::encode("STF"));
+        // Each stage reads a fresh node: its answers are queued, not replayed.
+        let node = || async {
+            let mut responses = stage_rpc_responses(false);
+            responses.remove("eth_estimateGas");
+            responses.insert(
+                "eth_call".into(),
+                vec![format!(
+                    r#"error:{{"code":3,"message":"execution reverted","data":"{stf}"}}"#
+                )],
+            );
+            stage_chain(&spawn_queued_rpc(responses).await)
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let engine = TxEngine::new(
+            Outbox::new(directory.path().join("outbox")).unwrap(),
+            60_000,
+        );
+        let permit = permit_for(&directory);
+        let from: Address = TEST_SIGNER_ADDRESS.parse().unwrap();
+        let body = r#"{"kind":"raw","to":"0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45","data":"0x1234","value":"0"}"#;
+        let stage = |chain: ChainClient| {
+            let (engine, permit) = (&engine, &permit);
+            async move {
+                engine
+                    .stage(
+                        permit,
+                        "alice",
+                        from,
+                        crate::intent_parser::parse(body).unwrap(),
+                        &chain,
+                        &Policy::default(),
+                        None,
+                    )
+                    .await
+            }
+        };
+        let error = stage(node().await)
+            .await
+            .expect_err("a reverting tx is not staged");
+        assert!(
+            matches!(&error, TxEngineError::SimulationReverted { reason } if reason.contains("STF")),
+            "{error}"
+        );
+        assert!(
+            engine
+                .outbox
+                .list("alice", "anvil", OutboxState::Pending)
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut earlier = fake_staged_1559("approve");
+        earlier.from = bloom_proto::checksum_address(&from);
+        engine.outbox.write_pending(&earlier, "p").unwrap();
+        stage(node().await)
+            .await
+            .expect("behind a pending entry it is staged");
+
+        // An explicit nonce equal to the chain's next has nothing before it,
+        // so it is judged too, even with an unrelated entry in the outbox.
+        let explicit = r#"{"kind":"raw","to":"0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45","data":"0x1234","value":"0","nonce":0}"#;
+        let error = engine
+            .stage(
+                &permit,
+                "alice",
+                from,
+                crate::intent_parser::parse(explicit).unwrap(),
+                &node().await,
+                &Policy::default(),
+                None,
+            )
+            .await
+            .expect_err("an explicit next nonce that reverts is not staged");
+        assert!(
+            matches!(&error, TxEngineError::SimulationReverted { reason } if reason.contains("STF")),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -13054,9 +13282,10 @@ mod tests {
         let r = engine
             .confirm(&permit, "alice", "anvil", "0001-test", &chain, &policy, "y")
             .await;
-        assert!(
-            matches!(r, Err(TxEngineError::PolicyDenied)),
-            "expected PolicyDenied, got {r:?}"
+        // The refusal names the check, so the caller can tell what to fix.
+        assert_eq!(
+            r.unwrap_err().to_string(),
+            "policy denied: caps.max_value_eth: value exceeds max"
         );
 
         // The outbox entry must have been moved to the `failed` state.
@@ -13087,7 +13316,7 @@ mod tests {
                 &permit, "alice", "anvil", &staged.id, &chain, &policy, false,
             )
             .await;
-        assert!(matches!(result, Err(TxEngineError::PolicyDenied)));
+        assert!(matches!(result, Err(TxEngineError::PolicyDenied(_))));
         let entry = engine.outbox.read("alice", "anvil", &staged.id).unwrap();
         assert_eq!(entry.state, OutboxState::Failed);
         assert_eq!(entry.staged.status, TxStatus::Failed);

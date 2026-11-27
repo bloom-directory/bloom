@@ -321,10 +321,12 @@ impl ToolSpec {
             VfsMethod::Write => {
                 let written = payload_len(arguments);
                 // A confirm that sent answers with its receipts; a send.tx
-                // that staged answers with its approval, and sent nothing.
+                // that staged answers with its approval, and a new.tx with
+                // what it staged. Only the first sent anything.
                 let sent = result.get("sent").and_then(Value::as_str);
+                let staged = result.get("staged").and_then(Value::as_str);
                 let pending = result.get("approval_pending");
-                let report = sent.or_else(|| pending?.get("text")?.as_str());
+                let report = sent.or(staged).or_else(|| pending?.get("text")?.as_str());
                 // Lead with NOT SENT, so a caller that reads only the first
                 // line or sees `isError: false` does not take it as sent.
                 let text = match (report, pending) {
@@ -334,8 +336,7 @@ impl ToolSpec {
                     (Some(report), None) => format!("wrote {written} byte(s) to {path}\n{report}"),
                     (None, _) => format!("wrote {written} byte(s) to {path}"),
                 };
-                let mut structured =
-                    json!({ "path": path, "bytes_written": written, "sent": sent });
+                let mut structured = json!({ "path": path, "bytes_written": written, "sent": sent, "staged": staged });
                 if let Some(pending) = pending {
                     structured["approval_pending"] = pending.clone();
                 }

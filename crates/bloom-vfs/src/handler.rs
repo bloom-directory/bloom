@@ -195,6 +195,10 @@ pub enum HandlerError {
     Denied(String),
     #[error("operation not permitted")]
     OperationNotPermitted,
+    /// A refusal that names its rule: a mount still reads it as
+    /// `Operation not permitted`, other callers get the rule too.
+    #[error("operation not permitted: {0}")]
+    Refused(String),
     /// A write refused until the owner approves its ceremony. Carries the VFS
     /// path of the public `approval_challenge.json`; never its ceremony link,
     /// because error text is logged.
