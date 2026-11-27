@@ -7,7 +7,8 @@ action on a Broker browser page; Bloom signs and sends. Reach paths with
 under Next Actions; `docs/` has one short file per refused or failed write.
 
 To send, approve or call a contract, use the account's outbox,
-`wallets/<wallet>/<n>/chains/<chain>/outbox/`. Write a body to `send.tx`:
+`wallets/<wallet>/<n>/chains/<chain>/outbox/`. Write a body to `send.tx`, in
+one of these forms (one form per transaction; no header or comment lines):
 
 ```text
 send 0.25 ETH to 0x...
@@ -18,10 +19,11 @@ send 0.25 ETH to 0x...
 ```
 
 `call` encodes the arguments (a struct is a JSON array); `value` is in wei.
-Bodies on separate lines go under one approval, in order (an approve, then the
-call that spends it); Bloom simulates them first and names a line that would
-revert. A swap, loan, stake or bridge is an approve and a `call` to the
-protocol's contract. `petals/` holds venue packages; read one's `README.md`
+Multiple transactions on separate lines go under one approval, in order (an
+approve, then the call that spends it); Bloom simulates them first and names a
+line that would revert. A swap, loan, stake or bridge is an approve and a
+`call` to the protocol's contract on the source chain (EVM chains share the
+account's address). `petals/` holds venue packages; read one's `README.md`
 only when the request names its venue. Nothing signs off-chain messages
 (permits, EIP-712 data).
 
