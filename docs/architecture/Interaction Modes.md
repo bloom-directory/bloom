@@ -77,8 +77,11 @@ executes the Machine action as part of the browser POST. Execution is a
 subsequent operation with its own operation identity. An IPC confirm (CLI,
 `bloom vfs`, MCP) that prepares an approval returns its ceremony link at
 once. A later confirm of that same approval waits up to 50 seconds for Broker
-to report it active, then performs that execution itself. Mounted writes do
-not wait.
+to report it active, then performs that execution itself. An IPC write to a
+Petal route that the Petal refuses only for owner approval is written again
+every 2 seconds, for up to 50 seconds, until it succeeds or another error
+returns. The Petal keys a pending action by the exact request bytes, so a
+repeat never creates a second action. Mounted writes do not wait.
 
 ## Mode matrix
 
