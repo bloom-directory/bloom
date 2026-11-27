@@ -22,6 +22,10 @@ const TOPICS: &[(&str, &str)] = &[
         include_str!("../docs/topics/error-meanings.md"),
     ),
     (
+        "only-in-the-cli.md",
+        include_str!("../docs/topics/only-in-the-cli.md"),
+    ),
+    (
         "paid-http-requests.md",
         include_str!("../docs/topics/paid-http-requests.md"),
     ),
