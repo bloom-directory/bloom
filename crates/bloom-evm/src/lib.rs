@@ -1142,6 +1142,23 @@ impl ChainRegistry {
         self.inner.read().keys().cloned().collect()
     }
 
+    /// The one chain whose numeric id `id` is, as paths accept it: none when
+    /// `id` is itself a chain name or two chains share it (a fork and the
+    /// network it copies), so an ambiguous id never picks one.
+    pub fn named_by_id(&self, id: &str) -> Option<String> {
+        let id: u64 = id.parse().ok()?;
+        let chains = self.inner.read();
+        if chains.keys().any(|name| name.parse::<u64>() == Ok(id)) {
+            return None;
+        }
+        let mut named = chains
+            .iter()
+            .filter(|(_, client)| client.spec().chain_id == id)
+            .map(|(name, _)| name.clone());
+        let only = named.next()?;
+        named.next().is_none().then_some(only)
+    }
+
     pub fn from_chains<I: IntoIterator<Item = ChainSpec>>(specs: I) -> Result<Self, ChainError> {
         let r = Self::new();
         for s in specs {

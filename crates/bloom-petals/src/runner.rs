@@ -180,6 +180,7 @@ fn host_from_handler(e: HandlerError) -> HostError {
         HandlerError::NotFound(s) => HostError::NotFound(s),
         HandlerError::NotADir(s) | HandlerError::NotAFile(s) => HostError::Invalid(s),
         HandlerError::PermissionDenied
+        | HandlerError::Denied(_)
         | HandlerError::OperationNotPermitted
         | HandlerError::ApprovalPending(_) => HostError::Denied("vfs".into()),
         HandlerError::Invalid(s) => HostError::Invalid(s),

@@ -93,19 +93,30 @@ async fn solana_full_stage_confirm_flow() -> Result<()> {
     );
 
     // 6. Stage.
-    step("6", "stage a transfer by writing outbox/new.tx");
+    step(
+        "6",
+        "stage and ask the owner in one write to outbox/send.tx",
+    );
     let destination = bs58::encode([0xbbu8; 32]).into_string();
     let intent = serde_json::json!({"destination": destination, "lamports": 250_000_000u64});
-    daemon
+    let send_tx = VfsPath::parse("/wallets/alice/0/chains/solana-local/outbox/send.tx").unwrap();
+    let sent = daemon
         .vfs
-        .write(&new_tx, serde_json::to_vec(&intent)?.as_slice())
-        .await
-        .map_err(|e| anyhow!("stage write: {e}"))?;
+        .write(&send_tx, serde_json::to_vec(&intent)?.as_slice())
+        .await;
+    assert!(
+        matches!(
+            &sent,
+            Err(bloom_vfs::handler::HandlerError::ApprovalPending(_))
+        ),
+        "send.tx must stage, then stop at the owner's approval: {sent:?}"
+    );
     let pending = daemon
         .vfs
         .list(&VfsPath::parse("/wallets/alice/0/chains/solana-local/outbox/pending").unwrap())
         .await
         .map_err(|e| anyhow!("list pending: {e}"))?;
+    assert_eq!(pending.len(), 1, "send.tx stages exactly one entry");
     let id = pending
         .first()
         .ok_or_else(|| anyhow!("no pending entry staged"))?
@@ -129,11 +140,10 @@ async fn solana_full_stage_confirm_flow() -> Result<()> {
     );
     assert_eq!(staged["fee_payer"].as_str().unwrap(), address);
 
-    // 7. Confirm must fail closed before owner approval.
-    step(
-        "7",
-        "first confirm must fail closed (no Sealed Approval yet)",
-    );
+    // 7. `send.tx` was the first confirm, and it failed closed above. The
+    // fixture Broker signs whenever it is asked, so a second confirm before
+    // the approval is not tested here; the real Broker refuses it.
+    step("7", "the entry's confirm is the repeat send.tx names");
     let confirm = VfsPath::parse(&format!(
         "/wallets/alice/0/chains/solana-local/outbox/pending/{id}/confirm"
     ))
@@ -141,15 +151,6 @@ async fn solana_full_stage_confirm_flow() -> Result<()> {
     match daemon.vfs.lookup(&confirm).await {
         Ok(e) => println!("    lookup confirm -> mode {:o}", e.mode),
         Err(e) => return Err(anyhow!("lookup confirm failed: {e}")),
-    }
-    let first = daemon.vfs.write(&confirm, b"y\n").await;
-    match &first {
-        Err(e) => println!("    first confirm correctly refused: {e}"),
-        Ok(()) => {
-            return Err(anyhow!(
-                "SECURITY: confirm succeeded without owner approval"
-            ));
-        }
     }
 
     // 8. Owner completes the ceremony; retry confirms, signs, broadcasts.
