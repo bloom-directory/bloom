@@ -3299,6 +3299,11 @@ pub fn is_policy_coordination_busy(error: &HandlerError) -> bool {
 fn tx_open_err(e: TxEngineError) -> HandlerError {
     match e {
         TxEngineError::ApprovalRequired(_) => HandlerError::PermissionDenied,
+        // Name where the allowed destinations are, so a refused router can
+        // be swapped for an allowed one without guessing.
+        TxEngineError::PolicyDenied(ref m) if m.contains("not on allowlist") => HandlerError::Refused(
+            format!("{e}; `wallets/<wallet>/policy.json` lists the destinations it allows"),
+        ),
         TxEngineError::PolicyDenied(_) => HandlerError::Refused(e.to_string()),
         TxEngineError::DependencyNotSatisfied { .. }
         | TxEngineError::SimulationReverted { .. }
@@ -5409,6 +5414,14 @@ mod tests {
         assert_eq!(
             refused.to_string(),
             "operation not permitted: policy denied: allowlists.recipients: 0xdead is not on the allowlist"
+        );
+        let refused = tx_open_err(TxEngineError::PolicyDenied(
+            "allowlists.recipients: 0xe592 not on allowlist".into(),
+        ));
+        assert_eq!(
+            refused.to_string(),
+            "operation not permitted: policy denied: allowlists.recipients: 0xe592 not on allowlist; \
+             `wallets/<wallet>/policy.json` lists the destinations it allows"
         );
     }
     use bloom_tx::outbox::Outbox;

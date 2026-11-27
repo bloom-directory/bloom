@@ -1,7 +1,7 @@
 # Bloom virtual filesystem
 
 Route reference. Rules are in the mount's `AGENTS.md`; procedures are in
-`examples/` and `wallets/` (one file per topic).
+`docs/examples/` and `docs/wallets/` (one file per topic).
 
 ## Top-level routes
 

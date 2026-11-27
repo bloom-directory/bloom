@@ -8,15 +8,18 @@ An error alone does not show whether an earlier operation completed.
   Read-only targets also deny.
 - **Operation not permitted**: policy or a safety check refused it. Do not
   change policy, switch accounts, remount a read-only route or try another
-  interface to get around it.
+  interface to get around it. If it refused a contract you chose, such as a
+  router, use one for the same action that `wallets/<wallet>/policy.json`
+  allows; never change a payee.
 - **Input/output error**: on an outbox confirm, see
   `confirm-denied-or-failed.md`.
 
-A refused Petal write leaves its reason in `petals/<name>/last_error.json`.
-Check its `path` and `at_ms` match your write; no record means no
-information, not success. A Petal write denied with no ceremony link: report
-the route and error rather than reinstalling, switching accounts or dropping
-fields.
+A refused Petal write says why after `permission denied:`; on a mount the
+reason is in `petals/<name>/last_error.json` (check its `path` and `at_ms`
+match your write). When the reason is an owner approval, `bloom vfs write`
+and MCP wait for it. If it is still not approved, tell the owner, then write
+the same request again in the same turn. Otherwise report the route
+and reason rather than reinstalling, switching accounts or dropping fields.
 
 A Petal operation that needs a policy change answers
 `POLICY_APPROVAL_REQUIRED` with a `ceremony_url` and status path. If that

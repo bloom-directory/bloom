@@ -181,6 +181,7 @@ pub async fn write(
                     entries.push(format!("{chain}:{id}"));
                 }
                 let url = url.and_then(|doc| doc["ceremony_url"].as_str().map(str::to_owned));
+                let outbox = outbox_dir(path);
                 // Staging is not a failure: answer with what will be signed,
                 // so the caller need not read each plan before confirming.
                 // Nothing is sent, so it is never reported as `Sent`.
@@ -188,7 +189,7 @@ pub async fn write(
                     let plans = staged_plans(vfs, path, &entries).await;
                     return Ok(Written::ApprovalPending {
                         text: format!(
-                            "{plans}Staged; owner approval{staged}: {url} . Write y to pending/{id}/confirm: it waits for their approval, then sends."
+                            "{plans}Staged; owner approval{staged}: {url} . Write y to {outbox}/pending/{id}/confirm: it waits for their approval, then sends."
                         ),
                         id,
                         ceremony_url: url.clone(),
@@ -196,10 +197,20 @@ pub async fn write(
                 }
                 Err(match url {
                     Some(url) => WriteError::Approval(format!(
-                        "permission denied: owner approval required{staged}: {url} . Write y to pending/{id}/confirm: it waits for their approval, then sends."
+                        "permission denied: owner approval required{staged}: {url} . Write y to {outbox}/pending/{id}/confirm: it waits for their approval, then sends."
                     )),
                     None => HandlerError::ApprovalPending(challenge).into(),
                 })
+            }
+            // A Petal write the owner must approve answers with its action
+            // id. The same bytes written again sign once they approve (the
+            // Petal keys the pending action by them), so wait here as a
+            // confirm does, instead of the caller stopping or polling.
+            Err(error)
+                if path.segments().first().is_some_and(|root| root == "petals")
+                    && petal_approval_pending(&error) =>
+            {
+                wait_for_petal_approval(vfs, path, bytes, error.to_string(), wait, cancelled).await
             }
             written => Ok(written.map(|()| Written::Done)?),
         };
@@ -276,6 +287,53 @@ pub async fn write(
         .map_or(Written::Done, Written::Sent))
 }
 
+/// Whether a Petal's refusal says only that the owner has not approved yet.
+/// Petals word it differently: `approval required for exchange: {"action_id":…}`,
+/// `APPROVAL_PENDING action_id=…`, or `Sealed Approval required for action …;
+/// … retry the exact write`.
+fn petal_approval_pending(error: &HandlerError) -> bool {
+    let (HandlerError::Denied(message) | HandlerError::Invalid(message)) = error else {
+        return false;
+    };
+    let asks = message.contains("APPROVAL_PENDING")
+        || message.to_ascii_lowercase().contains("approval required");
+    asks && (message.contains("action_id")
+        || message.contains("for action ")
+        || message.contains("retry the exact write"))
+}
+
+/// Write the same Petal request again until the owner approves it, `wait`
+/// runs out or the caller gives up.
+async fn wait_for_petal_approval(
+    vfs: &Vfs,
+    path: &VfsPath,
+    bytes: &[u8],
+    mut message: String,
+    wait: Duration,
+    cancelled: Cancelled<'_>,
+) -> Result<Written, WriteError> {
+    let deadline = tokio::time::Instant::now() + wait;
+    while !cancelled() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(BATCH_APPROVAL_POLL).await;
+        match vfs.write(path, bytes).await {
+            Ok(()) => return Ok(Written::Done),
+            Err(again) if petal_approval_pending(&again) => message = again.to_string(),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(WriteError::Approval(format!(
+        "{message} . The owner has not approved it yet: tell them, then write the same body again; it waits for their approval, then sends."
+    )))
+}
+
+/// The full path of the outbox a write went to, without a leading `/`, as
+/// AGENTS.md writes paths: an agent that runs `bloom vfs` from the root
+/// confirms with it as given.
+fn outbox_dir(path: &VfsPath) -> String {
+    let segments = path.segments();
+    segments[..segments.len().saturating_sub(1)].join("/")
+}
+
 /// Write `new.tx` and reply with the entry it staged, up to its confirm
 /// instructions, and how to ask the owner. The entry's ID is captured with
 /// the write: `latest` is whatever was staged last, which another writer
@@ -302,12 +360,16 @@ async fn staged_reply(vfs: &Vfs, path: &VfsPath, bytes: &[u8]) -> Result<Written
         return Ok(Written::Done);
     };
     let plans = staged_plans(vfs, path, &[format!("{chain}:{id}")]).await;
+    let outbox = outbox_dir(path);
     Ok(Written::Staged(format!(
-        "{plans}Staged, not yet asked. Write y to pending/{id}/confirm: it answers with the owner's approval link."
+        "{plans}Staged, not yet asked. Write y to {outbox}/pending/{id}/confirm: it answers with the owner's approval link."
     )))
 }
 
 /// Each staged `chain:id` entry's `plan.md`, up to its confirm instructions.
+/// plan.md lines a staging reply leaves out; the agent never acts on them.
+const PLAN_DETAIL: [&str; 5] = ["Wallet:", "From:", "Nonce:", "Gas:", "Data:"];
+
 async fn staged_plans(vfs: &Vfs, path: &VfsPath, entries: &[String]) -> String {
     let [root, wallet, number, ..] = path.segments() else {
         return String::new();
@@ -321,7 +383,13 @@ async fn staged_plans(vfs: &Vfs, path: &VfsPath, entries: &[String]) -> String {
         if let Ok(raw) = vfs.read(&plan).await {
             let text = String::from_utf8_lossy(&raw);
             let shown = text.split("\n## Confirm").next().unwrap_or_default();
-            plans.push_str(shown.trim_end());
+            // The reply carries what the agent checks: target, action, value and policy.
+            // Signing details (sender, nonce, gas, calldata size) stay in plan.md.
+            let shown: Vec<&str> = shown
+                .lines()
+                .filter(|line| !PLAN_DETAIL.iter().any(|label| line.starts_with(label)))
+                .collect();
+            plans.push_str(shown.join("\n").trim_end());
             plans.push_str("\n\n");
         }
     }
@@ -996,7 +1064,8 @@ mod tests {
                     br#"{"ceremony_url":"http://localhost/c/1"}"#.to_vec()
                 }
                 "/w/0/chains/base/outbox/pending/tx-1/plan.md" => {
-                    b"# Staged tx tx-1\n\nTo: 0xabc\n\n## Confirm\nWrite y\n".to_vec()
+                    // Signing details the reply leaves out (PLAN_DETAIL) around the line it keeps.
+                    b"# Staged tx tx-1\n\nFrom: 0xowner\nTo: 0xabc\nNonce: 1\nGas: limit=1\n\n## Confirm\nWrite y\n".to_vec()
                 }
                 other => return Err(HandlerError::not_found(other)),
             })
@@ -1006,6 +1075,65 @@ mod tests {
                 "wallets/w/0/chains/base/outbox/pending/tx-1/approval_challenge.json".into(),
             ))
         }
+    }
+
+    /// Answers "approval required" until `approved` writes have been made.
+    struct PendingPetal {
+        writes: std::sync::atomic::AtomicUsize,
+        approved: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl Handler for PendingPetal {
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            Ok(Entry::file(p.segments().last().unwrap()))
+        }
+        async fn write(&self, _p: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+            let n = self
+                .writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if n >= self.approved {
+                return Ok(());
+            }
+            Err(if n.is_multiple_of(2) {
+                HandlerError::Denied(
+                    r#"approval required for exchange: {"action_id":"a1","expires_ms":9}"#.into(),
+                )
+            } else {
+                HandlerError::Invalid(
+                    "Sealed Approval required for action 03f3; open the owner-visible Bloom \
+                     status, approve it, then retry the exact write"
+                        .into(),
+                )
+            })
+        }
+    }
+
+    /// A Petal write the owner must approve waits for them and then succeeds;
+    /// without the approval it says to write the same body again.
+    #[tokio::test]
+    async fn a_petal_write_waits_for_the_owner() {
+        let path =
+            VfsPath::parse("/petals/hyperliquid/mainnet/exchange/main/0/order.json").unwrap();
+        let petal = |approved| {
+            Arc::new(PendingPetal {
+                writes: Default::default(),
+                approved,
+            })
+        };
+        // Two polls of BATCH_APPROVAL_POLL: approved on the third write.
+        let vfs = Vfs::builder().mount("petals", petal(3)).build();
+        let written = write(&vfs, &path, b"{}", Duration::from_secs(10), &|| false, true).await;
+        assert_eq!(written.ok(), Some(Written::Done));
+
+        let vfs = Vfs::builder().mount("petals", petal(usize::MAX)).build();
+        let Err(WriteError::Approval(message)) =
+            write(&vfs, &path, b"{}", Duration::ZERO, &|| false, true).await
+        else {
+            panic!("an unapproved Petal write must say it waits");
+        };
+        assert!(message.contains("write the same body again"), "{message}");
     }
 
     /// Staging answers with the plan and the link instead of an error, so the
@@ -1024,7 +1152,7 @@ mod tests {
                 id: "tx-1".into(),
                 ceremony_url: "http://localhost/c/1".into(),
                 text: "# Staged tx tx-1\n\nTo: 0xabc\n\nStaged; owner approval: http://localhost/c/1 . \
-                 Write y to pending/tx-1/confirm: it waits for their approval, then sends."
+                 Write y to wallets/w/0/chains/base/outbox/pending/tx-1/confirm: it waits for their approval, then sends."
                     .into(),
             })
         );
@@ -1067,7 +1195,7 @@ mod tests {
             staged.ok(),
             Some(Written::Staged(
                 "# Staged tx tx-1\n\nTo: 0xabc\n\nStaged, not yet asked. Write y to \
-                 pending/tx-1/confirm: it answers with the owner's approval link."
+                 wallets/w/0/chains/base/outbox/pending/tx-1/confirm: it answers with the owner's approval link."
                     .into()
             ))
         );
@@ -1129,7 +1257,7 @@ mod tests {
         wallet.resume.notify_one();
         let reply = |id: &str| {
             Some(Written::Staged(format!(
-                "# Staged tx {id}\n\nStaged, not yet asked. Write y to pending/{id}/confirm: \
+                "# Staged tx {id}\n\nStaged, not yet asked. Write y to wallets/w/0/chains/base/outbox/pending/{id}/confirm: \
                  it answers with the owner's approval link."
             )))
         };
