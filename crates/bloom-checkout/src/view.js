@@ -22,7 +22,6 @@ function closeView(message) {
   status.textContent = message;
   document.getElementById('controls').hidden = true;
   document.getElementById('controls').disabled = true;
-  document.getElementById('text').value = '';
   document.getElementById('saved-tools').hidden = true;
   document.getElementById('task').hidden = true;
   document.getElementById('purpose').hidden = true;
@@ -52,7 +51,7 @@ function act(action) {
   }).catch(() => { if (!closed) status.textContent = 'Action was not confirmed. Inspect the page before trying again.'; });
 }
 // Typing straight onto the screen goes to the page's focused field.
-const keys = new Set(['Tab','Enter','Backspace','Escape','ArrowDown','ArrowUp']);
+const keys = new Set(['Tab','Enter','Backspace','Delete','Escape','ArrowDown','ArrowUp','ArrowLeft','ArrowRight']);
 screen.addEventListener('keydown', event => {
   if (event.ctrlKey || event.metaKey || event.altKey) return;
   if (keys.has(event.key)) act({action:'key',key:event.key});
@@ -73,12 +72,13 @@ screen.addEventListener('wheel', event => {
   event.preventDefault();const rect=screen.getBoundingClientRect();
   act({action:'scroll',x:(event.clientX-rect.left)*screen.naturalWidth/rect.width,y:(event.clientY-rect.top)*screen.naturalHeight/rect.height,delta_y:Math.max(-3000,Math.min(3000,event.deltaY))});
 },{passive:false});
-document.getElementById('typing').addEventListener('submit', event => {
-  event.preventDefault();const input = document.getElementById('text');const text=input.value;input.value='';act({action:'type',text});
+let staySignedIn=false;
+const stayCheckbox=document.getElementById('stay-signed-in');
+stayCheckbox.addEventListener('change',()=>{
+  staySignedIn=stayCheckbox.checked;
+  act({action:'stay_signed_in',stay_signed_in:staySignedIn});
 });
-document.querySelectorAll('[data-key]').forEach(button=>button.addEventListener('click',()=>act({action:'key',key:button.dataset.key})));
-document.getElementById('finish').addEventListener('click',()=>act({action:'finish'}));
-document.getElementById('stay-signed-in').addEventListener('click',()=>act({action:'finish',stay_signed_in:true}));
+document.getElementById('finish').addEventListener('click',()=>act({action:'finish',stay_signed_in:staySignedIn}));
 async function savedOptions() {
   const response = await privateFetch('/saved');
   if (!response.ok) return;
@@ -173,16 +173,26 @@ async function refresh() {
       return;
     }
     const state=await response.json();status.textContent=describe(state);
-    document.getElementById('saved-tools').hidden = !state.can_use_saved || !hasSaved;
-    for (const id of ['stay-signed-in', 'stay-note']) document.getElementById(id).hidden = !state.can_stay_signed_in;
-    document.getElementById('finish').classList.toggle('primary', !state.can_stay_signed_in);
+    document.getElementById('saved-tools').hidden = !state.can_use_saved || !hasSaved || Boolean(state.signing_in);
+    const canStay = Boolean(state.can_stay_signed_in);
+    staySignedIn = canStay && Boolean(state.stay_signed_in);
+    document.getElementById('stay-row').hidden = !canStay;
+    stayCheckbox.checked = staySignedIn;
+    const stayNote = document.getElementById('stay-note');
+    stayNote.hidden = !canStay;
+    if (canStay) {
+      stayNote.textContent = state.human_control
+        ? 'When you finish signing in, this view closes by itself. If checked, you stay signed in; the agent can read and click account pages, but cannot press pay buttons or use card or password fields.'
+        : 'Do not save your card in the merchant app. Keeping the session signed in lets the agent act in your account, so only enable this if no payment method is saved there.';
+    }
     document.getElementById('task').hidden = !state.agent_description;
     document.getElementById('task-text').textContent = state.agent_description || '';
     showSaved(state.saved);
-    if(state.state==='human_control'){
+    if(state.state==='human_control' || (state.human_control && state.state==='uncertain')){
+      status.textContent="You're in control. The agent can't see this view.";
       document.getElementById('heading').textContent="Your turn in Bloom's browser";
       document.getElementById('purpose').hidden=true;
-      document.getElementById('finish').textContent=state.can_stay_signed_in ? 'Done, sign me out' : 'Done';
+      document.getElementById('finish').textContent='Done';
       document.getElementById('note').hidden=true;
     }
     if(state.state==='needs_input') {
@@ -194,7 +204,9 @@ async function refresh() {
       closeView(describe(state) + ' You can close this tab and return to Bloom.');
       return;
     }
-    pages.replaceChildren(...state.pages.map(page=>{const option=document.createElement('option');option.value=page.target;option.textContent=page.origin;option.selected=page.target===state.selected_page;return option;}));
+    // An opaque origin ("null") is a blank or error tab, not a site.
+    pages.replaceChildren(...state.pages.map(page=>{const option=document.createElement('option');option.value=page.target;option.textContent=page.origin==='null'?'Blank page':page.origin;option.selected=page.target===state.selected_page;return option;}));
+    if (state.pages.find(page=>page.target===state.selected_page)?.origin==='null') status.textContent='This tab has no site open. Click Done and ask the agent to open the site, then start again.';
     const frame = await privateFetch('/frame');
     if (!frame.ok) throw Error('Browser image unavailable');
     if (frame.ok && !closed) {

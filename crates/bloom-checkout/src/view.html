@@ -28,24 +28,21 @@ h1{margin:0;font-size:22px;line-height:1.3;letter-spacing:-.02em;font-weight:600
 .address svg{width:14px;height:14px;flex:none}
 #pages{flex:1;min-width:0;border:0;background:transparent;padding:4px;font-size:13px;color:var(--ink)}
 #screen{display:block;width:100%;height:auto;background:white;cursor:pointer}
-.typing{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:14px 28px 0;font-size:13px;color:var(--muted)}
-#typing{display:flex;gap:6px;flex:1;min-width:240px}
-#text{flex:1;min-width:120px}
-.keys{display:flex;gap:6px}
-.keys button,#typing button{padding:6px 10px;font-size:13px}
 .tools{margin:20px 28px 0;padding:16px;border:1px solid var(--line);border-radius:10px;display:grid;gap:10px}
 .tools p{margin:0}
 #saved-status{color:var(--muted);font-size:14px}
 .footer{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:20px;padding:18px 28px;border-top:1px solid var(--line);background:#fcfbf9}
 .notes{flex:1 1 280px;font-size:13px;color:var(--muted)}
 .notes p{margin:0}
+.stay-toggle{display:flex;align-items:center;gap:8px;font-weight:500;color:var(--ink);margin-bottom:6px;cursor:pointer}
+.stay-toggle input{width:auto;padding:0;margin:0}
 input,button,select{font:inherit;border:1px solid #d8d2c8;border-radius:8px;padding:9px 14px;background:white;color:var(--ink)}
 button{cursor:pointer;font-weight:600}
 button:hover{background:var(--soft)}
 .primary{background:var(--accent);border-color:var(--accent);color:white}
 .primary:hover{background:var(--accent-dark)}
 #screen:focus-visible,input:focus-visible,button:focus-visible,select:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
-@media(max-width:640px){main{padding:12px}.summary{padding:18px}.window{margin:0 12px}.typing,.footer{padding-inline:12px}.tools{margin-inline:12px}.footer button{width:100%}}
+@media(max-width:640px){main{padding:12px}.summary{padding:18px}.window{margin:0 12px}.footer{padding-inline:12px}.tools{margin-inline:12px}.footer button{width:100%}}
 </style>
 </head>
 <body>
@@ -63,11 +60,6 @@ button:hover{background:var(--soft)}
 <div class="address"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/></svg><select id="pages" aria-label="Browser page"></select></div>
 <img id="screen" tabindex="0" alt="Bloom's browser. Click to use it, then type." hidden>
 </div>
-<div class="typing">
-<span>Click the page, then type. For passwords:</span>
-<form id="typing"><input id="text" type="password" autocomplete="off" aria-label="Hidden text for the selected field" placeholder="Hidden text"><button>Send</button></form>
-<div class="keys" aria-label="Keys"><button type="button" data-key="Tab">Tab</button><button type="button" data-key="Enter">Enter</button><button type="button" data-key="Backspace">⌫</button></div>
-</div>
 <section class="tools" id="saved-tools" aria-label="Saved details" hidden>
 <p id="traveler-row" hidden><label>Traveler <select id="saved-traveler"><option value="">Choose a saved traveler</option></select></label>
 <button type="button" id="fill-traveler">Fill traveler</button></p>
@@ -80,10 +72,10 @@ button:hover{background:var(--soft)}
 <a id="saved-approval" target="_blank" rel="noopener noreferrer" hidden>Review approval</a>
 </section>
 <div class="footer">
-<button type="button" id="stay-signed-in" class="primary" hidden>Done, stay signed in</button>
-<button type="button" id="finish">Close</button>
+<button type="button" id="finish" class="primary">Close</button>
 <div class="notes">
-<p id="stay-note" hidden>Staying signed in lets the agent read pages where you're signed in, such as your name, addresses and orders. It still can't click, type or pay without you.</p>
+<label id="stay-row" class="stay-toggle" hidden><input type="checkbox" id="stay-signed-in"> Keep me signed in after closing</label>
+<p id="stay-note" hidden></p>
 <p id="note">Closing before the site confirms leaves the result unknown. Check your email and bank before paying again.</p>
 </div>
 </div>
