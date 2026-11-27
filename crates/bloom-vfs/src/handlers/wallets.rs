@@ -2690,8 +2690,54 @@ impl WalletsHandler {
         data: &[u8],
     ) -> Result<(), HandlerError> {
         let _lock = self.lock_wallet_policy_update(wallet)?;
-        self.write_wallet_policy_update_locked(wallet, data, None)
+        let merged = self.with_added_destinations(wallet, data).await?;
+        self.write_wallet_policy_update_locked(wallet, merged.as_deref().unwrap_or(data), None)
             .await
+    }
+
+    /// `{"add_destinations":[{"chain":..,"destination":..}]}` proposes the
+    /// current policy plus those destinations, so adding a payee needs no
+    /// read and edit of the whole policy. Anything else is a full policy and
+    /// is left as written. The same write repeated proposes the same bytes
+    /// while the policy is unchanged, as the approval wait requires.
+    async fn with_added_destinations(
+        &self,
+        wallet: &str,
+        data: &[u8],
+    ) -> Result<Option<Vec<u8>>, HandlerError> {
+        let Ok(serde_json::Value::Object(body)) = serde_json::from_slice(data) else {
+            return Ok(None);
+        };
+        let Some(added) = body.get("add_destinations").filter(|_| body.len() == 1) else {
+            return Ok(None);
+        };
+        let added = added.as_array().ok_or_else(|| {
+            HandlerError::invalid(
+                r#"add_destinations takes a list: [{"chain":"ethereum","destination":"0x..."}]"#,
+            )
+        })?;
+        let mut policy: serde_json::Value =
+            serde_json::from_slice(&self.read_triad_wallet_policy(wallet).await?)
+                .map_err(|error| HandlerError::backend(format!("parse policy: {error}")))?;
+        let destinations = policy["allowed_destinations"]
+            .as_array_mut()
+            .ok_or_else(|| HandlerError::backend("policy has no allowed_destinations"))?;
+        // An address is the same destination in any letter case.
+        let key = |d: &serde_json::Value| {
+            let field = |name: &str| d[name].as_str().map(str::to_ascii_lowercase);
+            (field("chain"), field("destination"))
+        };
+        for destination in added {
+            if !destinations
+                .iter()
+                .any(|held| key(held) == key(destination))
+            {
+                destinations.push(destination.clone());
+            }
+        }
+        serde_json::to_vec(&policy)
+            .map(Some)
+            .map_err(|error| HandlerError::backend(error.to_string()))
     }
 
     async fn write_wallet_policy_update_locked(
@@ -3256,7 +3302,11 @@ fn tx_open_err(e: TxEngineError) -> HandlerError {
         TxEngineError::PolicyDenied => HandlerError::OperationNotPermitted,
         TxEngineError::DependencyNotSatisfied { .. }
         | TxEngineError::SimulationReverted { .. }
-        | TxEngineError::NonceGap { .. } => HandlerError::invalid(e.to_string()),
+        | TxEngineError::NonceGap { .. }
+        // What the body said, not a Bloom failure.
+        | TxEngineError::Address(_)
+        | TxEngineError::Amount(_)
+        | TxEngineError::Data(_) => HandlerError::invalid(e.to_string()),
         other => err_be(other),
     }
 }
@@ -3874,7 +3924,7 @@ impl Handler for WalletsHandler {
                         "account has no Broker-projected address for chain '{chain}'"
                     ))
                 })?;
-                self.require_staged_by(wallet, chain, id, address)?;
+                self.require_staged_by(wallet, chain, id, address, false)?;
                 let (_, policy) = self.planning_wallet_inputs(wallet, chain).await?;
                 let client = self
                     .chains
@@ -4741,12 +4791,9 @@ impl WalletsHandler {
             }
         };
         match rest {
-            // The root guide's `send.tx` and its bodies are EVM's.
-            [s] if s == "send.tx" => Err(HandlerError::invalid(
-                "a Solana outbox has no send.tx and takes its own body: read README.md here, write the body to new.tx, then y to latest/confirm",
-            )),
-            // outbox/new.tx — stage a native transfer.
-            [s] if s == "new.tx" => {
+            // outbox/new.tx — stage a native transfer. outbox/send.tx —
+            // stage it and confirm it in the same write, as on EVM.
+            [s] if s == "new.tx" || s == "send.tx" => {
                 self.write_permit()?;
                 let mut intent: bloom_solana_tx::SolanaTransferIntent =
                     serde_json::from_slice(data).map_err(|e| {
@@ -4782,6 +4829,13 @@ impl WalletsHandler {
                     .await
                     .map_err(|e| HandlerError::backend(e.to_string()))?;
                 tracing::info!(wallet, chain, id = %staged.id, "solana_outbox.staged");
+                if s == "send.tx" {
+                    let confirm = ["pending".to_owned(), staged.id, "confirm".to_owned()];
+                    return Box::pin(self.write_solana_outbox(
+                        wallet, chain, &confirm, b"y", engine, pinned, account,
+                    ))
+                    .await;
+                }
                 Ok(())
             }
             // outbox/pending/<id>/confirm — sign (ceremony) then broadcast.
@@ -4984,20 +5038,27 @@ impl WalletsHandler {
         }
     }
 
-    /// A pending entry is actionable only when the path's account key staged
-    /// it (`wallets/<w>/<n>/`); another account's entry is not found.
+    /// A pending entry (or, with `sent_ok`, a sent one) is actionable only
+    /// when the path's account key staged it (`wallets/<w>/<n>/`); another
+    /// account's entry is not found.
     fn require_staged_by(
         &self,
         wallet: &str,
         chain: &str,
         id: &str,
         sender: &str,
+        sent_ok: bool,
     ) -> Result<(), HandlerError> {
-        let entry = self
-            .tx_engine
-            .outbox
-            .read_in_state(wallet, chain, id, OutboxState::Pending)
-            .map_err(outbox_err)?;
+        let outbox = &self.tx_engine.outbox;
+        // Cancel also acts on a broadcast entry, which the engine moves to
+        // `sent/`; it is still addressed through `pending/`.
+        let entry = match outbox.read_in_state(wallet, chain, id, OutboxState::Pending) {
+            Err(OutboxError::StateMismatch { actual: "sent", .. }) if sent_ok => {
+                outbox.read_in_state(wallet, chain, id, OutboxState::Sent)
+            }
+            other => other,
+        }
+        .map_err(outbox_err)?;
         if !entry.staged.from.eq_ignore_ascii_case(sender) {
             return Err(HandlerError::not_found(format!("outbox/pending/{id}")));
         }
@@ -5071,7 +5132,7 @@ impl WalletsHandler {
             [state, id, fname]
                 if state == "pending" && (fname == "confirm" || fname == "confirm.override") =>
             {
-                self.require_staged_by(wallet, chain, id, &scope)?;
+                self.require_staged_by(wallet, chain, id, &scope, false)?;
                 // Fix #9: confirm must have non-empty content. Quietly
                 // accepting an empty body (the old behaviour) made every
                 // empty `> confirm` a footgun that broadcast a tx.
@@ -5151,7 +5212,7 @@ impl WalletsHandler {
             // outbox/pending/<id>/cancel — fire a self-send replacement.
             // Same content rules as confirm (fix #9 / #10).
             [state, id, fname] if state == "pending" && fname == "cancel" => {
-                self.require_staged_by(wallet, chain, id, &scope)?;
+                self.require_staged_by(wallet, chain, id, &scope, true)?;
                 let cancel_text = std::str::from_utf8(data)
                     .map_err(|_| HandlerError::invalid("non-utf8 cancel content"))?
                     .trim();
@@ -5162,17 +5223,31 @@ impl WalletsHandler {
                 }
                 self.require_outbox_petal_eligibility_for_action(wallet, chain, id, true)
                     .await?;
-                let _ = self
+                match self
                     .tx_engine
                     .cancel(self.write_permit()?, wallet, chain, id, &client, 10, policy)
                     .await
-                    .map_err(err_be)?;
-                Ok(())
+                {
+                    Ok(_) => Ok(()),
+                    // The cancellation waits on the owner; its challenge is
+                    // projected wherever the entry now is (usually `sent/`).
+                    Err(TxEngineError::ApprovalRequired(_)) => {
+                        let state = self
+                            .tx_engine
+                            .outbox
+                            .read(wallet, chain, id)
+                            .map_or("pending", |entry| entry.state.dirname());
+                        Err(HandlerError::ApprovalPending(format!(
+                            "{outbox}/{state}/{id}/{APPROVAL_CHALLENGE_FILE}"
+                        )))
+                    }
+                    Err(other) => Err(err_be(other)),
+                }
             }
             // outbox/pending/<id>/replace accepts only an exact EIP-1559 fee
             // pair. Any other body is refused before anything is recorded.
             [state, id, fname] if state == "pending" && fname == "replace" => {
-                self.require_staged_by(wallet, chain, id, &scope)?;
+                self.require_staged_by(wallet, chain, id, &scope, false)?;
                 #[derive(serde::Deserialize)]
                 #[serde(deny_unknown_fields)]
                 struct FeeRepair {
@@ -8008,6 +8083,95 @@ value = "0""#,
         );
     }
 
+    /// `add_destinations` proposes the current policy plus the new payees,
+    /// once each, whatever their letter case.
+    #[tokio::test]
+    async fn adding_a_destination_proposes_the_current_policy_plus_it() {
+        struct PolicyBroker {
+            baseline: SignedPolicySnapshot,
+            prepared: Mutex<Option<bloom_broker_api::PolicyUpdateRequest>>,
+        }
+        impl bloom_broker_api::MachineBrokerService for PolicyBroker {
+            fn dispatch<'a>(
+                &'a self,
+                request: MachineBrokerRequest,
+            ) -> bloom_broker_api::ServiceFuture<'a, MachineBrokerResponse> {
+                Box::pin(async move {
+                    match request {
+                        MachineBrokerRequest::PolicyRead(_) => {
+                            Ok(MachineBrokerResponse::PolicyRead(self.baseline.clone()))
+                        }
+                        MachineBrokerRequest::PolicyValidateUpdate(request) => {
+                            *self.prepared.lock().unwrap() = Some(request.clone());
+                            Ok(MachineBrokerResponse::PolicyValidateUpdate(
+                                bloom_broker_api::PolicyUpdatePrepareResponse {
+                                    operation_id: request.operation_id,
+                                    ceremony_kind: bloom_broker_api::CeremonyKind::PolicyUpdate,
+                                    ceremony_url: "https://example.invalid/add".into(),
+                                    ceremony_expires_at_ms: DecimalU64::new(u64::MAX),
+                                    review_manifest_digest: digest(90),
+                                },
+                            ))
+                        }
+                        other => panic!("unexpected policy request: {other:?}"),
+                    }
+                })
+            }
+        }
+        let f = make_handler();
+        let mut current: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../bloom-machine-client/tests/fixtures/legacy-policy-removal.json"
+        ))
+        .unwrap();
+        let mut current = current["current"].take();
+        current["wallet_id"] = serde_json::json!(f.wallet_name);
+        let held = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
+        current["allowed_destinations"] =
+            serde_json::json!([{"chain": "ethereum", "destination": held}]);
+        let current: CanonicalWalletPolicy = serde_json::from_value(current).unwrap();
+        let bytes = serde_jcs::to_vec(&current).unwrap();
+        let mut projection = static_projection_value(f.wallet_addr);
+        projection.policy.canonical_policy = Base64UrlBytes::from_bytes(&bytes);
+        projection.policy.policy_digest = Digest32::from_bytes(sha2::Sha256::digest(&bytes).into());
+        let broker = Arc::new(PolicyBroker {
+            baseline: projection.policy.clone(),
+            prepared: Mutex::new(None),
+        });
+        let home = bloom_proto::HomeDir::at(f._tmp.path());
+        let handler = f
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(broker.clone())))
+            .with_projection_reader(Arc::new(StaticProjection(projection)))
+            .with_home_write_permit(Arc::new(HomeWritePermit::acquire(&home).unwrap()));
+        let path = VfsPath::parse(&format!("/{}/policy.json", f.wallet_name)).unwrap();
+        let new = "0x54179eb54D8d25B633c825149AB37ac23ab0F101";
+        let body = serde_json::json!({"add_destinations": [
+            {"chain": "ethereum", "destination": new},
+            {"chain": "ethereum", "destination": held.to_ascii_lowercase()},
+        ]});
+        assert!(matches!(
+            handler.write(&path, body.to_string().as_bytes()).await,
+            Err(HandlerError::PermissionDenied)
+        ));
+        let prepared = broker.prepared.lock().unwrap().clone().unwrap();
+        let mut expected = current.clone();
+        let mut value = serde_json::to_value(&expected).unwrap();
+        value["allowed_destinations"] = serde_json::json!([
+            {"chain": "ethereum", "destination": held},
+            {"chain": "ethereum", "destination": new},
+        ]);
+        expected = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            prepared.proposed_canonical_policy.decode(),
+            serde_jcs::to_vec(&expected).unwrap()
+        );
+        let refused = handler.write(&path, br#"{"add_destinations":"0x1"}"#).await;
+        assert!(
+            refused.unwrap_err().to_string().contains("takes a list"),
+            "a wrong shape names the right one"
+        );
+    }
+
     impl bloom_broker_api::MachineBrokerService for StubBroker {
         fn dispatch<'a>(
             &'a self,
@@ -8384,6 +8548,24 @@ value = "0""#,
             .await
             .unwrap();
         assert_eq!(listed.len(), 1);
+        // `send.tx` also confirms, so without live authority it is refused
+        // before anything is staged.
+        let error = handler
+            .write(
+                &VfsPath::parse("/alice/0/chains/solana-devnet/outbox/send.tx").unwrap(),
+                serde_json::to_vec(&intent).unwrap().as_slice(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, HandlerError::Backend(message) if message.contains("authority unavailable")),
+            "{error:?}"
+        );
+        let pending = handler
+            .list(&VfsPath::parse("/alice/0/chains/solana-devnet/outbox/pending").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
         let error = handler
             .write(
                 &VfsPath::parse(&format!(
@@ -8417,6 +8599,26 @@ value = "0""#,
             bs58::encode(child_pubkey).into_string(),
             "the staged fee payer must be the resolved derived Solana child"
         );
+    }
+
+    /// A chain id resolves to its chain's name only while one configured
+    /// chain has it: a fork shares its network's id, and guessing between
+    /// them could send on the wrong one.
+    #[tokio::test]
+    async fn a_chain_id_shared_by_two_chains_names_neither() {
+        let f = make_handler_with_chain(true);
+        let by_id = VfsPath::parse(&format!("/{}/0/chains/31337", f.wallet_name)).unwrap();
+        let entry = f.handler.lookup(&by_id).await.unwrap();
+        assert_eq!(entry.link_target.as_deref(), Some("anvil"), "{entry:?}");
+        let mut fork = f.handler.chains.get("anvil").unwrap().spec().clone();
+        fork.name = "anvil-fork".into();
+        f.handler
+            .chains
+            .add(bloom_evm::ChainClient::new(fork).unwrap());
+        assert!(matches!(
+            f.handler.lookup(&by_id).await,
+            Err(HandlerError::NotFound(_))
+        ));
     }
 
     #[tokio::test]
@@ -8527,6 +8729,7 @@ value = "0""#,
             .list(&VfsPath::parse("/alice/0/chains/solana-devnet/outbox").unwrap())
             .await
             .unwrap();
+        assert!(outbox_entries.iter().any(|entry| entry.name == "send.tx"));
         assert!(outbox_entries.iter().any(|entry| entry.name == "new.tx"));
         assert_eq!(
             outbox_entries
@@ -9631,6 +9834,82 @@ value = "0""#,
             panic!("expected wallet registration prepare request")
         };
         assert_eq!(request.wallet_id.as_ref(), Some(&token(&name)));
+    }
+
+    /// bloom#285: a cancel of a broadcast entry that waits on the owner is
+    /// readable at `sent/<id>/approval_challenge.json`, the path the cancel
+    /// write's approval-pending error names.
+    #[tokio::test]
+    async fn a_waiting_cancel_of_a_sent_entry_is_projected_from_sent() {
+        let mut f = make_handler_with_chain(true);
+        let w = f.wallet_name.clone();
+        let approval = digest(22);
+        let mut waiting = approval_status(
+            approval.clone(),
+            &w,
+            ApprovalLifecycleState::AwaitingCeremony,
+        );
+        waiting.ceremony_url = Some("https://relay.test/ceremony/#cap=cancel".into());
+        waiting.ceremony_expires_at_ms = Some(DecimalU64::new(60_000));
+        f.handler = f
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(approval_broker(vec![
+                waiting,
+            ]))));
+        seed_pending(&f, "sent-cancel");
+        let outbox = &f.handler.tx_engine.outbox;
+        let pending = outbox
+            .read_in_state(&w, "anvil", "sent-cancel", OutboxState::Pending)
+            .unwrap();
+        let sent_dir = outbox.transition(&pending, OutboxState::Sent).unwrap();
+        std::fs::write(
+            sent_dir.join("ceremony.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "bloom.machine-evm-signing.1",
+                "action_id": "31337:sent-cancel:cancel",
+                "approval_id": approval.as_str(),
+                "ceremony_url": "https://relay.test/ceremony/#cap=cancel",
+                "ceremony_expires_at_ms": "60000",
+                "sign_dispatched": false,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let dir = format!("/{w}/0/chains/anvil/outbox/sent/sent-cancel");
+        let names: Vec<String> = f
+            .handler
+            .list(&vfs(dir.clone()))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert!(
+            names.contains(&"approval_challenge.json".to_string()),
+            "{names:?}"
+        );
+        let challenge: serde_json::Value = serde_json::from_slice(
+            &f.handler
+                .read(&vfs(format!("{dir}/approval_challenge.json")))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(challenge["state"], "awaiting_ceremony");
+        assert_eq!(
+            challenge["ceremony_url"],
+            "https://relay.test/ceremony/#cap=cancel"
+        );
+        assert!(challenge.get("retry_path").is_none(), "{challenge}");
+        let next = challenge["next"].as_str().unwrap();
+        assert!(
+            next.contains(&format!(
+                "run `bloom wallet cancel {w} anvil sent-cancel --account 0` again"
+            )),
+            "{next}"
+        );
+        assert!(!next.contains("retry_path"), "{next}");
+        assert_eq!(challenge["value_wei"], "0");
     }
 
     #[tokio::test]
@@ -11764,6 +12043,44 @@ value = "0""#,
         .unwrap();
         let r = f.handler.write(&p, b"").await;
         assert!(matches!(r, Err(HandlerError::Invalid(_))), "got: {r:?}");
+    }
+
+    /// A broadcast entry is in `sent/` but its cancel control is still
+    /// `pending/<id>/cancel`; the sender fence still hides another account's entry. Replace is refused,
+    /// because its approval is not projected for a sent entry.
+    #[tokio::test]
+    async fn cancel_reaches_a_sent_entry_of_the_same_sender() {
+        let f = make_handler_with_chain(true);
+        let w = f.wallet_name.clone();
+        let hash = format!("{:?}", alloy::primitives::B256::repeat_byte(1));
+        let mine = bloom_proto::checksum_address(&f.wallet_addr);
+        seed_sent_from(&f, "mine", &mine, 0, &hash);
+        seed_sent_from(
+            &f,
+            "theirs",
+            &format!("{:?}", Address::repeat_byte(0xaa)),
+            0,
+            &hash,
+        );
+        let path = |id: &str, control: &str| {
+            vfs(format!("/{w}/0/chains/anvil/outbox/pending/{id}/{control}"))
+        };
+        let cancel = f.handler.write(&path("mine", "cancel"), b"y").await;
+        assert!(
+            !matches!(cancel, Err(HandlerError::NotFound(_))),
+            "cancel of my sent entry: {cancel:?}"
+        );
+        let theirs = f.handler.write(&path("theirs", "cancel"), b"y").await;
+        assert!(
+            matches!(theirs, Err(HandlerError::NotFound(_))),
+            "cancel of another account's sent entry: {theirs:?}"
+        );
+        let fees = br#"{"max_fee_per_gas":"200","max_priority_fee_per_gas":"20"}"#;
+        let replace = f.handler.write(&path("mine", "replace"), fees).await;
+        assert!(
+            matches!(replace, Err(HandlerError::NotFound(_))),
+            "replace of a sent entry: {replace:?}"
+        );
     }
 
     /// `replace` accepts only the exact fee pair; every other body is

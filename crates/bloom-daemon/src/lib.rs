@@ -123,6 +123,72 @@ pub const BACKGROUND_EFFECT_AUDIT_MATRIX: &[(&str, &str)] = &[
     ),
 ];
 
+/// Development builds only: `BLOOM_DEV_PETAL_ENDPOINTS="api.example.com=http://127.0.0.1:18080,..."`
+/// sends a Petal's HTTPS request for that host to a local stand-in server, with the venue's
+/// host in the `Host` header. Network policy and the audit log still see the venue's own URL.
+/// Benchmarks use it to run Petals against simulated venues; release builds ignore it.
+#[cfg(feature = "triad-dev-harness")]
+fn dev_petal_endpoint(url: &str) -> Option<(String, String)> {
+    static MAP: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+    let map = MAP.get_or_init(|| {
+        parse_dev_petal_endpoints(&std::env::var("BLOOM_DEV_PETAL_ENDPOINTS").unwrap_or_default())
+    });
+    rewrite_dev_petal_endpoint(map, url)
+}
+
+#[cfg(not(feature = "triad-dev-harness"))]
+fn dev_petal_endpoint(_url: &str) -> Option<(String, String)> {
+    None
+}
+
+#[cfg(any(test, feature = "triad-dev-harness"))]
+fn parse_dev_petal_endpoints(value: &str) -> Vec<(String, String)> {
+    value
+        .split(',')
+        .filter_map(|pair| pair.trim().split_once('='))
+        .filter(|(_, origin)| origin.starts_with("http://127.0.0.1:"))
+        .map(|(host, origin)| {
+            (
+                host.trim().to_ascii_lowercase(),
+                origin.trim_end_matches('/').to_string(),
+            )
+        })
+        .collect()
+}
+
+#[cfg(any(test, feature = "triad-dev-harness"))]
+fn rewrite_dev_petal_endpoint(map: &[(String, String)], url: &str) -> Option<(String, String)> {
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let (_, origin) = map.iter().find(|(name, _)| *name == host)?;
+    let query = parsed.query().map(|q| format!("?{q}")).unwrap_or_default();
+    Some((format!("{origin}{}{query}", parsed.path()), host))
+}
+
+#[cfg(test)]
+mod dev_petal_endpoint_tests {
+    use super::*;
+
+    #[test]
+    fn a_mapped_venue_goes_to_its_local_stand_in_with_its_own_host() {
+        let map = parse_dev_petal_endpoints(
+            "api.hyperliquid.xyz=http://127.0.0.1:18080/, evil.example=https://attacker.example",
+        );
+        assert_eq!(map.len(), 1, "only loopback http origins are accepted");
+        assert_eq!(
+            rewrite_dev_petal_endpoint(&map, "https://API.hyperliquid.xyz/info?x=1"),
+            Some((
+                "http://127.0.0.1:18080/info?x=1".into(),
+                "api.hyperliquid.xyz".into()
+            ))
+        );
+        assert_eq!(
+            rewrite_dev_petal_endpoint(&map, "https://clob.polymarket.com/book"),
+            None
+        );
+    }
+}
+
 const PETAL_HTTP_MAX_REDIRECTS: usize = 5;
 
 /// Concrete adapter that bridges the Machine-owned central outbox and
@@ -1820,7 +1886,14 @@ impl PetalHost for DaemonPetalHost {
                 let err = HostError::Invalid(format!("http method: {e}"));
                 self.audited_http_error(&correlation_id, &method, &url, "error", None, None, err)
             })?;
-            let mut builder = self.http.request(reqwest_method, &url);
+            let mut builder = match dev_petal_endpoint(&url) {
+                // Policy and audit above saw the venue's own URL; only the socket differs.
+                Some((local, host)) => self
+                    .http
+                    .request(reqwest_method, local)
+                    .header(reqwest::header::HOST, host),
+                None => self.http.request(reqwest_method, &url),
+            };
             for (name, value) in &headers {
                 builder = builder.header(name.as_str(), value.as_str());
             }
@@ -3088,6 +3161,28 @@ async fn daemon_petal_chain_read(
                 .await
                 .map_err(|e| HostError::Backend(format!("eth_call: {e}")))?;
             format!("0x{}", hex::encode(bytes))
+        }
+        "eth_getTransactionReceipt" => {
+            let [hash_param] = params.as_slice() else {
+                return Err(HostError::Invalid(
+                    "eth_getTransactionReceipt takes a single transaction hash".into(),
+                ));
+            };
+            let hash: alloy::primitives::B256 = hash_param
+                .as_str()
+                .ok_or_else(|| {
+                    HostError::Invalid("eth_getTransactionReceipt hash must be a string".into())
+                })?
+                .parse()
+                .map_err(|e| HostError::Invalid(format!("eth_getTransactionReceipt hash: {e}")))?;
+            // The guest parses this response as raw JSON, so return the
+            // receipt object (or null) without the string-quoting tail below.
+            let receipt = chain
+                .receipt_json(hash)
+                .await
+                .map_err(|e| HostError::Backend(format!("transaction receipt: {e}")))?;
+            return serde_json::to_string(&receipt)
+                .map_err(|e| HostError::Backend(format!("encode receipt: {e}")));
         }
         "eth_chainId" | "eth_getBalance" | "eth_getCode" | "eth_call" => {
             return Err(HostError::Invalid(format!(
@@ -5827,8 +5922,42 @@ async fn render_next_actions_with_timeout(
     md.into_bytes()
 }
 
+/// The account's nonzero balances, as ` (now: 1.5 ETH on base, ...)`, or
+/// nothing when `holdings.json` cannot be read in time.
+async fn held_now(tree: &dyn Handler, wallet: &str, account: &str, limit: Duration) -> String {
+    let Ok(path) = VfsPath::parse(&format!("/{wallet}/{account}/holdings.json")) else {
+        return String::new();
+    };
+    let read = tokio::time::timeout(limit.min(Duration::from_secs(3)), tree.read(&path)).await;
+    let Some(holdings) = read
+        .ok()
+        .and_then(Result::ok)
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    else {
+        return String::new();
+    };
+    let held: Vec<String> = holdings["holdings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|h| h["raw"].as_str() != Some("0"))
+        .filter_map(|h| {
+            Some(format!(
+                "{} on {}",
+                h["display"].as_str()?,
+                h["chain"].as_str()?
+            ))
+        })
+        .collect();
+    if held.is_empty() {
+        String::new()
+    } else {
+        format!(" (now: {})", held.join(", "))
+    }
+}
+
 /// Where each account's balances and outboxes are, so a reader of `next.md`
-/// has real paths without listing the tree first.
+/// has real paths and balances without listing the tree first.
 async fn render_wallet_paths(
     wallet_tree: &dyn Handler,
     wallet_ids: &[String],
@@ -5853,6 +5982,10 @@ async fn render_wallet_paths(
         0 => String::new(),
         n => format!("- and {n} more; list `{what}`\n"),
     };
+    // Rows first, then every account's balances at once: each read is
+    // capped, so one slow chain costs the whole render that cap, not a
+    // multiple of it.
+    let mut rows = Vec::new();
     for wallet in wallet_ids.iter().take(SHOWN) {
         let accounts: Vec<String> = names(format!("/{wallet}"))
             .await
@@ -5864,18 +5997,33 @@ async fn render_wallet_paths(
             let chains = names(format!("/{wallet}/{account}/chains"))
                 .await
                 .unwrap_or_default();
-            if chains.is_empty() {
-                continue;
+            if !chains.is_empty() {
+                rows.push((wallet, account.clone(), Some(chains)));
             }
-            lines.push_str(&format!(
-                "- `{wallet}` account `{account}`: balances `wallets/{wallet}/{account}/holdings.json`; outbox `wallets/{wallet}/{account}/chains/<chain>/outbox/` on {}\n",
-                chains.join(", ")
-            ));
         }
-        lines.push_str(&more(
+        let hidden = more(
             accounts.len().saturating_sub(SHOWN),
             &format!("wallets/{wallet}/"),
-        ));
+        );
+        if !hidden.is_empty() {
+            rows.push((wallet, hidden, None));
+        }
+    }
+    let held = futures::future::join_all(rows.iter().map(|(wallet, account, chains)| async move {
+        match chains {
+            Some(_) => held_now(wallet_tree, wallet, account, live_timeout).await,
+            None => String::new(),
+        }
+    }))
+    .await;
+    for ((wallet, account, chains), held) in rows.iter().zip(held) {
+        match chains {
+            Some(chains) => lines.push_str(&format!(
+                "- `{wallet}` account `{account}`: balances `wallets/{wallet}/{account}/holdings.json`{held}; outbox `wallets/{wallet}/{account}/chains/<chain>/outbox/` on {}\n",
+                chains.join(", ")
+            )),
+            None => lines.push_str(account),
+        }
     }
     lines.push_str(&more(wallet_ids.len().saturating_sub(SHOWN), "wallets/"));
     if lines.is_empty() {
@@ -7206,6 +7354,8 @@ mod tests {
         dirs: std::collections::HashMap<&'static str, Vec<&'static str>>,
         files: std::collections::HashMap<&'static str, &'static str>,
         broken: Option<&'static str>,
+        /// How long each file read takes, like a slow chain RPC.
+        read_delay: Duration,
     }
 
     #[async_trait::async_trait]
@@ -7227,6 +7377,7 @@ mod tests {
         }
 
         async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            tokio::time::sleep(self.read_delay).await;
             let key = path.segments().join("/");
             self.files
                 .get(key.as_str())
@@ -7252,6 +7403,53 @@ mod tests {
         let text = render_wallet_paths(&tree, &["alice".to_owned()], Duration::from_secs(1)).await;
         assert!(text.contains("`alice` account `0`"), "{text}");
         assert!(text.contains("and 2 more; list `wallets/alice/`"), "{text}");
+    }
+
+    /// An account's line carries its nonzero balances, so a reader need not
+    /// open holdings.json before acting.
+    #[tokio::test]
+    async fn next_md_shows_what_each_account_holds() {
+        let tree = WalletTreeFixture {
+            dirs: [("alice", vec!["0"]), ("alice/0/chains", vec!["base"])].into(),
+            files: [(
+                "alice/0/holdings.json",
+                r#"{"holdings":[{"chain":"base","raw":"15","display":"1.5 ETH"},{"chain":"base","raw":"0","display":"0 USDC"}]}"#,
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let text = render_wallet_paths(&tree, &["alice".to_owned()], Duration::from_secs(1)).await;
+        assert!(
+            text.contains("holdings.json` (now: 1.5 ETH on base);"),
+            "{text}"
+        );
+    }
+
+    /// AGENTS.md ends with this render, so slow chains must not add up:
+    /// every account's balances are read at once.
+    #[tokio::test]
+    async fn next_md_reads_every_accounts_balances_at_once() {
+        let tree = WalletTreeFixture {
+            dirs: [
+                ("alice", vec!["0", "1", "2", "3"]),
+                ("alice/0/chains", vec!["base"]),
+                ("alice/1/chains", vec!["base"]),
+                ("alice/2/chains", vec!["base"]),
+                ("alice/3/chains", vec!["base"]),
+            ]
+            .into(),
+            read_delay: Duration::from_millis(600),
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let text = render_wallet_paths(&tree, &["alice".to_owned()], Duration::from_secs(10)).await;
+        assert!(text.contains("`alice` account `3`"), "{text}");
+        // One read at a time would take 2.4 s.
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     fn alice_tree() -> WalletTreeFixture {
@@ -7295,7 +7493,7 @@ mod tests {
                 ),
             ]
             .into(),
-            broken: None,
+            ..Default::default()
         }
     }
 
@@ -8854,6 +9052,75 @@ mod tests {
         assert!(parse_petal_hex_bytes("70a08231", "data").is_err());
         assert!(parse_petal_hex_quantity("0x0", "value").is_ok());
         assert!(parse_petal_hex_quantity("0", "value").is_err());
+    }
+
+    #[tokio::test]
+    async fn daemon_petal_chain_read_returns_receipt_object_and_null() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let hash = format!("0x{}", "ab".repeat(32));
+        let block = format!("0x{}", "cd".repeat(32));
+        let to = format!("0x{}", "22".repeat(20));
+        let log = serde_json::json!({
+            "address": to, "topics": [format!("0x{}", "33".repeat(32))], "data": "0x1234",
+            "logIndex": "0x0", "transactionIndex": "0x0", "transactionHash": hash,
+            "blockHash": block, "blockNumber": "0x1", "removed": false
+        });
+        let receipt = serde_json::json!({
+            "transactionHash": hash, "transactionIndex": "0x0", "blockHash": block,
+            "blockNumber": "0x1", "from": format!("0x{}", "11".repeat(20)), "to": to,
+            "cumulativeGasUsed": "0x5208", "gasUsed": "0x5208", "effectiveGasPrice": "0x1",
+            "contractAddress": null, "status": "0x1", "type": "0x2",
+            "logsBloom": format!("0x{}", "00".repeat(256)), "logs": [log]
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let rpc = tokio::spawn(async move {
+            for result in [receipt, serde_json::Value::Null] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let request: serde_json::Value = loop {
+                    let mut chunk = [0; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n")
+                        && let Ok(request) = serde_json::from_slice(&bytes[end + 4..])
+                    {
+                        break request;
+                    }
+                };
+                assert_eq!(request["method"], "eth_getTransactionReceipt");
+                let body =
+                    serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+                        .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let mut spec = bloom_proto::ChainSpec::anvil_default();
+        spec.rpc_urls = vec![format!("http://{address}")];
+        let chain = ChainClient::new(spec).unwrap();
+        let method = "eth_getTransactionReceipt";
+
+        let bad = daemon_petal_chain_read(&chain, method, r#"["not-a-hash"]"#).await;
+        assert!(matches!(bad, Err(HostError::Invalid(_))), "{bad:?}");
+
+        let params = serde_json::json!([hash]).to_string();
+        let found: serde_json::Value = serde_json::from_str(
+            &daemon_petal_chain_read(&chain, method, &params)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(found["logs"], serde_json::json!([log]));
+        let missing = daemon_petal_chain_read(&chain, method, &params)
+            .await
+            .unwrap();
+        assert_eq!(missing, "null");
+        rpc.await.unwrap();
     }
 
     #[tokio::test]
