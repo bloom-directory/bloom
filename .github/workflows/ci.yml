@@ -460,7 +460,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mode: [mount]
+        mode: [mount, owner-wait]
     steps:
       - uses: actions/checkout@v6
       - name: Run docker ${{ matrix.mode }} suite
@@ -468,6 +468,9 @@ jobs:
           case "${{ matrix.mode }}" in
             mount)
               bash tests/docker/run.sh --mount
+              ;;
+            owner-wait)
+              bash tests/docker/run.sh --owner-wait
               ;;
           esac
 
