@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod checkout;
 mod petal_eligibility;
 mod projection;
 

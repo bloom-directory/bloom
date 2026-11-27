@@ -92,6 +92,13 @@ jobs:
           repository: bloom-directory/bloom-signer
           ref: ${{ inputs.signer_ref || 'ea1f7bc9bb9d47f0b8ec57718ce695e8171577ce' }}
           path: bloom-signer
+      - name: Install checkout browser
+        shell: bash
+        run: |
+          if [[ ! -x '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' ]]; then
+            brew install --cask google-chrome
+          fi
+
       - name: Install Rust toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
 
@@ -128,6 +135,8 @@ jobs:
           cp "$RUNNER_TEMP/candidate-target/release/bloom-broker" \
             "$RUNNER_TEMP/baseline-staging/bin/bloom-broker"
           for name in baseline failing; do
+            cp "$RUNNER_TEMP/candidate-target/release/bloom-checkout" \
+              "$RUNNER_TEMP/$name-staging/bin/bloom-checkout"
             cp "$RUNNER_TEMP/candidate-target/release/bloom-signer" \
               "$RUNNER_TEMP/$name-staging/bin/bloom-signer"
             cp "$RUNNER_TEMP/candidate-target/release/bloom-signer-migrate" \
@@ -212,6 +221,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           sudo env \
+            RUNNER_TEMP="$RUNNER_TEMP" \
             BLOOM_RUN_MACOS_UNIX_W0=true \
             BLOOM_RELEASE_PUBLIC_KEY=/private/var/db/bloom-w0-release-key.pem \
             BLOOM_MACOS_W0_EVIDENCE_DIR="$RUNNER_TEMP/macos-two-login-evidence" \

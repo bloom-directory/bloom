@@ -8,6 +8,8 @@ die() { echo "$*" >&2; exit 65; }
 eval "$(sed -n '/^restore_macos_upgrade_state()/,/^}/p' "$installer")"
 root_prefix="$work/root"
 upgrade_transaction="$work/transaction"
+enrollments="$root_prefix/enrollments"
+mkdir -p "$enrollments"
 mkdir -p "$root_prefix/private/etc/newsyslog.d" "$root_prefix/private/etc/pf.anchors" "$root_prefix/config" "$upgrade_transaction"
 ln -s private/etc "$root_prefix/etc"
 live=true

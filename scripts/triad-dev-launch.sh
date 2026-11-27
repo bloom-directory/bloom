@@ -19,6 +19,13 @@ mount_dir=""
 machine_socket=""
 log_dir=""
 ready_file=""
+checkout_bin=""
+checkout_chromium=""
+checkout_view_port=""
+checkout_fixture_tls=0
+checkout_xvfb=""
+no_checkout=0
+checkout_build=0
 services_only=0
 retain_temporary_files=0
 hosted_relay=0
@@ -37,6 +44,12 @@ while [ "$#" -gt 0 ]; do
     --machine-socket) need_value "$@"; machine_socket="$2"; shift 2 ;;
     --log-dir) need_value "$@"; log_dir="$2"; shift 2 ;;
     --ready-file) need_value "$@"; ready_file="$2"; shift 2 ;;
+    --checkout-bin) need_value "$@"; checkout_bin="$2"; shift 2 ;;
+    --checkout-chromium) need_value "$@"; checkout_chromium="$2"; shift 2 ;;
+    --checkout-view-port) need_value "$@"; checkout_view_port="$2"; shift 2 ;;
+    --checkout-fixture-tls) checkout_fixture_tls=1; shift ;;
+    --checkout-xvfb) need_value "$@"; checkout_xvfb="$2"; shift 2 ;;
+    --no-checkout) no_checkout=1; shift ;;
     --ceremony-port) need_value "$@"; ceremony_port_arg="$2"; ceremony_port_arg_set=1; shift 2 ;;
     --remote-upstream-port) need_value "$@"; remote_upstream_port_arg="$2"; remote_upstream_port_arg_set=1; shift 2 ;;
     --services-only) services_only=1; shift ;;
@@ -45,11 +58,11 @@ while [ "$#" -gt 0 ]; do
     *) die "unknown argument: $1" ;;
   esac
 done
-required_paths=("$developer_root" "$machine_socket" "$log_dir" "$ready_file")
-for value in "${required_paths[@]}"; do
-  [ -n "$value" ] ||
-    die "developer root, Machine socket, log dir, and ready file are required"
-done
+[ -n "$developer_root" ] || die "--developer-root is required"
+# Everything else defaults inside the developer root, so one root isolates a candidate.
+machine_socket="${machine_socket:-${developer_root}/machine.sock}"
+log_dir="${log_dir:-${developer_root}/logs}"
+ready_file="${ready_file:-${developer_root}/ready}"
 if [ "$services_only" -eq 1 ] && [ -n "$mount_dir" ]; then
   die "--services-only cannot be combined with --mount"
 fi
@@ -89,6 +102,32 @@ elif [ -n "${BLOOM_TRIAD_DEV_CEREMONY_PORT:-}" ]; then
   ceremony_port_raw="$BLOOM_TRIAD_DEV_CEREMONY_PORT"
 fi
 ceremony_port="$(parse_port '--ceremony-port (or BLOOM_TRIAD_DEV_CEREMONY_PORT)' "$ceremony_port_raw")"
+# Checkout starts by default whenever a Chromium is installed. It builds from
+# this checkout, picks a free view port, and on Linux uses Xvfb when present;
+# its display stays in Checkout's own namespace. --no-checkout opts out.
+if [ -z "$checkout_bin" ] && [ "$no_checkout" -eq 0 ] && [ -z "$checkout_chromium$checkout_view_port$checkout_xvfb" ]; then
+  checkout_chromium="$(command -v chromium chromium-browser google-chrome-stable google-chrome | head -n 1 || true)"
+  if [ -n "$checkout_chromium" ]; then
+    checkout_bin="${BLOOM_INTEGRATION_CHECKOUT_BIN:-${repo_root}/target/debug/bloom-checkout}"
+    [ -n "${BLOOM_INTEGRATION_CHECKOUT_BIN:-}" ] || checkout_build=1
+    [ "$(uname -s)" != Linux ] || checkout_xvfb="$(command -v Xvfb || true)"
+  else
+    printf 'No Chromium found; starting without Checkout.\n' >&2
+  fi
+fi
+if [ -n "$checkout_bin" ]; then
+  { [ "$checkout_build" -eq 1 ] || [ -x "$checkout_bin" ]; } && [ -x "$checkout_chromium" ] ||
+    die "checkout and Chromium must be executable"
+  if [ -z "$checkout_view_port" ]; then
+    checkout_view_port=0
+  else
+    checkout_view_port="$(parse_port '--checkout-view-port' "$checkout_view_port")"
+  fi
+  [ "$checkout_view_port" -ne "$ceremony_port" ] || die "checkout and ceremony ports must differ"
+  [ -z "$checkout_xvfb" ] || [ -x "$checkout_xvfb" ] || die "--checkout-xvfb must be executable"
+elif [ -n "$checkout_chromium" ] || [ -n "$checkout_view_port" ] || [ -n "$checkout_xvfb" ]; then
+  die "checkout options require --checkout-bin"
+fi
 # The Broker's loopback hosted-relay upstream follows the same selection. The
 # custody pair keeps 18735; any other ceremony port derives a distinct
 # upstream 10000 away, so candidates on adjacent ceremony ports never collide
@@ -248,6 +287,9 @@ authority_edge_history="${config_dir}/authority-edge-history.json"
 if [ -z "${BLOOM_INTEGRATION_MACHINE_BIN:-}" ]; then
   (cd "$repo_root" && cargo build -p bloom --no-default-features --features mount,triad-dev-harness)
 fi
+if [ "$checkout_build" -eq 1 ]; then
+  (cd "$repo_root" && cargo build -p bloom-checkout)
+fi
 
 if [ -z "${BLOOM_INTEGRATION_BROKER_BIN:-}" ]; then
   (cd "$broker_repo" && cargo build -p bloom-broker --features triad-dev-harness)
@@ -371,7 +413,7 @@ chmod 0700 "${developer_root}/state" \
 runtime_dir="$(mktemp -d "${developer_root}/runtime.XXXXXX")"
 runtime_dir="$(cd "$runtime_dir" && pwd -P)"
 chmod 0700 "$runtime_dir"
-for endpoint in session signer broker; do
+for endpoint in session signer broker checkout; do
   mkdir "${runtime_dir}/${endpoint}"
   chgrp "$(id -g)" "${runtime_dir}/${endpoint}"
   chmod 0710 "${runtime_dir}/${endpoint}"
@@ -381,6 +423,8 @@ signer_socket="${runtime_dir}/signer/signer.sock"
 signer_control_socket="${runtime_dir}/signer/control.sock"
 broker_socket="${runtime_dir}/broker/broker.sock"
 broker_control_socket="${runtime_dir}/broker/control.sock"
+checkout_socket="${runtime_dir}/checkout/checkout.sock"
+checkout_intake_socket="${runtime_dir}/broker/checkout-intake.sock"
 broker_checkpoint_dir="${developer_root}/audit-checkpoints/broker"
 signer_checkpoint_dir="${developer_root}/audit-checkpoints/signer"
 machine_checkpoint_dir="${machine_home}/audit-checkpoints/machine"
@@ -402,6 +446,12 @@ rewrite_broker_config() {
     "$source" > "$temporary"
   chmod 0600 "$temporary"
   mv -f "$temporary" "$source"
+  if [ -n "$checkout_bin" ]; then
+    jq --arg socket "$checkout_intake_socket" --argjson uid "$(id -u)" \
+      '.checkout_socket_path=$socket | .checkout_uid=$uid' "$source" > "$temporary"
+    chmod 0600 "$temporary"
+    mv -f "$temporary" "$source"
+  fi
 }
 rewrite_signer_config() {
   source="${config_dir}/signer.json"
@@ -484,7 +534,7 @@ env_file="${log_dir}/triad.env"
   fi
 } > "$env_file"
 chmod 0600 "$env_file"
-session_pid=""; signer_pid=""; broker_pid=""; machine_pid=""; relay_admin_pid=""
+session_pid=""; signer_pid=""; broker_pid=""; machine_pid=""; relay_admin_pid=""; checkout_pid=""
 cleanup() {
   status=$?
   trap - EXIT
@@ -496,10 +546,10 @@ cleanup() {
     kill -9 "$relay_admin_pid" 2>/dev/null || true
     wait "$relay_admin_pid" 2>/dev/null || true
   fi
-  for pid in "$machine_pid" "$broker_pid" "$signer_pid" "$session_pid"; do
+  for pid in "$checkout_pid" "$machine_pid" "$broker_pid" "$signer_pid" "$session_pid"; do
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then kill "$pid" 2>/dev/null || true; fi
   done
-  for pid in "$machine_pid" "$broker_pid" "$signer_pid" "$session_pid"; do
+  for pid in "$checkout_pid" "$machine_pid" "$broker_pid" "$signer_pid" "$session_pid"; do
     if [ -n "$pid" ]; then wait "$pid" 2>/dev/null || true; fi
   done
   rm -f -- "$machine_socket"
@@ -649,6 +699,29 @@ if [ ! -e "$machine_config" ]; then
   cp "$canonical_machine_config" "$machine_config"
   chmod 0600 "$machine_config"
 fi
+if [ -n "$checkout_bin" ]; then
+  # This functional developer harness shares the login UID. Principal isolation
+  # is tested separately under Docker and is required for production installs.
+  mkdir -p "${developer_root}/state/checkout"
+  chmod 0700 "${developer_root}/state/checkout"
+  checkout_config_new="${machine_config}.checkout.$$"
+  awk '/^\[checkout\]$/ {skip=1;next} /^\[/ {skip=0} !skip' "$machine_config" > "$checkout_config_new"
+  printf '\n[checkout]\nsocket = "%s"\nuid = %s\n' "$checkout_socket" "$(id -u)" >> "$checkout_config_new"
+  chmod 0600 "$checkout_config_new"
+  mv "$checkout_config_new" "$machine_config"
+  checkout_extra=()
+  if [ "$checkout_fixture_tls" -eq 1 ]; then checkout_extra+=(--fixture-allow-insecure-tls); fi
+  # A headed browser on Checkout's own private display, for shops that refuse headless ones.
+  if [ -n "$checkout_xvfb" ]; then checkout_extra+=(--xvfb "$checkout_xvfb"); fi
+  "$checkout_bin" --chromium "$checkout_chromium" \
+    --profile "${developer_root}/state/checkout/profile" \
+    --state "${developer_root}/state/checkout/operations.sqlite3" \
+    --socket "$checkout_socket" --broker-socket "$checkout_intake_socket" \
+    --broker-uid "$(id -u)" --machine-uid "$(id -u)" \
+    --view-port "$checkout_view_port" "${checkout_extra[@]}" > "${log_dir}/checkout.log" 2>&1 &
+  checkout_pid=$!
+  wait_for_socket "$checkout_socket" "$checkout_pid" checkout
+fi
 
 if [ "$services_only" -eq 1 ]; then
   printf 'ready\n' > "$ready_file"
@@ -785,4 +858,8 @@ else
     sleep 1
   done
 fi
-wait "$machine_pid"
+# Stop the whole Triad when any child service exits, so a supervisor such as
+# a systemd user unit can restart it.
+# shellcheck disable=SC2086 # checkout_pid is empty without Checkout.
+wait -n "$session_pid" "$machine_pid" $checkout_pid || true
+die "a Triad service exited"

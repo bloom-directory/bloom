@@ -1,0 +1,167 @@
+# Checkout
+
+When `cards/` and `checkout/` are present, shop in Bloom's browser through
+`checkout/browse`. Do not use another browser tool or the desktop for this.
+Never ask for card numbers, expiry, cardholder name, CVC, legal names, birth
+dates, documents or contact details in chat, shell or VFS. The person enters
+them only on Bloom's private ceremony page. Every ID you create below is a new
+64-character lowercase hex string.
+
+## Saved cards and travelers
+
+- `cards/index.json` lists card IDs, labels, brands and last four digits. If
+  it is empty, ask the person to add a card first: approvals use the passkey
+  set up with the first card.
+- Add: write `cards/add.json` with `operation_id`, `card_id` and `label`.
+  Delete: write `cards/delete.json` with `operation_id` and `card_id`.
+- `travelers/index.json` lists traveler IDs, labels and field categories only.
+  Save or replace: `travelers/save.json` with `operation_id`, `traveler_id`
+  and a public `label`. Delete: `travelers/delete.json`.
+- For each of these, read `<cards|travelers>/operations/<operation_id>/ceremony.json`
+  and send the person its URL.
+
+If the card passkey is lost, existing saved cards and travelers cannot be
+recovered or replaced with a new passkey. An administrator can reset them:
+stop the login's Triad services and their activation sockets, then move
+`cards.sqlite3` and any `cards.sqlite3-journal` out of the Signer state
+directory before restarting the services. On Linux that directory is
+`/var/lib/bloom/<login-uid>/signer/`; on macOS it is
+`/private/var/db/bloom/<login-uid>/signer/`. This permanently discards all
+saved cards and travelers. It does not remove `signer.db` or wallet keys. Add
+the cards and travelers again with a new passkey. Keep the old encrypted files
+only if the person may recover the old passkey; never move them while Signer
+is running.
+
+## Browse
+
+Write `checkout/browse/<slot>/in.json`, then read `out.json` (kept five
+minutes). Reuse the slot. Actions: `open` + `url`, `snapshot`, `back`.
+Generic `click`, `type` and `select` are refused: any merchant event handler
+can charge a saved payment method, regardless of the control's label. Request
+a private take-over for those interactions.
+
+- Take a fresh snapshot after every action; refs expire. Pages load in
+  stages: if a control is missing or the page changed, snapshot again before
+  calling it unavailable.
+- `context` is the text around an element. Use it to tell apart identical
+  buttons, such as fares on different flight cards or the same day in two
+  months. Radio buttons and labels report `checked`.
+- Links carry `href` (no query or fragment): read a document link instead of
+  clicking it. If a popup closes or downloads a file, shopping continues on the
+  remaining page; take a new snapshot.
+
+## Travelers on a booking
+
+At a passenger, payer or contact form, request a take-over whose
+`agent_description` names the saved travelers to use. The person fills them
+in the private view and pays there with a saved card, since a handback
+discards the page; you never see the values.
+
+## Pay
+
+1. Finish everything first: contact, delivery and billing (choose "same as
+   delivery" when it matches), a named shipping rate, and the site's
+   credit/debit card option so its card fields show. Fix any form errors the
+   snapshot marks. A total beside "Enter shipping address" is not final.
+2. Tell the person the shop, total and anything that changes the price. For a
+   subscription, say what it costs after any trial and how often.
+3. Write `checkout/requests/<id>/in.json` with `card_id` and
+   `agent_description`, read `status.json`, send the ceremony URL and wait.
+   The person sees the shop, total, currency, installments, renewal terms and
+   card read from the page, approves with their passkey and enters the CVC.
+   Bloom fills and submits once. Shopping is paused meanwhile.
+4. To pay with the shop's own saved payment method, omit `card_id`. When
+   Bloom can read the total and one pay button, it clicks it once after
+   approval; otherwise the person logs in and pays in the private view.
+
+Bloom fills cards only into known payment providers (Stripe, Shopify, Adyen,
+Braintree, Yuno and others) or a listed merchant's own page. Anything else,
+a bank challenge or an unclear total goes to the person's private view; no
+card is released to a manual fallback. `agent_description` is shown as your
+words, not as verified facts.
+
+An early Buy button before passenger details is still a payment button. Use a
+take-over for that step; never bypass the guard.
+
+## Blocks: take-over
+
+For a login, code, captcha or bot check, write a request with
+`"take_over": true` and an `agent_description` telling the person what to do.
+Send the ceremony URL. They work in Bloom's browser and click Done.
+Any interaction may charge a shop-saved method, so the result remains
+`uncertain` unless merchant evidence establishes an outcome. An untouched
+view can return as `returned`. Shopping restarts on a blank page, without the
+page they left. It also loses their login unless they choose to stay signed in
+(not offered after a saved traveler was filled); you then see signed-in pages.
+If a shop needs a login to browse, say so in `agent_description`. Reopen the
+shop and recheck the basket.
+The first cardless take-over enrolls a passkey without requiring a saved card
+or traveler. Complete merchant interactions in that approved private session.
+
+## Results and recovery
+
+`status.json` `state` reports what the merchant showed; Bloom has not seen the
+bank charge.
+
+| State | Meaning and next step |
+| --- | --- |
+| `booked`, `paid` | Merchant reported success. `outcome.order_id` is the code shown; for flights it is not proof of a ticket. |
+| `requested`, `preparing`, `awaiting_approval`, `release_started` | The request is in progress. Read status; do not submit another payment. |
+| `restart_cancelling` | Checkout restarted and is reconciling the old approval with Broker. Wait for a definite result; do not request another payment. Checkout remains unavailable while Broker cannot confirm the outcome. |
+| `declined` | A merchant page reported a decline. Have the person check before another checkout. |
+| `filled`, `submitted` | Payment details were filled or a submission was attempted; neither proves payment. The shop remains blocked until the result is checked. |
+| `needs_input` | The page wants more input; payment may already be submitted. The person finishes in the private view. Optional wallet signup can add fields: complete or decline it there. |
+| `partially_filled`, `disclosure_unknown`, `uncertain` | Unknown whether money moved. Bloom refuses another checkout at that shop. A take-over with `"resolves": "<id>"` lets the person inspect it; Done alone does not clear uncertainty or permit a duplicate attempt. |
+| `manual_required`, `human_control` | The person must continue in the private view. |
+| `failed_before_release`, `cancelled`, `expired`, `resolved` | The request has ended. Check its history before deciding what to do next. |
+
+`paused` is a separate status field: Checkout could not hand the browser back.
+Check status before anything else; for a request that never released a card,
+write its `cancel` again to retry cleanup. A restart clears `paused`, not an
+uncertain result.
+
+Never buy again after a timeout, form error or closed view. Read
+`checkout/history.json` (latest 50 requests, with shop, total and status)
+before any repeat purchase at a shop. A failed request can show a total
+without any payment.
+
+When preparation falls back to the person, `reason` says why:
+
+- `facts_unreadable`: total, currency or payment step incomplete. Let the
+  page finish loading on the real payment step and request once more.
+- `fields_unsupported`: card fields in an unexpected shape. Same as above.
+- `payment_action_ambiguous`: several payment buttons. The person chooses
+  privately; never click Subscribe or Buy to test which one charges.
+- `charge_terms_unreadable`: unclear installments, or a subscription whose
+  later price, period or (when nothing is due today) start date the page does
+  not state once. The person reviews privately.
+- `receiving_origin_unreviewed`: the card would go to an unreviewed host.
+  The person pays privately, or choose another seller.
+
+If the same reason repeats on an unchanged page, use a take-over.
+
+- Cancel before release by writing the request's `cancel` file.
+- A lost private tab: read `status.json` and send `view_url`. It reopens only
+  in the browser that claimed the view. Never request another payment for it.
+- After a restart, interrupted private views become `uncertain`: the person
+  may have paid.
+
+## Subscriptions
+
+`history.json` entries carry the stated `renewal_minor`, `renewal_period`
+and `renewal_starts_on`; use them to say what the person still pays and
+when. Bloom pays a subscription only when the page states one later price
+and period (and the start date of a free trial); otherwise the person
+completes it privately. Bloom cannot cap later charges. To cancel, do it on
+the shop's site: the person does it in a take-over; it is never a payment
+request.
+
+Amounts ending in `_minor` use ISO 4217 minor units: JPY uses 1 per yen,
+USD uses 100 per dollar, and KWD and IQD use 1,000 per unit.
+
+## Flights
+
+Search and seller choice are in `/petals/flights/README.md`. Agencies can add
+fees, handle changes and refunds themselves, and may email the e-ticket after
+the order. Tell the person which agency is selling the flight; checkout
+history records the page origin. Do not call an order number a paid ticket.

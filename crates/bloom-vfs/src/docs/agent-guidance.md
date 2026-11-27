@@ -12,6 +12,8 @@ file is `/AGENTS.md`).
   is `0`.
 - `docs/`: for when a write is refused or fails; one short file per
   situation, named for it.
+- `cards/`, when present: read `docs/pay-with-a-saved-card.md` before
+  shopping.
 
 Send, approve or call a contract through the account's outbox,
 `wallets/<wallet>/<n>/chains/<chain>/outbox/`. Write a body to `send.tx`, in

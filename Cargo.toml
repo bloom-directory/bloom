@@ -1,5 +1,7 @@
 [workspace]
 members = [
+  "crates/bloom-checkout",
+  "crates/bloom-checkout-api",
   "crates/bloom",
   "crates/bloom-machine",
   "crates/bloom-daemon",
@@ -33,11 +35,12 @@ resolver = "2"
 [workspace.package]
 version = "0.5.2"
 edition = "2024"
-rust-version = "1.86"
+rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/bloom-directory/bloom"
 
 [workspace.dependencies]
+bloom-checkout-api = { path = "crates/bloom-checkout-api" }
 anyhow = "~1.0.104"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "signal", "sync", "time", "fs", "net", "io-util"] }
@@ -66,11 +69,11 @@ base64 = "0.22"
 bs58 = "0.5"
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
-zeroize = { version = "1", features = ["zeroize_derive"] }
+zeroize = { version = "1", features = ["zeroize_derive", "serde"] }
 rand = "0.8"
 ml-dsa = { version = "0.1.0", features = ["getrandom", "zeroize"] }
 ed25519-dalek = { version = "3", features = ["rand_core"] }
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled", "fallible_uint"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 flate2 = "1"
 mpp = { version = "0.10.4", default-features = false, features = ["client", "tempo", "reqwest-rustls-tls"] }

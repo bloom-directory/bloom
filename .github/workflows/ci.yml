@@ -229,6 +229,10 @@ jobs:
         with:
           name: nextest-archive
           path: target
+      # Ubuntu's AppArmor default denies the unprivileged user namespace that
+      # Checkout's private display runs in; allow it so the display test runs.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Run library unit tests from archive
         run: cargo nextest run --archive-file target/nextest-archive.tar.zst -E 'kind(lib) or (package(bloom) and kind(bin))' --no-fail-fast
 
@@ -275,6 +279,9 @@ jobs:
             --no-fail-fast
           cargo nextest run --archive-file target/nextest-archive.tar.zst \
             -E 'package(bloom-it) and (binary(anvil_e2e) or binary(erc20_e2e))' \
+            --no-fail-fast
+          cargo nextest run --archive-file target/nextest-archive.tar.zst \
+            -E 'package(bloom-checkout) and binary(browser_lifecycle)' \
             --no-fail-fast
           # Machine-to-Broker exact signing (x402, MPP, policy update). Only the
           # dispatch-only macOS W0 job ran it before, so Linux PRs missed breaks.
@@ -383,7 +390,7 @@ jobs:
           cp packaging/triad/linux/systemd/*.socket "$unit_dir/"
           for source in packaging/triad/linux/systemd/*.service.in; do
             destination="$unit_dir/$(basename "${source%.in}")"
-            sed 's|@BLOOM_BROKER_BINARY@|/usr/bin/true|; s|@BLOOM_SIGNER_BINARY@|/usr/bin/true|' \
+            sed 's|@BLOOM_[A-Z]*_BINARY@|/usr/bin/true|' \
               "$source" > "$destination"
           done
           cp "$unit_dir/bloom-signer@.service" "$unit_dir/bloom-signer@1000.service"
