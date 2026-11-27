@@ -322,18 +322,7 @@ impl Cdp {
                                         && let Some(url) = params["response"]["url"]
                                             .as_str()
                                             .and_then(|url| url::Url::parse(url).ok())
-                                        && url.origin().ascii_serialization()
-                                            == "https://merchant-ui-api.stripe.com"
-                                        && url.query().is_none()
-                                        && let Some(link) = url
-                                            .path()
-                                            .strip_prefix("/payment-links/")
-                                            .filter(|link| {
-                                                !link.is_empty()
-                                                    && link.bytes().all(|b| {
-                                                        b.is_ascii_alphanumeric() || b == b'_'
-                                                    })
-                                            })
+                                        && let Some(link) = stripe_bootstrap_key(&url)
                                         && let (
                                             Some(session),
                                             Some(request),
@@ -355,7 +344,7 @@ impl Cdp {
                                             request: request.into(),
                                             frame: frame.into(),
                                             loader: loader.into(),
-                                            link: link.into(),
+                                            link,
                                         });
                                     }
                                 }
@@ -496,6 +485,32 @@ impl Drop for Cdp {
     }
 }
 
+/// Identifies a Stripe hosted-checkout bootstrap response for either
+/// `buy.stripe.com` Payment Links or `checkout.stripe.com` Checkout Sessions.
+fn stripe_bootstrap_key(url: &url::Url) -> Option<String> {
+    if url.query().is_some() {
+        return None;
+    }
+    match url.origin().ascii_serialization().as_str() {
+        "https://merchant-ui-api.stripe.com" => url
+            .path()
+            .strip_prefix("/payment-links/")
+            .filter(|link| {
+                !link.is_empty() && link.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            })
+            .map(str::to_owned),
+        "https://api.stripe.com" => url
+            .path()
+            .strip_prefix("/v1/payment_pages/")
+            .and_then(|rest| rest.strip_suffix("/init"))
+            .filter(|id| {
+                id.starts_with("cs_") && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            })
+            .map(str::to_owned),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -547,5 +562,27 @@ mod tests {
         .expect("the next browser command must remain usable")
         .unwrap();
         assert_eq!(next["result"]["value"], 42);
+    }
+
+    #[test]
+    fn stripe_bootstrap_key_matches_payment_links_and_checkout_sessions() {
+        let link = url::Url::parse("https://merchant-ui-api.stripe.com/payment-links/test_28o7u4")
+            .unwrap();
+        assert_eq!(stripe_bootstrap_key(&link).as_deref(), Some("test_28o7u4"));
+
+        let session =
+            url::Url::parse("https://api.stripe.com/v1/payment_pages/cs_live_a1b2C3/init").unwrap();
+        assert_eq!(
+            stripe_bootstrap_key(&session).as_deref(),
+            Some("cs_live_a1b2C3")
+        );
+
+        let bad_origin =
+            url::Url::parse("https://evil.example/v1/payment_pages/cs_live_a1b2C3/init").unwrap();
+        assert_eq!(stripe_bootstrap_key(&bad_origin), None);
+
+        let bad_prefix =
+            url::Url::parse("https://api.stripe.com/v1/payment_pages/not_cs/init").unwrap();
+        assert_eq!(stripe_bootstrap_key(&bad_prefix), None);
     }
 }

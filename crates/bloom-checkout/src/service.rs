@@ -45,6 +45,7 @@ enum Refusal {
     Blocked(String),
     FormErrors,
     IdUsed,
+    BlankPage,
 }
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -55,6 +56,7 @@ impl std::fmt::Display for Refusal {
             ),
             Self::FormErrors => f.write_str("The page shows form errors; fix them before payment"),
             Self::IdUsed => f.write_str("Operation ID already used; check its status"),
+            Self::BlankPage => f.write_str("Open a shop page before requesting a take-over"),
         }
     }
 }
@@ -67,6 +69,7 @@ impl Refusal {
             }
             Self::FormErrors => json!({"error_code":"form_errors"}),
             Self::IdUsed => json!({"error_code":"id_used"}),
+            Self::BlankPage => json!({"error_code":"blank_page"}),
         }
     }
 }
@@ -744,7 +747,7 @@ impl CheckoutService {
                             return Err(Refusal::Blocked(open).into());
                         }
                     } else if shop.is_none() {
-                        bail!("Open a shop page before requesting a take-over");
+                        return Err(Refusal::BlankPage.into());
                     }
                     self.store.insert(&status, kind, &agent_description)?;
                     status.state = "preparing".into();
@@ -939,7 +942,8 @@ impl CheckoutService {
                 match status.state {
                     CardOperationState::Succeeded => {
                         checkout.approved = true;
-                        checkout.expires_at = Some(tokio::time::Instant::now() + PRIVATE_VIEW_TIMEOUT);
+                        checkout.expires_at =
+                            Some(tokio::time::Instant::now() + PRIVATE_VIEW_TIMEOUT);
                         let result = self
                             .consume_and_fill(checkout, receipt, output_aad.map(|aad| *aad))
                             .await;
@@ -1752,10 +1756,11 @@ impl CheckoutService {
                 private.as_ref().is_some_and(|c| c.mode == Mode::TakeOver),
                 private.as_ref().is_some_and(|c| c.stay_signed_in),
                 private.as_ref().and_then(|c| c.resolves.clone()),
-                private
-                    .as_ref()
-                    .and_then(|c| c.expires_at)
-                    .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()).as_secs()),
+                private.as_ref().and_then(|c| c.expires_at).map(|deadline| {
+                    deadline
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        .as_secs()
+                }),
             )
         };
         let can_stay_signed_in = !self.browser.has_private_traveler_data();
@@ -4124,7 +4129,11 @@ mod tests {
         };
         *service.private.lock().await = Some(checkout);
         let active = service.private_state(&token).await.unwrap();
-        assert!(active["remaining_secs"].as_u64().is_some_and(|s| s > 0 && s <= 120));
+        assert!(
+            active["remaining_secs"]
+                .as_u64()
+                .is_some_and(|s| s > 0 && s <= 120)
+        );
         let finished = service.private.lock().await.take().unwrap();
         service.retain_completed(&finished, service.store.get(&exp_id).unwrap(), true);
         let closed = service.private_state(&token).await.unwrap();

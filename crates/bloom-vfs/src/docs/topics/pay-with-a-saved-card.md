@@ -64,8 +64,14 @@ discards the page; you never see the values.
 
 1. Finish everything first: contact, delivery and billing (choose "same as
    delivery" when it matches), a named shipping rate, and the site's
-   credit/debit card option so its card fields show. Fix any form errors the
-   snapshot marks. A total beside "Enter shipping address" is not final.
+   credit/debit card option so its card fields (or hosted Stripe Checkout)
+   actually show on screen. Fix any form errors the snapshot marks. A total
+   beside "Enter shipping address" is not final. If a deploy/order page
+   requires a private field before opening payment, check whether the site has
+   a separate wallet/balance top-up page that opens payment directly; do not
+   request a saved-card payment before card fields exist, because `Close` on a
+   `manual_required` fallback abandons the payment (`uncertain`) and resets the
+   tab to `about:blank`.
 2. Tell the person the shop, total and anything that changes the price. For a
    subscription, say what it costs after any trial and how often.
 3. Write `checkout/requests/<id>/in.json` with `card_id` and

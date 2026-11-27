@@ -160,6 +160,23 @@ fn provider_hosts_card_fields(frame_origin: &str, top_origin: &str, fixture: boo
     known || fixture_host
 }
 
+fn hosted_stripe_key(url: &url::Url) -> Option<&str> {
+    match url.origin().ascii_serialization().as_str() {
+        "https://buy.stripe.com" => {
+            let link = url.path().trim_start_matches('/');
+            (!link.is_empty() && !link.contains('/')).then_some(link)
+        }
+        "https://checkout.stripe.com" => url
+            .path()
+            .strip_prefix("/c/pay/")
+            .map(|id| id.trim_end_matches('/'))
+            .filter(|id| {
+                id.starts_with("cs_") && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            }),
+        _ => None,
+    }
+}
+
 /// Read the already-received Stripe bootstrap, never initialize a second
 /// Checkout Session. Bind it to this exact frame and document loader.
 pub(crate) async fn hosted_stripe_facts(
@@ -169,10 +186,10 @@ pub(crate) async fn hosted_stripe_facts(
     url: &str,
 ) -> Result<Value> {
     let url = url::Url::parse(url)?;
-    if url.origin().ascii_serialization() != "https://buy.stripe.com" {
-        bail!("Not a Stripe Payment Link");
-    }
-    let link = url.path().trim_start_matches('/');
+    let origin = url.origin().ascii_serialization();
+    let Some(link) = hosted_stripe_key(&url) else {
+        bail!("Not a hosted Stripe checkout");
+    };
     let tree = cdp
         .call(Some(session), "Page.getFrameTree", json!({}))
         .await?;
@@ -207,11 +224,13 @@ pub(crate) async fn hosted_stripe_facts(
             .as_str()
             .context("Missing Stripe bootstrap body")?,
     )?;
-    if !matches!(page["mode"].as_str(), Some("payment" | "subscription"))
-        || !page["session_id"]
+    let bound_session = page["session_id"].as_str().is_some_and(|id| {
+        id.starts_with("cs_") && (origin == "https://buy.stripe.com" || id == link)
+    }) || (origin == "https://checkout.stripe.com"
+        && page["id"]
             .as_str()
-            .is_some_and(|id| id.starts_with("cs_"))
-    {
+            .is_some_and(|id| id.starts_with("ppage_")));
+    if !matches!(page["mode"].as_str(), Some("payment" | "subscription")) || !bound_session {
         bail!("Unbound Stripe checkout facts");
     }
     Ok(
@@ -420,7 +439,10 @@ impl Discovery {
             let world = context.world;
             if position == 0 {
                 top_origin = Some(origin.clone());
-                if origin == "https://buy.stripe.com" {
+                if matches!(
+                    origin.as_str(),
+                    "https://buy.stripe.com" | "https://checkout.stripe.com"
+                ) {
                     let facts =
                         hosted_stripe_facts(&tab.cdp, &session, &context.frame_id, url).await?;
                     evaluate(tab,&session,world,format!("(()=>{{const facts={facts};if(globalThis.__bloomHostedStripeFacts){{if(JSON.stringify(globalThis.__bloomHostedStripeFacts)!==JSON.stringify(facts))throw Error('Facts changed');}}else Object.defineProperty(globalThis,'__bloomHostedStripeFacts',{{value:Object.freeze(facts),writable:false,configurable:false}});return true;}})()")).await?;

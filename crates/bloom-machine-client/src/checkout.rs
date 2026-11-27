@@ -94,6 +94,7 @@ enum CheckoutRefusal {
     Blocked { operation_id: String },
     FormErrors,
     IdUsed,
+    BlankPage,
 }
 
 fn checkout_refusal(line: &str) -> Option<String> {
@@ -122,6 +123,7 @@ fn checkout_refusal(line: &str) -> Option<String> {
             Some("The page shows form errors; fix them before payment".into())
         }
         CheckoutRefusal::IdUsed => Some("Operation ID already used; check its status".into()),
+        CheckoutRefusal::BlankPage => Some("Open a shop page before requesting a take-over".into()),
         _ => None,
     }
 }
@@ -243,5 +245,13 @@ mod tests {
             })
             .await;
         assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn blank_page_refusal_message_reaches_caller() {
+        assert_eq!(
+            checkout_refusal("{\"error_code\":\"blank_page\"}").as_deref(),
+            Some("Open a shop page before requesting a take-over")
+        );
     }
 }

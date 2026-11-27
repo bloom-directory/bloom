@@ -1,7 +1,8 @@
 (() => {
   const text = document.body.innerText;
+  const hostedStripe = location.origin === 'https://buy.stripe.com' || location.origin === 'https://checkout.stripe.com';
   // This is only a page phrase, not proof that a charge did not happen.
-  const failed = (location.origin === 'https://buy.stripe.com' && /We are unable to authenticate your payment method\./.test(text)) || /card (?:was |has been )?declined|payment (?:was )?(?:declined|failed)|insufficient funds|payment details couldn.t be verified|(?:zahlung|karte) (?:wurde )?abgelehnt|zahlung fehlgeschlagen|paiement (?:a été )?refusé|carte (?:a été )?refusée|paiement échoué|(?:pago|tarjeta) (?:fue )?(?:rechazad[oa]|denegad[oa])|pagamento (?:foi )?recusado|cartão (?:foi )?recusado|pagamento (?:è stato )?rifiutato|carta rifiutata|betaling (?:is )?mislukt|betaling geweigerd/i.test(text);
+  const failed = (hostedStripe && /We are unable to authenticate your payment method\./.test(text)) || /card (?:was |has been )?declined|payment (?:was )?(?:declined|failed)|insufficient funds|payment details couldn.t be verified|(?:zahlung|karte) (?:wurde )?abgelehnt|zahlung fehlgeschlagen|paiement (?:a été )?refusé|carte (?:a été )?refusée|paiement échoué|(?:pago|tarjeta) (?:fue )?(?:rechazad[oa]|denegad[oa])|pagamento (?:foi )?recusado|cartão (?:foi )?recusado|pagamento (?:è stato )?rifiutato|carta rifiutata|betaling (?:is )?mislukt|betaling geweigerd/i.test(text);
   // A reservation reference can exist before payment. Require the merchant to
   // report a purchase/payment confirmation or an issued ticket as well.
   // `phrase` is the success evidence; checkout ignores it if the page already
@@ -17,7 +18,7 @@
   // A form error after the click: the merchant kept the human on the form.
   if (attention && (attention.errors.length || attention.invalid)) return {state:'needs_input',reason:'form_errors'};
   if (booking) return {state:'waiting',reason:'reservation_reference_only',order_id:booking[1]};
-  const hostedSubscription = location.origin === 'https://buy.stripe.com' && /\bThanks for subscribing\b/.exec(text);
+  const hostedSubscription = hostedStripe && /\bThanks for subscribing\b/.exec(text);
   // Shopify's thank-you page is reached only after the order is created.
   const shopifyThankYou = /^(?:\/\d+)?\/checkouts\/(?:[a-z]+\/)?[A-Za-z0-9]+(?:\/[a-z]{2}(?:-[a-z]{2})?)?\/thank[-_]you(?:\/|$)/i.exec(location.pathname);
   const success = /payment (?:successful|succeeded|complete)|order (?:is )?confirmed|thank you for (?:your order|your purchase|shopping)|purchase complete|bestellung (?:ist )?bestätigt|vielen dank für (?:ihre|deine) bestellung|zahlung erfolgreich|commande (?:est )?confirmée|merci pour votre commande|paiement réussi|pedido (?:está )?confirmado|gracias por (?:tu|su) (?:compra|pedido)|(?:reserva|reservación) (?:ha sido |está )?(?:confirmada|completada)|(?:compra|pago) (?:ha sido )?(?:confirmad[oa]|aprobad[oa]|exitos[oa]|acreditad[oa])|obrigad[oa] pela (?:sua )?compra|pagamento aprovado|ordine (?:è )?confermato|grazie per (?:il tuo|il suo) ordine|bestelling (?:is )?bevestigd|bedankt voor je bestelling/i.exec(text);

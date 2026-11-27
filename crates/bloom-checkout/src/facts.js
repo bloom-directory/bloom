@@ -180,9 +180,10 @@
   const explicit = fixture ? [...document.querySelectorAll('[data-bloom-total-minor][data-bloom-currency]')].filter(visible) : [];
   let total, currency;
   let processorRecurring = null;
-  if (location.origin === 'https://buy.stripe.com') {
+  if (location.origin === 'https://buy.stripe.com' || location.origin === 'https://checkout.stripe.com') {
     const processor = globalThis.__bloomHostedStripeFacts;
-    const displayed = [...document.querySelectorAll('.CurrencyAmount')].filter(visible);
+    const totalDisplayed = [...document.querySelectorAll('[data-testid="product-summary-total-amount"] .CurrencyAmount')].filter(visible);
+    const displayed = totalDisplayed.length ? totalDisplayed : [...document.querySelectorAll('.CurrencyAmount')].filter(visible);
     // Stripe can repeat the same price in its summary and submit area. Every
     // visible price must agree with the bound processor amount and currency.
     // Appending the processor code resolves a bare "$", but conflicting
